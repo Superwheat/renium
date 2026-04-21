@@ -1,0 +1,235 @@
+{
+  "name": "roblox-mcp-sync",
+  "displayName": "Roblox MCP Sync",
+  "description": "Roblox Studio sync for VS Code/Cursor using native executables",
+  "version": "0.1.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "roblox",
+    "rojo",
+    "argon",
+    "mcp",
+    "sync",
+    "luau"
+  ],
+  "activationEvents": [
+    "onCommand:robloxSync.openMenu",
+    "onCommand:robloxSync.fullSync",
+    "onCommand:robloxSync.exportSnapshots",
+    "onCommand:robloxSync.importSnapshots",
+    "onCommand:robloxSync.startLiveSync",
+    "onCommand:robloxSync.stopLiveSync",
+    "onCommand:robloxSync.syncActiveService",
+    "workspaceContains:tools/roblox-sync-rs/Cargo.toml"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "robloxSync.openMenu",
+        "title": "Open Menu",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.fullSync",
+        "title": "Full Sync (Studio -> src)",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.exportSnapshots",
+        "title": "Export Snapshots Only",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.importSnapshots",
+        "title": "Import Snapshots Into src",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.startLiveSync",
+        "title": "Start Live Sync (Editor -> Studio)",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.stopLiveSync",
+        "title": "Stop Live Sync",
+        "category": "Roblox Sync"
+      },
+      {
+        "command": "robloxSync.syncActiveService",
+        "title": "Sync Active Service Now",
+        "category": "Roblox Sync"
+      }
+    ],
+    "configuration": {
+      "title": "Roblox MCP Sync",
+      "properties": {
+        "robloxSync.exportCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/tools/roblox-sync-rs/target/release/roblox-sync-rs.exe",
+          "description": "Path to export executable."
+        },
+        "robloxSync.editorSyncCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/dist/editor_to_studio_sync.exe",
+          "description": "Path to live-sync executable."
+        },
+        "robloxSync.rustCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/tools/roblox-sync-rs/target/release/roblox-sync-rs.exe",
+          "description": "Path to roblox-sync-rs CLI binary used for high-performance snapshot import."
+        },
+        "robloxSync.projectRoot": {
+          "type": "string",
+          "default": "${workspaceFolder}",
+          "description": "Workspace-relative project root"
+        },
+        "robloxSync.snapshotDir": {
+          "type": "string",
+          "default": "snapshots",
+          "description": "Snapshot directory (relative to projectRoot unless absolute)"
+        },
+        "robloxSync.transport": {
+          "type": "string",
+          "enum": ["ws", "mcp"],
+          "default": "ws",
+          "description": "Transport mode used by the export CLI."
+        },
+        "robloxSync.server": {
+          "type": "string",
+          "default": "Roblox_Studio",
+          "description": "MCP server name from config.toml"
+        },
+        "robloxSync.configTomlPath": {
+          "type": "string",
+          "default": "${userHome}/.codex/config.toml",
+          "description": "Path to config.toml that defines the Roblox MCP server"
+        },
+        "robloxSync.services": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [
+            "Workspace",
+            "Players",
+            "Lighting",
+            "MaterialService",
+            "ReplicatedFirst",
+            "ReplicatedStorage",
+            "ServerScriptService",
+            "ServerStorage",
+            "StarterGui",
+            "StarterPack",
+            "StarterPlayer"
+          ],
+          "description": "Services included in full sync"
+        },
+        "robloxSync.sourceWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual worker count"
+        },
+        "robloxSync.instanceWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual instance batch worker count"
+        },
+        "robloxSync.importWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual direct-import worker count"
+        },
+        "robloxSync.chunkSize": {
+          "type": "number",
+          "default": 262144,
+          "minimum": 512,
+          "description": "Chunk size used for exporter RPC payload paging."
+        },
+        "robloxSync.snapshotInstanceChunkSize": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 0,
+          "description": "Instance count per snapshot chunk file (0 disables chunk splitting)."
+        },
+        "robloxSync.bridgeWaitSeconds": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "description": "Max wait for plugin bridge channels to connect."
+        },
+        "robloxSync.bridgePorts": {
+          "type": "string",
+          "default": "8781,8782,8783,8784",
+          "description": "Comma-separated WebSocket bridge ports used by plugin and exporter. Only four ports are supported."
+        },
+        "robloxSync.adaptiveThrottle": {
+          "type": "boolean",
+          "default": true,
+          "description": "Adaptive Studio FPS throttle for export RPCs."
+        },
+        "robloxSync.noUpdateEditorIcons": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skip editor icon settings updates during export."
+        },
+        "robloxSync.autoSyncOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically sync changed service(s) after file save"
+        },
+        "robloxSync.autoSyncDebounceMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 100,
+          "description": "Debounce time before triggering auto sync"
+        },
+        "robloxSync.runImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run import stage so src and generated project JSON are updated"
+        },
+        "robloxSync.importMode": {
+          "type": "string",
+          "enum": ["direct", "snapshot"],
+          "default": "direct",
+          "description": "Import mode for the export CLI."
+        },
+        "robloxSync.watchConfigPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/tools/editor_to_studio_sync.json",
+          "description": "Reserved config path for future live-sync support."
+        },
+        "robloxSync.wsWaitSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "description": "Studio connection wait timeout in seconds"
+        },
+        "robloxSync.progressHeartbeatSeconds": {
+          "type": "number",
+          "default": 2,
+          "minimum": 2,
+          "description": "Heartbeat interval for long-running command progress logs."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.5.4"
+  }
+}

@@ -1,0 +1,5 @@
+out
+auto
+auto.ps1
+node_modules
+*.vsix

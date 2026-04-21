@@ -1,0 +1,32 @@
+# This repository is intentionally scoped to sync tooling only.
+/*
+!/.gitignore
+!/tools/
+!/tools/**
+
+# Dependency installs
+node_modules/
+tools/**/node_modules/
+
+# Build output
+target/
+tools/**/target/
+out/
+tools/**/out/
+dist/
+
+# Packaged artifacts
+*.vsix
+
+# Local/vendor checkouts used as tooling references
+_external/
+tools/**/_external/
+
+# Runtime/generated output
+snapshots/
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
