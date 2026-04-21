@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use rayon::prelude::*;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tungstenite::protocol::WebSocketConfig;
@@ -31,6 +32,112 @@ const DEFAULT_SERVICES: [&str; 11] = [
     "StarterPack",
     "StarterPlayer",
 ];
+
+type PropertyCandidateMap = HashMap<String, Vec<String>>;
+
+const DEFAULT_PROPERTY_CANDIDATES: [&str; 90] = [
+    "Archivable",
+    "Enabled",
+    "RunContext",
+    "Disabled",
+    "LinkedSource",
+    "Value",
+    "Name",
+    "ClassName",
+    "Parent",
+    "Part0",
+    "Part1",
+    "Attachment0",
+    "Attachment1",
+    "AutoLocalize",
+    "RootLocalizationTable",
+    "BackgroundColor3",
+    "BackgroundTransparency",
+    "BorderColor3",
+    "BorderSizePixel",
+    "Position",
+    "Size",
+    "AnchorPoint",
+    "Rotation",
+    "Visible",
+    "Text",
+    "TextColor3",
+    "TextSize",
+    "TextScaled",
+    "FontFace",
+    "Image",
+    "ImageColor3",
+    "ImageTransparency",
+    "Color",
+    "Transparency",
+    "ZIndex",
+    "LayoutOrder",
+    "Active",
+    "Selectable",
+    "CanvasSize",
+    "ScrollBarThickness",
+    "AutomaticCanvasSize",
+    "RichText",
+    "LineHeight",
+    "MaxVisibleGraphemes",
+    "SliceCenter",
+    "ScaleType",
+    "TileSize",
+    "Padding",
+    "CellPadding",
+    "CellSize",
+    "FillDirection",
+    "SortOrder",
+    "HorizontalAlignment",
+    "VerticalAlignment",
+    "ApplyStrokeMode",
+    "Thickness",
+    "Color3",
+    "Material",
+    "BrickColor",
+    "CanCollide",
+    "CanQuery",
+    "CanTouch",
+    "Massless",
+    "Anchored",
+    "CastShadow",
+    "CFrame",
+    "Orientation",
+    "AssemblyLinearVelocity",
+    "AssemblyAngularVelocity",
+    "Shape",
+    "Reflectance",
+    "TopSurface",
+    "BottomSurface",
+    "LeftSurface",
+    "RightSurface",
+    "FrontSurface",
+    "BackSurface",
+    "LightInfluence",
+    "Brightness",
+    "ClockTime",
+    "FogColor",
+    "FogEnd",
+    "FogStart",
+    "GeographicLatitude",
+    "GlobalShadows",
+    "EnvironmentDiffuseScale",
+    "EnvironmentSpecularScale",
+    "Ambient",
+    "OutdoorAmbient",
+    "Technology",
+];
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn log_timing(label: &str, started: Instant) {
+    println!(
+        "[roblox-sync-rs] timing: {label} took {:.1}ms",
+        elapsed_ms(started)
+    );
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -192,7 +299,7 @@ struct SnapshotInstance {
     parent_instance_id: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServiceState {
     instances: Vec<SnapshotInstance>,
     children_by_parent_instance_id: HashMap<String, Vec<usize>>,
@@ -515,19 +622,15 @@ fn adaptive_tune_cache_path(project_root: &Path) -> PathBuf {
 
 fn load_adaptive_tune_cache(project_root: &Path) -> AdaptiveTuneCache {
     let path = adaptive_tune_cache_path(project_root);
-    let Ok(bytes) = fs::read(&path) else {
+    let Ok(cache) = read_json_file::<AdaptiveTuneCache>(&path) else {
         return AdaptiveTuneCache::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    cache
 }
 
 fn write_adaptive_tune_cache(project_root: &Path, cache: &AdaptiveTuneCache) {
     let path = adaptive_tune_cache_path(project_root);
-    if let Err(err) = write_json_file(
-        &path,
-        &serde_json::to_value(cache).unwrap_or_else(|_| json!({})),
-        true,
-    ) {
+    if let Err(err) = write_json_file(&path, cache, true) {
         println!(
             "[roblox-sync-rs] warning: failed to write adaptive tuning cache {}: {err:#}",
             path.display()
@@ -535,9 +638,60 @@ fn write_adaptive_tune_cache(project_root: &Path, cache: &AdaptiveTuneCache) {
     }
 }
 
-struct DirectImportTask {
+enum DirectImportTask {
+    Service {
+        service: String,
+        parts: ExportedSnapshotParts,
+    },
+    Subtree(DirectImportSubtreeTask),
+    Shutdown,
+}
+
+struct DirectImportSubtreeTask {
+    shared: Arc<SplitDirectImportState>,
+    items: Vec<DirectImportSubtreeItem>,
+}
+
+struct DirectImportSubtreeItem {
+    index: usize,
+    parent_dir: PathBuf,
+    fs_stem: String,
+    output_slot: usize,
+    parent_assembly: Arc<SplitNodeAssembly>,
+}
+
+struct SplitNodeAssembly {
+    name: String,
+    class_name: String,
+    file_paths: Vec<String>,
+    child_slots: Vec<usize>,
+    remaining_children: AtomicUsize,
+    output_slot: Option<usize>,
+    parent: Option<Arc<SplitNodeAssembly>>,
+}
+
+struct SplitDirectImportState {
     service: String,
-    parts: ExportedSnapshotParts,
+    service_dir: PathBuf,
+    project_root: PathBuf,
+    compact_meta_json: bool,
+    state: Arc<ServiceState>,
+    expected_paths: Arc<ImportPathSets>,
+    visited: Arc<Vec<AtomicBool>>,
+    slots: Mutex<Vec<Option<SourcemapNode>>>,
+    queued_tasks: AtomicUsize,
+    completed_tasks: AtomicUsize,
+    total_task_tenths_ms: AtomicU64,
+    max_task_tenths_ms: AtomicU64,
+    failed: AtomicBool,
+    started: Instant,
+}
+
+struct SplitNodeShell {
+    name: String,
+    class_name: String,
+    file_paths: Vec<String>,
+    dir_path: PathBuf,
 }
 
 enum SourcemapWriterMessage {
@@ -556,19 +710,32 @@ impl SourcemapWriter {
         let handle = thread::spawn(move || -> Result<()> {
             let mut service_nodes = HashMap::<String, SourcemapNode>::new();
             while let Ok(message) = receiver.recv() {
+                let mut pending_finish = false;
                 match message {
                     SourcemapWriterMessage::Service(service, node) => {
                         service_nodes.insert(service, node);
-                        write_project_sourcemap_temp_from_service_nodes(
-                            &project_root,
-                            &service_nodes,
-                        )?;
                     }
-                    SourcemapWriterMessage::Finish => {
-                        finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
-                        return Ok(());
+                    SourcemapWriterMessage::Finish => pending_finish = true,
+                }
+
+                while let Ok(pending) = receiver.try_recv() {
+                    match pending {
+                        SourcemapWriterMessage::Service(service, node) => {
+                            service_nodes.insert(service, node);
+                        }
+                        SourcemapWriterMessage::Finish => {
+                            pending_finish = true;
+                            break;
+                        }
                     }
                 }
+
+                if pending_finish {
+                    finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
+                    return Ok(());
+                }
+
+                write_project_sourcemap_temp_from_service_nodes(&project_root, &service_nodes)?;
             }
             finalize_project_sourcemap_temp(&project_root, &service_nodes)
         });
@@ -601,6 +768,8 @@ struct DirectImportDispatcher {
     workers: Vec<thread::JoinHandle<()>>,
     first_error: Arc<Mutex<Option<String>>>,
     service_nodes: Arc<Mutex<HashMap<String, SourcemapNode>>>,
+    pending_tasks: Arc<AtomicUsize>,
+    worker_count: usize,
 }
 
 impl DirectImportDispatcher {
@@ -610,19 +779,22 @@ impl DirectImportDispatcher {
         worker_count: usize,
         sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
     ) -> Self {
-        let queue_capacity = worker_count.max(1).saturating_mul(2).clamp(2, 64);
+        let queue_capacity = worker_count.max(1).saturating_mul(64).clamp(32, 1024);
         let (sender, receiver) = mpsc::sync_channel::<DirectImportTask>(queue_capacity);
         let shared_receiver = Arc::new(Mutex::new(receiver));
         let first_error = Arc::new(Mutex::new(None::<String>));
         let service_nodes = Arc::new(Mutex::new(HashMap::<String, SourcemapNode>::new()));
+        let pending_tasks = Arc::new(AtomicUsize::new(0));
         let worker_count = worker_count.max(1);
 
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let recv_clone = Arc::clone(&shared_receiver);
+            let sender_clone = sender.clone();
             let root_clone = project_root.clone();
             let error_clone = Arc::clone(&first_error);
             let service_nodes_clone = Arc::clone(&service_nodes);
+            let pending_tasks_clone = Arc::clone(&pending_tasks);
             let sourcemap_sender_clone = sourcemap_sender.clone();
             workers.push(thread::spawn(move || {
                 loop {
@@ -636,44 +808,118 @@ impl DirectImportDispatcher {
                     let Ok(task) = task else {
                         break;
                     };
+                    match task {
+                        DirectImportTask::Service { service, parts } => {
+                            let src_root = root_clone.join("src");
+                            let worker_started = Instant::now();
+                            println!("[roblox-sync-rs] {}: direct import worker start", service);
+                            let import_result = fs::create_dir_all(&src_root)
+                                .with_context(|| format!("Failed to create {}", src_root.display()))
+                                .and_then(|_| {
+                                    let build_started = Instant::now();
+                                    let state = exported_parts_to_service_state(&service, parts)?;
+                                    log_timing(
+                                        &format!("{}: build service state", service),
+                                        build_started,
+                                    );
+                                    Ok(state)
+                                })
+                                .and_then(|state| {
+                                    let maybe_shared = maybe_enqueue_split_import_tasks(
+                                        &sender_clone,
+                                        &pending_tasks_clone,
+                                        &root_clone,
+                                        &src_root,
+                                        &service,
+                                        compact_meta_json,
+                                        &state,
+                                    )?;
+                                    if let Some(shared) = maybe_shared {
+                                        println!(
+                                            "[roblox-sync-rs] {}: queued {} subtree import tasks",
+                                            service,
+                                            shared.queued_tasks.load(Ordering::Acquire)
+                                        );
+                                        Ok(None)
+                                    } else {
+                                        let import_started = Instant::now();
+                                        let node = import_service_state_with_sourcemap(
+                                            &state,
+                                            &root_clone,
+                                            &src_root,
+                                            &service,
+                                            compact_meta_json,
+                                        )?;
+                                        log_timing(
+                                            &format!("{}: import + sourcemap build", service),
+                                            import_started,
+                                        );
+                                        Ok(Some(node))
+                                    }
+                                });
 
-                    let src_root = root_clone.join("src");
-                    let import_result = fs::create_dir_all(&src_root)
-                        .with_context(|| format!("Failed to create {}", src_root.display()))
-                        .and_then(|_| exported_parts_to_service_state(&task.service, task.parts))
-                        .and_then(|state| {
-                            import_service_state_with_sourcemap(
-                                &state,
-                                &root_clone,
-                                &src_root,
-                                &task.service,
-                                compact_meta_json,
-                            )
-                        });
-                    match import_result {
-                        Ok(node) => {
-                            if let Some(sender) = sourcemap_sender_clone.as_ref() {
-                                let _ = sender.send(SourcemapWriterMessage::Service(
-                                    task.service.clone(),
-                                    node.clone(),
-                                ));
+                            match import_result {
+                                Ok(Some(node)) => {
+                                    if let Some(sender) = sourcemap_sender_clone.as_ref() {
+                                        let _ = sender.send(SourcemapWriterMessage::Service(
+                                            service.clone(),
+                                            node.clone(),
+                                        ));
+                                    }
+                                    let mut nodes = match service_nodes_clone.lock() {
+                                        Ok(lock) => lock,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    nodes.insert(service.clone(), node);
+                                    log_timing(
+                                        &format!("{}: direct import worker total", service),
+                                        worker_started,
+                                    );
+                                }
+                                Ok(None) => {
+                                    log_timing(
+                                        &format!("{}: direct import worker total", service),
+                                        worker_started,
+                                    );
+                                }
+                                Err(err) => {
+                                    let mut slot = match error_clone.lock() {
+                                        Ok(lock) => lock,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    if slot.is_none() {
+                                        *slot = Some(format!("{}: {}", service, err));
+                                    }
+                                    log_timing(
+                                        &format!("{}: direct import worker total", service),
+                                        worker_started,
+                                    );
+                                }
                             }
-                            let mut nodes = match service_nodes_clone.lock() {
-                                Ok(lock) => lock,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            nodes.insert(task.service.clone(), node);
                         }
-                        Err(err) => {
-                            let mut slot = match error_clone.lock() {
-                                Ok(lock) => lock,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            if slot.is_none() {
-                                *slot = Some(format!("{}: {}", task.service, err));
+                        DirectImportTask::Subtree(task) => {
+                            let worker_started = Instant::now();
+                            let shared = Arc::clone(&task.shared);
+                            let service = shared.service.clone();
+                            let result = process_split_subtree_task(
+                                task,
+                                &service_nodes_clone,
+                                sourcemap_sender_clone.as_ref(),
+                                worker_started,
+                            );
+                            if let Err(err) = result {
+                                let mut slot = match error_clone.lock() {
+                                    Ok(lock) => lock,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                if slot.is_none() {
+                                    *slot = Some(format!("{}: {}", service, err));
+                                }
                             }
                         }
+                        DirectImportTask::Shutdown => break,
                     }
+                    pending_tasks_clone.fetch_sub(1, Ordering::AcqRel);
                 }
             }));
         }
@@ -683,6 +929,8 @@ impl DirectImportDispatcher {
             workers,
             first_error,
             service_nodes,
+            pending_tasks,
+            worker_count,
         }
     }
 
@@ -692,12 +940,16 @@ impl DirectImportDispatcher {
             .sender
             .as_ref()
             .with_context(|| "Direct import dispatcher is closed")?;
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
         sender
-            .send(DirectImportTask {
+            .send(DirectImportTask::Service {
                 service: service.to_string(),
                 parts,
             })
-            .context("Failed to queue direct import task")
+            .map_err(|err| {
+                self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
+                anyhow::anyhow!("Failed to queue direct import task: {err}")
+            })
     }
 
     fn check_error(&self) -> Result<()> {
@@ -712,7 +964,15 @@ impl DirectImportDispatcher {
     }
 
     fn finish(mut self) -> Result<HashMap<String, SourcemapNode>> {
-        self.sender.take();
+        while self.pending_tasks.load(Ordering::Acquire) > 0 {
+            self.check_error()?;
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(sender) = self.sender.take() {
+            for _ in 0..self.worker_count {
+                let _ = sender.send(DirectImportTask::Shutdown);
+            }
+        }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -727,7 +987,11 @@ impl DirectImportDispatcher {
 
 impl Drop for DirectImportDispatcher {
     fn drop(&mut self) {
-        self.sender.take();
+        if let Some(sender) = self.sender.take() {
+            for _ in 0..self.worker_count {
+                let _ = sender.send(DirectImportTask::Shutdown);
+            }
+        }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -735,6 +999,7 @@ impl Drop for DirectImportDispatcher {
 }
 
 fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
+    let total_started = Instant::now();
     if args.transport != "ws" {
         bail!("Only --transport ws is supported in rust exporter");
     }
@@ -780,8 +1045,13 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
             "preSerializeOnPrepare": true
         }),
     );
-    if let Some(classes) = load_rbx_dom_property_candidates(&project_root)? {
-        match bridge.call("configurePropertyCandidates", json!({ "classes": classes })) {
+    let property_candidates_by_class =
+        load_rbx_dom_property_candidates(&project_root)?.unwrap_or_default();
+    if !property_candidates_by_class.is_empty() {
+        match bridge.call(
+            "configurePropertyCandidates",
+            json!({ "classes": property_candidate_map_to_value(&property_candidates_by_class) }),
+        ) {
             Ok(result) => {
                 let class_count = result
                     .get("classCount")
@@ -860,7 +1130,19 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
         None
     };
 
-    for service in &services {
+    let export_services = if direct_import_mode {
+        direct_import_export_order(&services)
+    } else {
+        services.clone()
+    };
+    if direct_import_mode && export_services != services {
+        println!(
+            "[roblox-sync-rs] direct import export order: {}",
+            export_services.join(",")
+        );
+    }
+
+    for service in &export_services {
         if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
             dispatcher.check_error()?;
         }
@@ -873,6 +1155,7 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
             source_workers,
             instance_workers,
             adaptive_tune_cache.services.get(service).cloned(),
+            &property_candidates_by_class,
         )?;
         if let Some(tune) = parts.adaptive_tune.clone() {
             adaptive_tune_cache
@@ -895,16 +1178,26 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
         if direct_import_mode {
             let mut sourcemap_nodes = HashMap::new();
             if let Some(dispatcher) = direct_import_dispatcher.take() {
+                let drain_started = Instant::now();
                 sourcemap_nodes = dispatcher.finish()?;
+                log_timing("direct import dispatcher drain", drain_started);
             }
+            let project_started = Instant::now();
             write_generated_project(&project_root, &services, compact_meta_json)?;
+            log_timing("write generated project", project_started);
             if let Some(writer) = sourcemap_writer {
+                let sourcemap_started = Instant::now();
                 if let Err(err) = writer.finish() {
                     println!("[roblox-sync-rs] warning: {err}");
                 }
-            } else if let Err(err) =
-                write_project_sourcemap_from_service_nodes(&project_root, &sourcemap_nodes)
-            {
+                log_timing("sourcemap finalize", sourcemap_started);
+            } else if let Err(err) = {
+                let sourcemap_started = Instant::now();
+                let result =
+                    write_project_sourcemap_from_service_nodes(&project_root, &sourcemap_nodes);
+                log_timing("sourcemap finalize", sourcemap_started);
+                result
+            } {
                 println!("[roblox-sync-rs] warning: {err}");
             }
         } else {
@@ -920,6 +1213,7 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
         }
     }
 
+    log_timing("full export-snapshots run", total_started);
     println!("[roblox-sync-rs] export done");
     Ok(())
 }
@@ -954,22 +1248,19 @@ fn parse_bridge_ports(raw: &str) -> Result<Vec<u16>> {
     Ok(out)
 }
 
-fn load_rbx_dom_property_candidates(project_root: &Path) -> Result<Option<Value>> {
+fn load_rbx_dom_property_candidates(project_root: &Path) -> Result<Option<PropertyCandidateMap>> {
     let database_path = project_root.join("_external/rbx-dom/rbx_dom_lua/src/database.json");
     if !database_path.exists() {
         return Ok(None);
     }
 
-    let database_text = fs::read_to_string(&database_path)
-        .with_context(|| format!("Failed to read {}", database_path.display()))?;
-    let database_value: Value = serde_json::from_str(&database_text)
-        .with_context(|| format!("Invalid JSON in {}", database_path.display()))?;
+    let database_value: Value = read_json_file(&database_path)?;
     let classes = database_value
         .get("Classes")
         .and_then(Value::as_object)
         .with_context(|| format!("Missing Classes object in {}", database_path.display()))?;
 
-    let mut by_class: Map<String, Value> = Map::new();
+    let mut by_class: PropertyCandidateMap = HashMap::new();
     let mut memo: HashMap<String, Vec<String>> = HashMap::new();
     let mut visiting: HashSet<String> = HashSet::new();
 
@@ -979,16 +1270,48 @@ fn load_rbx_dom_property_candidates(project_root: &Path) -> Result<Option<Value>
         if property_names.is_empty() {
             continue;
         }
-        by_class.insert(
-            class_name.clone(),
-            Value::Array(property_names.into_iter().map(Value::String).collect()),
-        );
+        by_class.insert(class_name.clone(), property_names);
     }
 
     if by_class.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Value::Object(by_class)))
+    Ok(Some(by_class))
+}
+
+fn property_candidate_map_to_value(by_class: &PropertyCandidateMap) -> Value {
+    let mut out = Map::new();
+    for (class_name, property_names) in by_class {
+        out.insert(
+            class_name.clone(),
+            Value::Array(property_names.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    Value::Object(out)
+}
+
+fn parse_property_candidate_map(value: Option<&Value>) -> Result<PropertyCandidateMap> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Some(classes) = value.as_object() else {
+        bail!("propertyCandidatesByClass must be an object");
+    };
+
+    let mut out = HashMap::with_capacity(classes.len());
+    for (class_name, property_names_value) in classes {
+        let property_names = property_names_value
+            .as_array()
+            .with_context(|| format!("propertyCandidatesByClass.{class_name} must be an array"))?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !property_names.is_empty() {
+            out.insert(class_name.clone(), property_names);
+        }
+    }
+    Ok(out)
 }
 
 fn collect_rbx_dom_properties_for_class(
@@ -1124,8 +1447,12 @@ fn export_single_service_parts(
     source_workers: usize,
     instance_workers: usize,
     cached_tune: Option<AdaptiveTuneEntry>,
+    default_property_candidates_by_class: &PropertyCandidateMap,
 ) -> Result<ExportedSnapshotParts> {
+    let service_started = Instant::now();
+    let prepare_started = Instant::now();
     let prepare = bridge.call("prepare", json!({ "service": service }))?;
+    log_timing(&format!("{service}: prepare"), prepare_started);
     let instance_count = prepare
         .get("instanceCount")
         .and_then(Value::as_u64)
@@ -1134,15 +1461,28 @@ fn export_single_service_parts(
         .get("scriptCount")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
+    let pre_serialized = prepare
+        .get("preSerialized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     println!(
-        "[roblox-sync-rs] {service}: prepared instances={}, scripts={}",
-        instance_count, script_count
+        "[roblox-sync-rs] {service}: prepared instances={}, scripts={}, pre_serialized={}",
+        instance_count, script_count, pre_serialized
     );
+    let service_property_candidates_by_class =
+        parse_property_candidate_map(prepare.get("propertyCandidatesByClass"))?;
+    let effective_property_candidates_by_class = if service_property_candidates_by_class.is_empty()
+    {
+        default_property_candidates_by_class.clone()
+    } else {
+        service_property_candidates_by_class
+    };
 
     let (class_defaults, mut instance_fetch, source_by_key) =
         thread::scope(|scope| -> Result<_> {
             let class_defaults_task = scope.spawn(|| {
+                let started = Instant::now();
                 fetch_json_payload(chunk_size, |chunk_start, max_len| {
                     bridge.call(
                         "getClassDefaultsChunk",
@@ -1153,8 +1493,13 @@ fn export_single_service_parts(
                         }),
                     )
                 })
+                .map(|value| {
+                    log_timing(&format!("{service}: class defaults fetch"), started);
+                    value
+                })
             });
 
+            let script_paths_started = Instant::now();
             let script_paths_value = fetch_json_payload(chunk_size, |chunk_start, max_len| {
                 bridge.call(
                     "getScriptPathsChunk",
@@ -1165,6 +1510,10 @@ fn export_single_service_parts(
                     }),
                 )
             })?;
+            log_timing(
+                &format!("{service}: script path fetch"),
+                script_paths_started,
+            );
             let script_paths = script_paths_value
                 .as_array()
                 .with_context(|| format!("Invalid script path list for {service}"))?;
@@ -1187,6 +1536,7 @@ fn export_single_service_parts(
 
             let script_keys_for_sources = script_keys.clone();
             let source_fetch_task = scope.spawn(move || {
+                let started = Instant::now();
                 fetch_script_sources(
                     bridge,
                     service,
@@ -1194,8 +1544,13 @@ fn export_single_service_parts(
                     &script_keys_for_sources,
                     source_worker_count,
                 )
+                .map(|value| {
+                    log_timing(&format!("{service}: script source fetch"), started);
+                    value
+                })
             });
 
+            let instance_fetch_started = Instant::now();
             let instance_fetch = if adaptive_instance_batches {
                 fetch_instances_adaptive(
                     bridge,
@@ -1204,6 +1559,7 @@ fn export_single_service_parts(
                     instance_count,
                     instance_workers,
                     cached_tune,
+                    &effective_property_candidates_by_class,
                 )?
             } else {
                 let instance_batch_size = initial_instance_batch_size(instance_count);
@@ -1225,10 +1581,15 @@ fn export_single_service_parts(
                         instance_count,
                         instance_batch_size,
                         instance_worker_count,
+                        &effective_property_candidates_by_class,
                     )?,
                     tune: None,
                 }
             };
+            log_timing(
+                &format!("{service}: instance fetch"),
+                instance_fetch_started,
+            );
 
             let class_defaults = match class_defaults_task.join() {
                 Ok(value) => value?,
@@ -1242,7 +1603,9 @@ fn export_single_service_parts(
             Ok((class_defaults, instance_fetch, source_by_key))
         })?;
 
+    let merge_started = Instant::now();
     merge_script_sources(&mut instance_fetch.instances, &source_by_key);
+    log_timing(&format!("{service}: merge script sources"), merge_started);
 
     let service_path = prepare
         .get("rootPath")
@@ -1267,7 +1630,13 @@ fn export_single_service_parts(
         .and_then(Value::as_i64)
         .unwrap_or(current_unix_ts());
 
+    let release_started = Instant::now();
     let _ = bridge.call("release", json!({ "service": service }));
+    log_timing(&format!("{service}: release"), release_started);
+    log_timing(
+        &format!("{service}: export assembly total"),
+        service_started,
+    );
     Ok(ExportedSnapshotParts {
         service_name,
         service_class,
@@ -1320,30 +1689,44 @@ fn parse_bridge_chunk(value: Value) -> Result<BridgeChunk> {
 
 fn initial_instance_batch_size(instance_count: usize) -> usize {
     if instance_count >= 150_000 {
-        2400
-    } else if instance_count >= 100_000 {
         1800
-    } else if instance_count >= 50_000 {
+    } else if instance_count >= 100_000 {
         1400
-    } else if instance_count >= 20_000 {
+    } else if instance_count >= 50_000 {
         1000
+    } else if instance_count >= 20_000 {
+        800
     } else {
-        700
+        500
     }
 }
 
 fn adaptive_instance_batch_size(instance_count: usize) -> usize {
     if instance_count >= 150_000 {
-        2400
+        1800
     } else if instance_count >= 100_000 {
-        2200
-    } else if instance_count >= 50_000 {
-        2000
-    } else if instance_count >= 20_000 {
         1600
+    } else if instance_count >= 50_000 {
+        1400
+    } else if instance_count >= 20_000 {
+        1100
     } else {
-        1200
+        800
     }
+}
+
+fn auto_instance_worker_target(instance_count: usize, concurrency_cap: usize) -> usize {
+    let concurrency_cap = concurrency_cap.max(1);
+    let desired = if instance_count >= 20_000 {
+        4
+    } else if instance_count >= 5_000 {
+        3
+    } else if instance_count >= 250 {
+        2
+    } else {
+        1
+    };
+    desired.clamp(1, concurrency_cap)
 }
 
 fn resolve_instance_worker_count(
@@ -1359,7 +1742,7 @@ fn resolve_instance_worker_count(
     }
 
     let channel_count = channel_count.max(1);
-    let soft_target = channel_count.max(1);
+    let soft_target = auto_instance_worker_target(instance_count, channel_count);
     let hard_cap = channel_count.saturating_mul(2).clamp(2, 64);
     let cpu_cap = std::thread::available_parallelism()
         .map(|v| v.get().saturating_mul(2))
@@ -1385,6 +1768,7 @@ fn fetch_instances_fixed(
     instance_count: usize,
     instance_batch_size: usize,
     instance_worker_count: usize,
+    property_candidates_by_class: &PropertyCandidateMap,
 ) -> Result<Vec<SnapshotInstance>> {
     let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
     if instance_count > 0 {
@@ -1404,13 +1788,14 @@ fn fetch_instances_fixed(
     } else if instance_worker_count <= 1 || ranges.len() <= 1 {
         let mut total_hint = instance_count;
         for (range_idx, start_index, take_count) in ranges {
-            let (hint, _, mut items) = fetch_instance_batch(
+            let (hint, _, _, mut items) = fetch_instance_batch(
                 bridge,
                 service,
                 chunk_size,
                 start_index,
                 take_count,
                 instance_count,
+                property_candidates_by_class,
             )?;
             instances.append(&mut items);
             total_hint = total_hint.max(hint);
@@ -1444,14 +1829,15 @@ fn fetch_instances_fixed(
             ranges
                 .par_iter()
                 .map(
-                    |(range_index, start_index, take_count)| -> Result<(usize, usize, Vec<SnapshotInstance>)> {
-                        let (total_hint, _, out) = fetch_instance_batch(
+                    |(range_index, start_index, take_count)| -> Result<(usize, usize, f64, Vec<SnapshotInstance>)> {
+                        let (total_hint, _, _, out) = fetch_instance_batch(
                             bridge,
                             service,
                             chunk_size,
                             *start_index,
                             *take_count,
                             instance_count,
+                            property_candidates_by_class,
                         )?;
 
                         let done_batches =
@@ -1469,15 +1855,15 @@ fn fetch_instances_fixed(
                             );
                         }
 
-                        Ok((*range_index, total_hint, out))
+                        Ok((*range_index, total_hint, 0.0, out))
                     },
                 )
                 .collect::<Result<Vec<_>>>()
         })?;
 
-        fetched.sort_by_key(|(range_index, _, _)| *range_index);
+        fetched.sort_by_key(|(range_index, _, _, _)| *range_index);
         let mut total_hint = instance_count;
-        for (_, hint, mut items) in fetched {
+        for (_, hint, _, mut items) in fetched {
             total_hint = total_hint.max(hint);
             instances.append(&mut items);
         }
@@ -1498,6 +1884,7 @@ fn fetch_instances_adaptive(
     instance_count: usize,
     requested_instance_workers: usize,
     cached_tune: Option<AdaptiveTuneEntry>,
+    property_candidates_by_class: &PropertyCandidateMap,
 ) -> Result<InstanceFetchResult> {
     if instance_count == 0 {
         println!("[roblox-sync-rs] {service}: instances 0/0");
@@ -1508,29 +1895,89 @@ fn fetch_instances_adaptive(
     }
 
     const LAG_FRAME_MS: f64 = 33.3;
+    const LARGE_SERVICE_SEED_CLAMP_MIN_INSTANCES: usize = 5000;
+    const INITIAL_SEED_CHUNKS_PER_BRIDGE_MIN: usize = 3;
+    const INITIAL_SEED_CHUNKS_PER_BRIDGE_MAX: usize = 4;
+    const BATCH_GROWTH_DIVISOR: usize = 8;
+    const WORKER_GROWTH_WAVE_INTERVAL: usize = 2;
     let default_batch_size = adaptive_instance_batch_size(instance_count).max(1);
-    let mut batch_size = cached_tune
+    let cached_batch_size = cached_tune
         .as_ref()
         .map(|tune| tune.batch_size)
-        .filter(|value| *value > 0)
-        .unwrap_or(default_batch_size)
-        .min(instance_count.max(1));
-    let mut worker_target = if requested_instance_workers > 0 {
-        requested_instance_workers
-    } else if let Some(workers) = cached_tune
+        .filter(|value| *value > 0);
+    let cached_or_default_batch_size = cached_batch_size.unwrap_or(default_batch_size);
+    let bridge_concurrency = bridge.channel_count().max(1);
+    let default_worker_target = auto_instance_worker_target(instance_count, bridge_concurrency);
+    let cached_worker_target = cached_tune
         .as_ref()
         .map(|tune| tune.workers)
-        .filter(|value| *value > 0)
-    {
-        workers
+        .filter(|value| *value > 0);
+    let seed_source = if requested_instance_workers > 0 {
+        "manual"
+    } else if cached_tune.is_some() {
+        "cached"
     } else {
-        bridge.channel_count().max(1)
+        "default"
     };
-    worker_target = worker_target.max(1);
+    let mut worker_target = if requested_instance_workers > 0 {
+        requested_instance_workers
+    } else if let Some(workers) = cached_worker_target {
+        workers.max(default_worker_target)
+    } else {
+        default_worker_target
+    };
+    worker_target = worker_target.clamp(1, bridge_concurrency);
+    let mut batch_size = cached_or_default_batch_size.min(instance_count.max(1));
+    let mut seed_reason = if requested_instance_workers > 0 {
+        "manual workers"
+    } else if cached_tune.is_some() {
+        "cached tune"
+    } else {
+        "default sizing"
+    };
+
+    if instance_count >= LARGE_SERVICE_SEED_CLAMP_MIN_INSTANCES {
+        let max_total_chunks = bridge_concurrency
+            .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MAX)
+            .clamp(1, 16);
+        let min_total_chunks = bridge_concurrency
+            .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MIN)
+            .clamp(1, 12);
+        let min_seed_batch = instance_count.div_ceil(max_total_chunks).max(1);
+        let max_seed_batch = instance_count.div_ceil(min_total_chunks).max(1);
+        batch_size = batch_size.clamp(min_seed_batch, max_seed_batch);
+        if batch_size != cached_or_default_batch_size {
+            seed_reason = "bridge seed window";
+        }
+    }
+
+    if batch_size < cached_or_default_batch_size {
+        println!(
+            "[roblox-sync-rs] {service}: clamped adaptive seed batch from {} to {} using {} bridge channels",
+            cached_or_default_batch_size, batch_size, bridge_concurrency
+        );
+    } else if batch_size > cached_or_default_batch_size {
+        println!(
+            "[roblox-sync-rs] {service}: raised adaptive seed batch from {} to {} using {} bridge channels",
+            cached_or_default_batch_size, batch_size, bridge_concurrency
+        );
+    }
 
     println!(
-        "[roblox-sync-rs] {service}: adaptive instance fetch start batch={}, workers={}, lag_frame_ms={:.1}",
-        batch_size, worker_target, LAG_FRAME_MS
+        "[roblox-sync-rs] {service}: adaptive seed source={} cached_batch={} cached_workers={} default_batch={} auto_workers={} final_batch={} final_workers={} reason={} lag_frame_ms={:.1}",
+        seed_source,
+        cached_batch_size
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        cached_worker_target
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        default_batch_size,
+        default_worker_target,
+        batch_size,
+        worker_target,
+        seed_reason,
+        LAG_FRAME_MS
     );
 
     let mut next_start = 1usize;
@@ -1560,15 +2007,16 @@ fn fetch_instances_adaptive(
         let mut fetched = if ranges.len() <= 1 {
             let mut out = Vec::with_capacity(ranges.len());
             for (range_index, start_index, take_count) in &ranges {
-                let (hint, bytes, items) = fetch_instance_batch(
+                let (hint, bytes, request_ms, items) = fetch_instance_batch(
                     bridge,
                     service,
                     chunk_size,
                     *start_index,
                     *take_count,
                     instance_count,
+                    property_candidates_by_class,
                 )?;
-                out.push((*range_index, hint, bytes, items));
+                out.push((*range_index, hint, bytes, request_ms, items));
             }
             out
         } else {
@@ -1580,25 +2028,50 @@ fn fetch_instances_adaptive(
                 ranges
                     .par_iter()
                     .map(
-                        |(range_index, start_index, take_count)| -> Result<(usize, usize, usize, Vec<SnapshotInstance>)> {
-                            let (hint, bytes, items) = fetch_instance_batch(
+                        |(range_index, start_index, take_count)| -> Result<(usize, usize, usize, f64, Vec<SnapshotInstance>)> {
+                            let (hint, bytes, request_ms, items) = fetch_instance_batch(
                                 bridge,
                                 service,
                                 chunk_size,
                                 *start_index,
                                 *take_count,
                                 instance_count,
+                                property_candidates_by_class,
                             )?;
-                            Ok((*range_index, hint, bytes, items))
+                            Ok((*range_index, hint, bytes, request_ms, items))
                         },
                     )
                     .collect::<Result<Vec<_>>>()
             })?
         };
 
-        fetched.sort_by_key(|(range_index, _, _, _)| *range_index);
-        let wave_bytes: usize = fetched.iter().map(|(_, _, bytes, _)| *bytes).sum();
-        for (_, hint, _, mut items) in fetched {
+        fetched.sort_by_key(|(range_index, _, _, _, _)| *range_index);
+        let wave_bytes: usize = fetched.iter().map(|(_, _, bytes, _, _)| *bytes).sum();
+        let wave_requests = fetched.len();
+        let total_request_ms: f64 = fetched
+            .iter()
+            .map(|(_, _, _, request_ms, _)| *request_ms)
+            .sum();
+        let max_request_ms = fetched
+            .iter()
+            .map(|(_, _, _, request_ms, _)| *request_ms)
+            .fold(0.0, f64::max);
+        let avg_request_ms = if wave_requests > 0 {
+            total_request_ms / wave_requests as f64
+        } else {
+            0.0
+        };
+        let max_request_bytes = fetched
+            .iter()
+            .map(|(_, _, bytes, _, _)| *bytes)
+            .max()
+            .unwrap_or(0);
+        let avg_request_bytes = if wave_requests > 0 {
+            wave_bytes as f64 / wave_requests as f64
+        } else {
+            0.0
+        };
+        for (_, hint, _, _, mut items) in fetched {
             total_hint = total_hint.max(hint);
             instances.append(&mut items);
         }
@@ -1619,14 +2092,25 @@ fn fetch_instances_adaptive(
             wave_bytes as f64 / (1024.0 * 1024.0),
             format_frame_ms(frame_ms)
         );
+        println!(
+            "[roblox-sync-rs] {service}: adaptive wave {} request stats -> requests={}, avg_req_ms={:.1}, max_req_ms={:.1}, avg_req_mb={:.1}, max_req_mb={:.1}",
+            wave_index,
+            wave_requests,
+            avg_request_ms,
+            max_request_ms,
+            avg_request_bytes / (1024.0 * 1024.0),
+            max_request_bytes as f64 / (1024.0 * 1024.0)
+        );
 
         if lagging {
             batch_size = batch_size.saturating_mul(3).div_ceil(4).max(1);
             worker_target = worker_target.saturating_mul(3).div_ceil(4).max(1);
         } else {
-            let batch_step = (batch_size / 4).max(1);
+            let batch_step = (batch_size / BATCH_GROWTH_DIVISOR).max(1);
             batch_size = batch_size.saturating_add(batch_step).min(total_hint.max(1));
-            worker_target = worker_target.saturating_add(1);
+            if wave_index % WORKER_GROWTH_WAVE_INTERVAL == 0 {
+                worker_target = worker_target.saturating_add(1);
+            }
         }
         suggested_batch_size = batch_size;
         suggested_workers = worker_target;
@@ -1656,11 +2140,13 @@ fn fetch_instance_batch(
     start_index: usize,
     take_count: usize,
     instance_count: usize,
-) -> Result<(usize, usize, Vec<SnapshotInstance>)> {
+    property_candidates_by_class: &PropertyCandidateMap,
+) -> Result<(usize, usize, f64, Vec<SnapshotInstance>)> {
+    let started = Instant::now();
     let (mut batch_value, bytes) =
         fetch_json_payload_with_size(chunk_size, |chunk_start, max_len| {
             bridge.call(
-                "getInstanceBatchChunk",
+                "getInstanceBatchCompactChunk",
                 json!({
                     "service": service,
                     "startIndex": start_index,
@@ -1676,15 +2162,216 @@ fn fetch_instance_batch(
         .and_then(Value::as_array_mut)
         .with_context(|| format!("Invalid instance batch payload for {service}"))?;
     let raw_items = Value::Array(items.drain(..).collect());
-    let out: Vec<SnapshotInstance> = serde_json::from_value(raw_items)
-        .with_context(|| format!("Invalid instance batch item schema for {service}"))?;
+    let out = match batch_value.get("format").and_then(Value::as_str) {
+        Some("compact") | Some("compact-v2") => {
+            parse_compact_instance_items(raw_items, property_candidates_by_class).with_context(
+                || format!("Invalid compact instance batch item schema for {service}"),
+            )?
+        }
+        Some("compact-v1") => {
+            parse_legacy_compact_instance_items(raw_items).with_context(|| {
+                format!("Invalid legacy compact instance batch item schema for {service}")
+            })?
+        }
+        _ => serde_json::from_value(raw_items)
+            .with_context(|| format!("Invalid instance batch item schema for {service}"))?,
+    };
 
     let total_hint = batch_value
         .get("total")
         .and_then(Value::as_u64)
         .unwrap_or(instance_count as u64) as usize;
 
-    Ok((total_hint, bytes, out))
+    Ok((total_hint, bytes, elapsed_ms(started), out))
+}
+
+fn compact_string(items: &[Value], index: usize) -> String {
+    items
+        .get(index)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn compact_optional_string(items: &[Value], index: usize) -> Option<String> {
+    items
+        .get(index)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn compact_string_vec(items: &[Value], index: usize) -> Vec<String> {
+    items
+        .get(index)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_map(items: &[Value], index: usize) -> Map<String, Value> {
+    items
+        .get(index)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn compact_property_name_for_id(
+    class_name: &str,
+    property_id: usize,
+    property_candidates_by_class: &PropertyCandidateMap,
+) -> Option<String> {
+    if let Some(property_names) = property_candidates_by_class.get(class_name) {
+        return property_names.get(property_id).cloned();
+    }
+    DEFAULT_PROPERTY_CANDIDATES
+        .get(property_id)
+        .map(|name| (*name).to_string())
+}
+
+fn compact_properties(
+    items: &[Value],
+    index: usize,
+    class_name: &str,
+    property_candidates_by_class: &PropertyCandidateMap,
+) -> Result<Map<String, Value>> {
+    let Some(value) = items.get(index) else {
+        return Ok(Map::new());
+    };
+
+    if let Some(map) = value.as_object() {
+        return Ok(map.clone());
+    }
+
+    let Some(pairs) = value.as_array() else {
+        return Ok(Map::new());
+    };
+
+    if pairs.len() % 2 != 0 {
+        bail!("Compact property pairs must have even length");
+    }
+
+    let mut out = Map::new();
+    for pair in pairs.chunks_exact(2) {
+        let property_name = match &pair[0] {
+            Value::Number(number) => {
+                let property_id = number
+                    .as_u64()
+                    .with_context(|| "Compact property id must be a non-negative integer")?
+                    as usize;
+                compact_property_name_for_id(class_name, property_id, property_candidates_by_class)
+                    .with_context(|| {
+                        format!("Unknown compact property id {property_id} for class {class_name}")
+                    })?
+            }
+            Value::String(name) => name.clone(),
+            _ => bail!("Compact property key must be a number or string"),
+        };
+        out.insert(property_name, pair[1].clone());
+    }
+
+    Ok(out)
+}
+
+fn parse_legacy_compact_instance_items(raw_items: Value) -> Result<Vec<SnapshotInstance>> {
+    let values = raw_items
+        .as_array()
+        .with_context(|| "Legacy compact instance items must be an array")?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let items = value
+            .as_array()
+            .with_context(|| "Legacy compact instance item must be an array")?;
+        out.push(SnapshotInstance {
+            path: compact_string(items, 0),
+            path_segments: compact_string_vec(items, 1),
+            name: compact_string(items, 2),
+            class_name: compact_string(items, 3),
+            properties: compact_map(items, 4),
+            source_key: compact_optional_string(items, 5),
+            parent_path: compact_optional_string(items, 6),
+            attributes: compact_map(items, 7),
+            debug_id: compact_optional_string(items, 8),
+            parent_debug_id: compact_optional_string(items, 9),
+            instance_id: compact_optional_string(items, 10),
+            parent_instance_id: compact_optional_string(items, 11),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_compact_instance_items(
+    raw_items: Value,
+    property_candidates_by_class: &PropertyCandidateMap,
+) -> Result<Vec<SnapshotInstance>> {
+    let values = raw_items
+        .as_array()
+        .with_context(|| "Compact instance items must be an array")?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let items = value
+            .as_array()
+            .with_context(|| "Compact instance item must be an array")?;
+        if items.first().is_some_and(Value::is_array) {
+            let path_segments = compact_string_vec(items, 0);
+            let name = path_segments.last().cloned().unwrap_or_default();
+            let path = path_segments.join(".");
+            let parent_path = if path_segments.len() > 1 {
+                Some(path_segments[..path_segments.len() - 1].join("."))
+            } else {
+                None
+            };
+            let class_name = compact_string(items, 1);
+            out.push(SnapshotInstance {
+                path,
+                path_segments,
+                name,
+                class_name: class_name.clone(),
+                properties: compact_properties(
+                    items,
+                    2,
+                    class_name.as_str(),
+                    property_candidates_by_class,
+                )?,
+                source_key: compact_optional_string(items, 3),
+                parent_path,
+                attributes: compact_map(items, 4),
+                debug_id: None,
+                parent_debug_id: None,
+                instance_id: compact_optional_string(items, 5),
+                parent_instance_id: compact_optional_string(items, 6),
+            });
+        } else {
+            let class_name = compact_string(items, 1);
+            out.push(SnapshotInstance {
+                path: String::new(),
+                path_segments: Vec::new(),
+                name: compact_string(items, 0),
+                class_name: class_name.clone(),
+                properties: compact_properties(
+                    items,
+                    2,
+                    class_name.as_str(),
+                    property_candidates_by_class,
+                )?,
+                source_key: compact_optional_string(items, 3),
+                parent_path: None,
+                attributes: compact_map(items, 4),
+                debug_id: None,
+                parent_debug_id: None,
+                instance_id: compact_optional_string(items, 5),
+                parent_instance_id: compact_optional_string(items, 6),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn read_bridge_frame_ms(bridge: &BridgeServer) -> Option<f64> {
@@ -1794,18 +2481,12 @@ fn import_service_state_with_sourcemap(
     service: &str,
     compact_meta_json: bool,
 ) -> Result<SourcemapNode> {
-    thread::scope(|scope| {
-        let sourcemap_task = scope.spawn(|| {
-            build_service_sourcemap_node_from_state(state, service, src_root, project_root)
-        });
-        let import_result = import_service_state(state, src_root, service, compact_meta_json);
-        let sourcemap_result = match sourcemap_task.join() {
-            Ok(value) => value,
-            Err(_) => bail!("Sourcemap worker panicked for {service}"),
-        };
-        import_result?;
-        sourcemap_result
-    })
+    let import_started = Instant::now();
+    let node = import_service_state(state, project_root, src_root, service, compact_meta_json)?;
+    log_timing(&format!("{service}: write src tree"), import_started);
+    log_timing(&format!("{service}: build sourcemap node"), import_started);
+    log_timing(&format!("{service}: import service total"), import_started);
+    Ok(node)
 }
 
 #[allow(dead_code)]
@@ -2027,6 +2708,22 @@ fn parse_services(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn direct_import_export_order(services: &[String]) -> Vec<String> {
+    const PRIORITY: [&str; 3] = ["ServerStorage", "Workspace", "ReplicatedStorage"];
+    let mut out = Vec::with_capacity(services.len());
+    for service in PRIORITY {
+        if services.iter().any(|candidate| candidate == service) {
+            out.push(service.to_string());
+        }
+    }
+    for service in services {
+        if !out.iter().any(|candidate| candidate == service) {
+            out.push(service.clone());
+        }
+    }
+    out
+}
+
 fn parse_single_service(raw: &str) -> Result<String> {
     let parsed = parse_services(raw)?;
     if parsed.len() != 1 {
@@ -2080,27 +2777,36 @@ fn fetch_script_sources(
     script_keys: &[String],
     source_worker_count: usize,
 ) -> Result<HashMap<String, String>> {
+    const SOURCE_BATCH_SIZE: usize = 16;
     let mut source_by_key: HashMap<String, String> = HashMap::new();
+    let source_batches: Vec<Vec<String>> = script_keys
+        .chunks(SOURCE_BATCH_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
     if script_keys.len() <= 1 || source_worker_count <= 1 {
-        for (index, source_key) in script_keys.iter().enumerate() {
+        let mut loaded_scripts = 0usize;
+        for batch in &source_batches {
             println!(
                 "[roblox-sync-rs] {service}: script {}/{}",
-                index + 1,
+                loaded_scripts + 1,
                 script_keys.len()
             );
-            let source = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
+            let encoded = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
                 let value = bridge.call(
-                    "getSourceChunk",
+                    "getSourceBatchChunk",
                     json!({
                         "service": service,
-                        "instancePath": source_key,
+                        "instancePaths": batch,
                         "startIndex": chunk_start,
                         "maxLen": max_len,
                     }),
                 )?;
                 parse_bridge_chunk(value)
             })?;
-            source_by_key.insert(source_key.clone(), source);
+            let fetched: HashMap<String, String> =
+                serde_json::from_str(&encoded).context("Invalid batched source payload")?;
+            loaded_scripts += batch.len();
+            source_by_key.extend(fetched);
         }
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2108,36 +2814,37 @@ fn fetch_script_sources(
             .build()
             .context("Failed to create script source worker pool")?;
         let fetched = pool.install(|| {
-            script_keys
+            source_batches
                 .par_iter()
                 .enumerate()
-                .map(|(index, source_key)| -> Result<(String, String)> {
-                    if index % 16 == 0 || index + 1 == script_keys.len() {
+                .map(|(index, batch)| -> Result<HashMap<String, String>> {
+                    let progress_scripts = ((index + 1) * SOURCE_BATCH_SIZE).min(script_keys.len());
+                    if index == 0 || progress_scripts == script_keys.len() || (index + 1) % 2 == 0 {
                         println!(
                             "[roblox-sync-rs] {service}: script {}/{}",
-                            index + 1,
+                            progress_scripts,
                             script_keys.len()
                         );
                     }
-                    let source = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
+                    let encoded = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
                         let value = bridge.call(
-                            "getSourceChunk",
+                            "getSourceBatchChunk",
                             json!({
                                 "service": service,
-                                "instancePath": source_key,
+                                "instancePaths": batch,
                                 "startIndex": chunk_start,
                                 "maxLen": max_len,
                             }),
                         )?;
                         parse_bridge_chunk(value)
                     })?;
-                    Ok((source_key.clone(), source))
+                    serde_json::from_str(&encoded).context("Invalid batched source payload")
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
 
-        for (key, source) in fetched {
-            source_by_key.insert(key, source);
+        for batch_sources in fetched {
+            source_by_key.extend(batch_sources);
         }
     }
 
@@ -2153,16 +2860,14 @@ fn resolve_direct_import_workers(requested: usize) -> usize {
         return requested.clamp(1, cpu_cap.clamp(2, 16));
     }
     std::thread::available_parallelism()
-        .map(|v| v.get().clamp(2, 8))
+        .map(|v| v.get().clamp(2, 16))
         .unwrap_or(4)
 }
 
 fn load_service_state(snapshot_dir: &Path, service: &str) -> Result<ServiceState> {
     let snapshot_path = snapshot_dir.join(format!("{service}.json"));
-    let manifest_text = fs::read_to_string(&snapshot_path)
+    let manifest: SnapshotManifest = read_json_file(&snapshot_path)
         .with_context(|| format!("Failed to read snapshot: {}", snapshot_path.display()))?;
-    let manifest: SnapshotManifest = serde_json::from_str(&manifest_text)
-        .with_context(|| format!("Invalid JSON in {}", snapshot_path.display()))?;
 
     let (instances, root_path_from_manifest, class_defaults_by_class) =
         collect_manifest_instances(manifest, Some(snapshot_dir), service)?;
@@ -2235,16 +2940,13 @@ fn collect_manifest_instances(
 fn build_service_state_from_instances(
     service: &str,
     root_path_from_manifest: Option<String>,
-    instances: Vec<SnapshotInstance>,
+    mut instances: Vec<SnapshotInstance>,
     class_defaults_by_class: HashMap<String, Map<String, Value>>,
 ) -> Result<ServiceState> {
     let mut children_by_parent_instance_id: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut children_by_parent_path: HashMap<String, Vec<usize>> = HashMap::new();
     let mut children_by_parent_debug: HashMap<String, Vec<usize>> = HashMap::new();
     let mut index_by_instance_id: HashMap<String, usize> = HashMap::new();
     let mut index_by_debug_id: HashMap<String, usize> = HashMap::new();
-    let mut index_by_path: HashMap<String, usize> = HashMap::new();
-    let mut index_by_path_segments: HashMap<String, usize> = HashMap::new();
 
     for (index, instance) in instances.iter().enumerate() {
         if let Some(instance_id) = instance.instance_id.as_deref().filter(|s| !s.is_empty()) {
@@ -2255,14 +2957,6 @@ fn build_service_state_from_instances(
         if let Some(debug_id) = instance.debug_id.as_deref().filter(|s| !s.is_empty()) {
             index_by_debug_id
                 .entry(debug_id.to_string())
-                .or_insert(index);
-        }
-        if !instance.path.is_empty() {
-            index_by_path.entry(instance.path.clone()).or_insert(index);
-        }
-        if !instance.path_segments.is_empty() {
-            index_by_path_segments
-                .entry(path_segments_key(&instance.path_segments))
                 .or_insert(index);
         }
 
@@ -2287,6 +2981,46 @@ fn build_service_state_from_instances(
                 .or_default()
                 .push(index);
         }
+    }
+
+    let service_root_index = find_service_root_index(
+        service,
+        root_path_from_manifest.as_deref(),
+        &instances,
+        &index_by_instance_id,
+    )
+    .with_context(|| {
+        format!(
+            "Snapshot missing root service instance: {service} (manifest root: {})",
+            root_path_from_manifest.as_deref().unwrap_or("n/a")
+        )
+    })?;
+
+    let needs_path_rebuild = instances
+        .iter()
+        .any(|instance| instance.path.is_empty() || instance.path_segments.is_empty());
+    if needs_path_rebuild && !children_by_parent_instance_id.is_empty() {
+        rebuild_instance_paths_from_ids(
+            service,
+            service_root_index,
+            &children_by_parent_instance_id,
+            &mut instances,
+        );
+    }
+
+    let mut children_by_parent_path: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut index_by_path: HashMap<String, usize> = HashMap::new();
+    let mut index_by_path_segments: HashMap<String, usize> = HashMap::new();
+
+    for (index, instance) in instances.iter().enumerate() {
+        if !instance.path.is_empty() {
+            index_by_path.entry(instance.path.clone()).or_insert(index);
+        }
+        if !instance.path_segments.is_empty() {
+            index_by_path_segments
+                .entry(path_segments_key(&instance.path_segments))
+                .or_insert(index);
+        }
 
         let parent_path = instance
             .parent_path
@@ -2302,33 +3036,6 @@ fn build_service_state_from_instances(
                 .push(index);
         }
     }
-
-    let mut root_candidates: Vec<String> = Vec::new();
-    if let Some(root_path) = root_path_from_manifest {
-        root_candidates.push(root_path);
-    }
-
-    let game_candidate = format!("game.{service}");
-    if !root_candidates.iter().any(|x| x == &game_candidate) {
-        root_candidates.push(game_candidate);
-    }
-    if !root_candidates.iter().any(|x| x == service) {
-        root_candidates.push(service.to_string());
-    }
-
-    let service_root_index = root_candidates
-        .iter()
-        .find_map(|candidate| {
-            instances
-                .iter()
-                .position(|instance| instance.path == *candidate)
-        })
-        .with_context(|| {
-            format!(
-                "Snapshot missing root service instance: {service} (candidates: {})",
-                root_candidates.join(", ")
-            )
-        })?;
 
     let rojo_ref_ids_by_index = collect_rojo_ref_ids(
         &instances,
@@ -2351,6 +3058,135 @@ fn build_service_state_from_instances(
         service_root_index,
         class_defaults_by_class,
     })
+}
+
+fn find_service_root_index(
+    service: &str,
+    root_path_from_manifest: Option<&str>,
+    instances: &[SnapshotInstance],
+    index_by_instance_id: &HashMap<String, usize>,
+) -> Option<usize> {
+    if let Some(index) = index_by_instance_id.get("1") {
+        return Some(*index);
+    }
+
+    let mut root_candidates: Vec<String> = Vec::new();
+    if let Some(root_path) = root_path_from_manifest {
+        root_candidates.push(root_path.to_string());
+    }
+
+    let game_candidate = format!("game.{service}");
+    if !root_candidates.iter().any(|x| x == &game_candidate) {
+        root_candidates.push(game_candidate);
+    }
+    if !root_candidates.iter().any(|x| x == service) {
+        root_candidates.push(service.to_string());
+    }
+
+    if let Some(index) = root_candidates.iter().find_map(|candidate| {
+        instances
+            .iter()
+            .position(|instance| instance.path == *candidate)
+    }) {
+        return Some(index);
+    }
+
+    instances
+        .iter()
+        .position(|instance| {
+            instance
+                .parent_instance_id
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+                && (instance.name == service || instance.path == service)
+        })
+        .or_else(|| {
+            instances.iter().position(|instance| {
+                instance
+                    .parent_instance_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+            })
+        })
+}
+
+fn rebuild_instance_paths_from_ids(
+    service: &str,
+    root_index: usize,
+    children_by_parent_instance_id: &HashMap<String, Vec<usize>>,
+    instances: &mut [SnapshotInstance],
+) {
+    if root_index >= instances.len() {
+        return;
+    }
+
+    let root_name = if instances[root_index].name.is_empty() {
+        service.to_string()
+    } else {
+        instances[root_index].name.clone()
+    };
+    let mut stack: Vec<(usize, Vec<String>)> = vec![(root_index, vec![root_name])];
+
+    while let Some((index, proposed_segments)) = stack.pop() {
+        if index >= instances.len() {
+            continue;
+        }
+
+        let effective_segments = if instances[index].path_segments.is_empty() {
+            proposed_segments
+        } else {
+            instances[index].path_segments.clone()
+        };
+        let path = effective_segments.join(".");
+
+        if instances[index].path_segments.is_empty() {
+            instances[index].path_segments = effective_segments.clone();
+        }
+        if instances[index].path.is_empty() {
+            instances[index].path = path.clone();
+        }
+        if index != root_index
+            && instances[index]
+                .parent_path
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            instances[index].parent_path = if effective_segments.len() > 1 {
+                Some(effective_segments[..effective_segments.len() - 1].join("."))
+            } else {
+                None
+            };
+        }
+
+        let Some(instance_id) = instances[index]
+            .instance_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let Some(child_indices) = children_by_parent_instance_id.get(instance_id) else {
+            continue;
+        };
+
+        for child_index in child_indices.iter().rev() {
+            if *child_index >= instances.len() {
+                continue;
+            }
+            let child_name = if instances[*child_index].name.is_empty() {
+                instances[*child_index].class_name.clone()
+            } else {
+                instances[*child_index].name.clone()
+            };
+            let mut child_segments = effective_segments.clone();
+            child_segments.push(child_name);
+            stack.push((*child_index, child_segments));
+        }
+    }
 }
 
 fn path_segments_key(segments: &[String]) -> String {
@@ -2570,12 +3406,89 @@ fn derive_parent_path(path: &str) -> Option<String> {
     Some(path[..last_dot].to_string())
 }
 
-fn import_service_state(
-    state: &ServiceState,
+const DIRECT_IMPORT_SUBTREE_SPLIT_MIN_INSTANCES: usize = 5_000;
+const DIRECT_IMPORT_SUBTREE_SPLIT_MIN_CHILDREN: usize = 2;
+const DIRECT_IMPORT_RECURSIVE_SPLIT_TARGET: usize = 4_000;
+const DIRECT_IMPORT_SUBTREE_GROUP_TARGET_INSTANCES: usize = 4_000;
+const DIRECT_IMPORT_SUBTREE_GROUP_MAX_ITEMS: usize = 8;
+
+fn direct_import_split_min_instances(service_instance_count: usize) -> usize {
+    if service_instance_count >= 60_000 {
+        2_000
+    } else {
+        DIRECT_IMPORT_SUBTREE_SPLIT_MIN_INSTANCES
+    }
+}
+
+fn direct_import_recursive_split_target(service_instance_count: usize) -> usize {
+    if service_instance_count >= 60_000 {
+        2_000
+    } else if service_instance_count >= 25_000 {
+        4_000
+    } else {
+        DIRECT_IMPORT_RECURSIVE_SPLIT_TARGET
+    }
+}
+
+fn direct_import_group_target_instances(service_instance_count: usize) -> usize {
+    if service_instance_count >= 60_000 {
+        1_200
+    } else if service_instance_count >= 25_000 {
+        2_000
+    } else {
+        DIRECT_IMPORT_SUBTREE_GROUP_TARGET_INSTANCES
+    }
+}
+
+fn direct_import_group_max_items(service_instance_count: usize) -> usize {
+    if service_instance_count >= 60_000 {
+        4
+    } else {
+        DIRECT_IMPORT_SUBTREE_GROUP_MAX_ITEMS
+    }
+}
+
+fn name_child_indices(state: &ServiceState, child_indices: &[usize]) -> Vec<(usize, String)> {
+    let mut counters: HashMap<String, usize> = HashMap::new();
+    let mut named_children: Vec<(usize, String)> = Vec::with_capacity(child_indices.len());
+    for child_index in child_indices {
+        let child = &state.instances[*child_index];
+        let base = sanitize_name(&child.name);
+        let count = counters.entry(base.clone()).or_insert(0);
+        *count += 1;
+        let child_stem = if *count == 1 {
+            base
+        } else {
+            format!("{base}_{}", count)
+        };
+        named_children.push((*child_index, child_stem));
+    }
+    named_children
+}
+
+fn maybe_enqueue_split_import_tasks(
+    sender: &mpsc::SyncSender<DirectImportTask>,
+    pending_tasks: &Arc<AtomicUsize>,
+    project_root: &Path,
     src_root: &Path,
     service: &str,
     compact_meta_json: bool,
-) -> Result<()> {
+    state: &ServiceState,
+) -> Result<Option<Arc<SplitDirectImportState>>> {
+    let service_instance_count = state.instances.len();
+    let root_children = child_indices_for_instance(state, state.service_root_index);
+    if service_instance_count < direct_import_split_min_instances(service_instance_count)
+        || root_children.len() < DIRECT_IMPORT_SUBTREE_SPLIT_MIN_CHILDREN
+    {
+        return Ok(None);
+    }
+
+    let named_children = name_child_indices(state, &root_children);
+    if named_children.len() < DIRECT_IMPORT_SUBTREE_SPLIT_MIN_CHILDREN {
+        return Ok(None);
+    }
+    let subtree_sizes = compute_subtree_sizes(state);
+
     let service_dir = src_root.join(sanitize_name(service));
     fs::create_dir_all(&service_dir)
         .with_context(|| format!("Failed to create {}", service_dir.display()))?;
@@ -2585,7 +3498,534 @@ fn import_service_state(
     let root = &state.instances[state.service_root_index];
     let root_meta = build_meta(state, state.service_root_index, root, false, true);
     let root_meta_path = service_dir.join("init.meta.json");
-    write_json_file_if_changed(&root_meta_path, &root_meta, compact_meta_json)?;
+    write_json_file(&root_meta_path, &root_meta, compact_meta_json)?;
+    track_expected_file(&expected_paths, &root_meta_path);
+
+    let visited = Arc::new(
+        (0..state.instances.len())
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>(),
+    );
+    let _ = mark_visited(&visited, state.service_root_index);
+
+    let shared = Arc::new(SplitDirectImportState {
+        service: service.to_string(),
+        service_dir: service_dir.clone(),
+        project_root: project_root.to_path_buf(),
+        compact_meta_json,
+        state: Arc::new(state.clone()),
+        expected_paths,
+        visited,
+        slots: Mutex::new(Vec::new()),
+        queued_tasks: AtomicUsize::new(0),
+        completed_tasks: AtomicUsize::new(0),
+        total_task_tenths_ms: AtomicU64::new(0),
+        max_task_tenths_ms: AtomicU64::new(0),
+        failed: AtomicBool::new(false),
+        started: Instant::now(),
+    });
+
+    let root_child_slots = allocate_split_slots(&shared, named_children.len());
+    let root_assembly = Arc::new(SplitNodeAssembly {
+        name: service.to_string(),
+        class_name: service.to_string(),
+        file_paths: Vec::new(),
+        child_slots: root_child_slots.clone(),
+        remaining_children: AtomicUsize::new(root_child_slots.len()),
+        output_slot: None,
+        parent: None,
+    });
+
+    plan_split_import_children(
+        &shared,
+        sender,
+        pending_tasks,
+        project_root,
+        &service_dir,
+        named_children,
+        root_child_slots,
+        Arc::clone(&root_assembly),
+        &subtree_sizes,
+    )?;
+
+    Ok(Some(shared))
+}
+
+fn compute_subtree_sizes(state: &ServiceState) -> Vec<usize> {
+    fn visit(
+        state: &ServiceState,
+        index: usize,
+        sizes: &mut [usize],
+        visiting: &mut HashSet<usize>,
+    ) -> usize {
+        if index >= sizes.len() {
+            return 0;
+        }
+        if sizes[index] > 0 {
+            return sizes[index];
+        }
+        if !visiting.insert(index) {
+            return 0;
+        }
+        let mut size = 1usize;
+        for child_index in child_indices_for_instance(state, index) {
+            size = size.saturating_add(visit(state, child_index, sizes, visiting));
+        }
+        visiting.remove(&index);
+        sizes[index] = size;
+        size
+    }
+
+    let mut sizes = vec![0usize; state.instances.len()];
+    let mut visiting = HashSet::new();
+    let _ = visit(state, state.service_root_index, &mut sizes, &mut visiting);
+    sizes
+}
+
+fn allocate_split_slots(shared: &Arc<SplitDirectImportState>, count: usize) -> Vec<usize> {
+    let mut slots = match shared.slots.lock() {
+        Ok(lock) => lock,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let start = slots.len();
+    slots.resize(start + count, None);
+    (start..start + count).collect()
+}
+
+fn child_indices_for_split(state: &ServiceState, index: usize) -> Vec<usize> {
+    child_indices_for_instance(state, index)
+}
+
+fn queue_split_subtree_task(
+    shared: &Arc<SplitDirectImportState>,
+    sender: &mpsc::SyncSender<DirectImportTask>,
+    pending_tasks: &Arc<AtomicUsize>,
+    items: Vec<DirectImportSubtreeItem>,
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    shared.queued_tasks.fetch_add(1, Ordering::AcqRel);
+    pending_tasks.fetch_add(1, Ordering::AcqRel);
+    sender
+        .send(DirectImportTask::Subtree(DirectImportSubtreeTask {
+            shared: Arc::clone(shared),
+            items,
+        }))
+        .map_err(|err| {
+            shared.queued_tasks.fetch_sub(1, Ordering::AcqRel);
+            pending_tasks.fetch_sub(1, Ordering::AcqRel);
+            anyhow::anyhow!("Failed to queue subtree import task: {err}")
+        })
+}
+
+fn plan_split_import_children(
+    shared: &Arc<SplitDirectImportState>,
+    sender: &mpsc::SyncSender<DirectImportTask>,
+    pending_tasks: &Arc<AtomicUsize>,
+    project_root: &Path,
+    parent_dir: &Path,
+    named_children: Vec<(usize, String)>,
+    child_slots: Vec<usize>,
+    parent_assembly: Arc<SplitNodeAssembly>,
+    subtree_sizes: &[usize],
+) -> Result<()> {
+    let service_instance_count = shared.state.instances.len();
+    let recursive_split_target = direct_import_recursive_split_target(service_instance_count);
+    let group_target_instances = direct_import_group_target_instances(service_instance_count);
+    let group_max_items = direct_import_group_max_items(service_instance_count);
+    let mut group_items = Vec::<DirectImportSubtreeItem>::new();
+    let mut group_instances = 0usize;
+
+    let flush_group =
+        |items: &mut Vec<DirectImportSubtreeItem>, instances: &mut usize| -> Result<()> {
+            if items.is_empty() {
+                return Ok(());
+            }
+            queue_split_subtree_task(shared, sender, pending_tasks, std::mem::take(items))?;
+            *instances = 0;
+            Ok(())
+        };
+
+    for ((child_index, child_stem), child_slot) in
+        named_children.into_iter().zip(child_slots.into_iter())
+    {
+        let child_indices = child_indices_for_split(&shared.state, child_index);
+        let subtree_size = subtree_sizes.get(child_index).copied().unwrap_or(1);
+        let should_recurse = subtree_size > recursive_split_target
+            && child_indices.len() >= DIRECT_IMPORT_SUBTREE_SPLIT_MIN_CHILDREN;
+
+        if should_recurse {
+            flush_group(&mut group_items, &mut group_instances)?;
+            plan_split_import_node(
+                shared,
+                sender,
+                pending_tasks,
+                project_root,
+                parent_dir,
+                child_index,
+                child_stem,
+                child_slot,
+                Arc::clone(&parent_assembly),
+                subtree_sizes,
+            )?;
+            continue;
+        }
+
+        if !group_items.is_empty()
+            && (group_items.len() >= group_max_items
+                || group_instances.saturating_add(subtree_size) > group_target_instances)
+        {
+            flush_group(&mut group_items, &mut group_instances)?;
+        }
+
+        group_instances = group_instances.saturating_add(subtree_size);
+        group_items.push(DirectImportSubtreeItem {
+            index: child_index,
+            parent_dir: parent_dir.to_path_buf(),
+            fs_stem: child_stem,
+            output_slot: child_slot,
+            parent_assembly: Arc::clone(&parent_assembly),
+        });
+    }
+
+    flush_group(&mut group_items, &mut group_instances)
+}
+
+fn plan_split_import_node(
+    shared: &Arc<SplitDirectImportState>,
+    sender: &mpsc::SyncSender<DirectImportTask>,
+    pending_tasks: &Arc<AtomicUsize>,
+    project_root: &Path,
+    parent_dir: &Path,
+    index: usize,
+    fs_stem: String,
+    output_slot: usize,
+    parent_assembly: Arc<SplitNodeAssembly>,
+    subtree_sizes: &[usize],
+) -> Result<()> {
+    let service_instance_count = shared.state.instances.len();
+    let recursive_split_target = direct_import_recursive_split_target(service_instance_count);
+    let child_indices = child_indices_for_split(&shared.state, index);
+    let subtree_size = subtree_sizes.get(index).copied().unwrap_or(1);
+    if subtree_size <= recursive_split_target
+        || child_indices.len() < DIRECT_IMPORT_SUBTREE_SPLIT_MIN_CHILDREN
+    {
+        queue_split_subtree_task(
+            shared,
+            sender,
+            pending_tasks,
+            vec![DirectImportSubtreeItem {
+                index,
+                parent_dir: parent_dir.to_path_buf(),
+                fs_stem,
+                output_slot,
+                parent_assembly,
+            }],
+        )?;
+        return Ok(());
+    }
+
+    let Some(shell) = emit_split_node_shell(
+        &shared.state,
+        index,
+        project_root,
+        parent_dir,
+        &fs_stem,
+        shared.compact_meta_json,
+        &shared.visited,
+        &shared.expected_paths,
+    )?
+    else {
+        bail!("Failed to create split shell for {}", shared.service);
+    };
+
+    let named_children = name_child_indices(&shared.state, &child_indices);
+    let child_slots = allocate_split_slots(shared, named_children.len());
+    let assembly = Arc::new(SplitNodeAssembly {
+        name: shell.name,
+        class_name: shell.class_name,
+        file_paths: shell.file_paths,
+        child_slots: child_slots.clone(),
+        remaining_children: AtomicUsize::new(child_slots.len()),
+        output_slot: Some(output_slot),
+        parent: Some(parent_assembly),
+    });
+
+    plan_split_import_children(
+        shared,
+        sender,
+        pending_tasks,
+        project_root,
+        &shell.dir_path,
+        named_children,
+        child_slots,
+        Arc::clone(&assembly),
+        subtree_sizes,
+    )
+}
+
+fn record_split_task_timing(shared: &Arc<SplitDirectImportState>, started: Instant) {
+    let tenths_ms = (elapsed_ms(started) * 10.0).round().max(0.0) as u64;
+    shared.completed_tasks.fetch_add(1, Ordering::AcqRel);
+    shared
+        .total_task_tenths_ms
+        .fetch_add(tenths_ms, Ordering::AcqRel);
+
+    let mut current = shared.max_task_tenths_ms.load(Ordering::Acquire);
+    while tenths_ms > current {
+        match shared.max_task_tenths_ms.compare_exchange_weak(
+            current,
+            tenths_ms,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn emit_split_node_shell(
+    state: &ServiceState,
+    index: usize,
+    project_root: &Path,
+    parent_dir: &Path,
+    fs_stem: &str,
+    compact_meta_json: bool,
+    visited: &Arc<Vec<AtomicBool>>,
+    expected_paths: &Arc<ImportPathSets>,
+) -> Result<Option<SplitNodeShell>> {
+    if !mark_visited(visited, index) {
+        return Ok(None);
+    }
+
+    let instance = &state.instances[index];
+    let class_name = instance.class_name.as_str();
+
+    if let Some((source_file_name, _leaf_suffix)) = script_file_names(class_name) {
+        let dir_path = parent_dir.join(fs_stem);
+        fs::create_dir_all(&dir_path)
+            .with_context(|| format!("Failed to create {}", dir_path.display()))?;
+        track_expected_dir(expected_paths, &dir_path);
+
+        let source = instance
+            .properties
+            .get("Source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let source_path = dir_path.join(source_file_name);
+        write_utf8_file(&source_path, &source)?;
+        track_expected_file(expected_paths, &source_path);
+
+        let meta = build_meta(state, index, instance, false, false);
+        if meta_has_payload(&meta) {
+            let init_meta_path = dir_path.join("init.meta.json");
+            write_json_file(&init_meta_path, &meta, compact_meta_json)?;
+            track_expected_file(expected_paths, &init_meta_path);
+        }
+
+        return Ok(Some(SplitNodeShell {
+            name: fs_stem.to_string(),
+            class_name: class_name.to_string(),
+            file_paths: vec![path_to_sourcemap_relative(project_root, &source_path)],
+            dir_path,
+        }));
+    }
+
+    let dir_path = parent_dir.join(fs_stem);
+    fs::create_dir_all(&dir_path)
+        .with_context(|| format!("Failed to create {}", dir_path.display()))?;
+    track_expected_dir(expected_paths, &dir_path);
+
+    let meta = build_meta(state, index, instance, false, true);
+    let has_meta_settings = meta_has_payload(&meta);
+    let should_write_meta = !(class_name == "Folder" && !has_meta_settings);
+    if should_write_meta {
+        let init_meta_path = dir_path.join("init.meta.json");
+        write_json_file(&init_meta_path, &meta, compact_meta_json)?;
+        track_expected_file(expected_paths, &init_meta_path);
+    }
+
+    Ok(Some(SplitNodeShell {
+        name: fs_stem.to_string(),
+        class_name: "Folder".to_string(),
+        file_paths: Vec::new(),
+        dir_path,
+    }))
+}
+
+fn complete_split_slot(
+    shared: &Arc<SplitDirectImportState>,
+    output_slot: usize,
+    node: Option<SourcemapNode>,
+    parent_assembly: &Arc<SplitNodeAssembly>,
+    service_nodes: &Arc<Mutex<HashMap<String, SourcemapNode>>>,
+    sourcemap_sender: Option<&mpsc::Sender<SourcemapWriterMessage>>,
+) -> Result<()> {
+    {
+        let mut slots = match shared.slots.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if output_slot < slots.len() {
+            slots[output_slot] = node;
+        }
+    }
+
+    if parent_assembly
+        .remaining_children
+        .fetch_sub(1, Ordering::AcqRel)
+        == 1
+    {
+        complete_split_assembly(shared, parent_assembly, service_nodes, sourcemap_sender)?;
+    }
+
+    Ok(())
+}
+
+fn complete_split_assembly(
+    shared: &Arc<SplitDirectImportState>,
+    assembly: &Arc<SplitNodeAssembly>,
+    service_nodes: &Arc<Mutex<HashMap<String, SourcemapNode>>>,
+    sourcemap_sender: Option<&mpsc::Sender<SourcemapWriterMessage>>,
+) -> Result<()> {
+    if shared.failed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let children = {
+        let slots = match shared.slots.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assembly
+            .child_slots
+            .iter()
+            .filter_map(|slot| slots.get(*slot).and_then(|node| node.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let node = SourcemapNode {
+        name: assembly.name.clone(),
+        class_name: assembly.class_name.clone(),
+        file_paths: assembly.file_paths.clone(),
+        children,
+    };
+
+    if let Some(output_slot) = assembly.output_slot {
+        if let Some(parent) = assembly.parent.as_ref() {
+            complete_split_slot(
+                shared,
+                output_slot,
+                Some(node),
+                parent,
+                service_nodes,
+                sourcemap_sender,
+            )?;
+        }
+    } else {
+        spawn_cleanup_service_dir(
+            shared.service_dir.clone(),
+            Arc::clone(&shared.expected_paths),
+        );
+
+        if let Some(sender) = sourcemap_sender {
+            let _ = sender.send(SourcemapWriterMessage::Service(
+                shared.service.clone(),
+                node.clone(),
+            ));
+        }
+
+        let mut nodes = match service_nodes.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        nodes.insert(shared.service.clone(), node);
+        let completed_tasks = shared.completed_tasks.load(Ordering::Acquire);
+        if completed_tasks > 0 {
+            let total_ms = shared.total_task_tenths_ms.load(Ordering::Acquire) as f64 / 10.0;
+            let max_ms = shared.max_task_tenths_ms.load(Ordering::Acquire) as f64 / 10.0;
+            println!(
+                "[roblox-sync-rs] {}: subtree import tasks done -> tasks={}, avg_ms={:.1}, max_ms={:.1}",
+                shared.service,
+                completed_tasks,
+                total_ms / completed_tasks as f64,
+                max_ms
+            );
+        }
+        log_timing(
+            &format!("{}: direct import split total", shared.service),
+            shared.started,
+        );
+    }
+
+    Ok(())
+}
+
+fn process_split_subtree_task(
+    task: DirectImportSubtreeTask,
+    service_nodes: &Arc<Mutex<HashMap<String, SourcemapNode>>>,
+    sourcemap_sender: Option<&mpsc::Sender<SourcemapWriterMessage>>,
+    started: Instant,
+) -> Result<()> {
+    let shared = task.shared;
+    let mut completed_slots = Vec::with_capacity(task.items.len());
+    for item in task.items {
+        let node = emit_node_index(
+            &shared.state,
+            item.index,
+            &shared.project_root,
+            &item.parent_dir,
+            &item.fs_stem,
+            shared.compact_meta_json,
+            &shared.visited,
+            &shared.expected_paths,
+        );
+
+        match node {
+            Ok(node) => completed_slots.push((item.output_slot, node, item.parent_assembly)),
+            Err(err) => {
+                record_split_task_timing(&shared, started);
+                shared.failed.store(true, Ordering::Release);
+                return Err(err);
+            }
+        }
+    }
+
+    record_split_task_timing(&shared, started);
+    for (output_slot, node, parent_assembly) in completed_slots {
+        complete_split_slot(
+            &shared,
+            output_slot,
+            node,
+            &parent_assembly,
+            service_nodes,
+            sourcemap_sender,
+        )?;
+    }
+    Ok(())
+}
+
+fn import_service_state(
+    state: &ServiceState,
+    project_root: &Path,
+    src_root: &Path,
+    service: &str,
+    compact_meta_json: bool,
+) -> Result<SourcemapNode> {
+    let service_dir = src_root.join(sanitize_name(service));
+    fs::create_dir_all(&service_dir)
+        .with_context(|| format!("Failed to create {}", service_dir.display()))?;
+    let expected_paths = Arc::new(ImportPathSets::default());
+    track_expected_dir(&expected_paths, &service_dir);
+
+    let root = &state.instances[state.service_root_index];
+    let root_meta = build_meta(state, state.service_root_index, root, false, true);
+    let root_meta_path = service_dir.join("init.meta.json");
+    write_json_file(&root_meta_path, &root_meta, compact_meta_json)?;
     track_expected_file(&expected_paths, &root_meta_path);
 
     let visited = Arc::new(
@@ -2596,9 +4036,10 @@ fn import_service_state(
     let _ = mark_visited(&visited, state.service_root_index);
 
     let root_children = child_indices_for_instance(state, state.service_root_index);
-    emit_children_indices(
+    let child_nodes = emit_children_indices(
         state,
         &root_children,
+        project_root,
         &service_dir,
         compact_meta_json,
         &visited,
@@ -2607,7 +4048,12 @@ fn import_service_state(
 
     spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
 
-    Ok(())
+    Ok(SourcemapNode {
+        name: service.to_string(),
+        class_name: service.to_string(),
+        file_paths: Vec::new(),
+        children: child_nodes,
+    })
 }
 
 #[derive(Default)]
@@ -2640,10 +4086,16 @@ fn track_expected_dir(expected_paths: &Arc<ImportPathSets>, path: &Path) {
 
 fn spawn_cleanup_service_dir(service_dir: PathBuf, expected_paths: Arc<ImportPathSets>) {
     thread::spawn(move || {
+        let cleanup_started = Instant::now();
         if let Err(err) = cleanup_service_dir(&service_dir, &expected_paths) {
             println!(
                 "[roblox-sync-rs] warning: cleanup failed for {}: {err:#}",
                 service_dir.display()
+            );
+        } else {
+            log_timing(
+                &format!("cleanup {}", service_dir.display()),
+                cleanup_started,
             );
         }
     });
@@ -2746,14 +4198,15 @@ fn collect_stale_paths(
 fn emit_node_index(
     state: &ServiceState,
     index: usize,
+    project_root: &Path,
     parent_dir: &Path,
     fs_stem: &str,
     compact_meta_json: bool,
     visited: &Arc<Vec<AtomicBool>>,
     expected_paths: &Arc<ImportPathSets>,
-) -> Result<()> {
+) -> Result<Option<SourcemapNode>> {
     if !mark_visited(visited, index) {
-        return Ok(());
+        return Ok(None);
     }
 
     let instance = &state.instances[index];
@@ -2777,34 +4230,46 @@ fn emit_node_index(
                 .with_context(|| format!("Failed to create {}", dir_path.display()))?;
             track_expected_dir(expected_paths, &dir_path);
             let source_path = dir_path.join(source_file_name);
-            write_utf8_file_if_changed(&source_path, &source)?;
+            write_utf8_file(&source_path, &source)?;
             track_expected_file(expected_paths, &source_path);
             if has_meta_settings {
                 let init_meta_path = dir_path.join("init.meta.json");
-                write_json_file_if_changed(&init_meta_path, &meta, compact_meta_json)?;
+                write_json_file(&init_meta_path, &meta, compact_meta_json)?;
                 track_expected_file(expected_paths, &init_meta_path);
             }
 
-            emit_children_indices(
+            let children = emit_children_indices(
                 state,
                 &child_indices,
+                project_root,
                 &dir_path,
                 compact_meta_json,
                 visited,
                 expected_paths,
             )?;
+            return Ok(Some(SourcemapNode {
+                name: fs_stem.to_string(),
+                class_name: class_name.to_string(),
+                file_paths: vec![path_to_sourcemap_relative(project_root, &source_path)],
+                children,
+            }));
         } else {
             let script_path = parent_dir.join(format!("{fs_stem}{leaf_suffix}"));
-            write_utf8_file_if_changed(&script_path, &source)?;
+            write_utf8_file(&script_path, &source)?;
             track_expected_file(expected_paths, &script_path);
             if has_meta_settings {
                 let meta_path = parent_dir.join(format!("{fs_stem}.meta.json"));
-                write_json_file_if_changed(&meta_path, &meta, compact_meta_json)?;
+                write_json_file(&meta_path, &meta, compact_meta_json)?;
                 track_expected_file(expected_paths, &meta_path);
             }
-        }
 
-        return Ok(());
+            return Ok(Some(SourcemapNode {
+                name: fs_stem.to_string(),
+                class_name: class_name.to_string(),
+                file_paths: vec![path_to_sourcemap_relative(project_root, &script_path)],
+                children: Vec::new(),
+            }));
+        }
     }
 
     let dir_path = parent_dir.join(fs_stem);
@@ -2817,28 +4282,41 @@ fn emit_node_index(
     let should_write_meta = !(class_name == "Folder" && !has_meta_settings);
     if should_write_meta {
         let init_meta_path = dir_path.join("init.meta.json");
-        write_json_file_if_changed(&init_meta_path, &meta, compact_meta_json)?;
+        write_json_file(&init_meta_path, &meta, compact_meta_json)?;
         track_expected_file(expected_paths, &init_meta_path);
     }
 
-    emit_children_indices(
+    let children = emit_children_indices(
         state,
         &child_indices,
+        project_root,
         &dir_path,
         compact_meta_json,
         visited,
         expected_paths,
-    )
+    )?;
+
+    if children.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(SourcemapNode {
+        name: fs_stem.to_string(),
+        class_name: "Folder".to_string(),
+        file_paths: Vec::new(),
+        children,
+    }))
 }
 
 fn emit_children_indices(
     state: &ServiceState,
     child_indices: &[usize],
+    project_root: &Path,
     dir_path: &Path,
     compact_meta_json: bool,
     visited: &Arc<Vec<AtomicBool>>,
     expected_paths: &Arc<ImportPathSets>,
-) -> Result<()> {
+) -> Result<Vec<SourcemapNode>> {
     let mut counters: HashMap<String, usize> = HashMap::new();
     let mut named_children: Vec<(usize, String)> = Vec::with_capacity(child_indices.len());
     for child_index in child_indices {
@@ -2856,33 +4334,40 @@ fn emit_children_indices(
 
     const PARALLEL_CHILD_THRESHOLD: usize = 8;
     if named_children.len() >= PARALLEL_CHILD_THRESHOLD && rayon::current_num_threads() > 1 {
-        named_children
+        let built: Vec<Option<SourcemapNode>> = named_children
             .par_iter()
-            .try_for_each(|(child_index, child_stem)| {
+            .map(|(child_index, child_stem)| {
                 emit_node_index(
                     state,
                     *child_index,
+                    project_root,
                     dir_path,
                     child_stem,
                     compact_meta_json,
                     visited,
                     expected_paths,
                 )
-            })?;
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(built.into_iter().flatten().collect());
     } else {
+        let mut built = Vec::with_capacity(named_children.len());
         for (child_index, child_stem) in named_children {
-            emit_node_index(
+            if let Some(node) = emit_node_index(
                 state,
                 child_index,
+                project_root,
                 dir_path,
                 &child_stem,
                 compact_meta_json,
                 visited,
                 expected_paths,
-            )?;
+            )? {
+                built.push(node);
+            }
         }
+        return Ok(built);
     }
-    Ok(())
 }
 
 fn mark_visited(visited: &Arc<Vec<AtomicBool>>, index: usize) -> bool {
@@ -2970,7 +4455,6 @@ fn build_meta(
                     );
                 }
             }
-            continue;
         }
         let converted = convert_value(raw_value);
         if !converted.is_null() {
@@ -3047,6 +4531,15 @@ fn is_default_property_value(
     property_name: &str,
     property_value: &Value,
 ) -> bool {
+    if matches!(
+        (property_name, property_value),
+        ("Archivable", Value::Bool(true))
+            | ("Sandboxed", Value::Bool(false))
+            | ("CharacterAutoLoads", Value::Bool(true))
+    ) {
+        return true;
+    }
+
     state
         .class_defaults_by_class
         .get(class_name)
@@ -3419,6 +4912,15 @@ fn make_sourcemap_root(project_root: &Path) -> SourcemapNode {
     }
 }
 
+fn empty_service_sourcemap_node(service: &str) -> SourcemapNode {
+    SourcemapNode {
+        name: service.to_string(),
+        class_name: service.to_string(),
+        file_paths: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
 fn sort_sourcemap_root_children(root: &mut SourcemapNode) {
     let service_order: HashMap<&str, usize> = DEFAULT_SERVICES
         .iter()
@@ -3441,11 +4943,7 @@ fn sort_sourcemap_root_children(root: &mut SourcemapNode) {
 fn write_sourcemap_root(project_root: &Path, mut root: SourcemapNode) -> Result<()> {
     sort_sourcemap_root_children(&mut root);
     let output_file = project_root.join("sourcemap.json");
-    write_json_file(
-        &output_file,
-        &serde_json::to_value(root).context("Failed to serialize sourcemap")?,
-        true,
-    )?;
+    write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
     println!("[roblox-sync-rs] wrote {}", output_file.display());
     Ok(())
 }
@@ -3456,14 +4954,7 @@ fn load_existing_sourcemap_root(project_root: &Path) -> Result<Option<SourcemapN
         return Ok(None);
     }
 
-    let bytes = fs::read(&sourcemap_path)
-        .with_context(|| format!("Failed to read {}", sourcemap_path.display()))?;
-    let slice = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        &bytes
-    };
-    let root = serde_json::from_slice(slice)
+    let root: SourcemapNode = read_json_file(&sourcemap_path)
         .with_context(|| format!("Invalid JSON in {}", sourcemap_path.display()))?;
     Ok(Some(root))
 }
@@ -3485,11 +4976,7 @@ fn write_project_sourcemap_temp_from_service_nodes(
     root.children = service_nodes.values().cloned().collect();
     sort_sourcemap_root_children(&mut root);
     let temp_file = project_root.join("sourcemap.json.tmp");
-    write_json_file(
-        &temp_file,
-        &serde_json::to_value(root).context("Failed to serialize sourcemap")?,
-        true,
-    )
+    write_json_file(&temp_file, &root, true).context("Failed to serialize sourcemap")
 }
 
 fn finalize_project_sourcemap_temp(
@@ -3758,11 +5245,7 @@ fn generate_project_sourcemap(project_root: &Path) -> Result<()> {
     }
 
     let output_file = project_root.join("sourcemap.json");
-    write_json_file(
-        &output_file,
-        &serde_json::to_value(root).context("Failed to serialize sourcemap")?,
-        true,
-    )?;
+    write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
     println!("[roblox-sync-rs] wrote {}", output_file.display());
     Ok(())
 }
@@ -3793,22 +5276,24 @@ fn write_generated_project(project_root: &Path, services: &[String], compact: bo
     )
 }
 
-fn write_json_file(path: &Path, value: &Value, compact: bool) -> Result<()> {
-    let serialized = if compact {
-        serde_json::to_string(value).context("Failed to serialize JSON")?
-    } else {
-        serialize_pretty_json_with_inline_numeric_arrays(value)?
-    };
-    write_utf8_file(path, &(serialized + "\n"))
+fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let file = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    if matches!(reader.fill_buf(), Ok(buffer) if buffer.starts_with(&[0xEF, 0xBB, 0xBF])) {
+        reader.consume(3);
+    }
+    serde_json::from_reader(reader).with_context(|| format!("Invalid JSON in {}", path.display()))
 }
 
-fn write_json_file_if_changed(path: &Path, value: &Value, compact: bool) -> Result<()> {
-    let serialized = if compact {
-        serde_json::to_string(value).context("Failed to serialize JSON")?
+fn write_json_file<T: Serialize>(path: &Path, value: &T, compact: bool) -> Result<()> {
+    if compact {
+        write_json_streaming(path, value)
     } else {
-        serialize_pretty_json_with_inline_numeric_arrays(value)?
-    };
-    write_utf8_file_if_changed(path, &(serialized + "\n"))
+        let value =
+            serde_json::to_value(value).context("Failed to convert JSON value for formatting")?;
+        let serialized = serialize_pretty_json_with_inline_numeric_arrays(&value)?;
+        write_utf8_file(path, &(serialized + "\n"))
+    }
 }
 
 fn serialize_pretty_json_with_inline_numeric_arrays(value: &Value) -> Result<String> {
@@ -3901,19 +5386,21 @@ fn write_utf8_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn write_utf8_file_if_changed(path: &Path, content: &str) -> Result<()> {
+fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    if let Ok(existing) = fs::read(path) {
-        if existing == content.as_bytes() {
-            return Ok(());
-        }
-    }
-
-    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+    let file = File::create(path).with_context(|| format!("Failed to write {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value).context("Failed to serialize JSON")?;
+    writer
+        .write_all(b"\n")
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn sanitize_name(input: &str) -> String {
