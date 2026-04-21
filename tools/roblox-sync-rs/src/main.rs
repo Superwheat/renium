@@ -166,7 +166,7 @@ enum InstanceChunkEntry {
     Entry { file: String },
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SnapshotInstance {
     path: String,
     #[serde(default, rename = "pathSegments")]
@@ -176,6 +176,8 @@ struct SnapshotInstance {
     class_name: String,
     #[serde(default)]
     properties: Map<String, Value>,
+    #[serde(default, rename = "sourceKey", skip_serializing_if = "Option::is_none")]
+    source_key: Option<String>,
     #[serde(default, rename = "parentPath")]
     parent_path: Option<String>,
     #[serde(default)]
@@ -222,7 +224,32 @@ struct ExportedSnapshotParts {
     generated_at: i64,
     script_count: usize,
     class_defaults: Value,
-    instances: Vec<Value>,
+    instances: Vec<SnapshotInstance>,
+    adaptive_tune: Option<AdaptiveTuneEntry>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AdaptiveTuneCache {
+    #[serde(default)]
+    services: HashMap<String, AdaptiveTuneEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdaptiveTuneEntry {
+    #[serde(rename = "batchSize")]
+    batch_size: usize,
+    workers: usize,
+    #[serde(default, rename = "instanceCount")]
+    instance_count: usize,
+    #[serde(default, rename = "frameMs")]
+    frame_ms: Option<f64>,
+    #[serde(default, rename = "updatedAtUnix")]
+    updated_at_unix: i64,
+}
+
+struct InstanceFetchResult {
+    instances: Vec<SnapshotInstance>,
+    tune: Option<AdaptiveTuneEntry>,
 }
 
 struct BridgeSocket {
@@ -482,9 +509,91 @@ fn generate_sourcemap_command(args: GenerateSourcemapArgs) -> Result<()> {
     generate_project_sourcemap(&project_root)
 }
 
+fn adaptive_tune_cache_path(project_root: &Path) -> PathBuf {
+    project_root.join(".roblox-sync-adaptive.json")
+}
+
+fn load_adaptive_tune_cache(project_root: &Path) -> AdaptiveTuneCache {
+    let path = adaptive_tune_cache_path(project_root);
+    let Ok(bytes) = fs::read(&path) else {
+        return AdaptiveTuneCache::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn write_adaptive_tune_cache(project_root: &Path, cache: &AdaptiveTuneCache) {
+    let path = adaptive_tune_cache_path(project_root);
+    if let Err(err) = write_json_file(
+        &path,
+        &serde_json::to_value(cache).unwrap_or_else(|_| json!({})),
+        true,
+    ) {
+        println!(
+            "[roblox-sync-rs] warning: failed to write adaptive tuning cache {}: {err:#}",
+            path.display()
+        );
+    }
+}
+
 struct DirectImportTask {
     service: String,
     parts: ExportedSnapshotParts,
+}
+
+enum SourcemapWriterMessage {
+    Service(String, SourcemapNode),
+    Finish,
+}
+
+struct SourcemapWriter {
+    sender: mpsc::Sender<SourcemapWriterMessage>,
+    handle: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl SourcemapWriter {
+    fn start(project_root: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
+        let handle = thread::spawn(move || -> Result<()> {
+            let mut service_nodes = HashMap::<String, SourcemapNode>::new();
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    SourcemapWriterMessage::Service(service, node) => {
+                        service_nodes.insert(service, node);
+                        write_project_sourcemap_temp_from_service_nodes(
+                            &project_root,
+                            &service_nodes,
+                        )?;
+                    }
+                    SourcemapWriterMessage::Finish => {
+                        finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
+                        return Ok(());
+                    }
+                }
+            }
+            finalize_project_sourcemap_temp(&project_root, &service_nodes)
+        });
+
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    fn sender(&self) -> mpsc::Sender<SourcemapWriterMessage> {
+        self.sender.clone()
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let _ = self.sender.send(SourcemapWriterMessage::Finish);
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => bail!("Sourcemap writer panicked"),
+            }
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct DirectImportDispatcher {
@@ -495,7 +604,12 @@ struct DirectImportDispatcher {
 }
 
 impl DirectImportDispatcher {
-    fn start(project_root: PathBuf, compact_meta_json: bool, worker_count: usize) -> Self {
+    fn start(
+        project_root: PathBuf,
+        compact_meta_json: bool,
+        worker_count: usize,
+        sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
+    ) -> Self {
         let queue_capacity = worker_count.max(1).saturating_mul(2).clamp(2, 64);
         let (sender, receiver) = mpsc::sync_channel::<DirectImportTask>(queue_capacity);
         let shared_receiver = Arc::new(Mutex::new(receiver));
@@ -509,6 +623,7 @@ impl DirectImportDispatcher {
             let root_clone = project_root.clone();
             let error_clone = Arc::clone(&first_error);
             let service_nodes_clone = Arc::clone(&service_nodes);
+            let sourcemap_sender_clone = sourcemap_sender.clone();
             workers.push(thread::spawn(move || {
                 loop {
                     let task = {
@@ -537,6 +652,12 @@ impl DirectImportDispatcher {
                         });
                     match import_result {
                         Ok(node) => {
+                            if let Some(sender) = sourcemap_sender_clone.as_ref() {
+                                let _ = sender.send(SourcemapWriterMessage::Service(
+                                    task.service.clone(),
+                                    node.clone(),
+                                ));
+                            }
                             let mut nodes = match service_nodes_clone.lock() {
                                 Ok(lock) => lock,
                                 Err(poisoned) => poisoned.into_inner(),
@@ -716,6 +837,12 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
     let source_workers = args.source_workers;
     let instance_workers = args.instance_workers;
     let import_workers = args.import_workers;
+    let mut adaptive_tune_cache = load_adaptive_tune_cache(&project_root);
+    let sourcemap_writer = if direct_import_mode {
+        Some(SourcemapWriter::start(project_root.clone()))
+    } else {
+        None
+    };
 
     let mut direct_import_dispatcher = if direct_import_mode {
         let resolved_import_workers = resolve_direct_import_workers(import_workers);
@@ -727,6 +854,7 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
             project_root.clone(),
             compact_meta_json,
             resolved_import_workers,
+            sourcemap_writer.as_ref().map(SourcemapWriter::sender),
         ))
     } else {
         None
@@ -744,7 +872,14 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
             adaptive_instance_batches,
             source_workers,
             instance_workers,
+            adaptive_tune_cache.services.get(service).cloned(),
         )?;
+        if let Some(tune) = parts.adaptive_tune.clone() {
+            adaptive_tune_cache
+                .services
+                .insert(service.to_string(), tune);
+            write_adaptive_tune_cache(&project_root, &adaptive_tune_cache);
+        }
 
         if direct_import_mode {
             if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
@@ -763,7 +898,11 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
                 sourcemap_nodes = dispatcher.finish()?;
             }
             write_generated_project(&project_root, &services, compact_meta_json)?;
-            if let Err(err) =
+            if let Some(writer) = sourcemap_writer {
+                if let Err(err) = writer.finish() {
+                    println!("[roblox-sync-rs] warning: {err}");
+                }
+            } else if let Err(err) =
                 write_project_sourcemap_from_service_nodes(&project_root, &sourcemap_nodes)
             {
                 println!("[roblox-sync-rs] warning: {err}");
@@ -984,6 +1123,7 @@ fn export_single_service_parts(
     adaptive_instance_batches: bool,
     source_workers: usize,
     instance_workers: usize,
+    cached_tune: Option<AdaptiveTuneEntry>,
 ) -> Result<ExportedSnapshotParts> {
     let prepare = bridge.call("prepare", json!({ "service": service }))?;
     let instance_count = prepare
@@ -1000,101 +1140,109 @@ fn export_single_service_parts(
         instance_count, script_count
     );
 
-    let (class_defaults, mut instances, source_by_key) = thread::scope(|scope| -> Result<_> {
-        let class_defaults_task = scope.spawn(|| {
-            fetch_json_payload(chunk_size, |chunk_start, max_len| {
+    let (class_defaults, mut instance_fetch, source_by_key) =
+        thread::scope(|scope| -> Result<_> {
+            let class_defaults_task = scope.spawn(|| {
+                fetch_json_payload(chunk_size, |chunk_start, max_len| {
+                    bridge.call(
+                        "getClassDefaultsChunk",
+                        json!({
+                            "service": service,
+                            "startIndex": chunk_start,
+                            "maxLen": max_len,
+                        }),
+                    )
+                })
+            });
+
+            let script_paths_value = fetch_json_payload(chunk_size, |chunk_start, max_len| {
                 bridge.call(
-                    "getClassDefaultsChunk",
+                    "getScriptPathsChunk",
                     json!({
                         "service": service,
                         "startIndex": chunk_start,
                         "maxLen": max_len,
                     }),
                 )
-            })
-        });
-
-        let script_paths_value = fetch_json_payload(chunk_size, |chunk_start, max_len| {
-            bridge.call(
-                "getScriptPathsChunk",
-                json!({
-                    "service": service,
-                    "startIndex": chunk_start,
-                    "maxLen": max_len,
-                }),
-            )
-        })?;
-        let script_paths = script_paths_value
-            .as_array()
-            .with_context(|| format!("Invalid script path list for {service}"))?;
-        let script_keys: Vec<String> = script_paths
-            .iter()
-            .filter_map(Value::as_str)
-            .map(ToString::to_string)
-            .collect();
-        let source_worker_count =
-            resolve_source_worker_count(source_workers, bridge.channel_count(), script_keys.len());
-
-        println!(
-            "[roblox-sync-rs] {service}: script sources={}, workers={}",
-            script_keys.len(),
-            source_worker_count
-        );
-
-        let script_keys_for_sources = script_keys.clone();
-        let source_fetch_task = scope.spawn(move || {
-            fetch_script_sources(
-                bridge,
-                service,
-                chunk_size,
-                &script_keys_for_sources,
-                source_worker_count,
-            )
-        });
-
-        let instances = if adaptive_instance_batches {
-            fetch_instances_adaptive(
-                bridge,
-                service,
-                chunk_size,
-                instance_count,
-                instance_workers,
-            )?
-        } else {
-            let instance_batch_size = initial_instance_batch_size(instance_count);
-            let instance_worker_count = resolve_instance_worker_count(
-                instance_workers,
+            })?;
+            let script_paths = script_paths_value
+                .as_array()
+                .with_context(|| format!("Invalid script path list for {service}"))?;
+            let script_keys: Vec<String> = script_paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            let source_worker_count = resolve_source_worker_count(
+                source_workers,
                 bridge.channel_count(),
-                instance_count,
-                instance_batch_size,
+                script_keys.len(),
             );
+
             println!(
-                "[roblox-sync-rs] {service}: instance batch size {} (fixed, workers={})",
-                instance_batch_size, instance_worker_count
+                "[roblox-sync-rs] {service}: script sources={}, workers={}",
+                script_keys.len(),
+                source_worker_count
             );
-            fetch_instances_fixed(
-                bridge,
-                service,
-                chunk_size,
-                instance_count,
-                instance_batch_size,
-                instance_worker_count,
-            )?
-        };
 
-        let class_defaults = match class_defaults_task.join() {
-            Ok(value) => value?,
-            Err(_) => bail!("Class defaults worker panicked for {service}"),
-        };
-        let source_by_key = match source_fetch_task.join() {
-            Ok(value) => value?,
-            Err(_) => bail!("Script source worker panicked for {service}"),
-        };
+            let script_keys_for_sources = script_keys.clone();
+            let source_fetch_task = scope.spawn(move || {
+                fetch_script_sources(
+                    bridge,
+                    service,
+                    chunk_size,
+                    &script_keys_for_sources,
+                    source_worker_count,
+                )
+            });
 
-        Ok((class_defaults, instances, source_by_key))
-    })?;
+            let instance_fetch = if adaptive_instance_batches {
+                fetch_instances_adaptive(
+                    bridge,
+                    service,
+                    chunk_size,
+                    instance_count,
+                    instance_workers,
+                    cached_tune,
+                )?
+            } else {
+                let instance_batch_size = initial_instance_batch_size(instance_count);
+                let instance_worker_count = resolve_instance_worker_count(
+                    instance_workers,
+                    bridge.channel_count(),
+                    instance_count,
+                    instance_batch_size,
+                );
+                println!(
+                    "[roblox-sync-rs] {service}: instance batch size {} (fixed, workers={})",
+                    instance_batch_size, instance_worker_count
+                );
+                InstanceFetchResult {
+                    instances: fetch_instances_fixed(
+                        bridge,
+                        service,
+                        chunk_size,
+                        instance_count,
+                        instance_batch_size,
+                        instance_worker_count,
+                    )?,
+                    tune: None,
+                }
+            };
 
-    merge_script_sources(&mut instances, &source_by_key);
+            let class_defaults = match class_defaults_task.join() {
+                Ok(value) => value?,
+                Err(_) => bail!("Class defaults worker panicked for {service}"),
+            };
+            let source_by_key = match source_fetch_task.join() {
+                Ok(value) => value?,
+                Err(_) => bail!("Script source worker panicked for {service}"),
+            };
+
+            Ok((class_defaults, instance_fetch, source_by_key))
+        })?;
+
+    merge_script_sources(&mut instance_fetch.instances, &source_by_key);
 
     let service_path = prepare
         .get("rootPath")
@@ -1127,7 +1275,8 @@ fn export_single_service_parts(
         generated_at,
         script_count,
         class_defaults,
-        instances,
+        instances: instance_fetch.instances,
+        adaptive_tune: instance_fetch.tune,
     })
 }
 
@@ -1154,13 +1303,11 @@ fn exported_parts_to_service_state(
     service: &str,
     parts: ExportedSnapshotParts,
 ) -> Result<ServiceState> {
-    let instances: Vec<SnapshotInstance> = serde_json::from_value(Value::Array(parts.instances))
-        .with_context(|| format!("Failed to convert streamed export instances for {service}"))?;
     let class_defaults_by_class = normalize_class_defaults(parts.class_defaults);
     build_service_state_from_instances(
         service,
         Some(parts.service_path),
-        instances,
+        parts.instances,
         class_defaults_by_class,
     )
 }
@@ -1238,7 +1385,7 @@ fn fetch_instances_fixed(
     instance_count: usize,
     instance_batch_size: usize,
     instance_worker_count: usize,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<SnapshotInstance>> {
     let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
     if instance_count > 0 {
         let mut range_index = 0usize;
@@ -1251,7 +1398,7 @@ fn fetch_instances_fixed(
         }
     }
 
-    let mut instances: Vec<Value> = Vec::with_capacity(instance_count);
+    let mut instances: Vec<SnapshotInstance> = Vec::with_capacity(instance_count);
     if ranges.is_empty() {
         println!("[roblox-sync-rs] {service}: instances 0/0");
     } else if instance_worker_count <= 1 || ranges.len() <= 1 {
@@ -1297,7 +1444,7 @@ fn fetch_instances_fixed(
             ranges
                 .par_iter()
                 .map(
-                    |(range_index, start_index, take_count)| -> Result<(usize, usize, Vec<Value>)> {
+                    |(range_index, start_index, take_count)| -> Result<(usize, usize, Vec<SnapshotInstance>)> {
                         let (total_hint, _, out) = fetch_instance_batch(
                             bridge,
                             service,
@@ -1350,16 +1497,32 @@ fn fetch_instances_adaptive(
     chunk_size: usize,
     instance_count: usize,
     requested_instance_workers: usize,
-) -> Result<Vec<Value>> {
+    cached_tune: Option<AdaptiveTuneEntry>,
+) -> Result<InstanceFetchResult> {
     if instance_count == 0 {
         println!("[roblox-sync-rs] {service}: instances 0/0");
-        return Ok(Vec::new());
+        return Ok(InstanceFetchResult {
+            instances: Vec::new(),
+            tune: None,
+        });
     }
 
     const LAG_FRAME_MS: f64 = 33.3;
-    let mut batch_size = adaptive_instance_batch_size(instance_count).max(1);
+    let default_batch_size = adaptive_instance_batch_size(instance_count).max(1);
+    let mut batch_size = cached_tune
+        .as_ref()
+        .map(|tune| tune.batch_size)
+        .filter(|value| *value > 0)
+        .unwrap_or(default_batch_size)
+        .min(instance_count.max(1));
     let mut worker_target = if requested_instance_workers > 0 {
         requested_instance_workers
+    } else if let Some(workers) = cached_tune
+        .as_ref()
+        .map(|tune| tune.workers)
+        .filter(|value| *value > 0)
+    {
+        workers
     } else {
         bridge.channel_count().max(1)
     };
@@ -1374,6 +1537,9 @@ fn fetch_instances_adaptive(
     let mut total_hint = instance_count;
     let mut wave_index = 0usize;
     let mut instances = Vec::with_capacity(instance_count);
+    let mut suggested_batch_size = batch_size;
+    let mut suggested_workers = worker_target;
+    let mut last_frame_ms = None;
 
     while next_start <= total_hint {
         let remaining = total_hint - next_start + 1;
@@ -1414,7 +1580,7 @@ fn fetch_instances_adaptive(
                 ranges
                     .par_iter()
                     .map(
-                        |(range_index, start_index, take_count)| -> Result<(usize, usize, usize, Vec<Value>)> {
+                        |(range_index, start_index, take_count)| -> Result<(usize, usize, usize, Vec<SnapshotInstance>)> {
                             let (hint, bytes, items) = fetch_instance_batch(
                                 bridge,
                                 service,
@@ -1440,6 +1606,7 @@ fn fetch_instances_adaptive(
         wave_index += 1;
         let wave_ms = wave_started.elapsed().as_secs_f64() * 1000.0;
         let frame_ms = read_bridge_frame_ms(bridge);
+        last_frame_ms = frame_ms;
         let lagging = frame_ms.map(|ms| ms >= LAG_FRAME_MS).unwrap_or(false);
         println!(
             "[roblox-sync-rs] {service}: adaptive wave {} -> instances {}/{} (batch={}, workers={}, wave_ms={:.0}, bytes={:.1}MB, frame_ms={})",
@@ -1461,6 +1628,8 @@ fn fetch_instances_adaptive(
             batch_size = batch_size.saturating_add(batch_step).min(total_hint.max(1));
             worker_target = worker_target.saturating_add(1);
         }
+        suggested_batch_size = batch_size;
+        suggested_workers = worker_target;
     }
 
     println!(
@@ -1468,7 +1637,16 @@ fn fetch_instances_adaptive(
         instances.len(),
         total_hint
     );
-    Ok(instances)
+    Ok(InstanceFetchResult {
+        instances,
+        tune: Some(AdaptiveTuneEntry {
+            batch_size: suggested_batch_size,
+            workers: suggested_workers,
+            instance_count: total_hint,
+            frame_ms: last_frame_ms,
+            updated_at_unix: current_unix_ts(),
+        }),
+    })
 }
 
 fn fetch_instance_batch(
@@ -1478,7 +1656,7 @@ fn fetch_instance_batch(
     start_index: usize,
     take_count: usize,
     instance_count: usize,
-) -> Result<(usize, usize, Vec<Value>)> {
+) -> Result<(usize, usize, Vec<SnapshotInstance>)> {
     let (mut batch_value, bytes) =
         fetch_json_payload_with_size(chunk_size, |chunk_start, max_len| {
             bridge.call(
@@ -1497,8 +1675,9 @@ fn fetch_instance_batch(
         .get_mut("items")
         .and_then(Value::as_array_mut)
         .with_context(|| format!("Invalid instance batch payload for {service}"))?;
-    let mut out = Vec::with_capacity(items.len());
-    out.extend(items.drain(..));
+    let raw_items = Value::Array(items.drain(..).collect());
+    let out: Vec<SnapshotInstance> = serde_json::from_value(raw_items)
+        .with_context(|| format!("Invalid instance batch item schema for {service}"))?;
 
     let total_hint = batch_value
         .get("total")
@@ -1561,47 +1740,43 @@ where
     Ok((value, size))
 }
 
-fn merge_script_sources(instances: &mut [Value], source_by_key: &HashMap<String, String>) {
+fn merge_script_sources(
+    instances: &mut [SnapshotInstance],
+    source_by_key: &HashMap<String, String>,
+) {
     for instance in instances.iter_mut() {
         let source = instance
-            .get("sourceKey")
-            .and_then(Value::as_str)
+            .source_key
+            .as_deref()
             .and_then(|source_key| source_by_key.get(source_key))
             .or_else(|| {
                 instance
-                    .get("instanceId")
-                    .and_then(Value::as_str)
+                    .instance_id
+                    .as_deref()
                     .and_then(|instance_id| source_by_key.get(&format!("id:{instance_id}")))
             })
             .or_else(|| {
                 instance
-                    .get("debugId")
-                    .and_then(Value::as_str)
+                    .debug_id
+                    .as_deref()
                     .and_then(|debug_id| source_by_key.get(&format!("debug:{debug_id}")))
             })
-            .or_else(|| {
-                instance
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .and_then(|path| source_by_key.get(path))
-            });
+            .or_else(|| source_by_key.get(&instance.path));
         let Some(source) = source else {
             continue;
         };
-        let Some(props) = instance
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-        else {
-            continue;
-        };
-        let is_placeholder = props
+        let is_placeholder = instance
+            .properties
             .get("Source")
             .and_then(Value::as_str)
             .map(|v| v == "__SOURCE_EXTERNAL__")
             .unwrap_or(false);
         if is_placeholder {
-            props.insert("Source".to_string(), Value::String(source.clone()));
+            instance
+                .properties
+                .insert("Source".to_string(), Value::String(source.clone()));
         }
+        instance.source_key = None;
     }
 }
 
@@ -3300,6 +3475,46 @@ fn write_project_sourcemap_from_service_nodes(
     let mut root = make_sourcemap_root(project_root);
     root.children = service_nodes.values().cloned().collect();
     write_sourcemap_root(project_root, root)
+}
+
+fn write_project_sourcemap_temp_from_service_nodes(
+    project_root: &Path,
+    service_nodes: &HashMap<String, SourcemapNode>,
+) -> Result<()> {
+    let mut root = make_sourcemap_root(project_root);
+    root.children = service_nodes.values().cloned().collect();
+    sort_sourcemap_root_children(&mut root);
+    let temp_file = project_root.join("sourcemap.json.tmp");
+    write_json_file(
+        &temp_file,
+        &serde_json::to_value(root).context("Failed to serialize sourcemap")?,
+        true,
+    )
+}
+
+fn finalize_project_sourcemap_temp(
+    project_root: &Path,
+    service_nodes: &HashMap<String, SourcemapNode>,
+) -> Result<()> {
+    write_project_sourcemap_temp_from_service_nodes(project_root, service_nodes)?;
+    let temp_file = project_root.join("sourcemap.json.tmp");
+    let output_file = project_root.join("sourcemap.json");
+    match fs::remove_file(&output_file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to remove {}", output_file.display()));
+        }
+    }
+    fs::rename(&temp_file, &output_file).with_context(|| {
+        format!(
+            "Failed to publish sourcemap {} -> {}",
+            temp_file.display(),
+            output_file.display()
+        )
+    })?;
+    println!("[roblox-sync-rs] wrote {}", output_file.display());
+    Ok(())
 }
 
 fn write_project_sourcemap_with_updates(
