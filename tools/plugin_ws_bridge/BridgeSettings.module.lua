@@ -69,21 +69,9 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 	return defaultPorts
 end
 
-function BridgeSettings.loadEnabled(plugin, prefix, defaultEnabled)
-	local value = plugin:GetSetting(prefix .. "enabled")
-	if type(value) == "boolean" then
-		return value
-	end
-	return defaultEnabled
-end
-
 function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
 	plugin:SetSetting(prefix .. "host", host)
 	plugin:SetSetting(prefix .. "ports", ports)
-end
-
-function BridgeSettings.saveEnabled(plugin, prefix, enabled)
-	plugin:SetSetting(prefix .. "enabled", enabled == true)
 end
 
 return BridgeSettings

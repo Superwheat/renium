@@ -440,7 +440,6 @@ class RobloxSyncController {
       const launchedAt = Date.now();
       let lastOutputAt = launchedAt;
       let sawOutput = false;
-      let lastOutputSummary = "process started";
       const child = childProcess.spawn(command, args, {
         cwd,
         env: process.env,
@@ -459,18 +458,13 @@ class RobloxSyncController {
         if (!sawOutput) {
           this.output.appendLine(`[roblox-sync] ${label}: waiting for first output (${elapsedSec}s elapsed)`);
         } else {
-          this.output.appendLine(
-            `[roblox-sync] ${label}: still running (${elapsedSec}s elapsed, idle ${idleSec}s, last activity: ${lastOutputSummary})`,
-          );
+          this.output.appendLine(`[roblox-sync] ${label}: still running (${elapsedSec}s elapsed, idle ${idleSec}s)`);
         }
       }, heartbeatMs);
 
-      this.bindProcessOutput(child, command, (summary) => {
+      this.bindProcessOutput(child, command, () => {
         sawOutput = true;
         lastOutputAt = Date.now();
-        if (summary) {
-          lastOutputSummary = summary;
-        }
       });
 
       child.on("error", (err) => {
@@ -489,30 +483,17 @@ class RobloxSyncController {
   private bindProcessOutput(
     child: childProcess.ChildProcess,
     prefix: string,
-    onActivity?: (summary?: string) => void,
+    onActivity?: () => void,
   ): void {
     child.stdout?.on("data", (data: Buffer | string) => {
-      onActivity?.(this.summarizeProcessChunk(data));
+      onActivity?.();
       this.output.append(this.prefixOutput(prefix, data));
     });
 
     child.stderr?.on("data", (data: Buffer | string) => {
-      onActivity?.(this.summarizeProcessChunk(data));
+      onActivity?.();
       this.output.append(this.prefixOutput(`${prefix}:err`, data));
     });
-  }
-
-  private summarizeProcessChunk(data: Buffer | string): string | undefined {
-    const lines = data
-      .toString()
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    if (lines.length === 0) {
-      return undefined;
-    }
-    const lastLine = lines[lines.length - 1]!;
-    return lastLine.length > 180 ? `${lastLine.slice(0, 177)}...` : lastLine;
   }
 
   private prefixOutput(prefix: string, data: Buffer | string): string {
