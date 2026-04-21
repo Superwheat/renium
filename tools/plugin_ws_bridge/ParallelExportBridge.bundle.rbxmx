@@ -22,8 +22,94 @@ local SETTINGS_PREFIX = "ParallelExportBridge."
 local DEFAULT_HOST = "127.0.0.1"
 local DEFAULT_PORTS = { 8781, 8782, 8783, 8784 }
 local RECONNECT_SECONDS = 0.2
+local SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
+local SERIALIZATION_BURST_CHECK_INTERVAL = 64
+local MAX_PARALLEL_CHUNK_WORKERS = 4
+local PARALLEL_PRE_SERIALIZE_MIN_ITEMS = 2048
+local PARALLEL_INSTANCE_BATCH_MIN_ITEMS = 768
+local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
+local PARALLEL_TARGET_ITEMS_PER_WORKER = 256
+local PRE_SERIALIZE_MAX_INSTANCES = 5000
 local UI = {}
 local Config = {}
+
+local function makeBurstYielder(checkInterval: number?, budgetSeconds: number?)
+	local interval = math.max(1, checkInterval or SERIALIZATION_BURST_CHECK_INTERVAL)
+	local budget = budgetSeconds or SERIALIZATION_BURST_BUDGET_SECONDS
+	local untilCheck = interval
+	local burstStarted = os.clock()
+	return function()
+		untilCheck -= 1
+		if untilCheck > 0 then
+			return
+		end
+		untilCheck = interval
+		if os.clock() - burstStarted >= budget then
+			task.wait()
+			burstStarted = os.clock()
+		end
+	end
+end
+
+local function getParallelChunkWorkerCount(totalItems: number, minItems: number): number
+	if totalItems < minItems then
+		return 1
+	end
+	return math.clamp(
+		math.ceil(totalItems / PARALLEL_TARGET_ITEMS_PER_WORKER),
+		1,
+		MAX_PARALLEL_CHUNK_WORKERS
+	)
+end
+
+local function runParallelChunks(totalItems: number, workerCount: number, job: (number, number) -> ())
+	if totalItems <= 0 then
+		return
+	end
+
+	local clampedWorkers = math.clamp(workerCount, 1, totalItems)
+	if clampedWorkers <= 1 then
+		job(1, totalItems)
+		return
+	end
+
+	local completedWorkers = 0
+	local activeWorkers = 0
+	local firstError: any = nil
+	local finished = Instance.new("BindableEvent")
+
+	for workerIndex = 1, clampedWorkers do
+		local startIndex = math.floor(((workerIndex - 1) * totalItems) / clampedWorkers) + 1
+		local endIndex = math.floor((workerIndex * totalItems) / clampedWorkers)
+		if startIndex <= endIndex then
+			activeWorkers += 1
+			task.spawn(function()
+				local ok, err = pcall(job, startIndex, endIndex)
+				if not ok and firstError == nil then
+					firstError = err
+				end
+				completedWorkers += 1
+				if completedWorkers >= activeWorkers then
+					finished:Fire()
+				end
+			end)
+		end
+	end
+
+	if activeWorkers == 0 then
+		finished:Destroy()
+		return
+	end
+
+	if completedWorkers < activeWorkers then
+		finished.Event:Wait()
+	end
+	finished:Destroy()
+
+	if firstError ~= nil then
+		error(firstError)
+	end
+end
 
 local function requireChildModule(name: string): any
 	local child = script:FindFirstChild(name)
@@ -264,6 +350,8 @@ local PROPERTY_CANDIDATES = {
 	"Parent",
 	"Part0",
 	"Part1",
+	"Attachment0",
+	"Attachment1",
 	"AutoLocalize",
 	"RootLocalizationTable",
 	"BackgroundColor3",
@@ -536,6 +624,7 @@ type ServiceState = {
 	rootClassName: string,
 	rootPath: string,
 	pathByInstance: { [Instance]: string },
+	pathSegmentsByInstance: { [Instance]: { string } },
 	debugIdByInstance: { [Instance]: string | boolean },
 	instanceIdByInstance: { [Instance]: string | boolean },
 	scriptObjects: { LuaSourceContainer },
@@ -549,7 +638,10 @@ type ServiceState = {
 	scriptPathsEncoded: string?,
 	batchCacheByKey: { [string]: string },
 	batchCacheKeys: { string },
+	sourceBatchCacheByKey: { [string]: string },
+	sourceBatchCacheKeys: { string },
 	safeReadByClass: { [string]: boolean },
+	servicePropertyCandidatesByClass: { [string]: { string } }?,
 }
 
 local stateByService: { [string]: ServiceState } = {}
@@ -634,22 +726,54 @@ local function getRefPathSegments(instance: Instance): { string }?
 	return segments
 end
 
-local function serializeRefValue(state: ServiceState?, instance: Instance): any
-	local pathSegments = getRefPathSegments(instance)
-	if pathSegments == nil or #pathSegments == 0 then
+local function getCachedRefPathSegments(state: ServiceState, instance: Instance): { string }?
+	if instance == game then
+		return {}
+	end
+	if not instance:IsDescendantOf(game) then
 		return nil
 	end
 
-	local out = {
-		_type = "Ref",
-		pathSegments = pathSegments,
-	}
+	local cached = state.pathSegmentsByInstance[instance]
+	if cached ~= nil then
+		return cached
+	end
 
+	local parent = instance.Parent
+	local segments = {}
+	if parent ~= nil and parent ~= game then
+		local parentSegments = getCachedRefPathSegments(state, parent)
+		if parentSegments == nil then
+			return nil
+		end
+		for i, segment in ipairs(parentSegments) do
+			segments[i] = segment
+		end
+	end
+	segments[#segments + 1] = instance.Name
+	state.pathSegmentsByInstance[instance] = segments
+	return segments
+end
+
+local function serializeRefValue(state: ServiceState?, instance: Instance): any
 	if state ~= nil then
 		local cachedInstanceId = state.instanceIdByInstance[instance]
 		if type(cachedInstanceId) == "string" and #cachedInstanceId > 0 then
-			out.instanceId = cachedInstanceId
+			return {
+				_type = "Ref",
+				instanceId = cachedInstanceId,
+			}
 		end
+
+		local pathSegments = getCachedRefPathSegments(state, instance)
+		if pathSegments == nil or #pathSegments == 0 then
+			return nil
+		end
+
+		local out = {
+			_type = "Ref",
+			pathSegments = pathSegments,
+		}
 		local cachedDebugId = state.debugIdByInstance[instance]
 		if type(cachedDebugId) == "string" and #cachedDebugId > 0 then
 			out.debugId = cachedDebugId
@@ -659,13 +783,22 @@ local function serializeRefValue(state: ServiceState?, instance: Instance): any
 				out.debugId = debugId
 			end
 		end
-	else
-		local debugId = getDebugId(instance)
-		if debugId ~= nil and #debugId > 0 then
-			out.debugId = debugId
-		end
+		return out
 	end
 
+	local pathSegments = getRefPathSegments(instance)
+	if pathSegments == nil or #pathSegments == 0 then
+		return nil
+	end
+
+	local out = {
+		_type = "Ref",
+		pathSegments = pathSegments,
+	}
+	local debugId = getDebugId(instance)
+	if debugId ~= nil and #debugId > 0 then
+		out.debugId = debugId
+	end
 	return out
 end
 
@@ -1012,10 +1145,12 @@ local function ensureScriptIndex(state: ServiceState)
 	end
 	local scriptPaths = table.create(#state.scriptObjects)
 	local scriptInstances = {}
+	local yieldIfNeeded = makeBurstYielder()
 	for i, inst in ipairs(state.scriptObjects) do
 		local sourceKey = getCachedScriptSourceKey(state, inst)
 		scriptPaths[i] = sourceKey
 		scriptInstances[sourceKey] = inst
+		yieldIfNeeded()
 	end
 	table.sort(scriptPaths)
 	state.scriptPaths = scriptPaths
@@ -1048,25 +1183,28 @@ local function exportInstanceInternal(
 	debugId: string?,
 	parentDebugId: string?,
 	instanceId: string?,
-	parentInstanceId: string?
+	parentInstanceId: string?,
+	includePathData: boolean?
 ): { [string]: any }
 	local entry: { [string]: any } = {
 		name = instance.Name,
 		className = instance.ClassName,
-		path = path,
-		pathSegments = getRefPathSegments(instance),
-		parentPath = parentPath,
-		parentDebugId = parentDebugId,
 		parentInstanceId = parentInstanceId,
 		attributes = instance:GetAttributes(),
 	}
+	if includePathData ~= false then
+		entry.path = path
+		entry.pathSegments = getCachedRefPathSegments(state, instance)
+		entry.parentPath = parentPath
+		entry.parentDebugId = parentDebugId
+	end
 	local properties = {}
 	local defaultProperties = nil
 	if not EXPORT_ALL_PROPERTIES then
 		defaultProperties = getDefaultSerializedProperties(instance.ClassName)
 	end
 
-	if debugId then
+	if includePathData ~= false and debugId then
 		entry.debugId = debugId
 	end
 	if instanceId then
@@ -1146,7 +1284,8 @@ local function exportInstanceFast(
 	debugId: string?,
 	parentDebugId: string?,
 	instanceId: string?,
-	parentInstanceId: string?
+	parentInstanceId: string?,
+	includePathData: boolean?
 ): { [string]: any }
 	return exportInstanceInternal(
 		state,
@@ -1157,8 +1296,29 @@ local function exportInstanceFast(
 		debugId,
 		parentDebugId,
 		instanceId,
-		parentInstanceId
+		parentInstanceId,
+		includePathData
 	)
+end
+
+local function getServicePropertyCandidates(state: ServiceState): { [string]: { string } }
+	local cached = state.servicePropertyCandidatesByClass
+	if cached ~= nil then
+		return cached
+	end
+
+	local byClass = {}
+	for _, className in ipairs(state.classNames) do
+		local sourceNames = getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
+		local names = table.create(#sourceNames)
+		for i, propertyName in ipairs(sourceNames) do
+			names[i] = propertyName
+		end
+		byClass[className] = names
+	end
+
+	state.servicePropertyCandidatesByClass = byClass
+	return byClass
 end
 
 local function exportInstanceSafe(
@@ -1169,7 +1329,8 @@ local function exportInstanceSafe(
 	debugId: string?,
 	parentDebugId: string?,
 	instanceId: string?,
-	parentInstanceId: string?
+	parentInstanceId: string?,
+	includePathData: boolean?
 ): { [string]: any }
 	return exportInstanceInternal(
 		state,
@@ -1180,7 +1341,8 @@ local function exportInstanceSafe(
 		debugId,
 		parentDebugId,
 		instanceId,
-		parentInstanceId
+		parentInstanceId,
+		includePathData
 	)
 end
 
@@ -1192,7 +1354,8 @@ local function exportInstanceWithFallback(
 	debugId: string?,
 	parentDebugId: string?,
 	instanceId: string?,
-	parentInstanceId: string?
+	parentInstanceId: string?,
+	includePathData: boolean?
 ): { [string]: any }
 	local className = instance.ClassName
 	if state.safeReadByClass[className] then
@@ -1204,7 +1367,8 @@ local function exportInstanceWithFallback(
 			debugId,
 			parentDebugId,
 			instanceId,
-			parentInstanceId
+			parentInstanceId,
+			includePathData
 		)
 	end
 
@@ -1217,7 +1381,8 @@ local function exportInstanceWithFallback(
 		debugId,
 		parentDebugId,
 		instanceId,
-		parentInstanceId
+		parentInstanceId,
+		includePathData
 	)
 	if ok then
 		return entry
@@ -1232,10 +1397,95 @@ local function exportInstanceWithFallback(
 		debugId,
 		parentDebugId,
 		instanceId,
-		parentInstanceId
+		parentInstanceId,
+		includePathData
 	)
 end
 
+local function exportInstanceWithoutSharedFallback(
+	state: ServiceState,
+	instance: Instance,
+	path: string,
+	parentPath: string?,
+	debugId: string?,
+	parentDebugId: string?,
+	instanceId: string?,
+	parentInstanceId: string?,
+	includePathData: boolean?
+): { [string]: any }
+	local ok, entry = pcall(
+		exportInstanceFast,
+		state,
+		instance,
+		path,
+		parentPath,
+		debugId,
+		parentDebugId,
+		instanceId,
+		parentInstanceId,
+		includePathData
+	)
+	if ok then
+		return entry
+	end
+
+	return exportInstanceSafe(
+		state,
+		instance,
+		path,
+		parentPath,
+		debugId,
+		parentDebugId,
+		instanceId,
+		parentInstanceId,
+		includePathData
+	)
+end
+
+local function compactInstanceEntry(state: ServiceState, entry: { [string]: any }): { any }
+	local compactProperties = false
+	local properties = entry.properties
+	if type(properties) == "table" and next(properties) ~= nil then
+		local servicePropertyCandidates = getServicePropertyCandidates(state)
+		local propertyNames = servicePropertyCandidates[entry.className or ""] or PROPERTY_CANDIDATES
+		local pairsOut = table.create(#propertyNames * 2)
+		local emitted = {}
+		for i, propertyName in ipairs(propertyNames) do
+			local value = properties[propertyName]
+			if value ~= nil then
+				pairsOut[#pairsOut + 1] = i - 1
+				pairsOut[#pairsOut + 1] = value
+				emitted[propertyName] = true
+			end
+		end
+
+		local leftovers = {}
+		for propertyName, _ in pairs(properties) do
+			if emitted[propertyName] ~= true then
+				leftovers[#leftovers + 1] = propertyName
+			end
+		end
+		table.sort(leftovers)
+		for _, propertyName in ipairs(leftovers) do
+			pairsOut[#pairsOut + 1] = propertyName
+			pairsOut[#pairsOut + 1] = properties[propertyName]
+		end
+
+		if #pairsOut > 0 then
+			compactProperties = pairsOut
+		end
+	end
+
+	return {
+		entry.name or "",
+		entry.className or "",
+		compactProperties,
+		entry.sourceKey or false,
+		entry.attributes or false,
+		entry.instanceId or false,
+		entry.parentInstanceId or false,
+	}
+end
 local function prepareService(serviceName: string): { [string]: any }
 	if not ALLOWED_SERVICES[serviceName] then
 		error("Unsupported service: " .. tostring(serviceName))
@@ -1255,7 +1505,10 @@ local function prepareService(serviceName: string): { [string]: any }
 	local scriptCount = 0
 	local classSeen = {}
 	local classNames = {}
+	classSeen[service.ClassName] = true
+	classNames[1] = service.ClassName
 	local pathByInstance = { [service] = service.Name }
+	local pathSegmentsByInstance = { [service] = { service.Name } }
 	local debugIdByInstance: { [Instance]: string | boolean } = {}
 	local instanceIdByInstance: { [Instance]: string | boolean } = {}
 	local scriptKeyByInstance: { [Instance]: string } = {}
@@ -1267,15 +1520,12 @@ local function prepareService(serviceName: string): { [string]: any }
 	end
 	instanceIdByInstance[service] = string.format("%x", 1)
 
-	local serviceClassName = service.ClassName
-	classSeen[serviceClassName] = true
-	classNames[1] = serviceClassName
-
 	if service:IsA("LuaSourceContainer") then
 		scriptCount += 1
 		scriptObjects[scriptCount] = service
 	end
 
+	local yieldIfNeeded = makeBurstYielder()
 	for _, inst in ipairs(descendants) do
 		instanceCount += 1
 		instances[instanceCount] = inst
@@ -1297,6 +1547,7 @@ local function prepareService(serviceName: string): { [string]: any }
 			scriptCount += 1
 			scriptObjects[scriptCount] = inst
 		end
+		yieldIfNeeded()
 	end
 
 	stateByService[serviceName] = {
@@ -1307,6 +1558,7 @@ local function prepareService(serviceName: string): { [string]: any }
 		rootClassName = service.ClassName,
 		rootPath = service.Name,
 		pathByInstance = pathByInstance,
+		pathSegmentsByInstance = pathSegmentsByInstance,
 		debugIdByInstance = debugIdByInstance,
 		instanceIdByInstance = instanceIdByInstance,
 		scriptObjects = scriptObjects,
@@ -1320,31 +1572,43 @@ local function prepareService(serviceName: string): { [string]: any }
 		scriptPathsEncoded = nil,
 		batchCacheByKey = {},
 		batchCacheKeys = {},
+		sourceBatchCacheByKey = {},
+		sourceBatchCacheKeys = {},
 		safeReadByClass = {},
+		servicePropertyCandidatesByClass = nil,
 	}
 
 	local state = stateByService[serviceName]
-	if PRE_SERIALIZE_ON_PREPARE then
+	local scriptKeyYieldIfNeeded = makeBurstYielder()
+	for _, inst in ipairs(scriptObjects) do
+		getCachedScriptSourceKey(state, inst)
+		scriptKeyYieldIfNeeded()
+	end
+	if PRE_SERIALIZE_ON_PREPARE and instanceCount <= PRE_SERIALIZE_MAX_INSTANCES then
 		local serialized = table.create(instanceCount)
-		for i, inst in ipairs(instances) do
-			local path = getCachedInstancePath(state, inst)
-			local parentPath = getCachedParentPath(state, inst)
-			local debugId = getCachedDebugId(state, inst)
-			local parentDebugId = getCachedParentDebugId(state, inst)
-			local instanceId = getCachedInstanceId(state, inst)
-			local parentInstanceId = getCachedParentInstanceId(state, inst)
-			local entry = exportInstanceWithFallback(
-				state,
-				inst,
-				path,
-				parentPath,
-				debugId,
-				parentDebugId,
-				instanceId,
-				parentInstanceId
-			)
-			serialized[i] = entry
-		end
+		local workerCount = getParallelChunkWorkerCount(instanceCount, PARALLEL_PRE_SERIALIZE_MIN_ITEMS)
+		runParallelChunks(instanceCount, workerCount, function(startIndex, endIndex)
+			for i = startIndex, endIndex do
+				local inst = instances[i]
+				local path = getCachedInstancePath(state, inst)
+				local parentPath = getCachedParentPath(state, inst)
+				local debugId = getCachedDebugId(state, inst)
+				local parentDebugId = getCachedParentDebugId(state, inst)
+				local instanceId = getCachedInstanceId(state, inst)
+				local parentInstanceId = getCachedParentInstanceId(state, inst)
+				serialized[i] = exportInstanceWithoutSharedFallback(
+					state,
+					inst,
+					path,
+					parentPath,
+					debugId,
+					parentDebugId,
+					instanceId,
+					parentInstanceId,
+					true
+				)
+			end
+		end)
 		state.serializedInstances = serialized
 	end
 
@@ -1356,6 +1620,8 @@ local function prepareService(serviceName: string): { [string]: any }
 		rootPath = state.rootPath,
 		instanceCount = instanceCount,
 		scriptCount = scriptCount,
+		preSerialized = state.serializedInstances ~= nil,
+		propertyCandidatesByClass = getServicePropertyCandidates(state),
 	}
 end
 
@@ -1390,33 +1656,110 @@ local function getInstanceBatch(serviceName: string, startIndex: number?, maxCou
 	else
 		local finish = math.min(total, startPos + take - 1)
 		local items = table.create(finish - startPos + 1)
+		local count = finish - startPos + 1
 		if state.serializedInstances then
 			for i = startPos, finish do
 				items[#items + 1] = state.serializedInstances[i]
 			end
 		else
-			for i = startPos, finish do
-				local inst = instances[i]
-				local path = getCachedInstancePath(state, inst)
-				local parentPath = getCachedParentPath(state, inst)
-				local debugId = getCachedDebugId(state, inst)
-				local parentDebugId = getCachedParentDebugId(state, inst)
-				local instanceId = getCachedInstanceId(state, inst)
-				local parentInstanceId = getCachedParentInstanceId(state, inst)
-				local entry = exportInstanceWithFallback(
-					state,
-					inst,
-					path,
-					parentPath,
-					debugId,
-					parentDebugId,
-					instanceId,
-					parentInstanceId
-				)
-				items[#items + 1] = entry
-			end
+			local workerCount = getParallelChunkWorkerCount(count, PARALLEL_INSTANCE_BATCH_MIN_ITEMS)
+			runParallelChunks(count, workerCount, function(startOffset, endOffset)
+				for offset = startOffset, endOffset do
+					local i = startPos + offset - 1
+					local inst = instances[i]
+					local path = getCachedInstancePath(state, inst)
+					local parentPath = getCachedParentPath(state, inst)
+					local debugId = getCachedDebugId(state, inst)
+					local parentDebugId = getCachedParentDebugId(state, inst)
+					local instanceId = getCachedInstanceId(state, inst)
+					local parentInstanceId = getCachedParentInstanceId(state, inst)
+					items[offset] = exportInstanceWithoutSharedFallback(
+						state,
+						inst,
+						path,
+						parentPath,
+						debugId,
+						parentDebugId,
+						instanceId,
+						parentInstanceId,
+						true
+					)
+				end
+			end)
 		end
 		encoded = HttpService:JSONEncode({
+			start = startPos,
+			nextStart = finish + 1,
+			total = total,
+			items = items,
+		})
+	end
+
+	state.batchCacheByKey[key] = encoded
+	state.batchCacheKeys[#state.batchCacheKeys + 1] = key
+	if #state.batchCacheKeys > 256 then
+		local oldestKey = table.remove(state.batchCacheKeys, 1)
+		if oldestKey and oldestKey ~= key then
+			state.batchCacheByKey[oldestKey] = nil
+		end
+	end
+	return encoded
+end
+
+local function getInstanceBatchCompact(serviceName: string, startIndex: number?, maxCount: number?): string
+	local state = getState(serviceName)
+	local key = "compact:" .. tostring(startIndex or 1) .. ":" .. tostring(maxCount or 300)
+	local cachedPayload = state.batchCacheByKey[key]
+	if cachedPayload then
+		return cachedPayload
+	end
+
+	local instances = state.instances
+	local total = #instances
+	local startPos = math.max(1, startIndex or 1)
+	local take = math.max(1, maxCount or 300)
+	local encoded: string
+
+	if startPos > total then
+		encoded = HttpService:JSONEncode({
+			format = "compact",
+			start = startPos,
+			nextStart = startPos,
+			total = total,
+			items = {},
+		})
+	else
+		local finish = math.min(total, startPos + take - 1)
+		local count = finish - startPos + 1
+		local items = table.create(count)
+		if state.serializedInstances then
+			for i = startPos, finish do
+				items[#items + 1] = compactInstanceEntry(state, state.serializedInstances[i])
+			end
+		else
+			local workerCount = getParallelChunkWorkerCount(count, PARALLEL_INSTANCE_BATCH_MIN_ITEMS)
+			runParallelChunks(count, workerCount, function(startOffset, endOffset)
+				for offset = startOffset, endOffset do
+					local i = startPos + offset - 1
+					local inst = instances[i]
+					local instanceId = getCachedInstanceId(state, inst)
+					local parentInstanceId = getCachedParentInstanceId(state, inst)
+					items[offset] = compactInstanceEntry(state, exportInstanceWithoutSharedFallback(
+						state,
+						inst,
+						"",
+						nil,
+						nil,
+						nil,
+						instanceId,
+						parentInstanceId,
+						false
+					))
+				end
+			end)
+		end
+		encoded = HttpService:JSONEncode({
+			format = "compact",
 			start = startPos,
 			nextStart = finish + 1,
 			total = total,
@@ -1481,6 +1824,68 @@ local function getSourceChunk(serviceName: string, instancePath: string, startIn
 	return chunkEncodedString(src, startIndex, maxLen)
 end
 
+local function getSourceBatchEncoded(serviceName: string, instancePaths: { any }): string
+	local state = getState(serviceName)
+	ensureScriptIndex(state)
+	local normalizedPaths = table.create(#instancePaths)
+	for i, value in ipairs(instancePaths) do
+		normalizedPaths[i] = tostring(value)
+	end
+	local cacheKey = table.concat(normalizedPaths, "\0")
+	local cachedPayload = state.sourceBatchCacheByKey[cacheKey]
+	if cachedPayload then
+		return cachedPayload
+	end
+
+	local out = {}
+	local sourcesByIndex = table.create(#normalizedPaths)
+	local workerCount = getParallelChunkWorkerCount(#normalizedPaths, PARALLEL_SOURCE_BATCH_MIN_ITEMS)
+	runParallelChunks(#normalizedPaths, workerCount, function(startIndex, endIndex)
+		for i = startIndex, endIndex do
+			local instancePath = normalizedPaths[i]
+			local src = state.scriptSources[instancePath]
+			if src == nil then
+				local scriptInstance = state.scriptInstances and state.scriptInstances[instancePath] or nil
+				if scriptInstance == nil then
+					src = ""
+				else
+					local ok, loaded = pcall(function()
+						return scriptInstance.Source
+					end)
+					src = ok and loaded or ""
+				end
+			end
+			sourcesByIndex[i] = src
+		end
+	end)
+	for i, instancePath in ipairs(normalizedPaths) do
+		local src = sourcesByIndex[i] or ""
+		state.scriptSources[instancePath] = src
+		out[instancePath] = src
+	end
+
+	local encoded = HttpService:JSONEncode(out)
+	state.sourceBatchCacheByKey[cacheKey] = encoded
+	state.sourceBatchCacheKeys[#state.sourceBatchCacheKeys + 1] = cacheKey
+	if #state.sourceBatchCacheKeys > 64 then
+		local oldestKey = table.remove(state.sourceBatchCacheKeys, 1)
+		if oldestKey and oldestKey ~= cacheKey then
+			state.sourceBatchCacheByKey[oldestKey] = nil
+		end
+	end
+	return encoded
+end
+
+local function getSourceBatchChunk(
+	serviceName: string,
+	instancePaths: { any },
+	startIndex: number?,
+	maxLen: number?
+): { [string]: any }
+	local encoded = getSourceBatchEncoded(serviceName, instancePaths)
+	return chunkEncodedString(encoded, startIndex, maxLen)
+end
+
 local perfState
 
 local function handleMethod(method: string, params: { [string]: any }?): any
@@ -1503,12 +1908,17 @@ local function handleMethod(method: string, params: { [string]: any }?): any
 	elseif method == "getInstanceBatchChunk" then
 		local encoded = getInstanceBatch(tostring(p.service), p.startIndex, p.maxCount)
 		return chunkEncodedString(encoded, p.chunkStart, p.maxLen)
+	elseif method == "getInstanceBatchCompactChunk" then
+		local encoded = getInstanceBatchCompact(tostring(p.service), p.startIndex, p.maxCount)
+		return chunkEncodedString(encoded, p.chunkStart, p.maxLen)
 	elseif method == "getClassDefaultsChunk" then
 		local encoded = getClassDefaults(tostring(p.service))
 		return chunkEncodedString(encoded, p.startIndex, p.maxLen)
 	elseif method == "getScriptPathsChunk" then
 		local encoded = getScriptPaths(tostring(p.service))
 		return chunkEncodedString(encoded, p.startIndex, p.maxLen)
+	elseif method == "getSourceBatchChunk" then
+		return getSourceBatchChunk(tostring(p.service), p.instancePaths or {}, p.startIndex, p.maxLen)
 	elseif method == "getSourceChunk" then
 		return getSourceChunk(tostring(p.service), tostring(p.instancePath), p.startIndex, p.maxLen)
 	elseif method == "release" then
@@ -1795,7 +2205,7 @@ reconnectAll()
       <Item class="ModuleScript" referent="2">
         <Properties>
           <string name="Name">BridgeSettings</string>
-          <string name="Source"><![CDATA[local BridgeSettings = {}
+          <string name="Source">local BridgeSettings = {}
 
 function BridgeSettings.parsePortsCsv(raw)
 	local out = {}
@@ -1807,7 +2217,7 @@ function BridgeSettings.parsePortsCsv(raw)
 			return nil
 		end
 		local port = math.floor(num)
-		if port <= 0 or port > 65535 then
+		if port &lt;= 0 or port > 65535 then
 			return nil
 		end
 		if not seen[port] then
@@ -1837,7 +2247,7 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 		for _, value in ipairs(configuredPorts) do
 			if type(value) == "number" and value > 0 then
 				local port = math.floor(value)
-				if port <= 65535 and not seen[port] then
+				if port &lt;= 65535 and not seen[port] then
 					seen[port] = true
 					table.insert(valid, port)
 				end
@@ -1871,8 +2281,7 @@ function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
 	plugin:SetSetting(prefix .. "ports", ports)
 end
 
-return BridgeSettings
-]]></string>
+return BridgeSettings</string>
         </Properties>
       </Item>
       <Item class="ModuleScript" referent="3">

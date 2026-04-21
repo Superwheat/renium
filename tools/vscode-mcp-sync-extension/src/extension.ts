@@ -626,7 +626,7 @@ class RobloxSyncController {
       if (!this.warnedBridgePortLimit) {
         this.warnedBridgePortLimit = true;
         this.output.appendLine(
-          `[roblox-sync] config: only 4 bridge ports are supported; using ${normalized
+          `[roblox-sync] config: only ${DEFAULT_BRIDGE_PORTS.length} bridge ports are supported; using ${normalized
             .slice(0, DEFAULT_BRIDGE_PORTS.length)
             .join(",")}.`,
         );

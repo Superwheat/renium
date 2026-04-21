@@ -42,34 +42,6 @@ The bundle is built from [ParallelExportBridge.project.json](E:/Documents/rblx/p
 
 When the `RbxDom` module tree is present, the plugin automatically derives class/property export candidates from the Luau `rbx_dom_lua` database instead of relying on the small hardcoded property list.
 
-## Local daemon (test harness)
-
-`ws_bridge_daemon.py` is a local test daemon that accepts plugin connections.
-
-Install dependency:
-
-```bash
-pip install websockets
-```
-
-Run:
-
-```bash
-python tools/plugin_ws_bridge/ws_bridge_daemon.py --host 127.0.0.1 --ports 8781,8782,8783,8784
-```
-
-Important:
-
-- `mcp_sync_export.py --transport ws` starts its own bridge server on the same ports.
-- Do not run `ws_bridge_daemon.py` at the same time unless you use different ports for one of them.
-
-Then in daemon console:
-
-- `status`
-- `ping`
-- `prepare Workspace`
-- `batch Workspace 1 600`
-
 ## Wire protocol (JSON over WebSocket)
 
 Request:
@@ -108,4 +80,3 @@ Error response:
 
 - This is Studio-only.
 - Roblox currently limits active WebStream clients; keep channel count conservative.
-- Close/reconnect channels if your daemon restarts.
