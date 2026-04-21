@@ -2,14 +2,10 @@ local BridgeStatus = {}
 
 function BridgeStatus.render(state)
 	local lines = {
-		("Enabled: %s"):format(state.enabled and "ON" or "OFF"),
 		("Host: %s"):format(state.host),
 		("Ports: %s"):format(table.concat(state.ports, ", ")),
 		("ExportAllProperties: %s"):format(state.exportAllProperties and "ON" or "OFF"),
-		("PreSerialize: %s%s"):format(
-			state.preSerializeOnPrepare and "ON" or "OFF",
-			state.preSerializeInstanceThreshold and (" (<=%d)"):format(state.preSerializeInstanceThreshold) or ""
-		),
+		("PreSerialize: %s"):format(state.preSerializeOnPrepare and "ON" or "OFF"),
 		"",
 	}
 	for _, channel in ipairs(state.channels) do

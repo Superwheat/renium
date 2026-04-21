@@ -67,11 +67,6 @@ local openButton = toolbar:CreateButton(
 	"Open Parallel Export Bridge panel",
 	"rbxassetid://4458901886"
 )
-local toggleButton = toolbar:CreateButton(
-	"Bridge Enabled",
-	"Enable or disable Parallel Export Bridge connections",
-	"rbxassetid://4458901886"
-)
 local reconnectButton = toolbar:CreateButton(
 	"Reconnect",
 	"Reconnect all WebSocket channels",
@@ -99,7 +94,7 @@ do
 	end
 end
 statusWidget.Title = "Parallel Export Bridge"
-statusWidget.Enabled = false
+statusWidget.Enabled = true
 
 function UI.showWidget()
 	statusWidget.Enabled = true
@@ -196,16 +191,6 @@ applyButton.TextSize = 13
 applyButton.Text = "Apply + Reconnect"
 applyButton.Parent = controlsFrame
 
-local enabledButton = Instance.new("TextButton")
-enabledButton.Size = UDim2.new(0, 140, 0, 28)
-enabledButton.Position = UDim2.new(0, 0, 0, 96)
-enabledButton.BackgroundColor3 = Color3.fromRGB(95, 35, 35)
-enabledButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-enabledButton.Font = Enum.Font.Code
-enabledButton.TextSize = 13
-enabledButton.Text = "Bridge: OFF"
-enabledButton.Parent = controlsFrame
-
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(1, -12, 1, -142)
 statusLabel.Position = UDim2.new(0, 6, 0, 136)
@@ -231,7 +216,6 @@ function UI.applyStudioTheme()
 		exportAllButton = exportAllButton,
 		preSerializeButton = preSerializeButton,
 		applyButton = applyButton,
-		enabledButton = enabledButton,
 		statusLabel = statusLabel,
 	})
 end
@@ -241,7 +225,6 @@ settings().Studio.ThemeChanged:Connect(UI.applyStudioTheme)
 
 local host: string = SettingsModule.loadHost(plugin, SETTINGS_PREFIX, DEFAULT_HOST)
 local ports: { number } = SettingsModule.loadPorts(plugin, SETTINGS_PREFIX, DEFAULT_PORTS)
-local BRIDGE_ENABLED: boolean = SettingsModule.loadEnabled(plugin, SETTINGS_PREFIX, false)
 
 hostBox.Text = host
 portsBox.Text = table.concat(ports, ",")
@@ -520,7 +503,6 @@ local CLASS_PROPERTY_CANDIDATES_CACHE: { [string]: any } = {}
 local EXPORT_ALL_PROPERTIES = true
 local configuredPreSerialize = plugin:GetSetting(SETTINGS_PREFIX .. "preSerialize")
 local PRE_SERIALIZE_ON_PREPARE = configuredPreSerialize ~= false
-local PRE_SERIALIZE_INSTANCE_THRESHOLD = 5000
 local EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS: { [string]: { string } } = buildPropertyCandidatesFromRbxDom(RbxDomDatabase)
 do
 	local classCount, propertyCount = countPropertyCandidates(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
@@ -535,10 +517,7 @@ do
 end
 
 exportAllButton.Text = "Export All Properties: ON (Locked)"
-preSerializeButton.Text = ("Pre-Serialize: %s (<=%d)"):format(
-	PRE_SERIALIZE_ON_PREPARE and "ON" or "OFF",
-	PRE_SERIALIZE_INSTANCE_THRESHOLD
-)
+preSerializeButton.Text = ("Pre-Serialize: %s"):format(PRE_SERIALIZE_ON_PREPARE and "ON" or "OFF")
 
 type ServiceState = {
 	instances: { Instance },
@@ -559,7 +538,6 @@ type ServiceState = {
 	classDefaultsEncoded: string?,
 	serializedInstances: { [number]: any }?,
 	scriptPathsEncoded: string?,
-	sourceBatchEncodedByKey: { [string]: string },
 	batchCacheByKey: { [string]: string },
 	batchCacheKeys: { string },
 	safeReadByClass: { [string]: boolean },
@@ -581,21 +559,12 @@ local channels: {
 
 function UI.updateStatusText()
 	statusLabel.Text = StatusModule.render({
-		enabled = BRIDGE_ENABLED,
 		host = host,
 		ports = ports,
 		exportAllProperties = EXPORT_ALL_PROPERTIES,
 		preSerializeOnPrepare = PRE_SERIALIZE_ON_PREPARE,
-		preSerializeInstanceThreshold = PRE_SERIALIZE_INSTANCE_THRESHOLD,
 		channels = channels,
 	})
-end
-
-function UI.updateEnabledState()
-	enabledButton.Text = ("Bridge: %s"):format(BRIDGE_ENABLED and "ON" or "OFF")
-	enabledButton.BackgroundColor3 = BRIDGE_ENABLED and Color3.fromRGB(35, 95, 55)
-		or Color3.fromRGB(95, 35, 35)
-	toggleButton:SetActive(BRIDGE_ENABLED)
 end
 
 local function tryRead(instance: Instance, propertyName: string): (boolean, any)
@@ -885,15 +854,11 @@ local function configureExportOptions(payload: any): { [string]: any }
 	plugin:SetSetting(SETTINGS_PREFIX .. "exportAllProperties", true)
 	plugin:SetSetting(SETTINGS_PREFIX .. "preSerialize", PRE_SERIALIZE_ON_PREPARE)
 	exportAllButton.Text = "Export All Properties: ON (Locked)"
-	preSerializeButton.Text = ("Pre-Serialize: %s (<=%d)"):format(
-		PRE_SERIALIZE_ON_PREPARE and "ON" or "OFF",
-		PRE_SERIALIZE_INSTANCE_THRESHOLD
-	)
+	preSerializeButton.Text = ("Pre-Serialize: %s"):format(PRE_SERIALIZE_ON_PREPARE and "ON" or "OFF")
 	UI.updateStatusText()
 	return {
 		exportAllProperties = true,
 		preSerializeOnPrepare = PRE_SERIALIZE_ON_PREPARE,
-		preSerializeInstanceThreshold = PRE_SERIALIZE_INSTANCE_THRESHOLD,
 	}
 end
 
@@ -1344,15 +1309,13 @@ local function prepareService(serviceName: string): { [string]: any }
 		classDefaultsEncoded = nil,
 		serializedInstances = nil,
 		scriptPathsEncoded = nil,
-		sourceBatchEncodedByKey = {},
 		batchCacheByKey = {},
 		batchCacheKeys = {},
 		safeReadByClass = {},
 	}
 
 	local state = stateByService[serviceName]
-	local preSerialized = PRE_SERIALIZE_ON_PREPARE and instanceCount <= PRE_SERIALIZE_INSTANCE_THRESHOLD
-	if preSerialized then
+	if PRE_SERIALIZE_ON_PREPARE then
 		local serialized = table.create(instanceCount)
 		for i, inst in ipairs(instances) do
 			local path = getCachedInstancePath(state, inst)
@@ -1384,8 +1347,6 @@ local function prepareService(serviceName: string): { [string]: any }
 		rootPath = state.rootPath,
 		instanceCount = instanceCount,
 		scriptCount = scriptCount,
-		preSerialized = preSerialized,
-		preSerializeInstanceThreshold = PRE_SERIALIZE_INSTANCE_THRESHOLD,
 	}
 end
 
@@ -1493,54 +1454,22 @@ local function getScriptPaths(serviceName: string): string
 	return state.scriptPathsEncoded
 end
 
-local function getOrLoadScriptSource(state: ServiceState, instancePath: string): string
-	local src = state.scriptSources[instancePath]
-	if src ~= nil then
-		return src
-	end
-
-	local scriptInstance = state.scriptInstances and state.scriptInstances[instancePath] or nil
-	if scriptInstance == nil then
-		return ""
-	end
-
-	local ok, loaded = pcall(function()
-		return scriptInstance.Source
-	end)
-	src = ok and loaded or ""
-	state.scriptSources[instancePath] = src
-	return src
-end
-
 local function getSourceChunk(serviceName: string, instancePath: string, startIndex: number?, maxLen: number?): { [string]: any }
 	local state = getState(serviceName)
 	ensureScriptIndex(state)
-	local src = getOrLoadScriptSource(state, instancePath)
-	return chunkEncodedString(src, startIndex, maxLen)
-end
-
-local function getSourceBatchChunk(
-	serviceName: string,
-	instancePaths: { string },
-	startIndex: number?,
-	maxLen: number?
-): { [string]: any }
-	local state = getState(serviceName)
-	ensureScriptIndex(state)
-	local cacheKey = table.concat(instancePaths, "\n")
-	local encoded = state.sourceBatchEncodedByKey[cacheKey]
-	if not encoded then
-		local entries = table.create(#instancePaths)
-		for i, instancePath in ipairs(instancePaths) do
-			entries[i] = {
-				instancePath = instancePath,
-				source = getOrLoadScriptSource(state, instancePath),
-			}
+	local src = state.scriptSources[instancePath]
+	if src == nil then
+		local scriptInstance = state.scriptInstances and state.scriptInstances[instancePath] or nil
+		if scriptInstance == nil then
+			return { start = 1, nextStart = 1, total = 0, chunk = "" }
 		end
-		encoded = HttpService:JSONEncode(entries)
-		state.sourceBatchEncodedByKey[cacheKey] = encoded
+		local ok, loaded = pcall(function()
+			return scriptInstance.Source
+		end)
+		src = ok and loaded or ""
+		state.scriptSources[instancePath] = src
 	end
-	return chunkEncodedString(encoded, startIndex, maxLen)
+	return chunkEncodedString(src, startIndex, maxLen)
 end
 
 local perfState
@@ -1573,13 +1502,6 @@ local function handleMethod(method: string, params: { [string]: any }?): any
 		return chunkEncodedString(encoded, p.startIndex, p.maxLen)
 	elseif method == "getSourceChunk" then
 		return getSourceChunk(tostring(p.service), tostring(p.instancePath), p.startIndex, p.maxLen)
-	elseif method == "getSourceBatchChunk" then
-		return getSourceBatchChunk(
-			tostring(p.service),
-			type(p.instancePaths) == "table" and p.instancePaths or {},
-			p.startIndex,
-			p.maxLen
-		)
 	elseif method == "release" then
 		stateByService[tostring(p.service)] = nil
 		return "ok"
@@ -1782,10 +1704,6 @@ connectChannel = function(channel)
 end
 
 local function reconnectAll()
-	if not BRIDGE_ENABLED then
-		UI.updateStatusText()
-		return
-	end
 	for _, channel in ipairs(channels) do
 		channel.shouldReconnect = true
 		closeChannel(channel)
@@ -1807,25 +1725,9 @@ local function resetChannels()
 			open = false,
 			connecting = false,
 			reconnectScheduled = false,
-			shouldReconnect = BRIDGE_ENABLED,
+			shouldReconnect = true,
 		}
 	end
-end
-
-local function setBridgeEnabled(enabled: boolean)
-	BRIDGE_ENABLED = enabled == true
-	SettingsModule.saveEnabled(plugin, SETTINGS_PREFIX, BRIDGE_ENABLED)
-	for _, channel in ipairs(channels) do
-		channel.shouldReconnect = BRIDGE_ENABLED
-		if not BRIDGE_ENABLED then
-			closeChannel(channel)
-		end
-	end
-	if BRIDGE_ENABLED then
-		reconnectAll()
-	end
-	UI.updateEnabledState()
-	UI.updateStatusText()
 end
 
 function Config.parsePortsCsv(raw: string): { number }?
@@ -1851,9 +1753,7 @@ function Config.applyWidgetSettings()
 
 	resetChannels()
 	UI.updateStatusText()
-	if BRIDGE_ENABLED then
-		reconnectAll()
-	end
+	reconnectAll()
 end
 
 preSerializeButton.MouseButton1Click:Connect(function()
@@ -1866,22 +1766,10 @@ applyButton.MouseButton1Click:Connect(function()
 	Config.applyWidgetSettings()
 end)
 
-enabledButton.MouseButton1Click:Connect(function()
-	setBridgeEnabled(not BRIDGE_ENABLED)
-end)
-
 openButton.Click:Connect(UI.showWidget)
-toggleButton.Click:Connect(function()
-	setBridgeEnabled(not BRIDGE_ENABLED)
-	UI.showWidget()
-end)
 reconnectButton.Click:Connect(function()
 	UI.showWidget()
-	if not BRIDGE_ENABLED then
-		setBridgeEnabled(true)
-	else
-		reconnectAll()
-	end
+	reconnectAll()
 end)
 plugin.Unloading:Connect(function()
 	for _, channel in ipairs(channels) do
@@ -1891,8 +1779,5 @@ plugin.Unloading:Connect(function()
 end)
 
 resetChannels()
-UI.updateEnabledState()
 UI.updateStatusText()
-if BRIDGE_ENABLED then
-	reconnectAll()
-end
+reconnectAll()

@@ -32,17 +32,6 @@ const DEFAULT_SERVICES: [&str; 11] = [
     "StarterPlayer",
 ];
 
-fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1000.0
-}
-
-fn log_timing(label: &str, started: Instant) {
-    println!(
-        "[roblox-sync-rs] timing: {label} took {:.1}ms",
-        elapsed_ms(started)
-    );
-}
-
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -226,13 +215,6 @@ struct BridgeChunk {
     total: usize,
     #[serde(default)]
     chunk: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScriptSourceBatchEntry {
-    #[serde(rename = "instancePath")]
-    instance_path: String,
-    source: String,
 }
 
 struct ExportedSnapshotParts {
@@ -576,26 +558,19 @@ impl SourcemapWriter {
             while let Ok(message) = receiver.recv() {
                 match message {
                     SourcemapWriterMessage::Service(service, node) => {
-                        let started = Instant::now();
                         service_nodes.insert(service, node);
                         write_project_sourcemap_temp_from_service_nodes(
                             &project_root,
                             &service_nodes,
                         )?;
-                        log_timing("sourcemap incremental write", started);
                     }
                     SourcemapWriterMessage::Finish => {
-                        let started = Instant::now();
                         finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
-                        log_timing("sourcemap finalize", started);
                         return Ok(());
                     }
                 }
             }
-            let started = Instant::now();
-            finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
-            log_timing("sourcemap finalize", started);
-            Ok(())
+            finalize_project_sourcemap_temp(&project_root, &service_nodes)
         });
 
         Self {
@@ -662,22 +637,11 @@ impl DirectImportDispatcher {
                         break;
                     };
 
-                    let worker_started = Instant::now();
-                    println!(
-                        "[roblox-sync-rs] {}: direct import worker start",
-                        task.service
-                    );
                     let src_root = root_clone.join("src");
-                    let decode_started = Instant::now();
                     let import_result = fs::create_dir_all(&src_root)
                         .with_context(|| format!("Failed to create {}", src_root.display()))
                         .and_then(|_| exported_parts_to_service_state(&task.service, task.parts))
                         .and_then(|state| {
-                            log_timing(
-                                &format!("{}: build service state", task.service),
-                                decode_started,
-                            );
-                            let import_started = Instant::now();
                             import_service_state_with_sourcemap(
                                 &state,
                                 &root_clone,
@@ -685,13 +649,6 @@ impl DirectImportDispatcher {
                                 &task.service,
                                 compact_meta_json,
                             )
-                            .map(|node| {
-                                log_timing(
-                                    &format!("{}: import + sourcemap build", task.service),
-                                    import_started,
-                                );
-                                node
-                            })
                         });
                     match import_result {
                         Ok(node) => {
@@ -706,10 +663,6 @@ impl DirectImportDispatcher {
                                 Err(poisoned) => poisoned.into_inner(),
                             };
                             nodes.insert(task.service.clone(), node);
-                            log_timing(
-                                &format!("{}: direct import worker total", task.service),
-                                worker_started,
-                            );
                         }
                         Err(err) => {
                             let mut slot = match error_clone.lock() {
@@ -782,7 +735,6 @@ impl Drop for DirectImportDispatcher {
 }
 
 fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
-    let export_started = Instant::now();
     if args.transport != "ws" {
         bail!("Only --transport ws is supported in rust exporter");
     }
@@ -909,7 +861,6 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
     };
 
     for service in &services {
-        let service_started = Instant::now();
         if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
             dispatcher.check_error()?;
         }
@@ -932,32 +883,21 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
 
         if direct_import_mode {
             if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
-                let queue_started = Instant::now();
                 dispatcher.enqueue_parts(service, parts)?;
-                log_timing(&format!("{service}: queue direct import"), queue_started);
             }
         } else {
-            let snapshot_started = Instant::now();
             let snapshot = exported_parts_to_snapshot(parts);
-            log_timing(&format!("{service}: build snapshot json"), snapshot_started);
-            let write_started = Instant::now();
             write_snapshot_file(&snapshot_dir, service, &snapshot)?;
-            log_timing(&format!("{service}: write snapshot file"), write_started);
         }
-        log_timing(&format!("{service}: total export service"), service_started);
     }
 
     if run_import {
         if direct_import_mode {
             let mut sourcemap_nodes = HashMap::new();
             if let Some(dispatcher) = direct_import_dispatcher.take() {
-                let finish_started = Instant::now();
                 sourcemap_nodes = dispatcher.finish()?;
-                log_timing("direct import dispatcher drain", finish_started);
             }
-            let project_started = Instant::now();
             write_generated_project(&project_root, &services, compact_meta_json)?;
-            log_timing("write generated project", project_started);
             if let Some(writer) = sourcemap_writer {
                 if let Err(err) = writer.finish() {
                     println!("[roblox-sync-rs] warning: {err}");
@@ -980,7 +920,6 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
         }
     }
 
-    log_timing("full export-snapshots run", export_started);
     println!("[roblox-sync-rs] export done");
     Ok(())
 }
@@ -1186,10 +1125,7 @@ fn export_single_service_parts(
     instance_workers: usize,
     cached_tune: Option<AdaptiveTuneEntry>,
 ) -> Result<ExportedSnapshotParts> {
-    let service_started = Instant::now();
-    let prepare_started = Instant::now();
     let prepare = bridge.call("prepare", json!({ "service": service }))?;
-    log_timing(&format!("{service}: prepare"), prepare_started);
     let instance_count = prepare
         .get("instanceCount")
         .and_then(Value::as_u64)
@@ -1198,31 +1134,15 @@ fn export_single_service_parts(
         .get("scriptCount")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
-    let pre_serialized = prepare
-        .get("preSerialized")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let pre_serialize_threshold = prepare
-        .get("preSerializeInstanceThreshold")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
 
     println!(
-        "[roblox-sync-rs] {service}: prepared instances={}, scripts={}, pre_serialized={}{}",
-        instance_count,
-        script_count,
-        pre_serialized,
-        if pre_serialize_threshold > 0 {
-            format!(", pre_serialize_threshold={pre_serialize_threshold}")
-        } else {
-            String::new()
-        }
+        "[roblox-sync-rs] {service}: prepared instances={}, scripts={}",
+        instance_count, script_count
     );
 
     let (class_defaults, mut instance_fetch, source_by_key) =
         thread::scope(|scope| -> Result<_> {
             let class_defaults_task = scope.spawn(|| {
-                let started = Instant::now();
                 fetch_json_payload(chunk_size, |chunk_start, max_len| {
                     bridge.call(
                         "getClassDefaultsChunk",
@@ -1233,13 +1153,8 @@ fn export_single_service_parts(
                         }),
                     )
                 })
-                .map(|value| {
-                    log_timing(&format!("{service}: class defaults fetch"), started);
-                    value
-                })
             });
 
-            let script_paths_started = Instant::now();
             let script_paths_value = fetch_json_payload(chunk_size, |chunk_start, max_len| {
                 bridge.call(
                     "getScriptPathsChunk",
@@ -1250,10 +1165,6 @@ fn export_single_service_parts(
                     }),
                 )
             })?;
-            log_timing(
-                &format!("{service}: script path fetch"),
-                script_paths_started,
-            );
             let script_paths = script_paths_value
                 .as_array()
                 .with_context(|| format!("Invalid script path list for {service}"))?;
@@ -1276,7 +1187,6 @@ fn export_single_service_parts(
 
             let script_keys_for_sources = script_keys.clone();
             let source_fetch_task = scope.spawn(move || {
-                let started = Instant::now();
                 fetch_script_sources(
                     bridge,
                     service,
@@ -1284,13 +1194,8 @@ fn export_single_service_parts(
                     &script_keys_for_sources,
                     source_worker_count,
                 )
-                .map(|value| {
-                    log_timing(&format!("{service}: script source fetch"), started);
-                    value
-                })
             });
 
-            let instance_fetch_started = Instant::now();
             let instance_fetch = if adaptive_instance_batches {
                 fetch_instances_adaptive(
                     bridge,
@@ -1324,10 +1229,6 @@ fn export_single_service_parts(
                     tune: None,
                 }
             };
-            log_timing(
-                &format!("{service}: instance fetch"),
-                instance_fetch_started,
-            );
 
             let class_defaults = match class_defaults_task.join() {
                 Ok(value) => value?,
@@ -1341,9 +1242,7 @@ fn export_single_service_parts(
             Ok((class_defaults, instance_fetch, source_by_key))
         })?;
 
-    let merge_started = Instant::now();
     merge_script_sources(&mut instance_fetch.instances, &source_by_key);
-    log_timing(&format!("{service}: merge script sources"), merge_started);
 
     let service_path = prepare
         .get("rootPath")
@@ -1368,13 +1267,7 @@ fn export_single_service_parts(
         .and_then(Value::as_i64)
         .unwrap_or(current_unix_ts());
 
-    let release_started = Instant::now();
     let _ = bridge.call("release", json!({ "service": service }));
-    log_timing(&format!("{service}: release"), release_started);
-    log_timing(
-        &format!("{service}: export assembly total"),
-        service_started,
-    );
     Ok(ExportedSnapshotParts {
         service_name,
         service_class,
@@ -1615,8 +1508,6 @@ fn fetch_instances_adaptive(
     }
 
     const LAG_FRAME_MS: f64 = 33.3;
-    const BATCH_GROWTH_DIVISOR: usize = 8;
-    const WORKER_GROWTH_WAVE_INTERVAL: usize = 2;
     let default_batch_size = adaptive_instance_batch_size(instance_count).max(1);
     let mut batch_size = cached_tune
         .as_ref()
@@ -1645,7 +1536,7 @@ fn fetch_instances_adaptive(
     let mut next_start = 1usize;
     let mut total_hint = instance_count;
     let mut wave_index = 0usize;
-    let mut instances: Vec<SnapshotInstance> = Vec::with_capacity(instance_count);
+    let mut instances = Vec::with_capacity(instance_count);
     let mut suggested_batch_size = batch_size;
     let mut suggested_workers = worker_target;
     let mut last_frame_ms = None;
@@ -1733,11 +1624,9 @@ fn fetch_instances_adaptive(
             batch_size = batch_size.saturating_mul(3).div_ceil(4).max(1);
             worker_target = worker_target.saturating_mul(3).div_ceil(4).max(1);
         } else {
-            let batch_step = (batch_size / BATCH_GROWTH_DIVISOR).max(1);
+            let batch_step = (batch_size / 4).max(1);
             batch_size = batch_size.saturating_add(batch_step).min(total_hint.max(1));
-            if wave_index % WORKER_GROWTH_WAVE_INTERVAL == 0 {
-                worker_target = worker_target.saturating_add(1);
-            }
+            worker_target = worker_target.saturating_add(1);
         }
         suggested_batch_size = batch_size;
         suggested_workers = worker_target;
@@ -1906,27 +1795,15 @@ fn import_service_state_with_sourcemap(
     compact_meta_json: bool,
 ) -> Result<SourcemapNode> {
     thread::scope(|scope| {
-        let import_started = Instant::now();
         let sourcemap_task = scope.spawn(|| {
-            let started = Instant::now();
-            build_service_sourcemap_node_from_state(state, service, src_root, project_root).map(
-                |node| {
-                    log_timing(&format!("{service}: build sourcemap node"), started);
-                    node
-                },
-            )
+            build_service_sourcemap_node_from_state(state, service, src_root, project_root)
         });
-        let emit_started = Instant::now();
         let import_result = import_service_state(state, src_root, service, compact_meta_json);
-        if import_result.is_ok() {
-            log_timing(&format!("{service}: write src tree"), emit_started);
-        }
         let sourcemap_result = match sourcemap_task.join() {
             Ok(value) => value,
             Err(_) => bail!("Sourcemap worker panicked for {service}"),
         };
         import_result?;
-        log_timing(&format!("{service}: import service total"), import_started);
         sourcemap_result
     })
 }
@@ -2203,24 +2080,27 @@ fn fetch_script_sources(
     script_keys: &[String],
     source_worker_count: usize,
 ) -> Result<HashMap<String, String>> {
-    const SCRIPT_SOURCE_BATCH_SIZE: usize = 16;
     let mut source_by_key: HashMap<String, String> = HashMap::new();
-    let script_batches: Vec<Vec<String>> = script_keys
-        .chunks(SCRIPT_SOURCE_BATCH_SIZE)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    if script_batches.len() <= 1 || source_worker_count <= 1 {
-        let mut completed = 0usize;
-        for batch in &script_batches {
-            completed += batch.len();
+    if script_keys.len() <= 1 || source_worker_count <= 1 {
+        for (index, source_key) in script_keys.iter().enumerate() {
             println!(
                 "[roblox-sync-rs] {service}: script {}/{}",
-                completed,
+                index + 1,
                 script_keys.len()
             );
-            let fetched = fetch_script_source_batch(bridge, service, chunk_size, batch)?;
-            source_by_key.extend(fetched);
+            let source = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
+                let value = bridge.call(
+                    "getSourceChunk",
+                    json!({
+                        "service": service,
+                        "instancePath": source_key,
+                        "startIndex": chunk_start,
+                        "maxLen": max_len,
+                    }),
+                )?;
+                parse_bridge_chunk(value)
+            })?;
+            source_by_key.insert(source_key.clone(), source);
         }
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2228,55 +2108,40 @@ fn fetch_script_sources(
             .build()
             .context("Failed to create script source worker pool")?;
         let fetched = pool.install(|| {
-            script_batches
+            script_keys
                 .par_iter()
                 .enumerate()
-                .map(|(batch_index, batch)| -> Result<Vec<(String, String)>> {
-                    let completed =
-                        ((batch_index + 1) * SCRIPT_SOURCE_BATCH_SIZE).min(script_keys.len());
-                    if batch_index % 2 == 0 || completed == script_keys.len() {
+                .map(|(index, source_key)| -> Result<(String, String)> {
+                    if index % 16 == 0 || index + 1 == script_keys.len() {
                         println!(
                             "[roblox-sync-rs] {service}: script {}/{}",
-                            completed,
+                            index + 1,
                             script_keys.len()
                         );
                     }
-                    fetch_script_source_batch(bridge, service, chunk_size, batch)
+                    let source = fetch_text_chunks(chunk_size, |chunk_start, max_len| {
+                        let value = bridge.call(
+                            "getSourceChunk",
+                            json!({
+                                "service": service,
+                                "instancePath": source_key,
+                                "startIndex": chunk_start,
+                                "maxLen": max_len,
+                            }),
+                        )?;
+                        parse_bridge_chunk(value)
+                    })?;
+                    Ok((source_key.clone(), source))
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
 
-        for batch in fetched {
-            source_by_key.extend(batch);
+        for (key, source) in fetched {
+            source_by_key.insert(key, source);
         }
     }
 
     Ok(source_by_key)
-}
-
-fn fetch_script_source_batch(
-    bridge: &BridgeServer,
-    service: &str,
-    chunk_size: usize,
-    script_keys: &[String],
-) -> Result<Vec<(String, String)>> {
-    let payload = fetch_json_payload(chunk_size, |chunk_start, max_len| {
-        bridge.call(
-            "getSourceBatchChunk",
-            json!({
-                "service": service,
-                "instancePaths": script_keys,
-                "startIndex": chunk_start,
-                "maxLen": max_len,
-            }),
-        )
-    })?;
-    let entries: Vec<ScriptSourceBatchEntry> = serde_json::from_value(payload)
-        .with_context(|| format!("Invalid script source batch payload for {service}"))?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| (entry.instance_path, entry.source))
-        .collect())
 }
 
 fn resolve_direct_import_workers(requested: usize) -> usize {
@@ -2775,14 +2640,11 @@ fn track_expected_dir(expected_paths: &Arc<ImportPathSets>, path: &Path) {
 
 fn spawn_cleanup_service_dir(service_dir: PathBuf, expected_paths: Arc<ImportPathSets>) {
     thread::spawn(move || {
-        let started = Instant::now();
         if let Err(err) = cleanup_service_dir(&service_dir, &expected_paths) {
             println!(
                 "[roblox-sync-rs] warning: cleanup failed for {}: {err:#}",
                 service_dir.display()
             );
-        } else {
-            log_timing(&format!("cleanup {}", service_dir.display()), started);
         }
     });
 }
@@ -3622,9 +3484,9 @@ fn write_project_sourcemap_temp_from_service_nodes(
     let mut root = make_sourcemap_root(project_root);
     root.children = service_nodes.values().cloned().collect();
     sort_sourcemap_root_children(&mut root);
-    let output_file = project_root.join("sourcemap.json.tmp");
+    let temp_file = project_root.join("sourcemap.json.tmp");
     write_json_file(
-        &output_file,
+        &temp_file,
         &serde_json::to_value(root).context("Failed to serialize sourcemap")?,
         true,
     )
