@@ -1,0 +1,230 @@
+{
+  "material-icon-theme.folders.associations": {
+    "Workspace": "src",
+    "Players": "client",
+    "Lighting": "animation",
+    "MaterialService": "config",
+    "ReplicatedFirst": "app",
+    "ReplicatedStorage": "database",
+    "ServerScriptService": "server",
+    "ServerStorage": "database",
+    "StarterGui": "ui",
+    "StarterPack": "packages",
+    "StarterPlayer": "client",
+    "src": "src",
+    "tools": "tools",
+    "snapshots": "database",
+    "workspace": "src",
+    "players": "client",
+    "lighting": "animation",
+    "materialservice": "config",
+    "replicatedfirst": "app",
+    "replicatedstorage": "database",
+    "serverscriptservice": "server",
+    "serverstorage": "database",
+    "startergui": "ui",
+    "starterpack": "packages",
+    "starterplayer": "client",
+    "scripts": "scripts",
+    "assets": "images",
+    "shared": "lib"
+  },
+  "vsicons.associations.folders": [
+    {
+      "icon": "images",
+      "extensions": [
+        "assets"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "theme",
+      "extensions": [
+        "Lighting"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "theme",
+      "extensions": [
+        "lighting"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "config",
+      "extensions": [
+        "MaterialService"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "config",
+      "extensions": [
+        "materialservice"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "client",
+      "extensions": [
+        "Players"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "client",
+      "extensions": [
+        "players"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "app",
+      "extensions": [
+        "ReplicatedFirst"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "app",
+      "extensions": [
+        "replicatedfirst"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "shared",
+      "extensions": [
+        "ReplicatedStorage"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "shared",
+      "extensions": [
+        "replicatedstorage"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "src",
+      "extensions": [
+        "scripts"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "server",
+      "extensions": [
+        "ServerScriptService"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "server",
+      "extensions": [
+        "serverscriptservice"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "private",
+      "extensions": [
+        "ServerStorage"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "private",
+      "extensions": [
+        "serverstorage"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "shared",
+      "extensions": [
+        "shared"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "log",
+      "extensions": [
+        "snapshots"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "src",
+      "extensions": [
+        "src"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "public",
+      "extensions": [
+        "StarterGui"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "public",
+      "extensions": [
+        "startergui"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "plugin",
+      "extensions": [
+        "StarterPack"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "plugin",
+      "extensions": [
+        "starterpack"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "client",
+      "extensions": [
+        "StarterPlayer"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "client",
+      "extensions": [
+        "starterplayer"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "tools",
+      "extensions": [
+        "tools"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "src",
+      "extensions": [
+        "Workspace"
+      ],
+      "format": "svg"
+    },
+    {
+      "icon": "src",
+      "extensions": [
+        "workspace"
+      ],
+      "format": "svg"
+    }
+  ]
+}
