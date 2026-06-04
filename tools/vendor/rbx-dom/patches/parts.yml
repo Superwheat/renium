@@ -1,0 +1,64 @@
+Change:
+  BasePart:
+    # BasePart.BrickColor now defers to the Color3 properties in every case, so
+    # we can basically pretend that BrickColor and brickColor never existed.
+    brickColor:
+      Serialization:
+        Type: Migrate
+        To: Color
+        Migration: BrickColorToColor
+    BrickColor:
+      Serialization:
+        Type: Migrate
+        To: Color
+        Migration: BrickColorToColor
+    Color:
+      Serialization:
+        Type: SerializesAs
+        As: Color3uint8
+    Color3uint8:
+      AliasFor: "Color"
+
+    Size:
+      Serialization:
+        Type: SerializesAs
+        As: size
+    size:
+      AliasFor: Size
+
+    MaterialVariant:
+      Serialization:
+        Type: SerializesAs
+        As: MaterialVariantSerialized
+    MaterialVariantSerialized:
+      AliasFor: MaterialVariant
+
+  FormFactorPart:
+    FormFactor:
+      Serialization:
+        Type: SerializesAs
+        As: formFactorRaw
+    formFactor:
+      AliasFor: FormFactor
+    formFactorRaw:
+      AliasFor: FormFactor
+
+  Part:
+    Shape:
+      Serialization:
+        Type: SerializesAs
+        As: shape
+    shape:
+      AliasFor: Shape
+
+  MeshPart:
+    MeshId:
+      Serialization:
+        Type: Migrate
+        To: MeshContent
+        Migration: ContentIdToContent
+    TextureID:
+      Serialization:
+        Type: Migrate
+        To: TextureContent
+        Migration: ContentIdToContent
