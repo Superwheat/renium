@@ -1,0 +1,30 @@
+[package]
+name = "renium"
+version = "0.1.2"
+edition = "2024"
+license-file = "../../LICENSE"
+repository = "https://github.com/Superwheat/renium"
+
+[dependencies]
+anyhow = "1.0.100"
+mimalloc = "0.1"
+clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+rayon = "1.11.0"
+tungstenite = "0.28.0"
+url = "2.5.7"
+png = "0.17"
+walkdir = "2.5.0"
+zstd = "0.13.2"
+rbx_binary = { path = "../vendor/rbx-dom/rbx_binary" }
+rbx_xml = { path = "../vendor/rbx-dom/rbx_xml" }
+rbx_dom_weak = { path = "../vendor/rbx-dom/rbx_dom_weak" }
+rbx_reflection = { path = "../vendor/rbx-dom/rbx_reflection" }
+rbx_reflection_database = { path = "../vendor/rbx-dom/rbx_reflection_database" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
