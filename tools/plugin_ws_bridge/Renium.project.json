@@ -1,0 +1,81 @@
+{
+  "name": "Renium",
+  "tree": {
+    "$className": "Folder",
+    "Renium": {
+      "$path": "Renium.plugin.lua",
+      "BridgeSettings": {
+        "$path": "BridgeSettings.module.lua"
+      },
+      "BridgeTheme": {
+        "$path": "BridgeTheme.module.lua"
+      },
+      "BridgeStatus": {
+        "$path": "BridgeStatus.module.lua"
+      },
+      "BridgeParallel": {
+        "$path": "BridgeParallel.module.lua"
+      },
+      "BridgeChunking": {
+        "$path": "BridgeChunking.module.lua"
+      },
+      "BridgeTransport": {
+        "$path": "BridgeTransport.module.lua"
+      },
+      "BridgeConnection": {
+        "$path": "BridgeConnection.module.lua"
+      },
+      "BridgePluginRuntime": {
+        "$path": "BridgePluginRuntime.module.lua"
+      },
+      "BridgeIdentity": {
+        "$path": "BridgeIdentity.module.lua"
+      },
+      "BridgeUi": {
+        "$path": "BridgeUi.module.lua"
+      },
+      "BridgeRuntimeApi": {
+        "$path": "BridgeRuntimeApi.module.lua"
+      },
+      "BridgePropertySchema": {
+        "$path": "BridgePropertySchema.module.lua"
+      },
+      "BridgeStudioApiSchema": {
+        "$path": "BridgeStudioApiSchema.module.lua"
+      },
+      "BridgeEditorSync": {
+        "$path": "BridgeEditorSync.module.lua"
+      },
+      "BridgeProfiling": {
+        "$path": "BridgeProfiling.module.lua"
+      },
+      "BridgeStudioChanges": {
+        "$path": "BridgeStudioChanges.module.lua"
+      },
+      "RbxDom": {
+        "$path": "rbx_dom_lua/init.module.lua",
+        "EncodedValue": {
+          "$path": "rbx_dom_lua/EncodedValue.module.lua"
+        },
+        "PropertyDescriptor": {
+          "$path": "rbx_dom_lua/PropertyDescriptor.module.lua"
+        },
+        "Error": {
+          "$path": "rbx_dom_lua/Error.module.lua"
+        },
+        "customProperties": {
+          "$path": "rbx_dom_lua/customProperties.module.lua"
+        },
+        "base64": {
+          "$path": "rbx_dom_lua/base64.module.lua"
+        },
+        "database": {
+          "$path": "rbx_dom_lua/database.json"
+        },
+        "allValues": {
+          "$path": "rbx_dom_lua/allValues.json"
+        }
+      }
+    }
+  }
+}
