@@ -41,7 +41,7 @@ local function readProperty(instance, propertyName)
 	local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
 
 	if descriptor == nil then
-		local fullName = ("%s.%s"):format(instance.className, propertyName)
+		local fullName = ("%s.%s"):format(instance.ClassName, propertyName)
 
 		return false, Error.new(Error.Kind.UnknownProperty, fullName)
 	end
@@ -53,7 +53,7 @@ local function writeProperty(instance, propertyName, value)
 	local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
 
 	if descriptor == nil then
-		local fullName = ("%s.%s"):format(instance.className, propertyName)
+		local fullName = ("%s.%s"):format(instance.ClassName, propertyName)
 
 		return false, Error.new(Error.Kind.UnknownProperty, fullName)
 	end

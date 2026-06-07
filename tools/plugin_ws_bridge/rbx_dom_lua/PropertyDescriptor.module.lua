@@ -34,6 +34,7 @@ function PropertyDescriptor.fromRaw(data, className, propertyName)
 		--
 		-- { Value = "<data type>" }
 		dataType = key == "Enum" and key or value,
+		enumType = key == "Enum" and ("Enum." .. value) or nil,
 
 		scriptability = data.Scriptability,
 		className = className,
@@ -54,7 +55,7 @@ function PropertyDescriptor:read(instance)
 
 	if self.scriptability == "Custom" then
 		if customProperties[self.className] == nil then
-			local fullName = ("%s.%s"):format(instance.className, self.name)
+			local fullName = ("%s.%s"):format(instance.ClassName, self.name)
 			return false, Error.new(Error.Kind.PropertyNotReadable, fullName)
 		end
 
@@ -64,7 +65,7 @@ function PropertyDescriptor:read(instance)
 	end
 
 	if self.scriptability == "None" or self.scriptability == "Write" then
-		local fullName = ("%s.%s"):format(instance.className, self.name)
+		local fullName = ("%s.%s"):format(instance.ClassName, self.name)
 
 		return false, Error.new(Error.Kind.PropertyNotReadable, fullName)
 	end
@@ -85,7 +86,7 @@ function PropertyDescriptor:write(instance, value)
 
 	if self.scriptability == "Custom" then
 		if customProperties[self.className] == nil then
-			local fullName = ("%s.%s"):format(instance.className, self.name)
+			local fullName = ("%s.%s"):format(instance.ClassName, self.name)
 			return false, Error.new(Error.Kind.PropertyNotWritable, fullName)
 		end
 
@@ -95,7 +96,7 @@ function PropertyDescriptor:write(instance, value)
 	end
 
 	if self.scriptability == "None" or self.scriptability == "Read" then
-		local fullName = ("%s.%s"):format(instance.className, self.name)
+		local fullName = ("%s.%s"):format(instance.ClassName, self.name)
 
 		return false, Error.new(Error.Kind.PropertyNotWritable, fullName)
 	end

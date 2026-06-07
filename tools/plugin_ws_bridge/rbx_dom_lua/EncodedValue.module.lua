@@ -144,7 +144,7 @@ types = {
 		fromPod = unpackDecoder(Color3.new),
 
 		toPod = function(roblox)
-			return { roblox.r, roblox.g, roblox.b }
+			return { roblox.R, roblox.G, roblox.B }
 		end,
 	},
 
@@ -239,7 +239,12 @@ types = {
 
 	EnumItem = {
 		fromPod = function(pod)
-			return Enum[pod.type]:FromValue(pod.value)
+			local enumType = tostring(pod.type or "")
+			local enumPrefix = "Enum."
+			if string.sub(enumType, 1, #enumPrefix) == enumPrefix then
+				enumType = string.sub(enumType, #enumPrefix + 1)
+			end
+			return Enum[enumType]:FromValue(pod.value)
 		end,
 
 		toPod = function(roblox)

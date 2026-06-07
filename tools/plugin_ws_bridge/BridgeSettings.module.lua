@@ -1,5 +1,88 @@
 local BridgeSettings = {}
 
+-- These are intentionally kept in one small module so the settings widget,
+-- connection lifecycle, and live-sync bridge all normalize the exact same
+-- persisted values.  They mirror the useful Argon-style controls while
+-- retaining Renium's loopback-only transport model.
+local RUNTIME_DEFAULTS = {
+	autoConnect = true,
+	autoReconnect = true,
+	liveHydrate = true,
+	keepUnknowns = false,
+	twoWaySync = true,
+	syncbackProperties = true,
+	onlyCodeMode = false,
+	initialSyncPriority = "studio",
+	diffLinesLimit = 3000,
+	displayPrompts = "always",
+	changesThreshold = 5,
+	logLevel = "warn",
+	overridePackages = false,
+}
+
+local RUNTIME_BOOLEAN_KEYS = {
+	autoConnect = true,
+	autoReconnect = true,
+	liveHydrate = true,
+	keepUnknowns = true,
+	twoWaySync = true,
+	syncbackProperties = true,
+	onlyCodeMode = true,
+	overridePackages = true,
+}
+
+local RUNTIME_ENUMS = {
+	initialSyncPriority = {
+		studio = true,
+		editor = true,
+		none = true,
+	},
+	displayPrompts = {
+		always = true,
+		initial = true,
+		never = true,
+	},
+	logLevel = {
+		off = true,
+		error = true,
+		warn = true,
+		info = true,
+		debug = true,
+		trace = true,
+	},
+}
+
+local RUNTIME_NUMBERS = {
+	changesThreshold = { minimum = 0, maximum = 100000 },
+	diffLinesLimit = { minimum = 100, maximum = 1000000 },
+}
+
+local function trim(value)
+	return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
+end
+
+-- The bridge protocol deliberately trusts the local machine and therefore has
+-- no shared-secret handshake. Keep the Studio client pointed only at a
+-- loopback listener so a saved widget setting cannot accidentally expose the
+-- same mutation/RPC surface to a LAN host.
+function BridgeSettings.normalizeLoopbackHost(raw)
+	local host = string.lower(trim(raw))
+	if host == "" or host == "localhost" or host == "127.0.0.1" then
+		return "127.0.0.1"
+	end
+	if host == "[::1]" or host == "::1" then
+		return "::1"
+	end
+	return nil
+end
+
+function BridgeSettings.formatWebSocketUrl(host, port)
+	if host == "::1" then
+		return string.format("ws://[::1]:%d", port)
+	end
+	return string.format("ws://%s:%d", host, port)
+end
+
 function BridgeSettings.parsePortsCsv(raw)
 	local out = {}
 	local seen = {}
@@ -26,10 +109,13 @@ end
 
 function BridgeSettings.loadHost(plugin, prefix, defaultHost)
 	local value = plugin:GetSetting(prefix .. "host")
-	if type(value) == "string" and value ~= "" then
-		return value
+	if type(value) == "string" then
+		local normalized = BridgeSettings.normalizeLoopbackHost(value)
+		if normalized ~= nil then
+			return normalized
+		end
 	end
-	return defaultHost
+	return BridgeSettings.normalizeLoopbackHost(defaultHost) or "127.0.0.1"
 end
 
 function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
@@ -47,8 +133,28 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 			end
 		end
 		if #valid > 0 then
-			-- Auto-upgrade legacy default port sets to the current default lanes.
-			if #valid == 3 and valid[1] == 8781 and valid[2] == 8782 and valid[3] == 8783 and #defaultPorts >= 4 then
+			-- Auto-migrate legacy default port sets to the current default lanes.
+			if
+				#valid == 4
+				and valid[1] == 8781
+				and valid[2] == 8782
+				and valid[3] == 8783
+				and valid[4] == 8784
+				and #defaultPorts == 3
+			then
+				return defaultPorts
+			end
+			if
+				#valid == 3
+				and valid[1] == 8781
+				and valid[2] == 8782
+				and valid[3] == 8783
+				and #defaultPorts == 4
+				and defaultPorts[1] == 8781
+				and defaultPorts[2] == 8782
+				and defaultPorts[3] == 8783
+				and defaultPorts[4] == 8784
+			then
 				return defaultPorts
 			end
 			if #valid == 8
@@ -60,7 +166,7 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 				and valid[6] == 8786
 				and valid[7] == 8787
 				and valid[8] == 8788
-				and #defaultPorts == 4 then
+				and (#defaultPorts == 3 or #defaultPorts == 4) then
 				return defaultPorts
 			end
 			return valid
@@ -70,8 +176,90 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 end
 
 function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
-	plugin:SetSetting(prefix .. "host", host)
+	local normalizedHost = BridgeSettings.normalizeLoopbackHost(host)
+	if normalizedHost == nil then
+		return false
+	end
+	plugin:SetSetting(prefix .. "host", normalizedHost)
 	plugin:SetSetting(prefix .. "ports", ports)
+	return true
+end
+
+function BridgeSettings.runtimeDefaults()
+	local copy = {}
+	for key, value in pairs(RUNTIME_DEFAULTS) do
+		copy[key] = value
+	end
+	return copy
+end
+
+function BridgeSettings.normalizeRuntimeSetting(key, value)
+	if RUNTIME_BOOLEAN_KEYS[key] then
+		if type(value) == "boolean" then
+			return value
+		end
+		return RUNTIME_DEFAULTS[key]
+	end
+
+	local enum = RUNTIME_ENUMS[key]
+	if enum ~= nil then
+		local normalized = string.lower(trim(value))
+		if enum[normalized] then
+			return normalized
+		end
+		return RUNTIME_DEFAULTS[key]
+	end
+
+	local numberSettings = RUNTIME_NUMBERS[key]
+	if numberSettings ~= nil then
+		local numeric = tonumber(value)
+		if numeric == nil or numeric ~= numeric then
+			return RUNTIME_DEFAULTS[key]
+		end
+		return math.clamp(math.floor(numeric), numberSettings.minimum, numberSettings.maximum)
+	end
+
+	return nil
+end
+
+function BridgeSettings.loadRuntimeSettings(plugin, prefix)
+	local out = BridgeSettings.runtimeDefaults()
+	for key, defaultValue in pairs(out) do
+		local stored = plugin:GetSetting(prefix .. key)
+		if stored ~= nil then
+			out[key] = BridgeSettings.normalizeRuntimeSetting(key, stored) or defaultValue
+		end
+	end
+	return out
+end
+
+function BridgeSettings.saveRuntimeSetting(plugin, prefix, key, value)
+	local normalized = BridgeSettings.normalizeRuntimeSetting(key, value)
+	if normalized == nil then
+		return nil
+	end
+	plugin:SetSetting(prefix .. key, normalized)
+	return normalized
+end
+
+-- Live-sync conflict resolution policy used when the same script is edited on
+-- both sides between syncs: "prompt" (write conflict markers + notify),
+-- "filesystem" (local wins), "studio" (Studio wins), or "none" (markers, no popup).
+-- Returns the stored policy, or `default` (may be nil) when the user has not
+-- explicitly chosen one in Studio. Callers leave it unset so the editor-side
+-- (VS Code) setting remains in effect until Studio overrides it.
+function BridgeSettings.loadConflictResolution(plugin, prefix, default)
+	local value = plugin:GetSetting(prefix .. "conflictResolution")
+	if value == "prompt" or value == "filesystem" or value == "studio" then
+		return value
+	end
+	return default
+end
+
+function BridgeSettings.saveConflictResolution(plugin, prefix, value)
+	if value == "prompt" or value == "filesystem" or value == "studio" then
+		plugin:SetSetting(prefix .. "conflictResolution", value)
+	end
 end
 
 return BridgeSettings

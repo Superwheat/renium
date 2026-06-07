@@ -141,7 +141,7 @@ return {
 		},
 		WorldPivotData = {
 			read = function(instance)
-				return true, instance.WorldPivot
+				return true, instance:GetPivot()
 			end,
 			write = function(instance, _, value)
 				if value == nil then
@@ -150,6 +150,24 @@ return {
 					instance.WorldPivot = value
 					return true
 				end
+			end,
+		},
+		WorldPivot = {
+			read = function(instance)
+				return true, instance:GetPivot()
+			end,
+			write = function(instance, _, value)
+				instance.WorldPivot = value
+				return true
+			end,
+		},
+		Origin = {
+			read = function(instance)
+				return true, instance:GetPivot()
+			end,
+			write = function(instance, _, value)
+				instance:PivotTo(value)
+				return true
 			end,
 		},
 	},
