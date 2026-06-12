@@ -1,0 +1,848 @@
+{
+  "name": "renium",
+  "displayName": "Renium",
+  "description": "Roblox Studio sync for VS Code/Cursor using native executables",
+  "version": "0.1.2",
+  "publisher": "local",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Superwheat/renium.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Superwheat/renium/issues"
+  },
+  "homepage": "https://github.com/Superwheat/renium#readme",
+  "icon": "assets/logo-white.png",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Renium executes workspace binaries and synchronizes workspace files, so the workspace must be trusted."
+    }
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "roblox",
+    "rojo",
+    "argon",
+    "mcp",
+    "sync",
+    "luau"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:renium.openMenu",
+    "onCommand:renium.installStudioPlugin",
+    "onCommand:renium.openExplorer",
+    "onCommand:renium.fullSync",
+    "onCommand:renium.exportSnapshots",
+    "onCommand:renium.exportGameFile",
+    "onCommand:renium.syncWallyPackages",
+    "onCommand:renium.startLiveSync",
+    "onCommand:renium.stopLiveSync",
+    "onCommand:renium.retryEditorInitialSync",
+    "onCommand:renium.serve",
+    "onCommand:renium.stopServe",
+    "onCommand:renium.gitSync",
+    "onCommand:renium.fileExplorer.refresh",
+    "onCommand:renium.fileExplorer.openScript",
+    "onCommand:renium.fileExplorer.addInstance",
+    "onCommand:renium.fileExplorer.deleteInstance",
+    "onCommand:renium.fileExplorer.desyncPackageLink",
+    "onCommand:renium.fileExplorer.copyPath",
+    "onCommand:renium.fileExplorer.importModel",
+    "onCommand:renium.fileExplorer.exportModel",
+    "onView:renium.fileExplorer",
+    "onView:renium.properties",
+    "onView:renium.packages",
+    "workspaceContains:tools/renium/Cargo.toml",
+    "onCustomEditor:renium.reniumEditor"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "colors": [
+      {
+        "id": "renium.packagePreviewForeground",
+        "description": "Foreground color for Renium package script preview tabs.",
+        "defaults": {
+          "dark": "#4FC1FF",
+          "light": "#007ACC",
+          "highContrast": "#4FC1FF"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "renium.openMenu",
+        "title": "Open Menu",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.installStudioPlugin",
+        "title": "Install Studio Plugin",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.openExplorer",
+        "title": "Open Explorer",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fullSync",
+        "title": "Full Sync (Studio -> src)",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.exportSnapshots",
+        "title": "Export Snapshots Only",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.exportGameFile",
+        "title": "Export Game File",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.syncWallyPackages",
+        "title": "Sync Wally Packages",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.apply",
+        "title": "Sync Link Mirrors",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.add",
+        "title": "Add Link",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.status",
+        "title": "Link Status",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.break",
+        "title": "Break Link",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.revealSource",
+        "title": "Reveal Link Source",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.link.addFromFile",
+        "title": "Create Link from This Script",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.packages.refresh",
+        "title": "Refresh Packages",
+        "category": "Renium",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "renium.packages.viewUses",
+        "title": "View Uses",
+        "category": "Renium",
+        "icon": "$(references)"
+      },
+      {
+        "command": "renium.packages.delete",
+        "title": "Delete Package",
+        "category": "Renium",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "renium.startLiveSync",
+        "title": "Start Live Sync",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.stopLiveSync",
+        "title": "Stop Live Sync",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.retryEditorInitialSync",
+        "title": "Retry Initial Editor Sync",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.serve",
+        "title": "Serve",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.stopServe",
+        "title": "Stop Serve",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.gitSync",
+        "title": "Git",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.refresh",
+        "title": "Refresh File Explorer",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.openScript",
+        "title": "Open Script",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.addInstance",
+        "title": "Add Instance",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.deleteInstance",
+        "title": "Delete Instance",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.desyncPackageLink",
+        "title": "Desync Roblox Package",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.copyPath",
+        "title": "Copy Roblox Path",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.importModel",
+        "title": "Import Roblox Model",
+        "category": "Renium"
+      },
+      {
+        "command": "renium.fileExplorer.exportModel",
+        "title": "Export Roblox Model",
+        "category": "Renium"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "renium.reniumEditor",
+        "displayName": "Renium Store Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.renium"
+          },
+          {
+            "filenamePattern": "*.rbsync"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "reniumContainer",
+          "title": "Renium",
+          "icon": "assets/renium-white-superbold.svg"
+        }
+      ]
+    },
+    "views": {
+      "reniumContainer": [
+        {
+          "id": "renium.fileExplorer",
+          "name": "Explorer",
+          "type": "webview"
+        },
+        {
+          "id": "renium.properties",
+          "name": "Properties",
+          "type": "webview"
+        },
+        {
+          "id": "renium.packages",
+          "name": "Packages"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "renium.packages",
+        "contents": "No link packages yet.\nPack any instance into a reusable read-only package: right-click it in the Renium Explorer and choose Create Link.\n[Open Explorer](command:renium.openExplorer)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "renium.fileExplorer.refresh",
+          "when": "view == renium.fileExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "renium.packages.refresh",
+          "when": "view == renium.packages",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "renium.packages.viewUses",
+          "when": "view == renium.packages && viewItem == reniumPackage",
+          "group": "renium@1"
+        },
+        {
+          "command": "renium.packages.delete",
+          "when": "view == renium.packages && viewItem == reniumPackage",
+          "group": "renium@2"
+        },
+        {
+          "command": "renium.fileExplorer.openScript",
+          "when": "view == renium.fileExplorer && viewItem =~ /script/",
+          "group": "inline@1"
+        },
+        {
+          "command": "renium.fileExplorer.addInstance",
+          "when": "view == renium.fileExplorer && viewItem =~ /canAdd/",
+          "group": "inline@2"
+        },
+        {
+          "command": "renium.fileExplorer.importModel",
+          "when": "view == renium.fileExplorer && viewItem =~ /canAdd/",
+          "group": "inline@3"
+        },
+        {
+          "command": "renium.fileExplorer.deleteInstance",
+          "when": "view == renium.fileExplorer && viewItem =~ /canDelete/",
+          "group": "inline@6"
+        },
+        {
+          "command": "renium.fileExplorer.exportModel",
+          "when": "view == renium.fileExplorer && viewItem =~ /canExport/",
+          "group": "inline@4"
+        },
+        {
+          "command": "renium.fileExplorer.desyncPackageLink",
+          "when": "view == renium.fileExplorer && viewItem =~ /canDesyncPackage/",
+          "group": "inline@5"
+        },
+        {
+          "command": "renium.fileExplorer.copyPath",
+          "when": "view == renium.fileExplorer",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "renium.link.addFromFile",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@1"
+        },
+        {
+          "command": "renium.link.break",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@2"
+        },
+        {
+          "command": "renium.link.revealSource",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "renium.link.addFromFile",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@1"
+        },
+        {
+          "command": "renium.link.break",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@2"
+        },
+        {
+          "command": "renium.link.revealSource",
+          "when": "resourceExtname == .luau || resourceExtname == .lua",
+          "group": "renium@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Renium",
+      "properties": {
+        "renium.exportCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/renium.exe",
+          "description": "Path to the Renium executable used for Studio export and sync."
+        },
+        "renium.editorSyncCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/dist/editor_to_studio_sync.exe",
+          "description": "Path to live-sync executable."
+        },
+        "renium.rustCliPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/renium.exe",
+          "description": "Path to the Renium CLI. Renium also searches bin/ and source-repository build folders."
+        },
+        "renium.projectRoot": {
+          "type": "string",
+          "default": "${workspaceFolder}",
+          "description": "Workspace-relative project root"
+        },
+        "renium.snapshotDir": {
+          "type": "string",
+          "default": "snapshots",
+          "description": "Snapshot directory (relative to projectRoot unless absolute)"
+        },
+        "renium.transport": {
+          "type": "string",
+          "enum": [
+            "ws",
+            "mcp"
+          ],
+          "default": "ws",
+          "description": "Transport mode used by the export CLI."
+        },
+        "renium.server": {
+          "type": "string",
+          "default": "Roblox_Studio",
+          "description": "MCP server name from config.toml"
+        },
+        "renium.configTomlPath": {
+          "type": "string",
+          "default": "${userHome}/.codex/config.toml",
+          "description": "Path to config.toml that defines the Roblox MCP server"
+        },
+        "renium.services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "Workspace",
+            "Players",
+            "Lighting",
+            "MaterialService",
+            "ReplicatedFirst",
+            "ReplicatedStorage",
+            "ServerScriptService",
+            "ServerStorage",
+            "StarterGui",
+            "StarterPack",
+            "StarterPlayer",
+            "Teams",
+            "SoundService"
+          ],
+          "description": "Services included in full sync"
+        },
+        "renium.sourceWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual worker count"
+        },
+        "renium.instanceWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual instance batch worker count"
+        },
+        "renium.importWorkers": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "0 = auto; otherwise manual direct-import worker count"
+        },
+        "renium.chunkSize": {
+          "type": "number",
+          "default": 4194304,
+          "minimum": 512,
+          "maximum": 8388608,
+          "description": "Chunk size used for exporter RPC payload paging. Default is 4 MiB to reduce round trips on large service exports; maximum is 8 MiB."
+        },
+        "renium.snapshotInstanceChunkSize": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 0,
+          "description": "Instance count per snapshot chunk file (0 disables chunk splitting)."
+        },
+        "renium.bridgeWaitSeconds": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "description": "Max wait for plugin bridge channels to connect."
+        },
+        "renium.bridgePorts": {
+          "type": "string",
+          "default": "8781,8782,8783",
+          "description": "Comma-separated WebSocket bridge ports used by plugin and exporter. Only three ports are supported by default."
+        },
+        "renium.usePersistentBridge": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep a persistent Rust bridge daemon alive for WebSocket exports so repeated full syncs reuse already-open Roblox Studio bridge channels instead of reconnecting every run."
+        },
+        "renium.verifyEditorPushSources": {
+          "type": "boolean",
+          "default": false,
+          "description": "Verify pushed Lua source by reading it back from Studio after editor -> Studio sync. Slower; useful for debugging sync mismatches."
+        },
+        "renium.adaptiveThrottle": {
+          "type": "boolean",
+          "default": true,
+          "description": "Adaptive Studio FPS throttle for export RPCs."
+        },
+        "renium.noUpdateEditorIcons": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skip editor icon settings updates during export."
+        },
+        "renium.autoSyncOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically sync changed service(s) after file save"
+        },
+        "renium.autoSyncDebounceMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 100,
+          "description": "Debounce time before triggering auto sync"
+        },
+        "renium.editorLiveSyncEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable live sync. When false, src changes do not push to Studio and Studio changes do not import into src."
+        },
+        "renium.editorLiveSyncOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Legacy compatibility setting. Live sync startup is controlled by renium.editorLiveSyncEnabled."
+        },
+        "renium.studioLiveSyncEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When editor live sync is on, import dirty Studio services back into src."
+        },
+        "renium.studioLiveSyncPollMs": {
+          "type": "number",
+          "default": 250,
+          "minimum": 10,
+          "description": "Base Studio dirty-state poll interval for live sync. Polling backs off while idle or after errors."
+        },
+        "renium.liveSync.initialSyncPriority": {
+          "type": "string",
+          "enum": ["studio", "editor", "none"],
+          "enumDescriptions": [
+            "Start from Studio and import its state into src before watching for later edits.",
+            "Start from src and push it to Studio before watching for later edits.",
+            "Start watching without an initial import or push."
+          ],
+          "default": "studio",
+          "description": "Which side initializes a newly started live-sync session."
+        },
+        "renium.liveSync.changesThreshold": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "Maximum Studio change records Renium applies through the granular fast path. Larger batches use the protected full-import path."
+        },
+        "renium.liveSync.diffLinesLimit": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 100,
+          "description": "Maximum lines rendered per side in a live-sync conflict preview. Full local and Studio backup files are preserved without truncation."
+        },
+        "renium.liveSync.displayPrompts": {
+          "type": "string",
+          "enum": ["always", "initial", "never"],
+          "enumDescriptions": [
+            "Show every manual live-sync conflict prompt.",
+            "Show only the first manual live-sync conflict prompt in each session.",
+            "Keep backups and log manual conflicts without showing a prompt."
+          ],
+          "default": "always",
+          "description": "When Renium should interrupt you for manual live-sync conflict review."
+        },
+        "renium.liveSync.overridePackages": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow editor pushes to write read-only Renium link-package mirrors. Disabled by default to preserve package protection."
+        },
+        "renium.logLevel": {
+          "type": "string",
+          "enum": ["off", "error", "warn", "info", "debug", "trace"],
+          "default": "info",
+          "description": "Minimum Renium output level to show in the Output panel. Errors still surface in VS Code notifications."
+        },
+        "renium.liveSync.conflictResolution": {
+          "type": "string",
+          "enum": ["prompt", "filesystem", "studio"],
+          "enumDescriptions": [
+            "No side prioritized: keep your local version on disk and pop a notification with a side-by-side diff so you can review or switch to Studio's. The file always stays valid (no conflict markers are written).",
+            "Filesystem wins: your editor's version of the overlapping lines is kept automatically.",
+            "Studio wins: Studio's version of the overlapping lines is kept automatically."
+          ],
+          "default": "prompt",
+          "description": "How to resolve overlapping concurrent edits to the same script during live sync, when the same lines changed in both Studio and your editor. Non-overlapping concurrent edits are always merged automatically. Conflict markers are never written into your scripts; both sides are always backed up under .renium/conflicts. The Studio plugin's setting, when chosen there, overrides this."
+        },
+        "renium.runImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run import stage so src and generated project JSON are updated"
+        },
+        "renium.importMode": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "snapshot"
+          ],
+          "default": "direct",
+          "description": "Import mode for the export CLI."
+        },
+        "renium.performanceMode": {
+          "type": "string",
+          "enum": [
+            "throughput",
+            "balanced",
+            "smooth"
+          ],
+          "default": "throughput",
+          "description": "Export scheduling mode. Throughput favors wall time, balanced limits visible stalls, smooth prioritizes Studio responsiveness over speed."
+        },
+        "renium.modifiedDefaultBypass": {
+          "type": "boolean",
+          "default": false,
+          "description": "Compact-v5 fast path that adaptively uses IsPropertyModified to avoid reading defaulted properties after guarded validation. Disabled by default."
+        },
+        "renium.watchConfigPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/tools/editor_to_studio_sync.json",
+          "description": "Reserved config path for future live-sync support."
+        },
+        "renium.wsWaitSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "description": "Studio connection wait timeout in seconds"
+        },
+        "renium.progressHeartbeatSeconds": {
+          "type": "number",
+          "default": 2,
+          "minimum": 2,
+          "description": "Heartbeat interval for long-running command progress logs."
+        },
+        "renium.benchmarkRuns": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "Number of repeated full-sync iterations to run for benchmark mode."
+        },
+        "renium.wallySync.wallyPath": {
+          "type": "string",
+          "default": "wally",
+          "description": "Wally executable used by Sync Wally Packages."
+        },
+        "renium.wallySync.rojoPath": {
+          "type": "string",
+          "default": "rojo",
+          "description": "Deprecated: Rojo is no longer required. Renium imports Wally packages directly."
+        },
+        "renium.wallySync.packagesDir": {
+          "type": "string",
+          "default": "Packages",
+          "description": "Wally packages directory, relative to projectRoot unless absolute."
+        },
+        "renium.wallySync.targetService": {
+          "type": "string",
+          "default": "ReplicatedStorage",
+          "description": "Service that receives the generated Wally Packages folder."
+        },
+        "renium.wallySync.targetName": {
+          "type": "string",
+          "default": "Packages",
+          "description": "Folder name used for imported Wally packages under the target service."
+        },
+        "renium.wallySync.runInstall": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run wally install before building and importing Packages."
+        },
+        "renium.wallySync.realms": {
+          "type": "string",
+          "default": "shared,server,dev",
+          "description": "Comma list of Wally realms to import. 'server' imports ServerPackages into ServerStorage; 'dev' imports DevPackages. Realms are skipped when their package directory is absent."
+        },
+        "renium.wallySync.applyToStudio": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "default": "ask",
+          "description": "After syncing Wally packages into src, optionally apply the package tree to Studio."
+        },
+        "renium.link.manifest": {
+          "type": "string",
+          "default": "renium-link.json",
+          "description": "Path to the renium-link manifest, relative to projectRoot unless absolute."
+        },
+        "renium.link.folder": {
+          "type": "string",
+          "default": "",
+          "description": "Where new packages are saved. Empty (default) uses the per-user global library at Documents/Renium/Packages so packages are usable from any project. Set a project-relative path like 'links' to store (and commit) packages inside this project instead."
+        },
+        "renium.link.cacheDir": {
+          "type": "string",
+          "default": "",
+          "description": "Folder where cloned git/Wally link sources are cached, relative to projectRoot unless absolute. Blank uses .renium/link-cache. Overrides the manifest cacheDir."
+        },
+        "renium.link.gitPath": {
+          "type": "string",
+          "default": "git",
+          "description": "Git executable used to fetch git link sources (public and private)."
+        },
+        "renium.link.offline": {
+          "type": "boolean",
+          "default": false,
+          "description": "Never fetch git/Wally link sources; use only what is already cached."
+        },
+        "renium.link.autoApplyOnManifestChange": {
+          "type": "boolean",
+          "default": false,
+          "description": "Re-apply links automatically when renium-link.json changes. Link packages can contain Luau source; disabled by default."
+        },
+        "renium.link.applyToStudio": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "default": "ask",
+          "description": "After materializing link targets into src, optionally push them to Studio. Link packages can contain Luau source."
+        },
+        "renium.gitSync.gitPath": {
+          "type": "string",
+          "default": "git",
+          "description": "Git executable used by the Renium Git tab."
+        },
+        "renium.gitSync.remote": {
+          "type": "string",
+          "default": "origin",
+          "description": "Default Git remote used by Renium Git sync commands."
+        },
+        "renium.gitSync.branch": {
+          "type": "string",
+          "default": "",
+          "description": "Optional branch override for Renium Git sync. Blank uses the current checked out branch."
+        },
+        "renium.gitSync.autoFetch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Fetch the configured remote before pull or push workflows."
+        },
+        "renium.gitSync.runFullSyncBeforePush": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "default": "ask",
+          "description": "Whether Renium should run a Full Sync before Git commit/push workflows."
+        },
+        "renium.gitSync.stageMode": {
+          "type": "string",
+          "enum": [
+            "tracked",
+            "configuredPaths"
+          ],
+          "default": "tracked",
+          "description": "How Renium stages files for Git commit/push. Default behavior is tracked src/ changes only; 'configuredPaths' restricts staging to stagePaths."
+        },
+        "renium.gitSync.stagePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "src"
+          ],
+          "description": "Pathspec list used when gitSync.stageMode is configuredPaths. Defaults to src only, which is the canonical Renium game code/data folder."
+        },
+        "renium.gitSync.includeUntracked": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow Git commit/push to include untracked files. Disabled by default for safety."
+        },
+        "renium.gitSync.commitMessageTemplate": {
+          "type": "string",
+          "default": "Renium sync: ${date}",
+          "description": "Default commit message template for Git commit/push. Supports ${date}, ${datetime}, and ${branch}."
+        },
+        "renium.gitSync.confirmBeforePush": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require a confirmation dialog before Renium commits or pushes Git changes."
+        },
+        "renium.gitSync.requireCleanWorktreeBeforePull": {
+          "type": "boolean",
+          "default": true,
+          "description": "Block Git pull while the repository has local worktree changes."
+        },
+        "renium.gitSync.applyPulledChangesToStudio": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "default": "ask",
+          "description": "After a successful Git pull, optionally apply pulled src changes back into Studio using Renium editor->Studio sync."
+        },
+        "renium.gitSync.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 10,
+          "description": "Timeout in seconds for git commands started from the Git tab."
+        },
+        "renium.gitSync.outputBehavior": {
+          "type": "string",
+          "enum": [
+            "onStart",
+            "onError",
+            "silent"
+          ],
+          "default": "onStart",
+          "description": "Controls when the Renium output channel is shown for Git sync commands."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "sync-assets": "node scripts/sync-assets.mjs",
+    "compile": "npm run sync-assets && tsc -p .",
+    "test:compile": "tsc -p tsconfig.test.json",
+    "test": "npm run test:compile && node --test out-test/test/gitSync.test.js out-test/test/conflictMerge.test.js",
+    "verify": "npm run compile && npm run test",
+    "watch": "tsc -p . -w",
+    "vscode:prepublish": "npm run compile",
+    "package": "npm run compile && npx --no-install vsce package -o renium.vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.9.2",
+    "@types/node": "^20.14.9",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.5.4"
+  }
+}

@@ -1,0 +1,3640 @@
+﻿<!DOCTYPE html>
+<html style="[[themeStyle]]">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Properties</title>
+    <link href="[[styleUri]]" rel="stylesheet">
+</head>
+
+<body>
+    <div class="root">
+        [[topbarHtml]]
+        <div id="scroller" class="scroller">
+            <div id="properties-container"></div>
+        </div>
+    </div>
+
+    <div id="curve-editor-modal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="curve-editor-title" class="modal-title">Edit NumberSequence</span>
+                <button class="modal-close" onclick="closeCurveEditor()">x</button>
+            </div>
+            <div class="modal-body">
+                <div id="curve-canvas-container">
+                    <canvas id="curve-canvas" width="500" height="250"></canvas>
+                </div>
+                <div id="curve-nodes-list" class="curve-nodes-list"></div>
+                <div class="curve-controls">
+                    <button onclick="addCurveNode()" class="curve-button">Add Node</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="applyCurveEditor()" class="curve-button primary">Apply</button>
+                <button onclick="closeCurveEditor()" class="curve-button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="gradient-editor-modal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="gradient-editor-title" class="modal-title">Edit ColorSequence</span>
+                <button class="modal-close" onclick="closeGradientEditor()">x</button>
+            </div>
+            <div class="modal-body">
+                <div id="gradient-preview-container" class="gradient-preview-container">
+                    <div id="gradient-preview" class="gradient-preview"></div>
+                    <div id="gradient-stops" class="gradient-stops"></div>
+                </div>
+                <div id="gradient-stops-list" class="gradient-stops-list"></div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="applyGradientEditor()" class="curve-button primary">Apply</button>
+                <button onclick="closeGradientEditor()" class="curve-button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+
+        let allProperties = [];
+        let allTags = [];
+        let allAttributes = [];
+        const collapsedCategories = new Set();
+        const expandedProperties = new Set();
+        let currentCurveProperty = null;
+        let currentCurveNodes = [];
+        let curveCanvas = null;
+        let curveCtx = null;
+        let draggingNodeIndex = -1;
+        let selectedNodeIndex = -1;
+        let currentGradientProperty = null;
+        let currentGradientStops = [];
+        let draggingGradientStopIndex = -1;
+        let selectedGradientStopIndex = -1;
+        let showTagInput = false;
+        let showAttributeModal = false;
+        let currentContextMenu = null;
+        let renamingAttribute = null;
+        let currentNodeClassName = null;
+        let audioPlaying = false;
+        let audioScrubbing = false;
+        let activePropertyEdit = null;
+        let activePropertyRow = null;
+        let lastEditorFocusSnapshot = null;
+        let restoreEditorFocusOnNextRender = false;
+        let deferredPropertiesMessage = null;
+        let curveCanvasListenersAttached = false;
+        let propertiesReadOnly = false;
+        const propertyPostTimers = new Map();
+
+        function applyDeferredPropertiesIfIdle() {
+            if (!deferredPropertiesMessage || activePropertyEdit) return;
+            const message = deferredPropertiesMessage;
+            deferredPropertiesMessage = null;
+            updateProperties(message);
+        }
+
+        function themeColor(name, fallbackName) {
+            const root = getComputedStyle(document.documentElement);
+            const body = getComputedStyle(document.body);
+            return (
+                body.getPropertyValue(name).trim() ||
+                root.getPropertyValue(name).trim() ||
+                (fallbackName ? body.getPropertyValue(fallbackName).trim() : "") ||
+                (fallbackName ? root.getPropertyValue(fallbackName).trim() : "")
+            );
+        }
+
+        const container = document.getElementById("properties-container");
+        [[scriptElements]]
+
+        function updateProperties(message) {
+            if (activePropertyEdit) {
+                deferredPropertiesMessage = message;
+                return;
+            }
+            if (typeof message === 'object') {
+                propertiesReadOnly = message.readOnly === true;
+                if (propertiesReadOnly) {
+                    showTagInput = false;
+                    renamingAttribute = null;
+                    closeAttributeContextMenu();
+                    closeAttributeModal();
+                }
+                if (message.properties && message.properties.properties) {
+                    allProperties = Array.isArray(message.properties.properties) ? message.properties.properties : [];
+                    allTags = Array.isArray(message.properties.tags) ? message.properties.tags : [];
+                    allAttributes = Array.isArray(message.properties.attributes) ? message.properties.attributes : [];
+                } else if (message.properties) {
+                    allProperties = Array.isArray(message.properties) ? message.properties : [];
+                    allTags = [];
+                    allAttributes = [];
+                }
+
+                if (message.title || (message.nodeName && message.nodeClassName)) {
+                    const titleElement = document.getElementById('properties-title');
+                    if (titleElement) {
+                        titleElement.textContent = message.title || `Properties - ${message.nodeClassName} - ${message.nodeName}`;
+                    }
+                    currentNodeClassName = message.nodeClassName || null;
+                }
+
+                if (currentNodeClassName === "Sound") {
+                    const playingProp = allProperties.find(p => p.name === "Playing");
+                    if (playingProp) {
+                        audioPlaying = !!playingProp.value;
+                    }
+                }
+            } else {
+                propertiesReadOnly = false;
+                allProperties = Array.isArray(message) ? message : [];
+                allTags = [];
+                allAttributes = [];
+            }
+            render();
+        }
+
+        function groupByCategory(properties) {
+            const categories = new Map();
+            const categoryOrder = [];
+
+            for (const prop of properties) {
+                const categoryName = (prop.category || "Other").toString();
+
+                if (!categories.has(categoryName)) {
+                    categories.set(categoryName, []);
+                    categoryOrder.push(categoryName);
+                }
+
+                categories.get(categoryName).push(prop);
+            }
+
+            return { categories, categoryOrder };
+        }
+
+
+        function compareCategoriesForCurrentClass(a, b) {
+            const normalize = (value) => String(value || "").toLowerCase().replace(/[\s_-]+/g, "");
+            if (currentNodeClassName === "Lighting") {
+                const aKey = normalize(a);
+                const bKey = normalize(b);
+                if (aKey === "appearance" && bKey === "data") return -1;
+                if (aKey === "data" && bKey === "appearance") return 1;
+            }
+            return compareCategoryNames(a, b);
+        }
+
+        function matchesFilter(prop) {
+            [[filterLogic]]
+        }
+
+        function render() {
+            const focusSnapshot = captureCurrentEditorFocus() || (restoreEditorFocusOnNextRender ? lastEditorFocusSnapshot : null);
+            container.innerHTML = "";
+
+            const filtered = allProperties.filter(matchesFilter);
+            if (filtered.length === 0 && allTags.length === 0 && allAttributes.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "empty";
+                empty.textContent = "No properties, tags, or attributes available.";
+                container.appendChild(empty);
+                restoreEditorFocusOnNextRender = false;
+                return;
+            }
+
+            const processedProps = filtered;
+
+            const { categories, categoryOrder } = groupByCategory(processedProps);
+            categoryOrder.sort(compareCategoriesForCurrentClass);
+
+            for (const categoryName of categoryOrder) {
+                const categoryProps = categories.get(categoryName) || [];
+
+                const sortedProps = [...categoryProps].sort((a, b) =>
+                    (a.displayName || a.name || "").localeCompare(b.displayName || b.name || "")
+                );
+
+
+                const categoryRoot = document.createElement("div");
+                categoryRoot.className = "category" + (collapsedCategories.has(categoryName) ? " collapsed" : "");
+
+                const header = document.createElement("div");
+                header.className = "category-header";
+
+                const caret = document.createElement("div");
+                caret.className = "caret";
+                header.appendChild(caret);
+
+                const title = document.createElement("div");
+                title.className = "category-header-title";
+                title.textContent = categoryName;
+                header.appendChild(title);
+
+                header.addEventListener("click", () => {
+                    if (collapsedCategories.has(categoryName)) collapsedCategories.delete(categoryName);
+                    else collapsedCategories.add(categoryName);
+                    render();
+                });
+
+                categoryRoot.appendChild(header);
+
+                const rows = document.createElement("div");
+                rows.className = "rows";
+
+                for (const prop of sortedProps) {
+                    const rowGroup = createRowGroup(prop);
+                    rows.appendChild(rowGroup);
+                }
+
+                categoryRoot.appendChild(rows);
+                container.appendChild(categoryRoot);
+            }
+
+            const tagsCategory = createTagsSection();
+            container.appendChild(tagsCategory);
+
+            const attributesCategory = createAttributesSection();
+            container.appendChild(attributesCategory);
+
+            restoreEditorFocusAfterRender(focusSnapshot);
+        }
+
+        function createRowGroup(prop) {
+            const group = document.createElement("div");
+            group.className = "property-group";
+            group.dataset.propertyName = prop.name;
+
+            const isExpandable = isMultiValueProperty(prop.type);
+            const isExpanded = expandedProperties.has(prop.name);
+
+            if (isExpandable) {
+                const mainRow = createRow(prop, true, isExpanded);
+                group.appendChild(mainRow);
+
+                if (isExpanded) {
+                    const subRows = createSubRows(prop);
+                    group.appendChild(subRows);
+                }
+            } else {
+                const mainRow = createRow(prop, false, false);
+                group.appendChild(mainRow);
+            }
+
+            if (currentNodeClassName === "Sound" && (prop.name === "AudioContent" || prop.name === "SoundId")) {
+                const previewRow = createAudioPreviewRow(prop);
+                group.appendChild(previewRow);
+            }
+
+            return group;
+        }
+
+        function createAudioPreviewRow(prop) {
+            const row = document.createElement("div");
+            row.className = "property-row property-subrow audio-preview-row";
+
+            const nameCell = document.createElement("div");
+            nameCell.className = "property-name";
+            nameCell.textContent = "Preview";
+            row.appendChild(nameCell);
+
+            const valueCell = document.createElement("div");
+            valueCell.className = "property-value audio-controls";
+
+            const playBtn = document.createElement("button");
+            playBtn.className = "audio-play-button" + (audioPlaying ? " playing" : "");
+            playBtn.title = audioPlaying ? "Stop" : "Play";
+            playBtn.addEventListener("click", () => {
+                if (audioPlaying) {
+                    stopSound();
+                } else {
+                    playSound();
+                }
+            });
+            valueCell.appendChild(playBtn);
+
+            const scrubberContainer = document.createElement("div");
+            scrubberContainer.className = "audio-scrubber-container";
+
+            const timePositionProp = allProperties.find(p => p.name === "TimePosition");
+            const timeLengthProp = allProperties.find(p => p.name === "TimeLength");
+            const timePosition = timePositionProp?.value || 0;
+            const timeLength = timeLengthProp?.value || 0;
+            const progress = timeLength > 0 ? (timePosition / timeLength) * 100 : 0;
+
+            const scrubberTrack = document.createElement("div");
+            scrubberTrack.className = "audio-scrubber-track";
+
+            const scrubberFill = document.createElement("div");
+            scrubberFill.className = "audio-scrubber-fill";
+            scrubberFill.style.width = `${Math.min(100, Math.max(0, progress))}%`;
+            scrubberTrack.appendChild(scrubberFill);
+
+            const scrubberHandle = document.createElement("div");
+            scrubberHandle.className = "audio-scrubber-handle";
+            scrubberHandle.style.left = `${Math.min(100, Math.max(0, progress))}%`;
+            scrubberTrack.appendChild(scrubberHandle);
+
+            let isDragging = false;
+
+            const updateScrubPosition = (e) => {
+                const rect = scrubberTrack.getBoundingClientRect();
+                const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+                const percent = x / rect.width;
+                const newTime = percent * timeLength;
+
+                scrubberFill.style.width = `${percent * 100}%`;
+                scrubberHandle.style.left = `${percent * 100}%`;
+
+                return newTime;
+            };
+
+            scrubberTrack.addEventListener("mousedown", (e) => {
+                isDragging = true;
+                audioScrubbing = true;
+                const newTime = updateScrubPosition(e);
+                setSoundTimePosition(newTime);
+            });
+
+            document.addEventListener("mousemove", (e) => {
+                if (isDragging) {
+                    const newTime = updateScrubPosition(e);
+                    setSoundTimePosition(newTime);
+                }
+            });
+
+            document.addEventListener("mouseup", () => {
+                if (isDragging) {
+                    isDragging = false;
+                    audioScrubbing = false;
+                }
+            });
+
+            scrubberContainer.appendChild(scrubberTrack);
+            valueCell.appendChild(scrubberContainer);
+
+            row.appendChild(valueCell);
+            return row;
+        }
+
+        function isMultiValueProperty(type) {
+            return type === "Vector2" || type === "Vector3" || type === "UDim2" ||
+                type === "CFrame" || type === "NumberRange" || type === "NumberSequence" ||
+                type === "ColorSequence";
+        }
+
+        function isDirectEditorInteraction(target) {
+            return target instanceof Element && !!target.closest("input, select, textarea, button, a, .expand-button");
+        }
+
+        function focusControlWithoutScroll(control) {
+            if (!control || typeof control.focus !== "function") return;
+            try {
+                control.focus({ preventScroll: true });
+            } catch {
+                control.focus();
+            }
+        }
+
+        function isRestorableTextControl(control) {
+            if (control instanceof HTMLTextAreaElement) return true;
+            if (!(control instanceof HTMLInputElement)) return false;
+            const type = String(control.type || "text").toLowerCase();
+            return !["button", "checkbox", "color", "file", "image", "radio", "range", "reset", "submit"].includes(type);
+        }
+
+        function selectEditorControlContents(control) {
+            if (!isRestorableTextControl(control)) return;
+            const selectAll = () => {
+                try {
+                    if (typeof control.select === "function") {
+                        control.select();
+                    } else if (typeof control.setSelectionRange === "function") {
+                        const length = String(control.value || "").length;
+                        control.setSelectionRange(0, length);
+                    }
+                } catch {
+                    // Some input types do not allow selection ranges.
+                }
+            };
+            selectAll();
+            if (typeof requestAnimationFrame === "function") {
+                requestAnimationFrame(selectAll);
+            }
+            setTimeout(selectAll, 0);
+        }
+
+        function restorableTextControls(row) {
+            if (!row) return [];
+            return Array.from(row.querySelectorAll(".property-value input:not([disabled]), .property-value textarea:not([disabled])"))
+                .filter(isRestorableTextControl);
+        }
+
+        function snapshotEditorFocus(control) {
+            if (!isRestorableTextControl(control)) return null;
+            const row = control.closest(".property-row");
+            const propertyKey = row?.dataset?.propertyKey || activePropertyRow;
+            if (!row || !propertyKey) return null;
+            const controls = restorableTextControls(row);
+            const controlIndex = Math.max(0, controls.indexOf(control));
+            return {
+                propertyKey,
+                controlIndex,
+                selectionStart: typeof control.selectionStart === "number" ? control.selectionStart : null,
+                selectionEnd: typeof control.selectionEnd === "number" ? control.selectionEnd : null,
+            };
+        }
+
+        function rememberEditorFocus(control) {
+            const snapshot = snapshotEditorFocus(control);
+            if (snapshot) {
+                lastEditorFocusSnapshot = snapshot;
+            }
+            return snapshot;
+        }
+
+        function captureCurrentEditorFocus() {
+            return rememberEditorFocus(document.activeElement);
+        }
+
+        function requestEditorFocusRestore(control = document.activeElement) {
+            const snapshot = rememberEditorFocus(control);
+            if (snapshot) {
+                restoreEditorFocusOnNextRender = true;
+            }
+        }
+
+        function findPropertyRowByKey(propertyKey) {
+            return Array.from(document.querySelectorAll(".property-row"))
+                .find((row) => row.dataset?.propertyKey === propertyKey) || null;
+        }
+
+        function restoreEditorFocusAfterRender(snapshot) {
+            restoreEditorFocusOnNextRender = false;
+            if (!snapshot || (activePropertyRow && snapshot.propertyKey !== activePropertyRow)) return;
+            const row = findPropertyRowByKey(snapshot.propertyKey);
+            const controls = restorableTextControls(row);
+            const control = controls[snapshot.controlIndex] || controls[0];
+            if (!control) return;
+            const restore = () => {
+                focusControlWithoutScroll(control);
+                if (typeof control.setSelectionRange === "function" && snapshot.selectionStart !== null && snapshot.selectionEnd !== null) {
+                    const max = String(control.value || "").length;
+                    const start = Math.max(0, Math.min(snapshot.selectionStart, max));
+                    const end = Math.max(0, Math.min(snapshot.selectionEnd, max));
+                    try {
+                        control.setSelectionRange(start, end);
+                    } catch {
+                        // Some input types do not allow selection ranges.
+                    }
+                }
+            };
+            restore();
+            if (typeof requestAnimationFrame === "function") {
+                requestAnimationFrame(restore);
+            }
+        }
+
+        function keepEditorTextFocus(control) {
+            if (control?.isConnected) {
+                focusControlWithoutScroll(control);
+                rememberEditorFocus(control);
+                return;
+            }
+            restoreEditorFocusAfterRender(lastEditorFocusSnapshot);
+        }
+
+        function setActivePropertyRow(row, propertyKey) {
+            if (!propertyKey) return;
+            activePropertyRow = propertyKey;
+            document.querySelectorAll(".property-row.active").forEach((existing) => {
+                if (existing !== row) existing.classList.remove("active");
+            });
+            row.classList.add("active");
+        }
+
+        function primaryEditorControl(row) {
+            if (!row) return null;
+            return row.querySelector(".property-value .color3-text:not([disabled])")
+                || restorableTextControls(row)[0]
+                || row.querySelector(".property-value select:not([disabled]), .property-value button:not([disabled])");
+        }
+
+        function focusPropertyRowEditor(row, propertyKey) {
+            setActivePropertyRow(row, propertyKey);
+            const control = primaryEditorControl(row);
+            if (!control || typeof control.focus !== "function") return;
+            focusControlWithoutScroll(control);
+            selectEditorControlContents(control);
+            rememberEditorFocus(control);
+        }
+
+        function activatePropertyRowOnClick(row, propertyKey) {
+            if (!row || row.classList.contains("readonly")) return;
+            row.dataset.propertyKey = propertyKey;
+            if (activePropertyRow === propertyKey) {
+                row.classList.add("active");
+            }
+            row.addEventListener("focusin", (event) => {
+                const wasActive = activePropertyRow === propertyKey && row.classList.contains("active");
+                setActivePropertyRow(row, propertyKey);
+                if (!wasActive) {
+                    selectEditorControlContents(event.target);
+                }
+                rememberEditorFocus(event.target);
+            });
+            row.addEventListener("mousedown", (event) => {
+                if (event.button !== 0) return;
+                if (event.target instanceof Element && event.target.closest(".expand-button, button, a")) return;
+                if (event.target instanceof Element && event.target.closest("input, select, textarea") && !event.target.closest(".color3-swatch")) return;
+                event.preventDefault();
+                focusPropertyRowEditor(row, propertyKey);
+            });
+        }
+
+        function createRow(prop, isExpandable, isExpanded) {
+            const row = document.createElement("div");
+            row.className = "property-row" + (prop.isReadOnly ? " readonly" : "");
+
+            const nameCell = document.createElement("div");
+            nameCell.className = "property-name";
+
+            if (isExpandable) {
+                const expandButton = document.createElement("span");
+                expandButton.className = "expand-button" + (isExpanded ? " expanded" : "");
+                expandButton.textContent = isExpanded ? "v" : ">";
+                expandButton.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    togglePropertyExpansion(prop.name);
+                });
+                nameCell.appendChild(expandButton);
+            }
+
+            const name = document.createElement("span");
+            name.textContent = prop.displayName || prop.name || "";
+            nameCell.appendChild(name);
+            row.appendChild(nameCell);
+
+            const value = document.createElement("div");
+            value.className = "property-value";
+            value.appendChild(createEditor(prop, isExpandable && !isExpanded));
+            row.appendChild(value);
+            activatePropertyRowOnClick(row, prop.name);
+
+            return row;
+        }
+
+        function createSubRows(prop) {
+            const subRows = document.createElement("div");
+            subRows.className = "property-subrows";
+
+            switch (prop.type) {
+                case "Vector2": {
+                    if (prop.value && typeof prop.value === "object") {
+                        subRows.appendChild(createSubRow(prop, "X", prop.value.X ?? 0, (val) => ({ X: val, Y: prop.value.Y ?? 0 })));
+                        subRows.appendChild(createSubRow(prop, "Y", prop.value.Y ?? 0, (val) => ({ X: prop.value.X ?? 0, Y: val })));
+                    } else {
+                        subRows.appendChild(createSubRow(prop, "X", 0, (val) => ({ X: val, Y: 0 })));
+                        subRows.appendChild(createSubRow(prop, "Y", 0, (val) => ({ X: 0, Y: val })));
+                    }
+                    break;
+                }
+                case "Vector3": {
+                    if (prop.value && typeof prop.value === "object") {
+                        subRows.appendChild(createSubRow(prop, "X", prop.value.X ?? 0, (val) => ({ X: val, Y: prop.value.Y ?? 0, Z: prop.value.Z ?? 0 })));
+                        subRows.appendChild(createSubRow(prop, "Y", prop.value.Y ?? 0, (val) => ({ X: prop.value.X ?? 0, Y: val, Z: prop.value.Z ?? 0 })));
+                        subRows.appendChild(createSubRow(prop, "Z", prop.value.Z ?? 0, (val) => ({ X: prop.value.X ?? 0, Y: prop.value.Y ?? 0, Z: val })));
+                    } else {
+                        subRows.appendChild(createSubRow(prop, "X", 0, (val) => ({ X: val, Y: 0, Z: 0 })));
+                        subRows.appendChild(createSubRow(prop, "Y", 0, (val) => ({ X: 0, Y: val, Z: 0 })));
+                        subRows.appendChild(createSubRow(prop, "Z", 0, (val) => ({ X: 0, Y: 0, Z: val })));
+                    }
+                    break;
+                }
+                case "UDim2": {
+                    if (prop.value && prop.value.X && prop.value.Y) {
+                        subRows.appendChild(createSubRow(prop, "X.Scale", prop.value.X.Scale ?? 0, (val) => ({ X: { Scale: val, Offset: prop.value.X.Offset ?? 0 }, Y: prop.value.Y })));
+                        subRows.appendChild(createSubRow(prop, "X.Offset", prop.value.X.Offset ?? 0, (val) => ({ X: { Scale: prop.value.X.Scale ?? 0, Offset: val }, Y: prop.value.Y })));
+                        subRows.appendChild(createSubRow(prop, "Y.Scale", prop.value.Y.Scale ?? 0, (val) => ({ X: prop.value.X, Y: { Scale: val, Offset: prop.value.Y.Offset ?? 0 } })));
+                        subRows.appendChild(createSubRow(prop, "Y.Offset", prop.value.Y.Offset ?? 0, (val) => ({ X: prop.value.X, Y: { Scale: prop.value.Y.Scale ?? 0, Offset: val } })));
+                    } else {
+                        subRows.appendChild(createSubRow(prop, "X.Scale", 0, (val) => ({ X: { Scale: val, Offset: 0 }, Y: { Scale: 0, Offset: 0 } })));
+                        subRows.appendChild(createSubRow(prop, "X.Offset", 0, (val) => ({ X: { Scale: 0, Offset: val }, Y: { Scale: 0, Offset: 0 } })));
+                        subRows.appendChild(createSubRow(prop, "Y.Scale", 0, (val) => ({ X: { Scale: 0, Offset: 0 }, Y: { Scale: val, Offset: 0 } })));
+                        subRows.appendChild(createSubRow(prop, "Y.Offset", 0, (val) => ({ X: { Scale: 0, Offset: 0 }, Y: { Scale: 0, Offset: val } })));
+                    }
+                    break;
+                }
+                case "CFrame": {
+                    const positionProp = {
+                        name: "Position",
+                        type: "Vector3",
+                        value: prop.value?.Position || { X: 0, Y: 0, Z: 0 },
+                        isReadOnly: prop.isReadOnly
+                    };
+                    const orientationProp = {
+                        name: "Orientation",
+                        type: "Vector3",
+                        value: prop.value?.Rotation || { X: 0, Y: 0, Z: 0 },
+                        isReadOnly: prop.isReadOnly
+                    };
+
+                    subRows.appendChild(createExpandableSubProperty(prop, positionProp, "Position", (newValue) => ({
+                        Position: newValue,
+                        Rotation: prop.value?.Rotation || { X: 0, Y: 0, Z: 0 }
+                    })));
+                    subRows.appendChild(createExpandableSubProperty(prop, orientationProp, "Orientation", (newValue) => ({
+                        Position: prop.value?.Position || { X: 0, Y: 0, Z: 0 },
+                        Rotation: newValue
+                    })));
+                    break;
+                }
+                case "NumberRange": {
+                    if (prop.value && typeof prop.value === "object") {
+                        subRows.appendChild(createSubRow(prop, "Min", prop.value.Min ?? 0, (val) => ({ Min: val, Max: prop.value.Max ?? 0 })));
+                        subRows.appendChild(createSubRow(prop, "Max", prop.value.Max ?? 0, (val) => ({ Min: prop.value.Min ?? 0, Max: val })));
+                    } else {
+                        subRows.appendChild(createSubRow(prop, "Min", 0, (val) => ({ Min: val, Max: 0 })));
+                        subRows.appendChild(createSubRow(prop, "Max", 0, (val) => ({ Min: 0, Max: val })));
+                    }
+                    break;
+                }
+            }
+
+            return subRows;
+        }
+
+        function createExpandableSubProperty(parentProp, subProp, subPropName, updateFn) {
+            const group = document.createElement("div");
+            group.className = "property-group property-subgroup";
+            group.dataset.propertyName = `${parentProp.name}.${subPropName}`;
+
+            const isExpandable = isMultiValueProperty(subProp.type);
+            const isExpanded = expandedProperties.has(`${parentProp.name}.${subPropName}`);
+
+            if (isExpandable) {
+                const mainRow = createSubRow(parentProp, subProp, subPropName, isExpanded);
+                group.appendChild(mainRow);
+
+                if (isExpanded) {
+                    const subSubRows = createSubRowsForSubProperty(parentProp, subProp, subPropName, updateFn);
+                    group.appendChild(subSubRows);
+                }
+            } else {
+                const mainRow = createSubRow(parentProp, subProp, subPropName, false);
+                group.appendChild(mainRow);
+            }
+
+            return group;
+        }
+
+        function createSubRowsForSubProperty(parentProp, subProp, subPropName, updateParentFn) {
+            const subRows = document.createElement("div");
+            subRows.className = "property-subrows property-subsubrows";
+
+            switch (subProp.type) {
+                case "Vector2": {
+                    if (subProp.value && typeof subProp.value === "object") {
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "X", subProp.value.X ?? 0, (val) => {
+                            const newSubValue = { X: val, Y: subProp.value.Y ?? 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Y", subProp.value.Y ?? 0, (val) => {
+                            const newSubValue = { X: subProp.value.X ?? 0, Y: val };
+                            return updateParentFn(newSubValue);
+                        }));
+                    } else {
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "X", 0, (val) => {
+                            const newSubValue = { X: val, Y: 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Y", 0, (val) => {
+                            const newSubValue = { X: 0, Y: val };
+                            return updateParentFn(newSubValue);
+                        }));
+                    }
+                    break;
+                }
+                case "Vector3": {
+                    if (subProp.value && typeof subProp.value === "object") {
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "X", subProp.value.X ?? 0, (val) => {
+                            const newSubValue = { X: val, Y: subProp.value.Y ?? 0, Z: subProp.value.Z ?? 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Y", subProp.value.Y ?? 0, (val) => {
+                            const newSubValue = { X: subProp.value.X ?? 0, Y: val, Z: subProp.value.Z ?? 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Z", subProp.value.Z ?? 0, (val) => {
+                            const newSubValue = { X: subProp.value.X ?? 0, Y: subProp.value.Y ?? 0, Z: val };
+                            return updateParentFn(newSubValue);
+                        }));
+                    } else {
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "X", 0, (val) => {
+                            const newSubValue = { X: val, Y: 0, Z: 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Y", 0, (val) => {
+                            const newSubValue = { X: 0, Y: val, Z: 0 };
+                            return updateParentFn(newSubValue);
+                        }));
+                        subRows.appendChild(createSubSubRow(parentProp, subPropName, "Z", 0, (val) => {
+                            const newSubValue = { X: 0, Y: 0, Z: val };
+                            return updateParentFn(newSubValue);
+                        }));
+                    }
+                    break;
+                }
+            }
+
+            return subRows;
+        }
+
+        function createSubSubRow(parentProp, subPropName, componentName, currentValue, updateFn) {
+            const row = document.createElement("div");
+            row.className = "property-row property-subrow property-subsubrow" + (parentProp.isReadOnly ? " readonly" : "");
+
+            const name = document.createElement("div");
+            name.className = "property-name";
+            name.textContent = componentName;
+            row.appendChild(name);
+
+            const value = document.createElement("div");
+            value.className = "property-value";
+
+            if (parentProp.isReadOnly) {
+                const display = document.createElement("div");
+                display.className = "value-display readonly-value";
+                display.textContent = formatNumber(currentValue);
+                value.appendChild(display);
+            } else {
+                value.appendChild(createNumberStepperEditor({
+                    value: currentValue,
+                    onCommit: (numericValue) => postSetProperty(parentProp.name, updateFn(numericValue))
+                }));
+            }
+
+            row.appendChild(value);
+            activatePropertyRowOnClick(row, `${parentProp.name}.${subPropName}.${componentName}`);
+
+            return row;
+        }
+
+        function createSubRow(parentProp, subProp, subPropName, isExpanded) {
+            if (typeof subProp === "string") {
+                return createComponentSubRow(parentProp, subProp, subPropName, isExpanded);
+            }
+
+            const row = document.createElement("div");
+            row.className = "property-row property-subrow" + (parentProp.isReadOnly ? " readonly" : "");
+
+            const nameCell = document.createElement("div");
+            nameCell.className = "property-name";
+
+            if (isMultiValueProperty(subProp.type)) {
+                const expandButton = document.createElement("span");
+                expandButton.className = "expand-button" + (isExpanded ? " expanded" : "");
+                expandButton.textContent = isExpanded ? "v" : ">";
+                expandButton.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    togglePropertyExpansion(`${parentProp.name}.${subPropName}`);
+                });
+                nameCell.appendChild(expandButton);
+            }
+
+            const name = document.createElement("span");
+            name.textContent = subPropName;
+            nameCell.appendChild(name);
+            row.appendChild(nameCell);
+
+            const value = document.createElement("div");
+            value.className = "property-value";
+            value.appendChild(createEditor(subProp, true));
+            row.appendChild(value);
+            activatePropertyRowOnClick(row, `${parentProp.name}.${subPropName}`);
+
+            return row;
+        }
+
+        function createComponentSubRow(parentProp, componentName, currentValue, updateFn) {
+            const row = document.createElement("div");
+            row.className = "property-row property-subrow property-component-row" + (parentProp.isReadOnly ? " readonly" : "");
+
+            const nameCell = document.createElement("div");
+            nameCell.className = "property-name";
+            nameCell.textContent = componentName;
+            row.appendChild(nameCell);
+
+            const valueCell = document.createElement("div");
+            valueCell.className = "property-value";
+
+            if (parentProp.isReadOnly) {
+                const display = document.createElement("div");
+                display.className = "value-display readonly-value";
+                display.textContent = formatNumber(currentValue);
+                valueCell.appendChild(display);
+            } else {
+                valueCell.appendChild(createNumberStepperEditor({
+                    value: currentValue,
+                    onCommit: (numericValue) => postSetProperty(parentProp.name, updateFn(numericValue))
+                }));
+            }
+
+            row.appendChild(valueCell);
+            activatePropertyRowOnClick(row, `${parentProp.name}.${componentName}`);
+            return row;
+        }
+
+        function togglePropertyExpansion(propertyName) {
+            if (expandedProperties.has(propertyName)) {
+                expandedProperties.delete(propertyName);
+            } else {
+                expandedProperties.add(propertyName);
+            }
+            render();
+        }
+
+        function postSetProperty(propertyName, propertyValue) {
+            if (propertiesReadOnly) return;
+            requestEditorFocusRestore();
+            activePropertyEdit = propertyName;
+            vscode.postMessage({
+                type: "setProperty",
+                propertyName,
+                propertyValue,
+            });
+        }
+
+        function postLiveSetProperty(propertyName, propertyValue) {
+            if (propertiesReadOnly) return;
+            vscode.postMessage({
+                type: "setProperty",
+                propertyName,
+                propertyValue,
+                live: true,
+            });
+        }
+
+        function scheduleLiveSetProperty(propertyName, propertyValue) {
+            const existing = propertyPostTimers.get(propertyName);
+            if (existing) clearTimeout(existing);
+            propertyPostTimers.set(propertyName, setTimeout(() => {
+                propertyPostTimers.delete(propertyName);
+                postLiveSetProperty(propertyName, propertyValue);
+            }, 16));
+        }
+
+        function flushSetProperty(propertyName, propertyValue) {
+            const existing = propertyPostTimers.get(propertyName);
+            if (existing) {
+                clearTimeout(existing);
+                propertyPostTimers.delete(propertyName);
+            }
+            postSetProperty(propertyName, propertyValue);
+        }
+
+        function playSound() {
+            audioPlaying = true;
+            vscode.postMessage({ type: "playSound" });
+            render();
+        }
+
+        function stopSound() {
+            audioPlaying = false;
+            vscode.postMessage({ type: "stopSound" });
+            render();
+        }
+
+        function setSoundTimePosition(timePosition) {
+            vscode.postMessage({ type: "setSoundTimePosition", timePosition });
+        }
+
+        function formatTime(seconds) {
+            if (!seconds || !isFinite(seconds)) return "0:00";
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function formatNumber(value) {
+            const number = Number(value);
+            if (!Number.isFinite(number)) {
+                if (value && typeof value === "object") return JSON.stringify(value);
+                return String(value ?? "");
+            }
+            const rounded = Math.round(number * 1000) / 1000;
+            return String(Object.is(rounded, -0) ? 0 : rounded);
+        }
+
+        function numberInputValue(value, fallback = "0") {
+            if (value === null || value === undefined || value === "") return fallback;
+            return formatNumber(value);
+        }
+
+        function parseNumberList(text) {
+            return String(text || "").split(",").map((part) => parseFloat(part.trim()));
+        }
+
+        function blurValueInputOnEnter(event) {
+            const target = event.target;
+            if (
+                event.key !== "Enter" ||
+                !(target instanceof HTMLInputElement) ||
+                (!target.classList.contains("value-input") && !target.classList.contains("color3-text"))
+            ) {
+                return;
+            }
+            event.preventDefault();
+            target.blur();
+        }
+
+        function parseStrictNumber(text, allowDecimal = true) {
+            const cleaned = String(text || "").trim();
+            const pattern = allowDecimal
+                ? /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)$/
+                : /^[-+]?\d+$/;
+            if (!pattern.test(cleaned)) return null;
+            const value = allowDecimal ? parseFloat(cleaned) : parseInt(cleaned, 10);
+            return Number.isFinite(value) ? value : null;
+        }
+
+        function numericSliderBounds(prop) {
+            if (!prop) return null;
+            const min = Number(prop.uiMinimum);
+            const max = Number(prop.uiMaximum);
+            if (!Number.isFinite(min) || !Number.isFinite(max) || !(max > min)) return null;
+            const isInt = String(prop.type || "").includes("int");
+            const ticks = Number(prop.uiNumTicks);
+            let step = Number.isFinite(ticks) && ticks > 0 ? (max - min) / ticks : (isInt ? 1 : 0.001);
+            if (!Number.isFinite(step) || step <= 0) {
+                step = isInt ? 1 : 0.001;
+            }
+            if (isInt) {
+                step = Math.max(1, Math.round(step));
+            }
+            return { min, max, step, isInt };
+        }
+
+        function clampToSliderBounds(value, bounds) {
+            return Math.max(bounds.min, Math.min(bounds.max, value));
+        }
+
+        function normalizeSliderValue(value, bounds) {
+            const clamped = clampToSliderBounds(value, bounds);
+            return bounds.isInt ? Math.round(clamped) : Number(formatNumber(clamped));
+        }
+
+        function sliderFillPercent(value, bounds) {
+            if (!bounds || !(bounds.max > bounds.min)) return 0;
+            const clamped = clampToSliderBounds(Number.isFinite(value) ? value : bounds.min, bounds);
+            return ((clamped - bounds.min) / (bounds.max - bounds.min)) * 100;
+        }
+
+        function updateSliderVisuals(slider, value, bounds) {
+            if (!(slider instanceof HTMLInputElement) || !bounds) return;
+            slider.style.setProperty("--slider-fill-percent", `${sliderFillPercent(value, bounds)}%`);
+            slider.classList.add("slider-ready");
+        }
+
+        function attachNumberInputGuards(input, options = {}) {
+            const allowDecimal = options.allowDecimal !== false;
+            const allowNegative = options.allowNegative !== false;
+            input.inputMode = allowDecimal ? "decimal" : "numeric";
+            input.spellcheck = false;
+            input.addEventListener("keydown", (e) => {
+                if (e.ctrlKey || e.metaKey) return;
+                if (["Backspace", "Delete", "Tab", "Escape", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
+                if (/^\d$/.test(e.key)) return;
+                if (allowDecimal && e.key === "." && !input.value.includes(".")) return;
+                if (allowNegative && e.key === "-" && input.selectionStart === 0 && !input.value.includes("-")) return;
+                e.preventDefault();
+            });
+            input.addEventListener("paste", (e) => {
+                const text = e.clipboardData?.getData("text") ?? "";
+                if (parseStrictNumber(text, allowDecimal) === null) {
+                    e.preventDefault();
+                }
+            });
+        }
+
+        function decimalPlacesForText(text) {
+            const match = String(text || "").match(/\.(\d+)/);
+            return match ? match[1].length : 0;
+        }
+
+        function numberStepForText(text, allowDecimal = true) {
+            return allowDecimal ? 0.001 : 1;
+        }
+
+        function steppedNumberValue(value, decimalPlaces) {
+            void decimalPlaces;
+            return Number(formatNumber(value));
+        }
+
+        function createNumberStepperEditor(options) {
+            const allowDecimal = options.allowDecimal !== false;
+            const wrapper = document.createElement("div");
+            wrapper.className = "number-stepper";
+
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "value-input";
+            input.value = numberInputValue(options.value);
+            attachNumberInputGuards(input, { allowDecimal });
+
+            const buttons = document.createElement("div");
+            buttons.className = "number-stepper-buttons";
+
+            const commit = (value) => {
+                input.value = numberInputValue(value);
+                options.onCommit(value);
+            };
+
+            const commitInput = () => {
+                const numericValue = parseStrictNumber(input.value, allowDecimal);
+                if (numericValue === null) return;
+                commit(numericValue);
+            };
+
+            const step = (direction) => {
+                const parsed = parseStrictNumber(input.value, allowDecimal);
+                const current = parsed === null ? Number(options.value ?? 0) || 0 : parsed;
+                const delta = numberStepForText(input.value, allowDecimal);
+                const decimalPlaces = allowDecimal ? decimalPlacesForText(input.value) : 0;
+                const next = allowDecimal ? current + direction * delta : current + direction;
+                commit(allowDecimal ? steppedNumberValue(next, decimalPlaces) : Math.trunc(next));
+            };
+
+            const makeButton = (direction, className, label) => {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = `number-stepper-button ${className}`;
+                button.tabIndex = -1;
+                button.title = label;
+                button.setAttribute("aria-label", label);
+                let delay = null;
+                let interval = null;
+                const stop = () => {
+                    if (delay !== null) {
+                        clearTimeout(delay);
+                        delay = null;
+                    }
+                    if (interval !== null) {
+                        clearInterval(interval);
+                        interval = null;
+                    }
+                    document.removeEventListener("pointerup", stop);
+                    document.removeEventListener("pointercancel", stop);
+                    keepEditorTextFocus(input);
+                };
+                button.addEventListener("mousedown", (event) => event.preventDefault());
+                button.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    keepEditorTextFocus(input);
+                    step(direction);
+                    stop();
+                    delay = setTimeout(() => {
+                        interval = setInterval(() => step(direction), 70);
+                    }, 350);
+                    document.addEventListener("pointerup", stop);
+                    document.addEventListener("pointercancel", stop);
+                });
+                button.addEventListener("click", (event) => event.preventDefault());
+                button.addEventListener("keydown", (event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        step(direction);
+                    }
+                });
+                return button;
+            };
+
+            input.addEventListener("change", commitInput);
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                    event.preventDefault();
+                    step(event.key === "ArrowUp" ? 1 : -1);
+                }
+            });
+
+            buttons.appendChild(makeButton(1, "up", "Increase"));
+            buttons.appendChild(makeButton(-1, "down", "Decrease"));
+            wrapper.appendChild(input);
+            wrapper.appendChild(buttons);
+            return wrapper;
+        }
+
+        function createSliderEditor(prop) {
+            const bounds = numericSliderBounds(prop);
+            if (!bounds) {
+                return createNumberStepperEditor({
+                    value: prop?.value,
+                    allowDecimal: !String(prop?.type || "").includes("int"),
+                    onCommit: (numericValue) => postSetProperty(prop.name, numericValue)
+                });
+            }
+
+            const wrapper = document.createElement("div");
+            wrapper.className = "slider-editor";
+
+            const numberWrapper = document.createElement("div");
+            numberWrapper.className = "number-stepper slider-number-stepper";
+
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "value-input slider-text";
+            attachNumberInputGuards(input, { allowDecimal: !bounds.isInt, allowNegative: bounds.min < 0 });
+
+            const buttons = document.createElement("div");
+            buttons.className = "number-stepper-buttons";
+
+            const slider = document.createElement("input");
+            slider.type = "range";
+            slider.className = "value-slider";
+            slider.min = String(bounds.min);
+            slider.max = String(bounds.max);
+            slider.step = String(bounds.step);
+
+            const setValue = (value) => {
+                const fallback = Number.isFinite(Number(prop?.value)) ? Number(prop.value) : bounds.min;
+                const next = normalizeSliderValue(Number.isFinite(value) ? value : fallback, bounds);
+                const text = numberInputValue(next, numberInputValue(bounds.min));
+                input.value = text;
+                slider.value = String(next);
+                updateSliderVisuals(slider, next, bounds);
+                return next;
+            };
+
+            const commitLive = (value) => {
+                activePropertyEdit = prop.name;
+                scheduleLiveSetProperty(prop.name, setValue(value));
+            };
+
+            const commitFinal = (value) => {
+                activePropertyEdit = prop.name;
+                flushSetProperty(prop.name, setValue(value));
+            };
+
+            const step = (direction) => {
+                const parsed = parseStrictNumber(input.value, !bounds.isInt);
+                const current = parsed === null
+                    ? (Number.isFinite(Number(prop?.value)) ? Number(prop.value) : bounds.min)
+                    : parsed;
+                commitFinal(current + direction * bounds.step);
+            };
+
+            const makeButton = (direction, className, label) => {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = `number-stepper-button ${className}`;
+                button.tabIndex = -1;
+                button.title = label;
+                button.setAttribute("aria-label", label);
+                let delay = null;
+                let interval = null;
+                const stop = () => {
+                    if (delay !== null) {
+                        clearTimeout(delay);
+                        delay = null;
+                    }
+                    if (interval !== null) {
+                        clearInterval(interval);
+                        interval = null;
+                    }
+                    document.removeEventListener("pointerup", stop);
+                    document.removeEventListener("pointercancel", stop);
+                    keepEditorTextFocus(input);
+                };
+                button.addEventListener("mousedown", (event) => event.preventDefault());
+                button.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    keepEditorTextFocus(input);
+                    step(direction);
+                    stop();
+                    delay = setTimeout(() => {
+                        interval = setInterval(() => step(direction), 70);
+                    }, 350);
+                    document.addEventListener("pointerup", stop);
+                    document.addEventListener("pointercancel", stop);
+                });
+                button.addEventListener("click", (event) => event.preventDefault());
+                button.addEventListener("keydown", (event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        step(direction);
+                    }
+                });
+                return button;
+            };
+
+            setValue(Number(prop?.value));
+
+            input.addEventListener("change", () => {
+                const parsed = parseStrictNumber(input.value, !bounds.isInt);
+                if (parsed === null) {
+                    setValue(Number(prop?.value));
+                    return;
+                }
+                commitFinal(parsed);
+            });
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                    event.preventDefault();
+                    step(event.key === "ArrowUp" ? 1 : -1);
+                }
+            });
+
+            slider.addEventListener("input", () => {
+                commitLive(parseFloat(slider.value));
+            });
+            slider.addEventListener("change", () => commitFinal(parseFloat(slider.value)));
+            slider.addEventListener("pointerup", () => commitFinal(parseFloat(slider.value)));
+            slider.addEventListener("keyup", (event) => {
+                if (event.key === "Enter" || event.key === " " || event.key.startsWith("Arrow")) {
+                    commitFinal(parseFloat(slider.value));
+                }
+            });
+
+            buttons.appendChild(makeButton(1, "up", "Increase"));
+            buttons.appendChild(makeButton(-1, "down", "Decrease"));
+            numberWrapper.appendChild(input);
+            numberWrapper.appendChild(buttons);
+            wrapper.appendChild(numberWrapper);
+            wrapper.appendChild(slider);
+            return wrapper;
+        }
+
+        function formatPropertyValue(prop) {
+            if (prop.value === null || prop.value === undefined) {
+                return "";
+            }
+
+            if (typeof prop.displayValue === "string") {
+                return prop.displayValue;
+            }
+
+            if (prop.value && prop.value.Name && (prop.isEnum || prop.value.EnumType)) {
+                return String(prop.value.Name);
+            }
+
+            if (typeof prop.value === "boolean") {
+                return prop.value ? "true" : "false";
+            }
+
+            if (typeof prop.value === "object") {
+                // Raw store-format values verde did not convert (no schema match).
+                if (prop.value._type === "EnumItem") {
+                    return String(prop.value.name != null ? prop.value.name : (prop.value.Name != null ? prop.value.Name : ""));
+                }
+                if (prop.value._type === "Ref") {
+                    if (prop.displayValue) return prop.displayValue;
+                    if (Array.isArray(prop.value.pathSegments)) return prop.value.pathSegments.join(".");
+                    if (prop.value.settingsId != null) return String(prop.value.settingsId);
+                    if (prop.value.instanceId != null) return String(prop.value.instanceId);
+                    if (prop.value.instanceIndex != null) return "#" + prop.value.instanceIndex;
+                    return "None";
+                }
+                if (typeof prop.value.Uri === "string") return prop.value.Uri;
+                if (typeof prop.value.uri === "string") return prop.value.uri;
+                if (prop.value.R === undefined && prop.value.r !== undefined && prop.value.g !== undefined && prop.value.b !== undefined) {
+                    return "[" + Math.round(prop.value.r * 255) + ", " + Math.round(prop.value.g * 255) + ", " + Math.round(prop.value.b * 255) + "]";
+                }
+                if (prop.value.X !== undefined && prop.value.Y !== undefined && prop.value.Z !== undefined) {
+                    return `${formatNumber(prop.value.X)}, ${formatNumber(prop.value.Y)}, ${formatNumber(prop.value.Z)}`;
+                }
+                if (prop.value.X !== undefined && prop.value.Y !== undefined) {
+                    if (typeof prop.value.X === "object") {
+                        return `{${formatNumber(prop.value.X.Scale)}, ${formatNumber(prop.value.X.Offset)}}, {${formatNumber(prop.value.Y.Scale)}, ${formatNumber(prop.value.Y.Offset)}}`;
+                    }
+                    return `${formatNumber(prop.value.X)}, ${formatNumber(prop.value.Y)}`;
+                }
+                if (prop.value.R !== undefined && prop.value.G !== undefined && prop.value.B !== undefined) {
+                    const r = Math.round(prop.value.R * 255);
+                    const g = Math.round(prop.value.G * 255);
+                    const b = Math.round(prop.value.B * 255);
+                    return `[${r}, ${g}, ${b}]`;
+                }
+                if (prop.value.Min !== undefined && prop.value.Max !== undefined) {
+                    return `${formatNumber(prop.value.Min)} - ${formatNumber(prop.value.Max)}`;
+                }
+                if (prop.value.Position && prop.value.Rotation) {
+                    const pos = prop.value.Position;
+                    return `${formatNumber(pos.X)}, ${formatNumber(pos.Y)}, ${formatNumber(pos.Z)}`;
+                }
+                if (prop.value.Keypoints) {
+                    return `${prop.value.Keypoints.length} keypoint${prop.value.Keypoints.length !== 1 ? 's' : ''}`;
+                }
+                return JSON.stringify(prop.value);
+            }
+
+            return String(prop.value);
+        }
+
+        function createEditor(prop, showCompact) {
+            const clamp255 = (value) => Math.max(0, Math.min(255, value));
+
+            const color3ToRgb255 = (color3) => {
+                const r = clamp255(Math.round(((color3?.R ?? 0) * 255)));
+                const g = clamp255(Math.round(((color3?.G ?? 0) * 255)));
+                const b = clamp255(Math.round(((color3?.B ?? 0) * 255)));
+                return { r, g, b };
+            };
+
+            const rgb255ToHex = (r, g, b) => {
+                const rr = clamp255(r).toString(16).padStart(2, "0");
+                const gg = clamp255(g).toString(16).padStart(2, "0");
+                const bb = clamp255(b).toString(16).padStart(2, "0");
+                return `#${rr}${gg}${bb}`;
+            };
+
+            const hexToRgb255 = (hex) => {
+                const cleaned = (hex || "").trim();
+                if (!/^#[0-9a-fA-F]{6}$/.test(cleaned)) return null;
+                return {
+                    r: parseInt(cleaned.slice(1, 3), 16),
+                    g: parseInt(cleaned.slice(3, 5), 16),
+                    b: parseInt(cleaned.slice(5, 7), 16),
+                };
+            };
+
+            const rgb255ToColor3 = (r, g, b) => ({
+                R: clamp255(r) / 255,
+                G: clamp255(g) / 255,
+                B: clamp255(b) / 255,
+            });
+
+            const formatRgbText = (r, g, b) => `${clamp255(r)},${clamp255(g)},${clamp255(b)}`;
+            const formatRgbDisplay = (r, g, b) => `[${formatRgbText(r, g, b)}]`;
+
+            const parseRgbBracket = (text) => {
+                const cleaned = (text || "").trim();
+                const match = cleaned.match(/^\[\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\]$/);
+                if (!match) return null;
+
+                const r = clamp255(parseInt(match[1], 10));
+                const g = clamp255(parseInt(match[2], 10));
+                const b = clamp255(parseInt(match[3], 10));
+
+                return { r, g, b };
+            };
+
+            const parseColorInput = (text) => {
+                const cleaned = (text || "").trim();
+
+                const bracketResult = parseRgbBracket(cleaned);
+                if (bracketResult) return bracketResult;
+
+                const commaParts = cleaned.split(",").map(s => s.trim());
+                if (commaParts.length === 3) {
+                    const r = clamp255(parseInt(commaParts[0], 10));
+                    const g = clamp255(parseInt(commaParts[1], 10));
+                    const b = clamp255(parseInt(commaParts[2], 10));
+                    if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
+                        return { r, g, b };
+                    }
+                }
+
+                const singleNum = parseFloat(cleaned);
+                if (!isNaN(singleNum) && isFinite(singleNum)) {
+                    if (singleNum === 0) return { r: 0, g: 0, b: 0 };
+                    if (singleNum === 1) return { r: 255, g: 255, b: 255 };
+
+                    if (singleNum > 0 && singleNum < 1) {
+                        const scaled = Math.round(singleNum * 255);
+                        return { r: scaled, g: scaled, b: scaled };
+                    }
+
+                    const clamped = clamp255(Math.round(singleNum));
+                    return { r: clamped, g: clamped, b: clamped };
+                }
+
+                return null;
+            };
+
+            const BRICK_COLORS = [
+                { name: "White", number: 1, r: 242, g: 243, b: 243 },
+                { name: "Grey", number: 2, r: 161, g: 165, b: 162 },
+                { name: "Light yellow", number: 3, r: 249, g: 233, b: 153 },
+                { name: "Brick yellow", number: 5, r: 215, g: 197, b: 154 },
+                { name: "Light green (Mint)", number: 6, r: 194, g: 218, b: 184 },
+                { name: "Light reddish violet", number: 9, r: 232, g: 186, b: 200 },
+                { name: "Pastel Blue", number: 11, r: 128, g: 187, b: 219 },
+                { name: "Light orange brown", number: 12, r: 203, g: 132, b: 66 },
+                { name: "Nougat", number: 18, r: 204, g: 142, b: 105 },
+                { name: "Bright red", number: 21, r: 196, g: 40, b: 28 },
+                { name: "Med. reddish violet", number: 22, r: 196, g: 112, b: 160 },
+                { name: "Bright blue", number: 23, r: 13, g: 105, b: 172 },
+                { name: "Bright yellow", number: 24, r: 245, g: 205, b: 48 },
+                { name: "Earth orange", number: 25, r: 98, g: 71, b: 50 },
+                { name: "Black", number: 26, r: 27, g: 42, b: 53 },
+                { name: "Dark grey", number: 27, r: 109, g: 110, b: 108 },
+                { name: "Dark green", number: 28, r: 40, g: 127, b: 71 },
+                { name: "Medium green", number: 29, r: 161, g: 196, b: 140 },
+                { name: "Lig. Yellowich orange", number: 36, r: 243, g: 207, b: 155 },
+                { name: "Bright green", number: 37, r: 75, g: 151, b: 75 },
+                { name: "Dark orange", number: 38, r: 160, g: 95, b: 53 },
+                { name: "Light bluish violet", number: 39, r: 193, g: 202, b: 222 },
+                { name: "Transparent", number: 40, r: 236, g: 236, b: 236 },
+                { name: "Tr. Red", number: 41, r: 205, g: 84, b: 75 },
+                { name: "Tr. Lg blue", number: 42, r: 193, g: 223, b: 240 },
+                { name: "Tr. Blue", number: 43, r: 123, g: 182, b: 232 },
+                { name: "Tr. Yellow", number: 44, r: 247, g: 241, b: 141 },
+                { name: "Light blue", number: 45, r: 180, g: 210, b: 228 },
+                { name: "Tr. Flu. Reddish orange", number: 47, r: 217, g: 133, b: 108 },
+                { name: "Tr. Green", number: 48, r: 132, g: 182, b: 141 },
+                { name: "Tr. Flu. Green", number: 49, r: 248, g: 241, b: 132 },
+                { name: "Phosph. White", number: 50, r: 236, g: 232, b: 222 },
+                { name: "Light red", number: 100, r: 238, g: 196, b: 182 },
+                { name: "Medium red", number: 101, r: 218, g: 134, b: 122 },
+                { name: "Medium blue", number: 102, r: 110, g: 153, b: 202 },
+                { name: "Light grey", number: 103, r: 199, g: 193, b: 183 },
+                { name: "Bright violet", number: 104, r: 107, g: 50, b: 124 },
+                { name: "Br. yellowish orange", number: 105, r: 226, g: 155, b: 64 },
+                { name: "Bright orange", number: 106, r: 218, g: 133, b: 65 },
+                { name: "Bright bluish green", number: 107, r: 0, g: 143, b: 156 },
+                { name: "Earth yellow", number: 108, r: 104, g: 92, b: 67 },
+                { name: "Bright bluish violet", number: 110, r: 67, g: 84, b: 147 },
+                { name: "Tr. Brown", number: 111, r: 191, g: 183, b: 177 },
+                { name: "Medium bluish violet", number: 112, r: 104, g: 116, b: 172 },
+                { name: "Tr. Medi. reddish violet", number: 113, r: 229, g: 173, b: 200 },
+                { name: "Med. yellowish green", number: 115, r: 199, g: 210, b: 60 },
+                { name: "Med. bluish green", number: 116, r: 85, g: 165, b: 175 },
+                { name: "Light bluish green", number: 118, r: 183, g: 215, b: 213 },
+                { name: "Br. yellowish green", number: 119, r: 164, g: 189, b: 71 },
+                { name: "Lig. yellowish green", number: 120, r: 217, g: 228, b: 167 },
+                { name: "Med. yellowish orange", number: 121, r: 231, g: 172, b: 88 },
+                { name: "Br. reddish orange", number: 123, r: 211, g: 111, b: 76 },
+                { name: "Bright reddish violet", number: 124, r: 146, g: 57, b: 120 },
+                { name: "Light orange", number: 125, r: 234, g: 184, b: 146 },
+                { name: "Tr. Bright bluish violet", number: 126, r: 165, g: 165, b: 203 },
+                { name: "Gold", number: 127, r: 220, g: 188, b: 129 },
+                { name: "Dark nougat", number: 128, r: 174, g: 122, b: 89 },
+                { name: "Silver", number: 131, r: 156, g: 163, b: 168 },
+                { name: "Neon orange", number: 133, r: 213, g: 115, b: 61 },
+                { name: "Neon green", number: 134, r: 216, g: 221, b: 86 },
+                { name: "Sand blue", number: 135, r: 116, g: 134, b: 157 },
+                { name: "Sand violet", number: 136, r: 135, g: 124, b: 144 },
+                { name: "Medium orange", number: 137, r: 224, g: 152, b: 100 },
+                { name: "Sand yellow", number: 138, r: 149, g: 138, b: 115 },
+                { name: "Earth blue", number: 140, r: 32, g: 58, b: 86 },
+                { name: "Earth green", number: 141, r: 39, g: 70, b: 45 },
+                { name: "Tr. Flu. Blue", number: 143, r: 207, g: 226, b: 247 },
+                { name: "Sand blue metallic", number: 145, r: 121, g: 136, b: 161 },
+                { name: "Sand violet metallic", number: 146, r: 149, g: 142, b: 163 },
+                { name: "Sand yellow metallic", number: 147, r: 147, g: 135, b: 103 },
+                { name: "Dark grey metallic", number: 148, r: 87, g: 88, b: 87 },
+                { name: "Black metallic", number: 149, r: 22, g: 29, b: 50 },
+                { name: "Light grey metallic", number: 150, r: 171, g: 173, b: 172 },
+                { name: "Sand green", number: 151, r: 120, g: 144, b: 130 },
+                { name: "Sand red", number: 153, r: 149, g: 121, b: 119 },
+                { name: "Dark red", number: 154, r: 123, g: 46, b: 47 },
+                { name: "Tr. Flu. Yellow", number: 157, r: 255, g: 246, b: 123 },
+                { name: "Tr. Flu. Red", number: 158, r: 225, g: 164, b: 194 },
+                { name: "Gun metallic", number: 168, r: 117, g: 108, b: 98 },
+                { name: "Red flip/flop", number: 176, r: 151, g: 105, b: 91 },
+                { name: "Yellow flip/flop", number: 178, r: 180, g: 132, b: 85 },
+                { name: "Silver flip/flop", number: 179, r: 137, g: 135, b: 136 },
+                { name: "Curry", number: 180, r: 215, g: 169, b: 75 },
+                { name: "Fire Yellow", number: 190, r: 249, g: 214, b: 46 },
+                { name: "Flame yellowish orange", number: 191, r: 232, g: 171, b: 45 },
+                { name: "Reddish brown", number: 192, r: 105, g: 64, b: 40 },
+                { name: "Flame reddish orange", number: 193, r: 207, g: 96, b: 36 },
+                { name: "Medium stone grey", number: 194, r: 163, g: 162, b: 165 },
+                { name: "Royal blue", number: 195, r: 70, g: 103, b: 164 },
+                { name: "Dark Royal blue", number: 196, r: 35, g: 71, b: 139 },
+                { name: "Bright reddish lilac", number: 198, r: 142, g: 66, b: 133 },
+                { name: "Dark stone grey", number: 199, r: 99, g: 95, b: 98 },
+                { name: "Lemon metalic", number: 200, r: 130, g: 138, b: 93 },
+                { name: "Light stone grey", number: 208, r: 229, g: 228, b: 223 },
+                { name: "Dark Curry", number: 209, r: 176, g: 142, b: 68 },
+                { name: "Faded green", number: 210, r: 112, g: 149, b: 120 },
+                { name: "Turquoise", number: 211, r: 121, g: 181, b: 181 },
+                { name: "Light Royal blue", number: 212, r: 159, g: 195, b: 233 },
+                { name: "Medium Royal blue", number: 213, r: 108, g: 129, b: 183 },
+                { name: "Rust", number: 216, r: 144, g: 76, b: 42 },
+                { name: "Brown", number: 217, r: 124, g: 92, b: 70 },
+                { name: "Reddish lilac", number: 218, r: 150, g: 112, b: 159 },
+                { name: "Lilac", number: 219, r: 107, g: 98, b: 155 },
+                { name: "Light lilac", number: 220, r: 167, g: 169, b: 206 },
+                { name: "Bright purple", number: 221, r: 205, g: 98, b: 152 },
+                { name: "Light purple", number: 222, r: 228, g: 173, b: 200 },
+                { name: "Light pink", number: 223, r: 220, g: 144, b: 149 },
+                { name: "Light brick yellow", number: 224, r: 240, g: 213, b: 160 },
+                { name: "Warm yellowish orange", number: 225, r: 235, g: 184, b: 127 },
+                { name: "Cool yellow", number: 226, r: 253, g: 234, b: 141 },
+                { name: "Dove blue", number: 232, r: 125, g: 187, b: 221 },
+                { name: "Medium lilac", number: 268, r: 52, g: 43, b: 117 },
+                { name: "Smoky grey", number: 302, r: 91, g: 93, b: 105 },
+                { name: "Dark blue", number: 303, r: 0, g: 16, b: 176 },
+                { name: "Steel blue", number: 305, r: 82, g: 124, b: 174 },
+                { name: "Storm blue", number: 306, r: 51, g: 88, b: 130 },
+                { name: "Dark indigo", number: 308, r: 61, g: 21, b: 133 },
+                { name: "Cadet blue", number: 314, r: 159, g: 173, b: 192 },
+                { name: "Eggplant", number: 316, r: 123, g: 0, b: 123 },
+                { name: "Ghost grey", number: 320, r: 202, g: 203, b: 209 },
+                { name: "Crimson", number: 327, r: 151, g: 0, b: 0 },
+                { name: "Carnation pink", number: 330, r: 255, g: 152, b: 220 },
+                { name: "Maroon", number: 332, r: 117, g: 0, b: 0 },
+                { name: "Institutional white", number: 1001, r: 248, g: 248, b: 248 },
+                { name: "Really black", number: 1003, r: 17, g: 17, b: 17 },
+                { name: "Really red", number: 1004, r: 255, g: 0, b: 0 },
+                { name: "Deep orange", number: 1005, r: 255, g: 176, b: 0 },
+                { name: "New Yeller", number: 1009, r: 255, g: 255, b: 0 },
+                { name: "Really blue", number: 1010, r: 0, g: 0, b: 255 },
+                { name: "Navy blue", number: 1011, r: 0, g: 32, b: 96 },
+                { name: "Cyan", number: 1013, r: 4, g: 175, b: 236 },
+                { name: "Magenta", number: 1015, r: 170, g: 0, b: 170 },
+                { name: "Pink", number: 1016, r: 255, g: 102, b: 204 },
+                { name: "Teal", number: 1018, r: 18, g: 238, b: 212 },
+                { name: "Lime green", number: 1020, r: 0, g: 255, b: 0 },
+                { name: "Royal purple", number: 1031, r: 98, g: 37, b: 209 },
+                { name: "Hot pink", number: 1032, r: 255, g: 0, b: 191 },
+            ];
+
+            const rgb255ToHsv = (r, g, b) => {
+                const rr = r / 255;
+                const gg = g / 255;
+                const bb = b / 255;
+
+                const max = Math.max(rr, gg, bb);
+                const min = Math.min(rr, gg, bb);
+                const delta = max - min;
+
+                let h = 0;
+                if (delta !== 0) {
+                    if (max === rr) h = ((gg - bb) / delta) % 6;
+                    else if (max === gg) h = (bb - rr) / delta + 2;
+                    else h = (rr - gg) / delta + 4;
+                    h *= 60;
+                    if (h < 0) h += 360;
+                }
+
+                const s = max === 0 ? 0 : delta / max;
+                const v = max;
+
+                return { h, s, v };
+            };
+
+
+            if (prop && prop.isInstanceReference) {
+                const wrapper = document.createElement("div");
+                wrapper.className = "instance-link";
+
+                if (prop.referencedInstanceId && prop.referencedInstanceName) {
+                    const link = document.createElement("a");
+                    link.href = "#";
+                    link.textContent = prop.referencedInstanceName;
+                    link.addEventListener("click", (e) => {
+                        e.preventDefault();
+                        vscode.postMessage({
+                            type: "navigateToInstance",
+                            instanceId: prop.referencedInstanceId
+                        });
+                    });
+                    wrapper.appendChild(link);
+                } else {
+                    const text = document.createElement("div");
+                    text.className = "none";
+                    text.textContent = prop.referencedInstanceName || prop.displayValue || "None";
+                    wrapper.appendChild(text);
+                }
+
+                return wrapper;
+            }
+
+            if (prop && prop.isReadOnly) {
+                if (prop.type === "boolean") {
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "value-checkbox";
+                    checkbox.checked = !!prop.value;
+                    checkbox.disabled = true;
+                    return checkbox;
+                }
+
+                if ((prop.type === "Color3" || prop.type === "BrickColor") && prop.value && typeof prop.value === "object") {
+                    const cr = prop.value.R !== undefined ? prop.value.R : prop.value.r;
+                    const cg = prop.value.G !== undefined ? prop.value.G : prop.value.g;
+                    const cb = prop.value.B !== undefined ? prop.value.B : prop.value.b;
+                    if (cr !== undefined && cg !== undefined && cb !== undefined) {
+                        const r = Math.round(cr * 255), g = Math.round(cg * 255), b = Math.round(cb * 255);
+                        const wrap = document.createElement("div");
+                        wrap.className = "value-display readonly-value color3-readonly";
+                        const sw = document.createElement("div");
+                        sw.className = "color3-swatch";
+                        const box = document.createElement("div");
+                        box.className = "color3-swatch-box";
+                        box.style.backgroundColor = "rgb(" + r + ", " + g + ", " + b + ")";
+                        sw.appendChild(box);
+                        const txt = document.createElement("span");
+                        txt.className = "color3-readonly-text";
+                        txt.textContent = r + ", " + g + ", " + b;
+                        wrap.appendChild(sw);
+                        wrap.appendChild(txt);
+                        return wrap;
+                    }
+                }
+
+                const display = document.createElement("div");
+                display.className = "value-display readonly-value";
+                display.textContent = formatPropertyValue(prop);
+                return display;
+            }
+
+            if (prop && prop.isEnum && Array.isArray(prop.enumValues)) {
+                const select = document.createElement("select");
+                select.className = "value-select";
+
+                for (const enumValue of prop.enumValues) {
+                    const option = document.createElement("option");
+                    option.value = String(enumValue.value);
+                    option.textContent = enumValue.name;
+                    if (prop.value && prop.value.Value === enumValue.value) option.selected = true;
+                    select.appendChild(option);
+                }
+
+                select.addEventListener("change", () => {
+                    const selectedOption = select.options[select.selectedIndex];
+                    postSetProperty(prop.name, { EnumName: selectedOption.textContent, EnumType: prop.type });
+                });
+
+                return select;
+            }
+
+            switch (prop.type) {
+                case "boolean": {
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "value-checkbox";
+                    checkbox.checked = !!prop.value;
+
+                    checkbox.addEventListener("change", () => {
+                        postSetProperty(prop.name, checkbox.checked);
+                    });
+
+                    return checkbox;
+                }
+
+                case "number":
+                case "int":
+                case "float":
+                case "double": {
+                    const bounds = numericSliderBounds(prop);
+                    if (bounds) {
+                        return createSliderEditor(prop);
+                    }
+
+                    const isInt = prop.type.includes("int");
+                    return createNumberStepperEditor({
+                        value: prop.value,
+                        allowDecimal: !isInt,
+                        onCommit: (numericValue) => postSetProperty(prop.name, numericValue)
+                    });
+                }
+
+                case "Vector2": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = prop.value && typeof prop.value === "object"
+                        ? `${formatNumber(prop.value.X ?? 0)}, ${formatNumber(prop.value.Y ?? 0)}`
+                        : "0, 0";
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 2 && parts.every(n => Number.isFinite(n))) {
+                            postSetProperty(prop.name, { X: parts[0], Y: parts[1] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "Vector3": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = prop.value && typeof prop.value === "object"
+                        ? `${formatNumber(prop.value.X ?? 0)}, ${formatNumber(prop.value.Y ?? 0)}, ${formatNumber(prop.value.Z ?? 0)}`
+                        : "0, 0, 0";
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 3 && parts.every(n => Number.isFinite(n))) {
+                            postSetProperty(prop.name, { X: parts[0], Y: parts[1], Z: parts[2] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "UDim2": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = prop.value && prop.value.X && prop.value.Y
+                        ? `${formatNumber(prop.value.X.Scale)}, ${formatNumber(prop.value.X.Offset)}, ${formatNumber(prop.value.Y.Scale)}, ${formatNumber(prop.value.Y.Offset)}`
+                        : "0, 0, 0, 0";
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 4 && parts.every(n => Number.isFinite(n))) {
+                            postSetProperty(prop.name, {
+                                X: { Scale: parts[0], Offset: parts[1] },
+                                Y: { Scale: parts[2], Offset: parts[3] }
+                            });
+                        }
+                    });
+                    return input;
+                }
+
+                case "CFrame": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    const pos = prop.value && typeof prop.value === "object" && prop.value.Position ? prop.value.Position : { X: 0, Y: 0, Z: 0 };
+                    input.value = `${formatNumber(pos.X ?? 0)}, ${formatNumber(pos.Y ?? 0)}, ${formatNumber(pos.Z ?? 0)}`;
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 3 && parts.every(n => Number.isFinite(n))) {
+                            postSetProperty(prop.name, {
+                                Position: { X: parts[0], Y: parts[1], Z: parts[2] },
+                                Rotation: prop.value?.Rotation || { X: 0, Y: 0, Z: 0 }
+                            });
+                        }
+                    });
+                    return input;
+                }
+
+                case "NumberRange": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = prop.value && typeof prop.value === "object"
+                        ? `${formatNumber(prop.value.Min ?? 0)}, ${formatNumber(prop.value.Max ?? 0)}`
+                        : "0, 0";
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 2 && parts.every(n => Number.isFinite(n))) {
+                            postSetProperty(prop.name, { Min: parts[0], Max: parts[1] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "NumberSequence": {
+                    const wrapper = document.createElement("div");
+                    wrapper.className = "sequence-wrapper";
+
+                    const display = document.createElement("div");
+                    display.className = "value-display sequence-display";
+                    if (prop.value && Array.isArray(prop.value.Keypoints)) {
+                        const keypoints = prop.value.Keypoints;
+                        display.textContent = `${keypoints.length} keypoint${keypoints.length !== 1 ? 's' : ''}`;
+                    } else {
+                        display.textContent = "0 keypoints";
+                    }
+
+                    const button = document.createElement("button");
+                    button.className = "sequence-button";
+                    button.textContent = "Edit";
+                    button.addEventListener("click", () => {
+                        openCurveEditor(prop);
+                    });
+
+                    wrapper.appendChild(display);
+                    wrapper.appendChild(button);
+                    return wrapper;
+                }
+
+                case "ColorSequence": {
+                    const wrapper = document.createElement("div");
+                    wrapper.className = "sequence-wrapper";
+
+                    const display = document.createElement("div");
+                    display.className = "value-display sequence-display";
+                    if (prop.value && Array.isArray(prop.value.Keypoints)) {
+                        const keypoints = prop.value.Keypoints;
+                        display.textContent = `${keypoints.length} keypoint${keypoints.length !== 1 ? 's' : ''}`;
+                    } else {
+                        display.textContent = "0 keypoints";
+                    }
+
+                    const button = document.createElement("button");
+                    button.className = "sequence-button";
+                    button.textContent = "Edit";
+                    button.addEventListener("click", () => {
+                        openColorSequenceEditor(prop);
+                    });
+
+                    wrapper.appendChild(display);
+                    wrapper.appendChild(button);
+                    return wrapper;
+                }
+
+                case "Color3": {
+                    const wrapper = document.createElement("div");
+                    wrapper.className = "color3-editor";
+
+                    const swatch = document.createElement("div");
+                    swatch.className = "color3-swatch";
+
+                    const swatchBox = document.createElement("div");
+                    swatchBox.className = "color3-swatch-box";
+
+                    const colorInput = document.createElement("input");
+                    colorInput.type = "color";
+                    colorInput.className = "color3-input";
+
+                    const textInput = document.createElement("input");
+                    textInput.type = "text";
+                    textInput.className = "color3-text";
+                    textInput.spellcheck = false;
+
+                    const initial = color3ToRgb255(prop.value);
+                    const initialHex = rgb255ToHex(initial.r, initial.g, initial.b);
+
+                    let suppress = false;
+                    let editingColorText = false;
+                    let currentRgb = { ...initial };
+
+                    const setUi = (r, g, b) => {
+                        currentRgb = { r: clamp255(r), g: clamp255(g), b: clamp255(b) };
+                        const hex = rgb255ToHex(r, g, b);
+                        swatchBox.style.backgroundColor = hex;
+
+                        suppress = true;
+                        colorInput.value = hex;
+                        textInput.value = editingColorText
+                            ? formatRgbText(r, g, b)
+                            : formatRgbDisplay(r, g, b);
+                        suppress = false;
+                    };
+
+                    const commit = (r, g, b) => {
+                        setUi(r, g, b);
+                        postSetProperty(prop.name, rgb255ToColor3(r, g, b));
+                    };
+
+                    setUi(initial.r, initial.g, initial.b);
+
+                    textInput.addEventListener("focus", () => {
+                        editingColorText = true;
+                        textInput.value = formatRgbText(currentRgb.r, currentRgb.g, currentRgb.b);
+                        textInput.select();
+                    });
+
+                    textInput.addEventListener("blur", () => {
+                        editingColorText = false;
+                        setUi(currentRgb.r, currentRgb.g, currentRgb.b);
+                    });
+
+                    textInput.addEventListener("keydown", (e) => {
+                        if ([46, 8, 9, 27, 13, 110, 190].indexOf(e.keyCode) !== -1 ||
+                            (e.ctrlKey && [65, 67, 86, 88, 90].indexOf(e.keyCode) !== -1) ||
+                            [35, 36, 37, 39].indexOf(e.keyCode) !== -1) {
+                            return;
+                        }
+                        if ((e.shiftKey || (e.keyCode < 48 || e.keyCode > 57)) &&
+                            (e.keyCode < 96 || e.keyCode > 105) &&
+                            e.key !== ",") {
+                            e.preventDefault();
+                        }
+                    });
+
+                    colorInput.addEventListener("change", () => {
+                        if (suppress) return;
+                        const rgb = hexToRgb255(colorInput.value);
+                        if (!rgb) return;
+                        commit(rgb.r, rgb.g, rgb.b);
+                    });
+
+                    textInput.addEventListener("change", () => {
+                        if (suppress) return;
+                        const rgb = parseColorInput(textInput.value);
+                        if (!rgb) {
+                            const current = color3ToRgb255(prop.value);
+                            setUi(current.r, current.g, current.b);
+                            return;
+                        }
+                        commit(rgb.r, rgb.g, rgb.b);
+                    });
+
+                    swatch.appendChild(swatchBox);
+                    swatch.appendChild(colorInput);
+
+                    wrapper.appendChild(swatch);
+                    wrapper.appendChild(textInput);
+
+                    return wrapper;
+                }
+
+
+                case "ContentId":
+                case "string": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = (prop.value !== null && typeof prop.value === "object")
+                        ? formatPropertyValue(prop)
+                        : (prop.value ?? "");
+
+                    input.addEventListener("change", () => {
+                        postSetProperty(prop.name, input.value);
+                    });
+
+                    return input;
+                }
+
+                default: {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = typeof prop.displayValue === "string"
+                        ? prop.displayValue
+                        : prop.value != null
+                            ? (typeof prop.value === "object" ? formatPropertyValue(prop) : String(prop.value))
+                            : "";
+
+                    input.addEventListener("change", () => {
+                        postSetProperty(prop.name, input.value);
+                    });
+
+                    return input;
+                }
+            }
+        }
+
+        function openCurveEditor(prop) {
+            currentCurveProperty = prop;
+            const modal = document.getElementById("curve-editor-modal");
+            const title = document.getElementById("curve-editor-title");
+            title.textContent = `Edit ${prop.name} (NumberSequence)`;
+
+            if (prop.value && Array.isArray(prop.value.Keypoints) && prop.value.Keypoints.length > 0) {
+                currentCurveNodes = prop.value.Keypoints.map(kp => ({
+                    t: kp.Time ?? 0,
+                    v: kp.Value ?? 0
+                })).sort((a, b) => a.t - b.t);
+
+                if (currentCurveNodes[0].t !== 0) {
+                    currentCurveNodes.unshift({ t: 0, v: currentCurveNodes[0].v });
+                }
+                const lastIdx = currentCurveNodes.length - 1;
+                if (currentCurveNodes[lastIdx].t !== 1) {
+                    currentCurveNodes.push({ t: 1, v: currentCurveNodes[lastIdx].v });
+                }
+            } else {
+                currentCurveNodes = [{ t: 0, v: 0 }, { t: 1, v: 0 }];
+            }
+
+            curveCanvas = document.getElementById("curve-canvas");
+            curveCtx = curveCanvas.getContext("2d");
+            selectedNodeIndex = -1;
+            draggingNodeIndex = -1;
+
+            setupCurveCanvasListeners();
+            updateCurveEditor();
+            modal.style.display = "flex";
+        }
+
+        function openColorSequenceEditor(prop) {
+            try {
+                currentGradientProperty = prop;
+                const modal = document.getElementById("gradient-editor-modal");
+                if (!modal) {
+                    console.error("Gradient editor modal not found");
+                    return;
+                }
+                const title = document.getElementById("gradient-editor-title");
+                if (title) {
+                    title.textContent = `Edit ${prop.name} (ColorSequence)`;
+                }
+
+                if (prop.value && Array.isArray(prop.value.Keypoints)) {
+                    currentGradientStops = prop.value.Keypoints.map(kp => {
+                        let color = { r: 0, g: 0, b: 0 };
+                        if (kp.Value) {
+                            if (typeof kp.Value === "object" && kp.Value.R !== undefined) {
+                                color = {
+                                    r: Math.round(kp.Value.R * 255),
+                                    g: Math.round(kp.Value.G * 255),
+                                    b: Math.round(kp.Value.B * 255)
+                                };
+                            }
+                        }
+                        return {
+                            time: kp.Time ?? 0,
+                            color: color
+                        };
+                    }).sort((a, b) => a.time - b.time);
+                } else {
+                    currentGradientStops = [
+                        { time: 0, color: { r: 0, g: 0, b: 0 } },
+                        { time: 1, color: { r: 255, g: 255, b: 255 } }
+                    ];
+                }
+
+                selectedGradientStopIndex = -1;
+                draggingGradientStopIndex = -1;
+
+                updateGradientEditor();
+                modal.style.display = "flex";
+            } catch (error) {
+                console.error("Error opening color sequence editor:", error);
+            }
+        }
+
+        function updateGradientEditor() {
+            const preview = document.getElementById("gradient-preview");
+            const stopsContainer = document.getElementById("gradient-stops");
+            const stopsList = document.getElementById("gradient-stops-list");
+
+            if (!preview || !stopsContainer || !stopsList) return;
+
+            const sortedStops = [...currentGradientStops].sort((a, b) => a.time - b.time);
+
+            let gradientStops = sortedStops.map(stop => {
+                const percent = stop.time * 100;
+                return `${rgbToHex(stop.color)} ${percent}%`;
+            }).join(", ");
+
+            preview.style.background = `linear-gradient(to right, ${gradientStops})`;
+
+            stopsContainer.innerHTML = "";
+            for (let i = 0; i < sortedStops.length; i++) {
+                const stop = sortedStops[i];
+                const idx = currentGradientStops.indexOf(stop);
+                const stopElement = document.createElement("div");
+                stopElement.className = "gradient-stop-handle" + (selectedGradientStopIndex === idx ? " selected" : "");
+                stopElement.style.left = `${stop.time * 100}%`;
+                stopElement.dataset.index = idx.toString();
+
+                stopElement.addEventListener("mousedown", (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    draggingGradientStopIndex = idx;
+                    selectedGradientStopIndex = idx;
+                    updateGradientEditor();
+                });
+
+                stopsContainer.appendChild(stopElement);
+            }
+
+            stopsList.innerHTML = "";
+            for (let i = 0; i < sortedStops.length; i++) {
+                const stop = sortedStops[i];
+                const idx = currentGradientStops.indexOf(stop);
+                const item = document.createElement("div");
+                item.className = "gradient-stop-item" + (selectedGradientStopIndex === idx ? " selected" : "");
+
+                const timeInput = document.createElement("input");
+                timeInput.type = "number";
+                timeInput.className = "curve-node-input";
+                timeInput.min = "0";
+                timeInput.max = "1";
+                timeInput.step = "0.01";
+                timeInput.value = stop.time.toFixed(2);
+                timeInput.addEventListener("change", () => {
+                    const val = parseFloat(timeInput.value);
+                    if (!isNaN(val)) {
+                        stop.time = Math.max(0, Math.min(1, val));
+                        updateGradientEditor();
+                    }
+                });
+
+                const colorInput = document.createElement("input");
+                colorInput.type = "color";
+                colorInput.className = "gradient-color-input";
+                colorInput.value = rgbToHex(stop.color);
+                colorInput.addEventListener("change", () => {
+                    const hex = colorInput.value;
+                    stop.color = hexToRgb(hex);
+                    updateGradientEditor();
+                });
+
+                const deleteBtn = document.createElement("button");
+                deleteBtn.className = "curve-node-delete";
+                deleteBtn.textContent = "x";
+                deleteBtn.addEventListener("click", () => {
+                    if (currentGradientStops.length > 2) {
+                        currentGradientStops.splice(idx, 1);
+                        selectedGradientStopIndex = -1;
+                        updateGradientEditor();
+                    }
+                });
+
+                item.appendChild(document.createTextNode("Time: "));
+                item.appendChild(timeInput);
+                item.appendChild(document.createTextNode(" Color: "));
+                item.appendChild(colorInput);
+                if (currentGradientStops.length > 2) {
+                    item.appendChild(deleteBtn);
+                }
+
+                item.addEventListener("click", (e) => {
+                    if (e.target !== deleteBtn && e.target !== timeInput && e.target !== colorInput) {
+                        selectedGradientStopIndex = idx;
+                        updateGradientEditor();
+                    }
+                });
+
+                stopsList.appendChild(item);
+            }
+        }
+
+        function rgbToHex(rgb) {
+            return "#" + [rgb.r, rgb.g, rgb.b].map(x => {
+                const hex = Math.round(x).toString(16);
+                return hex.length === 1 ? "0" + hex : hex;
+            }).join("");
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? {
+                r: parseInt(result[1], 16),
+                g: parseInt(result[2], 16),
+                b: parseInt(result[3], 16)
+            } : { r: 0, g: 0, b: 0 };
+        }
+
+        function applyGradientEditor() {
+            if (!currentGradientProperty) return;
+
+            const sortedStops = [...currentGradientStops].sort((a, b) => a.time - b.time);
+            if (sortedStops.length === 0) {
+                sortedStops.push(
+                    { time: 0, color: { r: 0, g: 0, b: 0 } },
+                    { time: 1, color: { r: 255, g: 255, b: 255 } }
+                );
+            } else {
+                if (sortedStops[0].time !== 0) {
+                    sortedStops.unshift({ time: 0, color: { ...sortedStops[0].color } });
+                } else {
+                    sortedStops[0] = { ...sortedStops[0], time: 0 };
+                }
+                const lastIdx = sortedStops.length - 1;
+                if (sortedStops[lastIdx].time !== 1) {
+                    sortedStops.push({ time: 1, color: { ...sortedStops[lastIdx].color } });
+                } else {
+                    sortedStops[lastIdx] = { ...sortedStops[lastIdx], time: 1 };
+                }
+            }
+
+            const keypoints = sortedStops.map(stop => ({
+                Time: stop.time,
+                Value: {
+                    R: stop.color.r / 255,
+                    G: stop.color.g / 255,
+                    B: stop.color.b / 255
+                }
+            }));
+
+            postSetProperty(currentGradientProperty.name, { Keypoints: keypoints });
+            closeGradientEditor();
+        }
+
+        function closeGradientEditor() {
+            const modal = document.getElementById("gradient-editor-modal");
+            if (modal) {
+                modal.style.display = "none";
+            }
+            currentGradientProperty = null;
+            currentGradientStops = [];
+            selectedGradientStopIndex = -1;
+            draggingGradientStopIndex = -1;
+        }
+
+        function updateCurveEditor() {
+            if (!curveCanvas || !curveCtx) return;
+
+            const width = curveCanvas.width;
+            const height = curveCanvas.height;
+            const padding = 30;
+
+            curveCtx.clearRect(0, 0, width, height);
+            curveCtx.fillStyle = themeColor('--vscode-editor-background', '--vscode-sideBar-background');
+            curveCtx.fillRect(0, 0, width, height);
+
+            const drawWidth = width - padding * 2;
+            const drawHeight = height - padding * 2;
+
+            curveCtx.strokeStyle = themeColor('--vscode-panel-border', '--vscode-sideBar-border');
+            curveCtx.lineWidth = 1;
+
+            for (let i = 0; i <= 10; i++) {
+                const x = padding + (drawWidth / 10) * i;
+                curveCtx.beginPath();
+                curveCtx.moveTo(x, padding);
+                curveCtx.lineTo(x, height - padding);
+                curveCtx.stroke();
+
+                const y = padding + (drawHeight / 10) * i;
+                curveCtx.beginPath();
+                curveCtx.moveTo(padding, y);
+                curveCtx.lineTo(width - padding, y);
+                curveCtx.stroke();
+            }
+
+            if (currentCurveNodes.length > 0) {
+                const sortedIndices = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+
+                curveCtx.strokeStyle = themeColor('--vscode-textLink-foreground', '--vscode-focusBorder');
+                curveCtx.lineWidth = 2;
+                curveCtx.beginPath();
+
+                for (let i = 0; i < sortedIndices.length; i++) {
+                    const idx = sortedIndices[i];
+                    const node = currentCurveNodes[idx];
+                    const x = padding + node.t * drawWidth;
+                    const y = height - padding - node.v * drawHeight;
+
+                    if (i === 0) {
+                        curveCtx.moveTo(x, y);
+                    } else {
+                        curveCtx.lineTo(x, y);
+                    }
+                }
+
+                curveCtx.stroke();
+
+                for (let i = 0; i < sortedIndices.length; i++) {
+                    const idx = sortedIndices[i];
+                    const node = currentCurveNodes[idx];
+                    const x = padding + node.t * drawWidth;
+                    const y = height - padding - node.v * drawHeight;
+
+                    const isSelected = selectedNodeIndex === idx;
+                    const nodeRadius = 7;
+
+                    curveCtx.fillStyle = isSelected
+                        ? themeColor('--vscode-list-activeSelectionBackground', '--vscode-focusBorder')
+                        : themeColor('--vscode-textLink-foreground', '--vscode-focusBorder');
+                    curveCtx.beginPath();
+                    curveCtx.arc(x, y, nodeRadius, 0, Math.PI * 2);
+                    curveCtx.fill();
+
+                    if (isSelected) {
+                        curveCtx.strokeStyle = themeColor('--vscode-list-activeSelectionBackground', '--vscode-focusBorder');
+                        curveCtx.lineWidth = 2;
+                        curveCtx.stroke();
+                    }
+                }
+            }
+
+            updateCurveNodesList();
+        }
+
+        function updateCurveNodesList() {
+            const list = document.getElementById("curve-nodes-list");
+            list.innerHTML = "";
+
+            const sortedIndices = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+
+            for (const idx of sortedIndices) {
+                const node = currentCurveNodes[idx];
+                const item = document.createElement("div");
+                item.className = "curve-node-item" + (selectedNodeIndex === idx ? " selected" : "");
+
+                const sortedIndices = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+                const isFirst = sortedIndices[0] === idx;
+                const isLast = sortedIndices[sortedIndices.length - 1] === idx;
+
+                const tInput = document.createElement("input");
+                tInput.type = "number";
+                tInput.className = "curve-node-input";
+                tInput.min = "0";
+                tInput.max = "1";
+                tInput.step = "0.01";
+                tInput.value = node.t.toFixed(2);
+                tInput.disabled = isFirst || isLast;
+                if (isFirst || isLast) {
+                    tInput.title = isFirst ? "First node must stay at t=0" : "Last node must stay at t=1";
+                }
+                tInput.addEventListener("change", () => {
+                    if (isFirst || isLast) return;
+                    const val = parseFloat(tInput.value);
+                    if (!isNaN(val)) {
+                        node.t = Math.max(0, Math.min(1, val));
+                        updateCurveEditor();
+                    }
+                });
+
+                const vInput = document.createElement("input");
+                vInput.type = "number";
+                vInput.className = "curve-node-input";
+                vInput.min = "0";
+                vInput.max = "1";
+                vInput.step = "0.01";
+                vInput.value = node.v.toFixed(2);
+                vInput.addEventListener("change", () => {
+                    const val = parseFloat(vInput.value);
+                    if (!isNaN(val)) {
+                        node.v = Math.max(0, Math.min(1, val));
+                        updateCurveEditor();
+                    }
+                });
+
+                const sortedIndicesForDelete = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+                const isFirstForDelete = sortedIndicesForDelete[0] === idx;
+                const isLastForDelete = sortedIndicesForDelete[sortedIndicesForDelete.length - 1] === idx;
+
+                const deleteBtn = document.createElement("button");
+                deleteBtn.className = "curve-node-delete";
+                deleteBtn.textContent = "x";
+                deleteBtn.disabled = isFirstForDelete || isLastForDelete;
+                if (isFirstForDelete || isLastForDelete) {
+                    deleteBtn.title = "Cannot delete first or last node";
+                }
+                deleteBtn.addEventListener("click", () => {
+                    if (currentCurveNodes.length > 2 && !isFirstForDelete && !isLastForDelete) {
+                        currentCurveNodes.splice(idx, 1);
+                        selectedNodeIndex = -1;
+                        updateCurveEditor();
+                    }
+                });
+
+                item.appendChild(document.createTextNode("T: "));
+                item.appendChild(tInput);
+                item.appendChild(document.createTextNode(" V: "));
+                item.appendChild(vInput);
+                item.appendChild(deleteBtn);
+
+                item.addEventListener("click", (e) => {
+                    if (e.target !== deleteBtn && e.target !== tInput && e.target !== vInput) {
+                        selectedNodeIndex = idx;
+                        updateCurveEditor();
+                    }
+                });
+
+                list.appendChild(item);
+            }
+        }
+
+        function addCurveNode() {
+            currentCurveNodes.push({ t: 0.5, v: 0.5 });
+            selectedNodeIndex = currentCurveNodes.length - 1;
+            updateCurveEditor();
+        }
+
+        function applyCurveEditor() {
+            if (!currentCurveProperty) return;
+
+            const sortedNodes = [...currentCurveNodes].sort((a, b) => a.t - b.t);
+
+            if (sortedNodes.length === 0) {
+                sortedNodes.push({ t: 0, v: 0 }, { t: 1, v: 0 });
+            } else {
+                if (sortedNodes[0].t !== 0) {
+                    sortedNodes.unshift({ t: 0, v: sortedNodes[0].v });
+                }
+                const lastIdx = sortedNodes.length - 1;
+                if (sortedNodes[lastIdx].t !== 1) {
+                    sortedNodes.push({ t: 1, v: sortedNodes[lastIdx].v });
+                }
+            }
+
+            const keypoints = sortedNodes.map(node => ({
+                Time: node.t,
+                Value: node.v
+            }));
+
+            postSetProperty(currentCurveProperty.name, { Keypoints: keypoints });
+            closeCurveEditor();
+        }
+
+        function closeCurveEditor() {
+            const modal = document.getElementById("curve-editor-modal");
+            modal.style.display = "none";
+            currentCurveProperty = null;
+            currentCurveNodes = [];
+            selectedNodeIndex = -1;
+            draggingNodeIndex = -1;
+        }
+
+        function setupCurveCanvasListeners() {
+            curveCanvas = document.getElementById("curve-canvas");
+            if (!curveCanvas) return;
+            if (curveCanvasListenersAttached) return;
+            curveCanvasListenersAttached = true;
+
+            curveCanvas.addEventListener("mousedown", (e) => {
+                if (!curveCanvas || !curveCtx) return;
+
+                const rect = curveCanvas.getBoundingClientRect();
+                const scaleX = curveCanvas.width / rect.width;
+                const scaleY = curveCanvas.height / rect.height;
+                const x = (e.clientX - rect.left) * scaleX;
+                const y = (e.clientY - rect.top) * scaleY;
+                const padding = 30;
+                const drawWidth = curveCanvas.width - padding * 2;
+                const drawHeight = curveCanvas.height - padding * 2;
+
+                let closestIdx = -1;
+                let closestDist = Infinity;
+
+                const sortedIndices = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+
+                for (let i = 0; i < currentCurveNodes.length; i++) {
+                    const node = currentCurveNodes[i];
+                    const nodeX = padding + node.t * drawWidth;
+                    const nodeY = curveCanvas.height - padding - node.v * drawHeight;
+                    const dist = Math.sqrt(Math.pow(x - nodeX, 2) + Math.pow(y - nodeY, 2));
+
+                    const hitRadius = 14;
+
+                    if (dist < hitRadius && dist < closestDist) {
+                        closestDist = dist;
+                        closestIdx = i;
+                    }
+                }
+
+                if (closestIdx >= 0) {
+                    draggingNodeIndex = closestIdx;
+                    selectedNodeIndex = closestIdx;
+                    updateCurveEditor();
+                } else {
+                    const t = Math.max(0, Math.min(1, (x - padding) / drawWidth));
+                    const v = Math.max(0, Math.min(1, (curveCanvas.height - padding - y) / drawHeight));
+                    currentCurveNodes.push({ t, v });
+                    selectedNodeIndex = currentCurveNodes.length - 1;
+                    updateCurveEditor();
+                }
+            });
+
+            curveCanvas.addEventListener("mousemove", (e) => {
+                if (draggingNodeIndex >= 0 && draggingNodeIndex < currentCurveNodes.length && curveCanvas) {
+                    const rect = curveCanvas.getBoundingClientRect();
+                    const scaleX = curveCanvas.width / rect.width;
+                    const scaleY = curveCanvas.height / rect.height;
+                    const x = (e.clientX - rect.left) * scaleX;
+                    const y = (e.clientY - rect.top) * scaleY;
+                    const padding = 30;
+                    const drawWidth = curveCanvas.width - padding * 2;
+                    const drawHeight = curveCanvas.height - padding * 2;
+
+                    const v = Math.max(0, Math.min(1, (curveCanvas.height - padding - y) / drawHeight));
+                    currentCurveNodes[draggingNodeIndex].v = v;
+
+                    const sortedIndices = currentCurveNodes.map((_, i) => i).sort((a, b) => currentCurveNodes[a].t - currentCurveNodes[b].t);
+                    const isFirst = sortedIndices[0] === draggingNodeIndex;
+                    const isLast = sortedIndices[sortedIndices.length - 1] === draggingNodeIndex;
+
+                    if (!isFirst && !isLast) {
+                        const t = Math.max(0, Math.min(1, (x - padding) / drawWidth));
+                        currentCurveNodes[draggingNodeIndex].t = t;
+                    } else {
+                        if (isFirst) {
+                            currentCurveNodes[draggingNodeIndex].t = 0;
+                        } else if (isLast) {
+                            currentCurveNodes[draggingNodeIndex].t = 1;
+                        }
+                    }
+
+                    updateCurveEditor();
+                }
+            });
+
+            curveCanvas.addEventListener("mouseup", () => {
+                draggingNodeIndex = -1;
+            });
+
+            curveCanvas.addEventListener("mouseleave", () => {
+                draggingNodeIndex = -1;
+            });
+        }
+
+        document.getElementById("curve-editor-modal")?.addEventListener("click", (e) => {
+            if (e.target.id === "curve-editor-modal") {
+                closeCurveEditor();
+            }
+        });
+
+        document.getElementById("gradient-editor-modal")?.addEventListener("click", (e) => {
+            if (e.target.id === "gradient-editor-modal") {
+                closeGradientEditor();
+            }
+        });
+
+        const gradientPreviewContainer = document.getElementById("gradient-preview-container");
+        if (gradientPreviewContainer) {
+            const preview = document.getElementById("gradient-preview");
+
+            if (preview) {
+                preview.addEventListener("mousedown", (e) => {
+                    if (draggingGradientStopIndex >= 0) return;
+
+                    const rect = preview.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const time = Math.max(0, Math.min(1, x / rect.width));
+
+                    const newStop = {
+                        time: time,
+                        color: { r: 128, g: 128, b: 128 }
+                    };
+                    currentGradientStops.push(newStop);
+                    selectedGradientStopIndex = currentGradientStops.length - 1;
+                    updateGradientEditor();
+                });
+            }
+
+            document.addEventListener("mousemove", (e) => {
+                if (draggingGradientStopIndex >= 0 && draggingGradientStopIndex < currentGradientStops.length) {
+                    const preview = document.getElementById("gradient-preview");
+                    if (!preview) return;
+
+                    const rect = preview.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const time = Math.max(0, Math.min(1, x / rect.width));
+
+                    currentGradientStops[draggingGradientStopIndex].time = time;
+                    updateGradientEditor();
+                }
+            });
+
+            document.addEventListener("mouseup", () => {
+                draggingGradientStopIndex = -1;
+            });
+        }
+
+        function createTagsSection() {
+            const categoryRoot = document.createElement("div");
+            categoryRoot.className = "category" + (collapsedCategories.has("Tags") ? " collapsed" : "");
+
+            const header = document.createElement("div");
+            header.className = "category-header";
+
+            const caret = document.createElement("div");
+            caret.className = "caret";
+            header.appendChild(caret);
+
+            const title = document.createElement("div");
+            title.className = "category-header-title";
+            title.textContent = "Tags";
+            header.appendChild(title);
+
+            const addButton = document.createElement("button");
+            addButton.className = "add-button";
+            addButton.textContent = "+";
+            addButton.title = "Add Tag";
+            addButton.disabled = propertiesReadOnly;
+            addButton.addEventListener("click", (e) => {
+                if (propertiesReadOnly) return;
+                e.stopPropagation();
+                showTagInput = !showTagInput;
+                render();
+            });
+            if (!propertiesReadOnly) {
+                header.appendChild(addButton);
+            }
+
+            header.addEventListener("click", (e) => {
+                if (e.target !== addButton) {
+                    if (collapsedCategories.has("Tags")) collapsedCategories.delete("Tags");
+                    else collapsedCategories.add("Tags");
+                    render();
+                }
+            });
+
+            categoryRoot.appendChild(header);
+
+            const rows = document.createElement("div");
+            rows.className = "rows";
+
+            if (showTagInput && !propertiesReadOnly) {
+                const inputWrapper = document.createElement("div");
+                inputWrapper.className = "tag-input-wrapper";
+                const input = document.createElement("input");
+                input.type = "text";
+                input.className = "tag-input";
+                input.placeholder = "Enter tag name...";
+                input.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") {
+                        const tagName = input.value.trim();
+                        if (tagName) {
+                            vscode.postMessage({
+                                type: "addTag",
+                                tagName
+                            });
+                            showTagInput = false;
+                        }
+                    } else if (e.key === "Escape") {
+                        showTagInput = false;
+                        render();
+                    }
+                });
+                input.addEventListener("blur", () => {
+                    if (!input.value.trim()) {
+                        showTagInput = false;
+                        render();
+                    }
+                });
+                inputWrapper.appendChild(input);
+                rows.appendChild(inputWrapper);
+                setTimeout(() => input.focus(), 10);
+            }
+
+            const tagsContainer = document.createElement("div");
+            tagsContainer.className = "tags-container";
+
+            if (allTags.length === 0 && !showTagInput) {
+                const empty = document.createElement("div");
+                empty.className = "empty";
+                empty.textContent = "No tags";
+                empty.style.padding = "4px 0";
+                tagsContainer.appendChild(empty);
+            } else {
+                for (const tag of allTags) {
+                    const tagItem = document.createElement("div");
+                    tagItem.className = "tag-item";
+
+                    const tagText = document.createElement("span");
+                    tagText.textContent = tag;
+                    tagItem.appendChild(tagText);
+
+                    const removeBtn = document.createElement("span");
+                    removeBtn.className = "tag-item-remove";
+                    removeBtn.textContent = "x";
+                    removeBtn.addEventListener("click", () => {
+                        if (propertiesReadOnly) return;
+                        vscode.postMessage({
+                            type: "removeTag",
+                            tagName: tag
+                        });
+                    });
+                    if (!propertiesReadOnly) {
+                        tagItem.appendChild(removeBtn);
+                    }
+
+                    tagsContainer.appendChild(tagItem);
+                }
+            }
+
+            rows.appendChild(tagsContainer);
+            categoryRoot.appendChild(rows);
+
+            return categoryRoot;
+        }
+
+        function createAttributesSection() {
+            const categoryRoot = document.createElement("div");
+            categoryRoot.className = "category" + (collapsedCategories.has("Attributes") ? " collapsed" : "");
+
+            const header = document.createElement("div");
+            header.className = "category-header";
+
+            const caret = document.createElement("div");
+            caret.className = "caret";
+            header.appendChild(caret);
+
+            const title = document.createElement("div");
+            title.className = "category-header-title";
+            title.textContent = "Attributes";
+            header.appendChild(title);
+
+            const addButton = document.createElement("button");
+            addButton.className = "add-button";
+            addButton.textContent = "+";
+            addButton.title = "Add Attribute";
+            addButton.disabled = propertiesReadOnly;
+            addButton.addEventListener("click", (e) => {
+                if (propertiesReadOnly) return;
+                e.stopPropagation();
+                openAttributeModal();
+            });
+            if (!propertiesReadOnly) {
+                header.appendChild(addButton);
+            }
+
+            header.addEventListener("click", (e) => {
+                if (e.target !== addButton) {
+                    if (collapsedCategories.has("Attributes")) collapsedCategories.delete("Attributes");
+                    else collapsedCategories.add("Attributes");
+                    render();
+                }
+            });
+
+            categoryRoot.appendChild(header);
+
+            const rows = document.createElement("div");
+            rows.className = "rows";
+
+            if (allAttributes.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "empty";
+                empty.textContent = "No attributes";
+                rows.appendChild(empty);
+            } else {
+                for (const attr of allAttributes) {
+                    const row = createAttributeRow(attr);
+                    rows.appendChild(row);
+                }
+            }
+
+            categoryRoot.appendChild(rows);
+
+            return categoryRoot;
+        }
+
+        function createAttributeRow(attr) {
+            const row = document.createElement("div");
+            const attrReadOnly = propertiesReadOnly || attr.isReadOnly === true;
+            row.className = "attribute-row" + (attrReadOnly ? " readonly" : "");
+
+            const nameCell = document.createElement("div");
+            nameCell.className = "attribute-name";
+
+            if (!attrReadOnly && renamingAttribute === attr.name) {
+                const nameInput = document.createElement("input");
+                nameInput.type = "text";
+                nameInput.className = "attribute-name-input";
+                nameInput.value = attr.name;
+                nameInput.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") {
+                        const newName = nameInput.value.trim();
+                        if (newName && newName !== attr.name) {
+                            vscode.postMessage({
+                                type: "renameAttribute",
+                                oldName: attr.name,
+                                newName: newName
+                            });
+                        }
+                        renamingAttribute = null;
+                        render();
+                    } else if (e.key === "Escape") {
+                        renamingAttribute = null;
+                        render();
+                    }
+                });
+                nameInput.addEventListener("blur", () => {
+                    renamingAttribute = null;
+                    render();
+                });
+                nameCell.appendChild(nameInput);
+                setTimeout(() => {
+                    nameInput.focus();
+                    nameInput.select();
+                }, 10);
+            } else {
+                const nameText = document.createElement("span");
+                nameText.className = "attribute-name-text";
+                nameText.textContent = attr.name;
+                nameCell.appendChild(nameText);
+            }
+
+            row.appendChild(nameCell);
+
+            const valueCell = document.createElement("div");
+            valueCell.className = "attribute-value";
+            valueCell.appendChild(createAttributeEditor(attr));
+            row.appendChild(valueCell);
+
+            if (!attrReadOnly) {
+                const gearCell = document.createElement("div");
+                gearCell.className = "attribute-gear";
+                gearCell.textContent = "*";
+                gearCell.title = "Options";
+                gearCell.addEventListener("click", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    showAttributeContextMenu(e, attr.name, gearCell);
+                });
+                gearCell.addEventListener("mousedown", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                });
+                row.appendChild(gearCell);
+            }
+
+            return row;
+        }
+
+        function showAttributeContextMenu(event, attributeName, gearElement) {
+            if (propertiesReadOnly) return;
+            closeAttributeContextMenu();
+
+            const menu = document.createElement("div");
+            menu.className = "attribute-context-menu";
+
+            const renameItem = document.createElement("div");
+            renameItem.className = "attribute-context-item";
+            renameItem.textContent = "Rename";
+            renameItem.addEventListener("click", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                renamingAttribute = attributeName;
+                closeAttributeContextMenu();
+                render();
+            });
+            menu.appendChild(renameItem);
+
+            const removeItem = document.createElement("div");
+            removeItem.className = "attribute-context-item";
+            removeItem.textContent = "Delete";
+            removeItem.addEventListener("click", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                vscode.postMessage({
+                    type: "removeAttribute",
+                    attributeName: attributeName
+                });
+                closeAttributeContextMenu();
+            });
+            menu.appendChild(removeItem);
+
+            document.body.appendChild(menu);
+            currentContextMenu = menu;
+
+            const gearRect = gearElement.getBoundingClientRect();
+            const menuRect = menu.getBoundingClientRect();
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+
+            menu.style.position = "fixed";
+
+            // align bottom-right of menu with bottom-right of gear icon
+            let left = gearRect.right - menuRect.width;
+            let top = gearRect.bottom - menuRect.height - 2;
+
+            // prevent overflow - adjust if menu would go off screen
+            if (left < 4) {
+                left = gearRect.left;
+            }
+            if (top < 4) {
+                top = gearRect.bottom + 2;
+            }
+            if (left + menuRect.width > viewportWidth - 4) {
+                left = viewportWidth - menuRect.width - 4;
+            }
+            if (top + menuRect.height > viewportHeight - 4) {
+                top = viewportHeight - menuRect.height - 4;
+            }
+
+            menu.style.left = `${left}px`;
+            menu.style.top = `${top}px`;
+
+            setTimeout(() => {
+                const closeHandler = (e) => {
+                    const target = e.target;
+                    if (menu.contains(target) ||
+                        target === gearElement ||
+                        target.tagName === "INPUT" ||
+                        target.tagName === "SELECT" ||
+                        target.closest("input") ||
+                        target.closest("select") ||
+                        target.closest(".attribute-context-menu")) {
+                        return;
+                    }
+                    closeAttributeContextMenu();
+                    document.removeEventListener("mousedown", closeHandler);
+                    document.removeEventListener("click", closeHandler);
+                };
+                menu.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                });
+                document.addEventListener("mousedown", closeHandler, true);
+                document.addEventListener("click", closeHandler, true);
+            }, 0);
+        }
+
+        function closeAttributeContextMenu() {
+            if (currentContextMenu) {
+                currentContextMenu.remove();
+                currentContextMenu = null;
+            }
+        }
+
+        function createAttributeEditor(attr) {
+            if (propertiesReadOnly || attr.isReadOnly === true) {
+                if (attr.type === "boolean") {
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "value-checkbox";
+                    checkbox.checked = !!attr.value;
+                    checkbox.disabled = true;
+                    return checkbox;
+                }
+                const display = document.createElement("div");
+                display.className = "value-display readonly-value";
+                display.textContent = formatPropertyValue(attr);
+                return display;
+            }
+
+            const clamp255 = (value) => Math.max(0, Math.min(255, value));
+
+            const color3ToRgb255 = (color3) => {
+                const r = clamp255(Math.round(((color3?.R ?? 0) * 255)));
+                const g = clamp255(Math.round(((color3?.G ?? 0) * 255)));
+                const b = clamp255(Math.round(((color3?.B ?? 0) * 255)));
+                return { r, g, b };
+            };
+
+            const rgb255ToHex = (r, g, b) => {
+                const rr = clamp255(r).toString(16).padStart(2, "0");
+                const gg = clamp255(g).toString(16).padStart(2, "0");
+                const bb = clamp255(b).toString(16).padStart(2, "0");
+                return `#${rr}${gg}${bb}`;
+            };
+
+            const hexToRgb255 = (hex) => {
+                const cleaned = (hex || "").trim();
+                if (!/^#[0-9a-fA-F]{6}$/.test(cleaned)) return null;
+                return {
+                    r: parseInt(cleaned.slice(1, 3), 16),
+                    g: parseInt(cleaned.slice(3, 5), 16),
+                    b: parseInt(cleaned.slice(5, 7), 16),
+                };
+            };
+
+            const rgb255ToColor3 = (r, g, b) => ({
+                R: clamp255(r) / 255,
+                G: clamp255(g) / 255,
+                B: clamp255(b) / 255,
+            });
+
+            const formatRgbText = (r, g, b) => `${clamp255(r)},${clamp255(g)},${clamp255(b)}`;
+            const formatRgbDisplay = (r, g, b) => `[${formatRgbText(r, g, b)}]`;
+
+            const parseRgbBracket = (text) => {
+                const cleaned = (text || "").trim();
+                const match = cleaned.match(/^\[\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\]$/);
+                if (!match) return null;
+
+                const r = clamp255(parseInt(match[1], 10));
+                const g = clamp255(parseInt(match[2], 10));
+                const b = clamp255(parseInt(match[3], 10));
+
+                return { r, g, b };
+            };
+
+            const parseColorInput = (text) => {
+                const cleaned = (text || "").trim();
+
+                const bracketResult = parseRgbBracket(cleaned);
+                if (bracketResult) return bracketResult;
+
+                const commaParts = cleaned.split(",").map(s => s.trim());
+                if (commaParts.length === 3) {
+                    const r = clamp255(parseInt(commaParts[0], 10));
+                    const g = clamp255(parseInt(commaParts[1], 10));
+                    const b = clamp255(parseInt(commaParts[2], 10));
+                    if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
+                        return { r, g, b };
+                    }
+                }
+
+                const singleNum = parseFloat(cleaned);
+                if (!isNaN(singleNum) && isFinite(singleNum)) {
+                    if (singleNum === 0) return { r: 0, g: 0, b: 0 };
+                    if (singleNum === 1) return { r: 255, g: 255, b: 255 };
+
+                    if (singleNum > 0 && singleNum < 1) {
+                        const scaled = Math.round(singleNum * 255);
+                        return { r: scaled, g: scaled, b: scaled };
+                    }
+
+                    const clamped = clamp255(Math.round(singleNum));
+                    return { r: clamped, g: clamped, b: clamped };
+                }
+
+                return null;
+            };
+
+            const BRICK_COLORS = [
+                { name: "White", number: 1, r: 242, g: 243, b: 243 },
+                { name: "Grey", number: 2, r: 161, g: 165, b: 162 },
+                { name: "Light yellow", number: 3, r: 249, g: 233, b: 153 },
+                { name: "Brick yellow", number: 5, r: 215, g: 197, b: 154 },
+                { name: "Light green (Mint)", number: 6, r: 194, g: 218, b: 184 },
+                { name: "Light reddish violet", number: 9, r: 232, g: 186, b: 200 },
+                { name: "Pastel Blue", number: 11, r: 128, g: 187, b: 219 },
+                { name: "Light orange brown", number: 12, r: 203, g: 132, b: 66 },
+                { name: "Nougat", number: 18, r: 204, g: 142, b: 105 },
+                { name: "Bright red", number: 21, r: 196, g: 40, b: 28 },
+                { name: "Med. reddish violet", number: 22, r: 196, g: 112, b: 160 },
+                { name: "Bright blue", number: 23, r: 13, g: 105, b: 172 },
+                { name: "Bright yellow", number: 24, r: 245, g: 205, b: 48 },
+                { name: "Earth orange", number: 25, r: 98, g: 71, b: 50 },
+                { name: "Black", number: 26, r: 27, g: 42, b: 53 },
+                { name: "Dark grey", number: 27, r: 109, g: 110, b: 108 },
+                { name: "Dark green", number: 28, r: 40, g: 127, b: 71 },
+                { name: "Medium green", number: 29, r: 161, g: 196, b: 140 },
+                { name: "Lig. Yellowich orange", number: 36, r: 243, g: 207, b: 155 },
+                { name: "Bright green", number: 37, r: 75, g: 151, b: 75 },
+                { name: "Dark orange", number: 38, r: 160, g: 95, b: 53 },
+                { name: "Light bluish violet", number: 39, r: 193, g: 202, b: 222 },
+                { name: "Transparent", number: 40, r: 236, g: 236, b: 236 },
+                { name: "Tr. Red", number: 41, r: 205, g: 84, b: 75 },
+                { name: "Tr. Lg blue", number: 42, r: 193, g: 223, b: 240 },
+                { name: "Tr. Blue", number: 43, r: 123, g: 182, b: 232 },
+                { name: "Tr. Yellow", number: 44, r: 247, g: 241, b: 141 },
+                { name: "Light blue", number: 45, r: 180, g: 210, b: 228 },
+                { name: "Tr. Flu. Reddish orange", number: 47, r: 217, g: 133, b: 108 },
+                { name: "Tr. Green", number: 48, r: 132, g: 182, b: 141 },
+                { name: "Tr. Flu. Green", number: 49, r: 248, g: 241, b: 132 },
+                { name: "Phosph. White", number: 50, r: 236, g: 232, b: 222 },
+                { name: "Light red", number: 100, r: 238, g: 196, b: 182 },
+                { name: "Medium red", number: 101, r: 218, g: 134, b: 122 },
+                { name: "Medium blue", number: 102, r: 110, g: 153, b: 202 },
+                { name: "Light grey", number: 103, r: 199, g: 193, b: 183 },
+                { name: "Bright violet", number: 104, r: 107, g: 50, b: 124 },
+                { name: "Br. yellowish orange", number: 105, r: 226, g: 155, b: 64 },
+                { name: "Bright orange", number: 106, r: 218, g: 133, b: 65 },
+                { name: "Bright bluish green", number: 107, r: 0, g: 143, b: 156 },
+                { name: "Earth yellow", number: 108, r: 104, g: 92, b: 67 },
+                { name: "Bright bluish violet", number: 110, r: 67, g: 84, b: 147 },
+                { name: "Tr. Brown", number: 111, r: 191, g: 183, b: 177 },
+                { name: "Medium bluish violet", number: 112, r: 104, g: 116, b: 172 },
+                { name: "Tr. Medi. reddish violet", number: 113, r: 229, g: 173, b: 200 },
+                { name: "Med. yellowish green", number: 115, r: 199, g: 210, b: 60 },
+                { name: "Med. bluish green", number: 116, r: 85, g: 165, b: 175 },
+                { name: "Light bluish green", number: 118, r: 183, g: 215, b: 213 },
+                { name: "Br. yellowish green", number: 119, r: 164, g: 189, b: 71 },
+                { name: "Lig. yellowish green", number: 120, r: 217, g: 228, b: 167 },
+                { name: "Med. yellowish orange", number: 121, r: 231, g: 172, b: 88 },
+                { name: "Br. reddish orange", number: 123, r: 211, g: 111, b: 76 },
+                { name: "Bright reddish violet", number: 124, r: 146, g: 57, b: 120 },
+                { name: "Light orange", number: 125, r: 234, g: 184, b: 146 },
+                { name: "Tr. Bright bluish violet", number: 126, r: 165, g: 165, b: 203 },
+                { name: "Gold", number: 127, r: 220, g: 188, b: 129 },
+                { name: "Dark nougat", number: 128, r: 174, g: 122, b: 89 },
+                { name: "Silver", number: 131, r: 156, g: 163, b: 168 },
+                { name: "Neon orange", number: 133, r: 213, g: 115, b: 61 },
+                { name: "Neon green", number: 134, r: 216, g: 221, b: 86 },
+                { name: "Sand blue", number: 135, r: 116, g: 134, b: 157 },
+                { name: "Sand violet", number: 136, r: 135, g: 124, b: 144 },
+                { name: "Medium orange", number: 137, r: 224, g: 152, b: 100 },
+                { name: "Sand yellow", number: 138, r: 149, g: 138, b: 115 },
+                { name: "Earth blue", number: 140, r: 32, g: 58, b: 86 },
+                { name: "Earth green", number: 141, r: 39, g: 70, b: 45 },
+                { name: "Tr. Flu. Blue", number: 143, r: 207, g: 226, b: 247 },
+                { name: "Sand blue metallic", number: 145, r: 121, g: 136, b: 161 },
+                { name: "Sand violet metallic", number: 146, r: 149, g: 142, b: 163 },
+                { name: "Sand yellow metallic", number: 147, r: 147, g: 135, b: 103 },
+                { name: "Dark grey metallic", number: 148, r: 87, g: 88, b: 87 },
+                { name: "Black metallic", number: 149, r: 22, g: 29, b: 50 },
+                { name: "Light grey metallic", number: 150, r: 171, g: 173, b: 172 },
+                { name: "Sand green", number: 151, r: 120, g: 144, b: 130 },
+                { name: "Sand red", number: 153, r: 149, g: 121, b: 119 },
+                { name: "Dark red", number: 154, r: 123, g: 46, b: 47 },
+                { name: "Tr. Flu. Yellow", number: 157, r: 255, g: 246, b: 123 },
+                { name: "Tr. Flu. Red", number: 158, r: 225, g: 164, b: 194 },
+                { name: "Gun metallic", number: 168, r: 117, g: 108, b: 98 },
+                { name: "Red flip/flop", number: 176, r: 151, g: 105, b: 91 },
+                { name: "Yellow flip/flop", number: 178, r: 180, g: 132, b: 85 },
+                { name: "Silver flip/flop", number: 179, r: 137, g: 135, b: 136 },
+                { name: "Curry", number: 180, r: 215, g: 169, b: 75 },
+                { name: "Fire Yellow", number: 190, r: 249, g: 214, b: 46 },
+                { name: "Flame yellowish orange", number: 191, r: 232, g: 171, b: 45 },
+                { name: "Reddish brown", number: 192, r: 105, g: 64, b: 40 },
+                { name: "Flame reddish orange", number: 193, r: 207, g: 96, b: 36 },
+                { name: "Medium stone grey", number: 194, r: 163, g: 162, b: 165 },
+                { name: "Royal blue", number: 195, r: 70, g: 103, b: 164 },
+                { name: "Dark Royal blue", number: 196, r: 35, g: 71, b: 139 },
+                { name: "Bright reddish lilac", number: 198, r: 142, g: 66, b: 133 },
+                { name: "Dark stone grey", number: 199, r: 99, g: 95, b: 98 },
+                { name: "Lemon metalic", number: 200, r: 130, g: 138, b: 93 },
+                { name: "Light stone grey", number: 208, r: 229, g: 228, b: 223 },
+                { name: "Dark Curry", number: 209, r: 176, g: 142, b: 68 },
+                { name: "Faded green", number: 210, r: 112, g: 149, b: 120 },
+                { name: "Turquoise", number: 211, r: 121, g: 181, b: 181 },
+                { name: "Light Royal blue", number: 212, r: 159, g: 195, b: 233 },
+                { name: "Medium Royal blue", number: 213, r: 108, g: 129, b: 183 },
+                { name: "Rust", number: 216, r: 144, g: 76, b: 42 },
+                { name: "Brown", number: 217, r: 124, g: 92, b: 70 },
+                { name: "Reddish lilac", number: 218, r: 150, g: 112, b: 159 },
+                { name: "Lilac", number: 219, r: 107, g: 98, b: 155 },
+                { name: "Light lilac", number: 220, r: 167, g: 169, b: 206 },
+                { name: "Bright purple", number: 221, r: 205, g: 98, b: 152 },
+                { name: "Light purple", number: 222, r: 228, g: 173, b: 200 },
+                { name: "Light pink", number: 223, r: 220, g: 144, b: 149 },
+                { name: "Light brick yellow", number: 224, r: 240, g: 213, b: 160 },
+                { name: "Warm yellowish orange", number: 225, r: 235, g: 184, b: 127 },
+                { name: "Cool yellow", number: 226, r: 253, g: 234, b: 141 },
+                { name: "Dove blue", number: 232, r: 125, g: 187, b: 221 },
+                { name: "Medium lilac", number: 268, r: 52, g: 43, b: 117 },
+                { name: "Smoky grey", number: 302, r: 91, g: 93, b: 105 },
+                { name: "Dark blue", number: 303, r: 0, g: 16, b: 176 },
+                { name: "Steel blue", number: 305, r: 82, g: 124, b: 174 },
+                { name: "Storm blue", number: 306, r: 51, g: 88, b: 130 },
+                { name: "Dark indigo", number: 308, r: 61, g: 21, b: 133 },
+                { name: "Cadet blue", number: 314, r: 159, g: 173, b: 192 },
+                { name: "Eggplant", number: 316, r: 123, g: 0, b: 123 },
+                { name: "Ghost grey", number: 320, r: 202, g: 203, b: 209 },
+                { name: "Crimson", number: 327, r: 151, g: 0, b: 0 },
+                { name: "Carnation pink", number: 330, r: 255, g: 152, b: 220 },
+                { name: "Maroon", number: 332, r: 117, g: 0, b: 0 },
+                { name: "Institutional white", number: 1001, r: 248, g: 248, b: 248 },
+                { name: "Really black", number: 1003, r: 17, g: 17, b: 17 },
+                { name: "Really red", number: 1004, r: 255, g: 0, b: 0 },
+                { name: "Deep orange", number: 1005, r: 255, g: 176, b: 0 },
+                { name: "New Yeller", number: 1009, r: 255, g: 255, b: 0 },
+                { name: "Really blue", number: 1010, r: 0, g: 0, b: 255 },
+                { name: "Navy blue", number: 1011, r: 0, g: 32, b: 96 },
+                { name: "Cyan", number: 1013, r: 4, g: 175, b: 236 },
+                { name: "Magenta", number: 1015, r: 170, g: 0, b: 170 },
+                { name: "Pink", number: 1016, r: 255, g: 102, b: 204 },
+                { name: "Teal", number: 1018, r: 18, g: 238, b: 212 },
+                { name: "Lime green", number: 1020, r: 0, g: 255, b: 0 },
+                { name: "Royal purple", number: 1031, r: 98, g: 37, b: 209 },
+                { name: "Hot pink", number: 1032, r: 255, g: 0, b: 191 },
+            ];
+
+
+
+
+
+
+            const rgb255ToHsv = (r, g, b) => {
+                const rr = r / 255;
+                const gg = g / 255;
+                const bb = b / 255;
+
+                const max = Math.max(rr, gg, bb);
+                const min = Math.min(rr, gg, bb);
+                const delta = max - min;
+
+                let h = 0;
+                if (delta !== 0) {
+                    if (max === rr) h = ((gg - bb) / delta) % 6;
+                    else if (max === gg) h = (bb - rr) / delta + 2;
+                    else h = (rr - gg) / delta + 4;
+                    h *= 60;
+                    if (h < 0) h += 360;
+                }
+
+                const s = max === 0 ? 0 : delta / max;
+                const v = max;
+
+                return { h, s, v };
+            };
+
+
+            const type = attr.type;
+
+            switch (type) {
+                case "boolean": {
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "value-checkbox";
+                    checkbox.checked = !!attr.value;
+                    checkbox.addEventListener("change", () => {
+                        postSetAttribute(attr.name, checkbox.checked);
+                    });
+                    return checkbox;
+                }
+
+                case "number": {
+                    return createNumberStepperEditor({
+                        value: attr.value,
+                        onCommit: (numericValue) => postSetAttribute(attr.name, numericValue)
+                    });
+                }
+
+                case "Vector2": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    if (attr.value && typeof attr.value === "object") {
+                        input.value = `${formatNumber(attr.value.X ?? 0)}, ${formatNumber(attr.value.Y ?? 0)}`;
+                    } else {
+                        input.value = "0, 0";
+                    }
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 2 && parts.every(n => Number.isFinite(n))) {
+                            postSetAttribute(attr.name, { X: parts[0], Y: parts[1] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "Vector3": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    if (attr.value && typeof attr.value === "object") {
+                        input.value = `${formatNumber(attr.value.X ?? 0)}, ${formatNumber(attr.value.Y ?? 0)}, ${formatNumber(attr.value.Z ?? 0)}`;
+                    } else {
+                        input.value = "0, 0, 0";
+                    }
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 3 && parts.every(n => Number.isFinite(n))) {
+                            postSetAttribute(attr.name, { X: parts[0], Y: parts[1], Z: parts[2] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "UDim": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    if (attr.value && typeof attr.value === "object") {
+                        input.value = `${formatNumber(attr.value.Scale ?? 0)}, ${formatNumber(attr.value.Offset ?? 0)}`;
+                    } else {
+                        input.value = "0, 0";
+                    }
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 2 && parts.every(n => Number.isFinite(n))) {
+                            postSetAttribute(attr.name, { Scale: parts[0], Offset: parts[1] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "UDim2": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    if (attr.value && attr.value.X && attr.value.Y) {
+                        input.value = `${formatNumber(attr.value.X.Scale ?? 0)}, ${formatNumber(attr.value.X.Offset ?? 0)}, ${formatNumber(attr.value.Y.Scale ?? 0)}, ${formatNumber(attr.value.Y.Offset ?? 0)}`;
+                    } else {
+                        input.value = "0, 0, 0, 0";
+                    }
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 4 && parts.every(n => Number.isFinite(n))) {
+                            postSetAttribute(attr.name, {
+                                X: { Scale: parts[0], Offset: parts[1] },
+                                Y: { Scale: parts[2], Offset: parts[3] }
+                            });
+                        }
+                    });
+                    return input;
+                }
+
+                case "Color3": {
+                    const wrapper = document.createElement("div");
+                    wrapper.className = "color3-editor";
+
+                    const swatch = document.createElement("div");
+                    swatch.className = "color3-swatch";
+
+                    const swatchBox = document.createElement("div");
+                    swatchBox.className = "color3-swatch-box";
+
+                    const colorInput = document.createElement("input");
+                    colorInput.type = "color";
+                    colorInput.className = "color3-input";
+
+                    const textInput = document.createElement("input");
+                    textInput.type = "text";
+                    textInput.className = "color3-text";
+                    textInput.spellcheck = false;
+
+                    const initial = color3ToRgb255(attr.value);
+                    let suppress = false;
+                    let editingColorText = false;
+                    let currentRgb = { ...initial };
+
+                    const setUi = (r, g, b) => {
+                        currentRgb = { r: clamp255(r), g: clamp255(g), b: clamp255(b) };
+                        const hex = rgb255ToHex(r, g, b);
+                        swatchBox.style.backgroundColor = hex;
+
+                        suppress = true;
+                        colorInput.value = hex;
+                        textInput.value = editingColorText
+                            ? formatRgbText(r, g, b)
+                            : formatRgbDisplay(r, g, b);
+                        suppress = false;
+                    };
+
+                    const commit = (r, g, b) => {
+                        setUi(r, g, b);
+                        postSetAttribute(attr.name, rgb255ToColor3(r, g, b));
+                    };
+
+                    setUi(initial.r, initial.g, initial.b);
+
+                    textInput.addEventListener("focus", () => {
+                        editingColorText = true;
+                        textInput.value = formatRgbText(currentRgb.r, currentRgb.g, currentRgb.b);
+                        textInput.select();
+                    });
+
+                    textInput.addEventListener("blur", () => {
+                        editingColorText = false;
+                        setUi(currentRgb.r, currentRgb.g, currentRgb.b);
+                    });
+
+                    textInput.addEventListener("keydown", (e) => {
+                        if ([46, 8, 9, 27, 13, 110, 190].indexOf(e.keyCode) !== -1 ||
+                            (e.ctrlKey && [65, 67, 86, 88, 90].indexOf(e.keyCode) !== -1) ||
+                            [35, 36, 37, 39].indexOf(e.keyCode) !== -1) {
+                            return;
+                        }
+                        if ((e.shiftKey || (e.keyCode < 48 || e.keyCode > 57)) &&
+                            (e.keyCode < 96 || e.keyCode > 105) &&
+                            e.key !== ",") {
+                            e.preventDefault();
+                        }
+                    });
+
+                    colorInput.addEventListener("change", () => {
+                        if (suppress) return;
+                        const rgb = hexToRgb255(colorInput.value);
+                        if (!rgb) return;
+                        commit(rgb.r, rgb.g, rgb.b);
+                    });
+
+                    textInput.addEventListener("change", () => {
+                        if (suppress) return;
+                        const rgb = parseColorInput(textInput.value);
+                        if (!rgb) {
+                            const current = color3ToRgb255(attr.value);
+                            setUi(current.r, current.g, current.b);
+                            return;
+                        }
+                        commit(rgb.r, rgb.g, rgb.b);
+                    });
+
+                    swatch.appendChild(swatchBox);
+                    swatch.appendChild(colorInput);
+
+                    wrapper.appendChild(swatch);
+                    wrapper.appendChild(textInput);
+
+                    return wrapper;
+                }
+
+
+                case "NumberRange": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    if (attr.value && typeof attr.value === "object") {
+                        input.value = `${formatNumber(attr.value.Min ?? 0)}, ${formatNumber(attr.value.Max ?? 0)}`;
+                    } else {
+                        input.value = "0, 0";
+                    }
+                    input.addEventListener("change", () => {
+                        const parts = parseNumberList(input.value);
+                        if (parts.length >= 2 && parts.every(n => Number.isFinite(n))) {
+                            postSetAttribute(attr.name, { Min: parts[0], Max: parts[1] });
+                        }
+                    });
+                    return input;
+                }
+
+                case "string": {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = attr.value ?? "";
+                    input.addEventListener("change", () => {
+                        postSetAttribute(attr.name, input.value);
+                    });
+                    return input;
+                }
+
+                default: {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.className = "value-input";
+                    input.value = attr.value != null ? String(attr.value) : "";
+                    input.addEventListener("change", () => {
+                        postSetAttribute(attr.name, input.value);
+                    });
+                    return input;
+                }
+            }
+        }
+
+        function postSetAttribute(attributeName, attributeValue) {
+            if (propertiesReadOnly) return;
+            vscode.postMessage({
+                type: "setAttribute",
+                attributeName,
+                attributeValue
+            });
+        }
+
+        function openAttributeModal() {
+            if (propertiesReadOnly) return;
+            const modal = document.getElementById("attribute-modal");
+            if (!modal) {
+                createAttributeModal();
+            }
+            const modalElement = document.getElementById("attribute-modal");
+            modalElement.style.display = "flex";
+
+            const nameInput = document.getElementById("attribute-name-input");
+            if (nameInput) {
+                nameInput.value = "";
+                setTimeout(() => nameInput.focus(), 10);
+            }
+
+            const typeSelect = document.getElementById("attribute-type-select");
+            if (typeSelect) {
+                typeSelect.selectedIndex = 0;
+            }
+
+            updateCharCounter();
+        }
+
+        function closeAttributeModal() {
+            const modal = document.getElementById("attribute-modal");
+            if (modal) {
+                modal.style.display = "none";
+            }
+        }
+
+        function createAttributeModal() {
+            const modal = document.createElement("div");
+            modal.id = "attribute-modal";
+            modal.className = "attribute-modal";
+            modal.style.display = "none";
+
+            const content = document.createElement("div");
+            content.className = "attribute-modal-content";
+
+            const body = document.createElement("div");
+            body.className = "attribute-modal-body";
+
+            const nameField = document.createElement("div");
+            nameField.className = "attribute-modal-field";
+            const nameLabel = document.createElement("label");
+            nameLabel.className = "attribute-modal-label";
+            nameLabel.textContent = "Name";
+            const nameInput = document.createElement("input");
+            nameInput.id = "attribute-name-input";
+            nameInput.type = "text";
+            nameInput.className = "attribute-modal-input";
+            nameInput.maxLength = 100;
+            nameInput.addEventListener("input", updateCharCounter);
+            nameInput.addEventListener("blur", () => {
+                setTimeout(() => {
+                    if (!nameInput.value.trim() && !content.contains(document.activeElement)) {
+                        closeAttributeModal();
+                    }
+                }, 0);
+            });
+            nameInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    const typeSelect = document.getElementById("attribute-type-select");
+                    const name = nameInput.value.trim();
+                    const type = typeSelect ? typeSelect.value : "string";
+                    if (name) {
+                        vscode.postMessage({
+                            type: "addAttribute",
+                            attributeName: name,
+                            attributeType: type
+                        });
+                        closeAttributeModal();
+                    }
+                } else if (e.key === "Escape") {
+                    closeAttributeModal();
+                }
+            });
+            const charCounter = document.createElement("div");
+            charCounter.id = "attribute-char-counter";
+            charCounter.className = "attribute-modal-char-counter";
+            charCounter.textContent = "0/100";
+            nameField.appendChild(nameLabel);
+            nameField.appendChild(nameInput);
+            nameField.appendChild(charCounter);
+
+            const typeField = document.createElement("div");
+            typeField.className = "attribute-modal-field";
+            const typeLabel = document.createElement("label");
+            typeLabel.className = "attribute-modal-label";
+            typeLabel.textContent = "Type";
+            const typeSelect = document.createElement("select");
+            typeSelect.id = "attribute-type-select";
+            typeSelect.className = "attribute-modal-select";
+
+            const types = ["string", "number", "boolean", "Color3", "Vector2", "Vector3", "UDim", "UDim2", "NumberRange", "NumberSequence", "ColorSequence"];
+            for (const type of types) {
+                const option = document.createElement("option");
+                option.value = type;
+                option.textContent = type;
+                typeSelect.appendChild(option);
+            }
+
+            typeField.appendChild(typeLabel);
+            typeField.appendChild(typeSelect);
+
+            body.appendChild(nameField);
+            body.appendChild(typeField);
+
+            const footer = document.createElement("div");
+            footer.className = "attribute-modal-footer";
+
+            const saveButton = document.createElement("button");
+            saveButton.className = "attribute-modal-button primary";
+            saveButton.textContent = "Save";
+            saveButton.addEventListener("click", () => {
+                const name = nameInput.value.trim();
+                const type = typeSelect.value;
+                if (name) {
+                    vscode.postMessage({
+                        type: "addAttribute",
+                        attributeName: name,
+                        attributeType: type
+                    });
+                    closeAttributeModal();
+                }
+            });
+
+            const cancelButton = document.createElement("button");
+            cancelButton.className = "attribute-modal-button secondary";
+            cancelButton.textContent = "Cancel";
+            cancelButton.addEventListener("click", closeAttributeModal);
+
+            footer.appendChild(saveButton);
+            footer.appendChild(cancelButton);
+
+            content.appendChild(body);
+            content.appendChild(footer);
+            modal.appendChild(content);
+
+            modal.addEventListener("click", (e) => {
+                if (e.target === modal) {
+                    closeAttributeModal();
+                }
+            });
+
+            document.body.appendChild(modal);
+        }
+
+        function updateCharCounter() {
+            const nameInput = document.getElementById("attribute-name-input");
+            const charCounter = document.getElementById("attribute-char-counter");
+            if (nameInput && charCounter) {
+                charCounter.textContent = `${nameInput.value.length}/100`;
+            }
+        }
+
+        window.addEventListener("message", (event) => {
+            const message = event.data;
+            if (message && message.type === "updateProperties") {
+                updateProperties(message);
+            } else if (message && message.type === "propertyCommitDone") {
+                if (!message.propertyName || activePropertyEdit === message.propertyName) {
+                    activePropertyEdit = null;
+                    applyDeferredPropertiesIfIdle();
+                }
+            } else if (message && message.type === "soundPlaybackUpdate") {
+                handleSoundPlaybackUpdate(message);
+            }
+        });
+
+        document.addEventListener("keydown", blurValueInputOnEnter);
+
+        window.addEventListener("keydown", (event) => {
+            const activeElement = document.activeElement;
+            const activeRow = activeElement instanceof Element ? activeElement.closest(".property-row") : null;
+            const propertyKey = activeRow?.dataset?.propertyKey;
+            if (!propertyKey) return;
+            if ((event.ctrlKey || event.metaKey) && event.key === "z" && !event.shiftKey) {
+                event.preventDefault();
+                requestEditorFocusRestore(activeElement);
+                activePropertyEdit = propertyKey;
+                vscode.postMessage({ type: "undo", propertyName: propertyKey });
+            } else if ((event.ctrlKey || event.metaKey) && event.key === "z" && event.shiftKey) {
+                event.preventDefault();
+                requestEditorFocusRestore(activeElement);
+                activePropertyEdit = propertyKey;
+                vscode.postMessage({ type: "redo", propertyName: propertyKey });
+            } else if ((event.ctrlKey || event.metaKey) && event.key === "y") {
+                event.preventDefault();
+                requestEditorFocusRestore(activeElement);
+                activePropertyEdit = propertyKey;
+                vscode.postMessage({ type: "redo", propertyName: propertyKey });
+            }
+        });
+
+        vscode.postMessage({ type: "ready" });
+
+        function handleSoundPlaybackUpdate(info) {
+            audioPlaying = info.playing;
+
+            if (!audioScrubbing) {
+                const scrubberFill = document.querySelector('.audio-scrubber-fill');
+                const scrubberHandle = document.querySelector('.audio-scrubber-handle');
+                const playBtn = document.querySelector('.audio-play-button');
+
+                if (scrubberFill && scrubberHandle && info.timeLength > 0) {
+                    const progress = (info.timePosition / info.timeLength) * 100;
+                    scrubberFill.style.width = `${Math.min(100, Math.max(0, progress))}%`;
+                    scrubberHandle.style.left = `${Math.min(100, Math.max(0, progress))}%`;
+                }
+
+                if (playBtn) {
+                    playBtn.title = info.playing ? "Stop" : "Play";
+                    if (info.playing) {
+                        playBtn.classList.add("playing");
+                    } else {
+                        playBtn.classList.remove("playing");
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+
+</html>
