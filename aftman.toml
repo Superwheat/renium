@@ -1,0 +1,3 @@
+# Tool versions used to build the Studio plugin.
+[tools]
+rojo = "rojo-rbx/rojo@7.6.1"

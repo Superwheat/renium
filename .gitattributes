@@ -1,0 +1,25 @@
+# Renium project version-control policy (written by `renium vc-init`).
+* text=auto
+*.lua text eol=lf
+*.luau text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.rbxmx text eol=lf
+*.rbxlx text eol=lf
+*.renium binary diff=renium merge=renium
+*.rbsync binary diff=renium merge=renium
+*.rbxm binary
+*.rbxl binary
+*.vsix binary
+*.exe binary
+*.dll binary
+*.pdb binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.mp3 binary
+*.ogg binary
+rbx text eol=lf

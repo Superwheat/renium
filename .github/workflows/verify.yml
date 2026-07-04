@@ -1,0 +1,59 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: tools/renium-vscode-extension/package-lock.json
+
+      - name: Build and test the CLI
+        run: |
+          cargo build --locked --release --manifest-path tools/renium/Cargo.toml
+          cargo test --locked --release --manifest-path tools/renium/Cargo.toml
+
+      - name: Install, test, and package the extension
+        run: |
+          npm.cmd ci --prefix tools/renium-vscode-extension
+          npm.cmd --prefix tools/renium-vscode-extension run verify
+          $vsix = Join-Path $env:RUNNER_TEMP "renium-ci.vsix"
+          Push-Location tools/renium-vscode-extension
+          try {
+            npx.cmd --no-install vsce package --out $vsix
+          }
+          finally {
+            Pop-Location
+          }
+          if (-not (Test-Path -LiteralPath $vsix -PathType Leaf)) { throw "VSIX was not produced" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($vsix)
+          try {
+            if ($null -eq $archive.GetEntry("extension/package.json")) { throw "VSIX is missing extension/package.json" }
+          }
+          finally {
+            $archive.Dispose()
+          }
