@@ -1,29 +1,6 @@
-// conflictMerge.ts
-//
-// Dependency-free three-way (diff3) line merge plus conflict-policy resolution
-// for Renium two-way live sync.
-//
-// Used when the same script/text is edited on BOTH sides between syncs:
-//   - base   = last value both sides agreed on (the last synced content)
-//   - ours   = current local file content (editor / filesystem side)
-//   - theirs = incoming Studio content
-//
-// Non-overlapping edits from each side are merged automatically. Only lines
-// changed differently on both sides relative to `base` produce a conflict.
-//
-// Algorithm: classic diff3 via "stable anchors". A base line that is unchanged
-// on BOTH sides is an anchor. Between consecutive anchors we have a segment with
-// the base text, the ours text, and the theirs text; we merge each segment
-// independently. This is simple, allocation-light, and provably terminating
-// (we iterate a finite, monotonic anchor list), so it is easy to reason about
-// without a heavy test harness.
 
 export type ConflictSide = "ours" | "theirs";
 
-// "filesystem" / "studio": the named side wins overlapping lines automatically.
-// "prompt": no side is prioritized — the local version is kept on disk (always
-// valid Lua) and the caller surfaces a diff so the user can review/switch.
-// Non-overlapping concurrent edits always merge automatically regardless.
 export type ConflictPolicy = "prompt" | "filesystem" | "studio";
 
 const MAX_LCS_CELLS = 4_000_000;
@@ -77,7 +54,6 @@ function lcsMatches(a: string[], b: string[]): Array<[number, number]> {
   if (n > Math.floor(MAX_LCS_CELLS / m)) {
     return [];
   }
-  // dp[i][j] = LCS length of a[i..] and b[j..]
   const dp: Uint32Array[] = new Array(n + 1);
   for (let i = 0; i <= n; i++) {
     dp[i] = new Uint32Array(m + 1);
@@ -131,7 +107,6 @@ interface Anchor {
  * identically) is clean, a region changed differently by both is a conflict.
  */
 export function threeWayMerge(base: string[], ours: string[], theirs: string[]): ThreeWayMergeResult {
-  // base index -> ours/theirs index for lines that are unchanged on that side.
   const mbOurs = new Map<number, number>();
   for (const [bi, oi] of lcsMatches(base, ours)) {
     mbOurs.set(bi, oi);
@@ -141,7 +116,6 @@ export function threeWayMerge(base: string[], ours: string[], theirs: string[]):
     mbTheirs.set(bi, ti);
   }
 
-  // Stable anchors: base lines unchanged on BOTH sides. Monotonic in b, o and t.
   const anchors: Anchor[] = [];
   for (let bi = 0; bi < base.length; bi++) {
     const o = mbOurs.get(bi);
@@ -172,17 +146,14 @@ export function threeWayMerge(base: string[], ours: string[], theirs: string[]):
       return;
     }
     if (arraysEqual(ourSeg, theirSeg)) {
-      // Both sides made the identical change (or no change).
       pushClean(ourSeg);
       return;
     }
     if (arraysEqual(ourSeg, baseSeg)) {
-      // Ours unchanged here -> take theirs.
       pushClean(theirSeg);
       return;
     }
     if (arraysEqual(theirSeg, baseSeg)) {
-      // Theirs unchanged here -> take ours.
       pushClean(ourSeg);
       return;
     }
@@ -204,7 +175,6 @@ export function threeWayMerge(base: string[], ours: string[], theirs: string[]):
     prevO = a.o;
     prevT = a.t;
   }
-  // Trailing segment after the last anchor (or the whole document if no anchors).
   emitSegment(prevB + 1, base.length, prevO + 1, ours.length, prevT + 1, theirs.length);
 
   return { clean: conflictCount === 0, regions, conflictCount };
@@ -279,10 +249,6 @@ export function mergeAndResolve(
   if (policy === "studio") {
     return { text: renderTakingSide(result, "theirs", eol), hadConflicts: true, needsManualResolution: false, conflictCount: result.conflictCount };
   }
-  // "filesystem" and "prompt" both keep the LOCAL side on disk so the file is
-  // always valid Lua — conflict markers are never written. "prompt" additionally
-  // flags the conflict (needsManualResolution) so the caller can surface a diff
-  // and let the user review or switch to Studio's version.
   void options;
   return {
     text: renderTakingSide(result, "ours", eol),

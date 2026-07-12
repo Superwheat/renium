@@ -151,9 +151,6 @@ function BridgeConnection.create(context)
 		if okCall then
 			local sent, sendError = TransportModule.sendSuccessResponse(channel.id, client, id, method, result, serverMs)
 			if not sent then
-				-- A bounded raw response (for example a chunk above the transport cap)
-				-- must become a normal RPC error. Otherwise the Rust caller waits for its
-				-- full request timeout despite the plugin already knowing the send failed.
 				local responseError = conciseConnectionError(sendError or "could not send bridge response")
 				local errorSent = TransportModule.sendEnvelope(client, {
 					id = id,
@@ -921,7 +918,6 @@ function BridgeConnection.create(context)
 			end)
 		end
 		if ui.setConflictResolutionActive ~= nil then
-			-- nil default -> nothing highlighted when unset (VS Code setting governs).
 			ui.setConflictResolutionActive(
 				SettingsModule.loadConflictResolution(plugin, context.settingsPrefix, nil)
 			)

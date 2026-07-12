@@ -26,7 +26,6 @@ const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SettingsBytecode {
     pub(crate) version: u8,
-    // Detached from ServiceState so tools can inspect and edit bytecode without a live export.
     pub(crate) instances: Vec<SettingsBytecodeInstance>,
 }
 
@@ -1797,8 +1796,6 @@ fn write_fixed_numeric_component<W: Write + ?Sized>(number: f64, writer: &mut W)
     Ok(())
 }
 
-// Clamp instead of erroring: one out-of-f32-range component (e.g. a part flung
-// to 1e39) must not fail the whole store write.
 fn fixed_numeric_component_f32(number: f64) -> f32 {
     let value = number as f32;
     if value.is_finite() {

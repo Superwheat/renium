@@ -1,7 +1,3 @@
-// Decoding a .renium store always goes through the real CLI (`renium view
-// --json`) so there is exactly one decoder. This module has no dependency on
-// the UI layer, so both the standalone viewer and the Explorer tab can use it
-// without an import cycle.
 
 import * as childProcess from "child_process";
 import * as fs from "fs";
@@ -146,7 +142,6 @@ async function runViewCommand(
       try {
         child.kill();
       } catch {
-        // The process may have exited between the limit check and kill.
       }
       finish({ ok: false, error });
     };
@@ -169,8 +164,6 @@ async function runViewCommand(
       if (settled) {
         return;
       }
-      // Keep enough diagnostics for the user without allowing an erroring CLI
-      // to retain an unbounded amount of text in the extension host.
       const next = appendLimited(stderr, stderrLength, data, MAX_RBSYNC_ERROR_BYTES);
       stderrLength = next.length;
     });
@@ -249,7 +242,6 @@ export async function decodeRbsyncBytes(
       try {
         await fs.promises.rm(tempDir, { recursive: true, force: true });
       } catch {
-        // Best effort cleanup; the OS temp cleaner can remove a stale directory.
       }
     }
   }

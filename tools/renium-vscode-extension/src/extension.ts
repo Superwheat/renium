@@ -326,8 +326,6 @@ type StudioChangeState = {
   waitTimedOut?: boolean;
   twoWaySyncEnabled?: boolean;
   runtimeSettings?: Record<string, unknown>;
-  // Conflict policy configured in the Studio plugin settings (when present it
-  // overrides the workspace `renium.liveSync.conflictResolution` setting).
   conflictResolution?: string;
 };
 
@@ -506,8 +504,6 @@ const DEFAULT_BRIDGE_PORTS = [8781, 8782, 8783];
 const PREVIOUS_DEFAULT_BRIDGE_PORTS = [8781, 8782, 8783, 8784];
 const LEGACY_BRIDGE_PORTS = [8781, 8782, 8783, 8784, 8785, 8786, 8787, 8788];
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
-// Keep this aligned with the raw WebSocket chunk ceiling in both the Rust CLI
-// and the Studio plugin. Larger requests cannot be delivered by the plugin.
 const MAX_BRIDGE_CHUNK_SIZE = 8 * 1024 * 1024;
 const SETTINGS_FILE_NAME = "__roblox_sync_settings.renium";
 const LEGACY_SETTINGS_FILE_NAME = "__roblox_sync_settings.rbsync";
@@ -755,26 +751,18 @@ class RobloxSyncController {
   private studioSnapshotFingerprintByService = new Map<string, string>();
   private editorLiveSyncRuntimeEnabled = false;
   private pendingEditorPaths = new Set<string>();
-  // Consecutive failed editor -> Studio flushes; drives retry backoff and
-  // limits the error toast to the first failure of a streak.
   private editorPushFailureStreak = 0;
   private forcedEditorLiveSyncPathKeys = new Set<string>();
   private suppressedEditorLiveSyncPathUntilByKey = new Map<string, number>();
   private recentDirectSaveAtByPath = new Map<string, number>();
-  // Conflict policy reported by the Studio plugin (overrides the workspace setting when present).
   private studioConflictPolicyOverride: ConflictPolicy | undefined;
-  // Runtime controls saved in the Studio widget. They apply to the active
-  // bridge, while workspace settings remain the fallback if Studio is offline.
   private studioRuntimeSettings: Record<string, unknown> | undefined;
-  // Lua files held back from Studio because they contain unresolved conflict markers (warn-once).
   private conflictMarkerWarnedKeys = new Set<string>();
-  // Short-lived cache of `renium link-status` for file-explorer decorations.
   private linkStatusCache: { at: number; value: CliLinkStatusResult | undefined } | undefined;
   private linkStatusInflight: Promise<CliLinkStatusResult | undefined> | undefined;
   private linkPackageSourceApplyTimer: NodeJS.Timeout | undefined;
   private readonly pendingLinkPackageSourcePaths = new Set<string>();
   private readonly linkChangeEmitter = new vscode.EventEmitter<void>();
-  // Fires whenever link state changes (apply / break); decorations subscribe.
   public readonly onLinksChanged = this.linkChangeEmitter.event;
   private daemonProcess: childProcess.ChildProcessWithoutNullStreams | undefined;
   private daemonKeyValue: string | undefined;
@@ -796,6 +784,7 @@ class RobloxSyncController {
   private activeTaskStartedAt = 0;
   private activeTaskTicker: NodeJS.Timeout | undefined;
   private warnedLegacyStartupWaitSeconds = false;
+  private warnedMultiRootWorkspace = false;
   private warnedLegacyBridgePorts = false;
   private warnedBridgePortLimit = false;
   private warnedLegacyChunkSize = false;
@@ -896,7 +885,6 @@ class RobloxSyncController {
           }
           return await this.gitOutput(this.getConfig(), repoRoot, ["show", `HEAD:${relPath}`], "read HEAD version");
         } catch {
-          // Untracked/new file has no HEAD version -> empty (diff shows all added).
           return "";
         }
       },
@@ -931,7 +919,6 @@ class RobloxSyncController {
       query: `root=${encodeURIComponent(repoRoot)}&t=${Date.now()}`,
     });
     if (!fs.existsSync(absFile)) {
-      // Deleted in the working tree: just show the HEAD version read-only.
       await vscode.window.showTextDocument(headUri, { preview: true });
       return;
     }
@@ -1642,9 +1629,6 @@ class RobloxSyncController {
       }
     });
     this.invalidateLinkStatusCache();
-    // Push to Studio only when a live sync is actually running — otherwise the
-    // materialized files just sit in src/ and reach Studio whenever sync starts.
-    // This avoids failed-connection retries when you aren't syncing.
     const forceStudioAllowed = options.forceStudio === true && this.canUseStudioPushPipeline();
     if (options.forceStudio === true && !forceStudioAllowed) {
       this.noteStudioPushSkipped("serve/live sync is not active");
@@ -1653,8 +1637,6 @@ class RobloxSyncController {
       const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
         .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
       if (changedPaths.length > 0) {
-        // Let this explicit push be the single source of truth; suppress the
-        // live-sync watcher for these paths so it doesn't push them again.
         this.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
         if (forceStudioAllowed) {
           const targetSettingsIds = (Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : [])
@@ -1886,12 +1868,10 @@ class RobloxSyncController {
         }
       }
     } catch {
-      // Leave keys empty on failure; the explorer simply shows "Create Link".
     }
     try {
       await vscode.commands.executeCommand("renium.fileExplorer.setLinkState", keys);
     } catch {
-      // The explorer view may not be registered; ignore.
     }
   }
 
@@ -2064,7 +2044,6 @@ class RobloxSyncController {
     const service = parts[0];
     const fileName = parts[parts.length - 1];
     if (/^init(\.server|\.client)?\.(luau|lua)$/i.test(fileName)) {
-      // A folder-script: the instance is the containing folder.
       const segments = parts.slice(0, parts.length - 1);
       return segments.length >= 2 ? { service, pathSegments: segments } : undefined;
     }
@@ -2766,8 +2745,6 @@ class RobloxSyncController {
     if (!force && this.linkStatusCache && now - this.linkStatusCache.at < 2000) {
       return this.linkStatusCache.value;
     }
-    // Decorations, the explorer link-state, and the Packages view all refresh on
-    // the same link-change event; share one in-flight CLI run between them.
     if (this.linkStatusInflight) {
       return this.linkStatusInflight;
     }
@@ -2809,7 +2786,6 @@ class RobloxSyncController {
     try {
       await vscode.commands.executeCommand("renium.fileExplorer.refresh");
     } catch {
-      // The file explorer view may not be registered yet; ignore.
     }
   }
 
@@ -3578,9 +3554,6 @@ class RobloxSyncController {
   }
 
   public async stopServe(options: { silent?: boolean } = {}): Promise<void> {
-    // Live Sync depends on the bridge. Stopping Serve underneath an active
-    // watcher leaves it marked as running but unable to make progress, so stop
-    // the dependent runtime first and then tear the daemon down.
     if (this.liveSyncWatcher || this.liveSyncStartPromise) {
       await this.stopLiveSync({ silent: true });
     }
@@ -4201,8 +4174,6 @@ class RobloxSyncController {
   }
 
   private studioLiveSyncWaitSeconds(delayMs: number): number {
-    // Keep the event-driven wait short so Studio -> editor stays responsive without
-    // monopolizing a bridge channel long enough to make editor -> Studio pushes queue up.
     return Math.max(0.05, Math.min(MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS / 1000, delayMs / 1000));
   }
 
@@ -4277,9 +4248,6 @@ class RobloxSyncController {
         }
         await this.getStudioChangeState(runtimeCfg, dirtyServices, ackObservedDirty);
       } else {
-        // Event-driven waits already spend the idle backoff interval inside the plugin and
-        // wake as soon as Studio records a dirty service. Schedule the next wait almost
-        // immediately after a timeout so idle backoff does not become visible sync latency.
         nextDelayMs = state.eventDriven === true ? MIN_STUDIO_LIVE_SYNC_POLL_MS : this.nextIdleStudioLiveSyncPollDelay(runtimeCfg);
       }
     } catch (err) {
@@ -4509,8 +4477,6 @@ class RobloxSyncController {
     };
 
     const queued = this.queue.catch(() => undefined).then(run);
-    // Keep the internal tail fulfilled even when this caller receives an error.
-    // That way a later user command can always be scheduled after a failure.
     this.queue = queued.catch(() => undefined);
     await queued;
   }
@@ -4540,8 +4506,6 @@ class RobloxSyncController {
   ): Promise<void> {
     const selectedServices = this.normalizeServices(services, cfg.services);
     this.studioToEditorImportInProgress = true;
-    // Capture locally-modified scripts before the full import overwrites them, so
-    // concurrent local edits can be 3-way merged back instead of being clobbered.
     const capturedLocalEdits = this.captureLocalScriptEditsForServices(selectedServices, cfg);
     try {
       await this.runRustImport(cfg, this.resolveSnapshotPath(cfg), selectedServices, { quietLog: options.quietLog === true });
@@ -4549,8 +4513,6 @@ class RobloxSyncController {
       this.commitStudioSnapshotFingerprints(selectedServices, fingerprintsByService);
       this.replaceEditorLiveSyncCacheForServices(selectedServices, cfg);
       if (survivingLocalEdits.length > 0) {
-        // These files kept local edits the import would have lost; make sure they
-        // propagate to Studio (invalidate their cache entry + queue a push).
         this.invalidateEditorLiveSyncCacheEntries(survivingLocalEdits, cfg);
         for (const filePath of survivingLocalEdits) {
           this.pendingEditorPaths.add(filePath);
@@ -4560,7 +4522,6 @@ class RobloxSyncController {
       try {
         await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
       } catch {
-        // The Explorer view is optional; file watchers still pick up imported settings changes.
       }
     } finally {
       this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
@@ -4582,10 +4543,6 @@ class RobloxSyncController {
       return false;
     }
 
-    // Applying a handful of direct property records avoids an export/import
-    // round-trip. Once the batch is larger, a full import is both safer for
-    // structural consistency and cheaper than spawning one CLI mutation per
-    // property. Zero deliberately disables the granular path.
     const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
     const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
     if (changeCount > cfg.changesThreshold) {
@@ -4681,7 +4638,6 @@ class RobloxSyncController {
       try {
         await vscode.commands.executeCommand("renium.fileExplorer.refreshPropertyChanges", Array.from(changedSettingsFiles));
       } catch {
-        // The Explorer view is optional; file watchers still pick up imported settings changes.
       }
     }
     this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
@@ -4701,12 +4657,6 @@ class RobloxSyncController {
       return directSourcePath;
     }
 
-    // The sourcemap could not map this source change to a local file (e.g. a
-    // stale or missing sourcemap.json after a rename/add in Studio). Previously
-    // we blind-overwrote the file via Rust `bytecode-set-source`, which would
-    // clobber any concurrent local edit with no 3-way merge. Instead, fail the
-    // fast path so the caller falls back to the full import, which captures and
-    // 3-way merges local edits AND regenerates the sourcemap (self-healing).
     void settingsFile;
     void service;
     throw new Error("Studio source change could not be mapped via sourcemap; deferring to protected full import.");
@@ -4729,8 +4679,6 @@ class RobloxSyncController {
 
     this.noteProgrammaticEditorWrite({ paths: [sourcePath], durationMs: 5000 });
     this.writeUtf8FileIfChanged(sourcePath, finalContent);
-    // The written file is always valid Lua (conflict markers are never inserted),
-    // so it is safe to record as the shared base for future 3-way merges.
     this.writeSyncBase(cfg, sourcePath, finalContent);
     this.noteProgrammaticEditorWrite({ paths: [sourcePath], durationMs: 5000, refreshCache: true });
     return sourcePath;
@@ -4762,7 +4710,6 @@ class RobloxSyncController {
     }
 
     const base = this.readSyncBase(cfg, sourcePath);
-    // Local file is unchanged since the last sync -> safe to take Studio's value.
     if (base !== undefined && ours === base) {
       return theirs;
     }
@@ -4788,7 +4735,6 @@ class RobloxSyncController {
     let resolvedText: string;
     let conflicted: boolean;
     if (base === undefined) {
-      // No common ancestor: fall back to a 2-way choice.
       resolvedText = policy === "studio" ? theirs : ours;
       conflicted = true;
     } else {
@@ -4801,7 +4747,6 @@ class RobloxSyncController {
       return resolvedText;
     }
 
-    // A real overlapping conflict occurred: back up both sides so nothing is lost.
     const localBackup = this.backupConflictCopy(cfg, sourcePath, ours, "local");
     const studioBackup = this.backupConflictCopy(cfg, sourcePath, theirs, "studio");
     if (policy === "filesystem") {
@@ -4809,7 +4754,6 @@ class RobloxSyncController {
     } else if (policy === "studio") {
       this.output.appendLine(`[renium] conflict on ${sourcePath}: kept Studio version (local copy backed up to .renium/conflicts).`);
     } else {
-      // "prompt" = no side prioritized: keep local on disk and let the user review.
       this.surfaceConflictChoice(cfg, sourcePath, localBackup, studioBackup);
     }
     return resolvedText;
@@ -4931,7 +4875,6 @@ class RobloxSyncController {
       try {
         this.writeSyncBase(cfg, abs, fs.readFileSync(abs, "utf8"));
       } catch {
-        // File may have been deleted/renamed; nothing to base.
       }
     }
   }
@@ -5002,17 +4945,13 @@ class RobloxSyncController {
       const base = this.readSyncBase(cfg, filePath);
       const resolved = this.mergeSourceAgainstBase(cfg, filePath, localContent, newDisk, base);
       if (resolved === newDisk) {
-        // Studio's version already subsumes the local edit.
         this.writeSyncBase(cfg, filePath, newDisk);
         continue;
       }
       this.writeUtf8FileIfChanged(filePath, resolved);
-      // Local edits survived the merge and are not yet in Studio -> must be pushed.
-      // Keep the prior base; it advances when the push succeeds.
       surviving.push(filePath);
     }
 
-    // Seed bases for scripts that don't have one yet so the next import is protected.
     const srcRoot = path.join(cfg.projectRoot, "src");
     for (const service of this.normalizeServices(services, cfg.services)) {
       const serviceDir = path.join(srcRoot, service);
@@ -5026,7 +4965,6 @@ class RobloxSyncController {
         try {
           this.writeSyncBase(cfg, filePath, fs.readFileSync(filePath, "utf8"));
         } catch {
-          // ignore unreadable files
         }
       }
     }
@@ -5217,8 +5155,6 @@ class RobloxSyncController {
   }
 
   private shouldDropLikelySelfDirtyStudioState(_dirtyServices: string[], _cfg: SyncConfig): boolean {
-    // Editor-push echoes are handled by plugin-side suppression inside applyEditorChanges.
-    // Never acknowledge/drop Studio dirty state just because a Studio -> editor import recently completed.
     return false;
   }
 
@@ -5310,7 +5246,6 @@ class RobloxSyncController {
         return Buffer.from(this.stableJsonStringify(snapshot), "utf8");
       }
     } catch {
-      // Fall through to the lightweight normalizer below.
     }
 
     return Buffer.from(
@@ -5598,7 +5533,6 @@ class RobloxSyncController {
         };
       }
     } catch {
-      // Missing or invalid cache is treated as a cold start.
     }
     return { existed: false, cache: this.emptyEditorLiveSyncCache(projectRoot) };
   }
@@ -5727,8 +5661,6 @@ class RobloxSyncController {
     } catch {
       return false;
     }
-    // Require both an opening and closing marker at line start to avoid matching
-    // legitimate code that merely contains a run of '<' or '>' characters.
     return /^<{7} /m.test(content) && /^>{7} /m.test(content);
   }
 
@@ -5861,9 +5793,6 @@ class RobloxSyncController {
       return;
     }
 
-    // The Studio plugin already suppresses editor-applied echo events inside applyEditorChanges.
-    // Resetting/suppressing the Studio change tracker again here can swallow a real Studio edit
-    // that happens immediately after a VS Code push while the user is testing round-trip sync.
     this.scheduleStudioLiveSyncPoll(cfg, this.resetStudioLiveSyncPollDelay(cfg));
   }
 
@@ -5909,10 +5838,7 @@ class RobloxSyncController {
       try {
         await startup;
       } catch {
-        // A cancelled startup can fail while its bridge request is being torn down.
       }
-      // A startup that won the race may have created its watcher after the first
-      // cleanup above; dispose it once more before reporting the stopped state.
       this.disposeLiveSyncRuntime();
       await this.setEditorLiveSyncEnabled(false);
     }
@@ -6240,8 +6166,6 @@ class RobloxSyncController {
   private reportEditorLiveSyncError(err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
     this.output.appendLine(`[renium] editor live sync failed: ${message}`);
-    // Failed flushes retry on a fast backoff; surface only the first failure of
-    // a streak as a toast and keep the retries in the output channel.
     if (this.editorPushFailureStreak <= 1) {
       this.output.show(true);
       vscode.window.showErrorMessage(`Renium: editor live sync failed. ${message}`);
@@ -6291,8 +6215,6 @@ class RobloxSyncController {
       await this.enqueue("Editor -> Studio sync", async () => {
         this.logEditorChangedPaths("Editor -> Studio", changedPaths, cfg);
         await this.runEditorPush(changedPaths, cfg);
-        // Editor and Studio now agree on these files; refresh the merge base so a
-        // later concurrent Studio edit is 3-way merged against the pushed content.
         this.refreshSyncBasesForPaths(changedPaths, cfg);
       });
       if (this.editorPushFailureStreak > 0) {
@@ -6302,10 +6224,6 @@ class RobloxSyncController {
       }
       this.editorPushFailureStreak = 0;
     } catch (err) {
-      // The hash cache only advances on success, so these files are still
-      // "changed" — but nothing would re-trigger a flush until the user edits
-      // them again. Re-queue the batch and retry with backoff so a transient
-      // daemon/bridge hiccup cannot silently un-sync a save.
       this.editorPushFailureStreak += 1;
       const retryDelayMs = Math.min(
         EDITOR_PUSH_RETRY_BASE_MS * 2 ** Math.min(this.editorPushFailureStreak - 1, 8),
@@ -6474,14 +6392,12 @@ class RobloxSyncController {
         try {
           fs.unlinkSync(changedPathsFile);
         } catch {
-          // Best effort cleanup; stale path lists are ignored by future runs.
         }
       }
       if (targetIdsFile) {
         try {
           fs.unlinkSync(targetIdsFile);
         } catch {
-          // Best effort cleanup; stale target-id lists are ignored by future runs.
         }
       }
     }
@@ -6502,7 +6418,6 @@ class RobloxSyncController {
           found = parsed as Record<string, unknown>;
         }
       } catch {
-        // Keep searching; the final sentinel wins if multiple attempts were logged.
       }
     }
     if (!found) {
@@ -6512,7 +6427,6 @@ class RobloxSyncController {
           return parsed as Record<string, unknown>;
         }
       } catch {
-        // Daemon-control fallbacks may not be pure JSON; the caller reports a missing result.
       }
     }
     return found;
@@ -6531,7 +6445,6 @@ class RobloxSyncController {
           return parsed as T;
         }
       } catch {
-        // Keep searching for the last JSON object line.
       }
     }
 
@@ -6545,7 +6458,6 @@ class RobloxSyncController {
         return parsed as T;
       }
     } catch {
-      // The caller reports command failure if the CLI did not emit parseable JSON.
     }
     return undefined;
   }
@@ -6600,7 +6512,6 @@ class RobloxSyncController {
       }
       return this.studioChangeStateFromRecord(record);
     } catch {
-      // Keep searching; callers report missing state if no supported shape is found.
       return undefined;
     }
   }
@@ -6697,7 +6608,6 @@ class RobloxSyncController {
         };
       }
     } catch {
-      // The caller reports command failure with more context.
     }
     return undefined;
   }
@@ -6888,7 +6798,6 @@ class RobloxSyncController {
       try {
         await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
       } catch {
-        // The Explorer view is optional; file watchers still pick up imported settings changes.
       }
     }
 
@@ -7143,19 +7052,11 @@ class RobloxSyncController {
       this.output.append(this.prefixOutput(prefix, data));
     }
 
-    // The daemon processes stdin requests strictly in order, so output belongs
-    // to the oldest pending request. Broadcasting it to every pending request
-    // would let one without its own result sentinel parse a stale sentinel from
-    // an earlier request and report a false success. stderr carries no
-    // sentinels, so chunk-level attribution is enough there.
     if (isStderr) {
       this.appendDaemonOutputToActiveRequest(text);
       return;
     }
 
-    // Attribute stdout per complete line: a single chunk can carry the tail of
-    // one request and the result of the next, and processing the result
-    // sentinel shifts attribution to the next pending request.
     this.daemonOutputBuffer += text;
     if (this.daemonOutputBuffer.length > MAX_DAEMON_OUTPUT_BUFFER_BYTES) {
       const error = new Error("Persistent bridge daemon emitted more than 1 MiB without a complete protocol line.");
@@ -7270,7 +7171,6 @@ class RobloxSyncController {
       const id = this.daemonRequestId++;
       proc.stdin.write(JSON.stringify({ id, command: "shutdown", args: [] }) + "\n", "utf8");
     } catch {
-      // Best-effort shutdown only.
     }
   }
 
@@ -7533,11 +7433,7 @@ class RobloxSyncController {
         try {
           child.kill();
         } catch {
-          // The process may have exited between the timeout and the kill request.
         }
-        // Resolve immediately after asking the OS to terminate the child. Waiting
-        // forever for a stuck process to emit "close" would keep the task queue
-        // blocked and prevent a later retry from recovering.
         finish(124);
       }, timeoutMs);
 
@@ -8041,11 +7937,23 @@ class RobloxSyncController {
   }
 
   private getWorkspaceRoot(): string {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
       throw new Error("Open a workspace folder before using Renium.");
     }
-    return folder.uri.fsPath;
+    if (folders.length > 1) {
+      const match = folders.find((folder) => fs.existsSync(path.join(folder.uri.fsPath, "renium.exe")));
+      if (match) {
+        return match.uri.fsPath;
+      }
+      if (!this.warnedMultiRootWorkspace) {
+        this.warnedMultiRootWorkspace = true;
+        this.output.appendLine(
+          `[renium] multi-root workspace: no folder contains renium.exe; using the first folder (${folders[0].uri.fsPath}). Set renium.projectRoot or renium.exportCliPath if this is wrong.`,
+        );
+      }
+    }
+    return folders[0].uri.fsPath;
   }
 
   private isPathInside(filePath: string, rootPath: string): boolean {
@@ -9483,7 +9391,6 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
     try {
       await vscode.languages.setTextDocumentLanguage(doc, "luau");
     } catch {
-      // The .luau filename still gives editors a useful title even without a Luau language extension.
     }
     return true;
   }
@@ -9504,7 +9411,6 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }
     } catch {
-      // Version gate is best-effort; never block activation.
     }
   }, 0);
   const fileExplorerController = new FileExplorerController(context, controller.gitViewActions());
@@ -9534,7 +9440,6 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         await vscode.commands.executeCommand("list.clear");
       } catch {
-        // Some VS Code-compatible hosts may not expose the internal list command.
       }
       setTimeout(() => {
         if (packagesTreeView.selection.length === 0) {
@@ -9782,5 +9687,4 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
-  // Resources are disposed via extension context subscriptions.
 }

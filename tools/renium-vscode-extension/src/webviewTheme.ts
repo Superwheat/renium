@@ -1,6 +1,3 @@
-// VS Code injects live --vscode-* theme variables and theme classes into webviews.
-// The only hardcoded override we apply is foreground text color so light themes render
-// black text and dark/high-contrast themes render white text, similar to the terminal.
 export function getThemeCssVars(): string {
 	return "";
 }

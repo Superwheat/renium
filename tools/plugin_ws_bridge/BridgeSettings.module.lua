@@ -1,9 +1,5 @@
 local BridgeSettings = {}
 
--- These are intentionally kept in one small module so the settings widget,
--- connection lifecycle, and live-sync bridge all normalize the exact same
--- persisted values.  They mirror the useful Argon-style controls while
--- retaining Renium's loopback-only transport model.
 local RUNTIME_DEFAULTS = {
 	autoConnect = true,
 	autoReconnect = true,
@@ -61,10 +57,6 @@ local function trim(value)
 	return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
 end
 
--- The bridge protocol deliberately trusts the local machine and therefore has
--- no shared-secret handshake. Keep the Studio client pointed only at a
--- loopback listener so a saved widget setting cannot accidentally expose the
--- same mutation/RPC surface to a LAN host.
 function BridgeSettings.normalizeLoopbackHost(raw)
 	local host = string.lower(trim(raw))
 	if host == "" or host == "localhost" or host == "127.0.0.1" then
@@ -133,7 +125,6 @@ function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 			end
 		end
 		if #valid > 0 then
-			-- Auto-migrate legacy default port sets to the current default lanes.
 			if
 				#valid == 4
 				and valid[1] == 8781
@@ -224,10 +215,13 @@ end
 
 function BridgeSettings.loadRuntimeSettings(plugin, prefix)
 	local out = BridgeSettings.runtimeDefaults()
-	for key, defaultValue in pairs(out) do
+	for key in pairs(out) do
 		local stored = plugin:GetSetting(prefix .. key)
 		if stored ~= nil then
-			out[key] = BridgeSettings.normalizeRuntimeSetting(key, stored) or defaultValue
+			local normalized = BridgeSettings.normalizeRuntimeSetting(key, stored)
+			if normalized ~= nil then
+				out[key] = normalized
+			end
 		end
 	end
 	return out
@@ -242,12 +236,6 @@ function BridgeSettings.saveRuntimeSetting(plugin, prefix, key, value)
 	return normalized
 end
 
--- Live-sync conflict resolution policy used when the same script is edited on
--- both sides between syncs: "prompt" (write conflict markers + notify),
--- "filesystem" (local wins), "studio" (Studio wins), or "none" (markers, no popup).
--- Returns the stored policy, or `default` (may be nil) when the user has not
--- explicitly chosen one in Studio. Callers leave it unset so the editor-side
--- (VS Code) setting remains in effect until Studio overrides it.
 function BridgeSettings.loadConflictResolution(plugin, prefix, default)
 	local value = plugin:GetSetting(prefix .. "conflictResolution")
 	if value == "prompt" or value == "filesystem" or value == "studio" then

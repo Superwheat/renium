@@ -1,9 +1,3 @@
-// Renium store custom editor: double-click a *.renium file (or a legacy
-// *.rbsync file) to open its
-// instance tree full-width in the same style as the Renium Explorer. Decoding
-// goes through the real CLI (./rbsyncDecode) — the webview never parses the
-// binary. Selecting an instance drives the Renium Properties view via onSelect,
-// so properties show in the same panel the Explorer uses (no custom pane).
 
 import * as vscode from "vscode";
 import { loadAssetIconNames } from "./fileExplorer";
@@ -60,8 +54,6 @@ export class RbsyncEditorProvider implements vscode.CustomReadonlyEditorProvider
           void this.decodeAndPost(webview, document.uri.fsPath);
         }
       } else if (msg.type === "select" && msg.node) {
-        // Reveal the Renium panel once so its Properties view is visible, then
-        // keep updating it on subsequent selections without stealing focus.
         if (!revealedProperties) {
           revealedProperties = true;
           void vscode.commands.executeCommand("workbench.view.extension.reniumContainer");
@@ -90,8 +82,6 @@ export class RbsyncEditorProvider implements vscode.CustomReadonlyEditorProvider
 }
 
 function jsonForScript(value: unknown): string {
-  // Only a webview URI and a list of icon names are injected, so plain JSON is
-  // safe here (no script-breaking characters to escape).
   return JSON.stringify(value) ?? "null";
 }
 
@@ -132,8 +122,6 @@ body{display:flex;flex-direction:column}
 <script>
 var vscode=acquireVsCodeApi();
 var ASSET=${jsonForScript(assetBase)},AVAILABLE_ICONS=new Set(${jsonForScript(iconNames)});
-// Virtualized instance tree: only rows within the viewport become DOM. flat is
-// the ordered list of visible rows (respecting expand state and search).
 var tree=null,expanded={},selId=null,byId={};
 var query='',searchCollapsed={},flat=[],sizer=null,rowsEl=null,paintQueued=false;
 var ROW_H=22,OVER=6;
@@ -156,8 +144,6 @@ function rowHtml(f){
   h+='<span class="labelWrap"><span class="name">'+(f.match?hi(n.name):esc(n.name))+'</span></span></div>';
   return h;
 }
-// With no query, honour expanded. With a query, keep every node that matches or
-// has a matching descendant, so each hit shows its full ancestor path.
 function buildFlat(){
   flat=[];
   if(!tree)return;

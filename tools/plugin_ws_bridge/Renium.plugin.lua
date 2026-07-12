@@ -1,6 +1,4 @@
 --!nocheck
--- Studio plugin: multi-channel WebSocket bridge for fast export RPCs.
--- Import this script as a plugin script.
 
 if not plugin then
 	error("Renium must run as a Studio plugin")

@@ -860,8 +860,6 @@ end
 local function buildStatusWidget(plugin, versionText)
 	local refs = newRefs()
 
-	-- overrideRestore=false: Studio restores the panel's last open/closed state
-	-- across sessions; do not force Enabled here or the restore is lost.
 	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 400, 300, 340, 240)
 	local widget = createWidget(plugin, "ReniumStatus", info, "Renium")
 
@@ -1064,8 +1062,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 	end
 
 	local toolbar = plugin:CreateToolbar("Renium")
-	-- Keep one named button in the Plugins tab. The text label remains visible
-	-- even when Studio has not loaded a toolbar image yet.
 	local openButton = toolbar:CreateButton("Renium", "Open or close Renium" .. tooltipVersion, TOOLBAR_ICON)
 
 	local settingsUi = buildSettingsWidget(plugin)

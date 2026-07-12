@@ -157,10 +157,6 @@ const BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR: char = '#';
 const ADAPTIVE_TUNE_CACHE_VERSION: u32 = 3;
 const SAFE_CACHED_TUNE_FRAME_MS: f64 = 20.0;
 const STALE_CACHED_TUNE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
-// Keep this aligned with BridgeTransport.module.lua.  The plugin can send raw
-// WebSocket chunk frames without JSON re-encoding, but it rejects anything
-// larger than this ceiling.  A single shared 8 MiB ceiling avoids accepting a
-// user-facing chunk size that can only turn into a delayed socket timeout.
 const MIN_BRIDGE_CHUNK_BYTES: usize = 256;
 const MAX_BRIDGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BRIDGE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -3003,8 +2999,6 @@ struct BridgeInfoPayload {
     pre_serialize_large_service_warm: bool,
 }
 
-// The bridge can send performance fields that current adaptive tuning does not
-// consume. Keep them for forward/backward-compatible deserialization.
 #[expect(dead_code, reason = "bridge performance payload compatibility")]
 #[derive(Debug, Default, Clone, Deserialize)]
 struct BridgePerformanceStats {
@@ -3353,11 +3347,6 @@ impl BridgeServer {
         let accepted_at = Instant::now();
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
-        // Studio can be busy immediately after a WebSocket opens, especially when the extension
-        // starts a persistent serve daemon while live sync is also polling.  A short readiness
-        // probe timeout makes the Rust side drop otherwise valid sockets, which appears in Studio
-        // as a rapid connect/disconnect loop.  Keep the probe bounded, but long enough for Studio
-        // to answer getBridgeInfo under load.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
@@ -3528,8 +3517,6 @@ impl BridgeServer {
     ) -> Result<()> {
         let mut places = Self::distinct_places_for_selector(sockets, target, player);
         if places.len() > 1 {
-            // A closed Studio leaves dead sockets behind until something touches
-            // them; don't refuse over places that are no longer connected.
             let dead_keys: Vec<String> = sockets
                 .iter_mut()
                 .filter_map(|(key, socket)| {
@@ -3694,8 +3681,6 @@ impl BridgeServer {
                 let guard = match channel.sockets.try_lock() {
                     Ok(guard) => guard,
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                    // A busy channel is not missing; its in-flight request will
-                    // still be bounded by the socket response timeout.
                     Err(TryLockError::WouldBlock) => return None,
                 };
                 if Self::select_role_for_target(&guard, target).is_some() {
@@ -3784,9 +3769,6 @@ impl BridgeServer {
                     Err(err) => {
                         let err_text = err.to_string();
                         if !Self::is_transport_error_text(&err_text) {
-                            // Application-level failures are deterministic; retrying
-                            // would re-execute the request (mutations included) on
-                            // every channel.
                             return Err(err);
                         }
                         last_error = Some(format!("port {socket_port} role {role}: {err_text}"));
@@ -3799,9 +3781,6 @@ impl BridgeServer {
             thread::yield_now();
         }
 
-        // Do not turn a busy/stalled channel into an unbounded Mutex::lock.
-        // A caller may be running in a worker pool, so an indefinite wait here
-        // used to wedge all later exports behind one dead Studio request.
         let lock_deadline = Instant::now() + BRIDGE_CHANNEL_LOCK_TIMEOUT;
         while Instant::now() < lock_deadline {
             let mut attempted_socket = false;
@@ -3896,9 +3875,6 @@ impl BridgeServer {
         match peek {
             Ok(0) => false,
             Err(err) if err.kind() != io::ErrorKind::WouldBlock => false,
-            // Readable-with-data or would-block both look alive, but a dead
-            // socket with unread buffered frames also peeks as readable.
-            // Writing is the tiebreaker: a ping to a reset socket fails.
             _ => {
                 socket.socket.send(Message::Ping(Vec::new().into())).is_ok()
                     && socket.socket.flush().is_ok()
@@ -3929,8 +3905,6 @@ impl BridgeServer {
                     dead_keys.push(role_key.clone());
                     continue;
                 }
-                // A play client that connected before LocalPlayer existed has no
-                // player name cached; refresh it once so selectors can match.
                 if Self::bridge_role_key_base(role_key) == BRIDGE_ROLE_PLAY_CLIENT
                     && socket.bridge_info.player_name.trim().is_empty()
                 {
@@ -4058,8 +4032,6 @@ impl BridgeServer {
                     Err(err) => {
                         let err_text = err.to_string();
                         if !Self::is_transport_error_text(&err_text) {
-                            // Application-level failures are deterministic; retrying
-                            // would re-execute the request on every channel.
                             return Err(err);
                         }
                         last_error = Some(format!("port {socket_port} role {role}: {err_text}"));
@@ -4685,11 +4657,6 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
                 );
             }
 
-            // The daemon already proved bidirectional plugin readiness during socket accept by
-            // sending getBridgeInfo and caching the validated response on the ready socket.
-            // Reusing that cached info keeps normal repeated exports from paying a variable
-            // per-run getBridgeInfo round trip. If Studio reconnects, the accept loop replaces
-            // the socket and refreshes this cache before the next export can use that channel.
             let bridge_info = bridge.cached_bridge_info_for_target(target)?;
             validate_bridge_info(&bridge_info)?;
             let bridge_info_refresh_ms = 0.0;
@@ -5275,9 +5242,6 @@ fn write_daemon_discovery_path(path: &Path, text: &str) -> io::Result<()> {
     drop(file);
 
     if let Err(first_error) = fs::rename(&temporary, path) {
-        // Windows does not replace an existing destination with rename. The
-        // discovery record is advisory, so fall back to replacing only this
-        // exact known file and report any failure to the caller.
         if path.exists() {
             fs::remove_file(path)?;
             fs::rename(&temporary, path)?;
@@ -5399,7 +5363,6 @@ fn is_process_alive(pid: u32) -> bool {
         if handle.is_null() {
             return false;
         }
-        // WAIT_TIMEOUT means the process has not signalled termination.
         let alive = WaitForSingleObject(handle, 0) == 0x0000_0102;
         CloseHandle(handle);
         alive
@@ -6250,7 +6213,6 @@ fn calibrate_click_delta(
     x: i32,
     y: i32,
 ) -> (i32, i32) {
-    // The first read also injects the in-game probe script when missing.
     let start_seq = match read_client_probe_state(bridge, player) {
         Ok((seq, _)) => seq,
         Err(_) => {
@@ -7026,14 +6988,14 @@ fn studio_play_status_result(bridge: &BridgeServer) -> Result<Value> {
 }
 
 fn studio_status_indicates_stopped(status: &Value) -> bool {
-    if let Some(edit_mode_active) = status
+    if let Some(running) = status.get("running").and_then(Value::as_bool) {
+        return !running;
+    }
+    status
         .get("studioTest")
         .and_then(|value| value.get("editModeActive"))
         .and_then(Value::as_bool)
-    {
-        return edit_mode_active;
-    }
-    status.get("running").and_then(Value::as_bool) == Some(false)
+        == Some(true)
 }
 
 fn ensure_plugin_api_ok(result: &Value) -> Result<()> {
@@ -7419,8 +7381,6 @@ fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathB
 }
 
 fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSet> {
-    // Strip the Windows `\\?\` prefix so changed-path prefix matching works
-    // against caller-supplied absolute paths, which arrive without it.
     let project_root = if args.project_root.exists() {
         strip_extended_prefix(args.project_root.canonicalize().with_context(|| {
             format!(
@@ -7454,8 +7414,6 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
     );
     for changed_path in enforced_changed_paths {
         let absolute_path = absolutize_under(&project_root, &changed_path);
-        // Canonicalize when possible so 8.3 short names and case differences
-        // match src_root; deleted files keep the joined path.
         let absolute_path = match absolute_path.canonicalize() {
             Ok(canonical) => strip_extended_prefix(canonical),
             Err(_) => strip_extended_prefix(absolute_path),
@@ -9462,9 +9420,6 @@ fn service_from_changed_path(src_root: &Path, changed_path: &Path) -> Option<Str
             _ => None,
         };
     }
-    // Same path spelled differently (case, separators): match on normalized
-    // keys, then recover the original-case service segment by byte offset.
-    // path_key only maps ASCII, so byte offsets line up with the original.
     let src_key = path_key(&src_norm);
     let changed_key = path_key(&changed_norm);
     let rest = changed_key.strip_prefix(&src_key)?;
@@ -9520,7 +9475,6 @@ fn parse_requested_fields(raw: Option<&str>) -> Option<HashSet<String>> {
         .filter(|field| !field.is_empty())
     {
         match field.as_str() {
-            // Presets keep common AI reads short without making outputs cryptic.
             "lookup" | "select" | "sel" => {
                 fields.extend(
                     ["id", "n", "c", "path"]
@@ -10517,9 +10471,6 @@ fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()> {
     {
         return print_json_output(&value, args.pretty);
     }
-    // A script's Source is usually externalized to its .luau mirror file rather
-    // than kept inline, so a plain property lookup misses it. Return the
-    // mirror's contents instead of reporting Source as absent.
     if args.property.eq_ignore_ascii_case("source")
         && is_lua_source_class(&document.instances[index].class_name)
     {
@@ -10710,11 +10661,17 @@ fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
 
 struct SettingsFileLock {
     path: PathBuf,
+    token: String,
 }
 
 impl Drop for SettingsFileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let still_ours = fs::read_to_string(&self.path)
+            .map(|content| content.trim() == self.token)
+            .unwrap_or(false);
+        if still_ours {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -10787,10 +10744,6 @@ fn acquire_settings_file_lock(settings_file: &Path) -> Result<SettingsFileLock> 
     if let Some(parent) = settings_file.parent()
         && !parent.exists()
     {
-        // A missing directory means the store was never created; surface a
-        // clear message instead of a raw os error from creating the lock
-        // file in a non-existent directory. Callers that legitimately
-        // create a new store first ensure the directory via write_file.
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
@@ -10802,8 +10755,12 @@ fn acquire_settings_file_lock(settings_file: &Path) -> Result<SettingsFileLock> 
             .open(&lock_path)
         {
             Ok(mut file) => {
-                let _ = writeln!(file, "{} {}", std::process::id(), current_millis());
-                return Ok(SettingsFileLock { path: lock_path });
+                let token = format!("{} {}", std::process::id(), current_millis());
+                let _ = writeln!(file, "{token}");
+                return Ok(SettingsFileLock {
+                    path: lock_path,
+                    token,
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if attempt > 60
@@ -10815,7 +10772,19 @@ fn acquire_settings_file_lock(settings_file: &Path) -> Result<SettingsFileLock> 
                         .map(|age| age > Duration::from_secs(30))
                         .unwrap_or(false)
                 {
-                    let _ = fs::remove_file(&lock_path);
+                    let owner_alive = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|content| {
+                            content
+                                .split_whitespace()
+                                .next()
+                                .and_then(|pid| pid.parse::<u32>().ok())
+                        })
+                        .map(is_process_alive)
+                        .unwrap_or(false);
+                    if !owner_alive {
+                        let _ = fs::remove_file(&lock_path);
+                    }
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -15191,17 +15160,6 @@ fn import_rbx_model_into_document(
     })
 }
 
-// ===========================================================================
-// renium-link
-//
-// A renium-link mirrors one canonical source (local path, git repo, or Wally
-// package) into one or more target locations in the synced tree. Targets are
-// ordinary scripts in Studio (no PackageLink, the manifest is never pushed), so
-// "the Roblox side can't see the links". Targets are read-only by default: edits
-// to a mirror are reverted to the canonical source on the next push, and edits
-// to a local canonical source fan out to every mirror. A target can be "broken"
-// to detach it into a normal editable script.
-// ===========================================================================
 
 const LINK_MANIFEST_VERSION: u32 = 1;
 
@@ -15507,7 +15465,6 @@ fn read_link_manifest(path: &Path) -> Result<LinkManifest> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("Failed to read link manifest {}", path.display()))?;
-    // Tolerate a UTF-8 BOM, which Windows editors commonly prepend.
     let raw = raw.trim_start_matches('\u{feff}');
     if raw.trim().is_empty() {
         return Ok(LinkManifest::default());
@@ -15749,8 +15706,6 @@ fn ensure_git_source(
         fs::create_dir_all(cache_root)
             .with_context(|| format!("Failed to create {}", cache_root.display()))?;
         let dir_str = dir.to_string_lossy().to_string();
-        // Deep repo paths inside an already-deep cache dir exceed Windows
-        // MAX_PATH without long-path support, failing checkout mid-clone.
         git(
             &["-c", "core.longpaths=true", "clone", url, &dir_str],
             cache_root,
@@ -15758,8 +15713,6 @@ fn ensure_git_source(
     }
 
     let dir_str = dir.to_string_lossy().to_string();
-    // Keep long paths enabled for later fetch/checkout in this cache, including
-    // caches cloned before this safeguard existed.
     let _ = git(&["-C", &dir_str, "config", "core.longpaths", "true"], &dir);
     if let Some(git_ref) = git_ref {
         if !offline {
@@ -15811,7 +15764,6 @@ fn resolve_wally_source(
             index_dir.display()
         );
     }
-    // Wally installs to Packages/_Index/<scope>_<name>@<version>/<name>/
     let wanted = package.replace('/', "_").to_ascii_lowercase();
     let leaf = package
         .rsplit('/')
@@ -15831,7 +15783,6 @@ fn resolve_wally_source(
         let version = dir_name.split('@').nth(1).unwrap_or("").to_string();
         let inner = entry.path().join(&leaf);
         let chosen = if inner.is_dir() { inner } else { entry.path() };
-        // Prefer the highest version string lexically (resolved by wally.lock already).
         if best.as_ref().map(|(_, v)| version > *v).unwrap_or(true) {
             best = Some((chosen, version));
         }
@@ -16023,7 +15974,9 @@ fn link_target_file_pairs(
 
     let target_root = parent_dir.join(&leaf);
     let mut pairs = Vec::new();
-    for entry in WalkDir::new(source_root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(source_root) {
+        let entry = entry
+            .with_context(|| format!("Failed to read link source {}", source_root.display()))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -16032,8 +15985,6 @@ fn link_target_file_pairs(
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default();
-        // Normalize source file names to renium's canonical layout so mirrored
-        // files round-trip through the source path map (.lua -> .luau, etc.).
         let Some((class_name, leaf_name)) = infer_source_class_and_leaf_name(&file_name) else {
             continue;
         };
@@ -16105,7 +16056,6 @@ fn resolve_link_targets(
                     entry.resolved_ref = resolved_ref.clone();
                     entry.source_path = Some(source_root.clone());
                     if !is_dir && is_package_path(source_root) {
-                        // A bytecode package: spliced wholesale, not file-mirrored.
                         entry.resolved = true;
                         entry.package_source = Some(source_root.clone());
                     } else {
@@ -16224,8 +16174,6 @@ fn materialize_package_target(
 
     let parent_index = ensure_editor_container_path(document, service, parent_segments)?;
 
-    // Splice the package's instances under the target parent. The package is in
-    // preorder (root first), so each parent is remapped before its children.
     let mut existing_ids: HashSet<String> = document
         .instances
         .iter()
@@ -16262,6 +16210,27 @@ fn materialize_package_target(
         });
         new_index_by_pkg.insert(pkg_index, new_index);
         new_settings_ids.push(settings_id);
+    }
+
+    let mut old_index_by_settings_id = HashMap::with_capacity(package.instances.len());
+    let mut new_settings_id_by_old = HashMap::with_capacity(package.instances.len());
+    for (pkg_index, instance) in package.instances.iter().enumerate() {
+        old_index_by_settings_id.insert(instance.settings_id.clone(), pkg_index);
+        if let Some(id) = new_settings_ids.get(pkg_index) {
+            new_settings_id_by_old.insert(pkg_index, id.clone());
+        }
+    }
+    let refs = BytecodeCloneRefMap {
+        new_index_by_old: new_index_by_pkg.clone(),
+        new_settings_id_by_old,
+        old_index_by_settings_id,
+        old_index_by_path_key: HashMap::new(),
+        new_path_segments_by_old: HashMap::new(),
+    };
+    for doc_index in new_index_by_pkg.values() {
+        let instance = &mut document.instances[*doc_index];
+        remap_internal_clone_refs_in_record(&mut instance.properties, &refs);
+        remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
     }
 
     let _ = read_only;
@@ -16523,7 +16492,6 @@ fn build_link_enforcement(
     if !manifest_path.exists() {
         return Ok(LinkEnforcement::default());
     }
-    // A malformed manifest must not break normal pushes: degrade to no enforcement.
     let manifest = match read_link_manifest(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -16588,8 +16556,6 @@ fn apply_link_enforcement_to_changed_paths(
         let absolute = absolutize_under(project_root, &path);
         let key = link_path_key(&absolute);
 
-        // A read-only mirror was edited (on disk or pushed back from Studio):
-        // restore canonical content so the edit is reverted on the way out.
         if let Some((canonical, read_only)) = enforcement.mirror_to_canonical.get(&key)
             && *read_only
             && let Ok(content) = fs::read_to_string(canonical)
@@ -16598,7 +16564,6 @@ fn apply_link_enforcement_to_changed_paths(
             let _ = set_path_readonly(&absolute, true);
         }
 
-        // A local canonical source was edited: refresh and enqueue every mirror.
         if let Some(mirrors) = enforcement.canonical_to_mirrors.get(&key)
             && let Ok(content) = fs::read_to_string(&absolute)
         {
@@ -16741,12 +16706,7 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
         let lock_entry = lock.entries.entry(target.link_id.clone()).or_default();
         lock_entry.resolved_ref = target.resolved_ref.clone();
 
-        // Bytecode-package source: splice the instance subtree into the target.
         if let Some(package_path) = &target.package_source {
-            // Splicing replaces the target subtree (new settings ids), so skip it
-            // when the package is unchanged since the last apply AND the target
-            // instance still exists. Without this, every apply would churn the
-            // subtree's identity (Studio delete+recreate, broken refs, noisy git).
             let lock_key = format!("package:{}", target.target_segments.join("/"));
             let target_fingerprint_key =
                 format!("package-target:{}", target.target_segments.join("/"));
@@ -16801,9 +16761,6 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
                 && !needs_inline_source_migration
                 && package_hash.is_some()
                 && lock_entry.files.get(&lock_key) == package_hash.as_ref();
-            // Writable package targets keep local edits: a locally drifted
-            // subtree is never re-spliced from the package (break the target or
-            // mark the link read-only to resync from the source).
             let preserved_target_edits = !target.read_only
                 && target_exists
                 && !target_matches_package
@@ -16832,8 +16789,6 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
                         target_settings_ids.push(id.clone());
                     }
                 }
-                // Push the service settings file so non-script instances in the
-                // subtree reconcile into Studio (they have no source files).
                 let settings_file = service_settings_path(&src_root.join(&target.service));
                 let settings_str = settings_file.to_string_lossy().to_string();
                 if changed_seen.insert(path_key(&settings_file)) {
@@ -16932,8 +16887,6 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
                 format!("Failed to read link source {}", pair.canonical.display())
             })?;
             let rel = link_mirror_lock_key(&src_root, &pair.mirror);
-            // Writable targets keep local edits: a mirror whose content no longer
-            // matches its last-synced lock hash is preserved, not overwritten.
             let mirror_current = fs::read_to_string(&pair.mirror).ok();
             let locally_edited = !target.read_only
                 && mirror_current.as_ref().is_some_and(|current| {
@@ -16977,9 +16930,6 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
                 set_path_readonly(&pair.mirror, target.read_only)?;
             }
         }
-        // Canonical files removed upstream would otherwise leave stale mirror
-        // files behind. Delete lock-tracked mirrors with no current pair; a
-        // writable mirror holding local edits is kept and detached instead.
         let target_prefix = {
             let mut prefix = target.service.clone();
             for segment in &target.target_segments {
@@ -17020,6 +16970,7 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
             }
             if locally_edited {
                 preserved_edits.push(mirror.to_string_lossy().to_string());
+                lock_entry.files.remove(&key);
             } else if mirror.exists() {
                 let _ = set_path_readonly(&mirror, false);
                 if fs::remove_file(&mirror).is_ok() {
@@ -17027,9 +16978,16 @@ fn link_apply(args: LinkApplyArgs) -> Result<()> {
                     if changed_seen.insert(path_key(&mirror)) {
                         changed_paths.push(mirror.to_string_lossy().to_string());
                     }
+                    lock_entry.files.remove(&key);
+                } else {
+                    warnings.push(format!(
+                        "failed to delete stale mirror {}",
+                        mirror.display()
+                    ));
                 }
+            } else {
+                lock_entry.files.remove(&key);
             }
-            lock_entry.files.remove(&key);
         }
         applied += 1;
         link_results.push(json!({
@@ -17089,8 +17047,6 @@ fn link_break(args: LinkBreakArgs) -> Result<()> {
     let manifest_path = link_manifest_path(&project_root, &args.manifest);
     let mut manifest = read_link_manifest(&manifest_path)?;
 
-    // Keys of every target that an existing link controls, so we never record a
-    // "broken" entry for an instance that was never linked.
     let known_target_keys: HashSet<String> = manifest
         .links
         .iter()
@@ -17144,8 +17100,6 @@ fn link_break(args: LinkBreakArgs) -> Result<()> {
         }
     }
 
-    // Clear the read-only attribute on the detached targets' mirror files so the
-    // user can edit them freely.
     let options = LinkResolveOptions {
         cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
         ..LinkResolveOptions::default()
@@ -17186,7 +17140,6 @@ fn link_status(args: LinkStatusArgs) -> Result<()> {
     };
     let resolved = resolve_link_targets(&project_root, &src_root, &manifest, &options);
 
-    // Describe each link's source once (type, root instance, last edited).
     let mut meta_by_link: HashMap<String, LinkSourceMeta> = HashMap::new();
     let mut source_path_by_link: HashMap<String, PathBuf> = HashMap::new();
     for target in &resolved {
@@ -17203,7 +17156,6 @@ fn link_status(args: LinkStatusArgs) -> Result<()> {
     let mut targets_out: Vec<Value> = Vec::new();
     let mut drifted = 0usize;
     let mut broken = 0usize;
-    // Per-service settings doc + source-path cache for package-target mirrors.
     #[expect(
         clippy::type_complexity,
         reason = "cache couples each service document with its indexed source paths"
@@ -17215,9 +17167,6 @@ fn link_status(args: LinkStatusArgs) -> Result<()> {
         let mut drift = false;
         let mut missing = false;
         let mut mirrors: Vec<Value> = Vec::new();
-        // For bytecode-package targets, list the materialized script files so the
-        // editor can badge them. Derive paths from the settings doc (a packed
-        // single Script materializes as a leaf FILE, not a directory).
         if let Some(package_path) = &target.package_source
             && target.resolved
         {
@@ -17402,8 +17351,6 @@ fn link_add(args: LinkAddArgs) -> Result<()> {
     }
 
     if let Some(link) = manifest.links.iter_mut().find(|link| link.id == id) {
-        // Existing link (e.g. inserting a known package elsewhere): just add the
-        // target. The source is already recorded, so --source isn't required.
         if !link
             .targets
             .iter()
@@ -17602,6 +17549,23 @@ fn pack_subtree_to_bytecode(
         });
         new_by_old.insert(*old, new_index);
     }
+    let mut old_index_by_settings_id = HashMap::with_capacity(subtree.len());
+    let mut new_settings_id_by_old = HashMap::with_capacity(subtree.len());
+    for (old, new) in &new_by_old {
+        old_index_by_settings_id.insert(document.instances[*old].settings_id.clone(), *old);
+        new_settings_id_by_old.insert(*old, format!("pkg:{new}"));
+    }
+    let refs = BytecodeCloneRefMap {
+        new_index_by_old: new_by_old,
+        new_settings_id_by_old,
+        old_index_by_settings_id,
+        old_index_by_path_key: HashMap::new(),
+        new_path_segments_by_old: HashMap::new(),
+    };
+    for instance in &mut package.instances {
+        remap_internal_clone_refs_in_record(&mut instance.properties, &refs);
+        remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
+    }
     package
 }
 
@@ -17663,9 +17627,6 @@ fn link_pack(args: LinkPackArgs) -> Result<()> {
         validate_filesystem_instance_name(id, "link id")?;
     }
 
-    // Nested link targets are undefined behavior: an outer package re-splice
-    // would clobber an inner link's instances (and vice versa). Refuse to pack
-    // inside or around an existing target — repacking the exact target is fine.
     for link in &manifest.links {
         for existing in &link.targets {
             if existing.service != args.service {
@@ -17673,7 +17634,7 @@ fn link_pack(args: LinkPackArgs) -> Result<()> {
             }
             let existing_segments = link_target_segments(existing);
             if existing_segments == segments_after_service {
-                continue; // exact repack
+                continue;
             }
             let inside_existing = segments_after_service.len() > existing_segments.len()
                 && segments_after_service[..existing_segments.len()] == existing_segments[..];
@@ -17730,10 +17691,6 @@ fn link_pack(args: LinkPackArgs) -> Result<()> {
         })
         .map(|link| link.id.clone());
 
-    // Pick a stable id. With an explicit --id we trust the caller; otherwise we
-    // slug the instance name but never clobber a *different* link that already
-    // owns that slug (e.g. two different instances both named "Script"). If the
-    // existing link already controls this exact target it's a re-pack, so reuse.
     let id = if let Some(explicit) = args.id.clone() {
         explicit
     } else {
@@ -17817,9 +17774,6 @@ fn link_pack(args: LinkPackArgs) -> Result<()> {
     }
     package.write_file(&package_file)?;
 
-    // The packed instance IS the package content, so record the lock hash now:
-    // the next apply sees it unchanged and leaves the original instance (and its
-    // settings ids) untouched instead of removing and re-splicing it.
     if let Ok(bytes) = fs::read(&package_file) {
         let mut lock = read_link_lock(&project_root);
         lock.version = LINK_MANIFEST_VERSION;
@@ -17856,8 +17810,6 @@ fn link_pack(args: LinkPackArgs) -> Result<()> {
     }
     write_link_manifest(&manifest_path, &manifest)?;
 
-    // Once the package owns this target, keep script Source inline in bytecode
-    // and remove the editable source mirror files from disk.
     let inlined_source_paths = inline_editor_source_files_for_indexes(
         &mut document,
         &service_dir,
@@ -18381,8 +18333,6 @@ fn sync_wally_packages(args: SyncWallyPackagesArgs) -> Result<()> {
     let lock_hash = wally_lock_hash(&project_root);
     let mut lock = read_link_lock(&project_root);
 
-    // Hold a lock + loaded document per service until every realm is imported, so
-    // realms that share a service (e.g. shared + dev) mutate one document.
     let mut documents: HashMap<String, (SettingsBytecode, PathBuf)> = HashMap::new();
     let mut guards: Vec<SettingsFileLock> = Vec::new();
 
@@ -18406,7 +18356,6 @@ fn sync_wally_packages(args: SyncWallyPackagesArgs) -> Result<()> {
                     realm.packages_dir.display()
                 );
             }
-            // wally install with zero dependencies creates no Packages dir.
             fs::create_dir_all(&realm.packages_dir)
                 .with_context(|| format!("Failed to create {}", realm.packages_dir.display()))?;
         }
@@ -18732,7 +18681,6 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
             let settings_file = if path.is_dir() {
                 existing_service_settings_path(&path)
             } else if !path.exists() && !bytecode_input_looks_like_settings_file(&raw) {
-                // Bare service name like "Workspace": resolve src/<Service>/<settings>.
                 let src_root = absolutize_under(&project_root, &args.src_root);
                 let service = validate_filesystem_instance_name(raw.trim(), "service")?;
                 existing_service_settings_path(&src_root.join(service))
@@ -21045,9 +20993,6 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
                 Err(err) => return Err(err),
             };
 
-        // Each socket is already probed with getBridgeInfo before BridgeServer::listen marks
-        // it ready. Reusing that cached metadata avoids a second post-connect RPC, which was
-        // one remaining source of 200ms/400ms handshake spikes on one-shot runs.
         let bridge_info_started = Instant::now();
         match candidate_bridge.cached_bridge_info().and_then(|info| {
             validate_bridge_info(&info)?;
@@ -21181,9 +21126,6 @@ fn export_snapshots_core(
                 "setExportOptions",
                 json!({
                     "exportAllProperties": export_all_properties,
-                    // Compact-v5 export uses getInstanceBatchCompactChunk, which does not read the
-                    // plugin's legacy serializedInstances cache. Keeping this off avoids duplicate
-                    // prepare-time serialization for medium services while preserving full fidelity.
                     "preSerializeOnPrepare": false,
                     "preSerializeLargeServiceWarm": false,
                     "performanceMode": performance_mode.as_str(),
@@ -21607,11 +21549,6 @@ fn export_snapshots_core(
         unmeasured_or_scheduler_gap_ms
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
-    // A one-shot export process is about to close its bridge sockets as it exits.  Asking the
-    // plugin to proactively reconnect here makes Studio immediately chase a server that is going
-    // away, which shows up as rapid connect/disconnect churn from the extension or plugin UI.  The
-    // persistent daemon path can still opt into prepareForNextRun when it is intentionally keeping
-    // a bridge alive for another export.
     if let ExportBridgeMode::Warm {
         prepare_next_run: true,
     } = mode
@@ -23553,8 +23490,6 @@ fn fetch_instances_adaptive(
     clippy::too_many_arguments,
     reason = "instance batch decoding takes independent schema and transport inputs"
 )]
-// The plugin caps items per request (MAX_INSTANCE_BATCH_ITEMS); a short return means
-// the rest of the range still needs fetching, not that the service ended.
 fn fetch_instance_batch(
     bridge: &BridgeServer,
     service: &str,
@@ -23642,9 +23577,6 @@ fn fetch_instance_batch_once(
                     "maxCount": take_count,
                     "chunkStart": chunk_start,
                     "maxLen": max_len,
-                    // Shape compression is opt-in per request. This prevents a newer plugin from
-                    // sending compact-v5-shape rows to an older Rust decoder, where the shape id
-                    // at row[3] could be mistaken for a class/name field in the legacy schema.
                     "supportsShapeBatches": true,
                     "supportedFormats": [BRIDGE_PROTOCOL_VERSION, "compact-v5-shape"],
                     "supportsStableInstanceIds": true,
@@ -23655,9 +23587,6 @@ fn fetch_instance_batch_once(
 
     let shape_batch = batch.format == "compact-v5-shape"
         || batch.format == "compact-v6-shape"
-        // Defensive fallback for stale caches or partially-applied plugin updates: if a payload
-        // carries a shape table, parse it as shape-compressed even if the format string was lost
-        // or rewritten.
         || !batch.shapes.is_empty();
     let debug_ids =
         decode_compact_batch_debug_ids(std::mem::take(&mut batch.debug_ids), &batch.strings)
@@ -25300,11 +25229,6 @@ fn parse_compact_v5_instance_items(
             bail!("Compact-v5 instance row has unsupported field count greater than 4");
         }
         let (attributes_raw, mask_raw, values_raw) = match (field4, field5, field6, field7) {
-            // compact-v5-schema-3 rows are:
-            // [nameId, class, parent]                                  when no attributes/properties
-            // [nameId, class, parent, attributes]                      when attributes only
-            // [nameId, class, parent, mask, values]                    when properties exist without attributes
-            // [nameId, class, parent, attributes, mask, values]        when properties exist
             (None, None, None, None) => {
                 (Value::Bool(false), Value::Bool(false), Value::Bool(false))
             }
@@ -25321,7 +25245,6 @@ fn parse_compact_v5_instance_items(
             (Some(attributes_raw), Some(mask_raw), Some(values_raw), None) => {
                 (attributes_raw, mask_raw, values_raw)
             }
-            // [nameId, class, parent, source, attributes, mask, values]
             (Some(_source_raw), Some(attributes_raw), Some(mask_raw), Some(values_raw)) => {
                 (attributes_raw, mask_raw, values_raw)
             }
@@ -25527,8 +25450,6 @@ where
             break;
         }
         if chunk.next_start <= start {
-            // A stalled cursor would otherwise truncate the payload silently and
-            // surface later as a confusing JSON parse error.
             bail!(
                 "Plugin returned a non-advancing payload chunk (start={start}, next={}, total={})",
                 chunk.next_start,
@@ -27629,9 +27550,6 @@ fn writable_service_settings_path(service_dir: &Path) -> Result<PathBuf> {
     if legacy.exists()
         && let Err(error) = fs::rename(&legacy, &canonical)
     {
-        // Another Renium process may have won the migration race between
-        // the existence check and rename. Its canonical file is safe to
-        // use; otherwise preserve the original I/O error.
         if !canonical.exists() {
             return Err(error).with_context(|| {
                 format!(
@@ -27698,8 +27616,6 @@ fn write_service_settings_file(
         &PathBuf::from(format!("{}.lock", settings_path.display())),
     );
     let started = Instant::now();
-    // Bytecode mutation commands (bs/bss/br/...) serialize on this lock; take it
-    // here too so an import rewrite cannot interleave with an editor mutation.
     let _lock = acquire_settings_file_lock(&settings_path)?;
     let preserved_state =
         state_with_preserved_material_service_settings(service, state, &settings_path)?;
@@ -28773,16 +28689,10 @@ fn write_bytes_if_changed(path: &Path, content: &[u8]) -> Result<()> {
         return Ok(());
     }
 
-    // Write to a sibling temp file and rename it over the target so concurrent
-    // readers (the extension explorer, another renium process) never observe a
-    // torn settings or source file mid-write.
     let temp_path = sibling_temp_path(path);
     fs::write(&temp_path, content)
         .with_context(|| format!("Failed to write {}", temp_path.display()))?;
 
-    // Linked mirror files are kept read-only on disk (renium-link). Clear the
-    // attribute around the rename, then restore it so the managed copy stays
-    // marked read-only instead of failing the whole import.
     let was_readonly = fs::metadata(path)
         .map(|meta| meta.permissions().readonly())
         .unwrap_or(false);
@@ -28869,8 +28779,6 @@ fn sanitize_name(input: &str) -> String {
         }
     }
     let trimmed = out.trim_end_matches([' ', '.']);
-    // Windows caps filename components at 255 UTF-16 units; cap the stem well
-    // below that to leave room for uniquing suffixes and script extensions.
     let capped: String = trimmed.chars().take(100).collect();
     let capped = capped.trim_end_matches([' ', '.']);
     let mut final_name = if capped.is_empty() {
@@ -28948,18 +28856,6 @@ fn unique_child_stem(
     }
 }
 
-// ===========================================================================
-// renium-vc
-//
-// Version-control integration (git/GitHub). `vc-init` provisions a Renium
-// project for git: ignore/attributes policy files plus a repo-local diff
-// textconv and merge driver for the binary .renium stores. `vc-textconv`
-// renders a store as deterministic text so `git diff` / `git log -p` show
-// real property changes instead of "Binary files differ". `vc-merge`
-// three-way merges divergent stores at the instance/property level using
-// stable settings ids as identity, so parallel branches editing different
-// properties of the same service merge cleanly.
-// ===========================================================================
 
 const RENIUM_DIR_GITIGNORE_LEGACY: &str = "# Renium local cache and state. Do not commit.\n*\n";
 const RENIUM_DIR_GITIGNORE: &str = "# Renium local cache. The link lockfile stays tracked so clones reproduce\n# pinned link sources.\nlink-cache/\n";
@@ -29047,8 +28943,6 @@ fn vc_init(args: VcInitArgs) -> Result<()> {
             .with_context(|| format!("Failed to write {}", ignore_path.display()))?;
     }
 
-    // Refine the .renium ignore so the link lockfile is committable. Only the
-    // untouched legacy content is replaced; user edits are respected.
     let renium_dir = project_root.join(".renium");
     fs::create_dir_all(&renium_dir)
         .with_context(|| format!("Failed to create {}", renium_dir.display()))?;
@@ -29080,8 +28974,6 @@ fn vc_init(args: VcInitArgs) -> Result<()> {
             vc_run_git(&args.git_path, &["init"], &project_root)?;
             git_initialized = true;
         }
-        // Report which repository receives the config: in a monorepo the
-        // project can be a subdirectory of the repo that owns .git/config.
         if let Ok(top) = vc_run_git(
             &args.git_path,
             &["rev-parse", "--show-toplevel"],
@@ -29123,8 +29015,6 @@ fn vc_init(args: VcInitArgs) -> Result<()> {
             ],
             &project_root,
         )?;
-        // Keep pre-Renium attribute rules functional for repositories that
-        // already map `*.rbsync` to the legacy driver name.
         vc_run_git(
             &args.git_path,
             &[
@@ -29283,8 +29173,6 @@ fn build_view_node(
     node.insert("className".into(), json!(instance.class_name));
     node.insert("settingsId".into(), json!(instance.settings_id));
 
-    // Keep Source out of the property blob and surface it on its own so the
-    // viewer can show a dedicated code panel.
     let mut properties: Vec<(&String, &Value)> = instance
         .properties
         .iter()
@@ -29315,8 +29203,6 @@ fn build_view_node(
             ),
         );
     }
-    // Script source: inline (packages) first, else the .luau mirror when the
-    // file lives inside a synced project (absent for a standalone dropped file).
     if is_lua_source_class(&instance.class_name) {
         if let Some(source) = instance.properties.get("Source").and_then(Value::as_str) {
             node.insert("source".into(), json!(source));
@@ -29350,8 +29236,6 @@ fn build_view_node(
 
 fn settings_doc_to_json_tree(document: &SettingsBytecode, file: &Path) -> Value {
     let children_by_parent = settings_children_by_parent(document);
-    // Resolve .luau mirror paths so externalized script sources render too when
-    // the file sits in a synced project. The service name is the root's name.
     let source_paths = match file.parent() {
         Some(dir) => {
             let service = document
@@ -29445,7 +29329,7 @@ fn settings_instance_path(document: &SettingsBytecode, index: usize) -> String {
     let mut hops = 0usize;
     while let Some(i) = current {
         if hops > document.instances.len() {
-            break; // cycle guard
+            break;
         }
         let instance = &document.instances[i];
         parts.push(instance.name.clone());
@@ -29599,7 +29483,6 @@ fn merge_settings_documents(
         attributes: document.instances[index].attributes.clone(),
     };
 
-    // Ours-side pass, in ours order (keeps our tree layout stable).
     for (ours_index, instance) in ours.instances.iter().enumerate() {
         let id = &instance.settings_id;
         if merged_ids.contains(id) {
@@ -29691,9 +29574,8 @@ fn merge_settings_documents(
                 merged_ids.insert(id.clone());
             }
             (Some(base_index), None) => {
-                // Deleted in theirs.
                 if vc_instance_equal(base, base_index, ours, ours_index) {
-                    continue; // untouched here: their deletion wins
+                    continue;
                 }
                 match prefer {
                     Some(false) => continue,
@@ -29712,15 +29594,12 @@ fn merge_settings_documents(
                 }
             }
             (None, _) => {
-                // Added here (a same-id addition on their side is handled in
-                // the theirs pass, appended under a fresh id if it differs).
                 merged.push(record_from(ours, ours_index));
                 merged_ids.insert(id.clone());
             }
         }
     }
 
-    // Theirs-side pass, in theirs (preorder) order so parents precede children.
     let mut theirs_id_remap: HashMap<String, String> = HashMap::new();
     for (theirs_index, instance) in theirs.instances.iter().enumerate() {
         let id = &instance.settings_id;
@@ -29731,9 +29610,6 @@ fn merge_settings_documents(
             if !base_ids.contains_key(id)
                 && !vc_instance_equal(ours, ours_index, theirs, theirs_index)
             {
-                // Same fresh id on both sides for different instances (the ids
-                // are sequential, so parallel additions collide): keep ours
-                // under the original id and append theirs under a fresh one.
                 let fresh = next_editor_settings_id_fast(&mut all_ids, &mut id_seed);
                 theirs_id_remap.insert(id.clone(), fresh.clone());
                 merged.push(VcMergedInstance {
@@ -29749,9 +29625,8 @@ fn merge_settings_documents(
             continue;
         }
         if let Some(base_index) = base_ids.get(id).copied() {
-            // Deleted in ours.
             if vc_instance_equal(base, base_index, theirs, theirs_index) {
-                continue; // untouched there: our deletion wins
+                continue;
             }
             match prefer {
                 Some(true) => continue,
@@ -29775,7 +29650,6 @@ fn merge_settings_documents(
             }
             continue;
         }
-        // Pure addition on their side.
         merged.push(VcMergedInstance {
             settings_id: id.clone(),
             name: instance.name.clone(),
@@ -29787,8 +29661,6 @@ fn merge_settings_documents(
         merged_ids.insert(id.clone());
     }
 
-    // Rebuild a preorder document. Instances whose parent chain no longer
-    // resolves (added under a subtree the other side deleted) are dropped.
     let index_by_id: HashMap<&str, usize> = merged
         .iter()
         .enumerate()
@@ -29900,8 +29772,6 @@ fn vc_merge(args: VcMergeArgs) -> Result<()> {
 
     let out_path = args.output.clone().unwrap_or_else(|| args.ours.clone());
     merged.write_file(&out_path)?;
-    // Driver mode (no -o): stay quiet on success so `git merge` output is not
-    // interleaved with JSON. Standalone callers still get the summary.
     if args.output.is_none() && !args.pretty {
         return Ok(());
     }
@@ -30001,11 +29871,9 @@ mod tests {
         }
         .write_file(&settings_file)
         .unwrap();
-        // Externalized source lives in the .luau mirror, not inline in the store.
         fs::write(service_dir.join("Mod.luau"), "return 123\n").unwrap();
         let settings_arg = settings_file.to_string_lossy().to_string();
 
-        // Before the fix this errored with "Property not found: Source".
         let args = BytecodeGetPropertyArgs::try_parse_from([
             "bytecode-get-property",
             "-f",
@@ -30018,7 +29886,6 @@ mod tests {
         .unwrap();
         assert!(bytecode_get_property(args).is_ok());
 
-        // With neither inline Source nor a mirror, absence is still reported.
         fs::remove_file(service_dir.join("Mod.luau")).unwrap();
         let args = BytecodeGetPropertyArgs::try_parse_from([
             "bytecode-get-property",
@@ -30085,7 +29952,6 @@ mod tests {
             "return 999\n"
         );
 
-        // Conflicting inputs are rejected.
         let args = BytecodeSetSourceArgs::try_parse_from([
             "bytecode-set-source",
             "-f",
@@ -33915,12 +33781,10 @@ mod tests {
         let mirror = service_dir.join("Logger.luau");
         assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 1\n");
 
-        // A local edit on a writable target survives re-apply.
         fs::write(&mirror, "return 2\n").unwrap();
         link_apply(test_link_apply_args(&dir)).unwrap();
         assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 2\n");
 
-        // Even when the canonical source moves on, the local edit still wins.
         fs::write(&canonical, "return 3\n").unwrap();
         link_apply(test_link_apply_args(&dir)).unwrap();
         assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 2\n");
@@ -34001,7 +33865,6 @@ mod tests {
 
         link_apply(test_link_apply_args(&dir)).unwrap();
 
-        // Locally add a child inside the writable package target.
         let mut document = read_editor_service_settings(&src_root, "ReplicatedStorage")
             .unwrap()
             .unwrap();
@@ -34024,7 +33887,6 @@ mod tests {
             .write_file(&service_settings_path(&service_dir))
             .unwrap();
 
-        // Re-apply must not re-splice the drifted writable target.
         link_apply(test_link_apply_args(&dir)).unwrap();
         let document = read_editor_service_settings(&src_root, "ReplicatedStorage")
             .unwrap()
@@ -34069,9 +33931,7 @@ mod tests {
         )
         .unwrap();
 
-        // Non-strict: warning only, still ok.
         link_apply(test_link_apply_args(&dir)).unwrap();
-        // Strict: same input must fail.
         let mut strict_args = test_link_apply_args(&dir);
         strict_args.strict = true;
         let error = link_apply(strict_args).unwrap_err();
@@ -34259,14 +34119,12 @@ mod tests {
             vc_test_instance("root", "S", "Folder", None, &[]),
             vc_test_instance("c", "Part", "Part", Some(0), &[("A", json!(1))]),
         ]);
-        // Theirs deletes an instance we did not touch: deletion wins.
         let ours = base.clone();
         let theirs = vc_test_doc(vec![vc_test_instance("root", "S", "Folder", None, &[])]);
         let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
         assert!(conflicts.is_empty());
         assert_eq!(merged.instances.len(), 1);
 
-        // We modified it, they deleted it: conflict without --prefer.
         let ours_modified = vc_test_doc(vec![
             vc_test_instance("root", "S", "Folder", None, &[]),
             vc_test_instance("c", "Part", "Part", Some(0), &[("A", json!(9))]),
@@ -34332,7 +34190,6 @@ mod tests {
         let a = &roots[0]["children"][0];
         assert_eq!(a["name"], json!("A"));
         assert_eq!(a["properties"]["X"], json!(1));
-        // A script's Source is surfaced on its own field, not left in properties.
         let s = &a["children"][0];
         assert_eq!(s["className"], json!("ModuleScript"));
         assert_eq!(s["source"], json!("return 1"));
@@ -34359,7 +34216,6 @@ mod tests {
         let renium_ignore = fs::read_to_string(dir.join(".renium").join(".gitignore")).unwrap();
         assert_eq!(renium_ignore, RENIUM_DIR_GITIGNORE);
 
-        // Second run must not duplicate anything.
         vc_init(VcInitArgs {
             project_root: dir.clone(),
             skip_git: true,
@@ -34387,7 +34243,6 @@ mod tests {
         assert_eq!(doc.instances[0].name, "ReplicatedStorage");
         assert_eq!(doc.instances[0].class_name, "ReplicatedStorage");
         assert!(doc.instances[0].parent_index.is_none());
-        // Idempotent: a second call leaves the existing store untouched.
         ensure_service_store_exists(&settings, "ReplicatedStorage").unwrap();
         assert_eq!(
             SettingsBytecode::read_file(&settings)
@@ -34683,14 +34538,12 @@ mod tests {
             vec![mirror_a.clone(), mirror_b.clone()],
         );
 
-        // A read-only mirror was edited -> reverted to canonical on the way out.
         fs::write(&mirror_a, "-- tampered").unwrap();
         let out =
             apply_link_enforcement_to_changed_paths(&root, &enforcement, vec![mirror_a.clone()]);
         assert_eq!(fs::read_to_string(&mirror_a).unwrap(), "-- canonical v1");
         assert!(out.contains(&mirror_a));
 
-        // The canonical source was edited -> fan out to every mirror.
         let _ = set_path_readonly(&mirror_a, false);
         let _ = set_path_readonly(&mirror_b, false);
         fs::write(&canonical, "-- canonical v2").unwrap();
@@ -34716,8 +34569,6 @@ mod tests {
 
     #[test]
     fn apply_link_enforcement_matches_relative_changed_paths() {
-        // The live-sync watcher passes paths relative to the project root; they
-        // must still match mirror keys resolved under the (canonical) root.
         let root = link_test_dir("rel");
         let canonical = root.join("links").join("L.luau");
         let mirror = root.join("src").join("ReplicatedStorage").join("L.luau");
@@ -34760,7 +34611,6 @@ mod tests {
         assert!(custom.ends_with("link-store"));
         assert!(custom.to_string_lossy().contains("vendor"));
 
-        // A blank cacheDir falls back to the default.
         manifest.cache_dir = Some("   ".to_string());
         assert!(link_cache_dir(root, &manifest).ends_with("link-cache"));
     }
@@ -34772,7 +34622,6 @@ mod tests {
         assert_eq!(manifest.cache_dir.as_deref(), Some("vendor/cache"));
         let serialized = serde_json::to_string(&manifest).unwrap();
         assert!(serialized.contains("\"cacheDir\":\"vendor/cache\""));
-        // Default manifests omit cacheDir entirely.
         let omitted = serde_json::to_string(&LinkManifest::default()).unwrap();
         assert!(!omitted.contains("cacheDir"));
     }
@@ -34783,8 +34632,6 @@ mod tests {
         let path = root.join("m.luau");
         fs::write(&path, "v1").unwrap();
         set_path_readonly(&path, true).unwrap();
-        // A studio -> editor import writing a linked (read-only) mirror must not
-        // fail; it clears the attribute, writes, and restores it.
         write_bytes_if_changed(&path, b"v2").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2");
         assert!(fs::metadata(&path).unwrap().permissions().readonly());
@@ -34894,7 +34741,6 @@ mod tests {
         let root = link_test_dir("pkg");
         let src_root = root.join("src");
 
-        // Package: Folder "Widget" > [ Part "Block" (Anchored=true), ModuleScript "Mod" (Source) ].
         let mut anchored = Map::new();
         anchored.insert("Anchored".to_string(), json!(true));
         let mut source = Map::new();
@@ -34952,7 +34798,6 @@ mod tests {
         )
         .unwrap();
 
-        // The whole subtree (folder + part + script) is spliced in.
         assert!(
             doc.instances
                 .iter()
@@ -34961,7 +34806,6 @@ mod tests {
         let block = doc.instances.iter().find(|i| i.name == "Block").unwrap();
         assert_eq!(block.class_name, "Part");
         assert_eq!(block.properties.get("Anchored"), Some(&json!(true)));
-        // Script Source stays in bytecode; package links must not create editable source mirrors.
         let module = doc.instances.iter().find(|i| i.name == "Mod").unwrap();
         assert_eq!(module.properties.get("Source"), Some(&json!("return 42")));
         assert_eq!(ids.len(), 3);
@@ -35252,7 +35096,6 @@ mod tests {
         let package_path = root.join("widget.rbsync");
         package.write_file(&package_path).unwrap();
 
-        // Materialize the package into a different service.
         let mut target_doc = SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
             instances: vec![SettingsBytecodeInstance {

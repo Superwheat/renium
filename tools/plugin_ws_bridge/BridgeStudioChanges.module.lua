@@ -183,7 +183,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		propertyFilterClassCount = 0,
 		propertyFilterPropertyCount = 0,
 		connectedInstanceCount = 0,
-		-- "" means "not configured in Studio"; the editor-side setting then applies.
 		conflictResolution = "",
 		syncbackProperties = true,
 		onlyCodeMode = false,
@@ -818,8 +817,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local connections: { RBXScriptConnection } = {}
 		local okChanged, changedConnection = pcall(function()
 			return instance.Changed:Connect(function(propertyName: any)
-				-- ValueBase.Changed passes the new value instead of a property name.
-				-- Treat it as a Value edit so StringValue/NumberValue/etc. still sync.
 				local dirtyPropertyName = propertyName
 				if safeIsA(instance, "ValueBase") then
 					dirtyPropertyName = "Value"

@@ -7,7 +7,6 @@ use crate::settings_bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PropertyScope {
-    // Prefer metadata first, then real properties, then attributes for ergonomic tooling calls.
     Auto,
     Metadata,
     Property,
