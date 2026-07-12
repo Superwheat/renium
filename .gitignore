@@ -1,6 +1,17 @@
 # This repository is intentionally scoped to sync tooling only.
 /*
 !/.gitignore
+!/.gitattributes
+!/AGENTS.md
+!/CLAUDE.md
+!/LICENSE
+!/README.md
+!/rbx
+!/rbx.cmd
+!/aftman.toml
+!/.nvmrc
+!/.github/
+!/.github/**
 !/tools/
 !/tools/**
 
@@ -11,9 +22,13 @@ tools/**/node_modules/
 # Build output
 target/
 tools/**/target/
+tools/**/target-*/
 out/
 tools/**/out/
+tools/**/out-test/
 dist/
+coverage/
+*.lcov
 
 # Packaged artifacts
 *.vsix
@@ -26,6 +41,15 @@ tools/**/_external/
 snapshots/
 *.log
 *.tmp
+.renium/
+.renium-cache/
+.roblox-sync/
+.roblox-sync-cache/
+.pi_tmp/
+tools/**/.renium/
+tools/**/.renium-cache/
+tools/**/.renium-daemon.json
+tools/**/.vscode-test/
 
 # OS/editor noise
 .DS_Store
