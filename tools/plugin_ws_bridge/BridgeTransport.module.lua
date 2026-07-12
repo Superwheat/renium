@@ -2,7 +2,6 @@ local HttpService = game:GetService("HttpService")
 
 local BridgeTransport = {}
 local MAX_RESPONSE_BYTES = 16 * 1024 * 1024
--- Keep this aligned with MAX_BRIDGE_CHUNK_BYTES in renium/src/main.rs.
 local MAX_RAW_CHUNK_BYTES = 8 * 1024 * 1024
 
 local RAW_CHUNK_METHODS = {

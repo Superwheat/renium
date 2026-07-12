@@ -257,10 +257,6 @@ end
 local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }): Instance?
 	local serviceName = tostring(change.service or "")
 	local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
-	-- A bare-hex settings id is an instance index pinned by an earlier export; if
-	-- the Studio tree shifted since, the same id can resolve to a different
-	-- instance. Reject class mismatches so the apply falls back to the explicit
-	-- path instead of silently writing to the wrong instance.
 	if instance ~= nil and not instanceMatchesExpectedClass(instance, change.className) then
 		instance = nil
 	end
@@ -833,9 +829,6 @@ local function enumHintForProperty(instance: Instance, propertyName: string): st
 			return descriptor.enumType
 		end
 	end
-	-- The current value names the real enum type even when the property is
-	-- missing from the reflection database; the property name alone is wrong
-	-- whenever they differ (e.g. Shape -> Enum.PartType).
 	local okRead, current = pcall(function()
 		return (instance :: any)[propertyName]
 	end)
@@ -973,8 +966,6 @@ local function writeProperty(instance: Instance, propertyName: string, value: an
 	if okWrite then
 		return true, nil
 	end
-	-- Content-typed properties (e.g. Decal.TextureContent) reject a plain asset
-	-- string; wrap it in a Content value and retry before reporting failure.
 	if type(value) == "string" and Content ~= nil and (Content :: any).fromUri ~= nil then
 		local okContent = pcall(function()
 			(instance :: any)[propertyName] = if value == ""
@@ -1087,8 +1078,6 @@ local function replaceInstanceClass(instance: Instance, className: string, stats
 		error("Cannot create replacement " .. className .. " for " .. instance:GetFullName() .. ": " .. tostring(replacement))
 	end
 	replacement.Name = instance.Name
-	-- Properties are re-sent by the editor push after a class replace, but
-	-- attributes and tags are not always part of that batch; carry them over.
 	local okAttributes, attributes = pcall(function()
 		return instance:GetAttributes()
 	end)
@@ -1637,9 +1626,6 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 	touchedServices[serviceName] = true
 
 	local beforeDeleted = stats.instanceDeleted
-	-- Resolve every entry before destroying anything: destroying one sibling
-	-- shifts the name ordinals of the rest, so resolving lazily would silently
-	-- miss same-name siblings later in the batch.
 	local targets = {}
 	local seenTargets = {}
 	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
@@ -1648,7 +1634,6 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 		end
 		local instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
 		if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
-			-- A stale settings id resolved to a different instance; trust the path.
 			instance = nil
 		end
 		if instance == nil then
@@ -1814,9 +1799,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				validatedChangeService(change, ctx)
 			end
 		end
-		-- Validate every service/path before applying the first mutation. This
-		-- avoids a partially applied request that later contains an out-of-scope
-		-- service or an escaping path.
 		validateChangeList(params.instanceChanges, "instance")
 		validateChangeList(params.sourceChanges, "source")
 		validateChangeList(params.propertyChanges, "property")

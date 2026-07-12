@@ -707,8 +707,6 @@ end)
 				entries[#entries + 1] = entry
 			end
 		end
-		-- Truncated means messages newer than sinceSeq fell outside the returned
-		-- window, not merely that the buffer holds more than `limit` entries.
 		local truncated = false
 		if startIndex > 1 then
 			local previous = consoleBuffer[startIndex - 1]
@@ -914,11 +912,11 @@ end)
 		if okRunning and running == true then
 			return true
 		end
-		if okEdit and editMode == true then
-			return false
-		end
 		if studioTestState.editModeActive == false then
 			return true
+		end
+		if okEdit and editMode == true then
+			return false
 		end
 		if okEdit and editMode == false then
 			return true

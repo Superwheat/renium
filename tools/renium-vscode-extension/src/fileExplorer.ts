@@ -1166,15 +1166,6 @@ function propertyMigrationTarget(property: RbxDomProperty | undefined): string |
   return typeof to === "string" ? to : undefined;
 }
 
-// A legacy property is "superseded" when Studio has switched its Properties UI
-// over to the migration target and no longer shows the source. The rbx-dom
-// database encodes exactly which migrations Roblox has rolled out: hide the
-// source only when its migration target is a property Studio itself shows (a
-// visible, writable target) or a vestigial DoesNotSerialize target (e.g.
-// Decal.ColorMap -> ColorMapContent). When the target is Hidden or missing —
-// Sound.SoundId -> Hidden AudioContent, SurfaceAppearance.ColorMap -> Hidden
-// ColorMapContent, UICorner.CornerRadius -> (split) — the rollout has not
-// happened and Studio still shows the source, so keep it.
 function isSupersededMigratedProperty(
   className: string,
   property: RbxDomProperty | undefined,
@@ -1857,10 +1848,6 @@ function propertyRowsForNode(node: FileExplorerNode): PropertyRow[] {
       continue;
     }
     const property = findRbxDomProperty(classes, node.className, propertyName);
-    // A superseded legacy property (e.g. Decal.Texture / Decal.ColorMap, which
-    // migrate to *Content) is hidden in favour of its migration target. Carry
-    // its stored value over to that target when the target has no value of its
-    // own, so the asset id still shows on the property Studio actually displays.
     if (property && isSupersededMigratedProperty(node.className, property, classes)) {
       const targetName = propertyMigrationTarget(property);
       if (targetName && !Object.prototype.hasOwnProperty.call(node.properties, targetName)) {
@@ -2307,11 +2294,6 @@ function sequenceToVerde(value: unknown, valueKind: "number" | "color"): { Keypo
   };
 }
 
-// Content / ContentId values arrive as a bare asset string ("rbxassetid://..."),
-// the string "None", or — for the newer Content type (e.g. SurfaceAppearance and
-// MaterialVariant *MapContent, from the Studio bridge) — an object wrapper such as
-// { Uri = "rbxassetid://..." }. Stringifying that object directly yields the
-// "[object Object]" the Properties panel was showing, so extract the URI instead.
 function contentToVerdeString(value: unknown): string {
   if (typeof value === "string") return value;
   const record = recordValue(value);
@@ -2320,8 +2302,6 @@ function contentToVerdeString(value: unknown): string {
       const uri = record[key];
       if (typeof uri === "string") return uri;
     }
-    // Object-source content references an instance (no asset URI); Roblox shows
-    // these as blank in the asset field, and "None"/unset content is blank too.
     return "";
   }
   return String(value);
@@ -4235,7 +4215,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   private currentNode: FileExplorerNode | undefined;
   private currentPackageMessage: PropertiesUpdateMessage | undefined;
   private webviewReady = false;
-  private readonly pendingPropertyFinalSets = new Map<string, { name: string; value: unknown }>();
+  private readonly pendingPropertyFinalSets = new Map<string, { node: FileExplorerNode; name: string; value: unknown }>();
   private readonly pendingPropertyHistory = new Map<string, PropertyEditHistoryItem>();
   private readonly propertyUndoStack: PropertyEditHistoryItem[] = [];
   private readonly propertyRedoStack: PropertyEditHistoryItem[] = [];
@@ -4542,14 +4522,15 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async queuePropertyFromWebview(name: string | undefined, value: unknown, live: boolean): Promise<void> {
-    if (!name) {
+    const node = this.currentNode;
+    if (!node || !name) {
       return;
     }
     if (live) {
-      await this.setPropertyFromWebview(name, value, true);
+      await this.setPropertyFromWebview(node, name, value, true);
       return;
     }
-    this.pendingPropertyFinalSets.set(name, { name, value });
+    this.pendingPropertyFinalSets.set(`${node.treeId}:${name}`, { node, name, value });
     if (this.propertyFinalSetActive) {
       return;
     }
@@ -4560,39 +4541,36 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
         if (!next) {
           break;
         }
-        this.pendingPropertyFinalSets.delete(next.name);
-        await this.setPropertyFromWebview(next.name, next.value, false);
+        this.pendingPropertyFinalSets.delete(`${next.node.treeId}:${next.name}`);
+        await this.setPropertyFromWebview(next.node, next.name, next.value, false);
       }
     } finally {
       this.propertyFinalSetActive = false;
     }
   }
 
-  private async setPropertyFromWebview(name: string | undefined, value: unknown, live = false): Promise<void> {
-    if (!this.currentNode || !name) {
-      return;
-    }
+  private async setPropertyFromWebview(node: FileExplorerNode, name: string, value: unknown, live = false): Promise<void> {
     const scope = isMetadataPropertyName(name) ? "metadata" : "property";
     if (scope === "metadata" && name !== "Name") {
       return;
     }
     const row = scope === "property"
-      ? propertyRowsForNode(this.currentNode).find((candidate) => candidate.name === name)
+      ? propertyRowsForNode(node).find((candidate) => candidate.name === name)
       : undefined;
     const currentValue = scope === "property"
-      ? isModelPivotCFrameProperty(this.currentNode, name)
-        ? modelPivotValue(this.currentNode)
-        : name === "Enabled" && usesDisabledProperty(this.currentNode.className)
-        ? !(this.currentNode.properties.Disabled === true)
-        : this.currentNode.properties[name]
-      : this.currentNode.name;
-    const writePropertyName = scope === "property" && (name === "WorldPivotData" || name === "Origin") && MODEL_PIVOT_CLASSES.has(this.currentNode.className)
+      ? isModelPivotCFrameProperty(node, name)
+        ? modelPivotValue(node)
+        : name === "Enabled" && usesDisabledProperty(node.className)
+        ? !(node.properties.Disabled === true)
+        : node.properties[name]
+      : node.name;
+    const writePropertyName = scope === "property" && (name === "WorldPivotData" || name === "Origin") && MODEL_PIVOT_CLASSES.has(node.className)
       ? "WorldPivot"
       : name;
     const studioPropertyName = scope === "property"
-      ? name === "Enabled" && usesDisabledProperty(this.currentNode.className)
+      ? name === "Enabled" && usesDisabledProperty(node.className)
         ? "Disabled"
-        : name === "Origin" && MODEL_PIVOT_CLASSES.has(this.currentNode.className)
+        : name === "Origin" && MODEL_PIVOT_CLASSES.has(node.className)
         ? "Origin"
         : writePropertyName
       : writePropertyName;
@@ -4600,19 +4578,19 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     const studioRawValue = studioPropertyName === "Disabled" && name === "Enabled"
       ? !(rawValue === true)
       : rawValue;
-    const pushTarget = this.snapshotStudioPushNode(this.currentNode);
-    const propertyKey = `${this.currentNode.treeId}:${scope}:${name}`;
+    const pushTarget = this.snapshotStudioPushNode(node);
+    const propertyKey = `${node.treeId}:${scope}:${name}`;
     const pendingHistory = this.pendingPropertyHistory.get(propertyKey);
     const historyItem: PropertyEditHistoryItem = pendingHistory ?? {
-      service: this.currentNode.service,
-      settingsId: this.currentNode.settingsId,
-      treeId: this.currentNode.treeId,
-      className: this.currentNode.className,
-      sourcePath: this.currentNode.sourcePath,
-      pathSegments: this.currentNode.pathSegments.length > 0
-        ? this.currentNode.pathSegments.slice()
-        : [this.currentNode.service, this.currentNode.name].filter((segment) => segment.length > 0),
-      pathOrdinals: this.currentNode.pathOrdinals.slice(),
+      service: node.service,
+      settingsId: node.settingsId,
+      treeId: node.treeId,
+      className: node.className,
+      sourcePath: node.sourcePath,
+      pathSegments: node.pathSegments.length > 0
+        ? node.pathSegments.slice()
+        : [node.service, node.name].filter((segment) => segment.length > 0),
+      pathOrdinals: node.pathOrdinals.slice(),
       propertyKey,
       scope,
       name,
@@ -4621,12 +4599,12 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       studioPropertyName,
       beforeRawValue: cloneHistoryValue(currentValue),
       afterRawValue: cloneHistoryValue(rawValue),
-      settingsFile: this.currentNode.settingsFile,
+      settingsFile: node.settingsFile,
     };
     if (live) {
       historyItem.afterRawValue = cloneHistoryValue(rawValue);
       this.pendingPropertyHistory.set(propertyKey, historyItem);
-      this.applyLocalPropertyValue(this.currentNode, scope, name, rawValue);
+      this.applyLocalPropertyValue(node, scope, name, rawValue);
       this.queueLiveStudioPush(pushTarget, scope, studioPropertyName, studioRawValue);
       return;
     }
@@ -4635,15 +4613,15 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     const changedFromEditStart = !jsonValuesEqual(historyItem.beforeRawValue, rawValue);
     if (!changedFromEditStart) {
       if (pendingHistory) {
-        this.applyLocalPropertyValue(this.currentNode, scope, name, rawValue);
+        this.applyLocalPropertyValue(node, scope, name, rawValue);
         this.pushCurrent();
         this.queueFinalStudioPropertyPush(pushTarget, scope, studioPropertyName, studioRawValue);
       }
       return;
     }
     const settingsBackup = this.capturePropertyHistoryBackup(historyItem);
-    this.applyLocalPropertyValue(this.currentNode, scope, name, rawValue);
-    await this.model.setValue(this.currentNode, scope, writePropertyName, JSON.stringify(rawValue), { skipStudioPush: true });
+    this.applyLocalPropertyValue(node, scope, name, rawValue);
+    await this.model.setValue(node, scope, writePropertyName, JSON.stringify(rawValue), { skipStudioPush: true });
     this.rememberPropertyHistory(historyItem, settingsBackup);
     this.pushCurrent();
     this.queueFinalStudioPropertyPush(pushTarget, scope, studioPropertyName, studioRawValue);
@@ -5322,7 +5300,6 @@ class ExplorerBackendClient implements vscode.Disposable {
       try {
         this.process.stdin.write(`${JSON.stringify({ t: "quit", id: this.requestId++ })}\n`);
       } catch {
-        // The process may already be gone.
       }
       this.process.kill();
     }
@@ -5636,8 +5613,6 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private packageCursorSampleCount = 0;
   private packageCursorSawButtonDown = false;
   private packageCursorReleaseTimer: NodeJS.Timeout | undefined;
-  // Map of link target pathKey (service + 0x01 + path) -> "linked" | "broken",
-  // used to gate the Create/Break Link context-menu items.
   private linkState: Record<string, string> = {};
 
   public setLinkState(keys: Record<string, string>): void {
@@ -6361,8 +6336,6 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       void webview.postMessage({ type: "rbsyncTree", name: displayName, error: result.error });
       return;
     }
-    // The webview renders rows with the Explorer's own iconName(), so no
-    // icon annotation is needed here.
     void webview.postMessage({ type: "rbsyncTree", name: displayName, result: result.tree });
   }
 
@@ -7766,7 +7739,6 @@ function renderGit(){
   var primaryAction=connected?'commitPush':'connect';
   var primaryActionEnabled=connected?canSync:canSetup;
   var html='<div class="gitRoot">';
-  // Header: branch pill, ahead/behind arrows, refresh.
   html+='<div class="ghHead">';
   html+='<span class="ghBranch" title="Current branch">'+ghBranchIcon()+'<span class="ghBranchName">'+esc(branch)+'</span></span>';
   html+='<span class="ghSync">';
@@ -7776,16 +7748,13 @@ function renderGit(){
   html+='<button class="ghIconBtn'+(gitLoading?' spin':'')+'" data-gh-refresh="1" title="Refresh Git status"'+(gitLoading?' disabled':'')+'>'+ghRefreshIcon()+'</button>';
   html+='</div>';
   html+='<div class="ghMeta" title="'+esc(repoMeta)+'">'+esc(repoMeta)+'</div>';
-  // Status banner.
   html+='<div class="ghStatus '+dotClass+'"><span class="ghDot"></span><span class="ghStatusText">'+esc(gitLoading?'Syncing...':statusText)+'</span></div>';
   if(message)html+='<div class="ghNote">'+esc(message)+'</div>';
-  // Primary actions.
   html+='<div class="ghActions">';
   html+='<button class="ghPrimary" data-gh-action="'+esc(primaryAction)+'"'+gitDisabled(primaryActionEnabled)+'>'+esc(primaryActionLabel)+'</button>';
   if(connected)html+='<button class="ghSecondary" data-gh-action="pull"'+gitDisabled(canSync)+' title="Pull from '+esc(remote)+'">'+ghDownIcon()+'Pull'+(behind?' '+esc(behind):'')+'</button>';
   else html+='<button class="ghSecondary" data-gh-output="1"'+gitDisabled(trusted)+'>Show Output</button>';
   html+='</div>';
-  // Changes section.
   html+='<div class="ghSection">';
   html+='<button class="ghSectionHead '+(gitChangesOpen?'open':'')+'" data-gh-group="changes" aria-expanded="'+(gitChangesOpen?'true':'false')+'">'+ghTwisty()+'<span class="ghSectionTitle">Changes</span><span class="ghBadgeCount'+(total?' has':'')+'">'+esc(total)+'</span></button>';
   if(gitChangesOpen){
@@ -7805,7 +7774,6 @@ function renderGit(){
     html+='</div>';
   }
   html+='</div>';
-  // Repository actions section.
   html+='<div class="ghSection">';
   html+='<button class="ghSectionHead '+(gitAdvancedOpen?'open':'')+'" data-gh-group="actions" aria-expanded="'+(gitAdvancedOpen?'true':'false')+'">'+ghTwisty()+'<span class="ghSectionTitle">Repository Actions</span></button>';
   if(gitAdvancedOpen){
@@ -8951,10 +8919,6 @@ tabs.addEventListener('click',function(e){
   var btn=e.target.closest('.tabBtn');if(!btn)return;
   setActiveTab(btn.dataset.tab);
 });
-// The Inspector renders the whole decoded store in the webview, so — like the
-// Explorer — it virtualizes: only rows inside the viewport are turned into DOM.
-// rbFlat is the ordered list of currently-visible rows (respecting expand state
-// and search); rbPaint renders just the slice under the scrollbar.
 var rbTree=null,rbExpanded={},rbSelId=null,rbById={};
 var rbQuery='',rbSearchCollapsed={},rbFlat=[],rbSizer=null,rbRowsEl=null,rbPaintQueued=false;
 var RB_ROW_H=22,RB_OVER=6;
@@ -8974,9 +8938,6 @@ function rbRowHtml(f){
   h+='<span class="labelWrap"><span class="name">'+(f.match?rbHi(n.name):esc(n.name))+'</span></span></div>';
   return h;
 }
-// Build the flat visible-row list. With no query, honour rbExpanded. With a
-// query, keep every node that matches or has a matching descendant, so each hit
-// is shown with its full ancestor path (auto-expanded, like Explorer search).
 function rbBuildFlat(){
   rbFlat=[];
   if(!rbTree)return;
@@ -9036,7 +8997,6 @@ function rbSchedulePaint(){
 }
 function rbWireBrowse(){var b=document.getElementById('rbsyncBrowse');if(b)b.addEventListener('click',function(e){e.preventDefault();vscode.postMessage({type:'rbsyncBrowse'})})}
 function rbEmpty(){rbSizer=null;rbRowsEl=null;rbsyncTree.innerHTML='<div class="rbsyncHint">Open a <b>.renium</b> store with the folder button above, or <a id="rbsyncBrowse" href="#">browse for a file</a>.</div>';rbWireBrowse()}
-// Full structural render: rebuild the flat list, then paint the visible slice.
 function rbRender(){
   if(!rbTree||!((rbTree.roots||[]).length)){rbEmpty();return}
   rbBuildFlat();
@@ -9853,7 +9813,6 @@ export class FileExplorerController implements vscode.Disposable {
     try {
       await vscode.languages.setTextDocumentLanguage(document, "luau");
     } catch {
-      // The virtual URI still uses a .luau file name for a useful editor title.
     }
   }
 
@@ -9877,7 +9836,6 @@ export class FileExplorerController implements vscode.Disposable {
           return;
         }
       } catch {
-        // Fall back to a local read-only preview for non-renium package links.
       }
       if (inlineSource !== undefined) {
         await this.showReadonlyScriptDocument(loaded, sourcePath, inlineSource);

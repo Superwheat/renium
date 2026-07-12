@@ -60,8 +60,6 @@ function BridgePluginRuntime.start(context)
 	local plugin = context.plugin
 	local rootScript = context.rootScript
 
-	-- Studio plugin: multi-channel WebSocket bridge for fast export RPCs.
-	-- Import this script as a plugin script.
 	
 	local HttpService = game:GetService("HttpService")
 	local RunService = game:GetService("RunService")
@@ -336,8 +334,6 @@ function BridgePluginRuntime.start(context)
 		end
 	end
 	do
-		-- Only override the editor-side conflict policy when the user has explicitly
-		-- chosen one in Studio (nil = unset -> leave the VS Code setting in charge).
 		local storedConflictResolution =
 			SettingsModule.loadConflictResolution(plugin, SETTINGS_PREFIX, nil)
 		if storedConflictResolution ~= nil then
@@ -464,10 +460,6 @@ function BridgePluginRuntime.start(context)
 	local NOOP_EXPORT_YIELDER = function() end
 	
 	local function makeExportBurstYielder(checkInterval: number?, budgetSeconds: number?)
-		-- Throughput mode is used by the Rust full-sync path.  Avoid frame-bound
-		-- task.wait() calls while preparing or indexing large services so the same
-		-- place exports in one CPU-bound pass instead of sometimes paying extra
-		-- frame waits. Balanced/smooth still yield to keep Studio responsive.
 		if PERFORMANCE_MODE == "throughput" then
 			return NOOP_EXPORT_YIELDER
 		end
@@ -874,9 +866,6 @@ function BridgePluginRuntime.start(context)
 	end
 	
 	local function contentSourceToUri(value: any): string
-		-- The newer Content type wraps a URI, an Object reference, or nothing.
-		-- Only URI-source content maps to an asset id we can display/edit, so
-		-- send that string (Object/None content has no asset id).
 		if value.SourceType == Enum.ContentSourceType.Uri then
 			return value.Uri or ""
 		end
@@ -1801,8 +1790,6 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 		if next(out) == nil then
-			-- The bundled database can predate newly added enums; the running
-			-- Studio is authoritative for its own API.
 			local okEnum, liveItems = pcall(function()
 				return (Enum :: any)[enumName]:GetEnumItems()
 			end)
@@ -4830,18 +4817,10 @@ function BridgePluginRuntime.start(context)
 		elseif method == "setExportOptions" then
 			return configureExportOptions(p)
 		elseif method == "applyEditorChanges" then
-			-- Suppress only the Changed events caused by this editor apply.
-			-- A previous fixed 2s suppression window could swallow a real Studio edit made
-			-- immediately after a VS Code push, especially when alternating the same property.
 			Config.studioChanges.beginSuppress()
 			local ok, result = pcall(function()
 				return editorSync.applyChanges(p)
 			end)
-			-- With deferred SignalBehavior the ItemChanged/DescendantAdded events from
-			-- the tail of the apply only run at the next resumption point. Release the
-			-- suppression depth from a deferred task so those queued events still see
-			-- it held; releasing synchronously here would let them re-mark services
-			-- dirty and echo the push straight back into a Studio -> editor import.
 			task.defer(function()
 				Config.studioChanges.endSuppress(0)
 			end)

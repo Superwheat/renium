@@ -128,7 +128,6 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
       try {
         child.kill();
       } catch {
-        // Ignore kill failures; the exit/error handlers will resolve the command.
       }
     }, timeoutMs);
 

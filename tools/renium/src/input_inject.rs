@@ -125,7 +125,6 @@ fn digit_name(ch: u8) -> &'static str {
 }
 
 fn mac_letter_keycode(ch: u8) -> u16 {
-    // ANSI virtual keycodes are not alphabetical; explicit table.
     const CODES: [u16; 26] = [
         0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
         6,
