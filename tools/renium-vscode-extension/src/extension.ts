@@ -4856,8 +4856,12 @@ class RobloxSyncController {
     transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
   button:active { transform: translateY(1px) scale(0.98); }
-  .apply { background: var(--ink); color: var(--vscode-editor-background, #17171a); }
-  .apply:hover { filter: brightness(0.92); }
+  .apply {
+    background: color-mix(in srgb, var(--green) 22%, transparent);
+    color: color-mix(in srgb, var(--green) 88%, var(--ink));
+    border-color: color-mix(in srgb, var(--green) 38%, transparent);
+  }
+  .apply:hover { background: color-mix(in srgb, var(--green) 32%, transparent); }
   .full { background: var(--surface-hover); color: var(--ink); border-color: var(--edge); }
   .full:hover { background: var(--edge); }
   .skip { background: transparent; font-weight: 480; color: var(--ink-dim); }
