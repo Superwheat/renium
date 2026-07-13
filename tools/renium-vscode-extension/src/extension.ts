@@ -4752,6 +4752,7 @@ class RobloxSyncController {
   h1 { font-size: 19px; font-weight: 640; letter-spacing: -0.018em; margin-top: 10px; }
   .subtitle { margin-top: 4px; font-size: 12.5px; color: var(--ink-mid); max-width: 60ch; }
   .subtitle b { color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; }
+  .subtitle .threshold { color: var(--amber); font-weight: 620; font-variant-numeric: tabular-nums; }
   .toolbar { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
   .filter {
     flex: none; width: 240px; font-family: inherit; font-size: 12px;
@@ -4871,7 +4872,7 @@ class RobloxSyncController {
   <div class="header">
     <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
     <h1>Studio changes awaiting review</h1>
-    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"} &mdash; this batch is over your review threshold of ${threshold}.${structural ? " It includes added or removed instances, so it can only be applied as a full import." : ""}</div>
+    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"}. This batch is over your review threshold of <span class="threshold">${threshold}</span></div>
     <div class="toolbar">
       <input class="filter" id="filter" type="text" placeholder="Filter by name, class, or property" spellcheck="false">
       <span class="toolbar-hint" id="toolbar-hint"></span>
