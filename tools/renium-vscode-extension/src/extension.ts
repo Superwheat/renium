@@ -4703,8 +4703,6 @@ class RobloxSyncController {
     --surface-hover: rgba(255,255,255,0.055);
     --edge: rgba(255,255,255,0.085);
     --edge-soft: rgba(255,255,255,0.05);
-    --accent: #8b7cf8;
-    --accent-2: #5e9bfa;
     --amber: #e8b53f;
     --red: #f47f76;
     --green: #66c88e;
@@ -4717,8 +4715,6 @@ class RobloxSyncController {
     --surface-hover: rgba(18,20,26,0.06);
     --edge: rgba(18,20,26,0.12);
     --edge-soft: rgba(18,20,26,0.07);
-    --accent: #6a58e8;
-    --accent-2: #3d7ce0;
     --amber: #b8860b;
     --red: #d0453a;
     --green: #1f8a4c;
@@ -4741,7 +4737,7 @@ class RobloxSyncController {
     font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
     color: var(--ink-dim);
   }
-  .kicker b { color: color-mix(in srgb, var(--accent) 75%, var(--ink)); font-weight: 700; }
+  .kicker b { color: var(--ink-mid); font-weight: 700; }
   .pulse {
     width: 7px; height: 7px; border-radius: 50%;
     background: var(--amber);
@@ -4763,7 +4759,7 @@ class RobloxSyncController {
     border-radius: 7px; padding: 5px 11px; outline: none;
     transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .filter:focus { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--surface-hover); }
+  .filter:focus { border-color: var(--ink-dim); background: var(--surface-hover); }
   .filter::placeholder { color: var(--ink-dim); }
   .toolbar-hint { font-size: 11px; color: var(--ink-dim); }
   .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; position: relative; animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both; }
@@ -4860,8 +4856,8 @@ class RobloxSyncController {
     transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
   button:active { transform: translateY(1px) scale(0.98); }
-  .apply { background: var(--accent); color: #fff; }
-  .apply:hover { filter: brightness(1.1); }
+  .apply { background: var(--ink); color: var(--vscode-editor-background, #17171a); }
+  .apply:hover { filter: brightness(0.92); }
   .full { background: var(--surface-hover); color: var(--ink); border-color: var(--edge); }
   .full:hover { background: var(--edge); }
   .skip { background: transparent; font-weight: 480; color: var(--ink-dim); }
