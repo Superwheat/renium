@@ -4636,87 +4636,122 @@ class RobloxSyncController {
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: var(--vscode-font-family);
+    font-family: "Segoe UI Variable Text", "Inter", var(--vscode-font-family, "Segoe UI"), sans-serif;
+    -webkit-font-smoothing: antialiased;
+    font-size: 13px; line-height: 1.5;
     color: var(--vscode-foreground);
     background: var(--vscode-editor-background);
     display: flex; flex-direction: column; height: 100vh; overflow: hidden;
   }
-  .header {
-    padding: 20px 24px 16px;
-    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.25));
-    flex: none;
+  .header { padding: 22px 28px 16px; flex: none; border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22)); }
+  .kicker {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
   }
-  .title-row { display: flex; align-items: center; gap: 10px; }
   .pulse {
-    width: 10px; height: 10px; border-radius: 50%;
+    width: 7px; height: 7px; border-radius: 50%;
     background: var(--vscode-editorWarning-foreground, #d7a600);
-    animation: pulse 1.6s ease-in-out infinite; flex: none;
+    animation: pulse 1.8s ease-in-out infinite; flex: none;
   }
-  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.72); } }
-  h1 { font-size: 16px; font-weight: 600; }
-  .subtitle { margin-top: 5px; font-size: 12px; color: var(--vscode-descriptionForeground); }
-  .chips { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(0.7); } }
+  h1 { font-size: 17px; font-weight: 650; letter-spacing: -0.012em; margin-top: 7px; }
+  .subtitle { margin-top: 3px; font-size: 12.5px; color: var(--vscode-descriptionForeground); }
+  .chips { display: flex; gap: 6px; margin-top: 14px; flex-wrap: wrap; }
   .chip {
-    font-size: 11px; padding: 3px 10px; border-radius: 999px;
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    font-size: 11px; font-weight: 600; padding: 3px 11px; border-radius: 999px;
+    border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.3));
+    color: var(--vscode-descriptionForeground); background: transparent;
   }
-  .list { flex: 1; overflow-y: auto; padding: 12px 24px 20px; }
-  .group { margin-top: 14px; animation: rise 0.28s ease both; }
-  .group-head { display: flex; align-items: center; gap: 9px; padding: 4px 0; }
+  .chip.strong { background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-color: transparent; }
+  .list { flex: 1; overflow-y: auto; padding: 16px 28px 24px; }
+  .group {
+    border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22));
+    border-radius: 10px; margin-top: 12px; overflow: hidden;
+    background: color-mix(in srgb, var(--vscode-editorWidget-background, rgba(128,128,128,0.08)) 45%, transparent);
+    animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .group-head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.14));
+  }
   .monogram {
-    width: 22px; height: 22px; border-radius: 6px; flex: none;
+    width: 26px; height: 26px; border-radius: 8px; flex: none;
     display: flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 700; color: #fff;
+    font-size: 10.5px; font-weight: 800; letter-spacing: 0.02em; color: #fff;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 1px 2px rgba(0,0,0,0.25);
   }
-  .leaf { font-weight: 600; font-size: 13px; }
-  .crumbs { font-size: 11px; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .classtag { font-size: 10px; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.35)); border-radius: 4px; padding: 1px 6px; flex: none; }
+  .leaf { font-weight: 650; font-size: 13.5px; letter-spacing: -0.005em; }
+  .classtag {
+    font-size: 10.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px; flex: none;
+    color: var(--vscode-descriptionForeground); background: rgba(128,128,128,0.13);
+  }
+  .crumbs { margin-left: auto; font-size: 11.5px; color: var(--vscode-descriptionForeground); opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .props { padding: 6px 8px 8px; }
   .prop-row {
-    display: flex; align-items: center; gap: 10px;
-    padding: 6px 10px 6px 32px; border-radius: 6px; font-size: 12px;
+    display: grid; grid-template-columns: minmax(130px, 200px) 1fr;
+    gap: 14px; align-items: center; padding: 6.5px 10px; border-radius: 7px;
   }
-  .prop-row:hover { background: var(--vscode-list-hoverBackground); }
-  .prop-name { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; flex: none; }
+  .prop-row:hover { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.09)); }
+  .prop-name-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .prop-name {
+    font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
+    font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .scope-badge {
-    font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em;
-    padding: 1px 6px; border-radius: 4px; flex: none;
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); opacity: 0.85;
+    font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 1.5px 7px; border-radius: 999px; flex: none;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); opacity: 0.8;
   }
-  .values { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; font-family: var(--vscode-editor-font-family, monospace); }
-  .old { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); text-decoration: line-through; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; flex: none; }
-  .arrow { color: var(--vscode-descriptionForeground); flex: none; }
-  .new { color: var(--vscode-gitDecoration-addedResourceForeground, #4ec96b); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 1px solid rgba(128,128,128,0.5); }
-  .bool-pill { padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .values { display: flex; align-items: center; gap: 9px; min-width: 0; font-variant-numeric: tabular-nums; }
+  .val {
+    font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
+    font-size: 12px; padding: 2.5px 10px; border-radius: 6px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .val.old {
+    color: var(--vscode-gitDecoration-deletedResourceForeground, #f28b82);
+    background: color-mix(in srgb, var(--vscode-gitDecoration-deletedResourceForeground, #f28b82) 11%, transparent);
+    text-decoration: line-through; text-decoration-thickness: 1px; opacity: 0.92;
+    max-width: 42%; flex: none;
+  }
+  .val.new {
+    color: var(--vscode-gitDecoration-addedResourceForeground, #81c995);
+    background: color-mix(in srgb, var(--vscode-gitDecoration-addedResourceForeground, #81c995) 11%, transparent);
+  }
+  .arrow { color: var(--vscode-descriptionForeground); opacity: 0.65; flex: none; font-size: 11px; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3.5px; margin-right: 6px; vertical-align: -1.5px; box-shadow: inset 0 0 0 1px rgba(128,128,128,0.45); }
   .footer {
-    flex: none; display: flex; align-items: center; gap: 14px;
-    padding: 14px 24px; border-top: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.25));
+    flex: none; display: flex; align-items: center; gap: 16px;
+    padding: 14px 28px; border-top: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22));
     background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   }
-  .countdown { font-size: 11px; color: var(--vscode-descriptionForeground); flex: 1; min-width: 0; }
-  .countdown-bar { height: 3px; border-radius: 2px; background: var(--vscode-editorWidget-border, rgba(128,128,128,0.3)); margin-top: 6px; overflow: hidden; }
-  .countdown-fill { height: 100%; width: 100%; background: var(--vscode-progressBar-background, #0e70c0); transition: width 1s linear; }
+  .countdown { font-size: 11.5px; color: var(--vscode-descriptionForeground); flex: 1; min-width: 0; }
+  .countdown-bar { height: 3px; border-radius: 2px; background: rgba(128,128,128,0.22); margin-top: 7px; overflow: hidden; }
+  .countdown-fill { height: 100%; width: 100%; background: var(--vscode-progressBar-background, #0e70c0); transition: width 1s linear; border-radius: 2px; }
   button {
-    font-family: inherit; font-size: 12.5px; padding: 7px 16px; border-radius: 5px;
+    font-family: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 8px 18px; border-radius: 7px;
     border: 1px solid transparent; cursor: pointer; flex: none;
-    transition: transform 0.08s ease, filter 0.12s ease;
+    transition: transform 0.08s ease, filter 0.12s ease, box-shadow 0.12s ease;
   }
   button:hover { filter: brightness(1.12); }
   button:active { transform: scale(0.97); }
-  .apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-weight: 600; }
-  .full { background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.2)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
-  .skip { background: transparent; color: var(--vscode-descriptionForeground); border-color: var(--vscode-editorWidget-border, rgba(128,128,128,0.35)); }
-  .skip:hover { color: var(--vscode-errorForeground, #f14c4c); border-color: var(--vscode-errorForeground, #f14c4c); }
-  @keyframes rise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+  .apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+  .full { background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.18)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
+  .skip { background: transparent; font-weight: 500; color: var(--vscode-descriptionForeground); border-color: var(--vscode-editorWidget-border, rgba(128,128,128,0.32)); }
+  .skip:hover { color: var(--vscode-errorForeground, #f28b82); border-color: var(--vscode-errorForeground, #f28b82); filter: none; }
+  @keyframes rise { from { opacity: 0; transform: translateY(9px); } to { opacity: 1; transform: none; } }
 </style>
 </head>
 <body>
   <div class="header">
-    <div class="title-row"><div class="pulse"></div><h1>Studio changes awaiting review</h1></div>
+    <div class="kicker"><div class="pulse"></div>Renium &middot; Live sync</div>
+    <h1>Studio changes awaiting review</h1>
     <div class="subtitle">This batch exceeded your review threshold of ${threshold}. Live sync is paused until you decide.</div>
     <div class="chips">
-      <span class="chip">${changeCount} change${changeCount === 1 ? "" : "s"}</span>
-      <span class="chip">${instanceCount} instance${instanceCount === 1 ? "" : "s"}</span>
+      <span class="chip strong">${changeCount} change${changeCount === 1 ? "" : "s"}</span>
+      <span class="chip strong">${instanceCount} instance${instanceCount === 1 ? "" : "s"}</span>
       ${services.map((service) => `<span class="chip">${service}</span>`).join("")}
     </div>
   </div>
@@ -4750,10 +4785,7 @@ class RobloxSyncController {
     if (value === undefined) return null;
     if (value === null) return '<i>nil</i>';
     const t = typeof value;
-    if (t === "boolean") {
-      const bg = value ? "rgba(78,201,107,0.18)" : "rgba(241,76,76,0.18)";
-      return '<span class="bool-pill" style="background:' + bg + '">' + value + "</span>";
-    }
+    if (t === "boolean") return String(value);
     if (t === "number") return esc(fmtNum(value));
     if (t === "string") return '"' + esc(value.length > 90 ? value.slice(0, 90) + "\\u2026" : value) + '"';
     if (t === "object") {
@@ -4793,17 +4825,18 @@ class RobloxSyncController {
     const propsHtml = rows.map((row) => {
       const oldHtml = fmt(row.oldValue);
       const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
-      return '<div class="prop-row"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge +
-        '<span class="values">' + (oldHtml !== null ? '<span class="old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
-        '<span class="new">' + fmt(row.newValue) + "</span></span></div>";
+      return '<div class="prop-row"><span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
+        '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
+        '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
     }).join("");
+    const h = hue(head.className || head.leaf);
     group.innerHTML =
       '<div class="group-head">' +
-      '<div class="monogram" style="background:hsl(' + hue(head.className || head.leaf) + ',52%,44%)">' + esc((head.className || head.leaf).slice(0, 2).toUpperCase()) + "</div>" +
+      '<div class="monogram" style="background:linear-gradient(160deg, hsl(' + h + ',54%,50%), hsl(' + h + ',58%,38%))">' + esc((head.className || head.leaf).slice(0, 2).toUpperCase()) + "</div>" +
       '<span class="leaf">' + esc(head.leaf) + "</span>" +
       '<span class="classtag">' + esc(head.className || "Instance") + "</span>" +
       '<span class="crumbs">' + esc(crumbs) + "</span>" +
-      "</div>" + propsHtml;
+      '</div><div class="props">' + propsHtml + "</div>";
     list.appendChild(group);
   }
   if (groups.size > MAX_GROUPS) {
