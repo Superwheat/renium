@@ -4721,9 +4721,11 @@ class RobloxSyncController {
   .filter:focus { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--surface-hover); }
   .filter::placeholder { color: var(--ink-dim); }
   .toolbar-hint { font-size: 11px; color: var(--ink-dim); }
-  .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; }
+  .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; position: relative; animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  #sizer { position: relative; width: 100%; }
+  #viewport { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
   .row {
-    display: flex; align-items: center; height: 25px; border-radius: 6px;
+    display: flex; align-items: center; height: 26px; border-radius: 6px;
     padding-right: 10px; cursor: pointer; user-select: none; min-width: 0;
   }
   .row:hover { background: var(--surface-hover); }
@@ -4740,17 +4742,15 @@ class RobloxSyncController {
   .rname { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row.folder .rname { color: var(--ink-mid); }
   .rsep { color: var(--ink-dim); margin: 0 4px; font-size: 11px; }
-  .rclass { margin-left: 9px; font-size: 11px; color: var(--ink-dim); flex: none; }
   .count {
     margin-left: auto; flex: none; font-size: 10px; font-weight: 650;
     padding: 1px 8px; border-radius: 999px;
     background: var(--surface-hover); color: var(--ink-mid);
     font-variant-numeric: tabular-nums;
   }
-  .props { margin: 1px 0 4px; }
   .prop-row {
     display: grid; grid-template-columns: minmax(120px, 190px) 1fr;
-    gap: 16px; align-items: center; padding: 4px 10px; border-radius: 6px;
+    gap: 16px; align-items: center; height: 26px; padding: 0 10px; border-radius: 6px;
   }
   .prop-row:hover { background: var(--surface-hover); }
   .prop-name-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -4826,7 +4826,7 @@ class RobloxSyncController {
       <span class="toolbar-hint" id="toolbar-hint"></span>
     </div>
   </div>
-  <div class="list" id="list"></div>
+  <div class="list" id="list"><div id="sizer"><div id="viewport"></div></div></div>
   <div class="footer">
     <div class="countdown">
       <span id="count-label">Protected full import in <b id="secs">90</b>s &mdash; hover the list to pause</span>
@@ -4894,36 +4894,40 @@ class RobloxSyncController {
   }
 
   const list = document.getElementById("list");
+  const sizer = document.getElementById("sizer");
+  const viewport = document.getElementById("viewport");
   const filterInput = document.getElementById("filter");
   const hintEl = document.getElementById("toolbar-hint");
+  const ROW_HEIGHT = 26;
+  const OVERSCAN = 20;
   const instanceTotal = ${instanceCount};
   const collapsed = new Set();
   const propsOpen = new Set();
   const autoOpenProps = instanceTotal <= 12;
   let filterText = "";
+  let flat = [];
+  let renderFrame = 0;
+  let lastStart = -1;
+  let lastCount = -1;
 
+  const matchCache = new Map();
   function nodeMatches(node, pathKey) {
     if (!filterText) return true;
-    if (node.name.toLowerCase().includes(filterText)) return true;
-    if (node.className && node.className.toLowerCase().includes(filterText)) return true;
-    if (node.changes && node.changes.some((c) => c.property.toLowerCase().includes(filterText))) return true;
-    for (const child of node.children.values()) {
-      if (nodeMatches(child, pathKey + "." + child.name)) return true;
+    const cached = matchCache.get(pathKey);
+    if (cached !== undefined) return cached;
+    let out = node.name.toLowerCase().includes(filterText)
+      || (node.className && node.className.toLowerCase().includes(filterText))
+      || (node.changes && node.changes.some((c) => c.property.toLowerCase().includes(filterText)));
+    if (!out) {
+      for (const child of node.children.values()) {
+        if (nodeMatches(child, pathKey + "." + child.name)) { out = true; break; }
+      }
     }
-    return false;
+    matchCache.set(pathKey, out);
+    return out;
   }
 
-  function propsHtml(changes) {
-    return changes.map((row) => {
-      const oldHtml = fmt(row.oldValue);
-      const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
-      return '<div class="prop-row"><span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
-        '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
-        '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
-    }).join("");
-  }
-
-  function renderNode(node, pathKey, depth, out) {
+  function flattenNode(node, pathKey, depth) {
     if (!nodeMatches(node, pathKey)) return;
     let chain = [node.name];
     let current = node;
@@ -4939,62 +4943,97 @@ class RobloxSyncController {
     const propCount = current.changes ? current.changes.length : 0;
     const isCollapsed = collapsed.has(key);
     const propsShown = propCount > 0 && !isCollapsed && (propsOpen.has(key) || autoOpenProps || !!filterText);
-    const expandable = hasKids || propCount > 0;
-    const iconName = isFolder
-      ? (depth === 0 ? (SERVICE_ICONS[chain[0]] || FOLDER_ICON) : FOLDER_ICON)
-      : current.icon;
-
-    const row = document.createElement("div");
-    row.className = "row" + (isFolder ? " folder" : "");
-    row.style.paddingLeft = (depth * 14 + 6) + "px";
-    row.innerHTML =
-      '<span class="twisty' + ((isCollapsed || (propCount > 0 && !propsShown && !hasKids)) ? "" : " open") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
-      '<img class="icon" src="' + ASSET + "/" + esc(iconName || "Folder") + '.png">' +
-      '<span class="rname">' + chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
-      (!isFolder && current.className ? '<span class="rclass">' + esc(current.className) + "</span>" : "") +
-      (propCount > 0 ? '<span class="count">' + propCount + "</span>" : "");
-    row.addEventListener("click", () => {
-      if (!expandable) return;
-      if (isFolder || hasKids) {
-        if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
-      }
-      if (propCount > 0 && !hasKids) {
-        if (propsShown) { propsOpen.delete(key); if (autoOpenProps || filterText) collapsed.add(key); }
-        else { propsOpen.add(key); collapsed.delete(key); }
-      }
-      render();
-    });
-    out.appendChild(row);
-
+    flat.push({ kind: "node", key, chain, depth, isFolder, hasKids, propCount, isCollapsed, propsShown,
+      className: current.className, icon: isFolder ? (depth === 0 ? (SERVICE_ICONS[chain[0]] || FOLDER_ICON) : FOLDER_ICON) : current.icon });
     if (isCollapsed) return;
     if (propsShown) {
-      const props = document.createElement("div");
-      props.className = "props";
-      props.style.paddingLeft = (depth * 14 + 29) + "px";
-      props.innerHTML = propsHtml(current.changes);
-      out.appendChild(props);
+      for (const change of current.changes) {
+        flat.push({ kind: "prop", depth, change });
+      }
     }
     const children = [...current.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     for (const child of children) {
-      renderNode(child, key + "." + child.name, depth + 1, out);
+      flattenNode(child, key + "." + child.name, depth + 1);
     }
   }
 
-  function render() {
-    list.textContent = "";
+  function rebuildFlat() {
+    flat = [];
+    matchCache.clear();
     for (const service of root.children.values()) {
-      renderNode(service, service.name, 0, list);
+      flattenNode(service, service.name, 0);
     }
-    hintEl.textContent = filterText && !list.querySelector(".row") ? "No changes match" : "";
+    sizer.style.height = (flat.length * ROW_HEIGHT) + "px";
+    hintEl.textContent = filterText && flat.length === 0 ? "No changes match" : "";
+    lastStart = -1;
+    renderWindow();
   }
+
+  function nodeRowHtml(item) {
+    const expandable = item.hasKids || item.propCount > 0;
+    const open = !(item.isCollapsed || (item.propCount > 0 && !item.propsShown && !item.hasKids));
+    return '<div class="row' + (item.isFolder ? " folder" : "") + '" data-key="' + esc(item.key) + '" title="' + esc(item.className || "") + '" style="padding-left:' + (item.depth * 14 + 6) + 'px">' +
+      '<span class="twisty' + (open ? " open" : "") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
+      '<img class="icon" src="' + ASSET + "/" + esc(item.icon || "Folder") + '.png">' +
+      '<span class="rname">' + item.chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
+      (item.propCount > 0 ? '<span class="count">' + item.propCount + "</span>" : "") +
+      "</div>";
+  }
+
+  function propRowHtml(item) {
+    const row = item.change;
+    const oldHtml = fmt(row.oldValue);
+    const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
+    return '<div class="prop-row" style="margin-left:' + (item.depth * 14 + 23) + 'px">' +
+      '<span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
+      '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
+      '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
+  }
+
+  function renderWindow() {
+    const start = Math.max(0, Math.floor(list.scrollTop / ROW_HEIGHT) - OVERSCAN);
+    const count = Math.min(flat.length - start, Math.ceil((list.clientHeight || 400) / ROW_HEIGHT) + OVERSCAN * 2);
+    if (start === lastStart && count === lastCount) return;
+    lastStart = start;
+    lastCount = count;
+    const parts = [];
+    for (let i = start; i < start + count; i++) {
+      const item = flat[i];
+      parts.push(item.kind === "node" ? nodeRowHtml(item) : propRowHtml(item));
+    }
+    viewport.style.transform = "translateY(" + (start * ROW_HEIGHT) + "px)";
+    viewport.innerHTML = parts.join("");
+  }
+
+  list.addEventListener("scroll", () => {
+    if (renderFrame) return;
+    renderFrame = requestAnimationFrame(() => { renderFrame = 0; renderWindow(); });
+  });
+
+  viewport.addEventListener("click", (event) => {
+    const row = event.target.closest(".row");
+    if (!row) return;
+    const key = row.dataset.key;
+    const item = flat.find((entry) => entry.kind === "node" && entry.key === key);
+    if (!item || !(item.hasKids || item.propCount > 0)) return;
+    if (item.isFolder || item.hasKids) {
+      if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
+    }
+    if (item.propCount > 0 && !item.hasKids) {
+      if (item.propsShown) { propsOpen.delete(key); if (autoOpenProps || filterText) collapsed.add(key); }
+      else { propsOpen.add(key); collapsed.delete(key); }
+    }
+    rebuildFlat();
+  });
+
   filterInput.addEventListener("input", () => {
     filterText = filterInput.value.trim().toLowerCase();
-    render();
+    rebuildFlat();
   });
   filterInput.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { filterInput.value = ""; filterText = ""; render(); }
+    if (e.key === "Escape") { filterInput.value = ""; filterText = ""; rebuildFlat(); }
   });
-  render();
+  rebuildFlat();
 
   let secs = 90;
   let paused = false;
