@@ -4834,13 +4834,6 @@ class RobloxSyncController {
     background: var(--surface-hover);
     box-shadow: inset 0 0 0 1px var(--edge-soft);
   }
-  .status-badge {
-    flex: none; width: 15px; height: 15px; margin-left: 8px; border-radius: 4px;
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 9.5px; font-weight: 800;
-  }
-  .status-badge.added { color: color-mix(in srgb, var(--green) 90%, var(--ink)); background: color-mix(in srgb, var(--green) 14%, transparent); }
-  .status-badge.removed { color: color-mix(in srgb, var(--red) 90%, var(--ink)); background: color-mix(in srgb, var(--red) 13%, transparent); }
   .row.added .rname { color: color-mix(in srgb, var(--green) 70%, var(--ink)); }
   .row.removed .rname {
     color: color-mix(in srgb, var(--red) 70%, var(--ink));
@@ -5047,16 +5040,10 @@ class RobloxSyncController {
     const open = !(item.isCollapsed || (item.propCount > 0 && !item.propsShown && !item.hasKids));
     const statusClass = item.status === "added" ? " added" : item.status === "removed" ? " removed" : "";
     const statusTitle = item.status === "added" ? "Added in Studio" : item.status === "removed" ? "Removed in Studio" : (item.className || "");
-    const statusBadge = item.status === "added"
-      ? '<span class="status-badge added">A</span>'
-      : item.status === "removed"
-        ? '<span class="status-badge removed">D</span>'
-        : "";
     return '<div class="row' + (item.isFolder ? " folder" : "") + statusClass + '" data-key="' + esc(item.key) + '" title="' + esc(statusTitle) + '" style="padding-left:' + (item.depth * 14 + 6) + 'px">' +
       '<span class="twisty' + (open ? " open" : "") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
       '<img class="icon" src="' + ASSET + "/" + esc(item.icon || "Folder") + '.png">' +
       '<span class="rname">' + item.chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
-      statusBadge +
       (item.propCount > 0 ? '<span class="count">' + item.propCount + "</span>" : "") +
       "</div>";
   }
