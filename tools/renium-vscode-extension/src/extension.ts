@@ -4872,7 +4872,7 @@ class RobloxSyncController {
   <div class="header">
     <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
     <h1>Studio changes awaiting review</h1>
-    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"}. This batch is over your review threshold of <span class="threshold">${threshold}</span></div>
+    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"}. This batch is over your review threshold of <span class="threshold">${threshold}</span>.</div>
     <div class="toolbar">
       <input class="filter" id="filter" type="text" placeholder="Filter by name, class, or property" spellcheck="false">
       <span class="toolbar-hint" id="toolbar-hint"></span>
