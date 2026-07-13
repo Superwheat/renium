@@ -4723,7 +4723,7 @@ class RobloxSyncController {
   .toolbar-hint { font-size: 11px; color: var(--ink-dim); }
   .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; position: relative; animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both; }
   #sizer { position: relative; width: 100%; }
-  #viewport { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+  #viewport { position: absolute; left: 0; right: 0; top: 0; }
   .row {
     display: flex; align-items: center; height: 26px; border-radius: 6px;
     padding-right: 10px; cursor: pointer; user-select: none; min-width: 0;
@@ -5001,7 +5001,7 @@ class RobloxSyncController {
       const item = flat[i];
       parts.push(item.kind === "node" ? nodeRowHtml(item) : propRowHtml(item));
     }
-    viewport.style.transform = "translateY(" + (start * ROW_HEIGHT) + "px)";
+    viewport.style.top = (start * ROW_HEIGHT) + "px";
     viewport.innerHTML = parts.join("");
   }
 
