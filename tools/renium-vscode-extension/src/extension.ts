@@ -4639,6 +4639,11 @@ class RobloxSyncController {
     const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
     const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
     const services = [...new Set(rows.map((row) => row.service).filter((service) => service.length > 0))];
+    const iconNames = this.changePreviewIconNames ?? new Set<string>();
+    const folderIcon = iconAssetNameForClass("Folder", iconNames);
+    const serviceIcons = Object.fromEntries(
+      services.map((service) => [service, iconAssetNameForClass(service, iconNames)]),
+    );
     return `<!DOCTYPE html>
 <html>
 <head>
@@ -4706,28 +4711,46 @@ class RobloxSyncController {
   h1 { font-size: 19px; font-weight: 640; letter-spacing: -0.018em; margin-top: 10px; }
   .subtitle { margin-top: 4px; font-size: 12.5px; color: var(--ink-mid); max-width: 60ch; }
   .subtitle b { color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; }
-  .list { flex: 1; overflow-y: auto; padding: 4px 30px 26px; }
-  .group {
-    border: 1px solid var(--edge);
-    border-radius: 12px; margin-top: 12px; overflow: hidden;
-    background: var(--surface);
-    animation: rise 0.34s cubic-bezier(0.16, 1, 0.3, 1) both;
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+  .filter {
+    flex: none; width: 240px; font-family: inherit; font-size: 12px;
+    color: var(--ink); background: var(--surface); border: 1px solid var(--edge);
+    border-radius: 7px; padding: 5px 11px; outline: none;
+    transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .group-head {
-    display: flex; align-items: baseline; gap: 10px; padding: 11px 16px 9px;
+  .filter:focus { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--surface-hover); }
+  .filter::placeholder { color: var(--ink-dim); }
+  .toolbar-hint { font-size: 11px; color: var(--ink-dim); }
+  .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; }
+  .row {
+    display: flex; align-items: center; height: 25px; border-radius: 6px;
+    padding-right: 10px; cursor: pointer; user-select: none; min-width: 0;
   }
+  .row:hover { background: var(--surface-hover); }
+  .twisty {
+    width: 17px; flex: none; text-align: center; color: var(--ink-dim);
+    font-size: 10px; line-height: 1; transition: transform 0.12s ease;
+  }
+  .twisty.open { transform: rotate(90deg); }
+  .twisty.blank { visibility: hidden; }
   .icon {
-    width: 16px; height: 16px; flex: none; align-self: center;
+    width: 16px; height: 16px; flex: none; margin-right: 6px;
     display: block; object-fit: contain; object-position: center center; image-rendering: pixelated;
   }
-  .leaf { font-weight: 640; font-size: 13.5px; letter-spacing: -0.008em; }
-  .classtag { font-size: 11px; font-weight: 500; color: var(--ink-dim); flex: none; }
-  .classtag::before { content: "\\00b7"; margin-right: 10px; opacity: 0.7; }
-  .crumbs { margin-left: auto; font-size: 11px; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
-  .props { padding: 2px 8px 9px; }
+  .rname { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row.folder .rname { color: var(--ink-mid); }
+  .rsep { color: var(--ink-dim); margin: 0 4px; font-size: 11px; }
+  .rclass { margin-left: 9px; font-size: 11px; color: var(--ink-dim); flex: none; }
+  .count {
+    margin-left: auto; flex: none; font-size: 10px; font-weight: 650;
+    padding: 1px 8px; border-radius: 999px;
+    background: var(--surface-hover); color: var(--ink-mid);
+    font-variant-numeric: tabular-nums;
+  }
+  .props { margin: 1px 0 4px; }
   .prop-row {
-    display: grid; grid-template-columns: minmax(130px, 210px) 1fr;
-    gap: 16px; align-items: center; padding: 6px 10px; border-radius: 8px;
+    display: grid; grid-template-columns: minmax(120px, 190px) 1fr;
+    gap: 16px; align-items: center; padding: 4px 10px; border-radius: 6px;
   }
   .prop-row:hover { background: var(--surface-hover); }
   .prop-name-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -4798,6 +4821,10 @@ class RobloxSyncController {
     <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
     <h1>Studio changes awaiting review</h1>
     <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"} &mdash; this batch is over your review threshold of ${threshold}.</div>
+    <div class="toolbar">
+      <input class="filter" id="filter" type="text" placeholder="Filter by name, class, or property" spellcheck="false">
+      <span class="toolbar-hint" id="toolbar-hint"></span>
+    </div>
   </div>
   <div class="list" id="list"></div>
   <div class="footer">
@@ -4813,6 +4840,8 @@ class RobloxSyncController {
   const vscode = acquireVsCodeApi();
   const DATA = ${payload};
   const ASSET = ${JSON.stringify(assetBase)};
+  const SERVICE_ICONS = ${JSON.stringify(serviceIcons)};
+  const FOLDER_ICON = ${JSON.stringify(folderIcon)};
 
   function esc(text) {
     return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -4846,44 +4875,126 @@ class RobloxSyncController {
     return esc(String(value));
   }
 
-  const groups = new Map();
+  const root = { children: new Map(), changes: null, icon: null, className: "" };
   for (const row of DATA) {
-    const key = row.service + "\\u0000" + row.path;
-    if (!groups.has(key)) groups.set(key, { head: row, rows: [] });
-    groups.get(key).rows.push(row);
+    const segments = row.path.length > 0 ? row.path.split(".") : [row.leaf];
+    let node = root;
+    for (const segment of segments) {
+      if (!node.children.has(segment)) {
+        node.children.set(segment, { name: segment, children: new Map(), changes: null, icon: null, className: "" });
+      }
+      node = node.children.get(segment);
+    }
+    if (!node.changes) {
+      node.changes = [];
+      node.icon = row.icon;
+      node.className = row.className;
+    }
+    node.changes.push(row);
   }
+
   const list = document.getElementById("list");
-  let order = 0;
-  const MAX_GROUPS = 300;
-  let rendered = 0;
-  for (const { head, rows } of groups.values()) {
-    if (rendered++ >= MAX_GROUPS) continue;
-    const group = document.createElement("div");
-    group.className = "group";
-    group.style.animationDelay = Math.min(order++ * 28, 500) + "ms";
-    const crumbs = head.path.includes(".") ? head.path.slice(0, head.path.lastIndexOf(".")) : head.service;
-    const propsHtml = rows.map((row) => {
+  const filterInput = document.getElementById("filter");
+  const hintEl = document.getElementById("toolbar-hint");
+  const instanceTotal = ${instanceCount};
+  const collapsed = new Set();
+  const propsOpen = new Set();
+  const autoOpenProps = instanceTotal <= 12;
+  let filterText = "";
+
+  function nodeMatches(node, pathKey) {
+    if (!filterText) return true;
+    if (node.name.toLowerCase().includes(filterText)) return true;
+    if (node.className && node.className.toLowerCase().includes(filterText)) return true;
+    if (node.changes && node.changes.some((c) => c.property.toLowerCase().includes(filterText))) return true;
+    for (const child of node.children.values()) {
+      if (nodeMatches(child, pathKey + "." + child.name)) return true;
+    }
+    return false;
+  }
+
+  function propsHtml(changes) {
+    return changes.map((row) => {
       const oldHtml = fmt(row.oldValue);
       const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
       return '<div class="prop-row"><span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
         '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
         '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
     }).join("");
-    group.innerHTML =
-      '<div class="group-head">' +
-      '<img class="icon" src="' + ASSET + "/" + esc(head.icon) + '.png">' +
-      '<span class="leaf">' + esc(head.leaf) + "</span>" +
-      '<span class="classtag">' + esc(head.className || "Instance") + "</span>" +
-      '<span class="crumbs">' + esc(crumbs) + "</span>" +
-      '</div><div class="props">' + propsHtml + "</div>";
-    list.appendChild(group);
   }
-  if (groups.size > MAX_GROUPS) {
-    const more = document.createElement("div");
-    more.className = "group";
-    more.innerHTML = '<div class="crumbs" style="padding:8px 0 0 32px">\\u2026 and ' + (groups.size - MAX_GROUPS) + " more instances (scroll of this size is best reviewed via full import)</div>";
-    list.appendChild(more);
+
+  function renderNode(node, pathKey, depth, out) {
+    if (!nodeMatches(node, pathKey)) return;
+    let chain = [node.name];
+    let current = node;
+    let key = pathKey;
+    while (!current.changes && current.children.size === 1 && !filterText) {
+      const child = current.children.values().next().value;
+      chain.push(child.name);
+      key = key + "." + child.name;
+      current = child;
+    }
+    const isFolder = !current.changes;
+    const hasKids = current.children.size > 0;
+    const propCount = current.changes ? current.changes.length : 0;
+    const isCollapsed = collapsed.has(key);
+    const propsShown = propCount > 0 && !isCollapsed && (propsOpen.has(key) || autoOpenProps || !!filterText);
+    const expandable = hasKids || propCount > 0;
+    const iconName = isFolder
+      ? (depth === 0 ? (SERVICE_ICONS[chain[0]] || FOLDER_ICON) : FOLDER_ICON)
+      : current.icon;
+
+    const row = document.createElement("div");
+    row.className = "row" + (isFolder ? " folder" : "");
+    row.style.paddingLeft = (depth * 14 + 6) + "px";
+    row.innerHTML =
+      '<span class="twisty' + ((isCollapsed || (propCount > 0 && !propsShown && !hasKids)) ? "" : " open") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
+      '<img class="icon" src="' + ASSET + "/" + esc(iconName || "Folder") + '.png">' +
+      '<span class="rname">' + chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
+      (!isFolder && current.className ? '<span class="rclass">' + esc(current.className) + "</span>" : "") +
+      (propCount > 0 ? '<span class="count">' + propCount + "</span>" : "");
+    row.addEventListener("click", () => {
+      if (!expandable) return;
+      if (isFolder || hasKids) {
+        if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
+      }
+      if (propCount > 0 && !hasKids) {
+        if (propsShown) { propsOpen.delete(key); if (autoOpenProps || filterText) collapsed.add(key); }
+        else { propsOpen.add(key); collapsed.delete(key); }
+      }
+      render();
+    });
+    out.appendChild(row);
+
+    if (isCollapsed) return;
+    if (propsShown) {
+      const props = document.createElement("div");
+      props.className = "props";
+      props.style.paddingLeft = (depth * 14 + 29) + "px";
+      props.innerHTML = propsHtml(current.changes);
+      out.appendChild(props);
+    }
+    const children = [...current.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    for (const child of children) {
+      renderNode(child, key + "." + child.name, depth + 1, out);
+    }
   }
+
+  function render() {
+    list.textContent = "";
+    for (const service of root.children.values()) {
+      renderNode(service, service.name, 0, list);
+    }
+    hintEl.textContent = filterText && !list.querySelector(".row") ? "No changes match" : "";
+  }
+  filterInput.addEventListener("input", () => {
+    filterText = filterInput.value.trim().toLowerCase();
+    render();
+  });
+  filterInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { filterInput.value = ""; filterText = ""; render(); }
+  });
+  render();
 
   let secs = 90;
   let paused = false;
