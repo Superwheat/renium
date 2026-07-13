@@ -90,6 +90,7 @@
         let deferredPropertiesMessage = null;
         let curveCanvasListenersAttached = false;
         let propertiesReadOnly = false;
+        let currentNodeTreeId = null;
         const propertyPostTimers = new Map();
 
         function applyDeferredPropertiesIfIdle() {
@@ -120,6 +121,7 @@
             }
             if (typeof message === 'object') {
                 propertiesReadOnly = message.readOnly === true;
+                currentNodeTreeId = typeof message.nodeTreeId === "string" ? message.nodeTreeId : null;
                 if (propertiesReadOnly) {
                     showTagInput = false;
                     renamingAttribute = null;
@@ -418,7 +420,6 @@
                         control.setSelectionRange(0, length);
                     }
                 } catch {
-                    // Some input types do not allow selection ranges.
                 }
             };
             selectAll();
@@ -489,7 +490,6 @@
                     try {
                         control.setSelectionRange(start, end);
                     } catch {
-                        // Some input types do not allow selection ranges.
                     }
                 }
             };
@@ -864,6 +864,7 @@
             activePropertyEdit = propertyName;
             vscode.postMessage({
                 type: "setProperty",
+                nodeTreeId: currentNodeTreeId,
                 propertyName,
                 propertyValue,
             });
@@ -873,6 +874,7 @@
             if (propertiesReadOnly) return;
             vscode.postMessage({
                 type: "setProperty",
+                nodeTreeId: currentNodeTreeId,
                 propertyName,
                 propertyValue,
                 live: true,
@@ -1286,7 +1288,6 @@
             }
 
             if (typeof prop.value === "object") {
-                // Raw store-format values verde did not convert (no schema match).
                 if (prop.value._type === "EnumItem") {
                     return String(prop.value.name != null ? prop.value.name : (prop.value.Name != null ? prop.value.Name : ""));
                 }
@@ -2614,6 +2615,7 @@
                         if (tagName) {
                             vscode.postMessage({
                                 type: "addTag",
+                                nodeTreeId: currentNodeTreeId,
                                 tagName
                             });
                             showTagInput = false;
@@ -2659,6 +2661,7 @@
                         if (propertiesReadOnly) return;
                         vscode.postMessage({
                             type: "removeTag",
+                            nodeTreeId: currentNodeTreeId,
                             tagName: tag
                         });
                     });
@@ -2755,6 +2758,7 @@
                         if (newName && newName !== attr.name) {
                             vscode.postMessage({
                                 type: "renameAttribute",
+                                nodeTreeId: currentNodeTreeId,
                                 oldName: attr.name,
                                 newName: newName
                             });
@@ -2836,6 +2840,7 @@
                 e.preventDefault();
                 vscode.postMessage({
                     type: "removeAttribute",
+                    nodeTreeId: currentNodeTreeId,
                     attributeName: attributeName
                 });
                 closeAttributeContextMenu();
@@ -2852,11 +2857,9 @@
 
             menu.style.position = "fixed";
 
-            // align bottom-right of menu with bottom-right of gear icon
             let left = gearRect.right - menuRect.width;
             let top = gearRect.bottom - menuRect.height - 2;
 
-            // prevent overflow - adjust if menu would go off screen
             if (left < 4) {
                 left = gearRect.left;
             }
@@ -3408,6 +3411,7 @@
             if (propertiesReadOnly) return;
             vscode.postMessage({
                 type: "setAttribute",
+                nodeTreeId: currentNodeTreeId,
                 attributeName,
                 attributeValue
             });
@@ -3481,6 +3485,7 @@
                     if (name) {
                         vscode.postMessage({
                             type: "addAttribute",
+                            nodeTreeId: currentNodeTreeId,
                             attributeName: name,
                             attributeType: type
                         });
@@ -3533,6 +3538,7 @@
                 if (name) {
                     vscode.postMessage({
                         type: "addAttribute",
+                        nodeTreeId: currentNodeTreeId,
                         attributeName: name,
                         attributeType: type
                     });

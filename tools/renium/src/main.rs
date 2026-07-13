@@ -5493,7 +5493,7 @@ fn execute_luau_daemon_args(args: &ExecuteLuauArgs) -> Result<Vec<String>> {
         return Ok(out);
     }
     if let Some(path) = args.file.as_ref() {
-        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let path = canonical_path(path).unwrap_or_else(|_| path.clone());
         out.push("-f".to_string());
         out.push(path.display().to_string());
         return Ok(out);
@@ -5953,13 +5953,67 @@ fn start_stop_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Res
     if let Some(players) = args.players {
         return start_multiplayer_test_result(bridge, players);
     }
-    let mut params = serde_json::Map::new();
     if args.start {
-        params.insert("start".to_string(), Value::Bool(true));
+        return start_single_play_result(bridge);
     }
-    let result = bridge.call("startStopPlay", Value::Object(params))?;
+    let result = bridge.call("startStopPlay", json!({}))?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
+}
+
+fn connected_play_roles(bridge: &BridgeServer) -> (Vec<Value>, usize) {
+    let clients = bridge.list_bridge_clients();
+    let play_roles = clients
+        .iter()
+        .filter(|entry| {
+            entry["role"] == BRIDGE_ROLE_PLAY_SERVER || entry["role"] == BRIDGE_ROLE_PLAY_CLIENT
+        })
+        .count();
+    (clients, play_roles)
+}
+
+fn start_single_play_result(bridge: &BridgeServer) -> Result<Value> {
+    let start_result = bridge.call(
+        "startStopPlay",
+        json!({ "start": true, "timeoutSeconds": 1.0 }),
+    )?;
+    if start_result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(start_result);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_status = start_result.clone();
+    loop {
+        let (clients, play_roles) = connected_play_roles(bridge);
+        if play_roles > 0 {
+            return Ok(json!({
+                "ok": true,
+                "action": "start",
+                "mode": "play",
+                "method": "bridgeRoles",
+                "clients": clients,
+                "startResult": start_result,
+            }));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
+                serde_json::to_string(&last_status)?,
+                serde_json::to_string(&bridge.list_bridge_clients())?
+            );
+        }
+        match studio_play_status_result(bridge) {
+            Ok(status) => {
+                if status.get("running").and_then(Value::as_bool) == Some(true) {
+                    return Ok(status);
+                }
+                last_status = status;
+            }
+            Err(err) => {
+                last_status = json!({ "error": format!("{err:#}") });
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<Value> {
@@ -6949,31 +7003,58 @@ fn list_clients_command(args: ListClientsArgs) -> Result<()> {
 
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     let mut last_status = Value::Null;
+    let mut last_play_roles = 0;
     for attempt in 1..=3 {
         let stop_result = bridge.call("startStopPlay", json!({ "stop": true }))?;
         ensure_plugin_api_ok(&stop_result)?;
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status_stopped = false;
         while Instant::now() < deadline {
             match studio_play_status_result(bridge) {
                 Ok(status) => {
                     last_status = status.clone();
-                    if studio_status_indicates_stopped(&status) {
-                        return Ok(json!({
-                            "ok": true,
-                            "action": "stop",
-                            "method": "pluginApi",
-                            "attempts": attempt,
-                            "stopResult": stop_result,
-                            "status": status,
-                        }));
-                    }
+                    status_stopped = studio_status_indicates_stopped(&status);
                 }
                 Err(err) => {
                     last_status = json!({ "error": format!("{:#}", err) });
+                    status_stopped = false;
                 }
+            }
+            if status_stopped {
+                break;
             }
             thread::sleep(Duration::from_millis(100));
         }
+        if status_stopped {
+            let teardown_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let (clients, play_roles) = connected_play_roles(bridge);
+                last_play_roles = play_roles;
+                if play_roles == 0 {
+                    return Ok(json!({
+                        "ok": true,
+                        "action": "stop",
+                        "method": "pluginApi",
+                        "attempts": attempt,
+                        "stopResult": stop_result,
+                        "status": last_status,
+                        "clients": clients,
+                    }));
+                }
+                if Instant::now() >= teardown_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    if last_play_roles > 0 {
+        bail!(
+            "Studio reported edit mode but {} play bridge(s) are still connected after stop; last status: {}, connected bridges: {}",
+            last_play_roles,
+            serde_json::to_string(&last_status)?,
+            serde_json::to_string(&bridge.list_bridge_clients())?
+        );
     }
     bail!(
         "Studio did not report edit mode after plugin stop request; last status: {}",
@@ -7382,7 +7463,7 @@ fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathB
 
 fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSet> {
     let project_root = if args.project_root.exists() {
-        strip_extended_prefix(args.project_root.canonicalize().with_context(|| {
+        strip_extended_prefix(canonical_path(&args.project_root).with_context(|| {
             format!(
                 "Failed to resolve project root: {}",
                 args.project_root.display()
@@ -7414,7 +7495,7 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
     );
     for changed_path in enforced_changed_paths {
         let absolute_path = absolutize_under(&project_root, &changed_path);
-        let absolute_path = match absolute_path.canonicalize() {
+        let absolute_path = match canonical_path(&absolute_path) {
             Ok(canonical) => strip_extended_prefix(canonical),
             Err(_) => strip_extended_prefix(absolute_path),
         };
@@ -7670,7 +7751,7 @@ fn save_editor_history_entries(
         return Ok(());
     }
     let project_root = if project_root_arg.exists() {
-        project_root_arg.canonicalize().with_context(|| {
+        canonical_path(project_root_arg).with_context(|| {
             format!(
                 "Failed to resolve project root: {}",
                 project_root_arg.display()
@@ -7770,7 +7851,7 @@ fn save_editor_history_entries(
 
 fn editor_revert(args: EditorRevertArgs) -> Result<()> {
     let project_root = if args.project_root.exists() {
-        args.project_root.canonicalize().with_context(|| {
+        canonical_path(&args.project_root).with_context(|| {
             format!(
                 "Failed to resolve project root: {}",
                 args.project_root.display()
@@ -14572,7 +14653,7 @@ fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()> {
 }
 
 fn bytecode_export_place(args: BytecodeExportPlaceArgs) -> Result<()> {
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
@@ -15882,11 +15963,9 @@ fn resolve_link_source(
 }
 
 fn canonical_existing_descendant(root: &Path, candidate: &Path, label: &str) -> Result<PathBuf> {
-    let root = root
-        .canonicalize()
+    let root = canonical_path(root)
         .with_context(|| format!("Failed to resolve {}", root.display()))?;
-    let candidate = candidate
-        .canonicalize()
+    let candidate = canonical_path(candidate)
         .with_context(|| format!("{label} not found: {}", candidate.display()))?;
     if candidate != root && !candidate.starts_with(&root) {
         bail!(
@@ -15910,8 +15989,7 @@ fn ensure_existing_ancestor_inside(root: &Path, target: &Path, label: &str) -> R
         return Ok(());
     }
 
-    let root = root
-        .canonicalize()
+    let root = canonical_path(root)
         .with_context(|| format!("Failed to resolve {}", root.display()))?;
     let mut ancestor = target;
     while fs::symlink_metadata(ancestor).is_err() {
@@ -15919,8 +15997,7 @@ fn ensure_existing_ancestor_inside(root: &Path, target: &Path, label: &str) -> R
             .parent()
             .with_context(|| format!("{label} has no existing parent: {}", target.display()))?;
     }
-    let ancestor = ancestor
-        .canonicalize()
+    let ancestor = canonical_path(ancestor)
         .with_context(|| format!("Failed to resolve {}", ancestor.display()))?;
     if ancestor != root && !ancestor.starts_with(&root) {
         bail!(
@@ -16587,24 +16664,34 @@ fn apply_link_enforcement_to_changed_paths(
 }
 
 /// Strip the Windows `\\?\` extended-length prefix from a canonicalized drive
-/// path so external tools (notably `git`) accept it. UNC paths are left intact.
+/// or UNC path so external tools (notably `git`) accept it and so path forms
+/// compare equal across call sites.
 fn strip_extended_prefix(path: PathBuf) -> PathBuf {
     if cfg!(windows)
         && let Some(text) = path.to_str()
-        && let Some(stripped) = text.strip_prefix(r"\\?\")
     {
-        let bytes = stripped.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' {
-            return PathBuf::from(stripped);
+        if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            let bytes = stripped.as_bytes();
+            if bytes.len() >= 2 && bytes[1] == b':' {
+                return PathBuf::from(stripped);
+            }
         }
     }
     path
 }
 
+/// Canonicalize with a normalized result form; every canonicalization in this
+/// crate must go through here so root and file paths always compare equal.
+fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(strip_extended_prefix(fs::canonicalize(path)?))
+}
+
 fn resolve_link_project_root(raw: &Path) -> Result<PathBuf> {
     if raw.exists() {
-        let canonical = raw
-            .canonicalize()
+        let canonical = canonical_path(raw)
             .with_context(|| format!("Failed to resolve project root: {}", raw.display()))?;
         Ok(strip_extended_prefix(canonical))
     } else {
@@ -18295,7 +18382,7 @@ fn import_wally_realm(
 
 fn sync_wally_packages(args: SyncWallyPackagesArgs) -> Result<()> {
     let project_root =
-        strip_extended_prefix(args.project_root.canonicalize().with_context(|| {
+        strip_extended_prefix(canonical_path(&args.project_root).with_context(|| {
             format!(
                 "Failed to resolve project root: {}",
                 args.project_root.display()
@@ -18479,11 +18566,9 @@ fn remove_existing_directory_inside(root: &Path, target: &Path) -> Result<bool> 
     if !target.exists() {
         return Ok(false);
     }
-    let root = root
-        .canonicalize()
+    let root = canonical_path(root)
         .with_context(|| format!("Failed to resolve {}", root.display()))?;
-    let target = target
-        .canonicalize()
+    let target = canonical_path(target)
         .with_context(|| format!("Failed to resolve {}", target.display()))?;
     if target == root || !target.starts_with(&root) {
         bail!(
@@ -18651,7 +18736,7 @@ fn bytecode_repack(args: BytecodeRepackArgs) -> Result<()> {
 }
 
 fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathBuf>> {
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
@@ -19176,7 +19261,10 @@ fn json_string_or_wrapped<'a>(value: &'a Value, wrapper_name: &str) -> Option<&'
 }
 
 fn json_f64(value: &Value) -> Option<f64> {
-    value.as_f64().filter(|value| value.is_finite())
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .or_else(|| nonfinite_float_from_json(value))
 }
 
 fn json_f32(value: &Value) -> Option<f32> {
@@ -19831,7 +19919,34 @@ fn rbx_variant_to_settings_json(
 }
 
 fn json_number_f64(value: f64) -> Option<Value> {
-    Number::from_f64(value).map(Value::Number)
+    if let Some(number) = Number::from_f64(value) {
+        return Some(Value::Number(number));
+    }
+    Some(nonfinite_float_json(value))
+}
+
+fn nonfinite_float_json(value: f64) -> Value {
+    let text = if value.is_nan() {
+        "nan"
+    } else if value > 0.0 {
+        "inf"
+    } else {
+        "-inf"
+    };
+    json!({ "_type": "Float", "value": text })
+}
+
+fn nonfinite_float_from_json(value: &Value) -> Option<f64> {
+    let object = value.as_object()?;
+    if object.get("_type").and_then(Value::as_str) != Some("Float") {
+        return None;
+    }
+    match object.get("value").and_then(Value::as_str)? {
+        "nan" => Some(f64::NAN),
+        "inf" => Some(f64::INFINITY),
+        "-inf" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
 }
 
 fn rbx_cframe_to_settings_json(value: RbxCFrame) -> Value {
@@ -20085,7 +20200,7 @@ fn parse_property_assignments(raw: &[String]) -> Result<Map<String, Value>> {
 }
 
 fn generate_sourcemap_command(args: GenerateSourcemapArgs) -> Result<()> {
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
@@ -20646,7 +20761,52 @@ fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PlaceGuardConfig {
+    #[serde(default, rename = "allowedPlaceIds")]
+    allowed_place_ids: Vec<i64>,
+    #[serde(default, rename = "allowedGameIds")]
+    allowed_game_ids: Vec<i64>,
+}
+
+fn active_place_guard() -> Option<&'static PlaceGuardConfig> {
+    static GUARD: std::sync::OnceLock<Option<PlaceGuardConfig>> = std::sync::OnceLock::new();
+    GUARD
+        .get_or_init(|| {
+            if std::env::var("RENIUM_ALLOW_ANY_PLACE").is_ok_and(|value| value == "1") {
+                return None;
+            }
+            let text = fs::read_to_string("renium.config.json").ok()?;
+            let config: PlaceGuardConfig = serde_json::from_str(&text).ok()?;
+            (!config.allowed_place_ids.is_empty() || !config.allowed_game_ids.is_empty())
+                .then_some(config)
+        })
+        .as_ref()
+}
+
+fn ensure_place_allowed(info: &BridgeInfoPayload) -> Result<()> {
+    let Some(guard) = active_place_guard() else {
+        return Ok(());
+    };
+    let place_allowed = info
+        .place_id
+        .is_some_and(|id| guard.allowed_place_ids.contains(&id));
+    let game_allowed = info
+        .game_id
+        .is_some_and(|id| guard.allowed_game_ids.contains(&id));
+    if place_allowed || game_allowed {
+        return Ok(());
+    }
+    bail!(
+        "Refusing bridge connection from place '{}' (placeId {}, gameId {}): not listed in renium.config.json allowedPlaceIds/allowedGameIds. Unsaved local places report placeId 0; add 0 to the allowlist or set RENIUM_ALLOW_ANY_PLACE=1 to override.",
+        info.place_name,
+        info.place_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        info.game_id.map_or_else(|| "none".to_string(), |id| id.to_string())
+    )
+}
+
 fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
+    ensure_place_allowed(info)?;
     if info.protocol_version != BRIDGE_PROTOCOL_VERSION {
         bail!(
             "Unsupported plugin protocol {} (expected {})",
@@ -20920,7 +21080,7 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
         args.modified_default_bypass
     };
 
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
@@ -25595,13 +25755,13 @@ fn current_unix_ts() -> i64 {
 }
 
 fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
         )
     })?;
-    let snapshot_dir = args.snapshot_dir.canonicalize().with_context(|| {
+    let snapshot_dir = canonical_path(&args.snapshot_dir).with_context(|| {
         format!(
             "Failed to resolve snapshot directory: {}",
             args.snapshot_dir.display()
@@ -25693,7 +25853,7 @@ fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
 }
 
 fn import_service(args: ImportServiceArgs) -> Result<()> {
-    let project_root = args.project_root.canonicalize().with_context(|| {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
         format!(
             "Failed to resolve project root: {}",
             args.project_root.display()
@@ -27549,8 +27709,7 @@ fn writable_service_settings_path(service_dir: &Path) -> Result<PathBuf> {
     let legacy = legacy_service_settings_path(service_dir);
     if legacy.exists()
         && let Err(error) = fs::rename(&legacy, &canonical)
-    {
-        if !canonical.exists() {
+        && !canonical.exists() {
             return Err(error).with_context(|| {
                 format!(
                     "Failed to migrate legacy settings store {} to {}",
@@ -27559,7 +27718,6 @@ fn writable_service_settings_path(service_dir: &Path) -> Result<PathBuf> {
                 )
             });
         }
-    }
     Ok(canonical)
 }
 
@@ -27581,10 +27739,12 @@ fn path_key(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        if ch == '\\' {
+        if ch == '\\' && cfg!(windows) {
             out.push('/');
-        } else {
+        } else if cfg!(windows) {
             out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
         }
     }
     out
@@ -28094,10 +28254,23 @@ struct SourcemapNode {
 }
 
 fn path_to_sourcemap_relative(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    let root = strip_extended_prefix(project_root.to_path_buf());
+    let path = strip_extended_prefix(path.to_path_buf());
+    if let Ok(stripped) = path.strip_prefix(&root) {
+        return stripped.to_string_lossy().replace('\\', "/");
+    }
+    if cfg!(windows) {
+        let root_key = path_key(&root);
+        let full_key = path_key(&path);
+        if let Some(rest) = full_key.strip_prefix(&root_key) {
+            let tail = rest.trim_start_matches('/');
+            let text = path.to_string_lossy().replace('\\', "/");
+            if text.len() >= tail.len() && text.is_char_boundary(text.len() - tail.len()) {
+                return text[text.len() - tail.len()..].to_string();
+            }
+        }
+    }
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[expect(
@@ -34564,6 +34737,61 @@ mod tests {
             let extended = link_path_key(Path::new(r"\\?\C:\Temp\src\X.luau"));
             let clean = link_path_key(Path::new(r"C:\Temp\src\X.luau"));
             assert_eq!(extended, clean);
+        }
+    }
+
+    #[test]
+    fn strip_extended_prefix_handles_unc_paths() {
+        if cfg!(windows) {
+            assert_eq!(
+                strip_extended_prefix(PathBuf::from(r"\\?\UNC\server\share\dir\f.luau")),
+                PathBuf::from(r"\\server\share\dir\f.luau")
+            );
+            assert_eq!(
+                strip_extended_prefix(PathBuf::from(r"\\?\C:\dir\f.luau")),
+                PathBuf::from(r"C:\dir\f.luau")
+            );
+            assert_eq!(
+                strip_extended_prefix(PathBuf::from(r"\\server\share\dir")),
+                PathBuf::from(r"\\server\share\dir")
+            );
+        }
+    }
+
+    #[test]
+    fn nonfinite_float_json_roundtrip() {
+        let nan = json_number_f64(f64::NAN).unwrap();
+        assert!(json_f64(&nan).unwrap().is_nan());
+        let inf = json_number_f64(f64::INFINITY).unwrap();
+        assert_eq!(json_f64(&inf), Some(f64::INFINITY));
+        let neg = json_number_f64(f64::NEG_INFINITY).unwrap();
+        assert_eq!(json_f64(&neg), Some(f64::NEG_INFINITY));
+        assert_eq!(json_f64(&json!(1.5)), Some(1.5));
+        assert_eq!(json_f64(&json!("inf")), None);
+    }
+
+    #[test]
+    fn sourcemap_relative_tolerates_root_form_mismatch() {
+        if cfg!(windows) {
+            assert_eq!(
+                path_to_sourcemap_relative(
+                    Path::new(r"C:\proj"),
+                    Path::new(r"\\?\C:\proj\src\Workspace\A.luau")
+                ),
+                "src/Workspace/A.luau"
+            );
+            assert_eq!(
+                path_to_sourcemap_relative(
+                    Path::new(r"c:\Proj"),
+                    Path::new(r"C:\proj\src\B.luau")
+                ),
+                "src/B.luau"
+            );
+        } else {
+            assert_eq!(
+                path_to_sourcemap_relative(Path::new("/proj"), Path::new("/proj/src/C.luau")),
+                "src/C.luau"
+            );
         }
     }
 

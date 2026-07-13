@@ -1016,9 +1016,20 @@ fn read_fixed_numeric_component(reader: &mut BytecodeReader<'_>) -> Result<f64> 
 }
 
 fn number_from_f64(value: f64) -> Result<Value> {
-    Number::from_f64(value)
-        .map(Value::Number)
-        .with_context(|| format!("Invalid finite JSON number {value}"))
+    if let Some(number) = Number::from_f64(value) {
+        return Ok(Value::Number(number));
+    }
+    let text = if value.is_nan() {
+        "nan"
+    } else if value > 0.0 {
+        "inf"
+    } else {
+        "-inf"
+    };
+    let mut object = Map::with_capacity(2);
+    object.insert("_type".to_string(), Value::String("Float".to_string()));
+    object.insert("value".to_string(), Value::String(text.to_string()));
+    Ok(Value::Object(object))
 }
 
 fn unzigzag_i64(value: u64) -> i64 {

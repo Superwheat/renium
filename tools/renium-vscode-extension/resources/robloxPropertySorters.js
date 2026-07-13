@@ -6856,7 +6856,6 @@ function comparePropertyNamesWithinCategory(categoryName, aPropertyName, bProper
     const categoryKey = normalizeKey(categoryName);
     const map = ORDER_DATA.propertyRankByCategory[categoryKey];
     if (!map) {
-        // Debug logging for misses
         if (typeof window !== 'undefined' && window.PROPERTY_SORTER_DEBUG) {
             console.log(`Property sorter fallback: ${categoryName} - "${aPropertyName}" vs "${bPropertyName}" (class: ${nodeClassName || 'none'})`);
         }
@@ -6878,7 +6877,6 @@ function comparePropertyNamesWithinCategory(categoryName, aPropertyName, bProper
     if (aHas && !bHas) return -1;
     if (!aHas && bHas) return 1;
 
-    // Debug logging for misses
     if (typeof window !== 'undefined' && window.PROPERTY_SORTER_DEBUG) {
         console.log(`Property sorter fallback: ${categoryName} - "${aPropertyName}" vs "${bPropertyName}" (class: ${nodeClassName || 'none'})`);
     }

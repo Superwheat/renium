@@ -715,7 +715,17 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 	end
 	typeName = tostring(typeName)
 
-	if typeName == "Vector2" then
+	if typeName == "Float" then
+		local text = raw.value
+		if text == "nan" then
+			return true, 0 / 0
+		elseif text == "inf" then
+			return true, math.huge
+		elseif text == "-inf" then
+			return true, -math.huge
+		end
+		return true, tonumber(text) or 0
+	elseif typeName == "Vector2" then
 		return true, Vector2.new(numberField(raw, "x"), numberField(raw, "y"))
 	elseif typeName == "Vector3" then
 		return true, Vector3.new(numberField(raw, "x"), numberField(raw, "y"), numberField(raw, "z"))

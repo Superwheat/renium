@@ -2726,6 +2726,22 @@ function BridgePluginRuntime.start(context)
 		return false
 	end
 	
+	Config.encodeNumberV5 = function(value: any): any
+		if type(value) ~= "number" then
+			return nil
+		end
+		if value ~= value then
+			return { _type = "Float", value = "nan" }
+		end
+		if value == math.huge then
+			return { _type = "Float", value = "inf" }
+		end
+		if value == -math.huge then
+			return { _type = "Float", value = "-inf" }
+		end
+		return value
+	end
+
 	local function encodeSchemaValueV5(
 		typeId: number,
 		enumType: string?,
@@ -2739,9 +2755,7 @@ function BridgePluginRuntime.start(context)
 				return value
 			end
 		elseif typeId == COMPACT_TYPE_IDS.Number then
-			if type(value) == "number" then
-				return value
-			end
+			return Config.encodeNumberV5(value)
 		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.ContentId or typeId == COMPACT_TYPE_IDS.BinaryString then
 			if type(value) == "string" then
 				return Config.internBatchString(strings, stringIds, value)
@@ -2966,10 +2980,7 @@ function BridgePluginRuntime.start(context)
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Number] = function(value: any): any
-			if type(value) == "number" then
-				return value
-			end
-			return nil
+			return Config.encodeNumberV5(value)
 		end,
 		[COMPACT_TYPE_IDS.String] = function(value: any, _state: ServiceState?, strings: { string }, stringIds: { [string]: number }): any
 			if type(value) == "string" then

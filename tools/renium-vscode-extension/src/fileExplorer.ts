@@ -15,7 +15,7 @@ import {
 } from "./rbsyncDecode";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
 import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
-import { isScriptClass } from "./utils";
+import { isScriptClass, pickWorkspaceRoot } from "./utils";
 
 const SETTINGS_FILE_NAME = "__roblox_sync_settings.renium";
 const LEGACY_SETTINGS_FILE_NAME = "__roblox_sync_settings.rbsync";
@@ -570,11 +570,11 @@ export function loadAssetIconNames(extensionUri: vscode.Uri): string[] {
 }
 
 function workspaceRoot(): string {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
+  const root = pickWorkspaceRoot();
+  if (!root) {
     throw new Error("Open a workspace folder before using Renium.");
   }
-  return folder.uri.fsPath;
+  return root;
 }
 
 function delay(ms: number): Promise<void> {
@@ -4419,6 +4419,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       ),
       nodeName: this.currentNode.name,
       nodeClassName: this.currentNode.className,
+      nodeTreeId: this.currentNode.treeId,
       readOnly: false,
     });
   }
@@ -4444,6 +4445,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     oldName?: string;
     newName?: string;
     instanceId?: string;
+    nodeTreeId?: string;
     live?: boolean;
   }): Promise<void> {
     if (message.type === "ready") {
@@ -4465,11 +4467,25 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!this.currentNode || !message.type) {
       return;
     }
+    const messageNode = typeof message.nodeTreeId === "string" && message.nodeTreeId.length > 0
+      ? this.model.getNode(message.nodeTreeId)
+      : this.currentNode;
+    const mutationTypes = new Set([
+      "setProperty", "addTag", "removeTag", "addAttribute", "setAttribute", "removeAttribute", "renameAttribute",
+    ]);
+    if (mutationTypes.has(message.type)) {
+      if (!messageNode) {
+        return;
+      }
+      if (message.type !== "setProperty" && messageNode.treeId !== this.currentNode.treeId) {
+        return;
+      }
+    }
     try {
       let shouldPush = true;
       switch (message.type) {
         case "setProperty":
-          await this.queuePropertyFromWebview(message.propertyName, message.propertyValue, message.live === true);
+          await this.queuePropertyFromWebview(messageNode, message.propertyName, message.propertyValue, message.live === true);
           if (message.live !== true) {
             this.webviewView?.webview.postMessage({ type: "propertyCommitDone", propertyName: message.propertyName });
           }
@@ -4521,8 +4537,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async queuePropertyFromWebview(name: string | undefined, value: unknown, live: boolean): Promise<void> {
-    const node = this.currentNode;
+  private async queuePropertyFromWebview(node: FileExplorerNode | undefined, name: string | undefined, value: unknown, live: boolean): Promise<void> {
     if (!node || !name) {
       return;
     }
