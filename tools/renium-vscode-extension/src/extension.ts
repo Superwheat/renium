@@ -4536,8 +4536,10 @@ class RobloxSyncController {
 
   private async showStudioChangePreview(
     propertyChanges: StudioPropertyChange[],
+    trackedChanges: StudioChangeLog[],
     changeCount: number,
     cfg: SyncConfig,
+    structural: boolean,
   ): Promise<"apply" | "full" | "discard"> {
     let oldValues: unknown[] = [];
     try {
@@ -4562,7 +4564,18 @@ class RobloxSyncController {
       this.changePreviewIconNames = new Set(loadAssetIconNames(this.context.extensionUri));
     }
     const iconNames = this.changePreviewIconNames;
-    const rows = propertyChanges.map((change, index) => {
+    const rows: Array<{
+      service: string;
+      path: string;
+      leaf: string;
+      className: string;
+      icon: string;
+      scope: string;
+      property: string;
+      status?: string;
+      oldValue?: unknown;
+      newValue?: unknown;
+    }> = propertyChanges.map((change, index) => {
       const segments = Array.isArray(change.pathSegments)
         ? change.pathSegments.map((segment) => String(segment))
         : [];
@@ -4579,6 +4592,36 @@ class RobloxSyncController {
         newValue: change.value,
       };
     });
+    const seenStatus = new Set<string>();
+    for (const change of trackedChanges) {
+      const action = String(change.action ?? "");
+      if (action !== "added" && action !== "removed") {
+        continue;
+      }
+      const segments = Array.isArray(change.pathSegments)
+        ? change.pathSegments.map((segment) => String(segment))
+        : [];
+      if (segments.length === 0) {
+        continue;
+      }
+      const path = segments.join(".");
+      const statusKey = `${action} ${path}`;
+      if (seenStatus.has(statusKey)) {
+        continue;
+      }
+      seenStatus.add(statusKey);
+      const className = String(change.className ?? "");
+      rows.push({
+        service: String(change.service ?? segments[0] ?? ""),
+        path,
+        leaf: segments[segments.length - 1],
+        className,
+        icon: iconAssetNameForClass(className || "Folder", iconNames),
+        scope: "__status",
+        property: "",
+        status: action,
+      });
+    }
 
     if (this.changePreviewResolve) {
       this.changePreviewResolve("full");
@@ -4595,7 +4638,7 @@ class RobloxSyncController {
     );
     this.changePreviewPanel = panel;
     const assetBase = panel.webview.asWebviewUri(assetsUri).toString();
-    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold, assetBase);
+    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold, assetBase, structural);
 
     return await new Promise<"apply" | "full" | "discard">((resolve) => {
       let settled = false;
@@ -4629,12 +4672,14 @@ class RobloxSyncController {
       icon: string;
       scope: string;
       property: string;
-      oldValue: unknown;
-      newValue: unknown;
+      status?: string;
+      oldValue?: unknown;
+      newValue?: unknown;
     }>,
     changeCount: number,
     threshold: number,
     assetBase: string,
+    structural: boolean,
   ): string {
     const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
     const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
@@ -4784,6 +4829,25 @@ class RobloxSyncController {
     background: color-mix(in srgb, var(--green) 10%, transparent);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--green) 24%, transparent);
   }
+  .val.neutral {
+    color: var(--ink-mid);
+    background: var(--surface-hover);
+    box-shadow: inset 0 0 0 1px var(--edge-soft);
+  }
+  .status-badge {
+    flex: none; width: 15px; height: 15px; margin-left: 8px; border-radius: 4px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 9.5px; font-weight: 800;
+  }
+  .status-badge.added { color: color-mix(in srgb, var(--green) 90%, var(--ink)); background: color-mix(in srgb, var(--green) 14%, transparent); }
+  .status-badge.removed { color: color-mix(in srgb, var(--red) 90%, var(--ink)); background: color-mix(in srgb, var(--red) 13%, transparent); }
+  .row.added .rname { color: color-mix(in srgb, var(--green) 70%, var(--ink)); }
+  .row.removed .rname {
+    color: color-mix(in srgb, var(--red) 70%, var(--ink));
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--red) 50%, transparent);
+  }
+  .row.removed .icon { opacity: 0.55; }
   .arrow { color: var(--ink-dim); flex: none; font-size: 11px; }
   .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3.5px; margin-right: 6px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(128,128,128,0.4); }
   .footer {
@@ -4820,7 +4884,7 @@ class RobloxSyncController {
   <div class="header">
     <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
     <h1>Studio changes awaiting review</h1>
-    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"} &mdash; this batch is over your review threshold of ${threshold}.</div>
+    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"} &mdash; this batch is over your review threshold of ${threshold}.${structural ? " It includes added or removed instances, so it can only be applied as a full import." : ""}</div>
     <div class="toolbar">
       <input class="filter" id="filter" type="text" placeholder="Filter by name, class, or property" spellcheck="false">
       <span class="toolbar-hint" id="toolbar-hint"></span>
@@ -4833,8 +4897,9 @@ class RobloxSyncController {
       <div class="countdown-bar"><div class="countdown-fill" id="fill"></div></div>
     </div>
     <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
-    <button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>
-    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>
+    ${structural
+      ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import changes</button>'
+      : '<button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>\n    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>'}
   </div>
 <script>
   const vscode = acquireVsCodeApi();
@@ -4875,15 +4940,22 @@ class RobloxSyncController {
     return esc(String(value));
   }
 
-  const root = { children: new Map(), changes: null, icon: null, className: "" };
+  const root = { children: new Map(), changes: null, icon: null, className: "", status: null };
   for (const row of DATA) {
     const segments = row.path.length > 0 ? row.path.split(".") : [row.leaf];
     let node = root;
     for (const segment of segments) {
       if (!node.children.has(segment)) {
-        node.children.set(segment, { name: segment, children: new Map(), changes: null, icon: null, className: "" });
+        node.children.set(segment, { name: segment, children: new Map(), changes: null, icon: null, className: "", status: null });
       }
       node = node.children.get(segment);
+    }
+    if (row.scope === "__status") {
+      node.status = row.status;
+      node.icon = node.icon || row.icon;
+      node.className = node.className || row.className;
+      if (!node.changes) node.changes = [];
+      continue;
     }
     if (!node.changes) {
       node.changes = [];
@@ -4944,11 +5016,12 @@ class RobloxSyncController {
     const isCollapsed = collapsed.has(key);
     const propsShown = propCount > 0 && !isCollapsed && (propsOpen.has(key) || autoOpenProps || !!filterText);
     flat.push({ kind: "node", key, chain, depth, isFolder, hasKids, propCount, isCollapsed, propsShown,
+      status: current.status,
       className: current.className, icon: isFolder ? (depth === 0 ? (SERVICE_ICONS[chain[0]] || FOLDER_ICON) : FOLDER_ICON) : current.icon });
     if (isCollapsed) return;
     if (propsShown) {
       for (const change of current.changes) {
-        flat.push({ kind: "prop", depth, change });
+        flat.push({ kind: "prop", depth, change, neutral: current.status === "added" });
       }
     }
     const children = [...current.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -4972,22 +5045,31 @@ class RobloxSyncController {
   function nodeRowHtml(item) {
     const expandable = item.hasKids || item.propCount > 0;
     const open = !(item.isCollapsed || (item.propCount > 0 && !item.propsShown && !item.hasKids));
-    return '<div class="row' + (item.isFolder ? " folder" : "") + '" data-key="' + esc(item.key) + '" title="' + esc(item.className || "") + '" style="padding-left:' + (item.depth * 14 + 6) + 'px">' +
+    const statusClass = item.status === "added" ? " added" : item.status === "removed" ? " removed" : "";
+    const statusTitle = item.status === "added" ? "Added in Studio" : item.status === "removed" ? "Removed in Studio" : (item.className || "");
+    const statusBadge = item.status === "added"
+      ? '<span class="status-badge added">A</span>'
+      : item.status === "removed"
+        ? '<span class="status-badge removed">D</span>'
+        : "";
+    return '<div class="row' + (item.isFolder ? " folder" : "") + statusClass + '" data-key="' + esc(item.key) + '" title="' + esc(statusTitle) + '" style="padding-left:' + (item.depth * 14 + 6) + 'px">' +
       '<span class="twisty' + (open ? " open" : "") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
       '<img class="icon" src="' + ASSET + "/" + esc(item.icon || "Folder") + '.png">' +
       '<span class="rname">' + item.chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
+      statusBadge +
       (item.propCount > 0 ? '<span class="count">' + item.propCount + "</span>" : "") +
       "</div>";
   }
 
   function propRowHtml(item) {
     const row = item.change;
-    const oldHtml = fmt(row.oldValue);
+    const oldHtml = item.neutral ? null : fmt(row.oldValue);
+    const neutral = item.neutral || oldHtml === null;
     const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
     return '<div class="prop-row" style="margin-left:' + (item.depth * 14 + 23) + 'px">' +
       '<span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
       '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
-      '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
+      '<span class="val ' + (neutral ? "neutral" : "new") + '">' + fmt(row.newValue) + "</span></span></div>";
   }
 
   function renderWindow() {
@@ -5054,7 +5136,8 @@ class RobloxSyncController {
     if (secs <= 0) { clearInterval(timer); vscode.postMessage({ action: "full" }); }
   }, 1000);
 
-  document.getElementById("apply").addEventListener("click", () => vscode.postMessage({ action: "apply" }));
+  const applyButton = document.getElementById("apply");
+  if (applyButton) applyButton.addEventListener("click", () => vscode.postMessage({ action: "apply" }));
   document.getElementById("full").addEventListener("click", () => vscode.postMessage({ action: "full" }));
   document.getElementById("skip").addEventListener("click", () => vscode.postMessage({ action: "discard" }));
 </script>
@@ -5071,12 +5154,24 @@ class RobloxSyncController {
       ? state.fullSyncServices.map((service) => service.trim()).filter((service) => service.length > 0)
       : [];
     const propertyChanges = Array.isArray(state.propertyChanges) ? state.propertyChanges : [];
+    const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
+    const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
     if (propertyChanges.length === 0 || fullSyncServices.length > 0) {
+      if (changeCount > cfg.changesThreshold && trackedChanges.length > 0 && cfg.displayPrompts !== "never") {
+        const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, true);
+        if (decision === "discard") {
+          this.output.appendLine(
+            `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
+          );
+          return true;
+        }
+        this.output.appendLine(
+          `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
+        );
+      }
       return false;
     }
 
-    const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
-    const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
     if (changeCount > cfg.changesThreshold) {
       if (cfg.displayPrompts === "never") {
         this.output.appendLine(
@@ -5084,7 +5179,7 @@ class RobloxSyncController {
         );
         return false;
       }
-      const decision = await this.showStudioChangePreview(propertyChanges, changeCount, cfg);
+      const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, false);
       if (decision === "full") {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
