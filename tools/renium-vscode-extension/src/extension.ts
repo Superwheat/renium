@@ -4852,7 +4852,7 @@ class RobloxSyncController {
   .countdown { font-size: 11.5px; color: var(--ink-dim); flex: 1; min-width: 0; }
   .countdown b { color: var(--ink-mid); font-weight: 620; font-variant-numeric: tabular-nums; }
   .countdown-bar { height: 2px; border-radius: 2px; background: var(--edge); margin-top: 8px; overflow: hidden; }
-  .countdown-fill { height: 100%; width: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 1s linear; border-radius: 2px; }
+  .countdown-fill { height: 100%; width: 100%; background: var(--green); transition: width 1s linear, background 1s linear; border-radius: 2px; }
   button {
     font-family: inherit; font-size: 12.5px; font-weight: 590; letter-spacing: 0.005em;
     padding: 8px 18px; border-radius: 8px;
@@ -4860,12 +4860,8 @@ class RobloxSyncController {
     transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
   button:active { transform: translateY(1px) scale(0.98); }
-  .apply {
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    color: #fff;
-    box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent), inset 0 1px 0 rgba(255,255,255,0.18);
-  }
-  .apply:hover { box-shadow: 0 3px 14px color-mix(in srgb, var(--accent) 50%, transparent), inset 0 1px 0 rgba(255,255,255,0.18); transform: translateY(-1px); }
+  .apply { background: var(--accent); color: #fff; }
+  .apply:hover { filter: brightness(1.1); }
   .full { background: var(--surface-hover); color: var(--ink); border-color: var(--edge); }
   .full:hover { background: var(--edge); }
   .skip { background: transparent; font-weight: 480; color: var(--ink-dim); }
@@ -5120,6 +5116,7 @@ class RobloxSyncController {
     const liveSecs = document.getElementById("secs");
     if (liveSecs) liveSecs.textContent = String(secs);
     fillEl.style.width = (secs / 90 * 100) + "%";
+    fillEl.style.background = "hsl(" + Math.round(120 * secs / 90) + ", 55%, 45%)";
     if (secs <= 0) { clearInterval(timer); vscode.postMessage({ action: "full" }); }
   }, 1000);
 
