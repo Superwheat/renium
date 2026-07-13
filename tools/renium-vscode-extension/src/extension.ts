@@ -744,6 +744,8 @@ class RobloxSyncController {
   private liveSyncTimerDueAt = 0;
   private studioLiveSyncTimer: NodeJS.Timeout | undefined;
   private studioLiveSyncInFlight = false;
+  private changePreviewPanel: vscode.WebviewPanel | undefined;
+  private changePreviewResolve: ((decision: "apply" | "full" | "discard") => void) | undefined;
   private studioLiveSyncStarted = false;
   private studioLiveSyncNextPollMs = DEFAULT_STUDIO_LIVE_SYNC_POLL_MS;
   private studioToEditorImportInProgress = false;
@@ -4531,6 +4533,313 @@ class RobloxSyncController {
     }
   }
 
+  private async showStudioChangePreview(
+    propertyChanges: StudioPropertyChange[],
+    changeCount: number,
+    cfg: SyncConfig,
+  ): Promise<"apply" | "full" | "discard"> {
+    let oldValues: unknown[] = [];
+    try {
+      const requests = propertyChanges.map((change) => ({
+        service: String(change.service ?? ""),
+        settingsId: typeof change.settingsId === "string" ? change.settingsId : undefined,
+        scope: change.scope ?? "property",
+        property: String(change.property ?? ""),
+      }));
+      const looked = await vscode.commands.executeCommand<unknown[]>(
+        "renium.fileExplorer.lookupPropertyValues",
+        requests,
+      );
+      if (Array.isArray(looked)) {
+        oldValues = looked;
+      }
+    } catch {
+      oldValues = [];
+    }
+
+    const rows = propertyChanges.map((change, index) => {
+      const segments = Array.isArray(change.pathSegments)
+        ? change.pathSegments.map((segment) => String(segment))
+        : [];
+      return {
+        service: String(change.service ?? ""),
+        path: segments.join("."),
+        leaf: segments.length > 0 ? segments[segments.length - 1] : String(change.settingsId ?? "instance"),
+        className: String(change.className ?? ""),
+        scope: change.scope ?? "property",
+        property: String(change.property ?? ""),
+        oldValue: oldValues[index],
+        newValue: change.value,
+      };
+    });
+
+    if (this.changePreviewResolve) {
+      this.changePreviewResolve("full");
+      this.changePreviewResolve = undefined;
+    }
+    this.changePreviewPanel?.dispose();
+
+    const panel = vscode.window.createWebviewPanel(
+      "reniumChangePreview",
+      `Renium: review ${changeCount} Studio changes`,
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    this.changePreviewPanel = panel;
+    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold);
+
+    return await new Promise<"apply" | "full" | "discard">((resolve) => {
+      let settled = false;
+      const finish = (decision: "apply" | "full" | "discard"): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.changePreviewResolve = undefined;
+        this.changePreviewPanel = undefined;
+        resolve(decision);
+        panel.dispose();
+      };
+      this.changePreviewResolve = finish;
+      panel.webview.onDidReceiveMessage((message: { action?: string }) => {
+        const action = message?.action;
+        if (action === "apply" || action === "full" || action === "discard") {
+          finish(action);
+        }
+      });
+      panel.onDidDispose(() => finish("full"));
+    });
+  }
+
+  private buildChangePreviewHtml(
+    rows: Array<{
+      service: string;
+      path: string;
+      leaf: string;
+      className: string;
+      scope: string;
+      property: string;
+      oldValue: unknown;
+      newValue: unknown;
+    }>,
+    changeCount: number,
+    threshold: number,
+  ): string {
+    const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
+    const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
+    const services = [...new Set(rows.map((row) => row.service).filter((service) => service.length > 0))];
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--vscode-font-family);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  .header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.25));
+    flex: none;
+  }
+  .title-row { display: flex; align-items: center; gap: 10px; }
+  .pulse {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--vscode-editorWarning-foreground, #d7a600);
+    animation: pulse 1.6s ease-in-out infinite; flex: none;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.72); } }
+  h1 { font-size: 16px; font-weight: 600; }
+  .subtitle { margin-top: 5px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+  .chips { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .chip {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+  }
+  .list { flex: 1; overflow-y: auto; padding: 12px 24px 20px; }
+  .group { margin-top: 14px; animation: rise 0.28s ease both; }
+  .group-head { display: flex; align-items: center; gap: 9px; padding: 4px 0; }
+  .monogram {
+    width: 22px; height: 22px; border-radius: 6px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; color: #fff;
+  }
+  .leaf { font-weight: 600; font-size: 13px; }
+  .crumbs { font-size: 11px; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .classtag { font-size: 10px; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.35)); border-radius: 4px; padding: 1px 6px; flex: none; }
+  .prop-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 10px 6px 32px; border-radius: 6px; font-size: 12px;
+  }
+  .prop-row:hover { background: var(--vscode-list-hoverBackground); }
+  .prop-name { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; flex: none; }
+  .scope-badge {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 1px 6px; border-radius: 4px; flex: none;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); opacity: 0.85;
+  }
+  .values { display: flex; align-items: center; gap: 8px; overflow: hidden; font-family: var(--vscode-editor-font-family, monospace); }
+  .old { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); text-decoration: line-through; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 34%; }
+  .arrow { color: var(--vscode-descriptionForeground); flex: none; }
+  .new { color: var(--vscode-gitDecoration-addedResourceForeground, #4ec96b); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 1px solid rgba(128,128,128,0.5); }
+  .bool-pill { padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .footer {
+    flex: none; display: flex; align-items: center; gap: 14px;
+    padding: 14px 24px; border-top: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.25));
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  }
+  .countdown { font-size: 11px; color: var(--vscode-descriptionForeground); flex: 1; min-width: 0; }
+  .countdown-bar { height: 3px; border-radius: 2px; background: var(--vscode-editorWidget-border, rgba(128,128,128,0.3)); margin-top: 6px; overflow: hidden; }
+  .countdown-fill { height: 100%; width: 100%; background: var(--vscode-progressBar-background, #0e70c0); transition: width 1s linear; }
+  button {
+    font-family: inherit; font-size: 12.5px; padding: 7px 16px; border-radius: 5px;
+    border: 1px solid transparent; cursor: pointer; flex: none;
+    transition: transform 0.08s ease, filter 0.12s ease;
+  }
+  button:hover { filter: brightness(1.12); }
+  button:active { transform: scale(0.97); }
+  .apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-weight: 600; }
+  .full { background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.2)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
+  .skip { background: transparent; color: var(--vscode-descriptionForeground); border-color: var(--vscode-editorWidget-border, rgba(128,128,128,0.35)); }
+  .skip:hover { color: var(--vscode-errorForeground, #f14c4c); border-color: var(--vscode-errorForeground, #f14c4c); }
+  @keyframes rise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title-row"><div class="pulse"></div><h1>Studio changes awaiting review</h1></div>
+    <div class="subtitle">This batch exceeded your review threshold of ${threshold}. Live sync is paused until you decide.</div>
+    <div class="chips">
+      <span class="chip">${changeCount} change${changeCount === 1 ? "" : "s"}</span>
+      <span class="chip">${instanceCount} instance${instanceCount === 1 ? "" : "s"}</span>
+      ${services.map((service) => `<span class="chip">${service}</span>`).join("")}
+    </div>
+  </div>
+  <div class="list" id="list"></div>
+  <div class="footer">
+    <div class="countdown">
+      <span id="count-label">Protected full import in <b id="secs">90</b>s &mdash; hover the list to pause</span>
+      <div class="countdown-bar"><div class="countdown-fill" id="fill"></div></div>
+    </div>
+    <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
+    <button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>
+    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>
+  </div>
+<script>
+  const vscode = acquireVsCodeApi();
+  const DATA = ${payload};
+
+  function esc(text) {
+    return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  function hue(text) {
+    let h = 0;
+    for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+    return h % 360;
+  }
+  function fmtNum(n) {
+    if (!isFinite(n)) return String(n);
+    return Math.abs(n) >= 1e6 || (Math.abs(n) < 1e-4 && n !== 0) ? n.toExponential(3) : String(Math.round(n * 1000) / 1000);
+  }
+  function fmt(value) {
+    if (value === undefined) return null;
+    if (value === null) return '<i>nil</i>';
+    const t = typeof value;
+    if (t === "boolean") {
+      const bg = value ? "rgba(78,201,107,0.18)" : "rgba(241,76,76,0.18)";
+      return '<span class="bool-pill" style="background:' + bg + '">' + value + "</span>";
+    }
+    if (t === "number") return esc(fmtNum(value));
+    if (t === "string") return '"' + esc(value.length > 90 ? value.slice(0, 90) + "\\u2026" : value) + '"';
+    if (t === "object") {
+      const k = value._type;
+      if (k === "Color3") {
+        const r = Math.round((value.r ?? 0) * 255), g = Math.round((value.g ?? 0) * 255), b = Math.round((value.b ?? 0) * 255);
+        return '<span class="swatch" style="background:rgb(' + r + "," + g + "," + b + ')"></span>' + r + ", " + g + ", " + b;
+      }
+      if (k === "Vector3") return esc(fmtNum(value.x ?? 0) + ", " + fmtNum(value.y ?? 0) + ", " + fmtNum(value.z ?? 0));
+      if (k === "Vector2") return esc(fmtNum(value.x ?? 0) + ", " + fmtNum(value.y ?? 0));
+      if (k === "EnumItem") return esc(String(value.value ?? value.name ?? "Enum"));
+      if (k === "Float") return esc(String(value.value));
+      if (k === "CFrame") return "CFrame (" + ((value.components || []).slice(0, 3).map(fmtNum).join(", ") || "\\u2026") + ", \\u2026)";
+      if (k === "Ref" || value.Ref) return "\\u2192 " + esc(String((value.Ref || value).settingsId ?? (value.Ref || value).instanceId ?? "instance"));
+      const json = JSON.stringify(value);
+      return esc(json.length > 90 ? json.slice(0, 90) + "\\u2026" : json);
+    }
+    return esc(String(value));
+  }
+
+  const groups = new Map();
+  for (const row of DATA) {
+    const key = row.service + "\\u0000" + row.path;
+    if (!groups.has(key)) groups.set(key, { head: row, rows: [] });
+    groups.get(key).rows.push(row);
+  }
+  const list = document.getElementById("list");
+  let order = 0;
+  const MAX_GROUPS = 300;
+  let rendered = 0;
+  for (const { head, rows } of groups.values()) {
+    if (rendered++ >= MAX_GROUPS) continue;
+    const group = document.createElement("div");
+    group.className = "group";
+    group.style.animationDelay = Math.min(order++ * 28, 500) + "ms";
+    const crumbs = head.path.includes(".") ? head.path.slice(0, head.path.lastIndexOf(".")) : head.service;
+    const propsHtml = rows.map((row) => {
+      const oldHtml = fmt(row.oldValue);
+      const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
+      return '<div class="prop-row"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge +
+        '<span class="values">' + (oldHtml !== null ? '<span class="old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
+        '<span class="new">' + fmt(row.newValue) + "</span></span></div>";
+    }).join("");
+    group.innerHTML =
+      '<div class="group-head">' +
+      '<div class="monogram" style="background:hsl(' + hue(head.className || head.leaf) + ',52%,44%)">' + esc((head.className || head.leaf).slice(0, 2).toUpperCase()) + "</div>" +
+      '<span class="leaf">' + esc(head.leaf) + "</span>" +
+      '<span class="classtag">' + esc(head.className || "Instance") + "</span>" +
+      '<span class="crumbs">' + esc(crumbs) + "</span>" +
+      "</div>" + propsHtml;
+    list.appendChild(group);
+  }
+  if (groups.size > MAX_GROUPS) {
+    const more = document.createElement("div");
+    more.className = "group";
+    more.innerHTML = '<div class="crumbs" style="padding:8px 0 0 32px">\\u2026 and ' + (groups.size - MAX_GROUPS) + " more instances (scroll of this size is best reviewed via full import)</div>";
+    list.appendChild(more);
+  }
+
+  let secs = 90;
+  let paused = false;
+  const secsEl = document.getElementById("secs");
+  const fillEl = document.getElementById("fill");
+  const labelEl = document.getElementById("count-label");
+  list.addEventListener("mouseenter", () => { paused = true; labelEl.innerHTML = "Auto import paused while reviewing"; });
+  list.addEventListener("mouseleave", () => {
+    paused = false;
+    labelEl.innerHTML = 'Protected full import in <b id="secs">' + secs + "</b>s &mdash; hover the list to pause";
+  });
+  const timer = setInterval(() => {
+    if (paused) return;
+    secs -= 1;
+    const liveSecs = document.getElementById("secs");
+    if (liveSecs) liveSecs.textContent = String(secs);
+    fillEl.style.width = (secs / 90 * 100) + "%";
+    if (secs <= 0) { clearInterval(timer); vscode.postMessage({ action: "full" }); }
+  }, 1000);
+
+  document.getElementById("apply").addEventListener("click", () => vscode.postMessage({ action: "apply" }));
+  document.getElementById("full").addEventListener("click", () => vscode.postMessage({ action: "full" }));
+  document.getElementById("skip").addEventListener("click", () => vscode.postMessage({ action: "discard" }));
+</script>
+</body>
+</html>`;
+  }
+
   private async tryApplyStudioPropertyChangesToEditor(
     state: StudioChangeState,
     dirtyServices: string[],
@@ -4547,10 +4856,26 @@ class RobloxSyncController {
     const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
     const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
     if (changeCount > cfg.changesThreshold) {
-      this.output.appendLine(
-        `[renium] Studio -> editor: ${changeCount} changes exceed liveSync.changesThreshold=${cfg.changesThreshold}; using protected full import.`,
-      );
-      return false;
+      if (cfg.displayPrompts === "never") {
+        this.output.appendLine(
+          `[renium] Studio -> editor: ${changeCount} changes exceed liveSync.changesThreshold=${cfg.changesThreshold}; using protected full import.`,
+        );
+        return false;
+      }
+      const decision = await this.showStudioChangePreview(propertyChanges, changeCount, cfg);
+      if (decision === "full") {
+        this.output.appendLine(
+          `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
+        );
+        return false;
+      }
+      if (decision === "discard") {
+        this.output.appendLine(
+          `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
+        );
+        return true;
+      }
+      this.output.appendLine(`[renium] Studio -> editor: applying ${changeCount} reviewed changes.`);
     }
 
     const dirtySet = new Set(dirtyServices.map((service) => service.trim()).filter((service) => service.length > 0));
