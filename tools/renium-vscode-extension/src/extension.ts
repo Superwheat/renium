@@ -4633,127 +4633,164 @@ class RobloxSyncController {
 <head>
 <meta charset="UTF-8">
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --ink: rgba(255,255,255,0.92);
+    --ink-mid: rgba(255,255,255,0.60);
+    --ink-dim: rgba(255,255,255,0.38);
+    --surface: rgba(255,255,255,0.032);
+    --surface-hover: rgba(255,255,255,0.055);
+    --edge: rgba(255,255,255,0.085);
+    --edge-soft: rgba(255,255,255,0.05);
+    --accent: #8b7cf8;
+    --accent-2: #5e9bfa;
+    --amber: #e8b53f;
+    --red: #f47f76;
+    --green: #66c88e;
+  }
+  body.vscode-light, body.vscode-high-contrast-light {
+    --ink: rgba(20,22,28,0.92);
+    --ink-mid: rgba(20,22,28,0.62);
+    --ink-dim: rgba(20,22,28,0.40);
+    --surface: rgba(18,20,26,0.035);
+    --surface-hover: rgba(18,20,26,0.06);
+    --edge: rgba(18,20,26,0.12);
+    --edge-soft: rgba(18,20,26,0.07);
+    --accent: #6a58e8;
+    --accent-2: #3d7ce0;
+    --amber: #b8860b;
+    --red: #d0453a;
+    --green: #1f8a4c;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  ::-webkit-scrollbar { width: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--edge); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--ink-dim); border: 2px solid transparent; background-clip: padding-box; }
   body {
     font-family: "Segoe UI Variable Text", "Inter", var(--vscode-font-family, "Segoe UI"), sans-serif;
     -webkit-font-smoothing: antialiased;
     font-size: 13px; line-height: 1.5;
-    color: var(--vscode-foreground);
-    background: var(--vscode-editor-background);
+    color: var(--ink);
+    background:
+      radial-gradient(1100px 420px at 12% -12%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+      var(--vscode-editor-background, #17171a);
     display: flex; flex-direction: column; height: 100vh; overflow: hidden;
   }
-  .header { padding: 22px 28px 16px; flex: none; border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22)); }
+  .header { padding: 26px 30px 20px; flex: none; }
   .kicker {
     display: flex; align-items: center; gap: 8px;
-    font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--vscode-descriptionForeground);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-dim);
   }
+  .kicker b { color: color-mix(in srgb, var(--accent) 75%, var(--ink)); font-weight: 700; }
   .pulse {
     width: 7px; height: 7px; border-radius: 50%;
-    background: var(--vscode-editorWarning-foreground, #d7a600);
-    animation: pulse 1.8s ease-in-out infinite; flex: none;
+    background: var(--amber);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent);
+    animation: pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite; flex: none;
   }
-  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(0.7); } }
-  h1 { font-size: 17px; font-weight: 650; letter-spacing: -0.012em; margin-top: 7px; }
-  .subtitle { margin-top: 3px; font-size: 12.5px; color: var(--vscode-descriptionForeground); }
-  .chips { display: flex; gap: 6px; margin-top: 14px; flex-wrap: wrap; }
-  .chip {
-    font-size: 11px; font-weight: 600; padding: 3px 11px; border-radius: 999px;
-    border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.3));
-    color: var(--vscode-descriptionForeground); background: transparent;
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent); }
+    70% { box-shadow: 0 0 0 7px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
   }
-  .chip.strong { background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-color: transparent; }
-  .list { flex: 1; overflow-y: auto; padding: 16px 28px 24px; }
+  h1 { font-size: 19px; font-weight: 640; letter-spacing: -0.018em; margin-top: 10px; }
+  .subtitle { margin-top: 4px; font-size: 12.5px; color: var(--ink-mid); max-width: 60ch; }
+  .subtitle b { color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; }
+  .list { flex: 1; overflow-y: auto; padding: 4px 30px 26px; }
   .group {
-    border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22));
-    border-radius: 10px; margin-top: 12px; overflow: hidden;
-    background: color-mix(in srgb, var(--vscode-editorWidget-background, rgba(128,128,128,0.08)) 45%, transparent);
-    animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+    border: 1px solid var(--edge);
+    border-radius: 12px; margin-top: 12px; overflow: hidden;
+    background: var(--surface);
+    animation: rise 0.34s cubic-bezier(0.16, 1, 0.3, 1) both;
   }
   .group-head {
-    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.14));
+    display: flex; align-items: baseline; gap: 10px; padding: 11px 16px 9px;
   }
   .monogram {
-    width: 26px; height: 26px; border-radius: 8px; flex: none;
+    width: 26px; height: 26px; border-radius: 8px; flex: none; align-self: center;
     display: flex; align-items: center; justify-content: center;
-    font-size: 10.5px; font-weight: 800; letter-spacing: 0.02em; color: #fff;
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 1px 2px rgba(0,0,0,0.25);
+    font-size: 10px; font-weight: 800; letter-spacing: 0.03em; color: rgba(255,255,255,0.95);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 2px 5px rgba(0,0,0,0.28);
   }
-  .leaf { font-weight: 650; font-size: 13.5px; letter-spacing: -0.005em; }
-  .classtag {
-    font-size: 10.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px; flex: none;
-    color: var(--vscode-descriptionForeground); background: rgba(128,128,128,0.13);
-  }
-  .crumbs { margin-left: auto; font-size: 11.5px; color: var(--vscode-descriptionForeground); opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .props { padding: 6px 8px 8px; }
+  .leaf { font-weight: 640; font-size: 13.5px; letter-spacing: -0.008em; }
+  .classtag { font-size: 11px; font-weight: 500; color: var(--ink-dim); flex: none; }
+  .classtag::before { content: "\\00b7"; margin-right: 10px; opacity: 0.7; }
+  .crumbs { margin-left: auto; font-size: 11px; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .props { padding: 2px 8px 9px; }
   .prop-row {
-    display: grid; grid-template-columns: minmax(130px, 200px) 1fr;
-    gap: 14px; align-items: center; padding: 6.5px 10px; border-radius: 7px;
+    display: grid; grid-template-columns: minmax(130px, 210px) 1fr;
+    gap: 16px; align-items: center; padding: 6px 10px; border-radius: 8px;
   }
-  .prop-row:hover { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.09)); }
+  .prop-row:hover { background: var(--surface-hover); }
   .prop-name-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .prop-name {
     font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
-    font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 11.5px; font-weight: 450; color: var(--ink-mid);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .scope-badge {
-    font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
-    padding: 1.5px 7px; border-radius: 999px; flex: none;
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); opacity: 0.8;
+    font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.1em;
+    padding: 1px 6px; border-radius: 4px; flex: none;
+    color: color-mix(in srgb, var(--accent) 80%, var(--ink));
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
   }
-  .values { display: flex; align-items: center; gap: 9px; min-width: 0; font-variant-numeric: tabular-nums; }
+  .values { display: flex; align-items: center; gap: 8px; min-width: 0; font-variant-numeric: tabular-nums; }
   .val {
     font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
-    font-size: 12px; padding: 2.5px 10px; border-radius: 6px;
+    font-size: 11.5px; padding: 2px 9px; border-radius: 6px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .val.old {
-    color: var(--vscode-gitDecoration-deletedResourceForeground, #f28b82);
-    background: color-mix(in srgb, var(--vscode-gitDecoration-deletedResourceForeground, #f28b82) 11%, transparent);
-    text-decoration: line-through; text-decoration-thickness: 1px; opacity: 0.92;
+    color: color-mix(in srgb, var(--red) 82%, var(--ink));
+    background: color-mix(in srgb, var(--red) 9%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--red) 22%, transparent);
+    text-decoration: line-through; text-decoration-thickness: 1px;
+    text-decoration-color: color-mix(in srgb, var(--red) 55%, transparent);
     max-width: 42%; flex: none;
   }
   .val.new {
-    color: var(--vscode-gitDecoration-addedResourceForeground, #81c995);
-    background: color-mix(in srgb, var(--vscode-gitDecoration-addedResourceForeground, #81c995) 11%, transparent);
+    color: color-mix(in srgb, var(--green) 85%, var(--ink));
+    background: color-mix(in srgb, var(--green) 10%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--green) 24%, transparent);
   }
-  .arrow { color: var(--vscode-descriptionForeground); opacity: 0.65; flex: none; font-size: 11px; }
-  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3.5px; margin-right: 6px; vertical-align: -1.5px; box-shadow: inset 0 0 0 1px rgba(128,128,128,0.45); }
+  .arrow { color: var(--ink-dim); flex: none; font-size: 11px; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3.5px; margin-right: 6px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(128,128,128,0.4); }
   .footer {
-    flex: none; display: flex; align-items: center; gap: 16px;
-    padding: 14px 28px; border-top: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.22));
-    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    flex: none; display: flex; align-items: center; gap: 18px;
+    padding: 15px 30px; border-top: 1px solid var(--edge-soft);
+    background: color-mix(in srgb, var(--vscode-editor-background, #17171a) 72%, transparent);
+    backdrop-filter: blur(14px);
   }
-  .countdown { font-size: 11.5px; color: var(--vscode-descriptionForeground); flex: 1; min-width: 0; }
-  .countdown-bar { height: 3px; border-radius: 2px; background: rgba(128,128,128,0.22); margin-top: 7px; overflow: hidden; }
-  .countdown-fill { height: 100%; width: 100%; background: var(--vscode-progressBar-background, #0e70c0); transition: width 1s linear; border-radius: 2px; }
+  .countdown { font-size: 11.5px; color: var(--ink-dim); flex: 1; min-width: 0; }
+  .countdown b { color: var(--ink-mid); font-weight: 620; font-variant-numeric: tabular-nums; }
+  .countdown-bar { height: 2px; border-radius: 2px; background: var(--edge); margin-top: 8px; overflow: hidden; }
+  .countdown-fill { height: 100%; width: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 1s linear; border-radius: 2px; }
   button {
-    font-family: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: 0.01em;
-    padding: 8px 18px; border-radius: 7px;
+    font-family: inherit; font-size: 12.5px; font-weight: 590; letter-spacing: 0.005em;
+    padding: 8px 18px; border-radius: 8px;
     border: 1px solid transparent; cursor: pointer; flex: none;
-    transition: transform 0.08s ease, filter 0.12s ease, box-shadow 0.12s ease;
+    transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
-  button:hover { filter: brightness(1.12); }
-  button:active { transform: scale(0.97); }
-  .apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
-  .full { background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.18)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
-  .skip { background: transparent; font-weight: 500; color: var(--vscode-descriptionForeground); border-color: var(--vscode-editorWidget-border, rgba(128,128,128,0.32)); }
-  .skip:hover { color: var(--vscode-errorForeground, #f28b82); border-color: var(--vscode-errorForeground, #f28b82); filter: none; }
-  @keyframes rise { from { opacity: 0; transform: translateY(9px); } to { opacity: 1; transform: none; } }
+  button:active { transform: translateY(1px) scale(0.98); }
+  .apply {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff;
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent), inset 0 1px 0 rgba(255,255,255,0.18);
+  }
+  .apply:hover { box-shadow: 0 3px 14px color-mix(in srgb, var(--accent) 50%, transparent), inset 0 1px 0 rgba(255,255,255,0.18); transform: translateY(-1px); }
+  .full { background: var(--surface-hover); color: var(--ink); border-color: var(--edge); }
+  .full:hover { background: var(--edge); }
+  .skip { background: transparent; font-weight: 480; color: var(--ink-dim); }
+  .skip:hover { color: var(--red); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 </style>
 </head>
 <body>
   <div class="header">
-    <div class="kicker"><div class="pulse"></div>Renium &middot; Live sync</div>
+    <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
     <h1>Studio changes awaiting review</h1>
-    <div class="subtitle">This batch exceeded your review threshold of ${threshold}. Live sync is paused until you decide.</div>
-    <div class="chips">
-      <span class="chip strong">${changeCount} change${changeCount === 1 ? "" : "s"}</span>
-      <span class="chip strong">${instanceCount} instance${instanceCount === 1 ? "" : "s"}</span>
-      ${services.map((service) => `<span class="chip">${service}</span>`).join("")}
-    </div>
+    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"} &mdash; this batch is over your review threshold of ${threshold}.</div>
   </div>
   <div class="list" id="list"></div>
   <div class="footer">
