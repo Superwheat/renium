@@ -29,6 +29,7 @@ import {
   summarizeStatus,
 } from "./gitSync";
 import { GitViewActions, GitViewState } from "./gitView";
+import { pickWorkspaceRoot } from "./utils";
 import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
 import { RbsyncEditorProvider } from "./rbsyncViewer";
 
@@ -1132,7 +1133,7 @@ class RobloxSyncController {
           }
           bytes = Buffer.from(await response.arrayBuffer());
         } catch (error) {
-          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          const workspaceRoot = pickWorkspaceRoot();
           const localBundle = workspaceRoot
             ? path.join(workspaceRoot, "tools", "plugin_ws_bridge", assetName)
             : undefined;
@@ -7938,22 +7939,17 @@ class RobloxSyncController {
 
   private getWorkspaceRoot(): string {
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) {
+    const root = pickWorkspaceRoot();
+    if (!root) {
       throw new Error("Open a workspace folder before using Renium.");
     }
-    if (folders.length > 1) {
-      const match = folders.find((folder) => fs.existsSync(path.join(folder.uri.fsPath, "renium.exe")));
-      if (match) {
-        return match.uri.fsPath;
-      }
-      if (!this.warnedMultiRootWorkspace) {
-        this.warnedMultiRootWorkspace = true;
-        this.output.appendLine(
-          `[renium] multi-root workspace: no folder contains renium.exe; using the first folder (${folders[0].uri.fsPath}). Set renium.projectRoot or renium.exportCliPath if this is wrong.`,
-        );
-      }
+    if (folders && folders.length > 1 && root === folders[0].uri.fsPath && !this.warnedMultiRootWorkspace) {
+      this.warnedMultiRootWorkspace = true;
+      this.output.appendLine(
+        `[renium] multi-root workspace: no folder contains renium.exe; using the first folder (${root}). Set renium.projectRoot or renium.exportCliPath if this is wrong.`,
+      );
     }
-    return folders[0].uri.fsPath;
+    return root;
   }
 
   private isPathInside(filePath: string, rootPath: string): boolean {
