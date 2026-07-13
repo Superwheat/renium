@@ -4539,7 +4539,7 @@ class RobloxSyncController {
     trackedChanges: StudioChangeLog[],
     changeCount: number,
     cfg: SyncConfig,
-    structural: boolean,
+    mode: "property" | "structural",
   ): Promise<"apply" | "full" | "discard"> {
     let oldValues: unknown[] = [];
     try {
@@ -4623,8 +4623,30 @@ class RobloxSyncController {
       });
     }
 
+    return await this.showChangeReviewPanel(rows, changeCount, cfg.changesThreshold, mode, `review ${changeCount} Studio changes`);
+  }
+
+  private async showChangeReviewPanel(
+    rows: Array<{
+      service: string;
+      path: string;
+      leaf: string;
+      className: string;
+      icon: string;
+      scope: string;
+      property: string;
+      status?: string;
+      oldValue?: unknown;
+      newValue?: unknown;
+    }>,
+    changeCount: number,
+    threshold: number,
+    mode: "property" | "structural",
+    title: string,
+  ): Promise<"apply" | "full" | "discard"> {
+    const defaultDecision = "full";
     if (this.changePreviewResolve) {
-      this.changePreviewResolve("full");
+      this.changePreviewResolve(defaultDecision);
       this.changePreviewResolve = undefined;
     }
     this.changePreviewPanel?.dispose();
@@ -4632,13 +4654,13 @@ class RobloxSyncController {
     const assetsUri = vscode.Uri.joinPath(this.context.extensionUri, "assets");
     const panel = vscode.window.createWebviewPanel(
       "reniumChangePreview",
-      `Renium: review ${changeCount} Studio changes`,
+      `Renium: ${title}`,
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetsUri] },
     );
     this.changePreviewPanel = panel;
     const assetBase = panel.webview.asWebviewUri(assetsUri).toString();
-    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold, assetBase, structural);
+    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, threshold, assetBase, mode);
 
     return await new Promise<"apply" | "full" | "discard">((resolve) => {
       let settled = false;
@@ -4659,7 +4681,7 @@ class RobloxSyncController {
           finish(action);
         }
       });
-      panel.onDidDispose(() => finish("full"));
+      panel.onDidDispose(() => finish(defaultDecision));
     });
   }
 
@@ -4679,7 +4701,7 @@ class RobloxSyncController {
     changeCount: number,
     threshold: number,
     assetBase: string,
-    structural: boolean,
+    mode: "property" | "structural",
   ): string {
     const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
     const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
@@ -4885,7 +4907,7 @@ class RobloxSyncController {
       <div class="countdown-bar"><div class="countdown-fill" id="fill"></div></div>
     </div>
     <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
-    ${structural
+    ${mode === "structural"
       ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import</button>'
       : '<button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>\n    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>'}
   </div>
@@ -5139,9 +5161,10 @@ class RobloxSyncController {
     const propertyChanges = Array.isArray(state.propertyChanges) ? state.propertyChanges : [];
     const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
     const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
+    const reviewStudioBatches = cfg.initialSyncPriority !== "studio" && cfg.displayPrompts !== "never";
     if (propertyChanges.length === 0 || fullSyncServices.length > 0) {
-      if (changeCount > cfg.changesThreshold && trackedChanges.length > 0 && cfg.displayPrompts !== "never") {
-        const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, true);
+      if (changeCount > cfg.changesThreshold && trackedChanges.length > 0 && reviewStudioBatches) {
+        const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, "structural");
         if (decision === "discard") {
           this.output.appendLine(
             `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
@@ -5156,13 +5179,13 @@ class RobloxSyncController {
     }
 
     if (changeCount > cfg.changesThreshold) {
-      if (cfg.displayPrompts === "never") {
+      if (!reviewStudioBatches) {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes exceed liveSync.changesThreshold=${cfg.changesThreshold}; using protected full import.`,
         );
         return false;
       }
-      const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, false);
+      const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, "property");
       if (decision === "full") {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
