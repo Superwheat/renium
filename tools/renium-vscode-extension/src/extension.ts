@@ -746,6 +746,7 @@ class RobloxSyncController {
   private studioLiveSyncInFlight = false;
   private changePreviewPanel: vscode.WebviewPanel | undefined;
   private changePreviewResolve: ((decision: "apply" | "full" | "discard") => void) | undefined;
+  private changePreviewIconNames: ReadonlySet<string> | undefined;
   private studioLiveSyncStarted = false;
   private studioLiveSyncNextPollMs = DEFAULT_STUDIO_LIVE_SYNC_POLL_MS;
   private studioToEditorImportInProgress = false;
@@ -4557,15 +4558,21 @@ class RobloxSyncController {
       oldValues = [];
     }
 
+    if (!this.changePreviewIconNames) {
+      this.changePreviewIconNames = new Set(loadAssetIconNames(this.context.extensionUri));
+    }
+    const iconNames = this.changePreviewIconNames;
     const rows = propertyChanges.map((change, index) => {
       const segments = Array.isArray(change.pathSegments)
         ? change.pathSegments.map((segment) => String(segment))
         : [];
+      const className = String(change.className ?? "");
       return {
         service: String(change.service ?? ""),
         path: segments.join("."),
         leaf: segments.length > 0 ? segments[segments.length - 1] : String(change.settingsId ?? "instance"),
-        className: String(change.className ?? ""),
+        className,
+        icon: iconAssetNameForClass(className || "Folder", iconNames),
         scope: change.scope ?? "property",
         property: String(change.property ?? ""),
         oldValue: oldValues[index],
@@ -4579,14 +4586,16 @@ class RobloxSyncController {
     }
     this.changePreviewPanel?.dispose();
 
+    const assetsUri = vscode.Uri.joinPath(this.context.extensionUri, "assets");
     const panel = vscode.window.createWebviewPanel(
       "reniumChangePreview",
       `Renium: review ${changeCount} Studio changes`,
       vscode.ViewColumn.Active,
-      { enableScripts: true, retainContextWhenHidden: true },
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetsUri] },
     );
     this.changePreviewPanel = panel;
-    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold);
+    const assetBase = panel.webview.asWebviewUri(assetsUri).toString();
+    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, cfg.changesThreshold, assetBase);
 
     return await new Promise<"apply" | "full" | "discard">((resolve) => {
       let settled = false;
@@ -4617,6 +4626,7 @@ class RobloxSyncController {
       path: string;
       leaf: string;
       className: string;
+      icon: string;
       scope: string;
       property: string;
       oldValue: unknown;
@@ -4624,6 +4634,7 @@ class RobloxSyncController {
     }>,
     changeCount: number,
     threshold: number,
+    assetBase: string,
   ): string {
     const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
     const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
@@ -4705,11 +4716,9 @@ class RobloxSyncController {
   .group-head {
     display: flex; align-items: baseline; gap: 10px; padding: 11px 16px 9px;
   }
-  .monogram {
-    width: 26px; height: 26px; border-radius: 8px; flex: none; align-self: center;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 800; letter-spacing: 0.03em; color: rgba(255,255,255,0.95);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 2px 5px rgba(0,0,0,0.28);
+  .icon {
+    width: 16px; height: 16px; flex: none; align-self: center;
+    display: block; object-fit: contain; object-position: center center; image-rendering: pixelated;
   }
   .leaf { font-weight: 640; font-size: 13.5px; letter-spacing: -0.008em; }
   .classtag { font-size: 11px; font-weight: 500; color: var(--ink-dim); flex: none; }
@@ -4803,14 +4812,10 @@ class RobloxSyncController {
 <script>
   const vscode = acquireVsCodeApi();
   const DATA = ${payload};
+  const ASSET = ${JSON.stringify(assetBase)};
 
   function esc(text) {
     return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  }
-  function hue(text) {
-    let h = 0;
-    for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
-    return h % 360;
   }
   function fmtNum(n) {
     if (!isFinite(n)) return String(n);
@@ -4864,10 +4869,9 @@ class RobloxSyncController {
         '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
         '<span class="val new">' + fmt(row.newValue) + "</span></span></div>";
     }).join("");
-    const h = hue(head.className || head.leaf);
     group.innerHTML =
       '<div class="group-head">' +
-      '<div class="monogram" style="background:linear-gradient(160deg, hsl(' + h + ',54%,50%), hsl(' + h + ',58%,38%))">' + esc((head.className || head.leaf).slice(0, 2).toUpperCase()) + "</div>" +
+      '<img class="icon" src="' + ASSET + "/" + esc(head.icon) + '.png">' +
       '<span class="leaf">' + esc(head.leaf) + "</span>" +
       '<span class="classtag">' + esc(head.className || "Instance") + "</span>" +
       '<span class="crumbs">' + esc(crumbs) + "</span>" +
