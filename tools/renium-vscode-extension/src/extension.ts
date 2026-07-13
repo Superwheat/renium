@@ -4682,8 +4682,8 @@ class RobloxSyncController {
     padding: 1px 6px; border-radius: 4px; flex: none;
     background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); opacity: 0.85;
   }
-  .values { display: flex; align-items: center; gap: 8px; overflow: hidden; font-family: var(--vscode-editor-font-family, monospace); }
-  .old { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); text-decoration: line-through; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 34%; }
+  .values { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; font-family: var(--vscode-editor-font-family, monospace); }
+  .old { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); text-decoration: line-through; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; flex: none; }
   .arrow { color: var(--vscode-descriptionForeground); flex: none; }
   .new { color: var(--vscode-gitDecoration-addedResourceForeground, #4ec96b); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 1px solid rgba(128,128,128,0.5); }
