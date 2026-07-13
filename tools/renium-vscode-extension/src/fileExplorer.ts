@@ -2972,6 +2972,36 @@ export class FileExplorerModel {
     return undefined;
   }
 
+  public lookupPropertyValues(
+    requests: Array<{ service?: string; settingsId?: string; scope?: string; property?: string }>,
+  ): Array<unknown> {
+    const byServiceSettingsId = new Map<string, FileExplorerNode>();
+    for (const node of this.nodesById.values()) {
+      if (node.settingsId) {
+        byServiceSettingsId.set(`${node.service} ${node.settingsId}`, node);
+      }
+    }
+    return requests.map((request) => {
+      if (!request || !request.settingsId || !request.property) {
+        return undefined;
+      }
+      const node = byServiceSettingsId.get(`${request.service ?? ""} ${request.settingsId}`);
+      if (!node) {
+        return undefined;
+      }
+      if (request.scope === "metadata") {
+        return request.property === "Name" ? node.name : undefined;
+      }
+      if (!node.detailsLoaded) {
+        return undefined;
+      }
+      if (request.scope === "attribute") {
+        return node.attributes[request.property];
+      }
+      return node.properties[request.property];
+    });
+  }
+
   public rememberNode(node: FileExplorerNode): FileExplorerNode {
     const existing = this.nodesById.get(node.treeId);
     if (existing) {
@@ -9544,6 +9574,11 @@ export class FileExplorerController implements vscode.Disposable {
       ),
       vscode.commands.registerCommand("renium.fileExplorer.refreshPropertyChanges", (settingsFiles?: string[]) =>
         this.refreshPropertyChanges(Array.isArray(settingsFiles) ? settingsFiles : []),
+      ),
+      vscode.commands.registerCommand(
+        "renium.fileExplorer.lookupPropertyValues",
+        (requests?: Array<{ service?: string; settingsId?: string; scope?: string; property?: string }>) =>
+          this.model.lookupPropertyValues(Array.isArray(requests) ? requests : []),
       ),
       vscode.commands.registerCommand("renium.properties.showPackageNode", (payload?: PackagePropertiesPayload) =>
         this.propertiesProvider.showReadonlyPackage(payload),
