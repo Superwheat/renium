@@ -4671,9 +4671,7 @@ class RobloxSyncController {
     -webkit-font-smoothing: antialiased;
     font-size: 13px; line-height: 1.5;
     color: var(--ink);
-    background:
-      radial-gradient(1100px 420px at 12% -12%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
-      var(--vscode-editor-background, #17171a);
+    background: var(--vscode-editor-background, #17171a);
     display: flex; flex-direction: column; height: 100vh; overflow: hidden;
   }
   .header { padding: 26px 30px 20px; flex: none; }
@@ -4732,8 +4730,8 @@ class RobloxSyncController {
   .scope-badge {
     font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.1em;
     padding: 1px 6px; border-radius: 4px; flex: none;
-    color: color-mix(in srgb, var(--accent) 80%, var(--ink));
-    background: color-mix(in srgb, var(--accent) 13%, transparent);
+    color: var(--ink-dim);
+    background: var(--surface-hover);
   }
   .values { display: flex; align-items: center; gap: 8px; min-width: 0; font-variant-numeric: tabular-nums; }
   .val {
