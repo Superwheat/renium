@@ -4891,7 +4891,7 @@ class RobloxSyncController {
     </div>
     <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
     ${structural
-      ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import changes</button>'
+      ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import</button>'
       : '<button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>\n    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>'}
   </div>
 <script>
