@@ -2373,6 +2373,31 @@ local function keepUnknownsEnabled(ctx: { [string]: any }): boolean
 	return syncOptions(ctx).keepUnknowns == true
 end
 
+local function ensureSourceParentPath(change: { [string]: any }, service: Instance, stats: { [string]: any }): Instance?
+	local pathSegments = change.pathSegments
+	if type(pathSegments) ~= "table" or #pathSegments < 2 then
+		return nil
+	end
+	local current = service
+	for i = 2, #pathSegments - 1 do
+		local name = tostring(pathSegments[i])
+		local ordinal = 1
+		if type(change.pathOrdinals) == "table" then
+			ordinal = tonumber(change.pathOrdinals[i]) or 1
+		end
+		local child = resolveOrdinalChild(current, name, ordinal)
+		if child == nil then
+			local folder = Instance.new("Folder")
+			folder.Name = name
+			folder.Parent = current
+			stats.instanceCreated += 1
+			child = folder
+		end
+		current = child
+	end
+	return current
+end
+
 local function applySourceChange(change: { [string]: any }, ctx: { [string]: any }, stats: { [string]: any }, touchedServices: { [string]: boolean })
 	local serviceName, service = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
@@ -2412,6 +2437,9 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		end
 		local parent = resolveParent(change, ctx.resolveCache)
 		if parent == nil then
+			parent = ensureSourceParentPath(change, service, stats)
+		end
+		if parent == nil then
 			error("Cannot create source instance; parent path was not found")
 		end
 		assertInstanceInService(parent, service)
@@ -2429,6 +2457,12 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		stats.sourceCreated += 1
 	end
 
+	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] == true then
+		instance = replaceInstanceClass(instance, tostring(change.className), stats)
+		if type(ctx.resolveCache) == "table" then
+			ctx.resolveCache[pathCacheKey(change.pathSegments, change.pathOrdinals)] = instance
+		end
+	end
 	if ctx.luaSourceClass[instance.ClassName] ~= true then
 		error("Target is not a Lua source container: " .. instance:GetFullName())
 	end
@@ -20618,13 +20652,24 @@ local function formatLiveValue(value)
 	if kind == "UDim2" then
 		return tostring(value)
 	end
+	if kind == "PhysicalProperties" then
+		return string.format("%.6g, %.6g, %.6g", value.Density, value.Friction, value.Elasticity)
+	end
 	if kind == "table" then
+		if value.density ~= nil then
+			return string.format(
+				"%.6g, %.6g, %.6g",
+				tonumber(value.density) or 0,
+				tonumber(value.friction) or 0,
+				tonumber(value.elasticity) or 0
+			)
+		end
+		if value.customPhysics == false then
+			return "Default"
+		end
 		local tag = tostring(value._type or "")
 		if tag ~= "" then
 			return tag
-		end
-		if value.density ~= nil or value.customPhysics ~= nil then
-			return "PhysicalProperties"
 		end
 		return "…"
 	end
@@ -20817,7 +20862,12 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				end
 				if not isNoop then
 					local oldText = haveOld and formatLiveValue(oldValue) or nil
-					local newText = haveNew and formatLiveValue(newValue) or formatPushValue(entry.value)
+					local newText
+					if haveNew then
+						newText = formatLiveValue(newValue) or "Default"
+					else
+						newText = formatPushValue(entry.value)
+					end
 					if oldText == nil or oldText ~= newText then
 						table.insert(node.props, { name = name, oldText = oldText, newText = newText })
 					end

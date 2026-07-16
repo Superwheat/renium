@@ -1161,13 +1161,24 @@ local function formatLiveValue(value)
 	if kind == "UDim2" then
 		return tostring(value)
 	end
+	if kind == "PhysicalProperties" then
+		return string.format("%.6g, %.6g, %.6g", value.Density, value.Friction, value.Elasticity)
+	end
 	if kind == "table" then
+		if value.density ~= nil then
+			return string.format(
+				"%.6g, %.6g, %.6g",
+				tonumber(value.density) or 0,
+				tonumber(value.friction) or 0,
+				tonumber(value.elasticity) or 0
+			)
+		end
+		if value.customPhysics == false then
+			return "Default"
+		end
 		local tag = tostring(value._type or "")
 		if tag ~= "" then
 			return tag
-		end
-		if value.density ~= nil or value.customPhysics ~= nil then
-			return "PhysicalProperties"
 		end
 		return "…"
 	end
@@ -1360,7 +1371,12 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				end
 				if not isNoop then
 					local oldText = haveOld and formatLiveValue(oldValue) or nil
-					local newText = haveNew and formatLiveValue(newValue) or formatPushValue(entry.value)
+					local newText
+					if haveNew then
+						newText = formatLiveValue(newValue) or "Default"
+					else
+						newText = formatPushValue(entry.value)
+					end
 					if oldText == nil or oldText ~= newText then
 						table.insert(node.props, { name = name, oldText = oldText, newText = newText })
 					end
