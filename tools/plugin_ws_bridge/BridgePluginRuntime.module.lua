@@ -4827,6 +4827,13 @@ function BridgePluginRuntime.start(context)
 			return configurePropertyCandidates(p.classes)
 		elseif method == "setExportOptions" then
 			return configureExportOptions(p)
+		elseif method == "requestEditorPushReview" then
+			return ui.requestEditorPushReview(p, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
+				decodeValue = EditorSyncModule.decodeValue,
+				valuesEqual = EditorSyncModule.valuesEqual,
+			})
+		elseif method == "getEditorPushReviewDecision" then
+			return ui.getEditorPushReviewDecision(p)
 		elseif method == "applyEditorChanges" then
 			Config.studioChanges.beginSuppress()
 			local ok, result = pcall(function()
@@ -5033,6 +5040,8 @@ function BridgePluginRuntime.start(context)
 		configurePropertyCandidates = true,
 		setExportOptions = true,
 		applyEditorChanges = true,
+		requestEditorPushReview = true,
+		getEditorPushReviewDecision = true,
 		getStudioChangeState = true,
 		setConflictResolution = true,
 		getConsoleOutput = true,

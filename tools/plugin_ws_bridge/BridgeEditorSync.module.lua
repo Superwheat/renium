@@ -894,6 +894,9 @@ local function valuesEqual(a: any, b: any): boolean
 	return false
 end
 
+BridgeEditorSync.decodeValue = decodeValue
+BridgeEditorSync.valuesEqual = valuesEqual
+
 local function connectProbeSignal(stats: { [string]: any }, eventName: string, countField: string, availableField: string, connections: { RBXScriptConnection })
 	local okSignal, signal = pcall(function()
 		return (game :: any)[eventName]

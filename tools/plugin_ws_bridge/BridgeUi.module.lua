@@ -2,6 +2,7 @@ local BridgeUi = {}
 
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local StudioService = game:GetService("StudioService")
 
 local TWEEN_FAST = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
@@ -26,6 +27,12 @@ local TEXT_MD = 18
 local TEXT_SM = 16
 local TEXT_XS = 14
 local DESCRIPTION_TEXT = 13
+
+local APPLY_GREEN = Color3.fromRGB(46, 158, 91)
+local REVIEW_COUNTDOWN_SECONDS = 90
+local REVIEW_ROW = 24
+local REVIEW_OVERSCAN = 6
+local REVIEW_AUTO_EXPAND_LEAVES = 12
 
 local CORNER = 6
 local CONTROL_HEIGHT = 32
@@ -1050,6 +1057,740 @@ local function applyThemeToRefs(refs, p)
 	end
 end
 
+local function escapeRich(text)
+	text = tostring(text)
+	text = string.gsub(text, "&", "&amp;")
+	text = string.gsub(text, "<", "&lt;")
+	text = string.gsub(text, ">", "&gt;")
+	return text
+end
+
+local function colorHex(color)
+	return string.format(
+		"#%02X%02X%02X",
+		math.floor(color.R * 255 + 0.5),
+		math.floor(color.G * 255 + 0.5),
+		math.floor(color.B * 255 + 0.5)
+	)
+end
+
+local function truncateValueText(text)
+	if #text > 48 then
+		return string.sub(text, 1, 45) .. "…"
+	end
+	return text
+end
+
+local function formatPushValue(raw)
+	local kind = typeof(raw)
+	if kind == "boolean" or kind == "number" then
+		return tostring(raw)
+	end
+	if kind == "string" then
+		return truncateValueText(raw)
+	end
+	if kind == "table" then
+		local tag = tostring(raw._type or "")
+		if tag == "Color3" then
+			return string.format(
+				"%d, %d, %d",
+				math.floor((tonumber(raw.r) or 0) * 255 + 0.5),
+				math.floor((tonumber(raw.g) or 0) * 255 + 0.5),
+				math.floor((tonumber(raw.b) or 0) * 255 + 0.5)
+			)
+		end
+		if tag == "Vector3" or tag == "Vector2" then
+			local parts = {}
+			for _, component in ipairs({ raw.x, raw.y, raw.z }) do
+				table.insert(parts, tostring(tonumber(component) or 0))
+			end
+			return table.concat(parts, ", ")
+		end
+		if tag == "EnumItem" then
+			local value = tostring(raw.name or raw.value or "")
+			return string.match(value, "[^%.]+$") or value
+		end
+		if tag == "Float" then
+			return tostring(raw.value)
+		end
+		if tag ~= "" then
+			return tag
+		end
+		return "…"
+	end
+	return tostring(raw)
+end
+
+local function formatLiveValue(value)
+	local kind = typeof(value)
+	if kind == "nil" then
+		return nil
+	end
+	if kind == "boolean" then
+		return tostring(value)
+	end
+	if kind == "number" then
+		return string.format("%.6g", value)
+	end
+	if kind == "string" then
+		return truncateValueText(value)
+	end
+	if kind == "Color3" then
+		return string.format(
+			"%d, %d, %d",
+			math.floor(value.R * 255 + 0.5),
+			math.floor(value.G * 255 + 0.5),
+			math.floor(value.B * 255 + 0.5)
+		)
+	end
+	if kind == "Vector3" then
+		return string.format("%.6g, %.6g, %.6g", value.X, value.Y, value.Z)
+	end
+	if kind == "Vector2" then
+		return string.format("%.6g, %.6g", value.X, value.Y)
+	end
+	if kind == "EnumItem" then
+		return value.Name
+	end
+	if kind == "Instance" then
+		return value.Name
+	end
+	if kind == "BrickColor" then
+		return value.Name
+	end
+	if kind == "UDim2" then
+		return tostring(value)
+	end
+	if kind == "table" then
+		local tag = tostring(value._type or "")
+		if tag ~= "" then
+			return tag
+		end
+		if value.density ~= nil or value.customPhysics ~= nil then
+			return "PhysicalProperties"
+		end
+		return "…"
+	end
+	return kind
+end
+
+local reviewIconCache = {}
+
+local function reviewClassIconData(className)
+	local cached = reviewIconCache[className]
+	if cached ~= nil then
+		return cached
+	end
+	local ok, data = pcall(function()
+		return StudioService:GetClassIcon(className)
+	end)
+	if not ok or type(data) ~= "table" then
+		data = {}
+	end
+	reviewIconCache[className] = data
+	return data
+end
+
+local function compareReviewNodes(a, b)
+	local an = string.lower(a.name)
+	local bn = string.lower(b.name)
+	local ap, ad = string.match(an, "^(.-)(%d+)$")
+	local bp, bd = string.match(bn, "^(.-)(%d+)$")
+	if ap ~= nil and bp ~= nil and ap == bp then
+		return tonumber(ad) < tonumber(bd)
+	end
+	return an < bn
+end
+
+local function findOrdinalChild(parent, name, ordinal)
+	if parent == nil then
+		return nil
+	end
+	if ordinal <= 1 then
+		return parent:FindFirstChild(name)
+	end
+	local seen = 0
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == name then
+			seen = seen + 1
+			if seen == ordinal then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+local function newReviewNode(name, className, instance)
+	return {
+		name = name,
+		className = className,
+		instance = instance,
+		children = {},
+		childByKey = {},
+		props = {},
+		expanded = true,
+		changeTotal = 0,
+	}
+end
+
+local function buildReviewTree(summaryRows, groups, helpers)
+	local roots = {}
+	local rootByName = {}
+
+	for _, row in ipairs(summaryRows) do
+		local serviceName = tostring(row.service or "")
+		local count = tonumber(row.count) or 0
+		local note = string.format(
+			"%d instances%s",
+			count,
+			row.allowDeletes == true and " · may remove instances" or ""
+		)
+		local node = newReviewNode("Reconcile " .. serviceName, serviceName, nil)
+		node.summary = true
+		node.note = note
+		node.changeTotal = count
+		table.insert(roots, node)
+	end
+
+	local function serviceNode(serviceName)
+		local node = rootByName[serviceName]
+		if node == nil then
+			local okService, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			node = newReviewNode(serviceName, serviceName, okService and service or nil)
+			rootByName[serviceName] = node
+			table.insert(roots, node)
+		end
+		return node
+	end
+
+	for _, group in ipairs(groups) do
+		local segments = group.pathSegments
+		local node = serviceNode(tostring(segments[1]))
+		for i = 2, #segments do
+			local name = tostring(segments[i])
+			local ordinal = 1
+			if type(group.pathOrdinals) == "table" then
+				ordinal = tonumber(group.pathOrdinals[i]) or 1
+			end
+			local key = name .. "\1" .. tostring(ordinal)
+			local child = node.childByKey[key]
+			if child == nil then
+				local liveChild = findOrdinalChild(node.instance, name, ordinal)
+				local className
+				if liveChild ~= nil then
+					className = liveChild.ClassName
+				elseif i == #segments then
+					className = tostring(group.className or "Folder")
+				else
+					className = "Folder"
+				end
+				child = newReviewNode(name, className, liveChild)
+				node.childByKey[key] = child
+				table.insert(node.children, child)
+			elseif i == #segments and child.instance == nil then
+				child.className = tostring(group.className or child.className)
+			end
+			node = child
+		end
+		for _, entry in ipairs(group.entries) do
+			if entry.kind == "instanceRemove" or (entry.kind == "source" and entry.deleted == true) then
+				node.status = "removed"
+			elseif entry.kind == "instanceAdd" and node.instance == nil and node.status == nil then
+				node.status = "added"
+			elseif entry.kind == "instanceReplace" then
+				local newClass = tostring(entry.className or "")
+				if node.instance == nil then
+					if node.status == nil then
+						node.status = "added"
+					end
+				elseif newClass == "Folder" and node.instance:IsA("LuaSourceContainer") then
+					node.status = "removed"
+				elseif newClass ~= "" and node.instance.ClassName ~= newClass then
+					table.insert(node.props, {
+						name = "ClassName",
+						oldText = node.instance.ClassName,
+						newText = newClass,
+					})
+				end
+			elseif entry.kind == "source" then
+				node.sourceEdited = true
+			elseif entry.kind == "property" or entry.kind == "attribute" then
+				local name = tostring(entry.name or "")
+				local haveOld = false
+				local oldValue = nil
+				if node.instance ~= nil then
+					local instance = node.instance
+					if entry.kind == "attribute" then
+						haveOld, oldValue = pcall(function()
+							return instance:GetAttribute(name)
+						end)
+					else
+						haveOld, oldValue = pcall(function()
+							return (instance :: any)[name]
+						end)
+					end
+				end
+				local haveNew = false
+				local newValue = nil
+				if helpers ~= nil and type(helpers.decodeValue) == "function" then
+					local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.value)
+					if okCall and okDecode then
+						haveNew = true
+						newValue = decoded
+					end
+				end
+				local isNoop = false
+				if haveOld and haveNew then
+					if helpers ~= nil and type(helpers.valuesEqual) == "function" then
+						isNoop = helpers.valuesEqual(oldValue, newValue)
+					else
+						isNoop = oldValue == newValue
+					end
+				end
+				if
+					not isNoop
+					and oldValue == nil
+					and type(newValue) == "table"
+					and newValue.customPhysics == false
+				then
+					isNoop = true
+				end
+				if not isNoop then
+					local oldText = haveOld and formatLiveValue(oldValue) or nil
+					local newText = haveNew and formatLiveValue(newValue) or formatPushValue(entry.value)
+					if oldText == nil or oldText ~= newText then
+						table.insert(node.props, { name = name, oldText = oldText, newText = newText })
+					end
+				end
+			end
+		end
+		if node.status == nil and node.instance == nil and (#node.props > 0 or node.sourceEdited == true) then
+			node.status = "added"
+		end
+		node.ownChanges = #node.props + ((node.status ~= nil or node.sourceEdited == true) and 1 or 0)
+	end
+
+	local instanceCount = 0
+	local function finalize(node, depth)
+		local kept = {}
+		for _, child in ipairs(node.children) do
+			if finalize(child, depth + 1) > 0 then
+				table.insert(kept, child)
+			end
+		end
+		node.children = kept
+		table.sort(node.children, compareReviewNodes)
+		table.sort(node.props, function(a, b)
+			return a.name < b.name
+		end)
+		local total = node.ownChanges or 0
+		if (node.ownChanges or 0) > 0 then
+			instanceCount = instanceCount + 1
+		end
+		for _, child in ipairs(node.children) do
+			total = total + child.changeTotal
+		end
+		node.changeTotal = total
+		return node.changeTotal
+	end
+	local keptRoots = {}
+	local effectiveCount = 0
+	for _, node in ipairs(roots) do
+		if node.summary then
+			table.insert(keptRoots, node)
+			effectiveCount = effectiveCount + node.changeTotal
+		elseif finalize(node, 1) > 0 then
+			table.insert(keptRoots, node)
+			effectiveCount = effectiveCount + node.changeTotal
+		end
+	end
+
+	local function applyExpansion(node, depth)
+		if #node.children == 0 then
+			node.expanded = instanceCount <= REVIEW_AUTO_EXPAND_LEAVES
+		else
+			node.expanded = not (depth >= 3 and instanceCount > 50)
+			for _, child in ipairs(node.children) do
+				applyExpansion(child, depth + 1)
+			end
+		end
+	end
+	for _, node in ipairs(keptRoots) do
+		if not node.summary then
+			applyExpansion(node, 1)
+		end
+	end
+
+	return { roots = keptRoots, effectiveCount = effectiveCount, instanceCount = instanceCount }
+end
+
+local function flattenReviewTree(roots)
+	local visible = {}
+	local function visit(node, depth)
+		local names = { node.name }
+		local tail = node
+		while
+			#tail.children == 1
+			and #tail.props == 0
+			and tail.status == nil
+			and tail.sourceEdited ~= true
+			and not tail.summary
+		do
+			tail = tail.children[1]
+			table.insert(names, tail.name)
+		end
+		table.insert(visible, { kind = "node", node = tail, depth = depth, chain = names })
+		if tail.expanded then
+			for _, prop in ipairs(tail.props) do
+				table.insert(visible, { kind = "prop", prop = prop, node = tail, depth = depth + 1 })
+			end
+			for _, child in ipairs(tail.children) do
+				visit(child, depth + 1)
+			end
+		end
+	end
+	for _, node in ipairs(roots) do
+		visit(node, 0)
+	end
+	return visible
+end
+
+local function ensureReviewRow(reviewUi, index)
+	local row = reviewUi.rowPool[index]
+	if row ~= nil then
+		return row
+	end
+	local button = Instance.new("TextButton")
+	button.Name = "PooledRow"
+	button.BackgroundTransparency = 1
+	button.BorderSizePixel = 0
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.Size = UDim2.new(1, 0, 0, REVIEW_ROW)
+	button.Parent = reviewUi.scroll
+
+	local twisty = Instance.new("Frame")
+	twisty.Name = "Twisty"
+	twisty.BackgroundTransparency = 1
+	twisty.Size = UDim2.fromOffset(14, REVIEW_ROW)
+	twisty.Parent = button
+	local twistyBars = {}
+	for barIndex, rotation in ipairs({ 45, -45 }) do
+		local bar = Instance.new("Frame")
+		bar.Name = "Bar" .. barIndex
+		bar.AnchorPoint = Vector2.new(0.5, 0.5)
+		bar.BorderSizePixel = 0
+		bar.Size = UDim2.fromOffset(6, 2)
+		bar.Position = UDim2.new(0.5, barIndex == 1 and -2 or 2, 0.5, 0)
+		bar.Rotation = rotation
+		local barCorner = Instance.new("UICorner")
+		barCorner.CornerRadius = UDim.new(1, 0)
+		barCorner.Parent = bar
+		bar.Parent = twisty
+		table.insert(twistyBars, bar)
+	end
+
+	local icon = Instance.new("ImageLabel")
+	icon.Name = "Icon"
+	icon.BackgroundTransparency = 1
+	icon.Size = UDim2.fromOffset(16, 16)
+	icon.Parent = button
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.RichText = true
+	label.FontFace = FONT_REGULAR
+	label.TextSize = TEXT_XS
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.Parent = button
+
+	row = { button = button, twisty = twisty, twistyBars = twistyBars, icon = icon, label = label }
+	button.MouseButton1Click:Connect(function()
+		local item = row.item
+		if item ~= nil and item.kind == "node" and (#item.node.children > 0 or #item.node.props > 0) then
+			item.node.expanded = not item.node.expanded
+			reviewUi.refreshList()
+		end
+	end)
+	reviewUi.rowPool[index] = row
+	return row
+end
+
+local function bindReviewRow(reviewUi, row, item)
+	local p = reviewUi.refs.palette
+	local textHex = colorHex(p.Text)
+	local dimHex = colorHex(p.Dimmed)
+	local greenHex = colorHex(OK_GREEN)
+	local redHex = colorHex(ERROR_RED)
+	local indent = item.depth * 14 + 2
+	row.item = item
+
+	if item.kind == "node" then
+		local node = item.node
+		local hasKids = #node.children > 0 or #node.props > 0
+		row.twisty.Visible = hasKids
+		row.twisty.Position = UDim2.fromOffset(indent, 0)
+		row.twisty.Rotation = node.expanded and 0 or -90
+		for _, bar in ipairs(row.twistyBars) do
+			bar.BackgroundColor3 = p.Dimmed
+		end
+		row.icon.Visible = true
+		row.icon.Position = UDim2.new(0, indent + 16, 0.5, -8)
+		local data = reviewClassIconData(node.className)
+		row.icon.Image = tostring(data.Image or "")
+		row.icon.ImageRectOffset = data.ImageRectOffset or Vector2.zero
+		row.icon.ImageRectSize = data.ImageRectSize or Vector2.zero
+		row.icon.ImageTransparency = node.status == "removed" and 0.45 or 0
+		local chain = item.chain
+		local html = ""
+		if #chain > 1 then
+			local prefix = {}
+			for i = 1, #chain - 1 do
+				table.insert(prefix, escapeRich(chain[i]))
+			end
+			html = string.format('<font color="%s">%s › </font>', dimHex, table.concat(prefix, " › "))
+		end
+		local leafName = escapeRich(chain[#chain])
+		local nameHex = textHex
+		if node.status == "added" then
+			nameHex = greenHex
+		elseif node.status == "removed" then
+			nameHex = redHex
+			leafName = "<s>" .. leafName .. "</s>"
+		end
+		html = html .. string.format('<font color="%s">%s</font>', nameHex, leafName)
+		if node.summary then
+			html = html .. string.format('  <font color="%s">%s</font>', dimHex, escapeRich(node.note or ""))
+		elseif not node.expanded and hasKids and node.changeTotal > 0 then
+			html = html .. string.format('  <font color="%s">%d</font>', dimHex, node.changeTotal)
+		end
+		row.label.Text = html
+		local labelX = indent + 36
+		row.label.Position = UDim2.fromOffset(labelX, 0)
+		row.label.Size = UDim2.new(1, -labelX - 4, 1, 0)
+	elseif item.kind == "prop" then
+		row.twisty.Visible = false
+		row.icon.Visible = false
+		local prop = item.prop
+		local html
+		if prop.oldText ~= nil and item.node.status == nil then
+			html = string.format(
+				'<font color="%s">%s</font>  <s><font color="%s">%s</font></s> <font color="%s">→</font> <font color="%s">%s</font>',
+				dimHex,
+				escapeRich(prop.name),
+				redHex,
+				escapeRich(prop.oldText),
+				dimHex,
+				greenHex,
+				escapeRich(prop.newText)
+			)
+		else
+			html = string.format(
+				'<font color="%s">%s</font>  <font color="%s">%s</font>',
+				dimHex,
+				escapeRich(prop.name),
+				textHex,
+				escapeRich(prop.newText)
+			)
+		end
+		row.label.Text = html
+		local labelX = indent + 22
+		row.label.Position = UDim2.fromOffset(labelX, 0)
+		row.label.Size = UDim2.new(1, -labelX - 4, 1, 0)
+	else
+		row.twisty.Visible = false
+		row.icon.Visible = false
+		row.label.Text = string.format('<font color="%s">+%d more</font>', dimHex, item.count)
+		row.label.Position = UDim2.fromOffset(indent + 4, 0)
+		row.label.Size = UDim2.new(1, -indent - 8, 1, 0)
+	end
+end
+
+local function buildReviewWidget(plugin)
+	local refs = newRefs()
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 500, 620, 430, 460)
+	local widget = createWidget(plugin, "ReniumReview", info, "Renium Review")
+	widget.Enabled = false
+
+	local root = Instance.new("Frame")
+	root.Name = "Root"
+	root.Size = UDim2.fromScale(1, 1)
+	root.BorderSizePixel = 0
+	root.Parent = widget
+	table.insert(refs.roots, root)
+	addPadding(root, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING)
+
+	local title = makeText(root, "Title", "Editor changes awaiting review", { font = FONT_BOLD, size = TEXT_MD })
+	title.Size = UDim2.new(1, 0, 0, 22)
+	table.insert(refs.text, title)
+
+	local subtitle = makeText(root, "Subtitle", "", {
+		size = DESCRIPTION_TEXT,
+		autoHeight = true,
+		wrap = true,
+		lineHeight = 1.15,
+	})
+	subtitle.RichText = true
+	subtitle.Position = UDim2.fromOffset(0, 28)
+	table.insert(refs.dimmed, subtitle)
+
+	local listCard = Instance.new("Frame")
+	listCard.Name = "List"
+	listCard.BorderSizePixel = 0
+	listCard.Parent = root
+	addCorner(listCard)
+	local listStroke = addStroke(listCard)
+	table.insert(refs.cards, listCard)
+	table.insert(refs.cardStrokes, listStroke)
+
+	local function layoutListCard()
+		local top = 28 + math.max(subtitle.AbsoluteSize.Y, DESCRIPTION_TEXT + 3) + 12
+		listCard.Position = UDim2.fromOffset(0, top)
+		listCard.Size = UDim2.new(1, 0, 1, -(top + 58))
+	end
+	subtitle:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutListCard)
+	layoutListCard()
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Name = "Rows"
+	scroll.Size = UDim2.fromScale(1, 1)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.CanvasSize = UDim2.new()
+	scroll.ScrollBarThickness = 6
+	scroll.ScrollBarImageTransparency = 0.4
+	scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+	scroll.VerticalScrollBarInset = Enum.ScrollBarInset.Always
+	scroll.Parent = listCard
+	addPadding(scroll, 6, 6, 6, 6)
+
+	local footer = Instance.new("Frame")
+	footer.Name = "Footer"
+	footer.AnchorPoint = Vector2.new(0, 1)
+	footer.Position = UDim2.fromScale(0, 1)
+	footer.Size = UDim2.new(1, 0, 0, 46)
+	footer.BackgroundTransparency = 1
+	footer.Parent = root
+
+	local countdownTrack = Instance.new("Frame")
+	countdownTrack.Name = "CountdownTrack"
+	countdownTrack.Size = UDim2.new(1, 0, 0, 3)
+	countdownTrack.BackgroundTransparency = 0.85
+	countdownTrack.BorderSizePixel = 0
+	countdownTrack.Parent = footer
+	local trackCorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = countdownTrack
+	table.insert(refs.dividers, countdownTrack)
+
+	local countdownBar = Instance.new("Frame")
+	countdownBar.Name = "CountdownBar"
+	countdownBar.Size = UDim2.new(1, 0, 0, 3)
+	countdownBar.BackgroundColor3 = APPLY_GREEN
+	countdownBar.BorderSizePixel = 0
+	countdownBar.Parent = countdownTrack
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = countdownBar
+
+	local countdownLabel = makeText(footer, "CountdownLabel", "", { size = DESCRIPTION_TEXT })
+	countdownLabel.Position = UDim2.new(0, 0, 0, 12)
+	countdownLabel.Size = UDim2.new(1, -220, 1, -12)
+	table.insert(refs.dimmed, countdownLabel)
+
+	local applyButton = Instance.new("TextButton")
+	applyButton.Name = "Apply"
+	applyButton.AnchorPoint = Vector2.new(1, 1)
+	applyButton.Position = UDim2.new(1, 0, 1, 0)
+	applyButton.Size = UDim2.new(0, 88, 0, CONTROL_HEIGHT)
+	applyButton.Text = "Apply"
+	applyButton.BorderSizePixel = 0
+	applyButton.AutoButtonColor = true
+	applyButton.FontFace = FONT_MEDIUM
+	applyButton.TextSize = TEXT_SM
+	applyButton.BackgroundColor3 = APPLY_GREEN
+	applyButton.TextColor3 = WHITE
+	applyButton.Parent = footer
+	addCorner(applyButton)
+
+	local skipButton = Instance.new("TextButton")
+	skipButton.Name = "Skip"
+	skipButton.AnchorPoint = Vector2.new(1, 1)
+	skipButton.Position = UDim2.new(1, -96, 1, 0)
+	skipButton.Size = UDim2.new(0, 96, 0, CONTROL_HEIGHT)
+	skipButton.Text = "Skip batch"
+	skipButton.Parent = footer
+	styleButton(skipButton, refs, false)
+
+	local reviewUi = {
+		widget = widget,
+		refs = refs,
+		root = root,
+		subtitle = subtitle,
+		scroll = scroll,
+		countdownBar = countdownBar,
+		countdownLabel = countdownLabel,
+		skipButton = skipButton,
+		applyButton = applyButton,
+		rowPool = {},
+		visibleItems = {},
+		treeRoots = {},
+		moreCount = 0,
+	}
+
+	local function renderWindow()
+		local items = reviewUi.visibleItems
+		local total = #items
+		scroll.CanvasSize = UDim2.fromOffset(0, total * REVIEW_ROW + 12)
+		local top = scroll.CanvasPosition.Y
+		local height = scroll.AbsoluteSize.Y
+		local first = math.max(math.floor(top / REVIEW_ROW) - REVIEW_OVERSCAN, 1)
+		local last = math.min(math.ceil((top + height) / REVIEW_ROW) + REVIEW_OVERSCAN, total)
+		local poolIndex = 0
+		for i = first, last do
+			poolIndex = poolIndex + 1
+			local row = ensureReviewRow(reviewUi, poolIndex)
+			row.button.Visible = true
+			row.button.Position = UDim2.fromOffset(0, (i - 1) * REVIEW_ROW)
+			bindReviewRow(reviewUi, row, items[i])
+		end
+		for i = poolIndex + 1, #reviewUi.rowPool do
+			reviewUi.rowPool[i].button.Visible = false
+		end
+	end
+
+	function reviewUi.refreshList()
+		local items = flattenReviewTree(reviewUi.treeRoots)
+		if reviewUi.moreCount > 0 then
+			table.insert(items, { kind = "more", count = reviewUi.moreCount, depth = 0 })
+		end
+		reviewUi.visibleItems = items
+		renderWindow()
+	end
+
+	local pendingRender = false
+	local function scheduleRender()
+		if pendingRender then
+			return
+		end
+		pendingRender = true
+		task.defer(function()
+			pendingRender = false
+			renderWindow()
+		end)
+	end
+	scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(scheduleRender)
+	scroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleRender)
+
+	return reviewUi
+end
+
 function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 	bridgeInfo = bridgeInfo or {}
 	local versionText = ""
@@ -1141,6 +1882,219 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		end
 	end
 
+	local reviewUi = nil
+	local reviewState = nil
+	local finishedReviewDecisions = {}
+	local reviewCounter = 0
+	local reviewCountdown = { connection = nil, remaining = 0, paused = false }
+
+	local function stopReviewCountdown()
+		if reviewCountdown.connection ~= nil then
+			reviewCountdown.connection:Disconnect()
+			reviewCountdown.connection = nil
+		end
+	end
+
+	local function decideReview(decision)
+		if reviewState == nil or reviewState.decision ~= nil then
+			return
+		end
+		reviewState.decision = decision
+		stopReviewCountdown()
+		if reviewUi ~= nil and reviewUi.widget.Enabled then
+			reviewUi.widget.Enabled = false
+		end
+	end
+
+	local function ensureReviewUi()
+		if reviewUi ~= nil then
+			return reviewUi
+		end
+		reviewUi = buildReviewWidget(plugin)
+		applyThemeToRefs(reviewUi.refs, palette(settings().Studio.Theme))
+		reviewUi.applyButton.MouseButton1Click:Connect(function()
+			decideReview("apply")
+		end)
+		reviewUi.skipButton.MouseButton1Click:Connect(function()
+			decideReview("skip")
+		end)
+		reviewUi.root.MouseEnter:Connect(function()
+			reviewCountdown.paused = true
+		end)
+		reviewUi.root.MouseLeave:Connect(function()
+			reviewCountdown.paused = false
+		end)
+		reviewUi.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if not reviewUi.widget.Enabled then
+				decideReview("apply")
+			end
+		end)
+		return reviewUi
+	end
+
+	local function startReviewCountdown()
+		stopReviewCountdown()
+		reviewCountdown.remaining = REVIEW_COUNTDOWN_SECONDS
+		reviewCountdown.paused = false
+		local lastShown = nil
+		reviewCountdown.connection = RunService.Heartbeat:Connect(function(dt)
+			if reviewUi == nil or reviewState == nil or reviewState.decision ~= nil then
+				stopReviewCountdown()
+				return
+			end
+			if not reviewCountdown.paused then
+				reviewCountdown.remaining = math.max(reviewCountdown.remaining - dt, 0)
+			end
+			local fraction = reviewCountdown.remaining / REVIEW_COUNTDOWN_SECONDS
+			reviewUi.countdownBar.Size = UDim2.new(fraction, 0, 0, 3)
+			reviewUi.countdownBar.BackgroundColor3 = Color3.fromHSV(fraction * 0.33, 0.62, 0.66)
+			if reviewCountdown.paused then
+				if lastShown ~= "paused" then
+					lastShown = "paused"
+					reviewUi.countdownLabel.Text = "Auto-apply paused"
+				end
+			else
+				local seconds = math.ceil(reviewCountdown.remaining)
+				if seconds ~= lastShown then
+					lastShown = seconds
+					reviewUi.countdownLabel.Text = string.format("Applies in %ds", seconds)
+				end
+			end
+			if reviewCountdown.remaining <= 0 then
+				decideReview("apply")
+			end
+		end)
+	end
+
+	function ui.requestEditorPushReview(params, runtimeSettings, helpers)
+		if type(params) ~= "table" then
+			params = {}
+		end
+		if type(runtimeSettings) ~= "table" then
+			runtimeSettings = {}
+		end
+		local changeCount = tonumber(params.changeCount) or 0
+		local threshold = tonumber(runtimeSettings.changesThreshold) or 5
+		if
+			tostring(runtimeSettings.displayPrompts or "") == "never"
+			or tostring(runtimeSettings.initialSyncPriority or "") == "editor"
+			or changeCount <= threshold
+			or ui._playModeHidden
+		then
+			return { required = false }
+		end
+		local rows = params.rows
+		if type(rows) ~= "table" or #rows == 0 then
+			return { required = false }
+		end
+		local summaryRows = {}
+		local groups = {}
+		local groupOrder = {}
+		local seenServices = {}
+		local serviceList = {}
+		local sentUnits = 0
+		for _, row in ipairs(rows) do
+			if type(row) == "table" then
+				local service = tostring(row.service or "")
+				if service ~= "" and not seenServices[service] then
+					seenServices[service] = true
+					table.insert(serviceList, service)
+				end
+				if row.kind == "instances" then
+					sentUnits = sentUnits + (tonumber(row.count) or 0)
+					table.insert(summaryRows, row)
+				elseif type(row.pathSegments) == "table" and #row.pathSegments > 0 then
+					local key = table.concat(row.pathSegments, "\1")
+					if type(row.pathOrdinals) == "table" and #row.pathOrdinals > 0 then
+						key = key .. "\2" .. table.concat(row.pathOrdinals, ",")
+					end
+					local group = groups[key]
+					if group == nil then
+						group = {
+							pathSegments = row.pathSegments,
+							pathOrdinals = row.pathOrdinals,
+							className = tostring(row.className or "Instance"),
+							entries = {},
+						}
+						groups[key] = group
+						table.insert(groupOrder, group)
+					end
+					table.insert(group.entries, row)
+					sentUnits = sentUnits + 1
+				end
+			end
+		end
+		if reviewState ~= nil and reviewState.decision == nil then
+			finishedReviewDecisions[reviewState.id] = "skip"
+			stopReviewCountdown()
+		end
+		local tree = buildReviewTree(summaryRows, groupOrder, helpers)
+		if tree.effectiveCount <= threshold then
+			return { required = false }
+		end
+		reviewCounter = reviewCounter + 1
+		local reviewId = string.format("review-%d-%d", os.time(), reviewCounter)
+		reviewState = { id = reviewId, decision = nil }
+		local panel = ensureReviewUi()
+		local changeWord = tree.effectiveCount == 1 and "change" or "changes"
+		local subtitleText
+		if tree.instanceCount > 0 then
+			local instanceWord = tree.instanceCount == 1 and "instance" or "instances"
+			subtitleText = string.format(
+				"%d %s across %d %s in %s.",
+				tree.effectiveCount,
+				changeWord,
+				tree.instanceCount,
+				instanceWord,
+				escapeRich(table.concat(serviceList, ", "))
+			)
+		else
+			subtitleText = string.format(
+				"%d %s in %s.",
+				tree.effectiveCount,
+				changeWord,
+				escapeRich(table.concat(serviceList, ", "))
+			)
+		end
+		panel.subtitle.Text = subtitleText
+			.. string.format(
+				' This batch is over your review threshold of <font color="%s">%d</font>.',
+				colorHex(WARN_AMBER),
+				threshold
+			)
+		panel.treeRoots = tree.roots
+		panel.moreCount = math.max(changeCount - sentUnits, 0)
+		panel.scroll.CanvasPosition = Vector2.zero
+		panel.refreshList()
+		panel.widget.Enabled = true
+		pcall(function()
+			panel.widget:RequestRaise()
+		end)
+		startReviewCountdown()
+		return { required = true, reviewId = reviewId }
+	end
+
+	function ui.getEditorPushReviewDecision(params)
+		if type(params) ~= "table" then
+			params = {}
+		end
+		local reviewId = tostring(params.reviewId or "")
+		if reviewState ~= nil and reviewState.id == reviewId then
+			if reviewState.decision == nil then
+				return { decided = false }
+			end
+			local decision = reviewState.decision
+			reviewState = nil
+			return { decided = true, decision = decision }
+		end
+		local finished = finishedReviewDecisions[reviewId]
+		if finished ~= nil then
+			finishedReviewDecisions[reviewId] = nil
+			return { decided = true, decision = finished }
+		end
+		return { decided = true, decision = "apply" }
+	end
+
 	statusUi.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 		pcall(function()
 			openButton:SetActive(statusUi.widget.Enabled and not ui._playModeHidden)
@@ -1193,6 +2147,9 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		local p = palette(settings().Studio.Theme)
 		applyThemeToRefs(statusUi.refs, p)
 		applyThemeToRefs(settingsUi.refs, p)
+		if reviewUi ~= nil then
+			applyThemeToRefs(reviewUi.refs, p)
+		end
 		settingsUi.paintSegments()
 		if ui._lastView ~= nil then
 			ui.updateStatus(ui._lastView)
