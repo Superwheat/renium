@@ -7497,7 +7497,16 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
         let absolute_path = absolutize_under(&project_root, &changed_path);
         let absolute_path = match canonical_path(&absolute_path) {
             Ok(canonical) => strip_extended_prefix(canonical),
-            Err(_) => strip_extended_prefix(absolute_path),
+            Err(_) => {
+                let parent_canonical = absolute_path
+                    .parent()
+                    .and_then(|parent| canonical_path(parent).ok())
+                    .map(strip_extended_prefix);
+                match (parent_canonical, absolute_path.file_name()) {
+                    (Some(parent), Some(file_name)) => parent.join(file_name),
+                    _ => strip_extended_prefix(absolute_path),
+                }
+            }
         };
         let path_id = path_key(&absolute_path);
         if !seen_paths.insert(path_id.clone()) {
@@ -8676,6 +8685,164 @@ fn normalize_editor_color3_value(value: Option<&Value>) -> Value {
     json!({ "_type": "Color3", "r": 0, "g": 0, "b": 0 })
 }
 
+const MAX_REVIEW_ROWS: usize = 1000;
+
+fn push_review_row(rows: &mut Vec<Value>, truncated: &mut bool, row: Value) {
+    if rows.len() < MAX_REVIEW_ROWS {
+        rows.push(row);
+    } else {
+        *truncated = true;
+    }
+}
+
+fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Value>, bool) {
+    let mut rows = Vec::new();
+    let mut change_count: u64 = 0;
+    let mut truncated = false;
+    for change in &changes.instance_changes {
+        change_count += change.instances.len() as u64;
+        match change.mode.as_str() {
+            "upsertInstances" | "replaceInstances" | "deleteInstances" => {
+                let kind = match change.mode.as_str() {
+                    "deleteInstances" => "instanceRemove",
+                    "replaceInstances" => "instanceReplace",
+                    _ => "instanceAdd",
+                };
+                for instance in &change.instances {
+                    push_review_row(
+                        &mut rows,
+                        &mut truncated,
+                        json!({
+                            "kind": kind,
+                            "service": &change.service,
+                            "pathSegments": &instance.path_segments,
+                            "pathOrdinals": &instance.path_ordinals,
+                            "className": &instance.class_name,
+                        }),
+                    );
+                }
+            }
+            _ => {
+                push_review_row(
+                    &mut rows,
+                    &mut truncated,
+                    json!({
+                        "kind": "instances",
+                        "mode": &change.mode,
+                        "service": &change.service,
+                        "count": change.instances.len(),
+                        "allowDeletes": change.allow_deletes,
+                    }),
+                );
+            }
+        }
+    }
+    for change in &changes.source_changes {
+        change_count += 1;
+        push_review_row(
+            &mut rows,
+            &mut truncated,
+            json!({
+                "kind": "source",
+                "service": &change.service,
+                "pathSegments": &change.path_segments,
+                "pathOrdinals": &change.path_ordinals,
+                "className": &change.class_name,
+                "deleted": change.deleted,
+            }),
+        );
+    }
+    for change in &changes.property_changes {
+        for (kind, values) in [
+            ("property", &change.properties),
+            ("attribute", &change.attributes),
+        ] {
+            for (name, value) in values {
+                change_count += 1;
+                push_review_row(
+                    &mut rows,
+                    &mut truncated,
+                    json!({
+                        "kind": kind,
+                        "service": &change.service,
+                        "pathSegments": &change.path_segments,
+                        "pathOrdinals": &change.path_ordinals,
+                        "className": &change.class_name,
+                        "name": name,
+                        "value": value,
+                    }),
+                );
+            }
+        }
+    }
+    (change_count, rows, truncated)
+}
+
+fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) -> Result<bool> {
+    let (change_count, rows, truncated) = editor_review_payload(changes);
+    if change_count == 0 {
+        return Ok(true);
+    }
+    if std::env::var("RENIUM_DEBUG_REVIEW").is_ok() {
+        println!(
+            "[renium] review rows: {}",
+            serde_json::to_string(&rows).unwrap_or_default()
+        );
+    }
+    let response = match bridge.call(
+        "requestEditorPushReview",
+        json!({
+            "changeCount": change_count,
+            "rows": rows,
+            "truncated": truncated,
+        }),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            println!("[renium] editor push review unavailable, applying directly: {err}");
+            return Ok(true);
+        }
+    };
+    if response.get("required").and_then(Value::as_bool) != Some(true) {
+        return Ok(true);
+    }
+    let Some(review_id) = response
+        .get("reviewId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(true);
+    };
+    println!("[renium] editor push held for review in Studio ({change_count} changes)");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut consecutive_errors = 0u32;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(300));
+        match bridge.call(
+            "getEditorPushReviewDecision",
+            json!({ "reviewId": &review_id }),
+        ) {
+            Ok(result) => {
+                consecutive_errors = 0;
+                if result.get("decided").and_then(Value::as_bool) == Some(true) {
+                    let decision = result
+                        .get("decision")
+                        .and_then(Value::as_str)
+                        .unwrap_or("apply");
+                    return Ok(decision != "skip");
+                }
+            }
+            Err(err) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 10 {
+                    return Err(err.context("Editor push review polling failed"));
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
@@ -8719,6 +8886,15 @@ fn send_editor_change_batches(
             )?;
             merge_editor_summary(&mut summary, &result);
         }
+        summary.insert(
+            "noops".to_string(),
+            Value::Number(serde_json::Number::from(0)),
+        );
+        return Ok(summary);
+    }
+
+    if !request_editor_push_review(bridge, changes)? {
+        summary.insert("skippedByReview".to_string(), Value::Bool(true));
         summary.insert(
             "noops".to_string(),
             Value::Number(serde_json::Number::from(0)),
