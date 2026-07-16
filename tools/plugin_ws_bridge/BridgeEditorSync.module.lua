@@ -1292,6 +1292,31 @@ local function keepUnknownsEnabled(ctx: { [string]: any }): boolean
 	return syncOptions(ctx).keepUnknowns == true
 end
 
+local function ensureSourceParentPath(change: { [string]: any }, service: Instance, stats: { [string]: any }): Instance?
+	local pathSegments = change.pathSegments
+	if type(pathSegments) ~= "table" or #pathSegments < 2 then
+		return nil
+	end
+	local current = service
+	for i = 2, #pathSegments - 1 do
+		local name = tostring(pathSegments[i])
+		local ordinal = 1
+		if type(change.pathOrdinals) == "table" then
+			ordinal = tonumber(change.pathOrdinals[i]) or 1
+		end
+		local child = resolveOrdinalChild(current, name, ordinal)
+		if child == nil then
+			local folder = Instance.new("Folder")
+			folder.Name = name
+			folder.Parent = current
+			stats.instanceCreated += 1
+			child = folder
+		end
+		current = child
+	end
+	return current
+end
+
 local function applySourceChange(change: { [string]: any }, ctx: { [string]: any }, stats: { [string]: any }, touchedServices: { [string]: boolean })
 	local serviceName, service = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
@@ -1331,6 +1356,9 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		end
 		local parent = resolveParent(change, ctx.resolveCache)
 		if parent == nil then
+			parent = ensureSourceParentPath(change, service, stats)
+		end
+		if parent == nil then
 			error("Cannot create source instance; parent path was not found")
 		end
 		assertInstanceInService(parent, service)
@@ -1348,6 +1376,12 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		stats.sourceCreated += 1
 	end
 
+	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] == true then
+		instance = replaceInstanceClass(instance, tostring(change.className), stats)
+		if type(ctx.resolveCache) == "table" then
+			ctx.resolveCache[pathCacheKey(change.pathSegments, change.pathOrdinals)] = instance
+		end
+	end
 	if ctx.luaSourceClass[instance.ClassName] ~= true then
 		error("Target is not a Lua source container: " .. instance:GetFullName())
 	end

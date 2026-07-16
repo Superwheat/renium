@@ -2596,6 +2596,13 @@ struct EditorChangeSet {
     source_changes: Vec<EditorSourceChange>,
     property_changes: Vec<EditorPropertyChange>,
     history_entries: Vec<EditorHistoryEntry>,
+    settings_writes: Vec<EditorSettingsWrite>,
+}
+
+#[derive(Debug, Clone)]
+struct EditorSettingsWrite {
+    path: PathBuf,
+    document: SettingsBytecode,
 }
 
 #[derive(Debug, Clone)]
@@ -7142,6 +7149,9 @@ fn push_editor_changes_with_collected(
 ) -> Result<serde_json::Map<String, Value>> {
     save_editor_history_entries(bridge, &args.project_root, &args.src_dir, &changes)?;
     let mut summary = send_editor_change_batches(bridge, &changes, args.probe_events)?;
+    if summary.get("skippedByReview").and_then(Value::as_bool) != Some(true) {
+        apply_editor_settings_writes(&changes)?;
+    }
     if args.verify_sources {
         let verification = verify_editor_source_changes(bridge, &changes)?;
         summary.insert(
@@ -7461,6 +7471,14 @@ fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathB
     Ok(paths)
 }
 
+fn apply_editor_settings_writes(changes: &EditorChangeSet) -> Result<()> {
+    for write in &changes.settings_writes {
+        let _lock = acquire_settings_file_lock(&write.path)?;
+        write.document.write_file(&write.path)?;
+    }
+    Ok(())
+}
+
 fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSet> {
     let project_root = if args.project_root.exists() {
         strip_extended_prefix(canonical_path(&args.project_root).with_context(|| {
@@ -7696,8 +7714,10 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
     for service in &dirty_services {
         if let Some(document) = documents.get(service).and_then(Option::as_ref) {
             let settings_path = writable_service_settings_path(&src_root.join(service))?;
-            let _lock = acquire_settings_file_lock(&settings_path)?;
-            document.write_file(&settings_path)?;
+            changes.settings_writes.push(EditorSettingsWrite {
+                path: settings_path,
+                document: document.clone(),
+            });
         }
     }
 
@@ -32304,6 +32324,7 @@ mod tests {
             override_packages: false,
         })
         .unwrap();
+        apply_editor_settings_writes(&changes).unwrap();
 
         assert!(changes.instance_changes.iter().any(|change| {
             change.mode == "upsertInstances"
@@ -32455,6 +32476,7 @@ mod tests {
             override_packages: false,
         })
         .unwrap();
+        apply_editor_settings_writes(&changes).unwrap();
 
         assert_eq!(changes.instance_changes.len(), 1);
         assert_eq!(changes.instance_changes[0].mode, "replaceInstances");
@@ -32549,6 +32571,7 @@ mod tests {
             override_packages: false,
         })
         .unwrap();
+        apply_editor_settings_writes(&changes).unwrap();
 
         assert_eq!(changes.instance_changes.len(), 1);
         assert_eq!(changes.instance_changes[0].mode, "replaceInstances");
