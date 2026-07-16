@@ -710,6 +710,9 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		raw = raw.Ref
 		typeName = "Ref"
 	end
+	if typeName == nil and raw.customPhysics ~= nil then
+		typeName = "PhysicalProperties"
+	end
 	if typeName == nil then
 		return true, raw
 	end
@@ -725,6 +728,18 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 			return true, -math.huge
 		end
 		return true, tonumber(text) or 0
+	elseif typeName == "PhysicalProperties" then
+		if raw.customPhysics == false or raw.density == nil then
+			return true, nil
+		end
+		return true,
+			PhysicalProperties.new(
+				numberField(raw, "density", 0.7),
+				numberField(raw, "friction", 0.3),
+				numberField(raw, "elasticity", 0.5),
+				numberField(raw, "frictionWeight", 1),
+				numberField(raw, "elasticityWeight", 1)
+			)
 	elseif typeName == "Vector2" then
 		return true, Vector2.new(numberField(raw, "x"), numberField(raw, "y"))
 	elseif typeName == "Vector3" then
