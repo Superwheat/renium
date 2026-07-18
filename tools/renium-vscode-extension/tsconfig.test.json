@@ -7,6 +7,13 @@
     "declaration": false,
     "types": ["node"]
   },
-  "include": ["src/gitSync.ts", "src/conflictMerge.ts", "test/**/*.ts"],
+  "include": [
+    "src/cliResolution.ts",
+    "src/conflictMerge.ts",
+    "src/editorLiveSyncCache.ts",
+    "src/gitSync.ts",
+    "src/pluginDistribution.ts",
+    "test/**/*.ts"
+  ],
   "exclude": ["node_modules", "out", "out-test"]
 }

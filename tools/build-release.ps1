@@ -121,6 +121,9 @@ foreach ($tool in @("git", "cargo", "node")) {
         throw "Required tool is not on PATH: $tool"
     }
 }
+if (-not $SkipTests -and -not (Get-Command -Name "lune" -ErrorAction SilentlyContinue)) {
+    throw "Required tool is not on PATH: lune"
+}
 
 $npm = if ($env:OS -eq "Windows_NT") { "npm.cmd" } else { "npm" }
 $npx = if ($env:OS -eq "Windows_NT") { "npx.cmd" } else { "npx" }
@@ -194,12 +197,49 @@ $cliBinary = Join-Path $cliDirectory ("target\release\" + $binaryName)
 Invoke-Checked -File "cargo" -Arguments @("build", "--locked", "--release", "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
 if (-not $SkipTests) {
     Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+    Invoke-Checked -File "lune" -Arguments @("run", "tools/plugin_ws_bridge/tests/run") -WorkingDirectory $repositoryRoot
 }
 if (-not (Test-Path -LiteralPath $cliBinary -PathType Leaf)) {
     throw "Cargo reported success but did not create $cliBinary"
 }
 $releaseCliBinary = Join-Path $releaseDirectory $binaryName
 Copy-Item -LiteralPath $cliBinary -Destination $releaseCliBinary
+$releaseReadme = Join-Path $releaseDirectory "README.md"
+$releaseCliReadme = Join-Path $releaseDirectory "CLI-README.md"
+$releaseLicense = Join-Path $releaseDirectory "LICENSE"
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $releaseReadme
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\README.md") -Destination $releaseCliReadme
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
+$releaseSupportFiles = @($releaseReadme, $releaseCliReadme, $releaseLicense)
+if ($env:OS -eq "Windows_NT") {
+    $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
+    $releaseRbxRunner = Join-Path $releaseDirectory "rbx-run.ps1"
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx.cmd") -Destination $releaseRbx
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\rbx-run.ps1") -Destination $releaseRbxRunner
+    $releaseSupportFiles += @($releaseRbx, $releaseRbxRunner)
+}
+else {
+    $releaseRbx = Join-Path $releaseDirectory "rbx"
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx") -Destination $releaseRbx
+    $releaseSupportFiles += $releaseRbx
+}
+
+$releasePluginXml = Join-Path $releaseDirectory "Renium.rbxmx"
+$releasePluginBinary = Join-Path $releaseDirectory "Renium.rbxm"
+Invoke-Checked -File $rojo -Arguments @("build", $pluginProjectPath, "--output", $releasePluginXml) -WorkingDirectory $repositoryRoot
+Invoke-Checked -File $rojo -Arguments @("build", $pluginProjectPath, "--output", $releasePluginBinary) -WorkingDirectory $repositoryRoot
+
+if ((Get-Item -LiteralPath $releasePluginXml).Length -lt 128 -or (Get-Item -LiteralPath $releasePluginBinary).Length -lt 16) {
+    throw "Rojo produced an unexpectedly small plugin artifact"
+}
+if (-not ([IO.File]::ReadAllText($releasePluginXml).Contains("<roblox"))) {
+    throw "The .rbxmx plugin artifact is not a Roblox XML model"
+}
+
+Copy-Item -LiteralPath $releasePluginXml -Destination (Join-Path $pluginDirectory "Renium.rbxmx") -Force
+Copy-Item -LiteralPath $releasePluginBinary -Destination (Join-Path $pluginDirectory "Renium.rbxm") -Force
+$extensionPluginBundle = Join-Path $extensionDirectory "assets\Renium.rbxm"
+Copy-Item -LiteralPath $releasePluginBinary -Destination $extensionPluginBundle -Force
 
 Invoke-Checked -File $npm -Arguments @("ci", "--prefix", $extensionDirectory) -WorkingDirectory $repositoryRoot
 if (-not $SkipTests) {
@@ -225,6 +265,19 @@ try {
     finally {
         $reader.Dispose()
     }
+    $pluginEntry = $archive.GetEntry("extension/assets/Renium.rbxm")
+    if ($null -eq $pluginEntry) {
+        throw "Packaged VSIX is missing extension/assets/Renium.rbxm"
+    }
+    $pluginStream = $pluginEntry.Open()
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $packagedPluginHash = [BitConverter]::ToString($sha256.ComputeHash($pluginStream)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $pluginStream.Dispose()
+    }
 }
 finally {
     $archive.Dispose()
@@ -232,21 +285,10 @@ finally {
 if (($packagedExtension.name -ne $extensionPackage.name) -or ($packagedExtension.version -ne $cliVersion) -or ($packagedExtension.publisher -ne $extensionPackage.publisher)) {
     throw "Packaged VSIX metadata does not match package.json"
 }
-
-$releasePluginXml = Join-Path $releaseDirectory "Renium.rbxmx"
-$releasePluginBinary = Join-Path $releaseDirectory "Renium.rbxm"
-Invoke-Checked -File $rojo -Arguments @("build", $pluginProjectPath, "--output", $releasePluginXml) -WorkingDirectory $repositoryRoot
-Invoke-Checked -File $rojo -Arguments @("build", $pluginProjectPath, "--output", $releasePluginBinary) -WorkingDirectory $repositoryRoot
-
-if ((Get-Item -LiteralPath $releasePluginXml).Length -lt 128 -or (Get-Item -LiteralPath $releasePluginBinary).Length -lt 16) {
-    throw "Rojo produced an unexpectedly small plugin artifact"
+$releasePluginHash = (Get-FileHash -LiteralPath $releasePluginBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($packagedPluginHash -ne $releasePluginHash) {
+    throw "Packaged VSIX plugin does not match the release plugin"
 }
-if (-not ([IO.File]::ReadAllText($releasePluginXml).Contains("<roblox"))) {
-    throw "The .rbxmx plugin artifact is not a Roblox XML model"
-}
-
-Copy-Item -LiteralPath $releasePluginXml -Destination (Join-Path $pluginDirectory "Renium.rbxmx") -Force
-Copy-Item -LiteralPath $releasePluginBinary -Destination (Join-Path $pluginDirectory "Renium.rbxm") -Force
 
 $pluginInputs = @(
     Get-ChildItem -LiteralPath $pluginDirectory -File -Recurse |
@@ -264,6 +306,9 @@ $pluginInputs = @(
 
 $artifacts = @(
     Get-ArtifactRecord -Path $releaseCliBinary -ReleaseDirectory $releaseDirectory
+    $releaseSupportFiles | ForEach-Object {
+        Get-ArtifactRecord -Path $_ -ReleaseDirectory $releaseDirectory
+    }
     Get-ArtifactRecord -Path $releaseVsix -ReleaseDirectory $releaseDirectory
     Get-ArtifactRecord -Path $releasePluginXml -ReleaseDirectory $releaseDirectory
     Get-ArtifactRecord -Path $releasePluginBinary -ReleaseDirectory $releaseDirectory

@@ -5,7 +5,9 @@ import * as os from "os";
 import * as path from "path";
 import { URLSearchParams } from "url";
 import * as vscode from "vscode";
+import { findExecutableOnPath } from "./cliResolution";
 import { mergeAndResolve, sameSourceText, withLineEnding, type ConflictPolicy } from "./conflictMerge";
+import { changedEditorLiveSyncPaths } from "./editorLiveSyncCache";
 import {
   FileExplorerController,
   iconAssetNameForClass,
@@ -32,6 +34,7 @@ import { GitViewActions, GitViewState } from "./gitView";
 import { pickWorkspaceRoot } from "./utils";
 import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
 import { RbsyncEditorProvider } from "./rbsyncViewer";
+import { isRobloxModel, reniumPluginReleaseUrl } from "./pluginDistribution";
 
 const RENIUM_PACKAGE_DRAG_MIME = "application/vnd.renium.package";
 const RENIUM_PACKAGE_TEXT_PREFIX = "renium-package:";
@@ -716,9 +719,11 @@ function rustCliVersion(cliPath: string): string | undefined {
 
 function resolveExistingRustCliPath(workspaceRoot: string, projectRoot: string, configuredPath: string): string {
   const roots = Array.from(new Set([workspaceRoot, projectRoot].map((value) => path.normalize(value))));
+  const pathCandidate = findExecutableOnPath(RUST_CLI_BINARY);
   const candidates = [
     configuredPath,
     ...roots.flatMap((root) => RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => path.normalize(path.join(root, relativePath)))),
+    ...(pathCandidate ? [pathCandidate] : []),
   ];
   const uniqueCandidates = Array.from(new Set(candidates.map((candidate) => path.normalize(candidate))));
 
@@ -1107,7 +1112,8 @@ class RobloxSyncController {
 
   public async installStudioPlugin(): Promise<void> {
     const assetName = "Renium.rbxm";
-    const releaseUrl = `https://github.com/Superwheat/renium/releases/latest/download/${assetName}`;
+    const extensionVersion = String(this.context.extension.packageJSON.version ?? "");
+    const releaseUrl = reniumPluginReleaseUrl(extensionVersion, assetName);
     let pluginsDir: string;
     if (process.platform === "win32") {
       const localAppData = process.env.LOCALAPPDATA;
@@ -1128,30 +1134,41 @@ class RobloxSyncController {
       { location: vscode.ProgressLocation.Notification, title: "Renium: installing Studio plugin..." },
       async () => {
         let bytes: Buffer | undefined;
-        let source = releaseUrl;
-        try {
-          const response = await fetch(releaseUrl);
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+        let source = "";
+        const workspaceRoot = pickWorkspaceRoot();
+        const localBundles = [
+          this.context.asAbsolutePath(path.join("assets", assetName)),
+          ...(workspaceRoot ? [path.join(workspaceRoot, "tools", "plugin_ws_bridge", assetName)] : []),
+        ];
+        for (const localBundle of localBundles) {
+          if (!fs.existsSync(localBundle)) {
+            continue;
           }
-          bytes = Buffer.from(await response.arrayBuffer());
-        } catch (error) {
-          const workspaceRoot = pickWorkspaceRoot();
-          const localBundle = workspaceRoot
-            ? path.join(workspaceRoot, "tools", "plugin_ws_bridge", assetName)
-            : undefined;
-          if (localBundle && fs.existsSync(localBundle)) {
-            bytes = fs.readFileSync(localBundle);
+          const candidateBytes = fs.readFileSync(localBundle);
+          if (isRobloxModel(candidateBytes)) {
+            bytes = candidateBytes;
             source = localBundle;
-          } else {
+            break;
+          }
+          this.output.appendLine(`[plugin-install] ignored invalid bundled model: ${localBundle}`);
+        }
+        if (!bytes) {
+          source = releaseUrl;
+          try {
+            const response = await fetch(releaseUrl);
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            bytes = Buffer.from(await response.arrayBuffer());
+          } catch (error) {
             void vscode.window.showErrorMessage(
-              `Renium: downloading the Studio plugin failed (${String(error)}). Check your network or grab ${assetName} from the GitHub release manually.`,
+              `Renium: downloading the matching Studio plugin failed (${String(error)}). Check your network or download ${assetName} from release v${extensionVersion}.`,
             );
             return;
           }
         }
-        if (!bytes.subarray(0, 8).toString("latin1").startsWith("<roblox")) {
-          void vscode.window.showErrorMessage("Renium: the downloaded plugin file is not a valid Roblox model.");
+        if (!isRobloxModel(bytes)) {
+          void vscode.window.showErrorMessage("Renium: the Studio plugin file is not a valid Roblox model.");
           return;
         }
         fs.mkdirSync(pluginsDir, { recursive: true });
@@ -6242,8 +6259,7 @@ class RobloxSyncController {
   private filterEditorLiveSyncChangedPaths(paths: string[], cfg: SyncConfig): string[] {
     const { cache, existed } = this.loadEditorLiveSyncCache(cfg.projectRoot);
     const seen = new Set<string>();
-    const changed: string[] = [];
-    const currentHashes: Record<string, string> = {};
+    const observations: { path: string; key: string; hash: string | undefined }[] = [];
 
     for (const filePath of paths) {
       const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
@@ -6251,29 +6267,10 @@ class RobloxSyncController {
         continue;
       }
       const hash = this.editorLiveSyncFileHash(filePath);
-      if (hash) {
-        currentHashes[key] = hash;
-      }
-      if (!existed) {
-        continue;
-      }
-      if (hash === undefined) {
-        if (cache.files[key] !== undefined) {
-          changed.push(filePath);
-        }
-        continue;
-      }
-      if (cache.files[key] !== hash) {
-        changed.push(filePath);
-      }
+      observations.push({ path: filePath, key, hash });
     }
 
-    if (!existed) {
-      cache.files = currentHashes;
-      this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
-      return [];
-    }
-
+    const changed = changedEditorLiveSyncPaths(observations, existed, cache.files);
     return this.excludeUnresolvedConflictMarkerPaths(changed);
   }
 
@@ -7923,11 +7920,16 @@ class RobloxSyncController {
   private resolveRustCliPathForCommand(cfg: SyncConfig, command: string): string {
     const workspaceRoot = this.getWorkspaceRoot();
     const roots = Array.from(new Set([workspaceRoot, cfg.projectRoot].map((value) => path.normalize(value))));
+    const pathCandidate = findExecutableOnPath(RUST_CLI_BINARY);
     const fallbackCandidates = roots.flatMap((root) =>
       RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => path.normalize(path.join(root, relativePath))),
     );
     const uniqueCandidates = Array.from(
-      new Set([cfg.rustCliPath, ...fallbackCandidates].map((candidate) => path.normalize(candidate))),
+      new Set([
+        cfg.rustCliPath,
+        ...fallbackCandidates,
+        ...(pathCandidate ? [pathCandidate] : []),
+      ].map((candidate) => path.normalize(candidate))),
     );
     const configuredPath = path.normalize(cfg.rustCliPath);
     const configuredIsDefaultCandidate = fallbackCandidates.includes(configuredPath);

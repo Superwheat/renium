@@ -1082,6 +1082,35 @@ return BridgeConnection
       </Item>
       <Item class="ModuleScript" referent="4">
         <Properties>
+          <string name="Name">BridgeContent</string>
+          <string name="Source"><![CDATA[local BridgeContent = {}
+
+function BridgeContent.serializeSource(sourceType, uri)
+	local name
+	if type(sourceType) == "string" then
+		name = sourceType
+	else
+		name = sourceType.Name
+	end
+	if name == "Uri" then
+		return uri or ""
+	end
+	if name == "None" then
+		return ""
+	end
+	error("Renium cannot serialize Content." .. tostring(name) .. " values without losing data")
+end
+
+function BridgeContent.serialize(value)
+	return BridgeContent.serializeSource(value.SourceType, value.Uri)
+end
+
+return BridgeContent
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
           <string name="Name">BridgeEditorSync</string>
           <string name="Source"><![CDATA[local BridgeEditorSync = {}
 
@@ -3714,7 +3743,7 @@ return BridgeEditorSync
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="5">
+      <Item class="ModuleScript" referent="6">
         <Properties>
           <string name="Name">BridgeIdentity</string>
           <string name="Source"><![CDATA[local BridgeIdentity = {}
@@ -3992,7 +4021,7 @@ return BridgeIdentity
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="6">
+      <Item class="ModuleScript" referent="7">
         <Properties>
           <string name="Name">BridgeParallel</string>
           <string name="Source"><![CDATA[local BridgeParallel = {}
@@ -4084,7 +4113,7 @@ return BridgeParallel
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="7">
+      <Item class="ModuleScript" referent="8">
         <Properties>
           <string name="Name">BridgePluginRuntime</string>
           <string name="Source"><![CDATA[
@@ -4425,6 +4454,7 @@ function BridgePluginRuntime.start(context)
 	local StatusModule = requireChildModule("BridgeStatus")
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
+	local ContentModule = requireChildModule("BridgeContent")
 	local TransportModule = requireChildModule("BridgeTransport")
 	local ConnectionModule = requireChildModule("BridgeConnection")
 	local IdentityModule = requireChildModule("BridgeIdentity")
@@ -5010,13 +5040,6 @@ function BridgePluginRuntime.start(context)
 		return false, hasModified, isModified, true, true, false
 	end
 
-	local function contentSourceToUri(value: any): string
-		if value.SourceType == Enum.ContentSourceType.Uri then
-			return value.Uri or ""
-		end
-		return ""
-	end
-
 	local function serializeValue(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
 		if valueType == "number" or valueType == "string" or valueType == "boolean" then
@@ -5103,7 +5126,7 @@ function BridgePluginRuntime.start(context)
 				direction = { x = value.Direction.X, y = value.Direction.Y, z = value.Direction.Z },
 			}
 		elseif valueType == "Content" then
-			return contentSourceToUri(value)
+			return ContentModule.serialize(value)
 		elseif valueType == "Instance" then
 			return IdentityModule.serializeRefValue(state, value)
 		end
@@ -5663,7 +5686,7 @@ function BridgePluginRuntime.start(context)
 		elseif valueType == "Font" then
 			return { COMPACT_VALUE_TAGS.Font, value.Family, tostring(value.Weight), tostring(value.Style) }
 		elseif valueType == "Content" then
-			return contentSourceToUri(value)
+			return ContentModule.serialize(value)
 		elseif valueType == "Instance" then
 			return serializeRefValueCompactV4(state, value)
 		end
@@ -9435,7 +9458,7 @@ return BridgePluginRuntime
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="8">
+      <Item class="ModuleScript" referent="9">
         <Properties>
           <string name="Name">BridgeProfiling</string>
           <string name="Source"><![CDATA[
@@ -10330,7 +10353,7 @@ return BridgeProfiling
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="9">
+      <Item class="ModuleScript" referent="10">
         <Properties>
           <string name="Name">BridgePropertySchema</string>
           <string name="Source"><![CDATA[local BridgePropertySchema = {}
@@ -10815,7 +10838,7 @@ return BridgePropertySchema
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="10">
+      <Item class="ModuleScript" referent="11">
         <Properties>
           <string name="Name">BridgeRuntimeApi</string>
           <string name="Source"><![CDATA[
@@ -12382,7 +12405,7 @@ return BridgeRuntimeApi
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="11">
+      <Item class="ModuleScript" referent="12">
         <Properties>
           <string name="Name">BridgeSettings</string>
           <string name="Source"><![CDATA[local BridgeSettings = {}
@@ -12641,7 +12664,7 @@ return BridgeSettings
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="12">
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">BridgeStatus</string>
           <string name="Source"><![CDATA[local BridgeStatus = {}
@@ -12759,7 +12782,7 @@ return BridgeStatus
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">BridgeStudioApiSchema</string>
           <string name="Source"><![CDATA[return {
@@ -19474,7 +19497,7 @@ return BridgeStatus
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">BridgeStudioChanges</string>
           <string name="Source"><![CDATA[
@@ -20799,7 +20822,7 @@ return BridgeStudioChanges
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">BridgeTheme</string>
           <string name="Source"><![CDATA[local BridgeTheme = {}
@@ -20887,7 +20910,7 @@ return BridgeTheme
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">BridgeTransport</string>
           <string name="Source"><![CDATA[local HttpService = game:GetService("HttpService")
@@ -20972,7 +20995,7 @@ return BridgeTransport
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">BridgeUi</string>
           <string name="Source"><![CDATA[local BridgeUi = {}
@@ -23539,7 +23562,7 @@ return BridgeUi
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">RbxDom</string>
           <string name="Source"><![CDATA[local database = require(script.database)
@@ -23614,7 +23637,7 @@ return {
 }
 ]]></string>
         </Properties>
-        <Item class="ModuleScript" referent="19">
+        <Item class="ModuleScript" referent="20">
           <Properties>
             <string name="Name">EncodedValue</string>
             <string name="Source"><![CDATA[local base64 = require(script.Parent.base64)
@@ -24247,7 +24270,7 @@ return EncodedValue
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="20">
+        <Item class="ModuleScript" referent="21">
           <Properties>
             <string name="Name">Error</string>
             <string name="Source"><![CDATA[local Error = {}
@@ -24282,7 +24305,7 @@ return Error
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="21">
+        <Item class="ModuleScript" referent="22">
           <Properties>
             <string name="Name">PropertyDescriptor</string>
             <string name="Source"><![CDATA[local Error = require(script.Parent.Error)
@@ -24393,7 +24416,7 @@ return PropertyDescriptor
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="22">
+        <Item class="ModuleScript" referent="23">
           <Properties>
             <string name="Name">allValues</string>
             <string name="Source">return {
@@ -24731,7 +24754,7 @@ return PropertyDescriptor
 }</string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="23">
+        <Item class="ModuleScript" referent="24">
           <Properties>
             <string name="Name">base64</string>
             <string name="Source"><![CDATA[local EncodingService = game:GetService("EncodingService")
@@ -24747,7 +24770,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="24">
+        <Item class="ModuleScript" referent="25">
           <Properties>
             <string name="Name">customProperties</string>
             <string name="Source"><![CDATA[local CollectionService = game:GetService("CollectionService")
@@ -25008,7 +25031,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="25">
+        <Item class="ModuleScript" referent="26">
           <Properties>
             <string name="Name">database</string>
             <string name="Source">return {
