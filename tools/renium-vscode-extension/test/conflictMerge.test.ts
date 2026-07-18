@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { mergeAndResolve, threeWayMerge } from "../src/conflictMerge";
+import { mergeAndResolve, sameSourceText, threeWayMerge, withLineEnding } from "../src/conflictMerge";
 
 test("mergeAndResolve combines non-overlapping edits from both sides", () => {
   const result = mergeAndResolve("a\nb\nc", "A\nb\nc", "a\nb\nC", "prompt");
@@ -38,4 +38,15 @@ test("threeWayMerge falls back to one conflict for oversized comparisons", () =>
   assert.equal(result.clean, false);
   assert.equal(result.conflictCount, 1);
   assert.equal(result.regions.length, 1);
+});
+
+test("source comparison ignores line-ending-only differences", () => {
+  assert.equal(sameSourceText("a\r\nb\r\n", "a\nb\n"), true);
+  assert.equal(sameSourceText("a\rb", "a\nb"), true);
+  assert.equal(sameSourceText("a\nb", "a\nc"), false);
+});
+
+test("accepted Studio source keeps the filesystem EOL convention", () => {
+  assert.equal(withLineEnding("a\nb\n", "\r\n"), "a\r\nb\r\n");
+  assert.equal(withLineEnding("a\r\nb\r\n", "\n"), "a\nb\n");
 });

@@ -6,11 +6,11 @@ export type ConflictPolicy = "prompt" | "filesystem" | "studio";
 const MAX_LCS_CELLS = 4_000_000;
 
 export interface MergeRegion {
-  /** true when this region is a clean (auto-mergeable) span. */
+
   readonly clean: boolean;
-  /** Resulting lines when clean. */
+
   readonly lines: string[];
-  /** Present only when !clean. */
+
   readonly conflict?: {
     readonly base: string[];
     readonly ours: string[];
@@ -19,15 +19,15 @@ export interface MergeRegion {
 }
 
 export interface ThreeWayMergeResult {
-  /** true when no region conflicted. */
+
   readonly clean: boolean;
-  /** Ordered regions describing the merged document. */
+
   readonly regions: MergeRegion[];
-  /** Number of conflicting regions. */
+
   readonly conflictCount: number;
 }
 
-/** Split text into lines. CRLF/CR are normalized to LF boundaries for comparison. */
+
 export function splitLines(text: string): string[] {
   if (text.length === 0) {
     return [];
@@ -39,12 +39,22 @@ export function joinLines(lines: string[], eol: "\n" | "\r\n" = "\n"): string {
   return lines.join(eol);
 }
 
-/**
- * Longest common subsequence of two line arrays.
- * Returns matched index pairs [aIndex, bIndex] in increasing order.
- * O(n*m) time/memory. Oversized comparisons deliberately return no anchors so
- * the caller resolves one whole-document conflict instead of exhausting memory.
- */
+
+export function sameSourceText(left: string, right: string): boolean {
+  return left.replace(/\r\n|\r/g, "\n") === right.replace(/\r\n|\r/g, "\n");
+}
+
+
+export function withLineEnding(text: string, eol: "\n" | "\r\n"): string {
+  return text.replace(/\r\n|\r|\n/g, "\n").replace(/\n/g, eol);
+}
+
+
+
+
+
+
+
 function lcsMatches(a: string[], b: string[]): Array<[number, number]> {
   const n = a.length;
   const m = b.length;
@@ -101,11 +111,11 @@ interface Anchor {
   readonly t: number;
 }
 
-/**
- * Three-way merge of `ours` and `theirs` against common ancestor `base`.
- * Produces ordered regions; a region changed by only one side (or by both
- * identically) is clean, a region changed differently by both is a conflict.
- */
+
+
+
+
+
 export function threeWayMerge(base: string[], ours: string[], theirs: string[]): ThreeWayMergeResult {
   const mbOurs = new Map<number, number>();
   for (const [bi, oi] of lcsMatches(base, ours)) {
@@ -185,13 +195,13 @@ export interface RenderOptions {
   readonly theirsLabel?: string;
 }
 
-/**
- * Resolve a merge result to final text given a side preference for conflicts.
- * Clean regions always merge; conflicting regions take the preferred side.
- * Renium never writes git-style conflict markers into script files — overlapping
- * conflicts always resolve to one side (and both sides are backed up by the
- * caller), so the file on disk is always valid Lua.
- */
+
+
+
+
+
+
+
 export function renderTakingSide(
   result: ThreeWayMergeResult,
   side: ConflictSide,
@@ -210,25 +220,25 @@ export function renderTakingSide(
 }
 
 export interface ResolvedMerge {
-  /** Final text to write (and/or push back). */
+
   readonly text: string;
-  /** Whether any region conflicted. */
+
   readonly hadConflicts: boolean;
-  /** True under the "prompt" policy when a conflict occurred: the local side was
-   * kept and the caller should surface a diff so the user can review/switch. */
+
+
   readonly needsManualResolution: boolean;
-  /** Number of conflicting regions. */
+
   readonly conflictCount: number;
 }
 
-/**
- * High-level entry point: merge three versions and resolve per policy.
- *   - "filesystem": overlapping conflicts resolved in favour of `ours`
- *   - "studio":     overlapping conflicts resolved in favour of `theirs`
- *   - "prompt":     keep `ours` (local) and set needsManualResolution so the
- *                   caller can surface a diff. No conflict markers are written.
- * Non-overlapping concurrent edits always merge automatically regardless.
- */
+
+
+
+
+
+
+
+
 export function mergeAndResolve(
   baseText: string,
   oursText: string,

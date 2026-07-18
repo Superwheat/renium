@@ -62,9 +62,7 @@ function Sanitize-Name {
     $invalid = [System.IO.Path]::GetInvalidFileNameChars() -join ""
     $pattern = "[" + [Regex]::Escape($invalid) + "]"
     $sanitized = [Regex]::Replace([string]$Name, $pattern, "_")
-    # Windows file/dir segments cannot end with space or dot.
     $sanitized = $sanitized.TrimEnd(" ", ".")
-    # Avoid reserved DOS device names.
     if ($sanitized -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
         $sanitized = "_" + $sanitized
     }
@@ -730,7 +728,6 @@ foreach ($service in $TargetServices) {
         }
 
         if (-not $parentPath) {
-            # Backward compatibility with older snapshots that did not include parentPath.
             $lastDot = $path.LastIndexOf('.')
             if ($lastDot -gt 0) {
                 $parentPath = $path.Substring(0, $lastDot)

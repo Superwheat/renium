@@ -1649,6 +1649,9 @@ return {
 	["EditableService"] = {
 		{ "Archivable", "Bool" },
 	},
+	["EditorSourceService"] = {
+		{ "Archivable", "Bool" },
+	},
 	["EncodingService"] = {
 		{ "Archivable", "Bool" },
 	},
@@ -2746,6 +2749,8 @@ return {
 		{ "Backward", "Enum.KeyCode" },
 		{ "Right", "Enum.KeyCode" },
 		{ "Archivable", "Bool" },
+		{ "DisplayImage", "ContentId" },
+		{ "DisplayName", "String" },
 	},
 	["InputContext"] = {
 		{ "Enabled", "Bool" },
@@ -6630,6 +6635,7 @@ return {
 		{ "EnableSLIMAvatars", "Enum.RolloutState" },
 		{ "MeshStreamingAndImprovedLods", "Enum.RolloutState" },
 		{ "ModelStreamingBehavior", "Enum.ModelStreamingBehavior" },
+		{ "PredictiveStreamingMode", "Enum.PredictiveStreamingMode" },
 		{ "StreamOutBehavior", "Enum.StreamOutBehavior" },
 		{ "StreamingEnabled", "Bool" },
 		{ "StreamingIntegrityMode", "Enum.StreamingIntegrityMode" },

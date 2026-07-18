@@ -1,4 +1,4 @@
---!nocheck
+
 
 local BridgeRuntimeApi = {}
 
@@ -102,6 +102,9 @@ function BridgeRuntimeApi.create(plugin)
 		lastStartedAt = 0,
 		lastStoppedAt = 0,
 	}
+	local deviceSimulatorReadyAt = os.clock() + 4
+	local captureProbeGui = nil
+	local captureProbeFrame = nil
 
 	local function appendConsoleEntry(message, messageType)
 		consoleSeq += 1
@@ -132,6 +135,128 @@ function BridgeRuntimeApi.create(plugin)
 	end)
 
 	local api = {}
+
+	local function executeWithRunner(parent, className, baseName, runContext, code, timeoutSeconds, context)
+		local scriptInstance = Instance.new(className)
+		scriptInstance.Name = baseName .. "_" .. tostring(runnerSequence + 1)
+		pcall(function()
+			scriptInstance.Enabled = false
+		end)
+		if runContext ~= nil then
+			scriptInstance.RunContext = runContext
+		end
+		local resultEvent = Instance.new("BindableEvent")
+		resultEvent.Name = "__ReniumResult"
+		resultEvent.Parent = scriptInstance
+		local status = nil
+		local values = nil
+		local resultConnection = resultEvent.Event:Connect(function(nextStatus, ...)
+			if status == nil then
+				status = tostring(nextStatus)
+				values = table.pack(...)
+			end
+		end)
+		local logError = nil
+		local logConnection = LogService.MessageOut:Connect(function(message, messageType)
+			if logError == nil
+				and string.find(tostring(message), scriptInstance.Name, 1, true)
+				and string.find(string.lower(consoleTypeName(messageType)), "error", 1, true)
+			then
+				logError = tostring(message)
+			end
+		end)
+		scriptInstance.Parent = parent
+		local path = compactInstancePath(scriptInstance)
+		local wrapped = ([==[
+local resultEvent = script:FindFirstChild("__ReniumResult")
+if resultEvent == nil then return end
+local output = {}
+local basePrint = print
+local baseWarn = warn
+local function capture(kind, ...)
+	local values = table.pack(...)
+	local parts = table.create(values.n)
+	for index = 1, values.n do parts[index] = tostring(values[index]) end
+	output[#output + 1] = { type = kind, message = table.concat(parts, "\t") }
+	if kind == "print" then basePrint(...) else baseWarn(...) end
+end
+local print = function(...) capture("print", ...) end
+local warn = function(...) capture("warn", ...) end
+local finished = false
+local worker
+worker = task.spawn(function()
+	local packed = table.pack(xpcall(function()
+%s
+	end, function(message)
+		local ok, trace = pcall(function() return debug.traceback(tostring(message), 2) end)
+		return if ok then trace else tostring(message)
+	end))
+	if finished then return end
+	finished = true
+	if packed[1] then
+		resultEvent:Fire("ok", output, table.unpack(packed, 2, packed.n))
+	else
+		resultEvent:Fire("error", tostring(packed[2]), output)
+	end
+end)
+task.delay(%.6f, function()
+	if finished then return end
+	finished = true
+	pcall(task.cancel, worker)
+	resultEvent:Fire("timeout", output)
+end)
+]==]):format(code, timeoutSeconds)
+		setRunnerSource(scriptInstance, wrapped)
+		local deadline = os.clock() + timeoutSeconds + 1
+		while status == nil and logError == nil and scriptInstance.Parent ~= nil and os.clock() < deadline do
+			task.wait()
+		end
+		resultConnection:Disconnect()
+		logConnection:Disconnect()
+		pcall(function()
+			scriptInstance.Enabled = false
+		end)
+		scriptInstance:Destroy()
+		if logError ~= nil then
+			return { ok = false, error = logError, output = {}, runner = true, path = path, context = context }
+		end
+		if status == "error" then
+			return {
+				ok = false,
+				error = tostring(values and values[1] or "Luau runner failed"),
+				output = if values and type(values[2]) == "table" then values[2] else {},
+				runner = true,
+				path = path,
+				context = context,
+			}
+		end
+		if status ~= "ok" then
+			return {
+				ok = false,
+				error = ("Luau runner timed out after %.1fs and was stopped"):format(timeoutSeconds),
+				timedOut = true,
+				stopped = true,
+				output = if values and type(values[1]) == "table" then values[1] else {},
+				runner = true,
+				path = path,
+				context = context,
+			}
+		end
+		local results = {}
+		if values ~= nil then
+			for index = 2, values.n do
+				results[#results + 1] = serializeApiValue(values[index])
+			end
+		end
+		return {
+			ok = true,
+			results = results,
+			output = if values and type(values[1]) == "table" then values[1] else {},
+			runner = true,
+			path = path,
+			context = context,
+		}
+	end
 
 	local function currentRunStateText()
 		local okState, state = pcall(function()
@@ -724,42 +849,358 @@ end)
 		}
 	end
 
+	function api.captureViewportProbe(params)
+		params = params or {}
+		local action = string.lower(tostring(params.action or "start"))
+		if action == "stop" or action == "clear" then
+			if captureProbeGui ~= nil then
+				captureProbeGui:Destroy()
+			end
+			captureProbeGui = nil
+			captureProbeFrame = nil
+			task.wait()
+			return { ok = true, action = "stop" }
+		end
+		local colors = params.colors
+		if type(colors) ~= "table" or #colors ~= 16 then
+			return { ok = false, error = "Capture probe requires 16 colors" }
+		end
+		if action == "start" then
+			if captureProbeGui ~= nil then
+				captureProbeGui:Destroy()
+			end
+			local screen = Instance.new("ScreenGui")
+			screen.Name = "__ReniumCaptureProbe"
+			screen.Archivable = false
+			screen.DisplayOrder = 2147483647
+			screen.IgnoreGuiInset = true
+			screen.ResetOnSpawn = false
+			screen.ZIndexBehavior = Enum.ZIndexBehavior.Global
+			pcall(function()
+				screen.ScreenInsets = Enum.ScreenInsets.None
+				screen.ClipToDeviceSafeArea = false
+				screen.SafeAreaCompatibility = Enum.SafeAreaCompatibility.None
+			end)
+			local frame = Instance.new("Frame")
+			frame.Name = "Probe"
+			frame.Archivable = false
+			frame.BackgroundTransparency = 1
+			frame.BorderSizePixel = 0
+			frame.ClipsDescendants = true
+			frame.Size = UDim2.fromScale(1, 1)
+			frame.ZIndex = 2147483647
+			for index = 1, 16 do
+				local packed = tonumber(colors[index]) or 0
+				local tile = Instance.new("Frame")
+				tile.Name = tostring(index)
+				tile.Archivable = false
+				tile.BackgroundColor3 = Color3.fromRGB(
+					bit32.extract(packed, 16, 8),
+					bit32.extract(packed, 8, 8),
+					bit32.extract(packed, 0, 8)
+				)
+				tile.BackgroundTransparency = 0.98
+				tile.BorderSizePixel = 0
+				tile.Position = UDim2.fromScale(((index - 1) % 4) / 4, math.floor((index - 1) / 4) / 4)
+				tile.Size = UDim2.fromScale(0.25, 0.25)
+				tile.ZIndex = 2147483647
+				tile.Parent = frame
+			end
+			frame.Parent = screen
+			screen.Parent = game:GetService("CoreGui")
+			captureProbeGui = screen
+			captureProbeFrame = frame
+		elseif action == "phase" then
+			if captureProbeFrame == nil or captureProbeFrame.Parent == nil then
+				return { ok = false, error = "Capture probe is not active" }
+			end
+			for index = 1, 16 do
+				local packed = tonumber(colors[index]) or 0
+				local tile = captureProbeFrame:FindFirstChild(tostring(index))
+				if tile == nil then
+					return { ok = false, error = "Capture probe tile is missing" }
+				end
+				tile.BackgroundColor3 = Color3.fromRGB(
+					bit32.extract(packed, 16, 8),
+					bit32.extract(packed, 8, 8),
+					bit32.extract(packed, 0, 8)
+				)
+			end
+		else
+			return { ok = false, error = "Unknown capture probe action '" .. action .. "'" }
+		end
+		task.wait()
+		return { ok = true, action = action }
+	end
+
+	function api.deviceSimulator(params)
+		params = params or {}
+		local action = string.lower(tostring(params.action or "status"))
+		local service = game:GetService("StudioDeviceSimulatorService")
+
+		local function enumName(value)
+			local text = tostring(value)
+			return string.match(text, "[^%.]+$") or text
+		end
+
+		local function deviceInfo(deviceId)
+			local info = service:GetDeviceInfoAsync(deviceId)
+			return {
+				id = tostring(info.DeviceId or deviceId),
+				name = tostring(info.Name or deviceId),
+				form = enumName(info.DeviceForm),
+				custom = info.IsCustom == true,
+				width = tonumber(info.Width),
+				height = tonumber(info.Height),
+				pixelDensity = tonumber(info.PixelDensity),
+				resolutionScale = tonumber(info.ResolutionScale),
+				portraitKeyboardHeight = tonumber(info.PortraitKeyboardHeight),
+				landscapeKeyboardHeight = tonumber(info.LandscapeKeyboardHeight),
+			}
+		end
+
+		local function status()
+			local camera = workspace.CurrentCamera
+			local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+			local inactive = {
+				ok = true,
+				action = "status",
+				simulating = false,
+				viewport = { width = viewport.X, height = viewport.Y },
+			}
+			local okDevice, deviceId = pcall(function()
+				return service:GetDeviceAsync()
+			end)
+			if not okDevice or type(deviceId) ~= "string" or deviceId == "" then
+				return inactive
+			end
+			local okConfig, resolution, orientation, scalingMode, pixelDensity = pcall(function()
+				return service:GetResolutionAsync(),
+					service:GetOrientationAsync(),
+					service:GetScalingModeAsync(),
+					service:GetPixelDensityAsync()
+			end)
+			if not okConfig then
+				return inactive
+			end
+			local result = {
+				ok = true,
+				action = "status",
+				simulating = true,
+				settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock()),
+				viewport = { width = viewport.X, height = viewport.Y },
+				deviceId = deviceId,
+				orientation = enumName(orientation),
+				scalingMode = enumName(scalingMode),
+				resolution = {
+					width = resolution.X,
+					height = resolution.Y,
+				},
+				pixelDensity = pixelDensity,
+			}
+			if type(deviceId) == "string" and deviceId ~= "" then
+				local okInfo, info = pcall(deviceInfo, deviceId)
+				if okInfo then
+					result.device = info
+				end
+			end
+			return result
+		end
+
+		local function listDevices()
+			local devices = {}
+			for _, deviceId in ipairs(service:GetDeviceListAsync()) do
+				local okInfo, info = pcall(deviceInfo, deviceId)
+				if okInfo then
+					devices[#devices + 1] = info
+				else
+					devices[#devices + 1] = { id = tostring(deviceId), name = tostring(deviceId) }
+				end
+			end
+			return devices
+		end
+
+		local function normalized(value)
+			return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
+		end
+
+		local function resolveDevice(requested, devices)
+			local key = normalized(requested)
+			if key == "" then
+				return nil, "Missing device name or id"
+			end
+			for _, device in ipairs(devices) do
+				if normalized(device.id) == key or normalized(device.name) == key then
+					return device
+				end
+			end
+			local matches = {}
+			for _, device in ipairs(devices) do
+				if string.find(normalized(device.id), key, 1, true)
+					or string.find(normalized(device.name), key, 1, true)
+				then
+					matches[#matches + 1] = device
+				end
+			end
+			if #matches == 1 then
+				return matches[1]
+			end
+			if #matches == 0 then
+				return nil, "Unknown device '" .. tostring(requested) .. "'"
+			end
+			local names = {}
+			for _, device in ipairs(matches) do
+				names[#names + 1] = device.name .. " (" .. device.id .. ")"
+			end
+			return nil, "Device '" .. tostring(requested) .. "' is ambiguous: " .. table.concat(names, ", ")
+		end
+
+		if action == "list" then
+			local devices = listDevices()
+			return { ok = true, action = "list", count = #devices, devices = devices }
+		end
+
+		if action == "status" or action == "get" then
+			return status()
+		end
+
+		if action == "stop" or action == "reset" then
+			local before = status()
+			if before.simulating ~= true then
+				return { ok = true, action = "stop", stopped = true, alreadyStopped = true }
+			end
+			local okStop, stopError = pcall(function()
+				service:StopSimulationAsync()
+			end)
+			if not okStop and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true) then
+				return { ok = false, error = tostring(stopError) }
+			end
+			deviceSimulatorReadyAt = 0
+			return { ok = true, action = "stop", stopped = true, alreadyStopped = false }
+		end
+
+		if action ~= "set" and action ~= "select" and action ~= "apply" then
+			return { ok = false, error = "Unknown device action '" .. action .. "'" }
+		end
+
+		local selectedDevice = nil
+		if params.device ~= nil and tostring(params.device) ~= "" then
+			local device, resolveError = resolveDevice(params.device, listDevices())
+			if device == nil then
+				return { ok = false, error = resolveError }
+			end
+			selectedDevice = device
+		end
+
+		local orientation = nil
+		if params.orientation ~= nil and tostring(params.orientation) ~= "" then
+			local key = normalized(params.orientation)
+			local orientations = {
+				portrait = Enum.ScreenOrientation.Portrait,
+				landscape = Enum.ScreenOrientation.LandscapeRight,
+				landscaperight = Enum.ScreenOrientation.LandscapeRight,
+				landscapeleft = Enum.ScreenOrientation.LandscapeLeft,
+				landscapesensor = Enum.ScreenOrientation.LandscapeSensor,
+				sensor = Enum.ScreenOrientation.Sensor,
+			}
+			orientation = orientations[key]
+			if orientation == nil then
+				return { ok = false, error = "Unknown orientation '" .. tostring(params.orientation) .. "'" }
+			end
+		end
+
+		local scalingMode = nil
+		if params.scalingMode ~= nil and tostring(params.scalingMode) ~= "" then
+			local key = normalized(params.scalingMode)
+			local scalingModes = {
+				physical = Enum.DeviceSimulatorScalingMode.ScaleToPhysicalSize,
+				scaletophysicalsize = Enum.DeviceSimulatorScalingMode.ScaleToPhysicalSize,
+				actual = Enum.DeviceSimulatorScalingMode.ActualResolution,
+				actualresolution = Enum.DeviceSimulatorScalingMode.ActualResolution,
+				fit = Enum.DeviceSimulatorScalingMode.FitToWindow,
+				fittowindow = Enum.DeviceSimulatorScalingMode.FitToWindow,
+			}
+			scalingMode = scalingModes[key]
+			if scalingMode == nil then
+				return { ok = false, error = "Unknown scaling mode '" .. tostring(params.scalingMode) .. "'" }
+			end
+		end
+
+		local width = tonumber(params.width)
+		local height = tonumber(params.height)
+		if width ~= nil or height ~= nil then
+			if width == nil or height == nil or width < 1 or height < 1 then
+				return { ok = false, error = "Resolution requires positive width and height" }
+			end
+		end
+
+		local density = nil
+		if params.pixelDensity ~= nil then
+			density = tonumber(params.pixelDensity)
+			if density == nil or density <= 0 then
+				return { ok = false, error = "Pixel density must be greater than zero" }
+			end
+		end
+
+		if selectedDevice == nil and orientation == nil and scalingMode == nil and width == nil and density == nil then
+			return { ok = false, error = "Set requires a device or configuration option" }
+		end
+
+		local changed = {}
+		if selectedDevice ~= nil then
+			service:SetDeviceAsync(selectedDevice.id)
+			changed[#changed + 1] = "device"
+		end
+		if orientation ~= nil then
+			service:SetOrientationAsync(orientation)
+			changed[#changed + 1] = "orientation"
+		end
+		if scalingMode ~= nil then
+			service:SetScalingModeAsync(scalingMode)
+			changed[#changed + 1] = "scalingMode"
+		end
+		if width ~= nil then
+			service:SetResolutionAsync(math.floor(width), math.floor(height))
+			changed[#changed + 1] = "resolution"
+		end
+		if density ~= nil then
+			service:SetPixelDensityAsync(density)
+			changed[#changed + 1] = "pixelDensity"
+		end
+
+		local wantsPortrait = orientation == Enum.ScreenOrientation.Portrait
+		local wantsLandscape = orientation == Enum.ScreenOrientation.LandscapeLeft
+			or orientation == Enum.ScreenOrientation.LandscapeRight
+			or orientation == Enum.ScreenOrientation.LandscapeSensor
+		if wantsPortrait or wantsLandscape then
+			local deadline = os.clock() + 2
+			while os.clock() < deadline do
+				local camera = workspace.CurrentCamera
+				local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+				if (wantsPortrait and viewport.Y >= viewport.X) or (wantsLandscape and viewport.X >= viewport.Y) then
+					break
+				end
+				RunService.Heartbeat:Wait()
+			end
+		end
+		deviceSimulatorReadyAt = os.clock() + 4
+
+		local result = status()
+		result.action = "set"
+		result.changed = changed
+		return result
+	end
+
 	function api.executeLuau(params)
 		params = params or {}
 		local code = tostring(params.code or "")
 		if code == "" then
 			return { ok = false, error = "Missing Luau code" }
 		end
+		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 20)
 
 		local context = string.lower(tostring(params.context or params.target or "plugin"))
 		if context == "client" or context == "local" then
-			local okClient, isClient = pcall(function()
-				return RunService:IsClient()
-			end)
-			local okRunning, running = pcall(function()
-				return RunService:IsRunning()
-			end)
-			if okClient and isClient == true and okRunning and running == true then
-				local directParams = {}
-				for key, value in pairs(params) do
-					directParams[key] = value
-				end
-				directParams.context = "plugin"
-				local directResult = api.executeLuau(directParams)
-				if type(directResult) == "table" then
-					if directResult.ok ~= false then
-						directResult.context = "client"
-						directResult.direct = true
-						return directResult
-					end
-					if not string.find(tostring(directResult.error or ""), "loadstring", 1, true) then
-						directResult.context = "client"
-						directResult.direct = true
-						return directResult
-					end
-				end
-			end
-
 			local players = game:GetService("Players")
 			local localPlayer = players.LocalPlayer
 			if localPlayer == nil then
@@ -770,24 +1211,25 @@ end)
 				return { ok = false, error = "PlayerScripts is not available on the play client" }
 			end
 
-			local scriptInstance = playerScripts:FindFirstChild(CLIENT_RUNNER_NAME)
-			if scriptInstance ~= nil and not scriptInstance:IsA("LocalScript") then
-				scriptInstance:Destroy()
-				scriptInstance = nil
-			end
-			if scriptInstance == nil then
-				scriptInstance = Instance.new("LocalScript")
-				scriptInstance.Name = CLIENT_RUNNER_NAME
-				scriptInstance.Parent = playerScripts
-			end
-			setRunnerSource(scriptInstance, code)
+			return executeWithRunner(playerScripts, "LocalScript", CLIENT_RUNNER_NAME, nil, code, timeoutSeconds, "client")
+		end
 
-			return {
-				ok = true,
-				context = "client",
-				runner = true,
-				path = compactInstancePath(scriptInstance),
-			}
+		local okRunning, running = pcall(function()
+			return RunService:IsRunning()
+		end)
+		local okServer, isServer = pcall(function()
+			return RunService:IsServer()
+		end)
+		if okRunning and running == true and okServer and isServer == true then
+			return executeWithRunner(
+				game:GetService("ServerScriptService"),
+				"Script",
+				SERVER_RUNNER_NAME,
+				Enum.RunContext.Server,
+				code,
+				timeoutSeconds,
+				"server"
+			)
 		end
 
 		if type(loadstring) ~= "function" then
@@ -813,35 +1255,6 @@ end)
 			end
 		end
 		if chunk == nil then
-			local errorText = tostring(compileError)
-			local okRunning, running = pcall(function()
-				return RunService:IsRunning()
-			end)
-			local okServer, isServer = pcall(function()
-				return RunService:IsServer()
-			end)
-			if string.find(errorText, "loadstring", 1, true) and okRunning and running == true and okServer and isServer == true then
-				local serverScriptService = game:GetService("ServerScriptService")
-				local scriptInstance = serverScriptService:FindFirstChild(SERVER_RUNNER_NAME)
-				if scriptInstance ~= nil and not scriptInstance:IsA("Script") then
-					scriptInstance:Destroy()
-					scriptInstance = nil
-				end
-				if scriptInstance == nil then
-					scriptInstance = Instance.new("Script")
-					scriptInstance.Name = SERVER_RUNNER_NAME
-					scriptInstance.RunContext = Enum.RunContext.Server
-					scriptInstance.Parent = serverScriptService
-				end
-				setRunnerSource(scriptInstance, code)
-
-				return {
-					ok = true,
-					context = "server",
-					runner = true,
-					path = compactInstancePath(scriptInstance),
-				}
-			end
 			return { ok = false, error = tostring(compileError) }
 		end
 
@@ -872,7 +1285,24 @@ end)
 		}, { __index = baseEnv })
 		pcall(setfenv, chunk, env)
 
-		local packed = table.pack(pcall(chunk))
+		local packed = nil
+		local executionThread = task.spawn(function()
+			packed = table.pack(pcall(chunk))
+		end)
+		local deadline = os.clock() + timeoutSeconds
+		while packed == nil and os.clock() < deadline do
+			task.wait()
+		end
+		if packed == nil then
+			pcall(task.cancel, executionThread)
+			return {
+				ok = false,
+				error = ("Luau execution timed out after %.1fs and was stopped"):format(timeoutSeconds),
+				timedOut = true,
+				stopped = true,
+				output = output,
+			}
+		end
 		if packed[1] ~= true then
 			return {
 				ok = false,

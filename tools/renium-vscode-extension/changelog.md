@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Pinned every multi-channel command to one Studio runtime so two windows on the same place cannot be mixed during chunked or parallel sync.
+- Added Studio undo recordings, Explorer selection preservation, CollectionService tag tracking, and first-error batch stopping for filesystem-to-Studio changes.
+- Hardened imports and uploads with recoverable stale-file backups, bounded/expiring sessions, explicit cancellation, and fail-closed place-guard reloads.
+- Ignored line-ending-only script differences while preserving the filesystem's CRLF/LF convention.
+- Made ordinary compile, test, package, and release builds use checked-in generated metadata without launching Studio; API and icon refreshes are now explicit maintenance commands.
+- Expanded release verification with Rust formatting/Clippy, Linux/macOS tests, generated plugin parsing, binary round-trip fixtures, and Rojo builds for both plugin formats.
+
 ## 0.1.2 - 2026-07-10
 
 - Added the **Rbsync Viewer**: a new tab in the Renium sidebar where you drag any `.rbsync` file (or double-click one in the Explorer) to see its full instance tree — class icons, properties, attributes, and script source, with a filter box. Decoding goes through the `renium view` CLI so what you see matches exactly what syncs.

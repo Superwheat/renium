@@ -41,9 +41,6 @@ fn main() {
     embed_windows_manifest();
 }
 
-/// Embed an application manifest declaring long-path awareness so Win32 file
-/// APIs accept paths over 260 characters (requires the OS LongPathsEnabled
-/// policy, which Windows 10 1607+ supports).
 fn embed_windows_manifest() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")

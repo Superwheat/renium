@@ -84,6 +84,19 @@ npm.cmd ci
 npm.cmd run verify
 ```
 
+Ordinary compile, verify, package, and release commands use the checked-in API
+metadata and class icons. They do not start Roblox Studio or rewrite generated
+source files. Asset refreshes are explicit:
+
+```powershell
+npm.cmd run sync-assets             # local metadata/icons; no Studio process
+npm.cmd run refresh-studio-assets   # also runs Studio's headless -API export
+```
+
+Review and commit the generated diff after either refresh. Release builds must
+not depend on whichever Studio version happens to be installed on the build
+machine.
+
 Build Rust backend (recommended):
 
 ```powershell
@@ -119,9 +132,7 @@ For a public release, omit `-LocalBuild`. The release command intentionally
 requires a clean checkout, a root product `LICENSE` file, and a registered VS
 Code publisher. The current `publisher: "local"` setting is suitable only for
 offline/private VSIX installation; replace it with your registered publisher
-before Marketplace publication. The product license has deliberately not been
-chosen by this project yet, so do not publish a public release until that is
-resolved.
+before Marketplace publication.
 
 ## Key settings
 

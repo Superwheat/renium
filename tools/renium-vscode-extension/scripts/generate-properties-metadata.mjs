@@ -357,8 +357,11 @@ function waitForFile(pathToWaitFor, minBytes, timeoutMs) {
   return fs.existsSync(pathToWaitFor) && fs.statSync(pathToWaitFor).size >= minBytes;
 }
 
-function ensureStudioApiDump(repoRoot) {
+function ensureStudioApiDump(repoRoot, refreshStudioApi = false) {
   const outputPath = path.join(repoRoot, "tools", "API-Dump.json");
+  if (!refreshStudioApi) {
+    return fs.existsSync(outputPath) ? outputPath : undefined;
+  }
   const studio = findLatestStudioExecutable();
   if (!studio) {
     return fs.existsSync(outputPath) ? outputPath : undefined;
@@ -379,8 +382,8 @@ function ensureStudioApiDump(repoRoot) {
   return waitForFile(outputPath, 1024 * 1024, 30000) ? outputPath : outputStat ? outputPath : undefined;
 }
 
-function resolvePropertySource(repoRoot) {
-  const studioApiDump = ensureStudioApiDump(repoRoot);
+function resolvePropertySource(repoRoot, refreshStudioApi = false) {
+  const studioApiDump = ensureStudioApiDump(repoRoot, refreshStudioApi);
   return [
     studioApiDump,
     path.join(repoRoot, "API-Dump.json"),
@@ -996,7 +999,7 @@ export function generateRobloxPropertiesMetadata(options = {}) {
   const extensionRoot = options.extensionRoot ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const repoRoot = options.repoRoot ?? path.resolve(extensionRoot, "..", "..");
   const outputPath = options.outputPath ?? path.join(extensionRoot, "resources", GENERATED_FILE_NAME);
-  const propertySourcePath = resolvePropertySource(repoRoot);
+  const propertySourcePath = resolvePropertySource(repoRoot, options.refreshStudioApi === true);
   if (!propertySourcePath) {
     throw new Error("Could not find API-Dump.json, Full-API-Dump.json, or plugin rbx_dom database.json.");
   }

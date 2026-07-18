@@ -3,7 +3,7 @@
   "sources": {
     "propertySource": "tools/API-Dump.json",
     "propertySourceKind": "api-dump",
-    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-39e592df3865409a/ReflectionMetadata.xml",
+    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-ed7d8193e8564b1f/ReflectionMetadata.xml",
     "propertySorter": "tools/renium-vscode-extension/resources/robloxPropertySorters.js"
   },
   "classes": {
@@ -13116,6 +13116,17 @@
         "declaringClass": "Instance"
       }
     },
+    "EditorSourceService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "EncodingService": {
       "Archivable": {
         "type": "Bool",
@@ -24691,6 +24702,24 @@
         "writable": true,
         "visible": true,
         "declaringClass": "Instance"
+      },
+      "DisplayImage": {
+        "type": "ContentId",
+        "category": "Display",
+        "displayName": "DisplayImage",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputBinding"
+      },
+      "DisplayName": {
+        "type": "String",
+        "category": "Display",
+        "displayName": "DisplayName",
+        "order": 281,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputBinding"
       }
     },
     "InputContext": {
@@ -56685,6 +56714,20 @@
           "Default",
           "Legacy",
           "Improved"
+        ]
+      },
+      "PredictiveStreamingMode": {
+        "type": "Enum.PredictiveStreamingMode",
+        "category": "Streaming",
+        "displayName": "PredictiveStreamingMode",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Workspace",
+        "enumItems": [
+          "Default",
+          "Enabled",
+          "Disabled"
         ]
       },
       "StreamOutBehavior": {

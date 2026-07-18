@@ -1,3 +1,5 @@
+Renium is a full-fidelity two-way sync and automation tool for Roblox Studio. Its compact `rbx` CLI lets agents inspect and edit projects, capture screenshots, run playtests, and control Studio without manual interaction.
+
 # Agent Notes
 
 - Use `rbx` (wrapper for `tools/renium/target/release/renium.exe`).
@@ -86,6 +88,23 @@ rbx play -x                    # end test
 ```
 
 `rbx l` = server during any test. `rbx lc "code" Player2` = `lx --player Player2 -e`.
+Luau execution returns values and captured output; compile errors, runtime errors, and timeouts exit nonzero. Use `rbx lx -e "code" -t 5` to change the 10-second limit.
+
+## Device emulation
+
+Use Studio's plugin-level simulator directly. No keyboard, mouse, focus, coordinates, or ribbon interaction is needed.
+
+```powershell
+rbx device list
+rbx device set "iPhone 16 Pro" --orientation portrait
+rbx device set --scaling fit
+rbx device set --resolution 1179x2556 --pixel-density 460
+rbx device status
+rbx shot --studio -o iphone-16-pro.png
+rbx device stop
+```
+
+Notched phones reproduce Studio's real safe-area behavior for `DeviceSafeInsets`, `ClipToDeviceSafeArea`, and `SafeAreaCompatibility` validation. Device names and stable ids from `rbx device list` are both accepted. With emulation active, `rbx shot` automatically captures the simulated Studio viewport; `--studio` makes that target explicit and `--client` forces the latest Play client instead.
 
 2+ games open = cmds refuse and list places; pin with `PLACE=<name|id>`
 (substring ok).

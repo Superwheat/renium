@@ -21,9 +21,11 @@ use rbx_dom_weak::types::{
     ContentId as RbxContentId, ContentType as RbxContentType,
     CustomPhysicalProperties as RbxCustomPhysicalProperties, Enum as RbxEnum,
     EnumItem as RbxEnumItem, Faces as RbxFaces, Font as RbxFont, FontStyle as RbxFontStyle,
-    FontWeight as RbxFontWeight, Matrix3 as RbxMatrix3, NumberRange as RbxNumberRange,
+    FontWeight as RbxFontWeight, MaterialColors as RbxMaterialColors, Matrix3 as RbxMatrix3,
+    NetAssetRef as RbxNetAssetRef, NumberRange as RbxNumberRange,
     NumberSequence as RbxNumberSequence, NumberSequenceKeypoint as RbxNumberSequenceKeypoint,
     PhysicalProperties as RbxPhysicalProperties, Ray as RbxRay, Rect as RbxRect, Ref as RbxRef,
+    Region3 as RbxRegion3, Region3int16 as RbxRegion3int16, SharedString as RbxSharedString,
     Tags as RbxTags, UDim as RbxUDim, UDim2 as RbxUDim2, Variant as RbxVariant,
     VariantType as RbxVariantType, Vector2 as RbxVector2, Vector2int16 as RbxVector2int16,
     Vector3 as RbxVector3, Vector3int16 as RbxVector3int16,
@@ -32,7 +34,8 @@ use rbx_dom_weak::{InstanceBuilder as RbxInstanceBuilder, WeakDom as RbxWeakDom}
 use rbx_reflection::{
     ClassDescriptor as RbxClassDescriptor, DataType as RbxDataType,
     PropertyDescriptor as RbxPropertyDescriptor, PropertyKind as RbxPropertyKind,
-    PropertySerialization as RbxPropertySerialization, ReflectionDatabase,
+    PropertySerialization as RbxPropertySerialization, PropertyTag as RbxPropertyTag,
+    ReflectionDatabase, Scriptability as RbxScriptability,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -145,7 +148,7 @@ const MAX_DAEMON_ARG_BYTES: usize = 512 * 1024;
 const MAX_DAEMON_CONTROL_CONNECTIONS: usize = 16;
 const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DAEMON_CONTROL_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_DISCOVERY_MAX_AGE_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS: u128 = 5 * 60 * 1000;
@@ -168,8 +171,7 @@ const BRIDGE_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const BRIDGE_SLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 const LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES: usize = 20_000;
 const LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES: usize = 5_000;
-/// Canonical Renium bytecode store name. `.rbsync` remains readable as a
-/// legacy import format, but every new or rewritten service store uses this.
+
 const SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.renium";
 const LEGACY_SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.rbsync";
 const RENIUM_STORE_EXTENSION: &str = "renium";
@@ -229,9 +231,6 @@ fn read_bounded_line<R: BufRead>(
     Ok(BoundedLineRead::Line)
 }
 
-/// Renium's bridge intentionally has no network authentication. Keep both the
-/// WebSocket listener and the daemon control port on loopback so a LAN peer
-/// cannot turn that trusted-local protocol into a remote code/mutation API.
 fn normalize_loopback_bridge_host(host: &str) -> Result<String> {
     let raw = host.trim();
     let normalized = if raw.is_empty() || raw.eq_ignore_ascii_case("localhost") {
@@ -269,12 +268,22 @@ fn bridge_response_timeout(method: &str) -> Duration {
     match method {
         "prepare"
         | "applyEditorChanges"
+        | "appendEditorBinaryImport"
+        | "appendEditorPushReview"
+        | "finishEditorBinaryImport"
         | "profilePluginOps"
         | "getInstanceBatchChunk"
         | "getInstanceBatchCompactChunk"
         | "getSourceBatchChunk"
         | "getSourceRangeBatchCompactChunk" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
         _ => BRIDGE_DEFAULT_RESPONSE_TIMEOUT,
+    }
+}
+
+fn bridge_channel_lock_timeout(method: &str) -> Duration {
+    match method {
+        "appendEditorBinaryImport" | "appendEditorPushReview" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
+        _ => BRIDGE_CHANNEL_LOCK_TIMEOUT,
     }
 }
 
@@ -551,7 +560,7 @@ impl PerformanceMode {
     about = "High-performance Roblox snapshot importer and project JSON generator"
 )]
 struct Cli {
-    /// Pin bridge commands to one Studio place by name or placeId (env: RENIUM_PLACE)
+    #[arg(help = "Pin bridge commands to one Studio place by name or placeId (env: RENIUM_PLACE)")]
     #[arg(long, global = true, value_name = "NAME|ID")]
     place: Option<String>,
     #[command(subcommand)]
@@ -572,10 +581,18 @@ enum Commands {
     GetConsoleOutput(PluginConsoleOutputArgs),
     #[command(alias = "lx")]
     ExecuteLuau(ExecuteLuauArgs),
+    #[command(
+        alias = "device",
+        alias = "dev",
+        about = "Control Studio's built-in device simulator"
+    )]
+    StudioDevice(StudioDeviceArgs),
     #[command(alias = "play")]
     StartStopPlay(StartStopPlayArgs),
     #[command(alias = "clients")]
     ListClients(ListClientsArgs),
+    #[command(alias = "review")]
+    EditorReviewDecision(EditorReviewDecisionArgs),
     #[command(alias = "pr")]
     Press(PressArgs),
     #[command(alias = "clk")]
@@ -695,10 +712,13 @@ struct BridgeDaemonArgs {
     bridge_ports: String,
     #[arg(long, alias = "ctl-port", default_value_t = DEFAULT_DAEMON_CONTROL_PORT)]
     control_port: u16,
-    #[arg(short = 's', long, alias = "keep-alive", action = ArgAction::SetTrue, default_value_t = false)]
-    serve: bool,
-    /// Exit automatically when this process dies. Passed by the editor so an
-    /// editor-owned daemon can't outlive its window; omit for a shared daemon.
+    #[arg(short = 's', long = "serve", alias = "keep-alive", action = ArgAction::SetTrue, hide = true)]
+    _serve: bool,
+    #[arg(long, action = ArgAction::SetTrue, help = "Use the editor-owned JSON stdin protocol and exit when stdin closes")]
+    editor_stdio: bool,
+    #[arg(
+        help = "Exit automatically when this process dies. Passed by the editor so an editor-owned daemon can't outlive its window; omit for a shared daemon"
+    )]
     #[arg(long = "parent-pid", value_name = "PID")]
     parent_pid: Option<u32>,
 }
@@ -723,8 +743,9 @@ struct ExplorerDaemonArgs {
     src_dir: PathBuf,
     #[arg(short = 's', long, value_name = "SERVICES", default_value = "")]
     services: String,
-    /// Exit automatically when this process dies, even if stdin stays open
-    /// (prevents orphaned explorer daemons when the editor crashes).
+    #[arg(
+        help = "Exit automatically when this process dies, even if stdin stays open (prevents orphaned explorer daemons when the editor crashes)"
+    )]
     #[arg(long = "parent-pid", value_name = "PID")]
     parent_pid: Option<u32>,
 }
@@ -931,6 +952,52 @@ struct ExecuteLuauArgs {
     client: bool,
     #[arg(long, value_name = "NAME|N")]
     player: Option<String>,
+    #[arg(short = 't', long, default_value_t = 10.0)]
+    timeout: f64,
+}
+
+#[derive(Parser, Debug)]
+struct StudioDeviceArgs {
+    #[arg(
+        value_name = "ACTION",
+        default_value = "status",
+        value_parser = ["list", "status", "set", "stop"]
+    )]
+    action: String,
+    #[arg(value_name = "DEVICE", help = "Catalog name or stable device id")]
+    device: Option<String>,
+    #[arg(
+        long,
+        value_name = "ORIENTATION",
+        help = "portrait, landscape, landscape-left, landscape-right, landscape-sensor, or sensor"
+    )]
+    orientation: Option<String>,
+    #[arg(
+        long = "scaling",
+        alias = "scaling-mode",
+        value_name = "MODE",
+        help = "physical, actual, or fit"
+    )]
+    scaling_mode: Option<String>,
+    #[arg(
+        long,
+        value_name = "WIDTHxHEIGHT",
+        help = "Override the simulated resolution"
+    )]
+    resolution: Option<String>,
+    #[arg(
+        long = "pixel-density",
+        alias = "density",
+        value_name = "DENSITY",
+        help = "Override pixels per inch"
+    )]
+    pixel_density: Option<f64>,
+    #[arg(short = 'w', long, alias = "wait", default_value_t = 8.0)]
+    bridge_wait_seconds: f64,
+    #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
+    bridge_host: String,
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    bridge_ports: String,
 }
 
 #[derive(Parser, Debug)]
@@ -951,6 +1018,20 @@ struct StartStopPlayArgs {
 
 #[derive(Parser, Debug)]
 struct ListClientsArgs {
+    #[arg(short = 'w', long, alias = "wait", default_value_t = 8.0)]
+    bridge_wait_seconds: f64,
+    #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
+    bridge_host: String,
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    bridge_ports: String,
+}
+
+#[derive(Parser, Debug)]
+struct EditorReviewDecisionArgs {
+    #[arg(value_name = "DECISION", default_value = "apply", value_parser = ["apply", "skip"])]
+    decision: String,
+    #[arg(short = 'i', long, value_name = "REVIEW_ID")]
+    review_id: Option<String>,
     #[arg(short = 'w', long, alias = "wait", default_value_t = 8.0)]
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
@@ -1035,13 +1116,13 @@ struct UiArgs {
 
 #[derive(Parser, Debug)]
 struct SetupArgs {
-    /// Install the Studio plugin from this .rbxm file instead of downloading
+    #[arg(help = "Install the Studio plugin from this .rbxm file instead of downloading")]
     #[arg(long, value_name = "PATH")]
     file: Option<String>,
-    /// Roblox Plugins directory override (default: the local Studio Plugins folder)
+    #[arg(help = "Roblox Plugins directory override (default: the local Studio Plugins folder)")]
     #[arg(long, value_name = "DIR")]
     dir: Option<String>,
-    /// Only download/copy without installing; print where the plugin would go
+    #[arg(help = "Only download/copy without installing; print where the plugin would go")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     dry_run: bool,
 }
@@ -1116,6 +1197,10 @@ struct ShotArgs {
     output: PathBuf,
     #[arg(short = 'p', long, value_name = "NAME|N")]
     player: Option<String>,
+    #[arg(long, conflicts_with_all = ["client", "player"], action = ArgAction::SetTrue, default_value_t = false)]
+    studio: bool,
+    #[arg(long, conflicts_with = "studio", action = ArgAction::SetTrue, default_value_t = false)]
+    client: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1155,7 +1240,9 @@ struct BridgeDaemonRequest {
 static PLACE_FILTER: Mutex<Option<String>> = Mutex::new(None);
 
 fn set_place_filter(value: Option<String>) {
-    let mut guard = PLACE_FILTER.lock().unwrap_or_else(|error| error.into_inner());
+    let mut guard = PLACE_FILTER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     *guard = value.filter(|text| !text.trim().is_empty());
 }
 
@@ -1382,18 +1469,40 @@ struct PushEditorChangesArgs {
     probe_events: bool,
     #[arg(short = 'v', long, alias = "verify", action = ArgAction::SetTrue, default_value_t = false)]
     verify_sources: bool,
-    /// Cache dir for renium-link git/wally sources, used when enforcing read-only
-    /// link mirrors during a push. Overrides the manifest cacheDir.
+    #[arg(long = "no-review", action = ArgAction::SetTrue, default_value_t = false)]
+    no_review: bool,
+    #[arg(long, alias = "apply", action = ArgAction::SetTrue, default_value_t = false)]
+    yes: bool,
+    #[arg(
+        help = "Cache dir for renium-link git/wally sources, used when enforcing read-only link mirrors during a push. Overrides the manifest cacheDir"
+    )]
     #[arg(long = "link-cache-dir", value_name = "PATH")]
     link_cache_dir: Option<PathBuf>,
-    /// Permit a push to modify mirrors from read-only Renium link packages.
-    /// Disabled by default so package protection remains the safe behavior.
+    #[arg(
+        help = "Permit a push to modify mirrors from read-only Renium link packages. Disabled by default so package protection remains the safe behavior"
+    )]
     #[arg(long = "override-packages", action = ArgAction::SetTrue, default_value_t = false)]
     override_packages: bool,
 }
 
 #[derive(Parser, Debug)]
 struct ApplyEditorPropertyArgs {
+    #[arg(
+        short = 'r',
+        long,
+        alias = "root",
+        value_name = "PATH",
+        default_value = "."
+    )]
+    project_root: PathBuf,
+    #[arg(
+        short = 'd',
+        long,
+        alias = "src",
+        value_name = "PATH",
+        default_value = "src"
+    )]
+    src_dir: PathBuf,
     #[arg(short = 'w', long, alias = "wait", default_value_t = 8.0)]
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
@@ -1418,6 +1527,10 @@ struct ApplyEditorPropertyArgs {
     value_json: String,
     #[arg(short = 'm', long, alias = "mesh", action = ArgAction::SetTrue, default_value_t = false)]
     allow_protected_mesh_id_apply: bool,
+    #[arg(long = "no-review", action = ArgAction::SetTrue, default_value_t = false)]
+    no_review: bool,
+    #[arg(long, alias = "apply", action = ArgAction::SetTrue, default_value_t = false)]
+    yes: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1563,8 +1676,9 @@ struct BytecodeSetSourceArgs {
     value_json: Option<String>,
     #[arg(long = "str", visible_alias = "source", alias = "value-str")]
     value_str: Option<String>,
-    /// Read the source from a file instead of an argument — use this for large
-    /// scripts that exceed the OS command-line length limit.
+    #[arg(
+        help = "Read the source from a file instead of an argument — use this for large scripts that exceed the OS command-line length limit"
+    )]
     #[arg(long = "source-file", alias = "src-file", value_name = "PATH")]
     source_file: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2099,7 +2213,7 @@ struct SyncWallyPackagesArgs {
     manifest: PathBuf,
     #[arg(long = "wally-path", value_name = "COMMAND", default_value = "wally")]
     wally_path: String,
-    /// Deprecated: Rojo is no longer required. Accepted and ignored for back-compat.
+    #[arg(help = "Deprecated: Rojo is no longer required. Accepted and ignored for back-compat")]
     #[arg(long = "rojo-path", value_name = "COMMAND", default_value = "rojo")]
     rojo_path: String,
     #[arg(long = "packages-dir", value_name = "PATH", default_value = "Packages")]
@@ -2108,8 +2222,9 @@ struct SyncWallyPackagesArgs {
     target_service: String,
     #[arg(long = "target-name", default_value = "Packages")]
     target_name: String,
-    /// Comma list of realms to import: shared, server, dev. Server/dev are
-    /// imported only when their package directory exists.
+    #[arg(
+        help = "Comma list of realms to import: shared, server, dev. Server/dev are imported only when their package directory exists"
+    )]
     #[arg(
         long = "realms",
         value_name = "LIST",
@@ -2136,7 +2251,7 @@ struct SyncWallyPackagesArgs {
     dev_target_service: String,
     #[arg(long = "dev-target-name", default_value = "DevPackages")]
     dev_target_name: String,
-    /// Re-import even when wally.lock is unchanged since the last sync.
+    #[arg(help = "Re-import even when wally.lock is unchanged since the last sync")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     force: bool,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2165,33 +2280,35 @@ struct LinkApplyArgs {
     src_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Apply only the link with this id (default: all links).
+    #[arg(help = "Apply only the link with this id (default: all links)")]
     #[arg(long, value_name = "ID")]
     link: Option<String>,
-    /// Report drift only; do not write files, settings, or the lockfile.
+    #[arg(help = "Report drift only; do not write files, settings, or the lockfile")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     check: bool,
-    /// Include unchanged package targets in changedPaths/targetSettingsIds so
-    /// explicit Studio pushes can upsert the already-materialized subtree.
+    #[arg(
+        help = "Include unchanged package targets in changedPaths/targetSettingsIds so explicit Studio pushes can upsert the already-materialized subtree"
+    )]
     #[arg(long = "force-targets", action = ArgAction::SetTrue, default_value_t = false)]
     force_targets: bool,
-    /// Force-apply one specific target, named by the same JSON path array
-    /// link-add takes (includes the service root). Repeatable. Unlike
-    /// --force-targets, every other target keeps its normal skip semantics.
+    #[arg(
+        help = "Force-apply one specific target, named by the same JSON path array link-add takes (includes the service root). Repeatable. Unlike --force-targets, every other target keeps its normal skip semantics"
+    )]
     #[arg(long = "force-target", value_name = "JSON", action = ArgAction::Append)]
     force_target: Vec<String>,
-    /// Never fetch git/wally sources; fail if a remote source is not cached.
+    #[arg(help = "Never fetch git/wally sources; fail if a remote source is not cached")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     offline: bool,
-    /// Exit with an error (ok:false) when any link resolves with a warning.
-    /// Recommended for CI so unreachable or invalid sources fail the build.
+    #[arg(
+        help = "Exit with an error (ok:false) when any link resolves with a warning. Recommended for CI so unreachable or invalid sources fail the build"
+    )]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     strict: bool,
     #[arg(long = "git-path", value_name = "COMMAND", default_value = "git")]
     git_path: String,
     #[arg(long = "wally-path", value_name = "COMMAND", default_value = "wally")]
     wally_path: String,
-    /// Where cloned git/wally sources are cached. Overrides the manifest cacheDir.
+    #[arg(help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir")]
     #[arg(long = "cache-dir", value_name = "PATH")]
     cache_dir: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2218,16 +2335,16 @@ struct LinkBreakArgs {
     src_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Break every target of this link id.
+    #[arg(help = "Break every target of this link id")]
     #[arg(long, value_name = "ID")]
     link: Option<String>,
-    /// Break a single target: the owning service.
+    #[arg(help = "Break a single target: the owning service")]
     #[arg(long, value_name = "SERVICE")]
     service: Option<String>,
-    /// Break a single target: JSON array of path segments (includes the service root).
+    #[arg(help = "Break a single target: JSON array of path segments (includes the service root)")]
     #[arg(long = "path", value_name = "JSON")]
     path_segments_json: Option<String>,
-    /// Where cloned git/wally sources are cached. Overrides the manifest cacheDir.
+    #[arg(help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir")]
     #[arg(long = "cache-dir", value_name = "PATH")]
     cache_dir: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2254,7 +2371,7 @@ struct LinkStatusArgs {
     src_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Where cloned git/wally sources are cached. Overrides the manifest cacheDir.
+    #[arg(help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir")]
     #[arg(long = "cache-dir", value_name = "PATH")]
     cache_dir: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2273,29 +2390,30 @@ struct LinkAddArgs {
     project_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Stable link id; defaults to a slug of the first target name.
+    #[arg(help = "Stable link id; defaults to a slug of the first target name")]
     #[arg(long, value_name = "ID")]
     id: Option<String>,
-    /// Source kind: local | git | wally.
+    #[arg(help = "Source kind: local | git | wally")]
     #[arg(long = "source-type", value_name = "KIND", default_value = "local")]
     source_type: String,
-    /// local: file/dir path. git: repo url. wally: package name (scope/name).
-    /// Optional when --id refers to an existing link (inserting it elsewhere).
+    #[arg(
+        help = "local: file/dir path. git: repo url. wally: package name (scope/name). Optional when --id refers to an existing link (inserting it elsewhere)"
+    )]
     #[arg(long = "source", value_name = "VALUE")]
     source: Option<String>,
-    /// git ref (branch/tag/commit) or wally version requirement.
+    #[arg(help = "git ref (branch/tag/commit) or wally version requirement")]
     #[arg(long = "ref", value_name = "REF")]
     source_ref: Option<String>,
-    /// git subpath within the repo.
+    #[arg(help = "git subpath within the repo")]
     #[arg(long = "subpath", value_name = "PATH")]
     source_subpath: Option<String>,
-    /// First target service.
+    #[arg(help = "First target service")]
     #[arg(long, value_name = "SERVICE")]
     service: String,
-    /// First target path as a JSON array of segments (includes the service root).
+    #[arg(help = "First target path as a JSON array of segments (includes the service root)")]
     #[arg(long = "path", value_name = "JSON")]
     path_segments_json: String,
-    /// Mark the link writable (targets are editable, not reverted).
+    #[arg(help = "Mark the link writable (targets are editable, not reverted)")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     writable: bool,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2326,9 +2444,10 @@ struct LinkMoveTargetArgs {
     pretty: bool,
 }
 
-/// Pack an existing instance subtree into a reusable bytecode package and register
-/// it as a link target.
 #[derive(Parser, Debug)]
+#[command(
+    about = "Pack an existing instance subtree into a reusable bytecode package and register it as a link target"
+)]
 struct LinkPackArgs {
     #[arg(
         short = 'r',
@@ -2348,29 +2467,29 @@ struct LinkPackArgs {
     src_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Project folder where bytecode packages are stored (commit it to share
-    /// packages with the repo). Omit to save into the per-user global library
-    /// (Documents/Renium/Packages), usable from any project on this machine.
+    #[arg(
+        help = "Project folder where bytecode packages are stored (commit it to share packages with the repo). Omit to save into the per-user global library (Documents/Renium/Packages), usable from any project on this machine"
+    )]
     #[arg(long = "link-folder", value_name = "PATH")]
     link_folder: Option<PathBuf>,
-    /// Package / link id; defaults to a slug of the instance name.
+    #[arg(help = "Package / link id; defaults to a slug of the instance name")]
     #[arg(long, value_name = "ID")]
     id: Option<String>,
-    /// Service that owns the instance to pack.
+    #[arg(help = "Service that owns the instance to pack")]
     #[arg(long, value_name = "SERVICE")]
     service: String,
-    /// Instance path as a JSON array of segments (includes the service root).
+    #[arg(help = "Instance path as a JSON array of segments (includes the service root)")]
     #[arg(long = "path", value_name = "JSON")]
     path_segments_json: String,
-    /// Mark the link writable (targets are editable, not reverted).
+    #[arg(help = "Mark the link writable (targets are editable, not reverted)")]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     writable: bool,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     pretty: bool,
 }
 
-/// Delete a bytecode package link and optionally resolve/delete existing uses.
 #[derive(Parser, Debug)]
+#[command(about = "Delete a bytecode package link and optionally resolve/delete existing uses")]
 struct LinkDeletePackageArgs {
     #[arg(
         short = 'r',
@@ -2390,10 +2509,10 @@ struct LinkDeletePackageArgs {
     src_root: PathBuf,
     #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
     manifest: PathBuf,
-    /// Package / link id to delete.
+    #[arg(help = "Package / link id to delete")]
     #[arg(long, value_name = "ID")]
     id: String,
-    /// delete-unused | delete-uses | unlink-uses.
+    #[arg(help = "delete-unused | delete-uses | unlink-uses")]
     #[arg(long, value_name = "ACTION", default_value = "delete-unused")]
     action: String,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2599,6 +2718,22 @@ struct EditorChangeSet {
     settings_writes: Vec<EditorSettingsWrite>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct EditorBinaryServiceGroup {
+    service: String,
+    #[serde(rename = "targetPath")]
+    target_path: Vec<String>,
+    count: usize,
+    #[serde(default, rename = "rootProperties")]
+    root_properties: Map<String, Value>,
+}
+
+struct EditorBinaryImport {
+    bytes: Vec<u8>,
+    groups: Vec<EditorBinaryServiceGroup>,
+    instance_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct EditorSettingsWrite {
     path: PathBuf,
@@ -2666,9 +2801,10 @@ struct ImportServiceArgs {
     compact_meta_json: bool,
 }
 
-/// Provision a Renium project for git/GitHub: ignore + attributes policy files
-/// and a repo-local diff textconv / merge driver for the binary .renium stores.
 #[derive(Parser, Debug)]
+#[command(
+    about = "Provision a Renium project for git/GitHub: ignore + attributes policy files and a repo-local diff textconv / merge driver for the binary .renium stores"
+)]
 struct VcInitArgs {
     #[arg(
         short = 'r',
@@ -2678,10 +2814,10 @@ struct VcInitArgs {
         default_value = "."
     )]
     project_root: PathBuf,
-    /// Only write the policy files; skip `git init`, git config, and remotes.
+    #[arg(help = "Only write the policy files; skip `git init`, git config, and remotes")]
     #[arg(long = "skip-git", action = ArgAction::SetTrue, default_value_t = false)]
     skip_git: bool,
-    /// Set the `origin` remote to this URL (added or updated).
+    #[arg(help = "Set the `origin` remote to this URL (added or updated)")]
     #[arg(long, value_name = "URL")]
     remote: Option<String>,
     #[arg(long = "git-path", value_name = "COMMAND", default_value = "git")]
@@ -2690,47 +2826,49 @@ struct VcInitArgs {
     pretty: bool,
 }
 
-/// Render a binary .renium settings store or package as deterministic text.
-/// Wired up by `vc-init` as a git textconv so `git diff` shows real changes.
 #[derive(Parser, Debug)]
+#[command(
+    about = "Render a binary .renium settings store or package as deterministic text. Wired up by `vc-init` as a git textconv so `git diff` shows real changes"
+)]
 struct VcTextconvArgs {
-    /// The .renium file to render (legacy .rbsync files are also accepted).
+    #[arg(help = "The .renium file to render (legacy .rbsync files are also accepted)")]
     file: PathBuf,
 }
 
-/// Inspect a .renium store: print its instance tree as text, or as a structured
-/// JSON tree (`--json`) for the VS Code viewer. Reuses the one decoder, so a
-/// dropped file decodes exactly like a synced one.
 #[derive(Parser, Debug)]
+#[command(
+    about = "Inspect a .renium store: print its instance tree as text, or as a structured JSON tree (`--json`) for the VS Code viewer. Reuses the one decoder, so a dropped file decodes exactly like a synced one"
+)]
 struct ViewArgs {
-    /// The .renium file to inspect (legacy .rbsync files are also accepted).
+    #[arg(help = "The .renium file to inspect (legacy .rbsync files are also accepted)")]
     file: PathBuf,
-    /// Emit a nested JSON tree (name/class/id/properties/attributes/source)
-    /// instead of the human-readable text rendering.
+    #[arg(
+        help = "Emit a nested JSON tree (name/class/id/properties/attributes/source) instead of the human-readable text rendering"
+    )]
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     json: bool,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     pretty: bool,
 }
 
-/// Three-way merge of .renium settings stores at the instance/property level,
-/// using stable settings ids as identity. Wired up by `vc-init` as the git
-/// merge driver for *.renium; also usable standalone with --output.
 #[derive(Parser, Debug)]
+#[command(
+    about = "Three-way merge of .renium settings stores at the instance/property level, using stable settings ids as identity. Wired up by `vc-init` as the git merge driver for *.renium; also usable standalone with --output"
+)]
 struct VcMergeArgs {
-    /// Common ancestor version (%O in the git merge driver).
+    #[arg(help = "Common ancestor version (%O in the git merge driver)")]
     base: PathBuf,
-    /// Our version (%A); receives the merge result in driver mode.
+    #[arg(help = "Our version (%A); receives the merge result in driver mode")]
     ours: PathBuf,
-    /// Their version (%B).
+    #[arg(help = "Their version (%B)")]
     theirs: PathBuf,
-    /// Repo-relative path of the file being merged (%P), for messages.
+    #[arg(help = "Repo-relative path of the file being merged (%P), for messages")]
     #[arg(long, value_name = "PATH")]
     path: Option<String>,
-    /// Write the merged store here instead of overwriting OURS.
+    #[arg(help = "Write the merged store here instead of overwriting OURS")]
     #[arg(short = 'o', long, value_name = "PATH")]
     output: Option<PathBuf>,
-    /// Resolve conflicting edits by taking this side instead of failing.
+    #[arg(help = "Resolve conflicting edits by taking this side instead of failing")]
     #[arg(long, value_name = "ours|theirs")]
     prefer: Option<String>,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
@@ -2964,6 +3102,8 @@ struct CompactBatchPayload {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeInfoPayload {
+    #[serde(default, rename = "runtimeId")]
+    runtime_id: String,
     #[serde(default)]
     bridge_version: String,
     #[serde(default)]
@@ -3075,10 +3215,10 @@ struct BridgeServer {
     alive: Arc<AtomicBool>,
     next_id: std::sync::atomic::AtomicU64,
     preferred_index: std::sync::atomic::AtomicUsize,
-    /// Daemon control and stdin requests can arrive concurrently.  Serializing
-    /// command execution prevents two mutations/exports from interleaving over
-    /// the same persistent Studio sockets.
+
     request_gate: Mutex<()>,
+
+    runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3087,10 +3227,30 @@ struct BridgeListenMetrics {
     wait_for_channels_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BridgeTarget {
+    Edit,
     Main,
     Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuntimePinKey {
+    target: BridgeTarget,
+    player: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePin {
+    runtime_id: Option<String>,
+    socket_keys_by_port: HashMap<u16, String>,
+}
+
+struct RuntimePinCandidate {
+    runtime_id: String,
+    socket_keys_by_port: HashMap<u16, String>,
+    role_rank: usize,
+    last_focused_at: Instant,
 }
 
 fn normalize_bridge_role(role: &str) -> &'static str {
@@ -3167,6 +3327,7 @@ impl BridgeServer {
             next_id: std::sync::atomic::AtomicU64::new(21335),
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
             request_gate: Mutex::new(()),
+            runtime_pins: Mutex::new(HashMap::new()),
         };
 
         let required_channels = server.channels.len();
@@ -3446,6 +3607,7 @@ impl BridgeServer {
     fn role_matches_target(role_key: &str, target: BridgeTarget) -> bool {
         let role = Self::bridge_role_key_base(role_key);
         match target {
+            BridgeTarget::Edit => role == BRIDGE_ROLE_EDIT,
             BridgeTarget::Main => {
                 role == BRIDGE_ROLE_EDIT
                     || role == BRIDGE_ROLE_PLAY_SERVER
@@ -3560,9 +3722,219 @@ impl BridgeServer {
 
     fn target_label(target: BridgeTarget) -> &'static str {
         match target {
+            BridgeTarget::Edit => "edit",
             BridgeTarget::Main => "main",
             BridgeTarget::Client => "play-client",
         }
+    }
+
+    fn role_preference_rank(role_key: &str, target: BridgeTarget) -> usize {
+        let role = Self::bridge_role_key_base(role_key);
+        match target {
+            BridgeTarget::Edit => usize::from(role != BRIDGE_ROLE_EDIT),
+            BridgeTarget::Main => match role {
+                BRIDGE_ROLE_PLAY_SERVER => 0,
+                BRIDGE_ROLE_EDIT => 1,
+                BRIDGE_ROLE_UNKNOWN => 2,
+                _ => 3,
+            },
+            BridgeTarget::Client => usize::from(role != BRIDGE_ROLE_PLAY_CLIENT),
+        }
+    }
+
+    fn runtime_pin_key(target: BridgeTarget, player: Option<&str>) -> RuntimePinKey {
+        RuntimePinKey {
+            target,
+            player: player.map(|value| value.trim().to_ascii_lowercase()),
+        }
+    }
+
+    fn clear_runtime_pins(&self) {
+        self.runtime_pins
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn choose_runtime_pin(&self, target: BridgeTarget, player: Option<&str>) -> Result<RuntimePin> {
+        let mut candidates: HashMap<String, RuntimePinCandidate> = HashMap::new();
+        let mut legacy_candidate: Option<(u16, String, Instant)> = None;
+        let mut legacy_ambiguous = false;
+        let mut matching_socket_count = 0usize;
+
+        for channel in &self.channels {
+            let mut guard = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            Self::ensure_place_unambiguous(&mut guard, target, player)?;
+            let matching = guard
+                .iter()
+                .filter(|(role_key, socket)| {
+                    Self::socket_matches_selector(role_key.as_str(), socket, target, player)
+                })
+                .map(|(role_key, socket)| (role_key.clone(), socket))
+                .collect::<Vec<_>>();
+            matching_socket_count += matching.len();
+
+            let legacy = matching
+                .iter()
+                .filter(|(_, socket)| socket.bridge_info.runtime_id.trim().is_empty())
+                .collect::<Vec<_>>();
+            if legacy.len() == 1 {
+                let (role_key, socket) = legacy[0];
+                if legacy_candidate
+                    .as_ref()
+                    .is_none_or(|(_, _, focused_at)| *focused_at < socket.last_focused_at)
+                {
+                    legacy_candidate =
+                        Some((channel.port, role_key.clone(), socket.last_focused_at));
+                }
+            } else if legacy.len() > 1 {
+                legacy_ambiguous = true;
+            }
+
+            for (role_key, socket) in matching {
+                let runtime_id = socket.bridge_info.runtime_id.trim();
+                if runtime_id.is_empty() {
+                    continue;
+                }
+                let role_rank = Self::role_preference_rank(&role_key, target);
+                let candidate = candidates.entry(runtime_id.to_string()).or_insert_with(|| {
+                    RuntimePinCandidate {
+                        runtime_id: runtime_id.to_string(),
+                        socket_keys_by_port: HashMap::new(),
+                        role_rank,
+                        last_focused_at: socket.last_focused_at,
+                    }
+                });
+                let replace_existing = candidate
+                    .socket_keys_by_port
+                    .get(&channel.port)
+                    .and_then(|existing_key| guard.get(existing_key))
+                    .is_none_or(|existing| existing.last_focused_at < socket.last_focused_at);
+                if replace_existing {
+                    candidate.socket_keys_by_port.insert(channel.port, role_key);
+                }
+                candidate.role_rank = candidate.role_rank.min(role_rank);
+                candidate.last_focused_at = candidate.last_focused_at.max(socket.last_focused_at);
+            }
+        }
+
+        if let Some(candidate) = candidates.into_values().max_by(|left, right| {
+            right
+                .role_rank
+                .cmp(&left.role_rank)
+                .then_with(|| left.last_focused_at.cmp(&right.last_focused_at))
+                .then_with(|| {
+                    left.socket_keys_by_port
+                        .len()
+                        .cmp(&right.socket_keys_by_port.len())
+                })
+        }) {
+            return Ok(RuntimePin {
+                runtime_id: Some(candidate.runtime_id),
+                socket_keys_by_port: candidate.socket_keys_by_port,
+            });
+        }
+
+        if matching_socket_count == 0 {
+            bail!(
+                "No connected {} bridge{} found",
+                Self::target_label(target),
+                player
+                    .map(|selector| format!(" for player {selector}"))
+                    .unwrap_or_default()
+            );
+        }
+        if legacy_ambiguous {
+            bail!(
+                "Multiple matching Studio runtimes use an older bridge without runtime identity. \
+                 Update the Renium Studio plugin before using multiple Studio windows"
+            );
+        }
+        let Some((channel_port, role_key, _)) = legacy_candidate else {
+            bail!(
+                "Matching bridge channels could not be associated with one Studio runtime; \
+                 reconnect or update the Renium Studio plugin"
+            );
+        };
+        Ok(RuntimePin {
+            runtime_id: None,
+            socket_keys_by_port: HashMap::from([(channel_port, role_key)]),
+        })
+    }
+
+    fn runtime_pin_for_selector(
+        &self,
+        target: BridgeTarget,
+        player: Option<&str>,
+    ) -> Result<RuntimePin> {
+        let key = Self::runtime_pin_key(target, player);
+        let mut pins = self
+            .runtime_pins
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(pin) = pins.get(&key) {
+            return Ok(pin.clone());
+        }
+        let pin = self.choose_runtime_pin(target, player)?;
+        pins.insert(key, pin.clone());
+        Ok(pin)
+    }
+
+    fn socket_matches_runtime_pin(
+        channel_port: u16,
+        role_key: &str,
+        socket: &BridgeSocket,
+        pin: &RuntimePin,
+    ) -> bool {
+        if let Some(runtime_id) = pin.runtime_id.as_deref() {
+            return socket.bridge_info.runtime_id == runtime_id;
+        }
+        pin.socket_keys_by_port
+            .get(&channel_port)
+            .is_some_and(|key| key == role_key)
+    }
+
+    fn select_role_for_selector_with_pin(
+        sockets: &HashMap<String, BridgeSocket>,
+        channel_port: u16,
+        target: BridgeTarget,
+        player: Option<&str>,
+        pin: &RuntimePin,
+    ) -> Option<String> {
+        let preferred: &[&str] = match target {
+            BridgeTarget::Edit => &[BRIDGE_ROLE_EDIT],
+            BridgeTarget::Main => &[
+                BRIDGE_ROLE_PLAY_SERVER,
+                BRIDGE_ROLE_EDIT,
+                BRIDGE_ROLE_UNKNOWN,
+            ],
+            BridgeTarget::Client => &[BRIDGE_ROLE_PLAY_CLIENT],
+        };
+        for role in preferred {
+            if let Some(key) = sockets
+                .iter()
+                .filter(|(key, socket)| {
+                    Self::bridge_role_key_base(key.as_str()) == *role
+                        && Self::socket_matches_selector(key.as_str(), socket, target, player)
+                        && Self::socket_matches_runtime_pin(channel_port, key.as_str(), socket, pin)
+                })
+                .max_by_key(|(_, socket)| socket.last_focused_at)
+                .map(|(key, _)| key.clone())
+            {
+                return Some(key);
+            }
+        }
+        sockets
+            .iter()
+            .filter(|(key, socket)| {
+                Self::socket_matches_selector(key.as_str(), socket, target, player)
+                    && Self::socket_matches_runtime_pin(channel_port, key.as_str(), socket, pin)
+            })
+            .max_by_key(|(_, socket)| socket.last_focused_at)
+            .map(|(key, _)| key.clone())
     }
 
     fn select_role_for_target(
@@ -3578,6 +3950,7 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Option<String> {
         let preferred: &[&str] = match target {
+            BridgeTarget::Edit => &[BRIDGE_ROLE_EDIT],
             BridgeTarget::Main => &[
                 BRIDGE_ROLE_PLAY_SERVER,
                 BRIDGE_ROLE_EDIT,
@@ -3632,6 +4005,7 @@ impl BridgeServer {
     }
 
     fn peer_for_selector(&self, target: BridgeTarget, player: Option<&str>) -> Result<String> {
+        let runtime_pin = self.runtime_pin_for_selector(target, player)?;
         for channel in &self.channels {
             let mut guard = match channel.sockets.try_lock() {
                 Ok(guard) => guard,
@@ -3639,8 +4013,13 @@ impl BridgeServer {
                 Err(TryLockError::WouldBlock) => continue,
             };
             Self::ensure_place_unambiguous(&mut guard, target, player)?;
-            if let Some(role) = Self::select_role_for_selector(&guard, target, player)
-                && let Some(socket) = guard.get(&role)
+            if let Some(role) = Self::select_role_for_selector_with_pin(
+                &guard,
+                channel.port,
+                target,
+                player,
+                &runtime_pin,
+            ) && let Some(socket) = guard.get(&role)
             {
                 return Ok(socket.peer.clone());
             }
@@ -3655,14 +4034,20 @@ impl BridgeServer {
     }
 
     fn cached_bridge_info_for_target(&self, target: BridgeTarget) -> Result<BridgeInfoPayload> {
+        let runtime_pin = self.runtime_pin_for_selector(target, None)?;
         for channel in &self.channels {
             let guard = match channel.sockets.try_lock() {
                 Ok(guard) => guard,
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                 Err(TryLockError::WouldBlock) => continue,
             };
-            if let Some(role) = Self::select_role_for_target(&guard, target)
-                && let Some(socket) = guard.get(&role)
+            if let Some(role) = Self::select_role_for_selector_with_pin(
+                &guard,
+                channel.port,
+                target,
+                None,
+                &runtime_pin,
+            ) && let Some(socket) = guard.get(&role)
             {
                 return Ok(socket.bridge_info.clone());
             }
@@ -3739,6 +4124,12 @@ impl BridgeServer {
         if self.channels.is_empty() {
             bail!("No active bridge sockets");
         }
+
+        let runtime_pin = if method == "startStopPlay" {
+            None
+        } else {
+            Some(self.runtime_pin_for_selector(target, player)?)
+        };
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3759,8 +4150,17 @@ impl BridgeServer {
                     Err(TryLockError::WouldBlock) => continue,
                 };
                 Self::ensure_place_unambiguous(&mut guard, target, player)?;
-                let Some(socket_role) = Self::select_role_for_selector(&guard, target, player)
-                else {
+                let socket_role = match runtime_pin.as_ref() {
+                    Some(pin) => Self::select_role_for_selector_with_pin(
+                        &guard,
+                        channel.port,
+                        target,
+                        player,
+                        pin,
+                    ),
+                    None => Self::select_role_for_selector(&guard, target, player),
+                };
+                let Some(socket_role) = socket_role else {
                     continue;
                 };
                 let Some(socket) = guard.get_mut(&socket_role) else {
@@ -3774,7 +4174,7 @@ impl BridgeServer {
                         return Ok(result);
                     }
                     Err(err) => {
-                        let err_text = err.to_string();
+                        let err_text = format!("{err:#}");
                         if !Self::is_transport_error_text(&err_text) {
                             return Err(err);
                         }
@@ -3788,7 +4188,7 @@ impl BridgeServer {
             thread::yield_now();
         }
 
-        let lock_deadline = Instant::now() + BRIDGE_CHANNEL_LOCK_TIMEOUT;
+        let lock_deadline = Instant::now() + bridge_channel_lock_timeout(method);
         while Instant::now() < lock_deadline {
             let mut attempted_socket = false;
             for offset in 0..total {
@@ -3799,8 +4199,17 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => continue,
                 };
-                let Some(socket_role) = Self::select_role_for_selector(&guard, target, player)
-                else {
+                let socket_role = match runtime_pin.as_ref() {
+                    Some(pin) => Self::select_role_for_selector_with_pin(
+                        &guard,
+                        channel.port,
+                        target,
+                        player,
+                        pin,
+                    ),
+                    None => Self::select_role_for_selector(&guard, target, player),
+                };
+                let Some(socket_role) = socket_role else {
                     continue;
                 };
                 let Some(socket) = guard.get_mut(&socket_role) else {
@@ -3813,7 +4222,7 @@ impl BridgeServer {
                 match call_result {
                     Ok(result) => return Ok(result),
                     Err(err) => {
-                        let err_text = err.to_string();
+                        let err_text = format!("{err:#}");
                         if !Self::is_transport_error_text(&err_text) {
                             return Err(err);
                         }
@@ -3824,7 +4233,7 @@ impl BridgeServer {
                     }
                 }
             }
-            if !attempted_socket {
+            if !attempted_socket && last_error.is_none() {
                 last_error = Some("all compatible bridge channels are busy".to_string());
             }
             thread::sleep(Duration::from_millis(2));
@@ -3836,7 +4245,13 @@ impl BridgeServer {
             player
                 .map(|selector| format!(" (player {selector})"))
                 .unwrap_or_default(),
-            last_error.unwrap_or_else(|| "no active channels".to_string())
+            last_error.unwrap_or_else(|| {
+                if runtime_pin.is_some() {
+                    "the pinned Studio runtime disconnected or has no available channel".to_string()
+                } else {
+                    "no active channels".to_string()
+                }
+            })
         )
     }
 
@@ -3891,6 +4306,7 @@ impl BridgeServer {
 
     fn list_bridge_clients(&self) -> Vec<Value> {
         struct ClientEntry {
+            runtime_id: String,
             role: String,
             player_name: String,
             player_user_id: Option<i64>,
@@ -3933,7 +4349,8 @@ impl BridgeServer {
                 let role = Self::bridge_role_key_base(role_key).to_string();
                 let info = &socket.bridge_info;
                 let existing = entries.iter_mut().find(|entry| {
-                    entry.role == role
+                    entry.runtime_id == info.runtime_id
+                        && entry.role == role
                         && entry.player_name == info.player_name
                         && entry.player_user_id == info.player_user_id
                         && entry.place_id == info.place_id
@@ -3946,6 +4363,7 @@ impl BridgeServer {
                         }
                     }
                     None => entries.push(ClientEntry {
+                        runtime_id: info.runtime_id.clone(),
                         role,
                         player_name: info.player_name.clone(),
                         player_user_id: info.player_user_id,
@@ -3958,13 +4376,21 @@ impl BridgeServer {
             }
         }
         entries.sort_by(|a, b| {
-            (&a.place_name, &a.role, &a.player_name).cmp(&(&b.place_name, &b.role, &b.player_name))
+            (&a.place_name, &a.role, &a.player_name, &a.runtime_id).cmp(&(
+                &b.place_name,
+                &b.role,
+                &b.player_name,
+                &b.runtime_id,
+            ))
         });
         entries
             .into_iter()
             .map(|mut entry| {
                 entry.ports.sort_unstable();
                 let mut object = serde_json::Map::new();
+                if !entry.runtime_id.is_empty() {
+                    object.insert("runtimeId".to_string(), json!(entry.runtime_id));
+                }
                 object.insert("role".to_string(), json!(entry.role));
                 if !entry.player_name.is_empty() {
                     object.insert("playerName".to_string(), json!(entry.player_name));
@@ -4003,6 +4429,7 @@ impl BridgeServer {
         if self.channels.is_empty() {
             bail!("No active bridge sockets");
         }
+        let runtime_pin = self.runtime_pin_for_selector(target, None)?;
 
         let id = self
             .next_id
@@ -4023,7 +4450,13 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => continue,
                 };
-                let Some(socket_role) = Self::select_role_for_target(&guard, target) else {
+                let Some(socket_role) = Self::select_role_for_selector_with_pin(
+                    &guard,
+                    channel.port,
+                    target,
+                    None,
+                    &runtime_pin,
+                ) else {
                     continue;
                 };
                 let Some(socket) = guard.get_mut(&socket_role) else {
@@ -4037,7 +4470,7 @@ impl BridgeServer {
                         return Ok(result);
                     }
                     Err(err) => {
-                        let err_text = err.to_string();
+                        let err_text = format!("{err:#}");
                         if !Self::is_transport_error_text(&err_text) {
                             return Err(err);
                         }
@@ -4051,7 +4484,7 @@ impl BridgeServer {
             thread::yield_now();
         }
 
-        let lock_deadline = Instant::now() + BRIDGE_CHANNEL_LOCK_TIMEOUT;
+        let lock_deadline = Instant::now() + bridge_channel_lock_timeout(method);
         while Instant::now() < lock_deadline {
             let mut attempted_socket = false;
             for offset in 0..total {
@@ -4062,7 +4495,13 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => continue,
                 };
-                let Some(socket_role) = Self::select_role_for_target(&guard, target) else {
+                let Some(socket_role) = Self::select_role_for_selector_with_pin(
+                    &guard,
+                    channel.port,
+                    target,
+                    None,
+                    &runtime_pin,
+                ) else {
                     continue;
                 };
                 let Some(socket) = guard.get_mut(&socket_role) else {
@@ -4075,7 +4514,7 @@ impl BridgeServer {
                 match call_result {
                     Ok(result) => return Ok(result),
                     Err(err) => {
-                        let err_text = err.to_string();
+                        let err_text = format!("{err:#}");
                         if !Self::is_transport_error_text(&err_text) {
                             return Err(err);
                         }
@@ -4086,7 +4525,7 @@ impl BridgeServer {
                     }
                 }
             }
-            if !attempted_socket {
+            if !attempted_socket && last_error.is_none() {
                 last_error = Some("all compatible bridge channels are busy".to_string());
             }
             thread::sleep(Duration::from_millis(2));
@@ -4095,7 +4534,9 @@ impl BridgeServer {
         bail!(
             "Bridge chunk call failed for {method} on {} target: {}",
             Self::target_label(target),
-            last_error.unwrap_or_else(|| "no active channels".to_string())
+            last_error.unwrap_or_else(|| {
+                "the pinned Studio runtime disconnected or has no available channel".to_string()
+            })
         )
     }
 
@@ -4346,8 +4787,10 @@ fn main() -> Result<()> {
         Commands::BridgeGetSource(args) => bridge_get_source(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
+        Commands::StudioDevice(args) => studio_device_command(args),
         Commands::StartStopPlay(args) => start_stop_play_command(args),
         Commands::ListClients(args) => list_clients_command(args),
+        Commands::EditorReviewDecision(args) => editor_review_decision_command(args),
         Commands::Press(args) => press_command(args),
         Commands::Click(args) => click_command(args),
         Commands::Key(args) => key_command(args),
@@ -4471,6 +4914,7 @@ fn parse_daemon_request_args<T: Parser>(command: &str, request_args: &[String]) 
 }
 
 fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
+    let editor_stdio = args.editor_stdio;
     if let Some(parent_pid) = args.parent_pid {
         watch_parent_and_exit(parent_pid);
     }
@@ -4480,7 +4924,7 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         &bridge_host,
         &ports,
         args.bridge_wait_seconds,
-        !args.serve,
+        editor_stdio,
     )?;
     let bridge = Arc::new(bridge);
     spawn_daemon_control_server(
@@ -4506,12 +4950,12 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
             "expectedChannels": bridge.expected_channel_count(),
             "bindMs": listen_metrics.bind_ms,
             "warmupHandshakeMs": listen_metrics.wait_for_channels_ms,
-            "serve": args.serve,
+            "serve": !editor_stdio,
         })
     );
-    if !args.serve {
+    if editor_stdio {
         println!(
-            "[renium] editor-owned stdio mode: serving JSON requests from stdin; exits when stdin closes (use -s/--serve for a standalone daemon)"
+            "[renium] editor-owned stdio mode: serving JSON requests from stdin; exits when stdin closes"
         );
     }
     let _ = io::stdout().flush();
@@ -4595,11 +5039,13 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
 
         let result = (|| -> Result<()> {
             let _request_gate = bridge.acquire_request_gate(DAEMON_CONTROL_QUEUE_TIMEOUT)?;
+            bridge.clear_runtime_pins();
             set_place_filter(request.place.clone());
             let daemon_command = normalize_daemon_command(&request.command)
                 .with_context(|| format!("Unsupported daemon command: {}", request.command))?;
 
             let target = match daemon_command {
+                "studio-device" => BridgeTarget::Edit,
                 "execute-luau"
                     if request
                         .args
@@ -4616,9 +5062,17 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
                 {
                     BridgeTarget::Client
                 }
-                "press" | "click" | "key" | "ui" | "type" | "shot" | "goto" => {
+                "press" | "click" | "key" | "ui" | "type" | "goto" => BridgeTarget::Client,
+                "shot"
+                    if request
+                        .args
+                        .iter()
+                        .any(|arg| arg == "-p" || arg == "--player" || arg == "--client") =>
+                {
                     BridgeTarget::Client
                 }
+                "shot" if request.args.iter().any(|arg| arg == "--studio") => BridgeTarget::Edit,
+                "shot" => BridgeTarget::Main,
                 "wait-until"
                     if request
                         .args
@@ -4659,7 +5113,9 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
                     ready_channels,
                     required_channels,
                     BridgeServer::target_label(target),
-                    place_filter().map(|place| format!(" for place filter '{place}'")).unwrap_or_default(),
+                    place_filter()
+                        .map(|place| format!(" for place filter '{place}'"))
+                        .unwrap_or_default(),
                     bridge.missing_ports_for_target(target)
                 );
             }
@@ -4669,8 +5125,16 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
             let bridge_info_refresh_ms = 0.0;
 
             match daemon_command {
+                "review-decision" => {
+                    let review_args: EditorReviewDecisionArgs =
+                        parse_daemon_request_args("editor-review-decision", &request.args)?;
+                    let result = editor_review_decision_result(&review_args, &bridge)?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(())
+                }
                 "export-snapshots" => {
-                    let export_args: ExportSnapshotsArgs = parse_daemon_request_args("export-snapshots", &request.args)?;
+                    let export_args: ExportSnapshotsArgs =
+                        parse_daemon_request_args("export-snapshots", &request.args)?;
                     export_snapshots_with_warm_bridge(
                         export_args,
                         &bridge,
@@ -4680,31 +5144,45 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
                     )
                 }
                 "push-editor-changes" => {
-                    let push_args: PushEditorChangesArgs = parse_daemon_request_args("push-editor-changes", &request.args)?;
+                    let push_args: PushEditorChangesArgs =
+                        parse_daemon_request_args("push-editor-changes", &request.args)?;
                     push_editor_changes_with_warm_bridge(push_args, &bridge).map(|_| ())
                 }
                 "apply-editor-property" => {
-                    let property_args: ApplyEditorPropertyArgs = parse_daemon_request_args("apply-editor-property", &request.args)?;
+                    let property_args: ApplyEditorPropertyArgs =
+                        parse_daemon_request_args("apply-editor-property", &request.args)?;
                     apply_editor_property_with_warm_bridge(property_args, &bridge)
                 }
                 "apply-editor-delete" => {
-                    let delete_args: ApplyEditorDeleteArgs = parse_daemon_request_args("apply-editor-delete", &request.args)?;
+                    let delete_args: ApplyEditorDeleteArgs =
+                        parse_daemon_request_args("apply-editor-delete", &request.args)?;
                     apply_editor_delete_with_warm_bridge(delete_args, &bridge)
                 }
                 "get-console-output" => {
-                    let console_args: PluginConsoleOutputArgs = parse_daemon_request_args("get-console-output", &request.args)?;
+                    let console_args: PluginConsoleOutputArgs =
+                        parse_daemon_request_args("get-console-output", &request.args)?;
                     get_console_output_with_warm_bridge(console_args, &bridge)
                 }
                 "execute-luau" => {
-                    let luau_args: ExecuteLuauArgs = parse_daemon_request_args("execute-luau", &request.args)?;
+                    let luau_args: ExecuteLuauArgs =
+                        parse_daemon_request_args("execute-luau", &request.args)?;
                     execute_luau_with_warm_bridge(luau_args, &bridge)
                 }
+                "studio-device" => {
+                    let device_args: StudioDeviceArgs =
+                        parse_daemon_request_args("studio-device", &request.args)?;
+                    let result = studio_device_result(&device_args, &bridge)?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(())
+                }
                 "start-stop-play" => {
-                    let play_args: StartStopPlayArgs = parse_daemon_request_args("start-stop-play", &request.args)?;
+                    let play_args: StartStopPlayArgs =
+                        parse_daemon_request_args("start-stop-play", &request.args)?;
                     start_stop_play_with_warm_bridge(play_args, &bridge)
                 }
                 "studio-change-state" => {
-                    let state_args: StudioChangeStateArgs = parse_daemon_request_args("studio-change-state", &request.args)?;
+                    let state_args: StudioChangeStateArgs =
+                        parse_daemon_request_args("studio-change-state", &request.args)?;
                     studio_change_state_with_warm_bridge(state_args, &bridge)
                 }
                 "press" => {
@@ -4738,7 +5216,8 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
                     Ok(())
                 }
                 "wait-until" => {
-                    let wait_args: WaitUntilArgs = parse_daemon_request_args("wait-until", &request.args)?;
+                    let wait_args: WaitUntilArgs =
+                        parse_daemon_request_args("wait-until", &request.args)?;
                     let result = wait_until_result(&wait_args, &bridge)?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                     Ok(())
@@ -4796,14 +5275,12 @@ fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         let _ = io::stdout().flush();
     }
 
-    while args.serve && !shutdown_requested && bridge.alive.load(Ordering::Relaxed) {
+    while !editor_stdio && !shutdown_requested && bridge.alive.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(250));
     }
     bridge.alive.store(false, Ordering::Relaxed);
-    if !args.serve && !shutdown_requested {
-        println!(
-            "[renium] stdin closed; editor-owned daemon exiting (nothing is listening anymore; use -s/--serve to run standalone)"
-        );
+    if editor_stdio && !shutdown_requested {
+        println!("[renium] stdin closed; editor-owned daemon exiting");
     } else {
         println!("[renium] daemon stopped");
     }
@@ -4926,8 +5403,19 @@ fn handle_daemon_control_connection(
         let response = match serde_json::from_str::<BridgeDaemonRequest>(trimmed) {
             Ok(request) => {
                 match validate_daemon_request(&request).and_then(|()| {
+                    if normalize_daemon_command(&request.command) == Some("review-decision") {
+                        if request.place.is_some() {
+                            set_place_filter(request.place.clone());
+                        }
+                        return handle_daemon_control_request(
+                            &request,
+                            bridge,
+                            bridge_wait_seconds,
+                        );
+                    }
                     let _request_gate =
                         bridge.acquire_request_gate(DAEMON_CONTROL_QUEUE_TIMEOUT)?;
+                    bridge.clear_runtime_pins();
                     set_place_filter(request.place.clone());
                     handle_daemon_control_request(&request, bridge, bridge_wait_seconds)
                 }) {
@@ -4986,35 +5474,47 @@ fn handle_daemon_control_request(
         }));
     }
 
+    if daemon_command == "review-decision" {
+        wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
+        let review_args: EditorReviewDecisionArgs =
+            parse_daemon_request_args("editor-review-decision", &request.args)?;
+        return editor_review_decision_result(&review_args, bridge);
+    }
+
     match daemon_command {
         "export-snapshots" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
             let bridge_info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
-            let export_args: ExportSnapshotsArgs = parse_daemon_request_args("export-snapshots", &request.args)?;
+            let export_args: ExportSnapshotsArgs =
+                parse_daemon_request_args("export-snapshots", &request.args)?;
             export_snapshots_with_warm_bridge(export_args, bridge, &bridge_info, 0.0, false)?;
             Ok(json!({ "ok": true }))
         }
         "push-editor-changes" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let push_args: PushEditorChangesArgs = parse_daemon_request_args("push-editor-changes", &request.args)?;
+            let push_args: PushEditorChangesArgs =
+                parse_daemon_request_args("push-editor-changes", &request.args)?;
             let mut summary = push_editor_changes_with_warm_bridge(push_args, bridge)?;
             summary.entry("ok".to_string()).or_insert(Value::Bool(true));
             Ok(Value::Object(summary))
         }
         "apply-editor-property" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let property_args: ApplyEditorPropertyArgs = parse_daemon_request_args("apply-editor-property", &request.args)?;
+            let property_args: ApplyEditorPropertyArgs =
+                parse_daemon_request_args("apply-editor-property", &request.args)?;
             apply_editor_property_with_warm_bridge(property_args, bridge)?;
             Ok(json!({ "ok": true }))
         }
         "apply-editor-delete" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let delete_args: ApplyEditorDeleteArgs = parse_daemon_request_args("apply-editor-delete", &request.args)?;
+            let delete_args: ApplyEditorDeleteArgs =
+                parse_daemon_request_args("apply-editor-delete", &request.args)?;
             apply_editor_delete_with_warm_bridge(delete_args, bridge)?;
             Ok(json!({ "ok": true }))
         }
         "get-console-output" => {
-            let console_args: PluginConsoleOutputArgs = parse_daemon_request_args("get-console-output", &request.args)?;
+            let console_args: PluginConsoleOutputArgs =
+                parse_daemon_request_args("get-console-output", &request.args)?;
             let target = if console_args.client || console_args.player.is_some() {
                 BridgeTarget::Client
             } else {
@@ -5024,7 +5524,8 @@ fn handle_daemon_control_request(
             get_console_output_result(console_args, bridge)
         }
         "execute-luau" => {
-            let luau_args: ExecuteLuauArgs = parse_daemon_request_args("execute-luau", &request.args)?;
+            let luau_args: ExecuteLuauArgs =
+                parse_daemon_request_args("execute-luau", &request.args)?;
             let target = if luau_args.client || luau_args.player.is_some() {
                 BridgeTarget::Client
             } else {
@@ -5033,14 +5534,22 @@ fn handle_daemon_control_request(
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, target)?;
             execute_luau_result(luau_args, bridge)
         }
+        "studio-device" => {
+            wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Edit)?;
+            let device_args: StudioDeviceArgs =
+                parse_daemon_request_args("studio-device", &request.args)?;
+            studio_device_result(&device_args, bridge)
+        }
         "start-stop-play" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let play_args: StartStopPlayArgs = parse_daemon_request_args("start-stop-play", &request.args)?;
+            let play_args: StartStopPlayArgs =
+                parse_daemon_request_args("start-stop-play", &request.args)?;
             start_stop_play_result(play_args, bridge)
         }
         "studio-change-state" => {
             wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let state_args: StudioChangeStateArgs = parse_daemon_request_args("studio-change-state", &request.args)?;
+            let state_args: StudioChangeStateArgs =
+                parse_daemon_request_args("studio-change-state", &request.args)?;
             studio_change_state_result(state_args, bridge)
         }
         "press" => {
@@ -5079,8 +5588,15 @@ fn handle_daemon_control_request(
             wait_until_result(&wait_args, bridge)
         }
         "shot" => {
-            wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             let shot_args: ShotArgs = parse_daemon_request_args("shot", &request.args)?;
+            let target = if shot_args.studio {
+                BridgeTarget::Edit
+            } else if shot_args.client || shot_args.player.is_some() {
+                BridgeTarget::Client
+            } else {
+                BridgeTarget::Main
+            };
+            wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, target)?;
             shot_result(&shot_args, bridge)
         }
         "goto" => {
@@ -5109,7 +5625,9 @@ fn wait_for_daemon_bridge_channels(
             ready_channels,
             required_channels,
             BridgeServer::target_label(target),
-            place_filter().map(|place| format!(" for place filter '{place}'")).unwrap_or_default(),
+            place_filter()
+                .map(|place| format!(" for place filter '{place}'"))
+                .unwrap_or_default(),
             bridge.missing_ports_for_target(target)
         );
     }
@@ -5126,8 +5644,10 @@ fn normalize_daemon_command(command: &str) -> Option<&'static str> {
         "del" | "apply-editor-delete" => Some("apply-editor-delete"),
         "co" | "console" | "get-console-output" => Some("get-console-output"),
         "lx" | "luau" | "execute-luau" => Some("execute-luau"),
+        "device" | "dev" | "studio-device" => Some("studio-device"),
         "play" | "start-stop-play" => Some("start-stop-play"),
         "clients" | "list-clients" => Some("list-clients"),
+        "review" | "editor-review-decision" => Some("review-decision"),
         "press" => Some("press"),
         "click" => Some("click"),
         "key" => Some("key"),
@@ -5445,8 +5965,15 @@ fn try_daemon_control_request(command: &str, args: Vec<String>) -> Result<Option
     let mut line = String::new();
     match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES) {
         Ok(BoundedLineRead::Line) => {}
-        Ok(BoundedLineRead::Eof) | Err(_) => return Ok(None),
+        Ok(BoundedLineRead::Eof) => {
+            bail!("Renium daemon closed the control connection before responding")
+        }
         Ok(BoundedLineRead::TooLong) => bail!("Daemon control response exceeds safe size limit"),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Renium daemon did not finish {command} before the control timeout")
+            });
+        }
     }
     let response: Value =
         serde_json::from_str(line.trim()).context("Invalid daemon control response")?;
@@ -5486,7 +6013,7 @@ fn get_console_output_daemon_args(args: &PluginConsoleOutputArgs) -> Vec<String>
 }
 
 fn execute_luau_daemon_args(args: &ExecuteLuauArgs) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+    let mut out = vec!["-t".to_string(), args.timeout.to_string()];
     if args.client {
         out.push("-c".to_string());
     }
@@ -5506,6 +6033,30 @@ fn execute_luau_daemon_args(args: &ExecuteLuauArgs) -> Result<Vec<String>> {
         return Ok(out);
     }
     Ok(out)
+}
+
+fn studio_device_daemon_args(args: &StudioDeviceArgs) -> Vec<String> {
+    let mut out = vec![args.action.clone()];
+    if let Some(device) = args.device.as_ref() {
+        out.push(device.clone());
+    }
+    if let Some(orientation) = args.orientation.as_ref() {
+        out.push("--orientation".to_string());
+        out.push(orientation.clone());
+    }
+    if let Some(scaling_mode) = args.scaling_mode.as_ref() {
+        out.push("--scaling".to_string());
+        out.push(scaling_mode.clone());
+    }
+    if let Some(resolution) = args.resolution.as_ref() {
+        out.push("--resolution".to_string());
+        out.push(resolution.clone());
+    }
+    if let Some(pixel_density) = args.pixel_density {
+        out.push("--pixel-density".to_string());
+        out.push(pixel_density.to_string());
+    }
+    out
 }
 
 fn start_stop_play_daemon_args(args: &StartStopPlayArgs) -> Vec<String> {
@@ -5687,6 +6238,12 @@ fn push_editor_changes_daemon_args(args: &PushEditorChangesArgs) -> Vec<String> 
     if args.verify_sources {
         out.push("-v".to_string());
     }
+    if args.no_review {
+        out.push("--no-review".to_string());
+    }
+    if args.yes {
+        out.push("--yes".to_string());
+    }
     if args.override_packages {
         out.push("--override-packages".to_string());
     }
@@ -5699,6 +6256,10 @@ fn push_editor_changes_daemon_args(args: &PushEditorChangesArgs) -> Vec<String> 
 
 fn apply_editor_property_daemon_args(args: &ApplyEditorPropertyArgs) -> Vec<String> {
     let mut out = vec![
+        "-r".to_string(),
+        args.project_root.display().to_string(),
+        "-d".to_string(),
+        args.src_dir.display().to_string(),
         "-w".to_string(),
         args.bridge_wait_seconds.to_string(),
         "-H".to_string(),
@@ -5725,6 +6286,12 @@ fn apply_editor_property_daemon_args(args: &ApplyEditorPropertyArgs) -> Vec<Stri
     }
     if args.allow_protected_mesh_id_apply {
         out.push("-m".to_string());
+    }
+    if args.no_review {
+        out.push("--no-review".to_string());
+    }
+    if args.yes {
+        out.push("--yes".to_string());
     }
     out
 }
@@ -5829,7 +6396,9 @@ fn execute_luau_command(args: ExecuteLuauArgs) -> Result<()> {
             ready_channels,
             required_channels,
             BridgeServer::target_label(target),
-            place_filter().map(|place| format!(" for place filter '{place}'")).unwrap_or_default(),
+            place_filter()
+                .map(|place| format!(" for place filter '{place}'"))
+                .unwrap_or_default(),
             bridge.missing_ports_for_target(target)
         );
     }
@@ -5842,6 +6411,20 @@ fn execute_luau_with_warm_bridge(args: ExecuteLuauArgs, bridge: &BridgeServer) -
     Ok(())
 }
 
+fn validate_luau_syntax(code: &str) -> Result<()> {
+    let parsed = full_moon::parse_fallible(code, full_moon::LuaVersion::luau());
+    if let Some(error) = parsed.errors().first() {
+        let (start, _) = error.range();
+        bail!(
+            "Invalid Luau syntax at {}:{}: {}",
+            start.line(),
+            start.character(),
+            error.error_message()
+        );
+    }
+    Ok(())
+}
+
 fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
     let code = if let Some(code) = args.code {
         code
@@ -5850,7 +6433,9 @@ fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<V
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
     };
+    validate_luau_syntax(&code)?;
     let client = args.client || args.player.is_some();
+    let timeout = args.timeout.clamp(0.1, 20.0);
     let target = if client {
         BridgeTarget::Client
     } else {
@@ -5865,10 +6450,101 @@ fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<V
             "code": code,
             "chunkName": "Renium",
             "context": if client { "client" } else { "plugin" },
+            "timeoutSeconds": timeout,
         }),
         target,
         args.player.as_deref(),
     )?;
+    ensure_plugin_api_ok(&result)?;
+    Ok(result)
+}
+
+fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
+    if let Some(result) = try_daemon_control_request("device", studio_device_daemon_args(&args))? {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let ports = parse_bridge_ports(&args.bridge_ports)?;
+    let (bridge, _listen_metrics) = BridgeServer::listen_with_initial_wait(
+        &args.bridge_host,
+        &ports,
+        args.bridge_wait_seconds,
+        false,
+    )?;
+    let required_channels = bridge.expected_channel_count();
+    let ready_channels = bridge.wait_for_ready_channels_for_target(
+        required_channels,
+        Duration::from_secs_f64(args.bridge_wait_seconds.max(1.0)),
+        BridgeTarget::Edit,
+    );
+    if ready_channels < required_channels {
+        bail!(
+            "Only {}/{} persistent edit plugin bridge channels are ready{}. Missing ports: {:?}",
+            ready_channels,
+            required_channels,
+            place_filter()
+                .map(|place| format!(" for place filter '{place}'"))
+                .unwrap_or_default(),
+            bridge.missing_ports_for_target(BridgeTarget::Edit)
+        );
+    }
+    let bridge_info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    validate_bridge_info(&bridge_info)?;
+    let result = studio_device_result(&args, &bridge)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn studio_device_resolution(raw: &str) -> Result<(u32, u32)> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('×', "x");
+    let (width, height) = normalized
+        .split_once('x')
+        .with_context(|| format!("Invalid resolution '{raw}'. Use WIDTHxHEIGHT."))?;
+    let width = width
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("Invalid resolution width in '{raw}'"))?;
+    let height = height
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("Invalid resolution height in '{raw}'"))?;
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        bail!("Resolution must use positive 32-bit dimensions");
+    }
+    Ok((width, height))
+}
+
+fn studio_device_result(args: &StudioDeviceArgs, bridge: &BridgeServer) -> Result<Value> {
+    let mut params = Map::new();
+    params.insert("action".to_string(), Value::String(args.action.clone()));
+    if let Some(device) = args.device.as_ref() {
+        params.insert("device".to_string(), Value::String(device.clone()));
+    }
+    if let Some(orientation) = args.orientation.as_ref() {
+        params.insert(
+            "orientation".to_string(),
+            Value::String(orientation.clone()),
+        );
+    }
+    if let Some(scaling_mode) = args.scaling_mode.as_ref() {
+        params.insert(
+            "scalingMode".to_string(),
+            Value::String(scaling_mode.clone()),
+        );
+    }
+    if let Some(resolution) = args.resolution.as_deref() {
+        let (width, height) = studio_device_resolution(resolution)?;
+        params.insert("width".to_string(), json!(width));
+        params.insert("height".to_string(), json!(height));
+    }
+    if let Some(pixel_density) = args.pixel_density {
+        if !pixel_density.is_finite() || pixel_density <= 0.0 {
+            bail!("Pixel density must be a finite number greater than zero");
+        }
+        params.insert("pixelDensity".to_string(), json!(pixel_density));
+    }
+    let result =
+        bridge.call_for_target("deviceSimulator", Value::Object(params), BridgeTarget::Edit)?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
 }
@@ -6095,17 +6771,75 @@ fn client_viewport_size(bridge: &BridgeServer, player: Option<&str>) -> Option<(
     Some((width.round() as i32, height.round() as i32))
 }
 
-#[cfg(not(windows))]
-fn read_client_mouse_location(
+fn studio_capture_status(bridge: &BridgeServer) -> Option<Value> {
+    let result = bridge
+        .call_for_target(
+            "deviceSimulator",
+            json!({ "action": "status" }),
+            BridgeTarget::Edit,
+        )
+        .ok()?;
+    ensure_plugin_api_ok(&result).ok()?;
+    Some(result)
+}
+
+fn set_capture_probe_phase(
     bridge: &BridgeServer,
-    player: Option<&str>,
-) -> Result<(f64, f64)> {
-    let result = bridge.call_for_selector(
-        "getMouseLocation",
-        json!({}),
-        BridgeTarget::Client,
-        player,
+    target: BridgeTarget,
+    phase: u8,
+    colors: &[u32],
+) -> Result<()> {
+    let action = match phase {
+        0 => "start",
+        1 => "phase",
+        2 => "stop",
+        _ => bail!("Invalid capture probe phase {phase}"),
+    };
+    let result = bridge.call_for_target(
+        "captureViewportProbe",
+        json!({ "action": action, "colors": colors }),
+        target,
     )?;
+    ensure_plugin_api_ok(&result)
+}
+
+#[cfg(windows)]
+fn resolve_edit_window(
+    bridge: &BridgeServer,
+    probe_target: BridgeTarget,
+) -> Result<input_inject::StudioWindow> {
+    let peer = bridge.peer_for_selector(BridgeTarget::Edit, None)?;
+    let port: u16 = peer
+        .rsplit(':')
+        .next()
+        .and_then(|part| part.parse().ok())
+        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
+    let pid = input_inject::pid_for_local_tcp_port(port)
+        .with_context(|| format!("Could not map bridge connection {peer} to a Studio process"))?;
+    input_inject::verified_studio_window_for_pid(pid, |phase, colors| {
+        set_capture_probe_phase(bridge, probe_target, phase, colors)
+    })
+}
+
+#[cfg(not(windows))]
+fn resolve_edit_window(
+    _bridge: &BridgeServer,
+    _probe_target: BridgeTarget,
+) -> Result<input_inject::StudioWindow> {
+    let mut windows = input_inject::list_studio_windows()?;
+    if windows.len() != 1 {
+        bail!(
+            "Expected one visible Studio window for an edit screenshot, found {}",
+            windows.len()
+        );
+    }
+    Ok(windows.remove(0))
+}
+
+#[cfg(not(windows))]
+fn read_client_mouse_location(bridge: &BridgeServer, player: Option<&str>) -> Result<(f64, f64)> {
+    let result =
+        bridge.call_for_selector("getMouseLocation", json!({}), BridgeTarget::Client, player)?;
     ensure_plugin_api_ok(&result)?;
     let x = result.get("x").and_then(Value::as_f64);
     let y = result.get("y").and_then(Value::as_f64);
@@ -6214,7 +6948,10 @@ fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Value> {
     if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
         bail!(
             "GUI element {} is not visible",
-            bounds.get("fullName").and_then(Value::as_str).unwrap_or(requested)
+            bounds
+                .get("fullName")
+                .and_then(Value::as_str)
+                .unwrap_or(requested)
         );
     }
     let viewport = match (
@@ -6250,12 +6987,8 @@ fn read_client_probe_state(
     bridge: &BridgeServer,
     player: Option<&str>,
 ) -> Result<(u64, Option<(f64, f64)>)> {
-    let result = bridge.call_for_selector(
-        "getMouseLocation",
-        json!({}),
-        BridgeTarget::Client,
-        player,
-    )?;
+    let result =
+        bridge.call_for_selector("getMouseLocation", json!({}), BridgeTarget::Client, player)?;
     let seq = result.get("probeSeq").and_then(Value::as_u64).unwrap_or(0);
     let position = match (
         result.get("probeX").and_then(Value::as_f64),
@@ -6534,7 +7267,10 @@ fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Value> {
         }
         (parts[0], parts[1], parts[2], pos.clone())
     } else {
-        let path = args.target.as_deref().context("Provide a part path or --pos")?;
+        let path = args
+            .target
+            .as_deref()
+            .context("Provide a part path or --pos")?;
         let point = bridge.call_for_selector(
             "getWorldPoint",
             json!({ "path": path }),
@@ -6667,8 +7403,44 @@ fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Value> {
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge_wait_seconds)?;
     }
-    let (window, _, _) =
-        resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
+    let studio_status = if player.is_none() && !args.client {
+        studio_capture_status(bridge)
+    } else {
+        None
+    };
+    let simulated = studio_status
+        .as_ref()
+        .and_then(|status| status.get("simulating"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if simulated {
+        let settle_seconds = studio_status
+            .as_ref()
+            .and_then(|status| status.get("settleSeconds"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 5.0);
+        if settle_seconds > 0.0 {
+            thread::sleep(Duration::from_secs_f64(settle_seconds));
+        }
+    }
+    let client_ready =
+        bridge.channel_count_for_target(BridgeTarget::Client) >= bridge.expected_channel_count();
+    let use_studio =
+        args.studio || (player.is_none() && !args.client && (simulated || !client_ready));
+    let probe_target = if simulated && client_ready {
+        BridgeTarget::Client
+    } else {
+        BridgeTarget::Edit
+    };
+    let (window, target) = if use_studio {
+        (resolve_edit_window(bridge, probe_target)?, "studio")
+    } else {
+        (
+            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?.0,
+            "play-client",
+        )
+    };
     let output = if args.output.is_absolute() {
         args.output.clone()
     } else {
@@ -6684,6 +7456,8 @@ fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Value> {
         "width": width,
         "height": height,
         "window": window.label,
+        "target": target,
+        "deviceSimulation": simulated,
     }))
 }
 
@@ -6850,7 +7624,13 @@ fn shot_command(args: ShotArgs) -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(&args.output)
     };
-    let daemon_args = vec!["-o".to_string(), output.display().to_string()];
+    let mut daemon_args = vec!["-o".to_string(), output.display().to_string()];
+    if args.studio {
+        daemon_args.push("--studio".to_string());
+    }
+    if args.client {
+        daemon_args.push("--client".to_string());
+    }
     if let Some(result) =
         try_daemon_control_request("shot", input_daemon_args(&args.player, daemon_args))?
     {
@@ -6898,18 +7678,10 @@ fn validate_rbxm(bytes: &[u8]) -> Result<()> {
 }
 
 fn download_latest_plugin(destination: &Path) -> Result<String> {
-    let url = format!(
-        "https://github.com/{GITHUB_REPO}/releases/latest/download/{PLUGIN_ASSET_NAME}"
-    );
+    let url =
+        format!("https://github.com/{GITHUB_REPO}/releases/latest/download/{PLUGIN_ASSET_NAME}");
     let status = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "15",
-            "-o",
-        ])
+        .args(["-fsSL", "--retry", "2", "--connect-timeout", "15", "-o"])
         .arg(destination)
         .arg(&url)
         .status()
@@ -6934,10 +7706,8 @@ fn setup_command(args: SetupArgs) -> Result<()> {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(PLUGIN_ASSET_NAME)))
         .filter(|path| path.is_file());
-    let staging_download = std::env::temp_dir().join(format!(
-        "renium-plugin-{}.rbxm",
-        std::process::id()
-    ));
+    let staging_download =
+        std::env::temp_dir().join(format!("renium-plugin-{}.rbxm", std::process::id()));
 
     let (source_path, source_label) = if let Some(file) = args.file.as_ref() {
         let path = PathBuf::from(file);
@@ -7005,6 +7775,52 @@ fn list_clients_command(args: ListClientsArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({ "clients": bridge.list_bridge_clients() }))?
     );
+    Ok(())
+}
+
+fn editor_review_decision_daemon_args(args: &EditorReviewDecisionArgs) -> Vec<String> {
+    let mut out = vec![
+        args.decision.clone(),
+        "-w".to_string(),
+        args.bridge_wait_seconds.to_string(),
+        "-H".to_string(),
+        args.bridge_host.clone(),
+        "-P".to_string(),
+        args.bridge_ports.clone(),
+    ];
+    if let Some(review_id) = &args.review_id {
+        out.push("-i".to_string());
+        out.push(review_id.clone());
+    }
+    out
+}
+
+fn editor_review_decision_result(
+    args: &EditorReviewDecisionArgs,
+    bridge: &BridgeServer,
+) -> Result<Value> {
+    let result = bridge.call(
+        "setEditorPushReviewDecision",
+        json!({
+            "reviewId": args.review_id,
+            "decision": args.decision,
+        }),
+    )?;
+    if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Studio has no matching review awaiting a decision");
+        bail!("{error}");
+    }
+    Ok(result)
+}
+
+fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> Result<()> {
+    let daemon_args = editor_review_decision_daemon_args(&args);
+    let result = try_daemon_control_request("review", daemon_args)?
+        .context("No Renium daemon is running; start `rbx bd` first")?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -7148,7 +7964,15 @@ fn push_editor_changes_with_collected(
     started: Instant,
 ) -> Result<serde_json::Map<String, Value>> {
     save_editor_history_entries(bridge, &args.project_root, &args.src_dir, &changes)?;
-    let mut summary = send_editor_change_batches(bridge, &changes, args.probe_events)?;
+    let binary_import = build_editor_binary_import(&args, &changes)?;
+    let mut summary = send_editor_change_batches(
+        bridge,
+        &changes,
+        args.probe_events,
+        !args.no_review,
+        args.yes,
+        binary_import.as_ref(),
+    )?;
     if summary.get("skippedByReview").and_then(Value::as_bool) != Some(true) {
         apply_editor_settings_writes(&changes)?;
     }
@@ -7183,6 +8007,60 @@ fn push_editor_changes_with_collected(
                 verification.failed.len()
             );
         }
+    }
+    let reported_protected_writes = summary
+        .get("protectedWrites")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let applicable_protected_writes = reported_protected_writes
+        .iter()
+        .filter(|row| {
+            !is_externally_managed_protected_write(row)
+                && is_user_facing_protected_write(row, database)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let unavailable_protected_skipped =
+        reported_protected_writes.len() - applicable_protected_writes.len();
+    let enriched_protected_writes = local_place_path_for_bridge(bridge)
+        .and_then(|path| {
+            protected_write_rows_with_previous_values(&path, &applicable_protected_writes).ok()
+        })
+        .unwrap_or(applicable_protected_writes);
+    let protected_writes = enriched_protected_writes
+        .iter()
+        .filter(|row| !protected_write_matches_previous(row))
+        .cloned()
+        .collect::<Vec<_>>();
+    let already_current = enriched_protected_writes.len() - protected_writes.len();
+    summary.insert(
+        "protectedWrites".to_string(),
+        Value::Array(protected_writes.clone()),
+    );
+    if unavailable_protected_skipped > 0 {
+        summary.insert(
+            "unavailableProtectedSkipped".to_string(),
+            Value::Number(Number::from(unavailable_protected_skipped as u64)),
+        );
+    }
+    if already_current > 0 {
+        summary.insert(
+            "protectedAlreadyCurrent".to_string(),
+            Value::Number(Number::from(already_current as u64)),
+        );
+    }
+    if !args.no_review
+        && !protected_writes.is_empty()
+        && (args.yes || request_protected_write_review(bridge, &protected_writes)?)
+    {
+        let result = apply_protected_writes_offline(bridge, &args, &protected_writes)?;
+        summary.insert("protectedOfflineApply".to_string(), result);
+        summary.insert(
+            "protectedApplied".to_string(),
+            Value::Number(serde_json::Number::from(protected_writes.len() as u64)),
+        );
     }
     println!(
         "[renium] editor push done: elapsed_ms={:.1}, summary={}",
@@ -7225,7 +8103,7 @@ fn apply_editor_change_with_warm_bridge(
 ) -> Result<()> {
     let started = Instant::now();
     let changes = collect()?;
-    let summary = send_editor_change_batches(bridge, &changes, false)?;
+    let summary = send_editor_change_batches(bridge, &changes, false, true, false, None)?;
     println!(
         "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
         elapsed_ms(started),
@@ -7262,12 +8140,38 @@ fn apply_editor_property_with_warm_bridge(
     args: ApplyEditorPropertyArgs,
     bridge: &BridgeServer,
 ) -> Result<()> {
-    apply_editor_change_with_warm_bridge(bridge, "property", || {
-        collect_direct_editor_property_change(args)
-    })
+    let started = Instant::now();
+    let changes = collect_direct_editor_property_change(&args)?;
+    push_editor_changes_with_collected(
+        PushEditorChangesArgs {
+            project_root: args.project_root,
+            src_dir: args.src_dir,
+            bridge_wait_seconds: args.bridge_wait_seconds,
+            bridge_host: args.bridge_host,
+            bridge_ports: args.bridge_ports,
+            changed_paths: Vec::new(),
+            changed_paths_files: Vec::new(),
+            target_settings_ids: Vec::new(),
+            target_settings_id_files: Vec::new(),
+            target_properties: Vec::new(),
+            upsert_instances_only: false,
+            probe_events: false,
+            verify_sources: false,
+            no_review: args.no_review,
+            yes: args.yes,
+            link_cache_dir: None,
+            override_packages: false,
+        },
+        bridge,
+        changes,
+        started,
+    )?;
+    Ok(())
 }
 
-fn collect_direct_editor_property_change(args: ApplyEditorPropertyArgs) -> Result<EditorChangeSet> {
+fn collect_direct_editor_property_change(
+    args: &ApplyEditorPropertyArgs,
+) -> Result<EditorChangeSet> {
     let service = args.service.trim().to_string();
     if service.is_empty() {
         bail!("--service is required");
@@ -7283,6 +8187,10 @@ fn collect_direct_editor_property_change(args: ApplyEditorPropertyArgs) -> Resul
     }
     let path_ordinals: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
         .context("Failed to parse --path-ordinals-json")?;
+    if is_externally_managed_editor_property(&service, &args.class_name, &path_segments, &property)
+    {
+        bail!("{service}.{property} is managed through Roblox Game Settings")
+    }
     let value: Value =
         serde_json::from_str(&args.value_json).context("Failed to parse --value-json")?;
 
@@ -7305,7 +8213,7 @@ fn collect_direct_editor_property_change(args: ApplyEditorPropertyArgs) -> Resul
             .map(str::to_string),
         path_segments,
         path_ordinals,
-        class_name: args.class_name,
+        class_name: args.class_name.clone(),
         properties,
         attributes,
         allow_protected_mesh_id_apply: args.allow_protected_mesh_id_apply,
@@ -8007,6 +8915,8 @@ fn editor_revert(args: EditorRevertArgs) -> Result<()> {
                 upsert_instances_only: false,
                 probe_events: false,
                 verify_sources: true,
+                no_review: false,
+                yes: false,
                 link_cache_dir: None,
                 override_packages: false,
             },
@@ -8307,7 +9217,7 @@ fn push_editor_instance_change(
             .then_with(|| a.settings_id.cmp(&b.settings_id))
     });
 
-    if instances.is_empty() {
+    if instances.is_empty() && !(mode == "reconcileService" && allow_deletes) {
         return;
     }
 
@@ -8347,6 +9257,9 @@ fn append_editor_target_instance_upserts(
     let mut selected_indices = HashSet::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
+            continue;
+        }
+        if instance.class_name == "PackageLink" {
             continue;
         }
         let mut current = Some(index);
@@ -8419,10 +9332,6 @@ fn append_editor_property_changes(
     filter: &EditorPropertyFilter,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
-    let path_segments_by_index = paths_by_index
-        .iter()
-        .map(|path| path.as_ref().map(|path| path.path_segments.clone()))
-        .collect::<Vec<_>>();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
             continue;
@@ -8445,11 +9354,19 @@ fn append_editor_property_changes(
             if !filter.includes_property(name) {
                 continue;
             }
+            if is_externally_managed_editor_property(
+                service,
+                &instance.class_name,
+                &path_segments,
+                name,
+            ) {
+                continue;
+            }
             let schema_entry =
                 property_schema_entry(property_schema_by_class, &instance.class_name, name);
             properties.insert(
                 name.clone(),
-                normalize_editor_bridge_value(value, schema_entry, &path_segments_by_index),
+                normalize_editor_bridge_value(value, schema_entry, &paths_by_index),
             );
         }
 
@@ -8458,7 +9375,7 @@ fn append_editor_property_changes(
             for (name, value) in &instance.attributes {
                 attributes.insert(
                     name.clone(),
-                    normalize_editor_bridge_value(value, None, &path_segments_by_index),
+                    normalize_editor_bridge_value(value, None, &paths_by_index),
                 );
             }
         }
@@ -8497,6 +9414,79 @@ fn is_workspace_camera_sync_target(
             .is_some_and(|segment| segment == "Camera" || segment == "CurrentCamera")
 }
 
+fn is_externally_managed_editor_property(
+    service: &str,
+    class_name: &str,
+    path_segments: &[String],
+    property_name: &str,
+) -> bool {
+    service.eq_ignore_ascii_case("Players")
+        && class_name.eq_ignore_ascii_case("Players")
+        && path_segments.len() == 1
+        && path_segments[0].eq_ignore_ascii_case("Players")
+        && matches!(
+            property_name.to_ascii_lowercase().as_str(),
+            "maxplayers" | "maxplayersinternal" | "preferredplayers" | "preferredplayersinternal"
+        )
+}
+
+fn is_externally_managed_protected_write(row: &Value) -> bool {
+    let service = row.get("service").and_then(Value::as_str).unwrap_or("");
+    let class_name = row.get("className").and_then(Value::as_str).unwrap_or("");
+    let property_name = row.get("name").and_then(Value::as_str).unwrap_or("");
+    let path_segments = row
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    is_externally_managed_editor_property(service, class_name, &path_segments, property_name)
+}
+
+fn is_user_facing_protected_write(row: &Value, database: &ReflectionDatabase<'_>) -> bool {
+    let Some(name) = row.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    if name.starts_with("RBX_") {
+        return false;
+    }
+    if row.get("kind").and_then(Value::as_str) == Some("attribute") {
+        return true;
+    }
+    let Some(class_name) = row.get("className").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(descriptor) = rbx_property_descriptor(database, class_name, name) else {
+        return false;
+    };
+    if descriptor.tags.iter().any(|tag| {
+        matches!(
+            tag,
+            RbxPropertyTag::Deprecated
+                | RbxPropertyTag::Hidden
+                | RbxPropertyTag::NotBrowsable
+                | RbxPropertyTag::ReadOnly
+                | RbxPropertyTag::WriteOnly
+        )
+    }) {
+        return false;
+    }
+    if matches!(&descriptor.data_type, RbxDataType::Enum(name) if *name == "RolloutState") {
+        return false;
+    }
+    if !matches!(descriptor.scriptability, RbxScriptability::Read) {
+        return false;
+    }
+    class_name == "MeshPart"
+        && name == "MeshId"
+        && rbx_model_property_descriptor(database, class_name, name).is_some()
+}
+
 fn property_schema_entry<'a>(
     property_schema_by_class: &'a PropertySchemaMap,
     class_name: &str,
@@ -8511,17 +9501,17 @@ fn property_schema_entry<'a>(
 fn normalize_editor_bridge_value(
     value: &Value,
     schema_entry: Option<&PropertySchemaEntry>,
-    path_segments_by_index: &[Option<Vec<String>>],
+    paths_by_index: &[Option<EditorInstancePath>],
 ) -> Value {
     match value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| normalize_editor_bridge_value(item, None, path_segments_by_index))
+                .map(|item| normalize_editor_bridge_value(item, None, paths_by_index))
                 .collect(),
         ),
         Value::Object(object) => {
-            normalize_editor_bridge_object(object, schema_entry, path_segments_by_index)
+            normalize_editor_bridge_object(object, schema_entry, paths_by_index)
         }
         _ => value.clone(),
     }
@@ -8530,13 +9520,13 @@ fn normalize_editor_bridge_value(
 fn normalize_editor_bridge_object(
     object: &Map<String, Value>,
     schema_entry: Option<&PropertySchemaEntry>,
-    path_segments_by_index: &[Option<Vec<String>>],
+    paths_by_index: &[Option<EditorInstancePath>],
 ) -> Value {
     if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-        return normalize_editor_ref_value(object, path_segments_by_index);
+        return normalize_editor_ref_value(object, paths_by_index);
     }
     if let Some(ref_object) = object.get("Ref").and_then(Value::as_object) {
-        return normalize_editor_ref_value(ref_object, path_segments_by_index);
+        return normalize_editor_ref_value(ref_object, paths_by_index);
     }
     if let Some(number) = object.get("BrickColor") {
         let mut out = Map::new();
@@ -8561,7 +9551,7 @@ fn normalize_editor_bridge_object(
     for (key, nested) in object {
         out.insert(
             key.clone(),
-            normalize_editor_bridge_value(nested, None, path_segments_by_index),
+            normalize_editor_bridge_value(nested, None, paths_by_index),
         );
     }
     if object.get("_type").and_then(Value::as_str) == Some("EnumItem")
@@ -8575,27 +9565,35 @@ fn normalize_editor_bridge_object(
 
 fn normalize_editor_ref_value(
     object: &Map<String, Value>,
-    path_segments_by_index: &[Option<Vec<String>>],
+    paths_by_index: &[Option<EditorInstancePath>],
 ) -> Value {
     let mut out = Map::with_capacity(object.len() + 2);
     for (key, nested) in object {
         out.insert(
             key.clone(),
-            normalize_editor_bridge_value(nested, None, path_segments_by_index),
+            normalize_editor_bridge_value(nested, None, paths_by_index),
         );
     }
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
-    if !object.contains_key("pathSegments")
-        && let Some(instance_index) = object.get("instanceIndex").and_then(Value::as_u64)
+    if let Some(instance_index) = object.get("instanceIndex").and_then(Value::as_u64)
         && let Some(zero_index) = instance_index.checked_sub(1).map(|value| value as usize)
-        && let Some(Some(path_segments)) = path_segments_by_index.get(zero_index)
+        && let Some(Some(path)) = paths_by_index.get(zero_index)
     {
         out.insert(
             "pathSegments".to_string(),
             Value::Array(
-                path_segments
+                path.path_segments
                     .iter()
                     .map(|segment| Value::String(segment.clone()))
+                    .collect(),
+            ),
+        );
+        out.insert(
+            "pathOrdinals".to_string(),
+            Value::Array(
+                path.path_ordinals
+                    .iter()
+                    .map(|ordinal| Value::Number(serde_json::Number::from(*ordinal as u64)))
                     .collect(),
             ),
         );
@@ -8705,71 +9703,126 @@ fn normalize_editor_color3_value(value: Option<&Value>) -> Value {
     json!({ "_type": "Color3", "r": 0, "g": 0, "b": 0 })
 }
 
-const MAX_REVIEW_ROWS: usize = 1000;
+fn editor_review_value(value: &Value) -> Value {
+    let encoded_len = serde_json::to_vec(value).map_or(0, |encoded| encoded.len());
+    if encoded_len <= 512 {
+        return value.clone();
+    }
+    let summary = match value {
+        Value::String(text) => {
+            format!("String ({} characters)", text.chars().count())
+        }
+        Value::Array(items) => format!("Array ({} values)", items.len()),
+        Value::Object(object) => {
+            let label = object
+                .get("_type")
+                .and_then(Value::as_str)
+                .unwrap_or("Object");
+            if let Some(base64) = object.get("base64").and_then(Value::as_str) {
+                let padding = base64
+                    .as_bytes()
+                    .iter()
+                    .rev()
+                    .take_while(|byte| **byte == b'=')
+                    .count();
+                let bytes = base64.len().saturating_mul(3) / 4 - padding;
+                format!("{label} ({bytes} bytes)")
+            } else {
+                format!("{label} ({encoded_len} bytes)")
+            }
+        }
+        _ => return value.clone(),
+    };
+    json!({ "_reviewTruncated": true, "summary": summary })
+}
 
-fn push_review_row(rows: &mut Vec<Value>, truncated: &mut bool, row: Value) {
-    if rows.len() < MAX_REVIEW_ROWS {
-        rows.push(row);
+struct EditorReviewTarget<'a> {
+    service: &'a str,
+    settings_id: Option<&'a str>,
+    path_segments: &'a [String],
+    path_ordinals: &'a [usize],
+    class_name: &'a str,
+}
+
+fn append_editor_review_entry(
+    rows: &mut Vec<Value>,
+    row_index_by_key: &mut HashMap<String, usize>,
+    target: EditorReviewTarget<'_>,
+    entry: Value,
+) {
+    let key = target.settings_id.map_or_else(
+        || {
+            serde_json::to_string(&(target.service, target.path_segments, target.path_ordinals))
+                .unwrap_or_else(|_| {
+                    format!("{}:{}", target.service, target.path_segments.join("."))
+                })
+        },
+        |settings_id| format!("{}\0{settings_id}", target.service),
+    );
+    let row_index = if let Some(index) = row_index_by_key.get(&key) {
+        *index
     } else {
-        *truncated = true;
+        let index = rows.len();
+        rows.push(json!({
+            "service": target.service,
+            "settingsId": target.settings_id,
+            "pathSegments": target.path_segments,
+            "pathOrdinals": target.path_ordinals,
+            "className": target.class_name,
+            "entries": [],
+        }));
+        row_index_by_key.insert(key, index);
+        index
+    };
+    if let Some(entries) = rows[row_index]
+        .as_object_mut()
+        .and_then(|row| row.get_mut("entries"))
+        .and_then(Value::as_array_mut)
+    {
+        entries.push(entry);
     }
 }
 
-fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Value>, bool) {
+fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Value>) {
     let mut rows = Vec::new();
+    let mut row_index_by_key = HashMap::new();
     let mut change_count: u64 = 0;
-    let mut truncated = false;
     for change in &changes.instance_changes {
-        change_count += change.instances.len() as u64;
-        match change.mode.as_str() {
-            "upsertInstances" | "replaceInstances" | "deleteInstances" => {
-                let kind = match change.mode.as_str() {
-                    "deleteInstances" => "instanceRemove",
-                    "replaceInstances" => "instanceReplace",
-                    _ => "instanceAdd",
-                };
-                for instance in &change.instances {
-                    push_review_row(
-                        &mut rows,
-                        &mut truncated,
-                        json!({
-                            "kind": kind,
-                            "service": &change.service,
-                            "pathSegments": &instance.path_segments,
-                            "pathOrdinals": &instance.path_ordinals,
-                            "className": &instance.class_name,
-                        }),
-                    );
-                }
-            }
-            _ => {
-                push_review_row(
-                    &mut rows,
-                    &mut truncated,
-                    json!({
-                        "kind": "instances",
-                        "mode": &change.mode,
-                        "service": &change.service,
-                        "count": change.instances.len(),
-                        "allowDeletes": change.allow_deletes,
-                    }),
-                );
-            }
+        let kind = match change.mode.as_str() {
+            "deleteInstances" => "instanceRemove",
+            "replaceInstances" => "instanceReplace",
+            "upsertInstances" => "instanceAdd",
+            _ => "instanceReconcile",
+        };
+        for instance in &change.instances {
+            change_count += 1;
+            append_editor_review_entry(
+                &mut rows,
+                &mut row_index_by_key,
+                EditorReviewTarget {
+                    service: &change.service,
+                    settings_id: Some(&instance.settings_id),
+                    path_segments: &instance.path_segments,
+                    path_ordinals: &instance.path_ordinals,
+                    class_name: &instance.class_name,
+                },
+                json!({ "kind": kind, "allowDeletes": change.allow_deletes }),
+            );
         }
     }
     for change in &changes.source_changes {
         change_count += 1;
-        push_review_row(
+        append_editor_review_entry(
             &mut rows,
-            &mut truncated,
-            json!({
-                "kind": "source",
-                "service": &change.service,
-                "pathSegments": &change.path_segments,
-                "pathOrdinals": &change.path_ordinals,
-                "className": &change.class_name,
-                "deleted": change.deleted,
-            }),
+            &mut row_index_by_key,
+            EditorReviewTarget {
+                service: &change.service,
+                settings_id: change.settings_id.as_deref(),
+                path_segments: &change.path_segments,
+                path_ordinals: &change.path_ordinals,
+                class_name: &change.class_name,
+            },
+            json!({ "kind": "source", "deleted": change.deleted }),
         );
     }
     for change in &changes.property_changes {
@@ -8779,27 +9832,52 @@ fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Value>, bool) {
         ] {
             for (name, value) in values {
                 change_count += 1;
-                push_review_row(
+                append_editor_review_entry(
                     &mut rows,
-                    &mut truncated,
+                    &mut row_index_by_key,
+                    EditorReviewTarget {
+                        service: &change.service,
+                        settings_id: change.settings_id.as_deref(),
+                        path_segments: &change.path_segments,
+                        path_ordinals: &change.path_ordinals,
+                        class_name: &change.class_name,
+                    },
                     json!({
                         "kind": kind,
-                        "service": &change.service,
-                        "pathSegments": &change.path_segments,
-                        "pathOrdinals": &change.path_ordinals,
-                        "className": &change.class_name,
                         "name": name,
-                        "value": value,
+                        "value": editor_review_value(value),
                     }),
                 );
             }
         }
     }
-    (change_count, rows, truncated)
+    (change_count, rows)
+}
+
+fn editor_review_chunks(rows: Vec<Value>, max_bytes: usize) -> Result<Vec<Vec<Value>>> {
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_bytes = 2usize;
+    for row in rows {
+        let row_bytes = serde_json::to_vec(&row)?.len() + usize::from(!chunk.is_empty());
+        if row_bytes + 2 > max_bytes {
+            bail!("One editor review row is too large to preview safely");
+        }
+        if !chunk.is_empty() && chunk_bytes + row_bytes > max_bytes {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_bytes = 2;
+        }
+        chunk_bytes += row_bytes;
+        chunk.push(row);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    Ok(chunks)
 }
 
 fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) -> Result<bool> {
-    let (change_count, rows, truncated) = editor_review_payload(changes);
+    let (change_count, rows) = editor_review_payload(changes);
     if change_count == 0 {
         return Ok(true);
     }
@@ -8809,20 +9887,1308 @@ fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) 
             serde_json::to_string(&rows).unwrap_or_default()
         );
     }
-    let response = match bridge.call(
-        "requestEditorPushReview",
-        json!({
-            "changeCount": change_count,
-            "rows": rows,
-            "truncated": truncated,
-        }),
-    ) {
+    let chunks = editor_review_chunks(rows, 1024 * 1024)?;
+    let response = match if chunks.len() == 1 {
+        bridge.call(
+            "requestEditorPushReview",
+            json!({
+                "changeCount": change_count,
+                "rows": chunks.into_iter().next().unwrap_or_default(),
+            }),
+        )
+    } else {
+        let upload_id = format!("{}-{change_count}", current_millis());
+        bridge.call(
+            "beginEditorPushReview",
+            json!({
+                "uploadId": &upload_id,
+                "changeCount": change_count,
+                "totalChunks": chunks.len(),
+            }),
+        )?;
+        let upload_result = (|| -> Result<Value> {
+            let transfer_threads = bridge
+                .channel_count()
+                .saturating_sub(1)
+                .max(1)
+                .min(chunks.len());
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(transfer_threads)
+                .build()
+                .context("Failed to initialize editor review transfer workers")?
+                .install(|| {
+                    chunks
+                        .par_iter()
+                        .enumerate()
+                        .try_for_each(|(index, rows)| -> Result<()> {
+                            bridge.call(
+                                "appendEditorPushReview",
+                                json!({
+                                    "uploadId": &upload_id,
+                                    "index": index + 1,
+                                    "rows": rows,
+                                }),
+                            )?;
+                            Ok(())
+                        })
+                })?;
+            bridge.call("finishEditorPushReview", json!({ "uploadId": &upload_id }))
+        })();
+        if upload_result.is_err() {
+            let _ = bridge.call("cancelEditorPushReview", json!({ "uploadId": &upload_id }));
+        }
+        upload_result
+    } {
         Ok(value) => value,
         Err(err) => {
-            println!("[renium] editor push review unavailable, applying directly: {err}");
-            return Ok(true);
+            return Err(err.context("Editor push review is unavailable"));
         }
     };
+    wait_for_editor_review_decision(bridge, response, change_count, "editor push")
+}
+
+fn request_protected_write_review(bridge: &BridgeServer, rows: &[Value]) -> Result<bool> {
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    let response = bridge
+        .call("requestProtectedWriteReview", json!({ "rows": rows }))
+        .context("Protected property review is unavailable")?;
+    wait_for_editor_review_decision(
+        bridge,
+        response,
+        rows.len() as u64,
+        "protected property fallback",
+    )
+}
+
+fn protected_write_matches_previous(row: &Value) -> bool {
+    row.get("oldValueKnown").and_then(Value::as_bool) == Some(true)
+        && row.get("oldValueMissing").and_then(Value::as_bool) != Some(true)
+        && row
+            .get("oldValue")
+            .zip(row.get("value"))
+            .is_some_and(|(previous, requested)| {
+                previous == requested || protected_enum_values_equal(previous, requested)
+            })
+}
+
+fn protected_enum_values_equal(previous: &Value, requested: &Value) -> bool {
+    let Some(previous) = previous.as_object() else {
+        return false;
+    };
+    let Some(requested) = requested.as_object() else {
+        return false;
+    };
+    if previous.get("_type").and_then(Value::as_str) != Some("EnumItem")
+        || requested.get("_type").and_then(Value::as_str) != Some("EnumItem")
+    {
+        return false;
+    }
+    let previous_type = previous.get("enumType").and_then(Value::as_str);
+    let requested_type = requested.get("enumType").and_then(Value::as_str);
+    if previous_type.is_some() && requested_type.is_some() && previous_type != requested_type {
+        return false;
+    }
+    match (
+        previous.get("name").and_then(Value::as_str),
+        requested.get("name").and_then(Value::as_str),
+    ) {
+        (Some(previous), Some(requested)) => previous == requested,
+        _ => previous.get("value") == requested.get("value"),
+    }
+}
+
+fn protected_write_rows_with_previous_values(path: &Path, rows: &[Value]) -> Result<Vec<Value>> {
+    let format = RbxPlaceFormat::from_path(path)?;
+    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let reader = BufReader::new(input);
+    let dom = match format {
+        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+    };
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let mut refs_preorder = Vec::new();
+    for referent in rbx_model_top_level_refs(&dom) {
+        collect_rbx_subtree_preorder(&dom, referent, &mut refs_preorder);
+    }
+    let path_segments_by_ref = refs_preorder
+        .iter()
+        .copied()
+        .map(|referent| (referent, rbx_dom_instance_path_segments(&dom, referent)))
+        .collect::<HashMap<_, _>>();
+    let new_index_by_ref = refs_preorder
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, referent)| (referent, index))
+        .collect::<HashMap<_, _>>();
+    let refs = BytecodeModelImportRefs {
+        path_segments_by_index: refs_preorder
+            .iter()
+            .map(|referent| path_segments_by_ref.get(referent).cloned())
+            .collect(),
+        path_segments_by_ref,
+        new_index_by_ref,
+        settings_id_by_ref: HashMap::new(),
+    };
+    let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut row = row.clone();
+        let Some(object) = row.as_object_mut() else {
+            out.push(row);
+            continue;
+        };
+        let path_segments = object
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let path_ordinals = object
+            .get("pathOrdinals")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|value| value as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(name) = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            out.push(row);
+            continue;
+        };
+        let Ok(referent) = rbx_dom_instance_by_path_unique(&dom, &path_segments, &path_ordinals)
+        else {
+            out.push(row);
+            continue;
+        };
+        let Some(instance) = dom.get_by_ref(referent) else {
+            out.push(row);
+            continue;
+        };
+        let kind = object
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("property");
+        let previous = if kind == "attribute" {
+            instance
+                .properties
+                .get(&attributes_key)
+                .and_then(|value| match value {
+                    RbxVariant::Attributes(attributes) => attributes.get(name.as_str()),
+                    _ => None,
+                })
+                .and_then(|value| rbx_variant_to_settings_json(value, None, database, &refs))
+        } else {
+            let class_name = instance.class.as_str();
+            let descriptor = rbx_model_property_descriptor(database, class_name, &name);
+            let serialized_name = descriptor.map(|value| value.name).unwrap_or(name.as_str());
+            let find_value = |property_name: &str| {
+                instance
+                    .properties
+                    .get(&rbx_dom_weak::Ustr::from(property_name))
+                    .or_else(|| {
+                        database
+                            .classes
+                            .get(class_name)
+                            .and_then(|class| database.find_default_property(class, property_name))
+                    })
+            };
+            let mut value = find_value(serialized_name);
+            let mut value_descriptor = descriptor;
+            if value.is_none()
+                && let Some(RbxPropertyDescriptor {
+                    kind:
+                        RbxPropertyKind::Canonical {
+                            serialization: RbxPropertySerialization::Migrate(migration),
+                        },
+                    ..
+                }) = descriptor
+            {
+                for migrated_name in migration.new_property_names() {
+                    if let Some(migrated_value) = find_value(migrated_name) {
+                        value = Some(migrated_value);
+                        value_descriptor =
+                            rbx_model_property_descriptor(database, class_name, migrated_name);
+                        break;
+                    }
+                }
+            }
+            value.and_then(|value| {
+                rbx_variant_to_settings_json(value, value_descriptor, database, &refs)
+            })
+        };
+        object.insert("oldValueKnown".to_string(), Value::Bool(true));
+        if let Some(previous) = previous {
+            object.insert("oldValue".to_string(), previous);
+        } else {
+            object.insert("oldValueMissing".to_string(), Value::Bool(true));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn studio_pid_for_bridge(bridge: &BridgeServer) -> Result<u32> {
+    let peer = bridge.peer_for_selector(BridgeTarget::Main, None)?;
+    let port = peer
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
+    input_inject::pid_for_local_tcp_port(port)
+        .with_context(|| format!("Could not map bridge connection {peer} to Studio"))
+}
+
+#[cfg(windows)]
+fn local_place_path_from_studio_title(title: &str) -> Option<PathBuf> {
+    let value = title.strip_suffix(" - Roblox Studio")?.trim();
+    let path = PathBuf::from(value);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    (path.is_absolute() && matches!(extension.as_str(), "rbxl" | "rbxlx")).then_some(path)
+}
+
+#[cfg(windows)]
+fn local_place_path_for_bridge(bridge: &BridgeServer) -> Option<PathBuf> {
+    let pid = studio_pid_for_bridge(bridge).ok()?;
+    let title = input_inject::studio_window_title(pid).ok()?;
+    local_place_path_from_studio_title(&title)
+}
+
+#[cfg(not(windows))]
+fn local_place_path_for_bridge(_bridge: &BridgeServer) -> Option<PathBuf> {
+    None
+}
+
+fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
+    let format = RbxPlaceFormat::from_path(path)?;
+    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let reader = BufReader::new(input);
+    let mut dom = match format {
+        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+    };
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let refs = BytecodeModelExportRefs {
+        by_index: HashMap::new(),
+        by_settings_id: HashMap::new(),
+        by_path_key: HashMap::new(),
+    };
+    let mut applied = 0usize;
+    for row in rows {
+        let path_segments = row
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let path_ordinals = row
+            .get("pathOrdinals")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|value| value as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .context("Protected write is missing its name")?;
+        let value = row
+            .get("value")
+            .context("Protected write is missing its value")?;
+        let referent = rbx_dom_instance_by_path_unique(&dom, &path_segments, &path_ordinals)?;
+        let kind = row
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("property");
+        if kind == "attribute" {
+            let variant = json_to_rbx_attribute_variant(value, database, &refs)
+                .with_context(|| format!("Could not encode protected attribute {name}"))?;
+            let instance = dom
+                .get_by_ref_mut(referent)
+                .context("Protected write target disappeared")?;
+            let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
+            let mut attributes = instance
+                .properties
+                .get(&attributes_key)
+                .and_then(|value| match value {
+                    RbxVariant::Attributes(attributes) => Some(attributes.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            attributes.insert(name.to_string(), variant);
+            instance
+                .properties
+                .insert(attributes_key, RbxVariant::Attributes(attributes));
+        } else {
+            let class_name = dom
+                .get_by_ref(referent)
+                .map(|instance| instance.class.to_string())
+                .context("Protected write target disappeared")?;
+            let descriptor = rbx_model_property_descriptor(database, &class_name, name);
+            let legacy_variant =
+                json_to_rbx_property_variant(value, descriptor, database, &refs)
+                    .with_context(|| format!("Could not encode protected property {name}"))?;
+            let mut serialized_name = descriptor.map(|value| value.name).unwrap_or(name);
+            let mut variant = legacy_variant;
+            if let Some(RbxPropertyDescriptor {
+                kind:
+                    RbxPropertyKind::Canonical {
+                        serialization: RbxPropertySerialization::Migrate(migration),
+                    },
+                ..
+            }) = descriptor
+                && let [migrated_name] = migration.new_property_names()
+            {
+                variant = migration.perform(&variant).with_context(|| {
+                    format!("Could not migrate protected property {name} to {migrated_name}")
+                })?;
+                serialized_name = migrated_name;
+            }
+            let instance = dom
+                .get_by_ref_mut(referent)
+                .context("Protected write target disappeared")?;
+            if serialized_name != name {
+                instance.properties.remove(&rbx_dom_weak::Ustr::from(name));
+            }
+            instance.properties.insert(serialized_name.into(), variant);
+        }
+        applied += 1;
+    }
+    let top_level_refs = rbx_model_top_level_refs(&dom);
+    let output =
+        File::create(path).with_context(|| format!("Failed to write {}", path.display()))?;
+    let writer = BufWriter::new(output);
+    match format {
+        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &dom, &top_level_refs)
+            .with_context(|| format!("Failed to write {}", path.display()))?,
+        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &dom, &top_level_refs)
+            .with_context(|| format!("Failed to write {}", path.display()))?,
+    }
+    Ok(applied)
+}
+
+#[cfg(windows)]
+fn apply_protected_writes_offline(
+    bridge: &BridgeServer,
+    args: &PushEditorChangesArgs,
+    rows: &[Value],
+) -> Result<Value> {
+    let pid = studio_pid_for_bridge(bridge)?;
+    let executable = input_inject::process_executable_path(pid)?;
+    let title = input_inject::studio_window_title(pid)?;
+    let original_path = local_place_path_from_studio_title(&title);
+    let extension = original_path
+        .as_ref()
+        .and_then(|path| path.extension())
+        .and_then(|value| value.to_str())
+        .filter(|value| matches!(value.to_ascii_lowercase().as_str(), "rbxl" | "rbxlx"))
+        .unwrap_or("rbxl");
+    let snapshot_name = format!(
+        ".renium-protected-{}-{}.{}",
+        pid,
+        current_millis(),
+        extension
+    );
+    let snapshot = original_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(&snapshot_name))
+        .unwrap_or_else(|| std::env::temp_dir().join(&snapshot_name));
+    let cloud_saved = if original_path.is_none() {
+        let saved = bridge
+            .call("savePlace", json!({}))
+            .context("Studio could not save the cloud place")?;
+        if saved.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("Studio did not save the cloud place");
+        }
+        true
+    } else {
+        false
+    };
+    let exported_instances =
+        match write_live_editor_place_snapshot(bridge, args, &snapshot, original_path.as_deref()) {
+            Ok(count) => count,
+            Err(error) => {
+                let _ = fs::remove_file(&snapshot);
+                return Err(error);
+            }
+        };
+    let applied = match patch_place_protected_writes(&snapshot, rows) {
+        Ok(applied) => applied,
+        Err(error) => {
+            let _ = fs::remove_file(&snapshot);
+            return Err(error);
+        }
+    };
+    input_inject::terminate_studio_process(pid)?;
+    let reopen_path = if let Some(original_path) = original_path {
+        let file_name = original_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("place.rbxl");
+        let backup = original_path.with_file_name(format!(
+            ".{file_name}.renium-backup-{}-{}",
+            pid,
+            current_millis()
+        ));
+        fs::rename(&original_path, &backup).with_context(|| {
+            format!(
+                "Failed to prepare {} for protected snapshot replacement",
+                original_path.display()
+            )
+        })?;
+        if let Err(error) = fs::rename(&snapshot, &original_path) {
+            let _ = fs::rename(&backup, &original_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to replace {} with protected snapshot",
+                    original_path.display()
+                )
+            });
+        }
+        let _ = fs::remove_file(backup);
+        original_path
+    } else {
+        snapshot
+    };
+    Command::new(&executable)
+        .arg(&reopen_path)
+        .spawn()
+        .with_context(|| format!("Failed to reopen Studio from {}", executable.display()))?;
+    Ok(json!({
+        "ok": true,
+        "applied": applied,
+        "exportedInstances": exported_instances,
+        "reopenedPath": reopen_path,
+        "localFile": !cloud_saved,
+        "cloudSaved": cloud_saved,
+        "nativeSnapshot": true,
+    }))
+}
+
+#[cfg(not(windows))]
+fn apply_protected_writes_offline(
+    _bridge: &BridgeServer,
+    _args: &PushEditorChangesArgs,
+    _rows: &[Value],
+) -> Result<Value> {
+    bail!("Protected offline place writes currently require Windows")
+}
+
+fn write_rbx_place_build(
+    output_path: &Path,
+    build: &RbxPlaceBuild,
+    format: RbxPlaceFormat,
+) -> Result<()> {
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    let output = File::create(output_path)
+        .with_context(|| format!("Failed to write {}", output_path.display()))?;
+    let writer = BufWriter::new(output);
+    let top_level_refs = build
+        .service_roots
+        .iter()
+        .map(|(_, referent)| *referent)
+        .collect::<Vec<_>>();
+    match format {
+        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &build.dom, &top_level_refs)
+            .with_context(|| format!("Failed to write {}", output_path.display())),
+        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &build.dom, &top_level_refs)
+            .with_context(|| format!("Failed to write {}", output_path.display())),
+    }
+}
+
+fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryImport> {
+    const RAW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+    let export_id = format!("{}-{}", current_millis(), std::process::id());
+    let begin = bridge.call("beginEditorBinaryExport", json!({ "exportId": &export_id }))?;
+    let total_bytes = begin
+        .get("totalBytes")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0 && *value <= MAX_EXPORT_BYTES)
+        .context("Studio returned an invalid native export size")?;
+    let instance_count = begin
+        .get("instanceCount")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(0);
+    let groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
+        begin
+            .get("groups")
+            .cloned()
+            .context("Studio native export omitted its service groups")?,
+    )
+    .context("Studio returned invalid native export groups")?;
+    if groups.is_empty()
+        || groups.iter().any(|group| {
+            group.service.is_empty()
+                || group.target_path.len() != 1
+                || group.target_path[0] != group.service
+        })
+    {
+        bail!("Studio returned invalid native export groups");
+    }
+    let ranges = (0..total_bytes)
+        .step_by(RAW_CHUNK_BYTES)
+        .map(|offset| (offset, (total_bytes - offset).min(RAW_CHUNK_BYTES)))
+        .collect::<Vec<_>>();
+    let result = ranges
+        .par_iter()
+        .map(|(offset, length)| -> Result<Vec<u8>> {
+            let response = bridge.call(
+                "readEditorBinaryExport",
+                json!({
+                    "exportId": &export_id,
+                    "offset": offset,
+                    "length": length,
+                }),
+            )?;
+            let data = response
+                .get("data")
+                .and_then(Value::as_str)
+                .context("Studio native export chunk omitted its data")?;
+            let decoded =
+                base64::decode(data).context("Studio returned invalid native export data")?;
+            if decoded.len() != *length {
+                bail!("Studio native export chunk has the wrong length");
+            }
+            Ok(decoded)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|chunks| {
+            let mut bytes = Vec::with_capacity(total_bytes);
+            for chunk in chunks {
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        });
+    let _ = bridge.call("finishEditorBinaryExport", json!({ "exportId": export_id }));
+    let bytes = result?;
+    if bytes.len() != total_bytes {
+        bail!("Studio native export is incomplete");
+    }
+    Ok(EditorBinaryImport {
+        bytes,
+        groups,
+        instance_count,
+    })
+}
+
+struct NativeSettingsOverlayDocument {
+    path: PathBuf,
+    document: SettingsBytecode,
+    paths: Vec<Option<Vec<String>>>,
+    root_index: usize,
+}
+
+fn map_native_children_to_settings(
+    dom: &RbxWeakDom,
+    native_children: &[RbxRef],
+    document: &SettingsBytecode,
+    settings_children: &[Vec<usize>],
+    settings_parent: usize,
+    service: &str,
+    targets: &mut HashMap<RbxRef, (String, usize)>,
+) -> Result<()> {
+    let mut candidates = HashMap::<(String, String), VecDeque<usize>>::new();
+    for index in settings_children
+        .get(settings_parent)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let instance = &document.instances[*index];
+        candidates
+            .entry((instance.name.clone(), instance.class_name.clone()))
+            .or_default()
+            .push_back(*index);
+    }
+
+    for referent in native_children {
+        let native = dom
+            .get_by_ref(*referent)
+            .context("Native Studio export contains a missing instance")?;
+        let key = (native.name.clone(), native.class.to_string());
+        let index = candidates
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .with_context(|| {
+                format!(
+                    "Native Studio export does not match {service}: missing {} {}",
+                    native.class, native.name
+                )
+            })?;
+        targets.insert(*referent, (service.to_string(), index));
+        map_native_children_to_settings(
+            dom,
+            native.children(),
+            document,
+            settings_children,
+            index,
+            service,
+            targets,
+        )?;
+    }
+
+    let unmatched = candidates.values().map(VecDeque::len).sum::<usize>();
+    if unmatched != 0 {
+        bail!(
+            "Native Studio export does not match {service}: {unmatched} stored children were absent"
+        );
+    }
+    Ok(())
+}
+
+fn roblox_asset_id(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if let Some(id) = value.strip_prefix("rbxassetid://") {
+        return Some(id.trim());
+    }
+    let lower = value.to_ascii_lowercase();
+    let marker = "roblox.com/asset/?id=";
+    let offset = lower.find(marker)? + marker.len();
+    Some(value[offset..].trim())
+}
+
+fn settings_values_equivalent(left: &Value, right: &Value) -> bool {
+    if left == right {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) {
+        return (left - right).abs() <= 1.0e-6;
+    }
+    if let (Some(left), Some(right)) = (left.as_str(), right.as_str())
+        && let (Some(left), Some(right)) = (roblox_asset_id(left), roblox_asset_id(right))
+    {
+        return left == right;
+    }
+    if let (Some(left), Some(right)) = (left.as_array(), right.as_array()) {
+        return left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| settings_values_equivalent(left, right));
+    }
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    if left.get("_type").and_then(Value::as_str) == Some("Font")
+        && right.get("_type").and_then(Value::as_str) == Some("Font")
+    {
+        return ["family", "weight", "style"].iter().all(|key| {
+            left.get(*key)
+                .zip(right.get(*key))
+                .is_some_and(|(left, right)| settings_values_equivalent(left, right))
+        });
+    }
+    left.len() == right.len()
+        && left.iter().all(|(key, left)| {
+            right
+                .get(key)
+                .is_some_and(|right| settings_values_equivalent(left, right))
+        })
+}
+
+fn merge_settings_values(
+    target: &mut Map<String, Value>,
+    values: Map<String, Value>,
+    preserve_engine_cache: bool,
+) {
+    for (name, value) in values {
+        let unresolved_ref = value.as_object().is_some_and(|object| {
+            object.get("_type").and_then(Value::as_str) == Some("Ref")
+                && !object.contains_key("instanceIndex")
+                && !object.contains_key("settingsId")
+                && !object.contains_key("instanceId")
+                && !object.contains_key("pathSegments")
+                && !object.contains_key("path")
+        });
+        if preserve_engine_cache && unresolved_ref && !target.contains_key(&name) {
+            continue;
+        }
+        if preserve_engine_cache
+            && matches!(name.as_str(), "PhysicalConfigData" | "DistanceAttenuation")
+            && target.contains_key(&name)
+        {
+            continue;
+        }
+        if preserve_engine_cache
+            && target
+                .get(&name)
+                .is_some_and(|existing| settings_values_equivalent(existing, &value))
+        {
+            continue;
+        }
+        target.insert(name, value);
+    }
+}
+
+fn apply_rbx_values_to_settings(
+    dom: &RbxWeakDom,
+    targets: &HashMap<RbxRef, (String, usize)>,
+    marker_roots: &HashSet<RbxRef>,
+    root_properties: &HashMap<String, Map<String, Value>>,
+    documents: &mut HashMap<String, NativeSettingsOverlayDocument>,
+    preserve_engine_cache: bool,
+    replace_values: bool,
+) -> Result<usize> {
+    let settings_id_by_ref = targets
+        .iter()
+        .filter_map(|(referent, (service, index))| {
+            documents
+                .get(service)
+                .and_then(|overlay| overlay.document.instances.get(*index))
+                .map(|instance| (*referent, instance.settings_id.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let path_segments_by_ref = targets
+        .iter()
+        .filter_map(|(referent, (service, index))| {
+            documents
+                .get(service)
+                .and_then(|overlay| overlay.paths.get(*index))
+                .and_then(|path| path.clone())
+                .map(|path| (*referent, path))
+        })
+        .collect::<HashMap<_, _>>();
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let services = documents.keys().cloned().collect::<Vec<_>>();
+    let mut merged = 0usize;
+
+    for service in services {
+        let overlay = documents
+            .get_mut(&service)
+            .with_context(|| format!("Native fidelity store is missing {service}"))?;
+        let local_targets = targets
+            .iter()
+            .filter_map(|(referent, (mapped_service, index))| {
+                (mapped_service == &service).then_some((*referent, *index))
+            })
+            .collect::<HashMap<_, _>>();
+        let refs = BytecodeModelImportRefs {
+            new_index_by_ref: local_targets.clone(),
+            settings_id_by_ref: settings_id_by_ref.clone(),
+            path_segments_by_index: overlay.paths.clone(),
+            path_segments_by_ref: path_segments_by_ref.clone(),
+        };
+        for (referent, index) in local_targets {
+            let native = dom
+                .get_by_ref(referent)
+                .context("Native Studio fidelity instance disappeared")?;
+            let (mut properties, attributes, _) =
+                rbx_instance_to_settings_records(native, database, &refs);
+            if marker_roots.contains(&referent) {
+                properties.retain(|name, _| name == "Tags");
+            }
+            let instance = overlay
+                .document
+                .instances
+                .get_mut(index)
+                .context("Native Studio fidelity target disappeared")?;
+            if replace_values {
+                let source = instance.properties.get("Source").cloned();
+                let mesh_size = instance
+                    .properties
+                    .get(MESH_SIZE_TRANSPORT_PROPERTY)
+                    .cloned();
+                instance.properties.clear();
+                instance.attributes.clear();
+                if let Some(source) = source {
+                    instance.properties.insert("Source".to_string(), source);
+                }
+                if let Some(mesh_size) = mesh_size {
+                    instance
+                        .properties
+                        .insert(MESH_SIZE_TRANSPORT_PROPERTY.to_string(), mesh_size);
+                }
+            }
+            merge_settings_values(&mut instance.properties, properties, preserve_engine_cache);
+            merge_settings_values(&mut instance.attributes, attributes, preserve_engine_cache);
+            if index == overlay.root_index
+                && let Some(values) = root_properties.get(&service)
+            {
+                merge_settings_values(
+                    &mut instance.properties,
+                    values.clone(),
+                    preserve_engine_cache,
+                );
+            }
+            merged += 1;
+        }
+    }
+    Ok(merged)
+}
+
+fn read_rbx_place_dom(path: &Path) -> Result<RbxWeakDom> {
+    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let reader = BufReader::new(input);
+    match RbxPlaceFormat::from_path(path)? {
+        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
+            .with_context(|| format!("Failed to read {}", path.display())),
+        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
+            .with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
+fn merge_native_editor_export_into_project(
+    project_root: &Path,
+    src_dir: &Path,
+    requested_services: &[String],
+    export: EditorBinaryImport,
+    source_place_path: Option<&Path>,
+) -> Result<usize> {
+    let dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
+        .context("Studio returned an invalid native fidelity snapshot")?;
+    let roots = dom.root().children().to_vec();
+    let expected_roots = export
+        .groups
+        .iter()
+        .map(|group| group.count + 1)
+        .sum::<usize>();
+    if roots.len() != expected_roots {
+        bail!("Studio native fidelity snapshot has the wrong root count");
+    }
+
+    let src_root = absolutize_under(project_root, src_dir);
+    let requested = requested_services.iter().cloned().collect::<HashSet<_>>();
+    let mut documents = HashMap::<String, NativeSettingsOverlayDocument>::new();
+    for service in requested_services {
+        let service_dir = src_root.join(sanitize_name(service));
+        let path = existing_service_settings_path(&service_dir);
+        let document = SettingsBytecode::read_file(&path).with_context(|| {
+            format!(
+                "Failed to read {} for native fidelity merge",
+                path.display()
+            )
+        })?;
+        let root_index = editor_service_root_index(&document, service)
+            .with_context(|| format!("{service} store has no service root"))?;
+        let paths = build_editor_instance_path_segments(&document, service);
+        documents.insert(
+            service.clone(),
+            NativeSettingsOverlayDocument {
+                path,
+                document,
+                paths,
+                root_index,
+            },
+        );
+    }
+
+    let mut local_baseline_merged = false;
+    if let Some(source_place_path) = source_place_path {
+        match read_rbx_place_dom(source_place_path).and_then(|source_dom| {
+            let mut source_targets = HashMap::<RbxRef, (String, usize)>::new();
+            for service in requested_services {
+                let overlay = &documents[service];
+                let source_root = source_dom
+                    .root()
+                    .children()
+                    .iter()
+                    .copied()
+                    .find(|referent| {
+                        source_dom.get_by_ref(*referent).is_some_and(|instance| {
+                            instance.class.as_str() == service && instance.name == *service
+                        })
+                    })
+                    .with_context(|| format!("Source place is missing {service}"))?;
+                let children = settings_children_by_parent(&overlay.document);
+                source_targets.insert(source_root, (service.clone(), overlay.root_index));
+                let source_children = source_dom
+                    .get_by_ref(source_root)
+                    .context("Source place service root disappeared")?
+                    .children();
+                map_native_children_to_settings(
+                    &source_dom,
+                    source_children,
+                    &overlay.document,
+                    &children,
+                    overlay.root_index,
+                    service,
+                    &mut source_targets,
+                )?;
+            }
+            for service in requested_services {
+                let mapped = source_targets
+                    .values()
+                    .filter(|(mapped_service, _)| mapped_service == service)
+                    .count();
+                if mapped != documents[service].document.instances.len() {
+                    bail!("Source place hierarchy changed while syncing {service}");
+                }
+            }
+            apply_rbx_values_to_settings(
+                &source_dom,
+                &source_targets,
+                &HashSet::new(),
+                &HashMap::new(),
+                &mut documents,
+                false,
+                true,
+            )
+        }) {
+            Ok(merged) => {
+                local_baseline_merged = true;
+                println!("[renium] local place fidelity baseline merged: {merged} instances")
+            }
+            Err(error) => {
+                println!("[renium] warning: local place fidelity baseline was skipped: {error:#}")
+            }
+        }
+    }
+
+    let mut targets = HashMap::<RbxRef, (String, usize)>::new();
+    let mut marker_roots = HashSet::new();
+    let mut root_properties = HashMap::<String, Map<String, Value>>::new();
+    let mut cursor = 0usize;
+    for group in &export.groups {
+        let marker_ref = roots[cursor];
+        cursor += 1;
+        let child_refs = &roots[cursor..cursor + group.count];
+        cursor += group.count;
+        if !requested.contains(&group.service) {
+            continue;
+        }
+        let overlay = documents
+            .get(&group.service)
+            .with_context(|| format!("Native fidelity store is missing {}", group.service))?;
+        let children = settings_children_by_parent(&overlay.document);
+        targets.insert(marker_ref, (group.service.clone(), overlay.root_index));
+        marker_roots.insert(marker_ref);
+        map_native_children_to_settings(
+            &dom,
+            child_refs,
+            &overlay.document,
+            &children,
+            overlay.root_index,
+            &group.service,
+            &mut targets,
+        )?;
+        root_properties.insert(group.service.clone(), group.root_properties.clone());
+    }
+
+    for service in requested_services {
+        let overlay = &documents[service];
+        let mapped = targets
+            .values()
+            .filter(|(mapped_service, _)| mapped_service == service)
+            .count();
+        if mapped != overlay.document.instances.len() {
+            bail!(
+                "Native Studio export mapped {mapped}/{} instances in {service}",
+                overlay.document.instances.len()
+            );
+        }
+    }
+
+    let merged = apply_rbx_values_to_settings(
+        &dom,
+        &targets,
+        &marker_roots,
+        &root_properties,
+        &mut documents,
+        local_baseline_merged,
+        false,
+    )?;
+
+    for service in requested_services {
+        let overlay = &documents[service];
+        let path = writable_settings_file_path(&overlay.path)?;
+        let _lock = acquire_settings_file_lock(&path)?;
+        overlay.document.write_file(&path)?;
+    }
+    Ok(merged)
+}
+
+fn rbx_dom_import_refs(dom: &RbxWeakDom) -> BytecodeModelImportRefs {
+    let mut refs_preorder = Vec::new();
+    for referent in rbx_model_top_level_refs(dom) {
+        collect_rbx_subtree_preorder(dom, referent, &mut refs_preorder);
+    }
+    let path_segments_by_ref = refs_preorder
+        .iter()
+        .copied()
+        .map(|referent| (referent, rbx_dom_instance_path_segments(dom, referent)))
+        .collect::<HashMap<_, _>>();
+    BytecodeModelImportRefs {
+        new_index_by_ref: refs_preorder
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, referent)| (referent, index))
+            .collect(),
+        settings_id_by_ref: HashMap::new(),
+        path_segments_by_index: refs_preorder
+            .iter()
+            .map(|referent| path_segments_by_ref.get(referent).cloned())
+            .collect(),
+        path_segments_by_ref,
+    }
+}
+
+fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs {
+    let mut refs_preorder = Vec::new();
+    for referent in rbx_model_top_level_refs(dom) {
+        collect_rbx_subtree_preorder(dom, referent, &mut refs_preorder);
+    }
+    BytecodeModelExportRefs {
+        by_index: HashMap::new(),
+        by_settings_id: HashMap::new(),
+        by_path_key: refs_preorder
+            .into_iter()
+            .map(|referent| {
+                (
+                    instance_path_key(&rbx_dom_instance_path_segments(dom, referent)),
+                    referent,
+                )
+            })
+            .collect(),
+    }
+}
+
+fn rbx_dom_service_root_property_values(
+    dom: &RbxWeakDom,
+    service_names: &HashSet<String>,
+    database: &ReflectionDatabase<'_>,
+) -> HashMap<String, Map<String, Value>> {
+    let refs = rbx_dom_import_refs(dom);
+    let mut result = HashMap::new();
+    for referent in rbx_model_top_level_refs(dom) {
+        let Some(instance) = dom.get_by_ref(referent) else {
+            continue;
+        };
+        let service = if service_names.contains(instance.class.as_str()) {
+            instance.class.to_string()
+        } else if service_names.contains(&instance.name) {
+            instance.name.clone()
+        } else {
+            continue;
+        };
+        let mut values = Map::new();
+        for (name, value) in &instance.properties {
+            if matches!(name.as_str(), "Attributes" | "Tags") {
+                continue;
+            }
+            let descriptor =
+                rbx_model_property_descriptor(database, instance.class.as_str(), name.as_str());
+            if let Some(value) = rbx_variant_to_settings_json(value, descriptor, database, &refs) {
+                values.insert(name.to_string(), value);
+            }
+        }
+        result.insert(service, values);
+    }
+    result
+}
+
+fn read_place_service_root_property_values(
+    path: &Path,
+    service_names: &HashSet<String>,
+    database: &ReflectionDatabase<'_>,
+) -> Result<HashMap<String, Map<String, Value>>> {
+    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let reader = BufReader::new(input);
+    let dom = match RbxPlaceFormat::from_path(path)? {
+        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))?,
+    };
+    Ok(rbx_dom_service_root_property_values(
+        &dom,
+        service_names,
+        database,
+    ))
+}
+
+fn merge_live_service_root_property_values(
+    service: &str,
+    values: &mut Map<String, Value>,
+    live_values: &Map<String, Value>,
+    database: &ReflectionDatabase<'_>,
+) {
+    let path_segments = [service.to_string()];
+    for (name, value) in live_values {
+        if is_externally_managed_editor_property(service, service, &path_segments, name) {
+            continue;
+        }
+        let Some(descriptor) = rbx_model_property_descriptor(database, service, name) else {
+            continue;
+        };
+        values.insert(descriptor.name.to_string(), value.clone());
+    }
+}
+
+fn encode_service_root_property_values(
+    service: &str,
+    values: &Map<String, Value>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelExportRefs,
+) -> rbx_dom_weak::UstrMap<RbxVariant> {
+    values
+        .iter()
+        .filter_map(|(name, value)| {
+            let descriptor = rbx_model_property_descriptor(database, service, name)?;
+            let value = json_to_rbx_property_variant(value, Some(descriptor), database, refs)?;
+            Some((descriptor.name.into(), value))
+        })
+        .collect()
+}
+
+fn write_live_editor_place_snapshot(
+    bridge: &BridgeServer,
+    args: &PushEditorChangesArgs,
+    output_path: &Path,
+    existing_place: Option<&Path>,
+) -> Result<usize> {
+    let export = receive_editor_binary_export(bridge)?;
+    let mut dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
+        .context("Studio returned an invalid native place snapshot")?;
+    let roots = dom.root().children().to_vec();
+    let expected_roots = export
+        .groups
+        .iter()
+        .map(|group| group.count + 1)
+        .sum::<usize>();
+    if roots.len() != expected_roots {
+        bail!("Studio native place snapshot has the wrong root count");
+    }
+    let project_root = if args.project_root.exists() {
+        canonical_path(&args.project_root).with_context(|| {
+            format!(
+                "Failed to resolve project root: {}",
+                args.project_root.display()
+            )
+        })?
+    } else {
+        args.project_root.clone()
+    };
+    let src_root = absolutize_under(&project_root, &args.src_dir);
+    let service_names = export
+        .groups
+        .iter()
+        .map(|group| group.service.clone())
+        .collect::<Vec<_>>();
+    let service_name_set = service_names.iter().cloned().collect::<HashSet<_>>();
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let mut root_property_values = if let Some(path) = existing_place {
+        read_place_service_root_property_values(path, &service_name_set, database)?
+    } else {
+        HashMap::new()
+    };
+    let project_services = service_names
+        .iter()
+        .filter(|service| !root_property_values.contains_key(*service))
+        .filter(|service| existing_service_settings_path(&src_root.join(service)).exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !project_services.is_empty() {
+        let base = build_rbx_place(&src_root, project_services, None)?;
+        for (service, values) in
+            rbx_dom_service_root_property_values(&base.dom, &service_name_set, database)
+        {
+            root_property_values.entry(service).or_insert(values);
+        }
+    }
+    let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
+    let tags_key = rbx_dom_weak::Ustr::from("Tags");
+    let mut cursor = 0usize;
+    let mut service_roots = Vec::with_capacity(export.groups.len());
+    let mut live_metadata = Vec::with_capacity(export.groups.len());
+    for group in &export.groups {
+        let marker_ref = roots[cursor];
+        cursor += 1;
+        let child_refs = roots[cursor..cursor + group.count].to_vec();
+        cursor += group.count;
+        let marker = dom
+            .get_by_ref_mut(marker_ref)
+            .context("Studio native place snapshot lost a service marker")?;
+        let live_attributes = marker.properties.get(&attributes_key).cloned();
+        let live_tags = marker.properties.get(&tags_key).cloned();
+        marker.class = group.service.as_str().into();
+        marker.name = group.service.clone();
+        for child_ref in child_refs {
+            dom.transfer_within(child_ref, marker_ref);
+        }
+        service_roots.push((group.service.clone(), marker_ref));
+        live_metadata.push((live_attributes, live_tags));
+    }
+    let target_refs = rbx_dom_path_export_refs(&dom);
+    for ((group, (_, marker_ref)), (live_attributes, live_tags)) in export
+        .groups
+        .iter()
+        .zip(service_roots.iter())
+        .zip(live_metadata)
+    {
+        let values = root_property_values
+            .entry(group.service.clone())
+            .or_default();
+        merge_live_service_root_property_values(
+            &group.service,
+            values,
+            &group.root_properties,
+            database,
+        );
+        let mut properties =
+            encode_service_root_property_values(&group.service, values, database, &target_refs);
+        if let Some(value) = live_attributes {
+            properties.insert(attributes_key, value);
+        }
+        if let Some(value) = live_tags {
+            properties.insert(tags_key, value);
+        }
+        dom.get_by_ref_mut(*marker_ref)
+            .context("Studio native place snapshot lost a service root")?
+            .properties = properties;
+    }
+    let build = RbxPlaceBuild {
+        dom,
+        service_roots,
+        total_instances: export.instance_count + export.groups.len(),
+    };
+    write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(output_path)?)?;
+    Ok(build.total_instances)
+}
+
+fn wait_for_editor_review_decision(
+    bridge: &BridgeServer,
+    response: Value,
+    change_count: u64,
+    label: &str,
+) -> Result<bool> {
     if response.get("required").and_then(Value::as_bool) != Some(true) {
         return Ok(true);
     }
@@ -8833,8 +11199,9 @@ fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) 
     else {
         return Ok(true);
     };
-    println!("[renium] editor push held for review in Studio ({change_count} changes)");
-    let deadline = Instant::now() + Duration::from_secs(180);
+    println!("[renium] {label} held for review in Studio: id={review_id}, changes={change_count}");
+    let _ = io::stdout().flush();
+    let deadline = Instant::now() + Duration::from_secs(610);
     let mut consecutive_errors = 0u32;
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(300));
@@ -8860,13 +11227,76 @@ fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) 
             }
         }
     }
-    Ok(true)
+    Ok(false)
+}
+
+fn send_editor_binary_import(
+    bridge: &BridgeServer,
+    binary_import: &EditorBinaryImport,
+) -> Result<Value> {
+    const RAW_CHUNK_BYTES: usize = 512 * 1024;
+    let import_id = format!("{}-{}", current_millis(), fnv1a64_hex(&binary_import.bytes));
+    let chunks = binary_import
+        .bytes
+        .par_chunks(RAW_CHUNK_BYTES)
+        .map(base64::encode)
+        .collect::<Vec<_>>();
+    bridge.call(
+        "beginEditorBinaryImport",
+        json!({
+            "importId": &import_id,
+            "totalBytes": binary_import.bytes.len(),
+            "totalChunks": chunks.len(),
+            "groups": &binary_import.groups,
+        }),
+    )?;
+    let import_result = (|| -> Result<Value> {
+        let transfer_threads = bridge
+            .channel_count()
+            .saturating_sub(1)
+            .max(1)
+            .min(chunks.len());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(transfer_threads)
+            .build()
+            .context("Failed to initialize native import transfer workers")?
+            .install(|| {
+                chunks
+                    .par_iter()
+                    .enumerate()
+                    .try_for_each(|(index, data)| -> Result<()> {
+                        bridge.call(
+                            "appendEditorBinaryImport",
+                            json!({
+                                "importId": &import_id,
+                                "index": index + 1,
+                                "data": data,
+                            }),
+                        )?;
+                        Ok(())
+                    })
+            })?;
+        bridge.call(
+            "finishEditorBinaryImport",
+            json!({ "importId": &import_id }),
+        )
+    })();
+    if import_result.is_err() {
+        let _ = bridge.call(
+            "cancelEditorBinaryImport",
+            json!({ "importId": &import_id }),
+        );
+    }
+    import_result
 }
 
 fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     probe_events: bool,
+    review: bool,
+    auto_apply_review: bool,
+    binary_import: Option<&EditorBinaryImport>,
 ) -> Result<Map<String, Value>> {
     let mut summary = Map::new();
     summary.insert("ok".to_string(), Value::Bool(true));
@@ -8913,7 +11343,7 @@ fn send_editor_change_batches(
         return Ok(summary);
     }
 
-    if !request_editor_push_review(bridge, changes)? {
+    if review && !auto_apply_review && !request_editor_push_review(bridge, changes)? {
         summary.insert("skippedByReview".to_string(), Value::Bool(true));
         summary.insert(
             "noops".to_string(),
@@ -8922,11 +11352,30 @@ fn send_editor_change_batches(
         return Ok(summary);
     }
 
-    const INSTANCE_BATCH_SIZE: usize = 512;
-    const SOURCE_BATCH_SIZE: usize = 16;
-    const PROPERTY_BATCH_SIZE: usize = 32;
+    if let Some(binary_import) = binary_import {
+        let result = send_editor_binary_import(bridge, binary_import)?;
+        merge_editor_summary(&mut summary, &result);
+        summary.insert(
+            "binaryBytes".to_string(),
+            Value::Number(serde_json::Number::from(binary_import.bytes.len() as u64)),
+        );
+        summary.insert(
+            "binaryInstances".to_string(),
+            Value::Number(serde_json::Number::from(
+                binary_import.instance_count as u64,
+            )),
+        );
+    }
 
-    for instance_change in &changes.instance_changes {
+    const INSTANCE_BATCH_SIZE: usize = 5000;
+    const SOURCE_BATCH_SIZE: usize = 16;
+    const PROPERTY_BATCH_MAX_ITEMS: usize = 5000;
+
+    for instance_change in changes
+        .instance_changes
+        .iter()
+        .filter(|_| binary_import.is_none())
+    {
         if instance_change.mode == "reconcileService"
             && instance_change.instances.len() > INSTANCE_BATCH_SIZE
         {
@@ -8959,7 +11408,7 @@ fn send_editor_change_batches(
                 } else {
                     "reconcileServiceChunk"
                 };
-                let result = bridge.call(
+                let result = match bridge.call(
                     "applyEditorChanges",
                     json!({
                         "probeEvents": probe_events,
@@ -8973,7 +11422,19 @@ fn send_editor_change_batches(
                         "sourceChanges": [],
                         "propertyChanges": [],
                     }),
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = bridge.call(
+                            "cancelEditorReconcile",
+                            json!({
+                                "service": &instance_change.service,
+                                "reconcileSession": &session_id,
+                            }),
+                        );
+                        return Err(error);
+                    }
+                };
                 merge_editor_summary(&mut summary, &result);
             }
         } else if instance_change.instances.len() > INSTANCE_BATCH_SIZE {
@@ -9008,7 +11469,16 @@ fn send_editor_change_batches(
         }
     }
 
-    for source_batch in changes.source_changes.chunks(SOURCE_BATCH_SIZE) {
+    let source_changes = changes
+        .source_changes
+        .iter()
+        .filter(|_| binary_import.is_none())
+        .collect::<Vec<_>>();
+    summary.insert(
+        "sourceSent".to_string(),
+        Value::Number(serde_json::Number::from(source_changes.len() as u64)),
+    );
+    for source_batch in source_changes.chunks(SOURCE_BATCH_SIZE) {
         let result = bridge.call(
             "applyEditorChanges",
             json!({
@@ -9021,7 +11491,42 @@ fn send_editor_change_batches(
         merge_editor_summary(&mut summary, &result);
     }
 
-    for property_batch in changes.property_changes.chunks(PROPERTY_BATCH_SIZE) {
+    let property_changes = changes
+        .property_changes
+        .iter()
+        .filter(|change| {
+            binary_import.is_none()
+                || change.path_segments.as_slice() == [change.service.as_str()]
+                || (change.path_segments.len() == 2
+                    && ((change.service == "Workspace" && change.class_name == "Terrain")
+                        || (change.service == "StarterPlayer"
+                            && matches!(
+                                change.class_name.as_str(),
+                                "StarterPlayerScripts" | "StarterCharacterScripts"
+                            ))))
+        })
+        .collect::<Vec<_>>();
+    summary.insert(
+        "propertySent".to_string(),
+        Value::Number(serde_json::Number::from(property_changes.len() as u64)),
+    );
+    let mut property_start = 0;
+    while property_start < property_changes.len() {
+        let mut property_end = property_start;
+        let mut estimated_bytes = 256usize;
+        while property_end < property_changes.len()
+            && property_end - property_start < PROPERTY_BATCH_MAX_ITEMS
+        {
+            let change_bytes = serde_json::to_vec(property_changes[property_end])?.len() + 1;
+            if property_end > property_start
+                && estimated_bytes.saturating_add(change_bytes) > MAX_BRIDGE_CHUNK_BYTES
+            {
+                break;
+            }
+            estimated_bytes = estimated_bytes.saturating_add(change_bytes);
+            property_end += 1;
+        }
+        let property_batch = &property_changes[property_start..property_end];
         let result = bridge.call(
             "applyEditorChanges",
             json!({
@@ -9032,6 +11537,7 @@ fn send_editor_change_batches(
             }),
         )?;
         merge_editor_summary(&mut summary, &result);
+        property_start = property_end;
     }
 
     Ok(summary)
@@ -9048,7 +11554,14 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
         if key == "ok" {
             continue;
         }
-        if let Some(next) = value.as_f64() {
+        if key == "protectedWrites" {
+            let target = summary
+                .entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let (Some(target), Some(values)) = (target.as_array_mut(), value.as_array()) {
+                target.extend(values.iter().cloned());
+            }
+        } else if let Some(next) = value.as_f64() {
             let current = summary.get(key).and_then(Value::as_f64).unwrap_or(0.0);
             if let Some(number) = serde_json::Number::from_f64(current + next) {
                 summary.insert(key.clone(), Value::Number(number));
@@ -9721,9 +12234,6 @@ fn absolutize_under(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Resolve a caller-relative path before forwarding it to the bridge daemon.
-/// The daemon runs with its own working directory, so relative paths must be
-/// pinned to the calling process's cwd or they silently target the wrong project.
 fn absolutize_for_daemon(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -10952,10 +13462,6 @@ impl Drop for SettingsFileLock {
     }
 }
 
-/// Actionable error when a command targets a service store that was never
-/// synced or is misspelled — replaces the raw "os error 2/3" the lock or decode
-/// step would otherwise surface. The service name is taken from the store's
-/// parent directory.
 fn missing_service_store_error(settings_file: &Path) -> anyhow::Error {
     let service = settings_file
         .parent()
@@ -10976,10 +13482,6 @@ fn missing_service_store_error(settings_file: &Path) -> anyhow::Error {
     }
 }
 
-/// Create an empty service store on demand for the "bring content in" commands
-/// (add-instance, import-model) so a first `rbx ba <Service> …` in a fresh
-/// project just works. When the service name is known the store is seeded with
-/// its service-root instance; otherwise it starts empty (a detached import).
 fn ensure_service_store_exists(settings_file: &Path, service_hint: &str) -> Result<()> {
     if settings_file.exists() {
         return Ok(());
@@ -11004,12 +13506,6 @@ fn ensure_service_store_exists(settings_file: &Path, service_hint: &str) -> Resu
         .with_context(|| format!("Failed to create {}", settings_file.display()))
 }
 
-/// Lock a service store that must already exist — used by the mutating CLI
-/// commands that operate on existing instances (set-property, set-source,
-/// clone, move, remove, …). Gives the actionable missing-store error instead of
-/// a raw lock os-error. add-instance / import-model create first and lock via
-/// [`acquire_settings_file_lock`] directly; internal flows that create a store
-/// on lock (e.g. orphan-source import) also use the plain lock.
 fn lock_existing_service_store(settings_file: &Path) -> Result<SettingsFileLock> {
     if !settings_file.exists() {
         return Err(missing_service_store_error(settings_file));
@@ -13242,7 +15738,6 @@ fn explorer_array<'a>(request: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value
         .find_map(|key| request.get(*key).and_then(Value::as_array))
 }
 
-/// Exit this process as soon as `parent_pid` dies.
 #[cfg(windows)]
 fn local_tcp_ports_owned_by_pid(pid: u32) -> Vec<u16> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -14730,6 +17225,7 @@ struct BytecodeModelImportRefs {
     new_index_by_ref: HashMap<RbxRef, usize>,
     settings_id_by_ref: HashMap<RbxRef, String>,
     path_segments_by_index: Vec<Option<Vec<String>>>,
+    path_segments_by_ref: HashMap<RbxRef, Vec<String>>,
 }
 
 struct BytecodeModelImportOutcome {
@@ -14737,6 +17233,12 @@ struct BytecodeModelImportOutcome {
     root_settings_ids: Vec<String>,
     settings_ids: Vec<String>,
     source_writes: Vec<Value>,
+}
+
+struct RbxPlaceBuild {
+    dom: RbxWeakDom,
+    service_roots: Vec<(String, RbxRef)>,
+    total_instances: usize,
 }
 
 fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()> {
@@ -14848,29 +17350,27 @@ fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()> {
     )
 }
 
-fn bytecode_export_place(args: BytecodeExportPlaceArgs) -> Result<()> {
-    let project_root = canonical_path(&args.project_root).with_context(|| {
-        format!(
-            "Failed to resolve project root: {}",
-            args.project_root.display()
-        )
-    })?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let format = match args.format.as_deref() {
-        Some(raw) => RbxPlaceFormat::parse(raw)?,
-        None => RbxPlaceFormat::from_path(&args.output)?,
-    };
-    let services = explorer_daemon_services(&src_root, &args.services)?;
+fn build_rbx_place(
+    src_root: &Path,
+    services: Vec<String>,
+    document_overrides: Option<&HashMap<String, SettingsBytecode>>,
+) -> Result<RbxPlaceBuild> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-
     let mut export_inputs = Vec::new();
     for service in services {
         let settings_file = existing_service_settings_path(&src_root.join(&service));
         if !settings_file.exists() {
             continue;
         }
-        let document = SettingsBytecode::read_file(&settings_file)
-            .with_context(|| format!("Failed to read {}", settings_file.display()))?;
+        let document = if let Some(document) = document_overrides
+            .and_then(|documents| documents.get(&service))
+            .cloned()
+        {
+            document
+        } else {
+            SettingsBytecode::read_file(&settings_file)
+                .with_context(|| format!("Failed to read {}", settings_file.display()))?
+        };
         let service_name = bytecode_service_name(&document, &settings_file, &service);
         let root_index = editor_service_root_index(&document, &service_name)
             .or_else(|| settings_root_indices(&document).into_iter().next())
@@ -14997,28 +17497,182 @@ fn bytecode_export_place(args: BytecodeExportPlaceArgs) -> Result<()> {
         top_level_refs.push(root_ref);
     }
 
+    let service_roots = export_inputs
+        .iter()
+        .zip(top_level_refs)
+        .map(|((service, _, _, _, _, _, _, _), referent)| (service.clone(), referent))
+        .collect();
+    Ok(RbxPlaceBuild {
+        dom,
+        service_roots,
+        total_instances,
+    })
+}
+
+fn build_editor_binary_import(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+) -> Result<Option<EditorBinaryImport>> {
+    if changes.instance_changes.is_empty() {
+        return Ok(None);
+    }
+    let services = changes
+        .instance_changes
+        .iter()
+        .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
+        .map(|change| change.service.clone())
+        .collect::<HashSet<_>>();
+    if services.is_empty()
+        || changes
+            .instance_changes
+            .iter()
+            .any(|change| !services.contains(&change.service))
+    {
+        return Ok(None);
+    }
+    if changes
+        .source_changes
+        .iter()
+        .any(|change| !services.contains(&change.service))
+        || changes
+            .property_changes
+            .iter()
+            .any(|change| !services.contains(&change.service))
+    {
+        return Ok(None);
+    }
+    let project_root = if args.project_root.exists() {
+        canonical_path(&args.project_root).with_context(|| {
+            format!(
+                "Failed to resolve project root: {}",
+                args.project_root.display()
+            )
+        })?
+    } else {
+        args.project_root.clone()
+    };
+    let src_root = absolutize_under(&project_root, &args.src_dir);
+    let mut ordered_services = services.iter().cloned().collect::<Vec<_>>();
+    ordered_services.sort_by(|a, b| {
+        explorer_service_order(a)
+            .unwrap_or(usize::MAX)
+            .cmp(&explorer_service_order(b).unwrap_or(usize::MAX))
+            .then_with(|| a.cmp(b))
+    });
+    let document_overrides = changes
+        .settings_writes
+        .iter()
+        .filter_map(|write| {
+            let service = write.path.parent()?.file_name()?.to_str()?.to_string();
+            Some((service, write.document.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let build = build_rbx_place(&src_root, ordered_services, Some(&document_overrides))?;
+    if build.service_roots.len() != services.len() {
+        return Ok(None);
+    }
+    let mut groups = Vec::with_capacity(build.service_roots.len());
+    let mut top_level_refs = Vec::new();
+    let mut instance_count = 0usize;
+    for (service, root_ref) in &build.service_roots {
+        let root = build
+            .dom
+            .get_by_ref(*root_ref)
+            .ok_or_else(|| anyhow::anyhow!("Export service root is missing"))?;
+        let mut children = Vec::new();
+        let mut nested_groups = Vec::new();
+        for referent in root.children().iter().copied() {
+            let Some(instance) = build.dom.get_by_ref(referent) else {
+                continue;
+            };
+            if instance.class.as_str() == "Terrain"
+                || (service == "StarterPlayer"
+                    && matches!(
+                        instance.class.as_str(),
+                        "StarterPlayerScripts" | "StarterCharacterScripts"
+                    ))
+            {
+                nested_groups.push((instance.name.clone(), instance.children().to_vec()));
+            } else {
+                children.push(referent);
+            }
+        }
+        groups.push(EditorBinaryServiceGroup {
+            service: service.clone(),
+            target_path: vec![service.clone()],
+            count: children.len(),
+            root_properties: Map::new(),
+        });
+        for referent in &children {
+            let mut subtree = Vec::new();
+            collect_rbx_subtree_preorder(&build.dom, *referent, &mut subtree);
+            instance_count += subtree.len();
+        }
+        top_level_refs.extend(children);
+        for (target_name, nested_children) in nested_groups {
+            groups.push(EditorBinaryServiceGroup {
+                service: service.clone(),
+                target_path: vec![service.clone(), target_name],
+                count: nested_children.len(),
+                root_properties: Map::new(),
+            });
+            for referent in &nested_children {
+                let mut subtree = Vec::new();
+                collect_rbx_subtree_preorder(&build.dom, *referent, &mut subtree);
+                instance_count += subtree.len();
+            }
+            top_level_refs.extend(nested_children);
+        }
+    }
+    let mut bytes = Vec::new();
+    rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)
+        .context("Failed to encode native Studio import")?;
+    Ok(Some(EditorBinaryImport {
+        bytes,
+        groups,
+        instance_count,
+    }))
+}
+
+fn bytecode_export_place(args: BytecodeExportPlaceArgs) -> Result<()> {
+    let project_root = canonical_path(&args.project_root).with_context(|| {
+        format!(
+            "Failed to resolve project root: {}",
+            args.project_root.display()
+        )
+    })?;
+    let src_root = absolutize_under(&project_root, &args.src_root);
+    let format = match args.format.as_deref() {
+        Some(raw) => RbxPlaceFormat::parse(raw)?,
+        None => RbxPlaceFormat::from_path(&args.output)?,
+    };
+    let services = explorer_daemon_services(&src_root, &args.services)?;
+    let build = build_rbx_place(&src_root, services, None)?;
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-
     let output = File::create(&args.output)
         .with_context(|| format!("Failed to write {}", args.output.display()))?;
     let writer = BufWriter::new(output);
+    let top_level_refs = build
+        .service_roots
+        .iter()
+        .map(|(_, referent)| *referent)
+        .collect::<Vec<_>>();
     match format {
-        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &dom, &top_level_refs)
+        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &build.dom, &top_level_refs)
             .with_context(|| format!("Failed to write {}", args.output.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &dom, &top_level_refs)
+        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &build.dom, &top_level_refs)
             .with_context(|| format!("Failed to write {}", args.output.display()))?,
     }
-
-    let exported_services = export_inputs
+    let exported_services = build
+        .service_roots
         .iter()
-        .map(|(service, _, _, _, _, _, _, _)| service.clone())
+        .map(|(service, _)| service.clone())
         .collect::<Vec<_>>();
-
     print_json_output(
         &json!({
             "ok": true,
@@ -15026,7 +17680,7 @@ fn bytecode_export_place(args: BytecodeExportPlaceArgs) -> Result<()> {
             "format": format.label(),
             "services": exported_services,
             "serviceCount": top_level_refs.len(),
-            "instances": total_instances,
+            "instances": build.total_instances,
         }),
         args.pretty,
     )
@@ -15382,6 +18036,15 @@ fn import_rbx_model_into_document(
 
     let path_segments_by_index = build_editor_instance_path_segments(document, service);
     let import_refs = BytecodeModelImportRefs {
+        path_segments_by_ref: new_index_by_ref
+            .iter()
+            .filter_map(|(referent, index)| {
+                path_segments_by_index
+                    .get(*index)
+                    .and_then(|path| path.clone())
+                    .map(|path| (*referent, path))
+            })
+            .collect(),
         new_index_by_ref,
         settings_id_by_ref,
         path_segments_by_index,
@@ -15437,15 +18100,13 @@ fn import_rbx_model_into_document(
     })
 }
 
-
 const LINK_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LinkManifest {
     #[serde(default = "default_link_manifest_version")]
     version: u32,
-    /// Where cloned git / wally link sources are cached. Relative to the project
-    /// root unless absolute. Defaults to `.renium/link-cache`.
+
     #[serde(rename = "cacheDir", default, skip_serializing_if = "Option::is_none")]
     cache_dir: Option<String>,
     #[serde(default)]
@@ -15576,14 +18237,12 @@ struct LinkLockEntry {
     files: BTreeMap<String, String>,
 }
 
-/// One resolved (mirror file on disk) <- (canonical source file) pair for a target.
 #[derive(Debug, Clone)]
 struct LinkFilePair {
     mirror: PathBuf,
     canonical: PathBuf,
 }
 
-/// A fully resolved link target ready to materialize or compare.
 #[derive(Debug, Clone)]
 struct ResolvedLinkTarget {
     link_id: String,
@@ -15595,12 +18254,11 @@ struct ResolvedLinkTarget {
     broken: bool,
     resolved: bool,
     unresolved_reason: Option<String>,
-    /// Script source <- mirror pairs (for script / script-tree sources).
+
     files: Vec<LinkFilePair>,
-    /// Set when the source is a renium bytecode package (`.rbsync`/`.renium`): an
-    /// instance subtree spliced wholesale into the target, not mirrored per file.
+
     package_source: Option<PathBuf>,
-    /// The resolved source root on disk (file/dir/package), used for metadata.
+
     source_path: Option<PathBuf>,
 }
 
@@ -15618,9 +18276,6 @@ fn file_modified_unix_ms(path: &Path) -> Option<u128> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_millis())
 }
 
-/// Inspect a resolved link source to describe it for the UI: is it a packaged
-/// subtree, what is its root instance type/name, how many instances, and when
-/// was it last edited.
 fn read_link_source_meta(source_path: &Path) -> LinkSourceMeta {
     let updated_unix_ms = file_modified_unix_ms(source_path);
     if is_package_path(source_path)
@@ -15708,8 +18363,6 @@ fn link_cache_dir(project_root: &Path, manifest: &LinkManifest) -> PathBuf {
     }
 }
 
-/// Resolve the link cache directory with precedence: explicit override (e.g. the
-/// editor setting) > manifest `cacheDir` > default `.renium/link-cache`.
 fn resolve_link_cache_dir(
     project_root: &Path,
     manifest: &LinkManifest,
@@ -15723,8 +18376,6 @@ fn resolve_link_cache_dir(
     link_cache_dir(project_root, manifest)
 }
 
-/// Ensure `.renium/` carries a `.gitignore` so caches, clones, and lockfiles are
-/// never accidentally committed in a user's project.
 fn ensure_renium_gitignore(project_root: &Path) {
     let dir = project_root.join(".renium");
     if fs::create_dir_all(&dir).is_err() {
@@ -15832,7 +18483,6 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Target segments without a leading duplicate of the service root name.
 fn link_target_segments(target: &LinkTargetRef) -> Vec<String> {
     if target.path.first().map(String::as_str) == Some(target.service.as_str()) {
         target.path[1..].to_vec()
@@ -15906,7 +18556,6 @@ fn link_mirror_lock_key(src_root: &Path, mirror: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Set or clear the read-only attribute on a file (best effort; ignores missing files).
 fn set_path_readonly(path: &Path, readonly: bool) -> Result<()> {
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
@@ -15920,8 +18569,6 @@ fn set_path_readonly(path: &Path, readonly: bool) -> Result<()> {
         .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
-/// Write content to a (possibly read-only) mirror file, returning whether the
-/// on-disk bytes changed. Clears read-only first so the write always succeeds.
 fn write_mirror_file(path: &Path, content: &str) -> Result<bool> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -15955,8 +18602,6 @@ fn run_git_checked(git_path: &str, args: &[String], cwd: &Path) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Ensure a git source is cached at `cache_root/<hash>` checked out at `git_ref`.
-/// Returns the checkout directory and the resolved commit hash.
 fn ensure_git_source(
     cache_root: &Path,
     url: &str,
@@ -16022,8 +18667,6 @@ fn ensure_git_source(
     Ok((dir, head))
 }
 
-/// Locate a Wally package's installed source directory inside `Packages/_Index`.
-/// Requires `wally install` to have populated the project's Packages folder.
 fn resolve_wally_source(
     project_root: &Path,
     package: &str,
@@ -16073,7 +18716,6 @@ fn resolve_wally_source(
     }
 }
 
-/// Manifest source prefix for the per-user global package library.
 const GLOBAL_LINK_PREFIX: &str = "~global/";
 
 fn renium_global_packages_dir() -> PathBuf {
@@ -16104,7 +18746,6 @@ fn is_global_link_path(raw: &str) -> bool {
     raw.replace('\\', "/").starts_with(GLOBAL_LINK_PREFIX)
 }
 
-/// Resolve a link source to a local file or directory on disk.
 fn resolve_link_source(
     project_root: &Path,
     source: &LinkSource,
@@ -16159,8 +18800,8 @@ fn resolve_link_source(
 }
 
 fn canonical_existing_descendant(root: &Path, candidate: &Path, label: &str) -> Result<PathBuf> {
-    let root = canonical_path(root)
-        .with_context(|| format!("Failed to resolve {}", root.display()))?;
+    let root =
+        canonical_path(root).with_context(|| format!("Failed to resolve {}", root.display()))?;
     let candidate = canonical_path(candidate)
         .with_context(|| format!("{label} not found: {}", candidate.display()))?;
     if candidate != root && !candidate.starts_with(&root) {
@@ -16185,8 +18826,8 @@ fn ensure_existing_ancestor_inside(root: &Path, target: &Path, label: &str) -> R
         return Ok(());
     }
 
-    let root = canonical_path(root)
-        .with_context(|| format!("Failed to resolve {}", root.display()))?;
+    let root =
+        canonical_path(root).with_context(|| format!("Failed to resolve {}", root.display()))?;
     let mut ancestor = target;
     while fs::symlink_metadata(ancestor).is_err() {
         ancestor = ancestor
@@ -16205,7 +18846,6 @@ fn ensure_existing_ancestor_inside(root: &Path, target: &Path, label: &str) -> R
     Ok(())
 }
 
-/// Compute the on-disk (parent dir, leaf name) for a target under `src_root`.
 fn link_target_dir_and_leaf(src_root: &Path, target: &LinkTargetRef) -> Result<(PathBuf, String)> {
     let segments = validate_link_target_ref(target)?;
     let leaf = segments.last().cloned().unwrap();
@@ -16217,9 +18857,6 @@ fn link_target_dir_and_leaf(src_root: &Path, target: &LinkTargetRef) -> Result<(
     Ok((dir, leaf))
 }
 
-/// Compute the (mirror, canonical, class) file pairs for one target given a
-/// resolved source. A file source maps to a single script; a directory source
-/// mirrors the whole subtree under the target location.
 fn link_target_file_pairs(
     src_root: &Path,
     target: &LinkTargetRef,
@@ -16285,7 +18922,6 @@ fn link_target_file_pairs(
     Ok(pairs)
 }
 
-/// Resolve every link target in a manifest into concrete file pairs.
 fn resolve_link_targets(
     project_root: &Path,
     src_root: &Path,
@@ -16349,8 +18985,6 @@ fn resolve_link_targets(
     resolved
 }
 
-/// Ensure a chain of Folder containers exists under a service root, creating the
-/// service root and any missing folders. Returns the deepest container index.
 fn ensure_editor_container_path(
     document: &mut SettingsBytecode,
     service: &str,
@@ -16392,10 +19026,6 @@ fn ensure_editor_container_path(
     Ok(current)
 }
 
-/// Splice a renium bytecode package (an instance subtree) into a target location,
-/// replacing any existing instance there. Script `Source` stays inline in the
-/// settings bytecode so package links do not create editable source mirrors.
-/// Returns (changed source paths, settings ids, removed-target descriptor).
 fn materialize_package_target(
     document: &mut SettingsBytecode,
     src_root: &Path,
@@ -16732,13 +19362,10 @@ fn package_target_needs_inline_source_migration(
     false
 }
 
-/// Owned indexes used by the push pipeline to enforce read-only mirrors and
-/// fan out canonical edits, built offline (cached sources only).
 #[derive(Debug, Default)]
 struct LinkEnforcement {
-    /// mirror file path key -> (canonical source path, read-only).
     mirror_to_canonical: HashMap<String, (PathBuf, bool)>,
-    /// canonical local file path key -> mirror file paths to fan out to.
+
     canonical_to_mirrors: HashMap<String, Vec<PathBuf>>,
     active: bool,
 }
@@ -16749,9 +19376,6 @@ impl LinkEnforcement {
     }
 }
 
-/// Path key for link enforcement that is stable across Windows `\\?\` extended
-/// paths, so a mirror resolved under a canonicalized root matches a changed path
-/// that arrives clean (or vice versa).
 fn link_path_key(path: &Path) -> String {
     path_key(&strip_extended_prefix(path.to_path_buf()))
 }
@@ -16805,9 +19429,6 @@ fn build_link_enforcement(
     Ok(enforcement)
 }
 
-/// Before processing editor changes, enforce link policy on the changed-path set:
-/// revert edited read-only mirrors to canonical, and fan canonical edits out to
-/// every mirror. Returns the (possibly extended) ordered, de-duplicated paths.
 fn apply_link_enforcement_to_changed_paths(
     project_root: &Path,
     enforcement: &LinkEnforcement,
@@ -16859,9 +19480,6 @@ fn apply_link_enforcement_to_changed_paths(
     out
 }
 
-/// Strip the Windows `\\?\` extended-length prefix from a canonicalized drive
-/// or UNC path so external tools (notably `git`) accept it and so path forms
-/// compare equal across call sites.
 fn strip_extended_prefix(path: PathBuf) -> PathBuf {
     if cfg!(windows)
         && let Some(text) = path.to_str()
@@ -16879,8 +19497,6 @@ fn strip_extended_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Canonicalize with a normalized result form; every canonicalization in this
-/// crate must go through here so root and file paths always compare equal.
 fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(strip_extended_prefix(fs::canonicalize(path)?))
 }
@@ -17777,7 +20393,6 @@ fn link_move_target(args: LinkMoveTargetArgs) -> Result<()> {
     )
 }
 
-/// Walk a service tree following name segments (after the service root).
 fn resolve_editor_instance_by_path(
     document: &SettingsBytecode,
     service: &str,
@@ -17790,8 +20405,6 @@ fn resolve_editor_instance_by_path(
     Some(current)
 }
 
-/// Extract an instance subtree into a self-contained bytecode package, embedding
-/// each script's `Source` (read from disk) into `properties["Source"]`.
 fn pack_subtree_to_bytecode(
     document: &SettingsBytecode,
     root_index: usize,
@@ -18466,9 +21079,6 @@ struct WallyRealmOutcome {
     changed_paths: Vec<String>,
 }
 
-/// Import one realm's installed package directory directly into the service
-/// settings document (no Rojo): remove the prior target subtree, then mirror the
-/// package files to disk and ensure their instances.
 fn import_wally_realm(
     document: &mut SettingsBytecode,
     settings_file: &Path,
@@ -18762,8 +21372,8 @@ fn remove_existing_directory_inside(root: &Path, target: &Path) -> Result<bool> 
     if !target.exists() {
         return Ok(false);
     }
-    let root = canonical_path(root)
-        .with_context(|| format!("Failed to resolve {}", root.display()))?;
+    let root =
+        canonical_path(root).with_context(|| format!("Failed to resolve {}", root.display()))?;
     let target = canonical_path(target)
         .with_context(|| format!("Failed to resolve {}", target.display()))?;
     if target == root || !target.starts_with(&root) {
@@ -19189,6 +21799,21 @@ fn rbx_model_property_descriptor<'db>(
     None
 }
 
+fn rbx_property_descriptor<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+    property_name: &str,
+) -> Option<&'db RbxPropertyDescriptor<'db>> {
+    let class_descriptor = database.classes.get(class_name)?;
+    for class in database.superclasses_iter(class_descriptor) {
+        let Some(property) = class.properties.get(property_name) else {
+            continue;
+        };
+        return Some(property);
+    }
+    None
+}
+
 fn rbx_serialized_property_descriptor<'db>(
     class: &'db RbxClassDescriptor<'db>,
     property: &'db RbxPropertyDescriptor<'db>,
@@ -19294,14 +21919,22 @@ fn json_to_rbx_variant_for_type(
         RbxVariantType::Axes => json_to_rbx_axes(value).map(RbxVariant::Axes),
         RbxVariantType::Faces => json_to_rbx_faces(value).map(RbxVariant::Faces),
         RbxVariantType::Ray => json_to_rbx_ray(value).map(RbxVariant::Ray),
+        RbxVariantType::MaterialColors => json_binary_payload(value, "MaterialColors")
+            .and_then(|bytes| RbxMaterialColors::decode(&bytes).ok())
+            .map(RbxVariant::MaterialColors),
+        RbxVariantType::SharedString => json_binary_payload(value, "SharedString")
+            .map(RbxSharedString::new)
+            .map(RbxVariant::SharedString),
+        RbxVariantType::NetAssetRef => json_binary_payload(value, "NetAssetRef")
+            .map(RbxNetAssetRef::new)
+            .map(RbxVariant::NetAssetRef),
+        RbxVariantType::Region3 => json_to_rbx_region3(value).map(RbxVariant::Region3),
+        RbxVariantType::Region3int16 => {
+            json_to_rbx_region3int16(value).map(RbxVariant::Region3int16)
+        }
         RbxVariantType::Attributes
         | RbxVariantType::UniqueId
-        | RbxVariantType::SecurityCapabilities
-        | RbxVariantType::MaterialColors
-        | RbxVariantType::SharedString
-        | RbxVariantType::NetAssetRef
-        | RbxVariantType::Region3
-        | RbxVariantType::Region3int16 => None,
+        | RbxVariantType::SecurityCapabilities => None,
         _ => None,
     }
 }
@@ -19333,6 +21966,34 @@ fn json_to_rbx_ray(value: &Value) -> Option<RbxRay> {
     ))
 }
 
+fn binary_payload_json(kind: &str, bytes: &[u8]) -> Value {
+    json!({ "_type": kind, "base64": base64::encode(bytes) })
+}
+
+fn json_binary_payload(value: &Value, kind: &str) -> Option<Vec<u8>> {
+    let object = value.as_object()?;
+    if object.get("_type").and_then(Value::as_str) != Some(kind) {
+        return None;
+    }
+    base64::decode(object.get("base64")?.as_str()?).ok()
+}
+
+fn json_to_rbx_region3(value: &Value) -> Option<RbxRegion3> {
+    let object = value.as_object()?;
+    Some(RbxRegion3::new(
+        json_to_rbx_vector3(object.get("min")?)?,
+        json_to_rbx_vector3(object.get("max")?)?,
+    ))
+}
+
+fn json_to_rbx_region3int16(value: &Value) -> Option<RbxRegion3int16> {
+    let object = value.as_object()?;
+    Some(RbxRegion3int16::new(
+        json_to_rbx_vector3int16(object.get("min")?)?,
+        json_to_rbx_vector3int16(object.get("max")?)?,
+    ))
+}
+
 fn json_to_rbx_inferred_variant(
     value: &Value,
     database: &ReflectionDatabase<'_>,
@@ -19347,6 +22008,7 @@ fn json_to_rbx_inferred_variant(
             Some("Vector3") => json_to_rbx_vector3(value).map(RbxVariant::Vector3),
             Some("Vector2int16") => json_to_rbx_vector2int16(value).map(RbxVariant::Vector2int16),
             Some("Vector3int16") => json_to_rbx_vector3int16(value).map(RbxVariant::Vector3int16),
+            Some("BinaryString") => json_binary_string(value).map(RbxVariant::BinaryString),
             Some("UDim") => json_to_rbx_udim(value).map(RbxVariant::UDim),
             Some("UDim2") => json_to_rbx_udim2(value).map(RbxVariant::UDim2),
             Some("Color3") => json_to_rbx_color3(value).map(RbxVariant::Color3),
@@ -19370,6 +22032,17 @@ fn json_to_rbx_inferred_variant(
             Some("Axes") => json_to_rbx_axes(value).map(RbxVariant::Axes),
             Some("Faces") => json_to_rbx_faces(value).map(RbxVariant::Faces),
             Some("Ray") => json_to_rbx_ray(value).map(RbxVariant::Ray),
+            Some("MaterialColors") => json_binary_payload(value, "MaterialColors")
+                .and_then(|bytes| RbxMaterialColors::decode(&bytes).ok())
+                .map(RbxVariant::MaterialColors),
+            Some("SharedString") => json_binary_payload(value, "SharedString")
+                .map(RbxSharedString::new)
+                .map(RbxVariant::SharedString),
+            Some("NetAssetRef") => json_binary_payload(value, "NetAssetRef")
+                .map(RbxNetAssetRef::new)
+                .map(RbxVariant::NetAssetRef),
+            Some("Region3") => json_to_rbx_region3(value).map(RbxVariant::Region3),
+            Some("Region3int16") => json_to_rbx_region3int16(value).map(RbxVariant::Region3int16),
             Some("Enum") | Some("EnumItem") => json_to_rbx_enum_variant(value, None, database),
             Some("Ref") => Some(RbxVariant::Ref(json_to_rbx_ref(value, refs))),
             _ => object
@@ -19492,6 +22165,9 @@ fn json_u8(value: &Value) -> Option<u8> {
 }
 
 fn json_binary_string(value: &Value) -> Option<RbxBinaryString> {
+    if let Some(bytes) = json_binary_payload(value, "BinaryString") {
+        return Some(RbxBinaryString::from(bytes));
+    }
     if let Some(text) = value.as_str() {
         return Some(RbxBinaryString::from(text.as_bytes().to_vec()));
     }
@@ -19960,15 +22636,15 @@ fn rbx_instance_to_settings_records(
 
     for (property_name, variant) in &instance.properties {
         let property_name = property_name.as_str();
-        if model_property_name_is_skipped(property_name) {
-            continue;
-        }
         if let RbxVariant::Attributes(rbx_attributes) = variant {
             attributes.extend(rbx_attributes_to_settings_map(
                 rbx_attributes,
                 database,
                 refs,
             ));
+            continue;
+        }
+        if model_property_name_is_skipped(property_name) {
             continue;
         }
         if property_name.eq_ignore_ascii_case("Source") && is_lua_source_class(class_name) {
@@ -20029,7 +22705,9 @@ fn rbx_variant_to_settings_json(
         RbxVariant::Float32(value) => json_number_f64(*value as f64),
         RbxVariant::Float64(value) => json_number_f64(*value),
         RbxVariant::String(value) => Some(Value::String(value.clone())),
-        RbxVariant::BinaryString(value) => Some(Value::String(String::from_utf8_lossy(value.as_ref()).to_string())),
+        RbxVariant::BinaryString(value) => {
+            Some(binary_payload_json("BinaryString", value.as_ref()))
+        }
         RbxVariant::ContentId(value) => Some(Value::String(value.as_str().to_string())),
         RbxVariant::Content(value) => rbx_content_to_settings_json(value, refs),
         RbxVariant::Tags(value) => Some(Value::Array(
@@ -20103,13 +22781,28 @@ fn rbx_variant_to_settings_json(
             "origin": {"x": value.origin.x, "y": value.origin.y, "z": value.origin.z},
             "direction": {"x": value.direction.x, "y": value.direction.y, "z": value.direction.z},
         })),
+        RbxVariant::MaterialColors(value) => {
+            Some(binary_payload_json("MaterialColors", &value.encode()))
+        }
+        RbxVariant::SharedString(value) => {
+            Some(binary_payload_json("SharedString", value.as_ref()))
+        }
+        RbxVariant::NetAssetRef(value) => {
+            Some(binary_payload_json("NetAssetRef", value.data()))
+        }
+        RbxVariant::Region3(value) => Some(json!({
+            "_type": "Region3",
+            "min": {"x": value.min.x, "y": value.min.y, "z": value.min.z},
+            "max": {"x": value.max.x, "y": value.max.y, "z": value.max.z},
+        })),
+        RbxVariant::Region3int16(value) => Some(json!({
+            "_type": "Region3int16",
+            "min": {"x": value.min.x, "y": value.min.y, "z": value.min.z},
+            "max": {"x": value.max.x, "y": value.max.y, "z": value.max.z},
+        })),
         RbxVariant::UniqueId(_)
         | RbxVariant::SecurityCapabilities(_)
-        | RbxVariant::MaterialColors(_)
-        | RbxVariant::SharedString(_)
-        | RbxVariant::NetAssetRef(_)
-        | RbxVariant::Region3(_)
-        | RbxVariant::Region3int16(_) => None,
+        => None,
         _ => None,
     }
 }
@@ -20188,12 +22881,18 @@ fn rbx_ref_to_settings_json(referent: RbxRef, refs: &BytecodeModelImportRefs) ->
         if let Some(settings_id) = refs.settings_id_by_ref.get(&referent) {
             out.insert("settingsId".to_string(), Value::String(settings_id.clone()));
         }
-        if let Some(Some(path_segments)) = refs.path_segments_by_index.get(new_index) {
-            out.insert(
-                "pathSegments".to_string(),
-                Value::Array(path_segments.iter().cloned().map(Value::String).collect()),
-            );
-        }
+    }
+    let path_segments = refs.path_segments_by_ref.get(&referent).or_else(|| {
+        refs.new_index_by_ref
+            .get(&referent)
+            .and_then(|index| refs.path_segments_by_index.get(*index))
+            .and_then(Option::as_ref)
+    });
+    if let Some(path_segments) = path_segments {
+        out.insert(
+            "pathSegments".to_string(),
+            Value::Array(path_segments.iter().cloned().map(Value::String).collect()),
+        );
     }
     Value::Object(out)
 }
@@ -20965,23 +23664,36 @@ struct PlaceGuardConfig {
     allowed_game_ids: Vec<i64>,
 }
 
-fn active_place_guard() -> Option<&'static PlaceGuardConfig> {
-    static GUARD: std::sync::OnceLock<Option<PlaceGuardConfig>> = std::sync::OnceLock::new();
-    GUARD
-        .get_or_init(|| {
-            if std::env::var("RENIUM_ALLOW_ANY_PLACE").is_ok_and(|value| value == "1") {
-                return None;
-            }
-            let text = fs::read_to_string("renium.config.json").ok()?;
-            let config: PlaceGuardConfig = serde_json::from_str(&text).ok()?;
-            (!config.allowed_place_ids.is_empty() || !config.allowed_game_ids.is_empty())
-                .then_some(config)
-        })
-        .as_ref()
+fn place_guard_config_path() -> PathBuf {
+    std::env::var_os("RENIUM_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("renium.config.json"))
+}
+
+fn active_place_guard() -> Result<Option<PlaceGuardConfig>> {
+    if std::env::var("RENIUM_ALLOW_ANY_PLACE").is_ok_and(|value| value == "1") {
+        return Ok(None);
+    }
+    let path = place_guard_config_path();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read place guard {}", path.display()));
+        }
+    };
+    let config: PlaceGuardConfig = serde_json::from_str(&text)
+        .with_context(|| format!("Invalid place guard JSON in {}", path.display()))?;
+    Ok(
+        (!config.allowed_place_ids.is_empty() || !config.allowed_game_ids.is_empty())
+            .then_some(config),
+    )
 }
 
 fn ensure_place_allowed(info: &BridgeInfoPayload) -> Result<()> {
-    let Some(guard) = active_place_guard() else {
+    let Some(guard) = active_place_guard()? else {
         return Ok(());
     };
     let place_allowed = info
@@ -20993,11 +23705,15 @@ fn ensure_place_allowed(info: &BridgeInfoPayload) -> Result<()> {
     if place_allowed || game_allowed {
         return Ok(());
     }
+    let config_path = place_guard_config_path();
     bail!(
-        "Refusing bridge connection from place '{}' (placeId {}, gameId {}): not listed in renium.config.json allowedPlaceIds/allowedGameIds. Unsaved local places report placeId 0; add 0 to the allowlist or set RENIUM_ALLOW_ANY_PLACE=1 to override.",
+        "Refusing bridge connection from place '{}' (placeId {}, gameId {}): not listed in {} allowedPlaceIds/allowedGameIds. Unsaved local places report placeId 0; add 0 to the allowlist or set RENIUM_ALLOW_ANY_PLACE=1 to override.",
         info.place_name,
-        info.place_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
-        info.game_id.map_or_else(|| "none".to_string(), |id| id.to_string())
+        info.place_id
+            .map_or_else(|| "none".to_string(), |id| id.to_string()),
+        info.game_id
+            .map_or_else(|| "none".to_string(), |id| id.to_string()),
+        config_path.display()
     )
 }
 
@@ -21333,7 +24049,8 @@ fn export_snapshots(args: ExportSnapshotsArgs) -> Result<()> {
     let (bridge, bridge_listen_metrics, bridge_info, all_channels_connected_to_bridge_info_ms) = loop {
         bridge_connect_attempt += 1;
         let (candidate_bridge, candidate_listen_metrics) =
-            match BridgeServer::listen(&args.bridge_host, &prelude.ports, args.bridge_wait_seconds) {
+            match BridgeServer::listen(&args.bridge_host, &prelude.ports, args.bridge_wait_seconds)
+            {
                 Ok(result) => result,
                 Err(err)
                     if bridge_connect_attempt < max_bridge_connect_attempts
@@ -21802,6 +24519,18 @@ fn export_snapshots_core(
         first_service_export_to_last_service_export_ms,
     );
 
+    let native_fidelity_source_path = run_import
+        .then(|| local_place_path_for_bridge(bridge))
+        .flatten();
+    let mut native_fidelity_export = if run_import {
+        Some(
+            receive_editor_binary_export(bridge)
+                .context("Failed to capture native Studio property fidelity")?,
+        )
+    } else {
+        None
+    };
+
     let mut dispatcher_drain_ms = 0.0;
     let mut write_generated_project_ms = 0.0;
     let mut sourcemap_finalize_ms = 0.0;
@@ -21820,6 +24549,18 @@ fn export_snapshots_core(
                 sourcemap_nodes = dispatcher.finish()?;
                 dispatcher_drain_ms = elapsed_ms(drain_started);
                 log_timing_ms("direct import dispatcher drain", dispatcher_drain_ms);
+            }
+            if let Some(export) = native_fidelity_export.take() {
+                let fidelity_started = Instant::now();
+                let merged = merge_native_editor_export_into_project(
+                    &project_root,
+                    Path::new("src"),
+                    &services,
+                    export,
+                    native_fidelity_source_path.as_deref(),
+                )?;
+                println!("[renium] native property fidelity merged: {merged} instances");
+                log_timing("native property fidelity merge", fidelity_started);
             }
             let project_started = Instant::now();
             write_generated_project(&project_root, &services, compact_meta_json)?;
@@ -21845,13 +24586,25 @@ fn export_snapshots_core(
         } else {
             let import_args = ImportSnapshotsArgs {
                 snapshot_dir: snapshot_dir.clone(),
-                project_root,
+                project_root: project_root.clone(),
                 services: services.join(","),
                 no_project_write: false,
                 compact_meta_json,
                 threads: 0,
             };
             import_snapshots(import_args)?;
+            if let Some(export) = native_fidelity_export.take() {
+                let fidelity_started = Instant::now();
+                let merged = merge_native_editor_export_into_project(
+                    &project_root,
+                    Path::new("src"),
+                    &services,
+                    export,
+                    native_fidelity_source_path.as_deref(),
+                )?;
+                println!("[renium] native property fidelity merged: {merged} instances");
+                log_timing("native property fidelity merge", fidelity_started);
+            }
         }
     }
 
@@ -27879,9 +30632,6 @@ fn is_service_settings_file_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(LEGACY_SERVICE_SETTINGS_FILE_NAME)
 }
 
-/// Locate a store without changing the working tree. The canonical `.renium`
-/// file wins when both names exist; the legacy name remains a read fallback for
-/// projects that have not yet been written by this release.
 fn existing_service_settings_path(service_dir: &Path) -> PathBuf {
     let canonical = service_settings_path(service_dir);
     if canonical.exists() {
@@ -27894,9 +30644,6 @@ fn existing_service_settings_path(service_dir: &Path) -> PathBuf {
     canonical
 }
 
-/// Return the canonical path for a service store, atomically promoting a
-/// legacy `.rbsync` store when it is first mutated. This keeps old projects
-/// readable while making Renium's own writes converge on `.renium`.
 fn writable_service_settings_path(service_dir: &Path) -> Result<PathBuf> {
     let canonical = service_settings_path(service_dir);
     if canonical.exists() {
@@ -27905,21 +30652,19 @@ fn writable_service_settings_path(service_dir: &Path) -> Result<PathBuf> {
     let legacy = legacy_service_settings_path(service_dir);
     if legacy.exists()
         && let Err(error) = fs::rename(&legacy, &canonical)
-        && !canonical.exists() {
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to migrate legacy settings store {} to {}",
-                    legacy.display(),
-                    canonical.display()
-                )
-            });
-        }
+        && !canonical.exists()
+    {
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to migrate legacy settings store {} to {}",
+                legacy.display(),
+                canonical.display()
+            )
+        });
+    }
     Ok(canonical)
 }
 
-/// Promote a service store when a command is about to mutate it. Arbitrary
-/// `.rbsync` package files retain their name for backwards compatibility; only
-/// the dedicated service-store filename is renamed to `.renium`.
 fn writable_settings_file_path(settings_file: &Path) -> Result<PathBuf> {
     let Some(name) = settings_file.file_name().and_then(|name| name.to_str()) else {
         return Ok(settings_file.to_path_buf());
@@ -28095,36 +30840,101 @@ fn cleanup_service_dir(service_dir: &Path, expected_paths: &Arc<ImportPathSets>)
     );
 
     let delete_started = Instant::now();
-    if !stale_files.is_empty() {
-        stale_files.par_iter().try_for_each(|path| -> Result<()> {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("Failed to remove {}", path.display()));
-                }
-            }
-            Ok(())
-        })?;
-    }
-
-    stale_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for dir in stale_dirs {
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("Failed to remove {}", dir.display()));
-            }
-        }
+    let backup = quarantine_stale_import_paths(service_dir, &stale_files, &stale_dirs)?;
+    if let Some(backup) = backup {
+        println!(
+            "[renium] moved {} stale file(s) and {} stale directorie(s) to {}",
+            stale_files.len(),
+            stale_dirs.len(),
+            backup.display()
+        );
     }
     log_timing(
-        &format!("cleanup delete {}", service_dir.display()),
+        &format!("cleanup quarantine {}", service_dir.display()),
         delete_started,
     );
 
     Ok(())
+}
+
+fn quarantine_stale_import_paths(
+    service_dir: &Path,
+    stale_files: &[PathBuf],
+    stale_dirs: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    if stale_files.is_empty() && stale_dirs.is_empty() {
+        return Ok(None);
+    }
+    let src_root = service_dir
+        .parent()
+        .context("Import service directory has no src parent")?;
+    let project_root = src_root
+        .parent()
+        .context("Import src directory has no project parent")?;
+    let service_name = service_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("service");
+    let backup_root = project_root
+        .join(".renium")
+        .join("import-backups")
+        .join(format!("{}-{}", current_millis(), std::process::id()))
+        .join(service_name);
+
+    let mut ordered_dirs = stale_dirs.to_vec();
+    ordered_dirs.sort_by_key(|path| path.components().count());
+    let mut root_dirs: Vec<PathBuf> = Vec::new();
+    for dir in ordered_dirs {
+        if !root_dirs.iter().any(|root| dir.starts_with(root)) {
+            root_dirs.push(dir);
+        }
+    }
+
+    for dir in &root_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let relative = dir.strip_prefix(service_dir).with_context(|| {
+            format!(
+                "Stale import directory escaped service root: {}",
+                dir.display()
+            )
+        })?;
+        let destination = backup_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::rename(dir, &destination).with_context(|| {
+            format!(
+                "Failed to move stale import directory {} to {}",
+                dir.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    for file in stale_files {
+        if root_dirs.iter().any(|root| file.starts_with(root)) || !file.exists() {
+            continue;
+        }
+        let relative = file.strip_prefix(service_dir).with_context(|| {
+            format!("Stale import file escaped service root: {}", file.display())
+        })?;
+        let destination = backup_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::rename(file, &destination).with_context(|| {
+            format!(
+                "Failed to move stale import file {} to {}",
+                file.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(Some(backup_root))
 }
 
 fn collect_stale_paths(
@@ -28357,10 +31167,6 @@ fn child_indices_for_instance(state: &ServiceState, parent_index: usize) -> &[us
         .unwrap_or(&[])
 }
 
-/// Write a script's fetched Source to disk. The compact decoder seeds every
-/// script with the `__SOURCE_EXTERNAL__` transport placeholder until
-/// merge_script_sources attaches the real text; if that attach ever misses
-/// (plugin/CLI version skew), never clobber the user's file with the marker.
 fn write_script_source_file(source_path: &Path, source: &str) -> Result<()> {
     if source == "__SOURCE_EXTERNAL__" {
         if source_path.exists() {
@@ -29225,7 +32031,6 @@ fn unique_child_stem(
     }
 }
 
-
 const RENIUM_DIR_GITIGNORE_LEGACY: &str = "# Renium local cache and state. Do not commit.\n*\n";
 const RENIUM_DIR_GITIGNORE: &str = "# Renium local cache. The link lockfile stays tracked so clones reproduce\n# pinned link sources.\nlink-cache/\n";
 
@@ -29448,9 +32253,6 @@ fn vc_init(args: VcInitArgs) -> Result<()> {
     )
 }
 
-/// Render a settings document as stable, diff-friendly text: DFS preorder,
-/// sorted property/attribute lines, `Source` bodies masked to a fingerprint
-/// (script sources already diff as their mirrored .luau files).
 fn settings_doc_to_text(document: &SettingsBytecode) -> String {
     let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
     for (index, instance) in document.instances.iter().enumerate() {
@@ -29527,8 +32329,6 @@ fn vc_textconv(args: VcTextconvArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build one JSON node for the viewer tree. `visited` guards against a malformed
-/// store whose parent links form a cycle so the viewer never hangs on bad input.
 fn build_view_node(
     document: &SettingsBytecode,
     children_by_parent: &[Vec<usize>],
@@ -29817,10 +32617,6 @@ fn vc_merge_maps(
     out
 }
 
-/// Instance-level three-way merge of settings documents. Identity is the
-/// stable settings id; per-instance fields merge field-wise (name, class,
-/// parent, each property, each attribute). Returns the merged document plus
-/// any conflicts (empty when the merge is clean or `prefer` resolved it).
 fn merge_settings_documents(
     base: &SettingsBytecode,
     ours: &SettingsBytecode,
@@ -30161,6 +32957,158 @@ mod tests {
     use crate::settings_bytecode::write_var_u64;
 
     #[test]
+    fn bridge_info_reads_runtime_identity() {
+        let info: BridgeInfoPayload = serde_json::from_value(json!({
+            "runtimeId": "runtime-a",
+            "bridgeRole": "edit",
+        }))
+        .unwrap();
+        assert_eq!(info.runtime_id, "runtime-a");
+    }
+
+    #[test]
+    fn runtime_pin_keys_normalize_player_selectors() {
+        assert_eq!(
+            BridgeServer::runtime_pin_key(BridgeTarget::Client, Some("  PlayerOne ")),
+            RuntimePinKey {
+                target: BridgeTarget::Client,
+                player: Some("playerone".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn stale_import_paths_are_quarantined_not_deleted() {
+        let root = link_test_dir("import-quarantine");
+        let service_dir = root.join("src").join("Workspace");
+        let stale_dir = service_dir.join("Old");
+        let stale_file = service_dir.join("loose.luau");
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::write(stale_dir.join("child.luau"), "return 1").unwrap();
+        fs::write(&stale_file, "return 2").unwrap();
+
+        let backup = quarantine_stale_import_paths(
+            &service_dir,
+            &[stale_dir.join("child.luau"), stale_file.clone()],
+            std::slice::from_ref(&stale_dir),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(!stale_dir.exists());
+        assert!(!stale_file.exists());
+        assert_eq!(
+            fs::read_to_string(backup.join("Old").join("child.luau")).unwrap(),
+            "return 1"
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join("loose.luau")).unwrap(),
+            "return 2"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn studio_bridge_modules_parse_as_luau() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin_ws_bridge");
+        for name in [
+            "BridgeConnection.module.lua",
+            "BridgeEditorSync.module.lua",
+            "BridgePluginRuntime.module.lua",
+            "BridgeStudioChanges.module.lua",
+        ] {
+            let path = root.join(name);
+            let source = fs::read_to_string(&path).unwrap();
+            let result = thread::Builder::new()
+                .name(format!("parse-{name}"))
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || validate_luau_syntax(&source))
+                .unwrap()
+                .join()
+                .unwrap();
+            result.unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+        }
+    }
+
+    #[test]
+    fn binary_roundtrip_keeps_parent_sensitive_instance_classes() {
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let part = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Part").with_name("RigPart"),
+        );
+        dom.insert(
+            part,
+            RbxInstanceBuilder::new("Attachment").with_name("Socket"),
+        );
+        dom.insert(part, RbxInstanceBuilder::new("Bone").with_name("Joint"));
+        let model = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Model").with_name("Character"),
+        );
+        let humanoid = dom.insert(model, RbxInstanceBuilder::new("Humanoid"));
+        dom.insert(humanoid, RbxInstanceBuilder::new("Animator"));
+        let mesh = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_name("Clothing"),
+        );
+        dom.insert(mesh, RbxInstanceBuilder::new("WrapLayer"));
+        dom.insert(mesh, RbxInstanceBuilder::new("WrapTarget"));
+
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[workspace]).unwrap();
+        let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let classes = decoded
+            .descendants()
+            .map(|instance| instance.class.to_string())
+            .collect::<HashSet<_>>();
+        for expected in ["Attachment", "Bone", "Animator", "WrapLayer", "WrapTarget"] {
+            assert!(classes.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn luau_syntax_validation_accepts_agent_snippets() {
+        validate_luau_syntax(
+            "local total: number = 0\nfor _, value in { 1, 2, 3 } do\n\ttotal += value\nend\nreturn if total > 0 then `total={total}` else \"empty\"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn luau_syntax_validation_rejects_invalid_code() {
+        let error = validate_luau_syntax("local =").unwrap_err().to_string();
+        assert!(error.starts_with("Invalid Luau syntax at "));
+    }
+
+    #[test]
+    fn bridge_daemon_defaults_to_persistent_mode() {
+        let cli = Cli::try_parse_from(["renium", "bridge-daemon"]).unwrap();
+        let Commands::BridgeDaemon(args) = cli.command else {
+            panic!("bridge-daemon parsed as another command");
+        };
+        assert!(!args.editor_stdio);
+
+        let cli = Cli::try_parse_from(["renium", "bridge-daemon", "--editor-stdio"]).unwrap();
+        let Commands::BridgeDaemon(args) = cli.command else {
+            panic!("bridge-daemon parsed as another command");
+        };
+        assert!(args.editor_stdio);
+    }
+
+    #[test]
+    fn editor_review_decision_defaults_to_apply() {
+        let args = EditorReviewDecisionArgs::try_parse_from(["editor-review-decision"]).unwrap();
+        assert_eq!(args.decision, "apply");
+        assert!(args.review_id.is_none());
+        assert!(
+            EditorReviewDecisionArgs::try_parse_from(["editor-review-decision", "invalid"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn unique_child_stem_avoids_case_insensitive_and_suffix_collisions() {
         let mut used = HashSet::new();
         let mut suffixes = HashMap::new();
@@ -30399,6 +33347,10 @@ mod tests {
         assert_eq!(BridgeServer::bridge_role_key_base("edit#duplicate"), "edit");
         assert!(BridgeServer::role_matches_target(
             "edit#duplicate",
+            BridgeTarget::Edit
+        ));
+        assert!(BridgeServer::role_matches_target(
+            "edit#duplicate",
             BridgeTarget::Main
         ));
         assert!(BridgeServer::role_matches_target(
@@ -30409,6 +33361,18 @@ mod tests {
             "play-client#duplicate",
             BridgeTarget::Main
         ));
+        assert!(!BridgeServer::role_matches_target(
+            "play-server#duplicate",
+            BridgeTarget::Edit
+        ));
+    }
+
+    #[test]
+    fn studio_device_resolution_accepts_standard_dimensions() {
+        assert_eq!(studio_device_resolution("1179x2556").unwrap(), (1179, 2556));
+        assert_eq!(studio_device_resolution("874X402").unwrap(), (874, 402));
+        assert!(studio_device_resolution("1179").is_err());
+        assert!(studio_device_resolution("0x2556").is_err());
     }
 
     #[test]
@@ -32248,6 +35212,76 @@ mod tests {
     }
 
     #[test]
+    fn editor_review_payload_keeps_every_instance_row() {
+        let instances = (0..5001)
+            .map(|index| EditorInstanceDescriptor {
+                settings_id: format!("editor:{index}"),
+                path_segments: vec!["Workspace".to_string(), format!("Part{index}")],
+                path_ordinals: Vec::new(),
+                class_name: "Part".to_string(),
+            })
+            .collect();
+        let changes = EditorChangeSet {
+            instance_changes: vec![EditorInstanceChange {
+                mode: "reconcileService".to_string(),
+                service: "Workspace".to_string(),
+                allow_deletes: true,
+                instances,
+            }],
+            ..EditorChangeSet::default()
+        };
+
+        let (change_count, rows) = editor_review_payload(&changes);
+
+        assert_eq!(change_count, 5001);
+        assert_eq!(rows.len(), 5001);
+        assert!(rows.iter().all(|row| {
+            row.get("entries")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("kind"))
+                == Some(&json!("instanceReconcile"))
+        }));
+    }
+
+    #[test]
+    fn editor_ref_transport_preserves_duplicate_path_ordinals() {
+        let paths = vec![
+            Some(EditorInstancePath {
+                path_segments: vec!["Workspace".to_string()],
+                path_ordinals: vec![1],
+            }),
+            Some(EditorInstancePath {
+                path_segments: vec!["Workspace".to_string(), "Ads".to_string()],
+                path_ordinals: vec![1, 1],
+            }),
+            Some(EditorInstancePath {
+                path_segments: vec!["Workspace".to_string(), "Ads".to_string(), "Ad".to_string()],
+                path_ordinals: vec![1, 1, 1],
+            }),
+            Some(EditorInstancePath {
+                path_segments: vec!["Workspace".to_string(), "Ads".to_string(), "Ad".to_string()],
+                path_ordinals: vec![1, 1, 2],
+            }),
+        ];
+        let normalized = normalize_editor_bridge_value(
+            &json!({
+                "_type": "Ref",
+                "instanceIndex": 4,
+                "pathSegments": ["Workspace", "Wrong"],
+            }),
+            None,
+            &paths,
+        );
+
+        assert_eq!(
+            normalized.get("pathSegments"),
+            Some(&json!(["Workspace", "Ads", "Ad"]))
+        );
+        assert_eq!(normalized.get("pathOrdinals"), Some(&json!([1, 1, 2])));
+    }
+
+    #[test]
     fn editor_source_path_spec_infers_init_script_instance() {
         let spec = infer_editor_source_path_spec(
             Path::new("project/src"),
@@ -32320,6 +35354,8 @@ mod tests {
             upsert_instances_only: false,
             probe_events: false,
             verify_sources: false,
+            no_review: false,
+            yes: false,
             link_cache_dir: None,
             override_packages: false,
         })
@@ -32472,6 +35508,8 @@ mod tests {
             upsert_instances_only: false,
             probe_events: false,
             verify_sources: false,
+            no_review: false,
+            yes: false,
             link_cache_dir: None,
             override_packages: false,
         })
@@ -32567,6 +35605,8 @@ mod tests {
             upsert_instances_only: false,
             probe_events: false,
             verify_sources: false,
+            no_review: false,
+            yes: false,
             link_cache_dir: None,
             override_packages: false,
         })
@@ -34980,10 +38020,7 @@ mod tests {
                 "src/Workspace/A.luau"
             );
             assert_eq!(
-                path_to_sourcemap_relative(
-                    Path::new(r"c:\Proj"),
-                    Path::new(r"C:\proj\src\B.luau")
-                ),
+                path_to_sourcemap_relative(Path::new(r"c:\Proj"), Path::new(r"C:\proj\src\B.luau")),
                 "src/B.luau"
             );
         } else {
@@ -35565,5 +38602,248 @@ mod tests {
         assert_eq!(module.properties.get("Source"), Some(&json!("return 7")));
         assert!(changed.is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_full_reconcile_is_not_discarded() {
+        let mut changes = EditorChangeSet::default();
+        push_editor_instance_change(
+            &mut changes,
+            "reconcileService",
+            "StarterGui",
+            true,
+            Vec::new(),
+        );
+        assert_eq!(changes.instance_changes.len(), 1);
+        assert!(changes.instance_changes[0].instances.is_empty());
+    }
+
+    #[test]
+    fn protected_place_writes_patch_binary_properties_and_attributes() {
+        let path = std::env::temp_dir().join(format!(
+            "renium-protected-place-writes-{}-{}.rbxl",
+            std::process::id(),
+            current_millis()
+        ));
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let mut builder = RbxInstanceBuilder::new("MaterialService").with_name("MaterialService");
+        builder.add_property("Use2022Materials", RbxVariant::Bool(false));
+        let service = dom.insert(dom.root_ref(), builder);
+        let output = File::create(&path).unwrap();
+        rbx_binary::to_writer(BufWriter::new(output), &dom, &[service]).unwrap();
+        let rows = vec![
+            json!({
+                "kind": "property",
+                "pathSegments": ["MaterialService"],
+                "pathOrdinals": [1],
+                "name": "Use2022Materials",
+                "value": true,
+            }),
+            json!({
+                "kind": "attribute",
+                "pathSegments": ["MaterialService"],
+                "pathOrdinals": [1],
+                "name": "ReniumTest",
+                "value": 4,
+            }),
+        ];
+        let review_rows = protected_write_rows_with_previous_values(&path, &rows).unwrap();
+        assert_eq!(review_rows[0].get("oldValueKnown"), Some(&json!(true)));
+        assert_eq!(review_rows[0].get("oldValue"), Some(&json!(false)));
+        assert_eq!(review_rows[1].get("oldValueKnown"), Some(&json!(true)));
+        assert_eq!(review_rows[1].get("oldValueMissing"), Some(&json!(true)));
+        assert_eq!(patch_place_protected_writes(&path, &rows).unwrap(), 2);
+        let input = File::open(&path).unwrap();
+        let output_dom = rbx_binary::from_reader(BufReader::new(input)).unwrap();
+        let output_service = output_dom
+            .get_by_ref(output_dom.root().children()[0])
+            .unwrap();
+        assert_eq!(
+            output_service.properties.get(&"Use2022MaterialsXml".into()),
+            Some(&RbxVariant::Bool(true))
+        );
+        let attributes = match output_service.properties.get(&"Attributes".into()) {
+            Some(RbxVariant::Attributes(attributes)) => attributes,
+            other => panic!("unexpected attributes: {other:?}"),
+        };
+        assert_eq!(
+            attributes.get("ReniumTest"),
+            Some(&RbxVariant::Float64(4.0))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn protected_review_reads_migrated_mesh_id_value() {
+        let path = std::env::temp_dir().join(format!(
+            "renium-protected-mesh-review-{}-{}.rbxl",
+            std::process::id(),
+            current_millis()
+        ));
+        let mesh = RbxInstanceBuilder::new("MeshPart")
+            .with_name("Mesh")
+            .with_property(
+                "MeshContent",
+                RbxContent::from_uri("rbxassetid://93436871821239"),
+            );
+        let dom = RbxWeakDom::new(mesh);
+        let output = File::create(&path).unwrap();
+        rbx_binary::to_writer(BufWriter::new(output), &dom, &[dom.root_ref()]).unwrap();
+        let rows = vec![json!({
+            "kind": "property",
+            "pathSegments": ["Mesh"],
+            "pathOrdinals": [1],
+            "name": "MeshId",
+            "value": "rbxassetid://131536866771677",
+        })];
+        let review_rows = protected_write_rows_with_previous_values(&path, &rows).unwrap();
+        assert_eq!(
+            review_rows[0].get("oldValue"),
+            Some(&json!("rbxassetid://93436871821239"))
+        );
+        assert!(review_rows[0].get("oldValueMissing").is_none());
+        assert_eq!(patch_place_protected_writes(&path, &rows).unwrap(), 1);
+        let patched_rows = protected_write_rows_with_previous_values(&path, &rows).unwrap();
+        assert_eq!(
+            patched_rows[0].get("oldValue"),
+            Some(&json!("rbxassetid://131536866771677"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_snapshot_preserves_unrelated_service_root_properties() {
+        let database = rbx_reflection_database::get().unwrap();
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let mut lighting = RbxInstanceBuilder::new("Lighting").with_name("Lighting");
+        lighting.add_property("Brightness", RbxVariant::Float32(1.75));
+        dom.insert(dom.root_ref(), lighting);
+        let mut players = RbxInstanceBuilder::new("Players").with_name("Players");
+        players.add_property("CharacterAutoLoads", RbxVariant::Bool(false));
+        dom.insert(dom.root_ref(), players);
+        let service_names = HashSet::from(["Lighting".to_string(), "Players".to_string()]);
+        let mut values = rbx_dom_service_root_property_values(&dom, &service_names, database);
+        let mut live_lighting = Map::new();
+        live_lighting.insert("Brightness".to_string(), json!(3.5));
+        merge_live_service_root_property_values(
+            "Lighting",
+            values.get_mut("Lighting").unwrap(),
+            &live_lighting,
+            database,
+        );
+        assert_eq!(
+            values
+                .get("Players")
+                .and_then(|properties| properties.get("CharacterAutoLoads")),
+            Some(&json!(false))
+        );
+        let mut live_players = Map::new();
+        live_players.insert("MaxPlayers".to_string(), json!(60));
+        live_players.insert("PreferredPlayers".to_string(), json!(60));
+        merge_live_service_root_property_values(
+            "Players",
+            values.get_mut("Players").unwrap(),
+            &live_players,
+            database,
+        );
+        assert!(!values["Players"].contains_key("MaxPlayersInternal"));
+        assert!(!values["Players"].contains_key("PreferredPlayersInternal"));
+        let refs = BytecodeModelExportRefs {
+            by_index: HashMap::new(),
+            by_settings_id: HashMap::new(),
+            by_path_key: HashMap::new(),
+        };
+        let encoded =
+            encode_service_root_property_values("Players", &values["Players"], database, &refs);
+        assert_eq!(
+            encoded.get(&rbx_dom_weak::Ustr::from("CharacterAutoLoads")),
+            Some(&RbxVariant::Bool(false))
+        );
+    }
+
+    #[test]
+    fn game_settings_properties_are_not_sent_or_patched() {
+        let path = vec!["Players".to_string()];
+        assert!(is_externally_managed_editor_property(
+            "Players",
+            "Players",
+            &path,
+            "MaxPlayers"
+        ));
+        assert!(is_externally_managed_protected_write(&json!({
+            "service": "Players",
+            "className": "Players",
+            "pathSegments": ["Players"],
+            "name": "PreferredPlayers",
+        })));
+        assert!(!is_externally_managed_editor_property(
+            "Players",
+            "Players",
+            &path,
+            "CharacterAutoLoads"
+        ));
+        assert!(protected_write_matches_previous(&json!({
+            "oldValueKnown": true,
+            "oldValue": {"_type": "EnumItem", "name": "Improved", "value": 1},
+            "value": {"_type": "EnumItem", "name": "Improved"},
+        })));
+        assert!(!protected_write_matches_previous(&json!({
+            "oldValueKnown": true,
+            "oldValueMissing": true,
+            "value": false,
+        })));
+    }
+
+    #[test]
+    fn protected_review_only_keeps_user_facing_properties() {
+        let database = rbx_reflection_database::get().unwrap();
+        assert!(!is_user_facing_protected_write(
+            &json!({
+                "kind": "attribute",
+                "className": "Lighting",
+                "name": "RBX_OriginalTechnologyOnFileLoad",
+            }),
+            database
+        ));
+        assert!(!is_user_facing_protected_write(
+            &json!({
+                "kind": "property",
+                "className": "Lighting",
+                "name": "ExtendLightRangeTo120",
+            }),
+            database
+        ));
+        assert!(!is_user_facing_protected_write(
+            &json!({
+                "kind": "property",
+                "className": "Workspace",
+                "name": "CollisionGroupData",
+            }),
+            database
+        ));
+        assert!(!is_user_facing_protected_write(
+            &json!({
+                "kind": "property",
+                "className": "Lighting",
+                "name": "Technology",
+            }),
+            database
+        ));
+        assert!(is_user_facing_protected_write(
+            &json!({
+                "kind": "property",
+                "className": "MeshPart",
+                "name": "MeshId",
+            }),
+            database
+        ));
+        assert!(is_user_facing_protected_write(
+            &json!({
+                "kind": "attribute",
+                "className": "Part",
+                "name": "CreatorNote",
+            }),
+            database
+        ));
     }
 }

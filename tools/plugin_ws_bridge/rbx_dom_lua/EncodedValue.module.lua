@@ -11,8 +11,8 @@ local function unpackDecoder(f)
 end
 
 local function serializeFloat(value)
-	-- TODO: Figure out a better way to serialize infinity and NaN, neither of
-	-- which fit into JSON.
+
+
 	if value == math.huge or value == -math.huge then
 		return 999999999 * math.sign(value)
 	end
@@ -117,7 +117,7 @@ types = {
 			local pos = pod.position
 			local orient = pod.orientation
 
-			--stylua: ignore
+
 			return CFrame.new(
 				pos[1], pos[2], pos[3],
 				orient[1][1], orient[1][2], orient[1][3],
@@ -228,7 +228,7 @@ types = {
 		fromPod = identity,
 
 		toPod = function(roblox)
-			-- FIXME: More robust handling of enums
+
 			if typeof(roblox) == "number" then
 				return roblox
 			else
@@ -350,9 +350,9 @@ types = {
 			local keypoints = {}
 
 			for index, keypoint in ipairs(pod.keypoints) do
-				-- TODO: Add a test for NaN or Infinity values and envelopes
-				-- Right now it isn't possible because it'd fail the roundtrip.
-				-- It's more important that it works right now, though.
+
+
+
 				local value = keypoint.value or 0
 				local envelope = keypoint.envelope or 0
 				keypoints[index] = NumberSequenceKeypoint.new(keypoint.time, value, envelope)
@@ -383,8 +383,8 @@ types = {
 			if pod == "Default" then
 				return nil
 			else
-				-- Passing `nil` instead of not passing anything gives
-				-- different results, so we have to branch here.
+
+
 				if pod.acousticAbsorption then
 					return (PhysicalProperties.new :: any)(
 						pod.density,
@@ -584,7 +584,7 @@ function EncodedValue.decode(encodedValue)
 	local ty, value = next(encodedValue)
 
 	if ty == nil then
-		-- If the encoded pair is empty, assume it is an unoccupied optional value
+
 		return true, nil
 	end
 

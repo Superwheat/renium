@@ -828,6 +828,7 @@ fn unwrap_attribute_value(value: Value) -> Value {
         "Font",
         "ColorSequence",
         "NumberSequence",
+        "BinaryString",
     ] {
         if let Some(value) = object.remove(key) {
             return value;
@@ -2061,9 +2062,6 @@ fn collect_raw_object_strings<'a>(
         }
     }
     for (key, child) in obj {
-        if key == "_type" {
-            continue;
-        }
         add_count(out, key, 1);
         collect_raw_value_strings(child, lookup, out)?;
     }
@@ -2082,6 +2080,10 @@ fn collect_font_strings<'a>(obj: &'a Map<String, Value>, out: &mut SettingsStrin
     if let Some(style) = obj.get("style").and_then(Value::as_str) {
         add_count(out, "style", 1);
         add_count(out, split_enum_tail(style), 1);
+    }
+    if let Some(cached_face_id) = obj.get("cachedFaceId").and_then(Value::as_str) {
+        add_count(out, "cachedFaceId", 1);
+        add_count(out, cached_face_id, 1);
     }
 }
 
@@ -2277,10 +2279,7 @@ fn write_raw_object_payload<W: Write + ?Sized>(
         }
     }
 
-    let fields: Vec<_> = obj
-        .iter()
-        .filter(|(key, _)| key.as_str() != "_type")
-        .collect();
+    let fields: Vec<_> = obj.iter().collect();
     write_var_u64(writer, fields.len() as u64)?;
     for (key, child) in fields {
         write_binary_string_id(writer, string_ids, key)?;
@@ -2392,6 +2391,9 @@ fn write_font_payload<W: Write + ?Sized>(
     if let Some(style) = obj.get("style").and_then(Value::as_str) {
         fields.push(("style", split_enum_tail(style)));
     }
+    if let Some(cached_face_id) = obj.get("cachedFaceId").and_then(Value::as_str) {
+        fields.push(("cachedFaceId", cached_face_id));
+    }
 
     write_var_u64(writer, fields.len() as u64)?;
     for (key, value) in fields {
@@ -2480,6 +2482,7 @@ fn attribute_type_key(obj: &Map<String, Value>) -> Option<&'static str> {
         "Font",
         "ColorSequence",
         "NumberSequence",
+        "BinaryString",
     ];
     for key in supported {
         if obj.get(key).is_some() {
@@ -2704,9 +2707,6 @@ mod tests {
         assert_eq!(fixed_numeric_component_f32(f64::NAN), 0.0_f32);
     }
 
-    /// Diagnostic, not a correctness test. Run with:
-    /// RENIUM_TIMING_STORE=path\to\__roblox_sync_settings.renium \
-    ///   cargo test --release decode_timing_breakdown -- --ignored --nocapture
     #[test]
     #[ignore]
     fn decode_timing_breakdown() {
@@ -2861,8 +2861,28 @@ mod tests {
                     properties: Map::from_iter([
                         ("Tags".to_string(), json!(["Enemy"])),
                         ("Transparency".to_string(), json!(0.25)),
+                        (
+                            "CollisionGroupData".to_string(),
+                            json!({"_type":"BinaryString","base64":"AAEC"}),
+                        ),
+                        (
+                            "FontFace".to_string(),
+                            json!({
+                                "_type":"Font",
+                                "family":"rbxasset://fonts/families/SourceSansPro.json",
+                                "weight":"Regular",
+                                "style":"Normal",
+                                "cachedFaceId":"rbxasset://fonts/SourceSansPro-Regular.ttf",
+                            }),
+                        ),
                     ]),
-                    attributes: Map::from_iter([("Health".to_string(), json!(100))]),
+                    attributes: Map::from_iter([
+                        ("Health".to_string(), json!(100)),
+                        (
+                            "OriginalMaterial".to_string(),
+                            json!({"_type":"BinaryString","base64":"UGxhc3RpYw=="}),
+                        ),
+                    ]),
                 },
                 SettingsBytecodeInstance {
                     settings_id: "input".to_string(),
@@ -2898,6 +2918,23 @@ mod tests {
         assert_eq!(
             decoded.instances[1].attributes.get("Health"),
             Some(&json!(100))
+        );
+        assert_eq!(
+            decoded.instances[1].properties.get("CollisionGroupData"),
+            Some(&json!({"_type":"BinaryString","base64":"AAEC"}))
+        );
+        assert_eq!(
+            decoded.instances[1].properties.get("FontFace"),
+            Some(&json!({
+                "family":"rbxasset://fonts/families/SourceSansPro.json",
+                "weight":"Regular",
+                "style":"Normal",
+                "cachedFaceId":"rbxasset://fonts/SourceSansPro-Regular.ttf",
+            }))
+        );
+        assert_eq!(
+            decoded.instances[1].attributes.get("OriginalMaterial"),
+            Some(&json!({"_type":"BinaryString","base64":"UGxhc3RpYw=="}))
         );
         assert_eq!(
             decoded.instances[2].attributes.get("gamepadEnterKeyCode"),

@@ -1,14 +1,4 @@
-//! Focus-free input injection into Roblox Studio play-test windows.
-//!
-//! Windows: posts WM_MOUSE*/WM_KEY* messages to the largest child window (the
-//! 3D viewport) of each Studio top-level window; the target window never needs
-//! focus. macOS: posts CGEvents to the Studio process id, with locations
-//! computed from the window's on-screen bounds; requires the Accessibility
-//! permission. Both backends expose window-relative coordinates; the caller
-//! calibrates a viewport offset by posting a mouse move and asking the target
-//! client (over the plugin bridge) where the engine saw the cursor.
-
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub struct StudioWindow {
     pub label: String,
@@ -28,8 +18,31 @@ pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWi
 }
 
 #[cfg(windows)]
+pub fn verified_studio_window_for_pid<F>(pid: u32, mut set_probe_phase: F) -> Result<StudioWindow>
+where
+    F: FnMut(u8, &[u32]) -> Result<()>,
+{
+    platform::verified_studio_window_for_pid(pid, &mut set_probe_phase)
+}
+
+#[cfg(windows)]
 pub fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
     platform::pid_for_local_tcp_port(port)
+}
+
+#[cfg(windows)]
+pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
+    platform::process_executable_path(pid)
+}
+
+#[cfg(windows)]
+pub fn studio_window_title(pid: u32) -> Result<String> {
+    platform::studio_window_title(pid)
+}
+
+#[cfg(windows)]
+pub fn terminate_studio_process(pid: u32) -> Result<()> {
+    platform::terminate_studio_process(pid)
 }
 
 #[cfg(not(windows))]
@@ -146,8 +159,13 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_filter(png::FilterType::Paeth);
-    let _ = encoder.add_text_chunk("Software".to_string(), "capture-rs 0.5.3+build.57".to_string());
-    let mut writer = encoder.write_header().context("Failed to write PNG header")?;
+    let _ = encoder.add_text_chunk(
+        "Software".to_string(),
+        "capture-rs 0.5.3+build.57".to_string(),
+    );
+    let mut writer = encoder
+        .write_header()
+        .context("Failed to write PNG header")?;
     writer
         .write_image_data(rgba)
         .context("Failed to write PNG data")?;
@@ -157,15 +175,19 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 #[cfg(windows)]
 mod platform {
     use super::StudioWindow;
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
 
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, EnumWindows, GetClientRect, GetWindowTextW, GetWindowThreadProcessId,
-        IsIconic, IsWindowVisible, PostMessageW, ShowWindow, SW_SHOWMINNOACTIVE,
-        SW_SHOWNOACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_RBUTTONDOWN, WM_RBUTTONUP,
+        EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsChild, IsIconic, IsWindowVisible, PostMessageW,
+        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, ShowWindow, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     const MK_LBUTTON: WPARAM = 0x0001;
@@ -176,6 +198,8 @@ mod platform {
         viewport: isize,
         capture: isize,
         render_matched: bool,
+        capture_verified: bool,
+        verified_frame: Option<(u32, u32, Vec<u8>)>,
         offset_x: i32,
         offset_y: i32,
     }
@@ -283,15 +307,280 @@ mod platform {
                 );
             }
         }
-        let click_target = if state.exact != 0 { state.exact } else { state.best };
-        let capture = if state.render != 0 { state.render } else { click_target };
+        let click_target = if state.exact != 0 {
+            state.exact
+        } else {
+            state.best
+        };
+        let capture = if state.render != 0 {
+            state.render
+        } else {
+            click_target
+        };
         WindowHandle {
             viewport: click_target,
             capture,
             render_matched: state.render != 0,
+            capture_verified: false,
+            verified_frame: None,
             offset_x: 0,
             offset_y: 0,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CaptureCandidate {
+        hwnd: isize,
+        width: i32,
+        height: i32,
+    }
+
+    struct EnumCaptureState {
+        candidates: Vec<CaptureCandidate>,
+    }
+
+    unsafe extern "system" fn enum_capture_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut EnumCaptureState) };
+        if unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+            return 1;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width >= 96 && height >= 96 {
+            state.candidates.push(CaptureCandidate {
+                hwnd: hwnd as isize,
+                width,
+                height,
+            });
+        }
+        1
+    }
+
+    fn capture_candidates(top: isize) -> Vec<CaptureCandidate> {
+        let mut state = EnumCaptureState {
+            candidates: Vec::new(),
+        };
+        let _dpi = ThreadDpiAwareness::per_monitor_v2();
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetClientRect(top as HWND, &mut rect) } != 0 {
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            if width >= 96 && height >= 96 {
+                state.candidates.push(CaptureCandidate {
+                    hwnd: top,
+                    width,
+                    height,
+                });
+            }
+        }
+        unsafe {
+            EnumChildWindows(
+                top as HWND,
+                Some(enum_capture_proc),
+                &mut state as *mut EnumCaptureState as LPARAM,
+            );
+        }
+        state.candidates
+    }
+
+    fn capture_hwnd_pixels(hwnd: isize, allow_fallback: bool) -> Result<(u32, u32, Vec<u8>)> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+            CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+            ReleaseDC, SRCCOPY, SelectObject,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn PrintWindow(hwnd: HWND, hdc: *mut std::ffi::c_void, flags: u32) -> i32;
+        }
+        const PW_CLIENTONLY: u32 = 0x1;
+        const PW_RENDERFULLCONTENT: u32 = 0x2;
+
+        let _dpi = ThreadDpiAwareness::per_monitor_v2();
+        let hwnd = hwnd as HWND;
+        if unsafe { IsWindow(hwnd) } == 0 {
+            bail!("Capture target no longer exists");
+        }
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+            bail!("GetClientRect failed for capture target");
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            bail!("Capture target has no client area");
+        }
+
+        unsafe {
+            let window_dc = GetDC(hwnd);
+            if window_dc.is_null() {
+                bail!("GetDC failed for capture target");
+            }
+            let memory_dc = CreateCompatibleDC(window_dc);
+            if memory_dc.is_null() {
+                ReleaseDC(hwnd, window_dc);
+                bail!("CreateCompatibleDC failed for capture target");
+            }
+            let bitmap = CreateCompatibleBitmap(window_dc, width, height);
+            if bitmap.is_null() {
+                DeleteDC(memory_dc);
+                ReleaseDC(hwnd, window_dc);
+                bail!("CreateCompatibleBitmap failed for capture target");
+            }
+            let previous = SelectObject(memory_dc, bitmap as _);
+            let printed = PrintWindow(hwnd, memory_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+            if printed == 0 && !allow_fallback {
+                SelectObject(memory_dc, previous);
+                DeleteObject(bitmap as _);
+                DeleteDC(memory_dc);
+                ReleaseDC(hwnd, window_dc);
+                bail!("PrintWindow rejected the verified capture target");
+            }
+            if printed == 0 {
+                BitBlt(memory_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY);
+            }
+
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+            let copied = GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+
+            SelectObject(memory_dc, previous);
+            DeleteObject(bitmap as _);
+            DeleteDC(memory_dc);
+            ReleaseDC(hwnd, window_dc);
+            if copied == 0 {
+                bail!("GetDIBits failed for capture target");
+            }
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+                pixel[3] = 0xFF;
+            }
+            Ok((width as u32, height as u32, pixels))
+        }
+    }
+
+    struct ProbeFrame {
+        candidate: CaptureCandidate,
+        pixels: Vec<u8>,
+    }
+
+    fn capture_probe_frames(candidates: &[CaptureCandidate]) -> Vec<ProbeFrame> {
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let (width, height, pixels) = capture_hwnd_pixels(candidate.hwnd, false).ok()?;
+                if width as i32 != candidate.width || height as i32 != candidate.height {
+                    return None;
+                }
+                Some(ProbeFrame {
+                    candidate: *candidate,
+                    pixels,
+                })
+            })
+            .collect()
+    }
+
+    fn probe_palette(mut state: u64) -> [u32; 16] {
+        let mut colors = [0u32; 16];
+        for color in &mut colors {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let red = if state & 1 == 0 { 16 } else { 240 };
+            let green = if state & 2 == 0 { 16 } else { 240 };
+            let blue = if state & 4 == 0 { 16 } else { 240 };
+            *color = ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
+        }
+        colors
+    }
+
+    fn probe_transition_matches(
+        before: &ProbeFrame,
+        after: &ProbeFrame,
+        first: &[u32; 16],
+        second: &[u32; 16],
+    ) -> bool {
+        let width = before.candidate.width as usize;
+        let height = before.candidate.height as usize;
+        if before.pixels.len() != width.saturating_mul(height).saturating_mul(4)
+            || after.pixels.len() != before.pixels.len()
+        {
+            return false;
+        }
+        first
+            .iter()
+            .zip(second)
+            .enumerate()
+            .all(|(index, (first_color, second_color))| {
+                let column = index % 4;
+                let row = index / 4;
+                let center_x = ((column * 2 + 1) * width) / 8;
+                let center_y = ((row * 2 + 1) * height) / 8;
+                let first_rgb = [
+                    ((first_color >> 16) & 0xff) as i16,
+                    ((first_color >> 8) & 0xff) as i16,
+                    (first_color & 0xff) as i16,
+                ];
+                let second_rgb = [
+                    ((second_color >> 16) & 0xff) as i16,
+                    ((second_color >> 8) & 0xff) as i16,
+                    (second_color & 0xff) as i16,
+                ];
+                let mut matching = 0usize;
+                for dy in -2isize..=2 {
+                    for dx in -2isize..=2 {
+                        let x = center_x.saturating_add_signed(dx).min(width - 1);
+                        let y = center_y.saturating_add_signed(dy).min(height - 1);
+                        let offset = (y * width + x) * 4;
+                        let channels_match = (0..3).all(|channel| {
+                            let expected = second_rgb[channel] - first_rgb[channel];
+                            let actual = after.pixels[offset + channel] as i16
+                                - before.pixels[offset + channel] as i16;
+                            actual.signum() == expected.signum() && (2..=8).contains(&actual.abs())
+                        });
+                        if channels_match {
+                            matching += 1;
+                        }
+                    }
+                }
+                matching >= 20
+            })
+    }
+
+    fn probe_frames_equivalent(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let different = a
+            .chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(x, y)| {
+                x[0].abs_diff(y[0])
+                    .max(x[1].abs_diff(y[1]))
+                    .max(x[2].abs_diff(y[2]))
+                    > 2
+            })
+            .count();
+        different * 10_000 <= a.len() / 4
     }
 
     pub fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
@@ -337,6 +626,84 @@ mod platform {
             }
         }
         bail!("No TCP connection with local port {port} found")
+    }
+
+    fn windows_for_pid(pid: u32) -> Vec<(isize, String)> {
+        let mut state = EnumTopState {
+            pids: vec![pid],
+            windows: Vec::new(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(enum_top_proc),
+                &mut state as *mut EnumTopState as LPARAM,
+            );
+        }
+        state
+            .windows
+            .into_iter()
+            .map(|(hwnd, _, title)| (hwnd, title))
+            .collect()
+    }
+
+    fn window_class(hwnd: isize) -> String {
+        let mut class = [0u16; 128];
+        let len = unsafe { GetClassNameW(hwnd as HWND, class.as_mut_ptr(), class.len() as i32) };
+        if len <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&class[..len as usize])
+        }
+    }
+
+    pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            bail!("Could not open Studio process {pid}");
+        }
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 || length == 0 {
+            bail!("Could not read the executable path for Studio process {pid}");
+        }
+        Ok(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buffer[..length as usize],
+        )))
+    }
+
+    pub fn studio_window_title(pid: u32) -> Result<String> {
+        let windows = windows_for_pid(pid);
+        windows
+            .iter()
+            .find(|(hwnd, title)| {
+                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+            })
+            .or_else(|| {
+                windows
+                    .iter()
+                    .find(|(hwnd, _)| window_class(*hwnd).starts_with("Qt"))
+            })
+            .map(|(_, title)| title.clone())
+            .with_context(|| format!("No Studio window found for process {pid}"))
+    }
+
+    pub fn terminate_studio_process(pid: u32) -> Result<()> {
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(handle, 0) } == 0 {
+            unsafe { CloseHandle(handle) };
+            bail!("Could not terminate Studio process {pid}");
+        }
+        if unsafe { WaitForSingleObject(handle, 5000) } != 0 {
+            unsafe { CloseHandle(handle) };
+            bail!("Studio process {pid} did not terminate");
+        }
+        unsafe { CloseHandle(handle) };
+        Ok(())
     }
 
     struct ThreadDpiAwareness {
@@ -413,6 +780,143 @@ mod platform {
         })
     }
 
+    pub fn verified_studio_window_for_pid<F>(
+        pid: u32,
+        set_probe_phase: &mut F,
+    ) -> Result<StudioWindow>
+    where
+        F: FnMut(u8, &[u32]) -> Result<()>,
+    {
+        let mut state = EnumTopState {
+            pids: vec![pid],
+            windows: Vec::new(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(enum_top_proc),
+                &mut state as *mut EnumTopState as LPARAM,
+            );
+        }
+        let (hwnd, pid, title) = state
+            .windows
+            .into_iter()
+            .find(|(hwnd, _, title)| {
+                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+            })
+            .with_context(|| format!("No visible Studio window found for process {pid}"))?;
+        let reminimize = if unsafe { IsIconic(hwnd as HWND) } != 0 {
+            unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Some(ReminimizeGuard { top: hwnd })
+        } else {
+            None
+        };
+        let mut probe_started = false;
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+            ^ ((pid as u64) << 32)
+            ^ hwnd as u64;
+        let first_colors = probe_palette(seed ^ 0x4f1b_7ca3_8d25_e691);
+        let second_colors = first_colors.map(|color| 0x00ff_ffff ^ color);
+        let selection = (|| {
+            set_probe_phase(0, &first_colors)?;
+            probe_started = true;
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let candidates = capture_candidates(hwnd);
+            if candidates.is_empty() {
+                bail!("Studio exposed no capturable windows for viewport verification");
+            }
+            let first = capture_probe_frames(&candidates);
+            set_probe_phase(1, &second_colors)?;
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let second = capture_probe_frames(&candidates);
+
+            let mut contenders = Vec::new();
+            for after in second {
+                let Some(before) = first.iter().find(|entry| {
+                    entry.candidate.hwnd == after.candidate.hwnd
+                        && entry.candidate.width == after.candidate.width
+                        && entry.candidate.height == after.candidate.height
+                }) else {
+                    continue;
+                };
+                if probe_transition_matches(before, &after, &first_colors, &second_colors) {
+                    contenders.push(after);
+                }
+            }
+            if contenders.is_empty() {
+                bail!(
+                    "Could not prove which Studio child is the rendered viewport; no window reproduced both capture identity patterns"
+                );
+            }
+            Ok(contenders)
+        })();
+        let stop_result = if probe_started {
+            set_probe_phase(2, &[])
+        } else {
+            Ok(())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let contenders = selection?;
+        stop_result.context("Failed to remove the Studio viewport capture probe")?;
+        let baseline = capture_probe_frames(
+            &contenders
+                .iter()
+                .map(|frame| frame.candidate)
+                .collect::<Vec<_>>(),
+        );
+        let composite_hosts = baseline
+            .iter()
+            .filter(|host| {
+                baseline.iter().any(|child| {
+                    child.candidate.hwnd != host.candidate.hwnd
+                        && unsafe {
+                            IsChild(host.candidate.hwnd as HWND, child.candidate.hwnd as HWND)
+                        } != 0
+                        && probe_frames_equivalent(&host.pixels, &child.pixels)
+                })
+            })
+            .collect::<Vec<_>>();
+        let leaves = composite_hosts
+            .iter()
+            .filter(|host| {
+                !composite_hosts.iter().any(|other| {
+                    other.candidate.hwnd != host.candidate.hwnd
+                        && unsafe {
+                            IsChild(host.candidate.hwnd as HWND, other.candidate.hwnd as HWND)
+                        } != 0
+                })
+            })
+            .collect::<Vec<_>>();
+        if leaves.len() != 1 || leaves[0].candidate.hwnd == hwnd {
+            bail!(
+                "Studio exposed no unique probe-free composited viewport host; refusing to guess"
+            );
+        }
+        let root = leaves[0];
+        let candidate = root.candidate;
+        let handle = WindowHandle {
+            viewport: candidate.hwnd,
+            capture: candidate.hwnd,
+            render_matched: true,
+            capture_verified: true,
+            verified_frame: Some((
+                candidate.width as u32,
+                candidate.height as u32,
+                root.pixels.clone(),
+            )),
+            offset_x: 0,
+            offset_y: 0,
+        };
+        Ok(StudioWindow {
+            label: format!("verified viewport for pid {pid}: {title}"),
+            handle,
+            _reminimize: reminimize,
+        })
+    }
+
     fn mouse_lparam(handle: &WindowHandle, x: i32, y: i32) -> LPARAM {
         let x = x + handle.offset_x;
         let y = y + handle.offset_y;
@@ -478,84 +982,21 @@ mod platform {
     }
 
     pub fn capture_window_png(handle: &WindowHandle, path: &std::path::Path) -> Result<(u32, u32)> {
-        use windows_sys::Win32::Graphics::Gdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-            GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-            DIB_RGB_COLORS, HDC, SRCCOPY,
-        };
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> i32;
+        if let Some((width, height, pixels)) = &handle.verified_frame {
+            super::write_png(path, *width, *height, pixels)?;
+            return Ok((*width, *height));
         }
-        const PW_CLIENTONLY: u32 = 0x1;
-        const PW_RENDERFULLCONTENT: u32 = 0x2;
-
-        let _dpi = ThreadDpiAwareness::per_monitor_v2();
-        let hwnd = handle.capture as HWND;
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-            bail!("GetClientRect failed for capture target");
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 0 || height <= 0 {
-            bail!("Capture target has no client area");
-        }
-
-        unsafe {
-            let window_dc = GetDC(hwnd);
-            if window_dc.is_null() {
-                bail!("GetDC failed for capture target");
-            }
-            let memory_dc = CreateCompatibleDC(window_dc);
-            let bitmap = CreateCompatibleBitmap(window_dc, width, height);
-            let previous = SelectObject(memory_dc, bitmap as _);
-
-            let printed = PrintWindow(hwnd, memory_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
-            if printed == 0 {
-                BitBlt(memory_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY);
-            }
-
-            let mut info: BITMAPINFO = std::mem::zeroed();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = width;
-            info.bmiHeader.biHeight = -height;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            info.bmiHeader.biCompression = BI_RGB;
-            let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
-            let copied = GetDIBits(
-                memory_dc,
-                bitmap,
-                0,
-                height as u32,
-                pixels.as_mut_ptr() as *mut _,
-                &mut info,
-                DIB_RGB_COLORS,
-            );
-
-            SelectObject(memory_dc, previous);
-            DeleteObject(bitmap as _);
-            DeleteDC(memory_dc);
-            ReleaseDC(hwnd, window_dc);
-
-            if copied == 0 {
-                bail!("GetDIBits failed for capture target");
-            }
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-                pixel[3] = 0xFF;
-            }
-            super::write_png(path, width as u32, height as u32, &pixels)?;
-        }
-        Ok((width as u32, height as u32))
+        let (width, height, pixels) =
+            capture_hwnd_pixels(handle.capture, !handle.capture_verified)?;
+        super::write_png(path, width, height, &pixels)?;
+        Ok((width, height))
     }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::StudioWindow;
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use std::ffi::c_void;
 
     type CFTypeRef = *const c_void;
@@ -603,7 +1044,7 @@ mod platform {
     unsafe extern "C" {
         fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
         fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
-            -> bool;
+        -> bool;
         fn CGEventCreateMouseEvent(
             source: *const c_void,
             event_type: u32,
@@ -616,11 +1057,7 @@ mod platform {
             key_down: bool,
         ) -> CGEventRef;
         fn CGEventPostToPid(pid: i32, event: CGEventRef);
-        fn CGEventKeyboardSetUnicodeString(
-            event: CGEventRef,
-            length: usize,
-            string: *const u16,
-        );
+        fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
         fn CGWindowListCreateImage(
             screen_bounds: CGRect,
             options: u32,
@@ -906,10 +1343,7 @@ mod platform {
         Ok(())
     }
 
-    pub fn capture_window_png(
-        handle: &WindowHandle,
-        path: &std::path::Path,
-    ) -> Result<(u32, u32)> {
+    pub fn capture_window_png(handle: &WindowHandle, path: &std::path::Path) -> Result<(u32, u32)> {
         const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
         const K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING: u32 = 1 << 0;
         let null_rect = CGRect {
@@ -946,8 +1380,7 @@ mod platform {
                 false,
             );
             let png_type = cf_string("public.png");
-            let destination =
-                CGImageDestinationCreateWithURL(url, png_type, 1, std::ptr::null());
+            let destination = CGImageDestinationCreateWithURL(url, png_type, 1, std::ptr::null());
             let mut finalized = false;
             if !destination.is_null() {
                 CGImageDestinationAddImage(destination, image, std::ptr::null());
@@ -970,7 +1403,7 @@ mod platform {
 #[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use super::StudioWindow;
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
 
     #[derive(Clone)]
     pub struct WindowHandle;

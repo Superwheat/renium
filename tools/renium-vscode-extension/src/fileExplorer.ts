@@ -4349,8 +4349,8 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     this.pushCurrent();
   }
 
-  /** Show a decoded .renium instance's inline properties in the Properties view
-   * (read-only) — used by the Inspector tab, which has no live backend node. */
+
+
   public showReadonlyInstance(info: {
     name?: string;
     className?: string;
@@ -6310,7 +6310,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Decode raw bytes dropped from the OS onto the Inspector tab. */
+
   private async handleRbsyncDecode(name: string | undefined, base64: string | undefined): Promise<void> {
     const webview = this.webviewView?.webview;
     if (!webview || typeof base64 !== "string") {
@@ -6340,8 +6340,8 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
-  /** Decode a file dropped from the VS Code Explorer (a text/uri-list URI) or
-   * chosen via the browse dialog — both arrive as a filesystem path/URI. */
+
+
   private async handleRbsyncDecodePath(raw: string | undefined): Promise<void> {
     const webview = this.webviewView?.webview;
     if (!webview || typeof raw !== "string" || !raw.trim()) {
@@ -6353,7 +6353,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         fsPath = vscode.Uri.parse(fsPath).fsPath;
       }
     } catch {
-      /* fall back to the raw string as a path */
+
     }
     const config = getExplorerConfig();
     this.postRbsyncResult(
@@ -6363,8 +6363,8 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
-  /** Browse fallback so the tab is usable even where webview file drops don't
-   * fire: open a picker and decode the chosen .renium store. */
+
+
   private async handleRbsyncBrowse(): Promise<void> {
     const picked = await vscode.window.showOpenDialog({
       canSelectMany: false,
@@ -9513,8 +9513,8 @@ export class FileExplorerController implements vscode.Disposable {
   private reniumActivityVisible = false;
   private observedVisibleViewThisSession = false;
 
-  /** Show a decoded .renium instance's properties in the Renium Properties view
-   * — used by the double-click custom editor, which has no Properties pane. */
+
+
   public showRbsyncPropertiesReadonly(node: {
     name?: string;
     className?: string;
