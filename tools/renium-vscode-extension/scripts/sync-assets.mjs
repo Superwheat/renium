@@ -17,6 +17,15 @@ const insertableObjectsIconTheme = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_TH
 const insertableObjectsIconSize = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SIZE ?? "Standard";
 const preferredIconScale = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SCALE ?? "@2x";
 
+function syncStudioPluginBundle() {
+  const source = path.join(repoRoot, "tools", "plugin_ws_bridge", "Renium.rbxm");
+  const bytes = fs.readFileSync(source);
+  if (bytes.length < 16 || bytes.subarray(0, 7).toString("ascii") !== "<roblox") {
+    throw new Error(`Invalid Studio plugin bundle: ${source}`);
+  }
+  fs.copyFileSync(source, path.join(extensionAssets, "Renium.rbxm"));
+}
+
 function discoverInsertableObjectsIconRoot() {
   const localAppData = process.env.LOCALAPPDATA;
   if (!localAppData) {
@@ -145,4 +154,5 @@ generateRobloxPropertiesMetadata({
     process.argv.includes("--refresh-studio-api") ||
     process.env.RENIUM_REFRESH_STUDIO_API === "1",
 });
+syncStudioPluginBundle();
 syncInsertableObjectIcons();

@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content tools/renium/Cargo.toml -Raw
+          $match = [regex]::Match($manifest, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*$')
+          if (-not $match.Success) { throw "Could not read the Renium version" }
+          $version = $match.Groups["version"].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match version $version"
+          }
+          $package = Get-Content tools/renium-vscode-extension/package.json -Raw | ConvertFrom-Json
+          if ([string]$package.version -ne $version) { throw "Extension version does not match $version" }
+          $runtime = Get-Content tools/plugin_ws_bridge/BridgePluginRuntime.module.lua -Raw
+          if ($runtime -notmatch ('BRIDGE_VERSION\s*=\s*"' + [regex]::Escape($version) + '"')) {
+            throw "Studio plugin version does not match $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+  cli:
+    name: CLI (${{ matrix.os }})
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Test and build
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --release --manifest-path tools/renium/Cargo.toml
+          cargo build --locked --release --manifest-path tools/renium/Cargo.toml
+
+      - name: Package CLI
+        shell: pwsh
+        run: |
+          $version = "${{ needs.verify-tag.outputs.version }}"
+          $platform = "${{ runner.os }}-${{ runner.arch }}".ToLowerInvariant()
+          $stage = Join-Path $env:RUNNER_TEMP "renium-$version-$platform"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          $binary = if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" }
+          Copy-Item "tools/renium/target/release/$binary" $stage
+          Copy-Item README.md $stage
+          Copy-Item tools/renium/README.md (Join-Path $stage "CLI-README.md")
+          Copy-Item LICENSE $stage
+          if ("${{ runner.os }}" -eq "Windows") {
+            Copy-Item rbx.cmd $stage
+            Copy-Item tools/renium/rbx-run.ps1 $stage
+          }
+          else {
+            Copy-Item rbx $stage
+          }
+          $archive = Join-Path $env:RUNNER_TEMP "renium-$version-$platform.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $archive
+          "RENIUM_ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.RENIUM_ARCHIVE }}
+          if-no-files-found: error
+
+  integration:
+    name: Plugin and extension
+    needs: verify-tag
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ok-nick/setup-aftman@e226f24209f47677da7b215bab44f6351a2c043b
+        with:
+          version: v0.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: tools/renium-vscode-extension/package-lock.json
+
+      - name: Build release components
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP "release-output"
+          ./tools/build-release.ps1 -OutputDirectory $output
+          $release = Join-Path $output "renium-${{ needs.verify-tag.outputs.version }}"
+          if (-not (Test-Path $release -PathType Container)) { throw "Release directory was not produced" }
+          "RENIUM_RELEASE_DIR=$release" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integration
+          path: ${{ env.RENIUM_RELEASE_DIR }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [verify-tag, cli, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -d '' files < <(find artifacts -type f -print0)
+          gh release create "${{ github.ref_name }}" "${files[@]}" --verify-tag --generate-notes

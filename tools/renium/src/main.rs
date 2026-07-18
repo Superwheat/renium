@@ -2703,6 +2703,7 @@ struct EditorSourceEnsureResult {
 struct EditorSourcePathSpec {
     service: String,
     class_name: String,
+    run_context: Option<String>,
     instance_name: String,
     instance_stem: String,
     parent_components: Vec<String>,
@@ -7677,9 +7678,12 @@ fn validate_rbxm(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn download_latest_plugin(destination: &Path) -> Result<String> {
-    let url =
-        format!("https://github.com/{GITHUB_REPO}/releases/latest/download/{PLUGIN_ASSET_NAME}");
+fn plugin_release_url(version: &str) -> String {
+    format!("https://github.com/{GITHUB_REPO}/releases/download/v{version}/{PLUGIN_ASSET_NAME}")
+}
+
+fn download_compatible_plugin(destination: &Path) -> Result<String> {
+    let url = plugin_release_url(BUILD_VERSION);
     let status = std::process::Command::new("curl")
         .args(["-fsSL", "--retry", "2", "--connect-timeout", "15", "-o"])
         .arg(destination)
@@ -7719,7 +7723,7 @@ fn setup_command(args: SetupArgs) -> Result<()> {
         let label = format!("bundled {}", sibling.display());
         (sibling, label)
     } else {
-        let url = download_latest_plugin(&staging_download)?;
+        let url = download_compatible_plugin(&staging_download)?;
         (staging_download.clone(), url)
     };
 
@@ -8507,6 +8511,23 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
                         source_key: Some(editor_source_key_from_target(target)),
                         settings_before: settings_before.clone(),
                     });
+                    if let Some(run_context) = spec.run_context.as_ref() {
+                        let mut properties = Map::new();
+                        properties.insert(
+                            "RunContext".to_string(),
+                            editor_run_context_value(run_context),
+                        );
+                        changes.property_changes.push(EditorPropertyChange {
+                            service: service.clone(),
+                            settings_id: target.settings_id.clone(),
+                            path_segments: target.path_segments.clone(),
+                            path_ordinals: target.path_ordinals.clone(),
+                            class_name: target.class_name.clone(),
+                            properties,
+                            attributes: Map::new(),
+                            allow_protected_mesh_id_apply: false,
+                        });
+                    }
                 }
                 dirty_services.insert(service.clone());
                 if !ensured.upsert_instances.is_empty() {
@@ -9064,6 +9085,28 @@ fn ensure_editor_source_target_in_bytecode(
         changed = true;
         added.index
     };
+
+    if document.instances[target_index].class_name == "Script" {
+        if let Some(run_context) = spec.run_context.as_ref()
+            && document.instances[target_index]
+                .properties
+                .get("RunContext")
+                .and_then(run_context_name)
+                .is_none_or(|value| !value.eq_ignore_ascii_case(run_context))
+        {
+            document.instances[target_index].properties.insert(
+                "RunContext".to_string(),
+                editor_run_context_value(run_context),
+            );
+            changed = true;
+        }
+    } else if document.instances[target_index]
+        .properties
+        .remove("RunContext")
+        .is_some()
+    {
+        changed = true;
+    }
 
     let target_ordinal = editor_child_name_ordinal(document, current_index, target_index);
     path_segments.push(document.instances[target_index].name.clone());
@@ -11651,7 +11694,9 @@ fn append_editor_source_path_node(
         .unwrap_or(&[]);
     let has_children = !child_indices.is_empty();
 
-    if let Some((source_file_name, leaf_suffix)) = script_file_names(&instance.class_name) {
+    if let Some((source_file_name, leaf_suffix)) =
+        script_file_names_for_properties(&instance.class_name, &instance.properties)
+    {
         let source_path = if has_children {
             parent_dir.join(fs_stem).join(source_file_name)
         } else {
@@ -11739,7 +11784,9 @@ fn append_editor_source_node(
         .unwrap_or(&[]);
     let has_children = !child_indices.is_empty();
 
-    if let Some((source_file_name, leaf_suffix)) = script_file_names(&instance.class_name) {
+    if let Some((source_file_name, leaf_suffix)) =
+        script_file_names_for_properties(&instance.class_name, &instance.properties)
+    {
         let source_path = if has_children {
             parent_dir.join(fs_stem).join(source_file_name)
         } else {
@@ -12139,6 +12186,7 @@ fn infer_editor_source_path_spec(
 ) -> Option<EditorSourcePathSpec> {
     let file_name = source_path.file_name()?.to_string_lossy();
     let (class_name, leaf_name) = infer_source_class_and_leaf_name(&file_name)?;
+    let run_context = inferred_source_run_context(&file_name).map(str::to_string);
     let service_dir = src_root.join(service);
     let relative = source_path.strip_prefix(service_dir).ok()?;
     let mut components = relative
@@ -12168,6 +12216,7 @@ fn infer_editor_source_path_spec(
     Some(EditorSourcePathSpec {
         service: service.to_string(),
         class_name: class_name.to_string(),
+        run_context,
         instance_name,
         instance_stem,
         parent_components,
@@ -12180,6 +12229,7 @@ fn infer_source_class_and_leaf_name(file_name: &str) -> Option<(&'static str, Op
     match lower.as_str() {
         "init.server.luau" | "init.server.lua" => return Some(("Script", None)),
         "init.client.luau" | "init.client.lua" => return Some(("LocalScript", None)),
+        "init.plugin.luau" | "init.plugin.lua" => return Some(("Script", None)),
         "init.luau" | "init.lua" => return Some(("ModuleScript", None)),
         _ => {}
     }
@@ -12189,6 +12239,8 @@ fn infer_source_class_and_leaf_name(file_name: &str) -> Option<(&'static str, Op
         (".server.lua", "Script"),
         (".client.luau", "LocalScript"),
         (".client.lua", "LocalScript"),
+        (".plugin.luau", "Script"),
+        (".plugin.lua", "Script"),
         (".luau", "ModuleScript"),
         (".lua", "ModuleScript"),
     ] {
@@ -12196,6 +12248,23 @@ fn infer_source_class_and_leaf_name(file_name: &str) -> Option<(&'static str, Op
             let leaf = file_name[..file_name.len() - suffix.len()].to_string();
             return Some((class_name, Some(leaf)));
         }
+    }
+    None
+}
+
+fn inferred_source_run_context(file_name: &str) -> Option<&'static str> {
+    let lower = file_name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "init.plugin.luau" | "init.plugin.lua")
+        || lower.ends_with(".plugin.luau")
+        || lower.ends_with(".plugin.lua")
+    {
+        return Some("Plugin");
+    }
+    if matches!(lower.as_str(), "init.server.luau" | "init.server.lua")
+        || lower.ends_with(".server.luau")
+        || lower.ends_with(".server.lua")
+    {
+        return Some("Legacy");
     }
     None
 }
@@ -18872,8 +18941,9 @@ fn link_target_file_pairs(
         let (class_name, _) = infer_source_class_and_leaf_name(&file_name).ok_or_else(|| {
             anyhow::anyhow!("link source is not a Lua script: {}", source_root.display())
         })?;
-        let (_, leaf_suffix) = script_file_names(class_name)
-            .ok_or_else(|| anyhow::anyhow!("unsupported script class {class_name}"))?;
+        let (_, leaf_suffix) =
+            script_file_names_for_run_context(class_name, inferred_source_run_context(&file_name))
+                .ok_or_else(|| anyhow::anyhow!("unsupported script class {class_name}"))?;
         let mirror = parent_dir.join(format!("{leaf}{leaf_suffix}"));
         ensure_existing_ancestor_inside(src_root, &mirror, "link target file")?;
         return Ok(vec![LinkFilePair {
@@ -18898,7 +18968,9 @@ fn link_target_file_pairs(
         let Some((class_name, leaf_name)) = infer_source_class_and_leaf_name(&file_name) else {
             continue;
         };
-        let Some((init_name, leaf_suffix)) = script_file_names(class_name) else {
+        let Some((init_name, leaf_suffix)) =
+            script_file_names_for_run_context(class_name, inferred_source_run_context(&file_name))
+        else {
             continue;
         };
         let renium_name = match leaf_name {
@@ -23657,11 +23729,24 @@ fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlaceGuardConfig {
     #[serde(default, rename = "allowedPlaceIds")]
     allowed_place_ids: Vec<i64>,
     #[serde(default, rename = "allowedGameIds")]
     allowed_game_ids: Vec<i64>,
+}
+
+fn parse_place_guard_config(text: &str, path: &Path) -> Result<PlaceGuardConfig> {
+    let config: PlaceGuardConfig = serde_json::from_str(text)
+        .with_context(|| format!("Invalid place guard JSON in {}", path.display()))?;
+    if config.allowed_place_ids.is_empty() && config.allowed_game_ids.is_empty() {
+        bail!(
+            "Place guard {} must contain at least one allowedPlaceIds or allowedGameIds entry; remove the file to disable the guard",
+            path.display()
+        );
+    }
+    Ok(config)
 }
 
 fn place_guard_config_path() -> PathBuf {
@@ -23684,12 +23769,7 @@ fn active_place_guard() -> Result<Option<PlaceGuardConfig>> {
                 .with_context(|| format!("Failed to read place guard {}", path.display()));
         }
     };
-    let config: PlaceGuardConfig = serde_json::from_str(&text)
-        .with_context(|| format!("Invalid place guard JSON in {}", path.display()))?;
-    Ok(
-        (!config.allowed_place_ids.is_empty() || !config.allowed_game_ids.is_empty())
-            .then_some(config),
-    )
+    Ok(Some(parse_place_guard_config(&text, &path)?))
 }
 
 fn ensure_place_allowed(info: &BridgeInfoPayload) -> Result<()> {
@@ -30272,7 +30352,9 @@ fn emit_split_node_shell(
     let instance = &state.instances[index];
     let class_name = instance.class_name.as_str();
 
-    if let Some((source_file_name, _leaf_suffix)) = script_file_names(class_name) {
+    if let Some((source_file_name, _leaf_suffix)) =
+        script_file_names_for_properties(class_name, &instance.properties)
+    {
         let dir_path = parent_dir.join(fs_stem);
         fs::create_dir_all(&dir_path)
             .with_context(|| format!("Failed to create {}", dir_path.display()))?;
@@ -30997,7 +31079,9 @@ fn emit_node_index(
     let class_name = instance.class_name.as_str();
     let mut expected = ExpectedPathBatch::default();
 
-    if let Some((source_file_name, leaf_suffix)) = script_file_names(class_name) {
+    if let Some((source_file_name, leaf_suffix)) =
+        script_file_names_for_properties(class_name, &instance.properties)
+    {
         let source = instance
             .properties
             .get("Source")
@@ -31186,12 +31270,54 @@ fn write_script_source_file(source_path: &Path, source: &str) -> Result<()> {
 }
 
 fn script_file_names(class_name: &str) -> Option<(&'static str, &'static str)> {
+    script_file_names_for_run_context(class_name, None)
+}
+
+fn script_file_names_for_properties(
+    class_name: &str,
+    properties: &Map<String, Value>,
+) -> Option<(&'static str, &'static str)> {
+    script_file_names_for_run_context(
+        class_name,
+        properties.get("RunContext").and_then(run_context_name),
+    )
+}
+
+fn script_file_names_for_run_context(
+    class_name: &str,
+    run_context: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
     match class_name {
+        "Script" if run_context.is_some_and(|value| value.eq_ignore_ascii_case("Client")) => {
+            Some(("init.client.luau", ".client.luau"))
+        }
+        "Script" if run_context.is_some_and(|value| value.eq_ignore_ascii_case("Plugin")) => {
+            Some(("init.plugin.luau", ".plugin.luau"))
+        }
         "Script" => Some(("init.server.luau", ".server.luau")),
         "LocalScript" => Some(("init.client.luau", ".client.luau")),
         "ModuleScript" => Some(("init.luau", ".luau")),
         _ => None,
     }
+}
+
+fn run_context_name(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| {
+        value.as_object().and_then(|object| {
+            object
+                .get("name")
+                .or_else(|| object.get("Name"))
+                .and_then(Value::as_str)
+        })
+    })
+}
+
+fn editor_run_context_value(name: &str) -> Value {
+    json!({
+        "_type": "EnumItem",
+        "enumType": "Enum.RunContext",
+        "name": name,
+    })
 }
 
 fn should_skip_binary_property(
@@ -31333,7 +31459,9 @@ fn build_sourcemap_node_from_state(
     let has_children = !child_indices.is_empty();
     let class_name = instance.class_name.as_str();
 
-    if let Some((source_file_name, leaf_suffix)) = script_file_names(class_name) {
+    if let Some((source_file_name, leaf_suffix)) =
+        script_file_names_for_properties(class_name, &instance.properties)
+    {
         if has_children {
             let dir_path = parent_dir.join(fs_stem);
             let init_source_path = dir_path.join(source_file_name);
@@ -32967,6 +33095,55 @@ mod tests {
     }
 
     #[test]
+    fn plugin_download_matches_the_cli_version() {
+        assert_eq!(
+            plugin_release_url("0.1.2"),
+            "https://github.com/Superwheat/renium/releases/download/v0.1.2/Renium.rbxm"
+        );
+    }
+
+    #[test]
+    fn place_guard_rejects_typos_and_empty_allowlists() {
+        let path = Path::new("renium.config.json");
+        assert!(
+            parse_place_guard_config(r#"{"allowedPlaceId":[123]}"#, path)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid place guard JSON")
+        );
+        assert!(
+            parse_place_guard_config(r#"{"allowedPlaceIds":[],"allowedGameIds":[]}"#, path)
+                .unwrap_err()
+                .to_string()
+                .contains("must contain at least one")
+        );
+        let parsed =
+            parse_place_guard_config(r#"{"allowedPlaceIds":[123],"allowedGameIds":[]}"#, path)
+                .unwrap();
+        assert_eq!(parsed.allowed_place_ids, vec![123]);
+    }
+
+    #[test]
+    fn script_file_names_follow_script_run_context() {
+        assert_eq!(
+            script_file_names_for_run_context("Script", Some("Client")),
+            Some(("init.client.luau", ".client.luau"))
+        );
+        assert_eq!(
+            script_file_names_for_run_context("Script", Some("Plugin")),
+            Some(("init.plugin.luau", ".plugin.luau"))
+        );
+        assert_eq!(
+            script_file_names_for_run_context("Script", Some("Server")),
+            Some(("init.server.luau", ".server.luau"))
+        );
+        assert_eq!(
+            script_file_names_for_run_context("LocalScript", None),
+            Some(("init.client.luau", ".client.luau"))
+        );
+    }
+
+    #[test]
     fn runtime_pin_keys_normalize_player_selectors() {
         assert_eq!(
             BridgeServer::runtime_pin_key(BridgeTarget::Client, Some("  PlayerOne ")),
@@ -33012,6 +33189,7 @@ mod tests {
     fn studio_bridge_modules_parse_as_luau() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin_ws_bridge");
         for name in [
+            "BridgeContent.module.lua",
             "BridgeConnection.module.lua",
             "BridgeEditorSync.module.lua",
             "BridgePluginRuntime.module.lua",
@@ -35296,6 +35474,57 @@ mod tests {
         assert_eq!(
             spec.path_segments,
             vec!["ServerScriptService", "Parent", "Child"]
+        );
+    }
+
+    #[test]
+    fn editor_source_path_spec_infers_plugin_run_context() {
+        let spec = infer_editor_source_path_spec(
+            Path::new("project/src"),
+            "ServerStorage",
+            Path::new("project/src/ServerStorage/Tools/init.plugin.luau"),
+        )
+        .unwrap();
+
+        assert_eq!(spec.class_name, "Script");
+        assert_eq!(spec.run_context.as_deref(), Some("Plugin"));
+        assert_eq!(spec.instance_name, "Tools");
+
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance {
+                settings_id: "root".to_string(),
+                name: "ServerStorage".to_string(),
+                class_name: "ServerStorage".to_string(),
+                parent_index: None,
+                properties: Map::new(),
+                attributes: Map::new(),
+            }],
+        };
+        let ensured = ensure_editor_source_target_in_bytecode(&mut document, &spec).unwrap();
+        let target_index = document_instance_index_by_settings_id(
+            &document,
+            ensured.target.settings_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            document.instances[target_index]
+                .properties
+                .get("RunContext"),
+            Some(&json!({
+                "_type": "EnumItem",
+                "enumType": "Enum.RunContext",
+                "name": "Plugin",
+            }))
+        );
+        assert_eq!(
+            run_context_name(
+                document.instances[target_index]
+                    .properties
+                    .get("RunContext")
+                    .unwrap()
+            ),
+            Some("Plugin")
         );
     }
 

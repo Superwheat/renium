@@ -336,6 +336,7 @@ function BridgePluginRuntime.start(context)
 	local StatusModule = requireChildModule("BridgeStatus")
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
+	local ContentModule = requireChildModule("BridgeContent")
 	local TransportModule = requireChildModule("BridgeTransport")
 	local ConnectionModule = requireChildModule("BridgeConnection")
 	local IdentityModule = requireChildModule("BridgeIdentity")
@@ -921,13 +922,6 @@ function BridgePluginRuntime.start(context)
 		return false, hasModified, isModified, true, true, false
 	end
 
-	local function contentSourceToUri(value: any): string
-		if value.SourceType == Enum.ContentSourceType.Uri then
-			return value.Uri or ""
-		end
-		return ""
-	end
-
 	local function serializeValue(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
 		if valueType == "number" or valueType == "string" or valueType == "boolean" then
@@ -1014,7 +1008,7 @@ function BridgePluginRuntime.start(context)
 				direction = { x = value.Direction.X, y = value.Direction.Y, z = value.Direction.Z },
 			}
 		elseif valueType == "Content" then
-			return contentSourceToUri(value)
+			return ContentModule.serialize(value)
 		elseif valueType == "Instance" then
 			return IdentityModule.serializeRefValue(state, value)
 		end
@@ -1574,7 +1568,7 @@ function BridgePluginRuntime.start(context)
 		elseif valueType == "Font" then
 			return { COMPACT_VALUE_TAGS.Font, value.Family, tostring(value.Weight), tostring(value.Style) }
 		elseif valueType == "Content" then
-			return contentSourceToUri(value)
+			return ContentModule.serialize(value)
 		elseif valueType == "Instance" then
 			return serializeRefValueCompactV4(state, value)
 		end

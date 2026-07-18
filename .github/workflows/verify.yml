@@ -73,6 +73,20 @@ jobs:
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
 
+      - name: Build both Studio plugin formats
+        run: |
+          $pluginXml = Join-Path $env:RUNNER_TEMP "Renium.rbxmx"
+          $pluginBinary = Join-Path $env:RUNNER_TEMP "Renium.rbxm"
+          rojo build tools/plugin_ws_bridge/Renium.project.json --output $pluginXml
+          rojo build tools/plugin_ws_bridge/Renium.project.json --output $pluginBinary
+          if ((Get-Item -LiteralPath $pluginXml).Length -lt 128) { throw "Rojo produced an unexpectedly small XML plugin" }
+          if ((Get-Item -LiteralPath $pluginBinary).Length -lt 16) { throw "Rojo produced an unexpectedly small binary plugin" }
+          if (-not ([IO.File]::ReadAllText($pluginXml).Contains("<roblox"))) { throw "The XML plugin is not a Roblox model" }
+          Copy-Item -LiteralPath $pluginBinary -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
+
+      - name: Test Studio plugin modules
+        run: lune run tools/plugin_ws_bridge/tests/run
+
       - name: Install, test, and package the extension
         run: |
           npm.cmd ci --prefix tools/renium-vscode-extension
@@ -90,17 +104,20 @@ jobs:
           $archive = [System.IO.Compression.ZipFile]::OpenRead($vsix)
           try {
             if ($null -eq $archive.GetEntry("extension/package.json")) { throw "VSIX is missing extension/package.json" }
+            $pluginEntry = $archive.GetEntry("extension/assets/Renium.rbxm")
+            if ($null -eq $pluginEntry) { throw "VSIX is missing its matching Studio plugin" }
+            $stream = $pluginEntry.Open()
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              $packagedPluginHash = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace("-", "").ToLowerInvariant()
+            }
+            finally {
+              $sha256.Dispose()
+              $stream.Dispose()
+            }
+            $expectedPluginHash = (Get-FileHash -LiteralPath (Join-Path $env:RUNNER_TEMP "Renium.rbxm") -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($packagedPluginHash -ne $expectedPluginHash) { throw "VSIX plugin does not match the built Studio plugin" }
           }
           finally {
             $archive.Dispose()
           }
-
-      - name: Build both Studio plugin formats
-        run: |
-          $pluginXml = Join-Path $env:RUNNER_TEMP "Renium.rbxmx"
-          $pluginBinary = Join-Path $env:RUNNER_TEMP "Renium.rbxm"
-          rojo build tools/plugin_ws_bridge/Renium.project.json --output $pluginXml
-          rojo build tools/plugin_ws_bridge/Renium.project.json --output $pluginBinary
-          if ((Get-Item -LiteralPath $pluginXml).Length -lt 128) { throw "Rojo produced an unexpectedly small XML plugin" }
-          if ((Get-Item -LiteralPath $pluginBinary).Length -lt 16) { throw "Rojo produced an unexpectedly small binary plugin" }
-          if (-not ([IO.File]::ReadAllText($pluginXml).Contains("<roblox"))) { throw "The XML plugin is not a Roblox model" }

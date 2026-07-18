@@ -31,6 +31,9 @@
       "BridgeIdentity": {
         "$path": "BridgeIdentity.module.lua"
       },
+      "BridgeContent": {
+        "$path": "BridgeContent.module.lua"
+      },
       "BridgeUi": {
         "$path": "BridgeUi.module.lua"
       },

@@ -508,7 +508,8 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
   (`DateTime` isn't serializable by rbx-dom, so place files never contain it)
   and the Studio-only `QDir`/`QFont` settings fields. `Axes`, `Faces`, and
   `Ray` properties sync fully.
-- Modern `Content` properties survive only when their source is a URI (an
-  asset id). `Object`-source and `None` content sync as empty content.
+- Modern `Content` properties preserve URI and `None` sources. `Object` and
+  `Opaque` sources can't be represented by the current file store, so export
+  stops with an error instead of replacing them with empty content.
 - Infinity, negative Infinity, and NaN use Renium's tagged float transport and
   round-trip without being converted to finite JSON numbers.
