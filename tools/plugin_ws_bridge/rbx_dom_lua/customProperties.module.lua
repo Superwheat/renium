@@ -3,7 +3,7 @@ local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local Error = require(script.Parent.Error)
 
---- A list of `Enum.Material` values that are used for Terrain.MaterialColors
+
 local TERRAIN_MATERIAL_COLORS = {
 	Enum.Material.Grass,
 	Enum.Material.Slate,
@@ -29,23 +29,23 @@ local TERRAIN_MATERIAL_COLORS = {
 }
 
 local function isAttributeNameValid(attributeName)
-	-- For SetAttribute to succeed, the attribute name must be less than or
-	-- equal to 100 characters...
+
+
 	return #attributeName <= 100
-		-- ...and must only contain alphanumeric characters, periods, hyphens,
-		-- underscores, or forward slashes.
+
+
 		and attributeName:match("[^%w%.%-_/]") == nil
 end
 
 local function isAttributeNameReserved(attributeName)
-	-- For SetAttribute to succeed, attribute names must not use the RBX
-	-- prefix, which is reserved by Roblox.
+
+
 	return attributeName:sub(1, 3) == "RBX"
 end
 
--- Defines how to read and write properties that aren't directly scriptable.
---
--- The reflection database refers to these as having scriptability = "Custom"
+
+
+
 return {
 	Instance = {
 		Attributes = {
@@ -62,9 +62,9 @@ return {
 
 				for attributeName, attributeValue in pairs(value) do
 					if isAttributeNameReserved(attributeName) then
-						-- If the attribute name is reserved, then we don't
-						-- really care about reporting any failures about
-						-- it.
+
+
+
 						continue
 					end
 
@@ -174,8 +174,8 @@ return {
 	Terrain = {
 		MaterialColors = {
 			read = function(instance: Terrain)
-				-- There's no way to get a list of every color, so we have to
-				-- make one.
+
+
 				local colors = {}
 				for _, material in TERRAIN_MATERIAL_COLORS do
 					colors[material] = instance:GetMaterialColor(material)

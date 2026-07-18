@@ -102,9 +102,6 @@ body {
 .scroller {
 	flex: 1 1 auto;
 	overflow-y: auto;
-	/* The value column is a fixed-width track; never let a long value scroll the
-	   panel horizontally (dragging a selection inside an input used to shift the
-	   whole X position). The input scrolls its own text internally instead. */
 	overflow-x: hidden;
 }
 
@@ -157,8 +154,6 @@ body {
 
 .property-row {
 	display: grid;
-	/* minmax(0,...) lets each track shrink below its content's min-content width,
-	   so a long value can't blow the row wider than the panel. */
 	grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
 	align-items: center;
 	height: 22px;

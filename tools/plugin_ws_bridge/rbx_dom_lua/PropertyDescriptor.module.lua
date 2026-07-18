@@ -1,13 +1,13 @@
 local Error = require(script.Parent.Error)
 local customProperties = require(script.Parent.customProperties)
 
--- A wrapper around a property descriptor from the reflection database with some
--- extra convenience methods.
---
--- The aim of this API is to facilitate looking up a property once, then reading
--- from it or writing to it multiple times. It's also useful when a consumer
--- wants to check additional constraints on the property before trying to use
--- it, like scriptability.
+
+
+
+
+
+
+
 local PropertyDescriptor = {}
 PropertyDescriptor.__index = PropertyDescriptor
 
@@ -23,16 +23,16 @@ function PropertyDescriptor.fromRaw(data, className, propertyName)
 	local key, value = next(data.DataType)
 
 	return setmetatable({
-		-- The meanings of the key and value in DataType differ when the type of
-		-- the property is Enum. When the property is of type Enum, the key is
-		-- the name of the type:
-		--
-		-- { Enum = "<name of enum>" }
-		--
-		-- When the property is not of type Enum, the value is the name of the
-		-- type:
-		--
-		-- { Value = "<data type>" }
+
+
+
+
+
+
+
+
+
+
 		dataType = key == "Enum" and key or value,
 		enumType = key == "Enum" and ("Enum." .. value) or nil,
 

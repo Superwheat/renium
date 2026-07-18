@@ -3,11 +3,11 @@ import * as vscode from "vscode";
 import { loadAssetIconNames } from "./fileExplorer";
 import { decodeRbsyncToTree } from "./rbsyncDecode";
 
-/** How the viewer locates the CLI (reuses the resolved renium.exe + root). */
+
 export type ReniumCliResolver = () => { cliPath: string; cwd: string } | undefined;
 
-/** Called when an instance is selected, to show its properties in the Renium
- * Properties view. */
+
+
 export type RbsyncSelectHandler = (node: {
   name?: string;
   className?: string;
@@ -85,8 +85,8 @@ function jsonForScript(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-/** Full-width viewer HTML: a search bar + an Explorer-style instance tree. Rows
- * reuse the Explorer's markup/CSS so they look identical. */
+
+
 function rbsyncEditorHtml(assetBase: string, iconNames: string[]): string {
   return `<!doctype html>
 <html>

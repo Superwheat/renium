@@ -1,8 +1,8 @@
---!strict
+
 
 local HttpService = game:GetService("HttpService")
 
--- Change this before each run.
+
 local TARGET_SERVICE = "Workspace"
 
 local ALLOWED_SERVICES = {

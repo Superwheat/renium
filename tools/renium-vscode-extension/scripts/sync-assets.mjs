@@ -138,5 +138,11 @@ for (const fileName of logoFiles) {
   fs.copyFileSync(source, path.join(extensionAssets, fileName));
 }
 
-generateRobloxPropertiesMetadata({ extensionRoot, repoRoot });
+generateRobloxPropertiesMetadata({
+  extensionRoot,
+  repoRoot,
+  refreshStudioApi:
+    process.argv.includes("--refresh-studio-api") ||
+    process.env.RENIUM_REFRESH_STUDIO_API === "1",
+});
 syncInsertableObjectIcons();

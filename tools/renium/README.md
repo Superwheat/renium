@@ -3,7 +3,8 @@
 Renium is a two-way sync tool for Roblox Studio. It mirrors a place into a plain
 file tree — scripts as `.luau` files, everything else in one compact binary
 store per service — and keeps Studio and your editor in sync in both
-directions, with full property fidelity.
+directions, with high property fidelity subject to the documented limitations
+below.
 
 Licensed under [AGPL-3.0 with the Commons Clause](../../LICENSE): free for
 everyone, including commercial game development — the license covers the tool
@@ -71,7 +72,7 @@ not yet live-verified.
 2. Start the daemon and leave it running:
 
    ```powershell
-   rbx bd -s
+   rbx bd
    ```
 
 3. Export the place into files:
@@ -93,6 +94,13 @@ The daemon is found automatically by later commands (env vars
 `RENIUM_DAEMON`, `RENIUM_DAEMON_HOST`/`RENIUM_DAEMON_CONTROL_PORT`,
 `RENIUM_DAEMON_FILE`, then `.renium-daemon.json` in the project,
 `%LOCALAPPDATA%\Renium\daemon.json`, then the default local endpoint).
+
+`rbx bd` is a standalone long-running process. It keeps ports 8781-8783 open
+until it is stopped. `--editor-stdio` is reserved for the VS Code extension's
+owned child process: it reads daemon requests from stdin and exits when its
+owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.
+The older `-s`/`--serve` spelling is accepted for compatibility but is no
+longer required.
 
 ## Everyday commands
 
@@ -116,6 +124,27 @@ rbx lc "warn('client hi')"       # client context during Play
 rbx lc "print('p2')" Player2     # a specific client in a multiplayer test
 rbx lf .\script.luau             # from a file
 ```
+
+Control Studio's built-in device simulator through the plugin API:
+
+```powershell
+rbx device list
+rbx device set "iPhone 16 Pro" --orientation portrait
+rbx device set --scaling fit
+rbx device set --resolution 1179x2556 --pixel-density 460
+rbx device status
+rbx shot --studio -o iphone-16-pro.png
+rbx device stop
+```
+
+The command accepts catalog names or stable ids and requires no keyboard,
+mouse, focus, coordinates, or ribbon interaction. Notched devices reproduce
+Studio's actual safe-area behavior for `DeviceSafeInsets`,
+`ClipToDeviceSafeArea`, and `SafeAreaCompatibility`. Daemon clients can call
+the same surface with command `device` and the CLI arguments in `args`. While
+emulation is active, `rbx shot` automatically targets the simulated Studio
+viewport. Use `--studio` to force it or `--client` to force the latest Play
+client.
 
 In multiplayer tests every instance runs its own bridge; `--player <name|N>`
 on `lx`/`co` targets one client (`Player2` and `2` both work). Without a
@@ -147,6 +176,17 @@ commands refuse with the list instead of guessing. Pin commands to one game with
 the `RENIUM_PLACE` env var or the global `--place <name|id>` flag (id, exact
 name, or substring). With a single game open no filter is needed.
 
+Multiple Studio windows can also have the same place open. `rbx clients` exposes
+their distinct `runtimeId` values. Renium chooses the most recently focused
+matching runtime once per command and pins every bridge channel to it, so a
+chunked or parallel operation cannot combine two windows.
+
+For an optional allowlist, put `allowedPlaceIds` and/or `allowedGameIds` arrays
+in `renium.config.json` in the command's working directory. Set
+`RENIUM_CONFIG=<path>` to use an explicit file. The daemon reloads this file for
+new bridge handshakes and rejects malformed JSON instead of silently disabling
+the guard. `RENIUM_ALLOW_ANY_PLACE=1` is the explicit bypass.
+
 Duplicate GUI names resolve with `[n]` ordinals (`"Shop[2].BuyButton"`) or by
 element id (`press -i <id>`); ambiguous presses fail with a candidate list, and
 if exactly one match is visible it is picked automatically. `press` auto-scrolls
@@ -173,6 +213,23 @@ Push editor changes to Studio:
 rbx push -r . -d src --upsert                                      # everything
 rbx push -r . -d src -p src\Workspace\__roblox_sync_settings.renium --upsert
 rbx push -r . -d src -p src\ServerScriptService\Main.server.luau --verify
+```
+
+If Studio rejects a read-only property, Renium shows the rejected items before
+using its offline fallback. **Apply anyway** serializes the complete live place,
+patches only those rejected values, closes that exact Studio process, and
+reopens the same local file. The original file and Studio process are left
+untouched if serialization or validation fails. This path does not send
+keyboard or mouse input.
+
+The protected-property prompt applies automatically after its countdown unless
+**Not now** is chosen. Automation can resolve the active prompt through the
+daemon without interacting with Studio:
+
+```powershell
+rbx review apply
+rbx review skip
+rbx review apply --review-id review-123-1
 ```
 
 Set or delete one live instance property without a full push:
@@ -373,10 +430,12 @@ ed   explorer-daemon          bss  bytecode-set-source
 src  bridge-get-source        bb   bytecode-explorer-batch
 co   get-console-output       bt   bytecode-editor-targets
 lx   execute-luau             ba   bytecode-add-instance
+dev  studio-device
 play start-stop-play          bcl  bytecode-clone-instance
 st   studio-change-state      br   bytecode-remove-instance
 prof profile-plugin-ops       bem  bytecode-export-model
 push push-editor-changes      bep  bytecode-export-place
+review editor-review-decision
 prop apply-editor-property    bim  bytecode-import-model
 del  apply-editor-delete      bpack bytecode-repack
 rev  editor-revert            wally sync-wally-packages
@@ -420,14 +479,28 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
 
 - Prefer settings ids over names in scripts and automation — names can repeat.
 - For model pivots the property is `WorldPivot`.
-- `rbx bd -s` waits silently until the Studio plugin connects; that's normal.
+- `rbx bd` stays alive while Studio is closed or reconnecting. It exits only
+  when stopped. `--editor-stdio` is for the VS Code extension's owned child
+  process and exits when the editor closes its stdin stream.
 - Live sync = editor changes push to Studio, and dirty Studio services import
-  back after serve/plugin connection. Dirty detection uses `game.ItemChanged`
-  plus service-root descendant add/remove listeners; those listeners stay for
-  the Studio session once live sync has started, which is what catches edits
-  made while the editor was disconnected.
+  back after serve/plugin connection. Dirty detection uses per-instance
+  property/attribute listeners, service-root descendant add/remove listeners,
+  and CollectionService tag membership signals. Newly created tag names are
+  discovered during the session. Those listeners stay active once live sync
+  has started, which is what catches edits made while the editor was
+  disconnected.
 - Studio imports use stable `GetDebugId` ids, so reparenting an instance in
   Studio updates its parent in the store instead of duplicating it.
+- Filesystem-to-Studio mutations create a Studio undo recording and preserve
+  Explorer selection across class/full-import replacements. A failed batch
+  stops at its first error so the recorded partial work can be undone as one
+  Renium action.
+- Snapshot imports move stale generated paths to
+  `.renium/import-backups/<timestamp>/` instead of permanently deleting them.
+  The manual VS Code import command asks for confirmation; automated live sync
+  remains non-interactive.
+- Script comparison ignores CRLF/LF-only differences while retaining the
+  existing filesystem line-ending convention.
 
 ## Known limitations
 
@@ -437,6 +510,5 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
   `Ray` properties sync fully.
 - Modern `Content` properties survive only when their source is a URI (an
   asset id). `Object`-source and `None` content sync as empty content.
-- Non-finite numbers are not lossless: Infinity/NaN can't cross the JSON
-  transport, and components beyond f32 range are clamped to the nearest
-  finite value instead of failing the sync.
+- Infinity, negative Infinity, and NaN use Renium's tagged float transport and
+  round-trip without being converted to finite JSON numbers.

@@ -1,4 +1,4 @@
---!nocheck
+
 
 if not plugin then
 	error("Renium must run as a Studio plugin")

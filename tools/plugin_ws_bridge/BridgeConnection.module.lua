@@ -1,4 +1,4 @@
---!nocheck
+
 
 local BridgeConnection = {}
 
@@ -537,6 +537,7 @@ function BridgeConnection.create(context)
 				channel = channel.id,
 				version = context.bridgeVersion,
 				bridgeVersion = context.bridgeVersion,
+				runtimeId = context.runtimeId,
 				bridgeRole = Config.bridgeRole,
 				protocolVersion = context.protocolVersion,
 				codecVersion = context.codecVersion,
@@ -940,6 +941,9 @@ function BridgeConnection.create(context)
 
 	plugin.Unloading:Connect(function()
 		pluginUnloading = true
+		if type(context.onUnload) == "function" then
+			pcall(context.onUnload)
+		end
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = false
 			closeChannel(channel)

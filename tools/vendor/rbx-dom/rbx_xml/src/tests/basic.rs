@@ -3,8 +3,8 @@
 use rbx_dom_weak::types::{
     Attributes, BinaryString, BrickColor, Color3, Color3uint8, ColorSequence,
     ColorSequenceKeypoint, ContentId, Enum, EnumItem, Font, MaterialColors, NumberRange,
-    NumberSequence, NumberSequenceKeypoint, Rect, Tags, TerrainMaterials, UDim, UDim2,
-    UniqueId, Variant, VariantType, Vector2, Vector3,
+    NumberSequence, NumberSequenceKeypoint, Rect, Tags, TerrainMaterials, UDim, UDim2, UniqueId,
+    Variant, VariantType, Vector2, Vector3,
 };
 use rbx_dom_weak::{ustr, InstanceBuilder, WeakDom};
 
@@ -270,10 +270,22 @@ fn serialize_contentid_migrations_with_legacy_xml_property_names() {
     let encoded = String::from_utf8(encoded).unwrap();
 
     assert!(encoded.contains(r#"<Content name="MeshId">"#), "{encoded}");
-    assert!(encoded.contains(r#"<Content name="ColorMap">"#), "{encoded}");
-    assert!(encoded.contains(r#"<Content name="MetalnessMap">"#), "{encoded}");
-    assert!(encoded.contains(r#"<Content name="NormalMap">"#), "{encoded}");
-    assert!(encoded.contains(r#"<Content name="RoughnessMap">"#), "{encoded}");
+    assert!(
+        encoded.contains(r#"<Content name="ColorMap">"#),
+        "{encoded}"
+    );
+    assert!(
+        encoded.contains(r#"<Content name="MetalnessMap">"#),
+        "{encoded}"
+    );
+    assert!(
+        encoded.contains(r#"<Content name="NormalMap">"#),
+        "{encoded}"
+    );
+    assert!(
+        encoded.contains(r#"<Content name="RoughnessMap">"#),
+        "{encoded}"
+    );
 
     assert!(!encoded.contains("MeshContent"), "{encoded}");
     assert!(!encoded.contains("ColorMapContent"), "{encoded}");

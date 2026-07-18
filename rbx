@@ -27,7 +27,7 @@ usage_exit() {
 
 ensure_daemon() {
   if ! pgrep -x renium >/dev/null 2>&1; then
-    "$CLI" bd -s >/dev/null 2>&1 &
+    "$CLI" bd >/dev/null 2>&1 &
     sleep 1
   fi
 }

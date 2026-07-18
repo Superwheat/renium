@@ -531,8 +531,6 @@ fn value_string(value: Value, label: &str) -> Result<String> {
     }
 }
 
-/// Reparenting an instance under itself or one of its descendants would create
-/// a parent cycle, which the path builders recurse over without a guard.
 fn ensure_parent_is_not_descendant(
     document: &SettingsBytecode,
     index: usize,

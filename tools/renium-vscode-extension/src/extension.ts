@@ -5,7 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { URLSearchParams } from "url";
 import * as vscode from "vscode";
-import { mergeAndResolve, type ConflictPolicy } from "./conflictMerge";
+import { mergeAndResolve, sameSourceText, withLineEnding, type ConflictPolicy } from "./conflictMerge";
 import {
   FileExplorerController,
   iconAssetNameForClass,
@@ -873,7 +873,7 @@ class RobloxSyncController {
 
   private gitHeadProviderRegistered = false;
 
-  /** Lazily register a read-only content provider that serves a file's HEAD version. */
+
   private ensureGitHeadProvider(): void {
     if (this.gitHeadProviderRegistered) {
       return;
@@ -898,7 +898,7 @@ class RobloxSyncController {
     );
   }
 
-  /** Open a working-tree-vs-HEAD diff for a changed file from the Git tab. */
+
   private async openGitDiff(filePath: string): Promise<void> {
     const requested = String(filePath ?? "").trim();
     if (!requested) {
@@ -1267,6 +1267,15 @@ class RobloxSyncController {
     await this.enqueue("Import snapshots", async () => {
       const cfg = this.getConfig();
       const snapshotPath = this.resolveSnapshotPath(cfg);
+      const serviceLabel = cfg.services.length === 1 ? cfg.services[0] : `${cfg.services.length} services`;
+      const confirmed = await vscode.window.showWarningMessage(
+        `Import Studio snapshots into src for ${serviceLabel}? Existing generated files may be replaced; stale files are recoverable from .renium/import-backups.`,
+        { modal: true },
+        "Import snapshots",
+      );
+      if (confirmed !== "Import snapshots") {
+        return;
+      }
       await this.runRustImport(cfg, snapshotPath, cfg.services);
 
       vscode.window.showInformationMessage("Renium: snapshot import finished.");
@@ -1565,7 +1574,7 @@ class RobloxSyncController {
       : path.join(cfg.projectRoot, cfg.linkSync.manifest);
   }
 
-  /** Resolve, materialize, and push every link target to disk and (optionally) Studio. */
+
   public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean } = {}): Promise<CliLinkApplyResult | undefined> {
     let result: CliLinkApplyResult | undefined;
     await this.enqueue("Apply packages", async () => {
@@ -1703,7 +1712,7 @@ class RobloxSyncController {
     }
   }
 
-  /** Detach a link target so it becomes a normal editable script. */
+
   public async breakLink(service: string, pathSegments: string[], options: { silent?: boolean; refreshExplorer?: boolean } = {}): Promise<void> {
     await this.enqueue("Break link", async () => {
       const cfg = this.getConfig();
@@ -1744,7 +1753,7 @@ class RobloxSyncController {
     }
   }
 
-  /** Guided creation of a new link entry in the manifest. */
+
   public async addLinkInteractive(seed?: { service?: string; pathSegments?: string[] }): Promise<void> {
     const cfg = this.getConfig();
     const sourceType = await vscode.window.showQuickPick(
@@ -1857,8 +1866,8 @@ class RobloxSyncController {
     this.linkChangeEmitter.fire();
   }
 
-  /** Push the set of linked/broken target keys to the file explorer so it can
-   * show "Create Link" vs "Break Link" appropriately. */
+
+
   public async pushLinkStateToExplorer(): Promise<void> {
     const keys: Record<string, string> = {};
     try {
@@ -1885,7 +1894,7 @@ class RobloxSyncController {
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   }
 
-  /** Per-user global package library (mirrors the CLI's resolution). */
+
   private globalPackagesDir(): string {
     const custom = (process.env.RENIUM_GLOBAL_PACKAGES_DIR ?? "").trim();
     if (custom) {
@@ -1895,7 +1904,7 @@ class RobloxSyncController {
     return path.normalize(path.join(home, "Documents", "Renium", "Packages"));
   }
 
-  /** In-project package folder (the committed, git-shareable location). */
+
   private linkPackageFolderPath(cfg: SyncConfig): string {
     const folder = cfg.linkSync.folder || "links";
     return path.isAbsolute(folder)
@@ -1903,7 +1912,7 @@ class RobloxSyncController {
       : path.normalize(path.join(cfg.projectRoot, folder));
   }
 
-  /** True when the path is a Renium-managed package location (project or global). */
+
   private isManagedPackagePath(cfg: SyncConfig, candidate: string): boolean {
     return this.isPathInside(candidate, this.linkPackageFolderPath(cfg))
       || this.isPathInside(candidate, this.globalPackagesDir());
@@ -1993,7 +2002,7 @@ class RobloxSyncController {
     }, 750);
   }
 
-  /** Map of normalized mirror file path -> link info, for decorations and break/reveal. */
+
   public async getLinkFileIndex(force = false): Promise<Map<string, LinkFileInfo>> {
     const status = await this.getLinkStatus(force);
     const index = new Map<string, LinkFileInfo>();
@@ -2034,7 +2043,7 @@ class RobloxSyncController {
     return undefined;
   }
 
-  /** Derive a link target (service + instance path) from a src script file. */
+
   private linkTargetFromFile(uri: vscode.Uri): { service: string; pathSegments: string[] } | undefined {
     const cfg = this.getConfig();
     const srcRoot = path.join(cfg.projectRoot, "src");
@@ -2058,7 +2067,7 @@ class RobloxSyncController {
     return { service, pathSegments: [...parts.slice(0, parts.length - 1), leaf] };
   }
 
-  /** Right-click entry: turn the selected script into a link target. */
+
   public async addLinkFromFile(uri: vscode.Uri | undefined): Promise<void> {
     const target = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!target) {
@@ -2073,7 +2082,7 @@ class RobloxSyncController {
     await this.addLinkInteractive(seed);
   }
 
-  /** Pack any instance (subtree) into a bytecode package and link it; optionally mirror elsewhere. */
+
   public async packInstanceLink(request: { service?: string; pathSegments?: string[]; id?: string; resave?: boolean }): Promise<void> {
     const service = typeof request?.service === "string" ? request.service : "";
     const pathSegments = Array.isArray(request?.pathSegments)
@@ -2381,7 +2390,7 @@ class RobloxSyncController {
     );
   }
 
-  /** The available packages (links) for the Packages view. */
+
   public async getLinkPackages(force = false): Promise<CliLinkStatusLink[]> {
     const status = await this.getLinkStatus(force);
     const links = (Array.isArray(status?.links) ? status!.links! : [])
@@ -2448,7 +2457,7 @@ class RobloxSyncController {
     return [service, ...parent, candidate];
   }
 
-  /** Insert an existing package as a read-only copy at a concrete Explorer path. */
+
   public async insertPackageAtPath(request: { linkId?: string; service?: string; pathSegments?: string[] }): Promise<void> {
     const linkId = typeof request?.linkId === "string" ? request.linkId.trim() : "";
     const service = typeof request?.service === "string" ? request.service.trim() : "";
@@ -2743,7 +2752,7 @@ class RobloxSyncController {
     panel.webview.html = packagePreviewHtml(preview);
   }
 
-  /** Cached `renium link-status` used by file-explorer decorations. */
+
   public async getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
     const now = Date.now();
     if (!force && this.linkStatusCache && now - this.linkStatusCache.at < 2000) {
@@ -5333,15 +5342,15 @@ class RobloxSyncController {
     return sourcePath;
   }
 
-  /**
-   * Reconcile an incoming Studio script-source value with any concurrent local
-   * edits via a 3-way merge against the last-synced base. Non-overlapping edits
-   * from both sides always merge automatically. For lines changed on BOTH sides,
-   * the configured policy decides: "filesystem" keeps your local line, "studio"
-   * keeps Studio's, "prompt" keeps your local line and surfaces a diff so you can
-   * review/switch. The written file is always valid Lua (no conflict markers are
-   * ever inserted), and both sides are backed up under .renium/conflicts.
-   */
+
+
+
+
+
+
+
+
+
   private reconcileStudioSourceWithLocalEdits(cfg: SyncConfig, sourcePath: string, theirs: string): string {
     let ours: string;
     try {
@@ -5354,23 +5363,23 @@ class RobloxSyncController {
       return theirs;
     }
 
-    if (ours === theirs) {
-      return theirs;
+    if (sameSourceText(ours, theirs)) {
+      return ours;
     }
 
     const base = this.readSyncBase(cfg, sourcePath);
-    if (base !== undefined && ours === base) {
-      return theirs;
+    if (base !== undefined && sameSourceText(ours, base)) {
+      return withLineEnding(theirs, ours.includes("\r\n") ? "\r\n" : "\n");
     }
 
     return this.mergeSourceAgainstBase(cfg, sourcePath, ours, theirs, base);
   }
 
-  /**
-   * Core 3-way merge + policy resolution for already-read local (`ours`) and
-   * incoming (`theirs`) source. `base` may be undefined (no ancestor recorded).
-   * Returns the content to write — always valid Lua, never conflict markers.
-   */
+
+
+
+
+
   private mergeSourceAgainstBase(
     cfg: SyncConfig,
     sourcePath: string,
@@ -5408,11 +5417,11 @@ class RobloxSyncController {
     return resolvedText;
   }
 
-  /**
-   * Surface a non-destructive conflict chooser in VS Code (no markers written).
-   * The local version is already on disk; the user can open a side-by-side diff
-   * of the two backups or switch the file to Studio's version.
-   */
+
+
+
+
+
   private surfaceConflictChoice(
     cfg: SyncConfig,
     sourcePath: string,
@@ -5458,8 +5467,8 @@ class RobloxSyncController {
       });
   }
 
-  /** Keep very large conflict previews responsive without truncating either
-   * authoritative backup file. */
+
+
   private conflictDiffPreview(cfg: SyncConfig, backupPath: string): { path: string; truncated: boolean } {
     try {
       const content = fs.readFileSync(backupPath, "utf8");
@@ -5514,7 +5523,7 @@ class RobloxSyncController {
     }
   }
 
-  /** Record the current on-disk content of pushed Lua source files as the shared merge base. */
+
   private refreshSyncBasesForPaths(paths: string[], cfg: SyncConfig): void {
     for (const filePath of paths) {
       const abs = path.isAbsolute(filePath) ? filePath : path.resolve(cfg.projectRoot, filePath);
@@ -5533,12 +5542,12 @@ class RobloxSyncController {
     return basePath !== undefined && fs.existsSync(basePath);
   }
 
-  /**
-   * Before a full (Rust) import overwrites the service tree, snapshot the content
-   * of scripts that diverge from their recorded sync base (i.e. have unpushed
-   * local edits) so they can be merged back afterwards. Files with no base yet
-   * are skipped here and seeded after the import to bootstrap protection.
-   */
+
+
+
+
+
+
   private captureLocalScriptEditsForServices(services: string[], cfg: SyncConfig): Map<string, string> {
     const captured = new Map<string, string>();
     const srcRoot = path.join(cfg.projectRoot, "src");
@@ -5569,11 +5578,11 @@ class RobloxSyncController {
     return captured;
   }
 
-  /**
-   * After a full import, 3-way merge any captured local edits against the freshly
-   * imported Studio content, then seed bases for scripts that lack one. Returns
-   * the files whose local edits survived the merge (and must be pushed to Studio).
-   */
+
+
+
+
+
   private reconcileLocalEditsAfterFullImport(
     services: string[],
     cfg: SyncConfig,
@@ -6268,12 +6277,12 @@ class RobloxSyncController {
     return this.excludeUnresolvedConflictMarkerPaths(changed);
   }
 
-  /**
-   * Never push a script that still contains unresolved git-style conflict
-   * markers — that would send syntactically broken Lua to Studio. Such files are
-   * held back (logged once) until the user resolves them, after which they sync
-   * normally on the next change.
-   */
+
+
+
+
+
+
   private excludeUnresolvedConflictMarkerPaths(paths: string[]): string[] {
     const pushable: string[] = [];
     for (const filePath of paths) {
@@ -7609,7 +7618,7 @@ class RobloxSyncController {
       cfg.bridgePorts,
       "--parent-pid",
       String(process.pid),
-      options.serve ? "-s" : "",
+	  options.serve ? "" : "--editor-stdio",
     ].filter((value) => value.length > 0);
 
     const child = childProcess.spawn(command, args, {
@@ -8165,7 +8174,7 @@ class RobloxSyncController {
     return Array.from(services);
   }
 
-  /** CLI path + cwd for the .renium viewer, reusing the resolved export CLI. */
+
   public rbsyncViewerCli(): { cliPath: string; cwd: string } | undefined {
     const cfg = this.getConfig();
     if (!cfg.exportCliPath) {
@@ -9132,10 +9141,10 @@ class RobloxSyncController {
   }
 }
 
-/**
- * Decorates renium-link mirror files in the VS Code Explorer and editor tabs.
- * Linked files are also OS read-only, so the editor shows the native lock too.
- */
+
+
+
+
 class LinkDecorationProvider implements vscode.FileDecorationProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri[] | undefined>();
   public readonly onDidChangeFileDecorations = this.emitter.event;
@@ -9500,7 +9509,7 @@ class PackageScriptDecorationProvider implements vscode.FileDecorationProvider {
   }
 }
 
-/** A browsable, draggable tree of available renium-link packages. */
+
 class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement>, vscode.TreeDragAndDropController<PackageTreeElement>, vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<PackageTreeElement | undefined | null | void>();
   public readonly onDidChangeTreeData = this.changeEmitter.event;

@@ -1001,7 +1001,7 @@ class RobloxSyncController {
                 await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
             }
             catch {
-                // The Explorer view is optional; file watchers still pick up imported settings changes.
+
             }
         }
         finally {
@@ -1102,7 +1102,7 @@ class RobloxSyncController {
             }
         }
         catch {
-            // Fall through to the lightweight normalizer below.
+
         }
         return Buffer.from(text.replace(/(\"generatedAtUnix\"\s*:\s*)-?\d+(\s*,?)/g, (_match, prefix, suffix) => prefix + "0" + suffix), "utf8");
     }
@@ -1358,7 +1358,7 @@ class RobloxSyncController {
             }
         }
         catch {
-            // Missing or invalid cache is treated as a cold start.
+
         }
         return { existed: false, cache: this.emptyEditorLiveSyncCache(projectRoot) };
     }
@@ -1920,7 +1920,7 @@ class RobloxSyncController {
                     fs.unlinkSync(changedPathsFile);
                 }
                 catch {
-                    // Best effort cleanup; stale path lists are ignored by future runs.
+
                 }
             }
         }
@@ -1941,7 +1941,7 @@ class RobloxSyncController {
                 }
             }
             catch {
-                // Keep searching; the final sentinel wins if multiple attempts were logged.
+
             }
         }
         return found;
@@ -1973,7 +1973,7 @@ class RobloxSyncController {
                 }
             }
             catch {
-                // Keep searching; the final sentinel wins if multiple attempts were logged.
+
             }
         }
         return found;
@@ -2120,7 +2120,7 @@ class RobloxSyncController {
                 await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
             }
             catch {
-                // The Explorer view is optional; file watchers still pick up imported settings changes.
+
             }
         }
         if (options.notifyOnSuccess && options.reason) {
@@ -2394,7 +2394,7 @@ class RobloxSyncController {
             proc.stdin.write(JSON.stringify({ id, command: "shutdown", args: [] }) + "\n", "utf8");
         }
         catch {
-            // Best-effort shutdown only.
+
         }
     }
     stopBridgeDaemon() {
@@ -3195,5 +3195,5 @@ function activate(context) {
     }));
 }
 function deactivate() {
-    // Resources are disposed via extension context subscriptions.
+
 }

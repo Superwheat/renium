@@ -26,7 +26,7 @@ if /I "%~1"=="l" (
     exit /b 2
   )
   "%CLI%" lx -e "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="lf" (
@@ -35,7 +35,7 @@ if /I "%~1"=="lf" (
     exit /b 2
   )
   "%CLI%" lx -f "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="lc" (
@@ -48,7 +48,7 @@ if /I "%~1"=="lc" (
   ) else (
     "%CLI%" lx --player "%~3" -e "%~2"
   )
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="r" (
@@ -61,7 +61,7 @@ if /I "%~1"=="r" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -Code "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="rf" (
@@ -74,7 +74,7 @@ if /I "%~1"=="rf" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -File "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="rc" (
@@ -87,7 +87,7 @@ if /I "%~1"=="rc" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -Client -Code "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="rcf" (
@@ -100,7 +100,7 @@ if /I "%~1"=="rcf" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -Client -File "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="rw" (
@@ -115,7 +115,7 @@ if /I "%~1"=="rw" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -ConsoleWaitSeconds !WAIT! -Code "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="rcw" (
@@ -130,7 +130,7 @@ if /I "%~1"=="rcw" (
     exit /b 2
   )
   powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNNER%" -Cli "%CLI%" -Client -ConsoleWaitSeconds !WAIT! -Code "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="lcf" (
@@ -139,19 +139,19 @@ if /I "%~1"=="lcf" (
     exit /b 2
   )
   "%CLI%" lx -c -f "%~2"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="c" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $env:RENIUM_CLI = '%CLI%'; $json = & '%CLI%' co -n 1 | ConvertFrom-Json; if ($json.entries.Count -gt 0) { [string]$json.entries[0].message -replace '\r?\n', ' | ' } }"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="cl" (
   set "LIMIT=%~2"
   if "%LIMIT%"=="" set "LIMIT=20"
   powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $env:RENIUM_CLI = '%CLI%'; $json = & '%CLI%' co -n !LIMIT! | ConvertFrom-Json; foreach ($entry in $json.entries) { $msg = [string]$entry.message -replace '\r?\n', ' | '; '{0}: {1}' -f $entry.type, $msg } }"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="ps" (
@@ -160,26 +160,26 @@ if /I "%~1"=="ps" (
   ) else (
     "%CLI%" play -s --players %~2
   )
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="px" (
   "%CLI%" play -x
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="pl" (
   "%CLI%" play -s
-  if errorlevel 1 exit /b %ERRORLEVEL%
+  if errorlevel 1 exit /b !ERRORLEVEL!
   timeout /t 3 /nobreak >nul
   "%CLI%" play -x
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /I "%~1"=="status" (
   "%CLI%" lx -e "local r=game:GetService('RunService') local s=game:GetService('StudioTestService') return { IsRunning=tostring(r:IsRunning()), IsEdit=tostring(r:IsEdit()), RunState=tostring(r.RunState), EditModeActive=tostring((s :: any).EditModeActive) }"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 "%CLI%" %*
-exit /b %ERRORLEVEL%
+exit /b !ERRORLEVEL!

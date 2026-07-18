@@ -1,6 +1,6 @@
 # Renium
 
-Renium is a full fidelity two-way sync tool for Roblox Studio made in Rust, faster than any other, syncing big places in seconds. Built with AI in mind: a token-efficient CLI lets agents read, edit, screenshot, and playtest your game. Ships with a full automation API and a VS Code extension, under active development.
+Renium is a high-fidelity two-way sync tool for Roblox Studio made in Rust, designed to sync large places quickly. Built with AI in mind: a token-efficient CLI lets agents read, edit, screenshot, and playtest your game. It ships with an automation API and a VS Code extension and is under active development. See the documented limitations before relying on a property type in release-critical workflows.
 
 ## Components
 

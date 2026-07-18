@@ -8,17 +8,6 @@ param(
     [switch]$LocalBuild
 )
 
-<#
-.SYNOPSIS
-Builds a traceable Renium release directory.
-
-.DESCRIPTION
-The default mode is deliberately fail-closed for a public release: it requires
-a clean checkout, a root product license, and a real VS Code publisher.  Use
--LocalBuild only for private test artifacts; it relaxes those publication
-guards but still verifies versions, tests, and the packaged artifacts.
-#>
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -256,7 +245,6 @@ if (-not ([IO.File]::ReadAllText($releasePluginXml).Contains("<roblox"))) {
     throw "The .rbxmx plugin artifact is not a Roblox XML model"
 }
 
-# Replace the checked-in/local convenience bundles only after both fresh builds validate.
 Copy-Item -LiteralPath $releasePluginXml -Destination (Join-Path $pluginDirectory "Renium.rbxmx") -Force
 Copy-Item -LiteralPath $releasePluginBinary -Destination (Join-Path $pluginDirectory "Renium.rbxm") -Force
 

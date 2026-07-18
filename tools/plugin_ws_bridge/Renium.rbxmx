@@ -7,7 +7,7 @@
       <Properties>
         <string name="Name">Renium</string>
         <token name="RunContext">3</token>
-        <string name="Source"><![CDATA[--!nocheck
+        <string name="Source"><![CDATA[
 
 if not plugin then
 	error("Renium must run as a Studio plugin")
@@ -103,7 +103,7 @@ return BridgeChunking
       <Item class="ModuleScript" referent="3">
         <Properties>
           <string name="Name">BridgeConnection</string>
-          <string name="Source"><![CDATA[--!nocheck
+          <string name="Source"><![CDATA[
 
 local BridgeConnection = {}
 
@@ -642,6 +642,7 @@ function BridgeConnection.create(context)
 				channel = channel.id,
 				version = context.bridgeVersion,
 				bridgeVersion = context.bridgeVersion,
+				runtimeId = context.runtimeId,
 				bridgeRole = Config.bridgeRole,
 				protocolVersion = context.protocolVersion,
 				codecVersion = context.codecVersion,
@@ -1045,6 +1046,9 @@ function BridgeConnection.create(context)
 
 	plugin.Unloading:Connect(function()
 		pluginUnloading = true
+		if type(context.onUnload) == "function" then
+			pcall(context.onUnload)
+		end
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = false
 			closeChannel(channel)
@@ -1081,8 +1085,12 @@ return BridgeConnection
           <string name="Name">BridgeEditorSync</string>
           <string name="Source"><![CDATA[local BridgeEditorSync = {}
 
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
+local EncodingService = game:GetService("EncodingService")
 local InsertService = game:GetService("InsertService")
+local Selection = game:GetService("Selection")
+local SerializationService = game:GetService("SerializationService")
 local Workspace = game:GetService("Workspace")
 local ScriptEditorService = nil
 pcall(function()
@@ -1115,6 +1123,105 @@ end
 local PATH_SEPARATOR = "\0"
 local reconcileSessions = {}
 local recentlyCreatedMeshPartKeys = {}
+local binaryImports = {}
+local binaryExports = {}
+local SESSION_TTL_SECONDS = 120
+local MAX_RECONCILE_SESSIONS = 16
+local MAX_RECONCILE_ENTRIES = 1000000
+local MAX_BINARY_IMPORT_SESSIONS = 4
+local MAX_BINARY_IMPORT_BUFFERED_BYTES = 536870912
+local nextSessionExpiryToken = 0
+
+local function countEntries(values: { [any]: any }): number
+	local count = 0
+	for _ in pairs(values) do
+		count += 1
+	end
+	return count
+end
+
+local function pruneExpiredSessions(values: { [any]: any })
+	local now = os.clock()
+	for key, session in pairs(values) do
+		if type(session) ~= "table" or now - (tonumber(session.updatedAt) or 0) > SESSION_TTL_SECONDS then
+			values[key] = nil
+		end
+	end
+end
+
+local function armSessionExpiry(values: { [any]: any }, key: any, session: { [any]: any })
+	session.updatedAt = os.clock()
+	if session.expiryArmed == true then
+		return
+	end
+	nextSessionExpiryToken += 1
+	local token = nextSessionExpiryToken
+	session.expiryToken = token
+	session.expiryArmed = true
+	local function expireWhenIdle()
+		local current = values[key]
+		if type(current) ~= "table" or current.expiryToken ~= token then
+			return
+		end
+		local idleSeconds = os.clock() - (tonumber(current.updatedAt) or 0)
+		if idleSeconds > SESSION_TTL_SECONDS then
+			values[key] = nil
+			return
+		end
+		task.delay(math.max(1, SESSION_TTL_SECONDS - idleSeconds + 1), expireWhenIdle)
+	end
+	task.delay(SESSION_TTL_SECONDS + 1, expireWhenIdle)
+end
+
+local function beginHistoryRecording(label: string): any?
+	local ok, recording = pcall(function()
+		return ChangeHistoryService:TryBeginRecording(
+			("Renium:%s:%s"):format(label, tostring(os.clock())),
+			"Renium: " .. label
+		)
+	end)
+	if ok then
+		return recording
+	end
+	warn("[Renium] could not begin undo recording: " .. tostring(recording))
+	return nil
+end
+
+local function finishHistoryRecording(recording: any?, operation: any?)
+	if recording == nil then
+		return
+	end
+	local finishOperation = operation or Enum.FinishRecordingOperation.Commit
+	local ok, err = pcall(function()
+		ChangeHistoryService:FinishRecording(recording, finishOperation)
+	end)
+	if not ok then
+		warn("[Renium] could not finish undo recording: " .. tostring(err))
+	end
+end
+
+local function captureExplorerSelection(): { Instance }
+	local ok, selected = pcall(Selection.Get, Selection)
+	if ok and type(selected) == "table" then
+		return selected
+	end
+	return {}
+end
+
+local function restoreExplorerSelection(selected: { Instance }, replacements: { [Instance]: Instance }?)
+	local restored = {}
+	for _, instance in ipairs(selected) do
+		local candidate = if replacements ~= nil then replacements[instance] or instance else instance
+		if typeof(candidate) == "Instance" and (candidate.Parent ~= nil or candidate:IsDescendantOf(game)) then
+			restored[#restored + 1] = candidate
+		end
+	end
+	pcall(Selection.Set, Selection, restored)
+end
+
+local function removeInstanceForUndo(instance: Instance)
+	instance.Parent = nil
+end
 
 local function pathKey(pathSegments: any): string
 	if type(pathSegments) ~= "table" then
@@ -1337,17 +1444,32 @@ end
 
 local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }): Instance?
 	local serviceName = tostring(change.service or "")
+	local pathSegments = change.pathSegments
+	if type(pathSegments) == "table" and #pathSegments > 0 then
+		if #pathSegments == 1 and tostring(pathSegments[1]) == serviceName then
+			local okService, service = pcall(game.GetService, game, serviceName)
+			if not okService then
+				service = game:FindFirstChild(serviceName)
+			end
+			if service ~= nil and instanceMatchesExpectedClass(service, change.className) then
+				return service
+			end
+		end
+		local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
+		if instance ~= nil and instanceMatchesExpectedClass(instance, change.className) then
+			return instance
+		end
+		local pathInstance = resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
+		if pathInstance ~= nil and instanceMatchesExpectedClass(pathInstance, change.className) then
+			return pathInstance
+		end
+	end
 	local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
 	if instance ~= nil and not instanceMatchesExpectedClass(instance, change.className) then
 		instance = nil
 	end
 	if instance ~= nil then
 		return instance
-	end
-
-	local pathSegments = change.pathSegments
-	if type(pathSegments) == "table" and #pathSegments > 0 then
-		return resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
 	end
 	return nil
 end
@@ -1396,11 +1518,15 @@ local function resolveEntryParent(entry: { [string]: any }, resolvedEntries: { [
 end
 
 local function resolveEntryInstance(entry: { [string]: any }, serviceName: string, ctx: { [string]: any }): Instance?
+	local pathInstance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+	if pathInstance ~= nil and instanceMatchesExpectedClass(pathInstance, entry.className) then
+		return pathInstance
+	end
 	local instance = resolveInstanceBySettingsId(serviceName, entry.settingsId, ctx)
 	if instance ~= nil then
 		return instance
 	end
-	return resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+	return pathInstance
 end
 
 local function syncEntryPlacement(entry: { [string]: any }, instance: Instance, stats: { [string]: any }, resolvedEntries: { [string]: any }?)
@@ -1755,14 +1881,17 @@ local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boole
 end
 
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
-	if type(ctx) == "table" and type(serviceName) == "string" and serviceName ~= "" then
-		local instance = resolveInstanceBySettingsId(serviceName, raw.settingsId or raw.instanceId or raw.instanceIndex, ctx)
+	if type(raw.pathSegments) == "table" then
+		local instance = resolvePathSegments(raw.pathSegments, nil, raw.pathOrdinals)
 		if instance ~= nil then
 			return instance
 		end
 	end
-	if type(raw.pathSegments) == "table" then
-		return resolvePathSegments(raw.pathSegments)
+	if type(ctx) == "table" and type(serviceName) == "string" and serviceName ~= "" then
+		local instance = resolveInstanceBySettingsId(serviceName, raw.settingsId or raw.instanceId, ctx)
+		if instance ~= nil then
+			return instance
+		end
 	end
 	return nil
 end
@@ -1787,6 +1916,10 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		raw = raw.NumberSequence
 		typeName = "NumberSequence"
 	end
+	if typeName == nil and type(raw.NumberRange) == "table" then
+		raw = raw.NumberRange
+		typeName = "NumberRange"
+	end
 	if typeName == nil and type(raw.Ref) == "table" then
 		raw = raw.Ref
 		typeName = "Ref"
@@ -1809,6 +1942,16 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 			return true, -math.huge
 		end
 		return true, tonumber(text) or 0
+	elseif typeName == "BinaryString" then
+		local encoded = raw.base64
+		if type(encoded) ~= "string" then
+			return false, "BinaryString base64 must be a string"
+		end
+		local ok, decoded = pcall(EncodingService.Base64Decode, EncodingService, buffer.fromstring(encoded))
+		if not ok then
+			return false, decoded
+		end
+		return true, buffer.tostring(decoded)
 	elseif typeName == "PhysicalProperties" then
 		if raw.customPhysics == false or raw.density == nil then
 			return true, nil
@@ -1820,6 +1963,12 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 				numberField(raw, "elasticity", 0.5),
 				numberField(raw, "frictionWeight", 1),
 				numberField(raw, "elasticityWeight", 1)
+			)
+	elseif typeName == "NumberRange" then
+		return true,
+			NumberRange.new(
+				tonumber(raw.min or raw.Min or raw[1]) or 0,
+				tonumber(raw.max or raw.Max or raw[2]) or 0
 			)
 	elseif typeName == "Vector2" then
 		return true, Vector2.new(numberField(raw, "x"), numberField(raw, "y"))
@@ -1963,12 +2112,30 @@ local function classHasProperty(instance: Instance, propertyName: string): boole
 end
 
 local function decodePropertyValue(instance: Instance, propertyName: string, rawValue: any, ctx: { [string]: any }, serviceName: string): (boolean, any)
+	if type(rawValue) == "table" and rawValue._type == nil then
+		local okCurrent, current = pcall(function()
+			return (instance :: any)[propertyName]
+		end)
+		if okCurrent and typeof(current) == "NumberRange" then
+			return true,
+				NumberRange.new(
+					tonumber(rawValue.min or rawValue.Min or rawValue[1]) or 0,
+					tonumber(rawValue.max or rawValue.Max or rawValue[2]) or 0
+				)
+		end
+	end
 	return decodeValue(rawValue, enumHintForProperty(instance, propertyName), ctx, serviceName)
 end
 
-local function tableValuesEqual(a: { [any]: any }, b: { [any]: any }): boolean
+local valuesEqual
+
+local function tableValuesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: any }): boolean
+	if seen[a] == b then
+		return true
+	end
+	seen[a] = b
 	for key, value in pairs(a) do
-		if b[key] ~= value then
+		if not valuesEqual(value, b[key], seen) then
 			return false
 		end
 	end
@@ -1980,12 +2147,15 @@ local function tableValuesEqual(a: { [any]: any }, b: { [any]: any }): boolean
 	return true
 end
 
-local function valuesEqual(a: any, b: any): boolean
+valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
 	if a == b then
 		return true
 	end
+	if type(a) == "number" and type(b) == "number" and a ~= a and b ~= b then
+		return true
+	end
 	if type(a) == "table" and type(b) == "table" then
-		return tableValuesEqual(a, b)
+		return tableValuesEqual(a, b, seen or {})
 	end
 	return false
 end
@@ -2172,7 +2342,12 @@ local function applyTags(instance: Instance, rawTags: any, stats: { [string]: an
 	end
 end
 
-local function replaceInstanceClass(instance: Instance, className: string, stats: { [string]: any }): Instance
+local function replaceInstanceClass(
+	instance: Instance,
+	className: string,
+	stats: { [string]: any },
+	selectionReplacements: { [Instance]: Instance }?
+): Instance
 	if instance.ClassName == className then
 		stats.noops += 1
 		return instance
@@ -2202,11 +2377,35 @@ local function replaceInstanceClass(instance: Instance, className: string, stats
 			CollectionService:AddTag(replacement, tag)
 		end)
 	end
-	replacement.Parent = parent
-	for _, child in ipairs(instance:GetChildren()) do
-		child.Parent = replacement
+	local movedChildren = {}
+	local okSwap, swapErr = pcall(function()
+		replacement.Parent = parent
+		for _, child in ipairs(instance:GetChildren()) do
+			child.Parent = replacement
+			movedChildren[#movedChildren + 1] = child
+		end
+		removeInstanceForUndo(instance)
+	end)
+	if not okSwap then
+		for i = #movedChildren, 1, -1 do
+			pcall(function()
+				movedChildren[i].Parent = instance
+			end)
+		end
+		pcall(function()
+			instance.Parent = parent
+		end)
+		pcall(function()
+			replacement:Destroy()
+		end)
+		error(
+			"Cannot replace " .. instance:GetFullName() .. " with " .. className .. ": " .. tostring(swapErr),
+			0
+		)
 	end
-	instance:Destroy()
+	if selectionReplacements ~= nil then
+		selectionReplacements[instance] = replacement
+	end
 	stats.instanceReplaced += 1
 	return replacement
 end
@@ -2458,7 +2657,7 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 	end
 
 	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] == true then
-		instance = replaceInstanceClass(instance, tostring(change.className), stats)
+		instance = replaceInstanceClass(instance, tostring(change.className), stats, ctx.selectionReplacements)
 		if type(ctx.resolveCache) == "table" then
 			ctx.resolveCache[pathCacheKey(change.pathSegments, change.pathOrdinals)] = instance
 		end
@@ -2511,7 +2710,8 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 	for _, raw in ipairs(rawInstances) do
 		if type(raw) == "table" then
 			local pathSegments = cloneArray(raw.pathSegments)
-			if #pathSegments > 0 then
+			local className = tostring(raw.className or "Folder")
+			if #pathSegments > 0 and className ~= "PackageLink" then
 				if tostring(pathSegments[1]) ~= service.Name then
 					error("Instance path root does not match service: " .. pathKey(pathSegments))
 				end
@@ -2519,7 +2719,7 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 					pathSegments = pathSegments,
 					pathOrdinals = cloneArray(raw.pathOrdinals),
 					key = pathCacheKey(pathSegments, raw.pathOrdinals),
-					className = tostring(raw.className or "Folder"),
+					className = className,
 					settingsId = settingsIdText(raw.settingsId),
 				}
 				desiredKeys[entry.key] = true
@@ -2542,8 +2742,6 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 			local instance = resolveEntryInstance(entry, service.Name, ctx)
 			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
 				stats.noops += 1
-			elseif instance == nil and not liveHydrateEnabled(ctx) then
-				stats.noops += 1
 			elseif instance == nil then
 				local parent = resolveEntryParent(entry, resolvedEntries)
 				if parent == nil then
@@ -2551,7 +2749,7 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 				end
 				local okCreate, created = pcall(Instance.new, entry.className)
 				if not okCreate or created == nil then
-					error("Cannot create instance " .. entry.key .. ": " .. tostring(created))
+					error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
 				end
 				created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 				created.Parent = parent
@@ -2564,7 +2762,7 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 				syncEntryPlacement(entry, instance, stats, resolvedEntries)
 				if instance.ClassName ~= entry.className then
 					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats)
+					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
 					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
 				end
 				resolvedEntries[entry.key] = instance
@@ -2580,7 +2778,7 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 			local pathOrdinals = getInstancePathOrdinals(instance)
 			local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
 			if key ~= "" and not shouldKeepInstanceByDesiredEntry(service.Name, instance, pathSegments, pathOrdinals, ctx, desiredKeys, desiredSettingsIds, desiredStableKeys) and not isProtectedWorkspaceCameraInstance(instance) then
-				instance:Destroy()
+				removeInstanceForUndo(instance)
 				stats.instanceDeleted += 1
 			end
 		end
@@ -2604,17 +2802,20 @@ local function sortedInstanceEntries(change: { [string]: any }, serviceName: str
 	for _, raw in ipairs(rawInstances) do
 		if type(raw) == "table" then
 			local pathSegments = cloneArray(raw.pathSegments)
+			local className = tostring(raw.className or "Folder")
 			if #pathSegments > 0 then
 				if tostring(pathSegments[1]) ~= serviceName then
 					error("Instance path root does not match service: " .. pathKey(pathSegments))
 				end
-				table.insert(entries, {
-					pathSegments = pathSegments,
-					pathOrdinals = cloneArray(raw.pathOrdinals),
-					key = pathCacheKey(pathSegments, raw.pathOrdinals),
-					className = tostring(raw.className or "Folder"),
-					settingsId = settingsIdText(raw.settingsId),
-				})
+				if #pathSegments > 1 and className ~= serviceName and className ~= "PackageLink" then
+					table.insert(entries, {
+						pathSegments = pathSegments,
+						pathOrdinals = cloneArray(raw.pathOrdinals),
+						key = pathCacheKey(pathSegments, raw.pathOrdinals),
+						className = className,
+						settingsId = settingsIdText(raw.settingsId),
+					})
+				end
 			end
 		end
 	end
@@ -2638,16 +2839,25 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 
 	local mode = tostring(change.mode or "")
 	local sessionKey = reconcileSessionKey(serviceName, change.reconcileSession)
-	if mode == "beginReconcileService" or reconcileSessions[sessionKey] == nil then
+	pruneExpiredSessions(reconcileSessions)
+	if mode == "beginReconcileService" then
+		if reconcileSessions[sessionKey] == nil and countEntries(reconcileSessions) >= MAX_RECONCILE_SESSIONS then
+			error("Too many active editor reconcile sessions")
+		end
 		reconcileSessions[sessionKey] = {
 			desiredKeys = {},
 			desiredSettingsIds = {},
 			desiredStableKeys = {},
 			resolvedEntries = {},
 			failed = false,
+			entryCount = 0,
+			updatedAt = os.clock(),
 		}
+	elseif reconcileSessions[sessionKey] == nil then
+		error("Editor reconcile session was not found or expired; restart the reconcile")
 	end
 	local session = reconcileSessions[sessionKey]
+	armSessionExpiry(reconcileSessions, sessionKey, session)
 	if session.failed == true then
 		if mode == "finishReconcileService" then
 			reconcileSessions[sessionKey] = nil
@@ -2658,14 +2868,24 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 	local beforeCreated = stats.instanceCreated
 	local beforeDeleted = stats.instanceDeleted
 	local beforeReplaced = stats.instanceReplaced
-	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
+	local entries = sortedInstanceEntries(change, service.Name)
+	local newEntries = 0
+	for _, entry in ipairs(entries) do
+		if session.desiredKeys[entry.key] ~= true then
+			newEntries += 1
+		end
+	end
+	if session.entryCount + newEntries > MAX_RECONCILE_ENTRIES then
+		session.failed = true
+		error("Editor reconcile session exceeds the supported instance count")
+	end
+	session.entryCount += newEntries
+	for _, entry in ipairs(entries) do
 		session.desiredKeys[entry.key] = true
 		recordDesiredStableEntry(entry, service.Name, ctx, session.desiredSettingsIds, session.desiredStableKeys)
 		if #entry.pathSegments > 1 then
 			local instance = resolveEntryInstance(entry, service.Name, ctx)
 			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
-				stats.noops += 1
-			elseif instance == nil and not liveHydrateEnabled(ctx) then
 				stats.noops += 1
 			elseif instance == nil then
 				local parent = resolveEntryParent(entry, session.resolvedEntries)
@@ -2674,7 +2894,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 				end
 				local okCreate, created = pcall(Instance.new, entry.className)
 				if not okCreate or created == nil then
-					error("Cannot create instance " .. entry.key .. ": " .. tostring(created))
+					error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
 				end
 				created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 				created.Parent = parent
@@ -2687,7 +2907,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 				syncEntryPlacement(entry, instance, stats, session.resolvedEntries)
 				if instance.ClassName ~= entry.className then
 					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats)
+					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
 					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
 				end
 				session.resolvedEntries[entry.key] = instance
@@ -2704,7 +2924,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 				local pathOrdinals = getInstancePathOrdinals(instance)
 				local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
 				if key ~= "" and not shouldKeepInstanceByDesiredEntry(service.Name, instance, pathSegments, pathOrdinals, ctx, session.desiredKeys, session.desiredSettingsIds, session.desiredStableKeys) and not isProtectedWorkspaceCameraInstance(instance) then
-					instance:Destroy()
+					removeInstanceForUndo(instance)
 					stats.instanceDeleted += 1
 				end
 			end
@@ -2751,7 +2971,7 @@ local function applyInstanceUpserts(change: { [string]: any }, ctx: { [string]: 
 				syncEntryPlacement(entry, instance, stats, resolvedEntries)
 				if instance.ClassName ~= entry.className then
 					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats)
+					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
 					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
 				end
 				resolvedEntries[entry.key] = instance
@@ -2775,12 +2995,12 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
-		local instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
-		if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
-			instance = nil
-		end
+		local instance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
 		if instance == nil then
-			instance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+			instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
+			if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
+				instance = nil
+			end
 		end
 		if instance == nil or isProtectedWorkspaceCameraInstance(instance) or seenTargets[instance] == true then
 			stats.noops += 1
@@ -2790,7 +3010,7 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 		end
 	end
 	for _, instance in ipairs(targets) do
-		instance:Destroy()
+		removeInstanceForUndo(instance)
 		stats.instanceDeleted += 1
 	end
 
@@ -2814,13 +3034,31 @@ local function applyInstanceChange(change: { [string]: any }, ctx: { [string]: a
 	end
 end
 
+local function recordProtectedWrite(stats, change, kind, name, value)
+	stats.protectedSkipped += 1
+	table.insert(stats.protectedWrites, {
+		kind = kind,
+		service = change.service,
+		settingsId = change.settingsId,
+		pathSegments = change.pathSegments,
+		pathOrdinals = change.pathOrdinals,
+		className = change.className,
+		name = name,
+		value = value,
+	})
+end
+
 local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: any }, stats: { [string]: any }, touchedServices: { [string]: boolean })
 	local serviceName, service = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
+	if tostring(change.className or "") == "PackageLink" then
+		stats.noops += 1
+		return
+	end
 
 	local instance = resolveInstance(change, ctx)
 	if instance == nil then
-		error("Target instance was not found")
+		error("Target instance was not found: " .. pathKey(cloneArray(change.pathSegments)) .. " [" .. tostring(change.className or "") .. "]")
 	end
 	assertInstanceInService(instance, service)
 	if isProtectedWorkspaceCameraPath(change.pathSegments) or isProtectedWorkspaceCameraInstance(instance) then
@@ -2877,6 +3115,7 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 					end
 				else
 					if propertyName == "MeshId" and instance:IsA("MeshPart") and not canApplyProtectedMeshId(change, instance) then
+						recordProtectedWrite(stats, change, "property", propertyName, rawValue)
 						stats.noops += 1
 						clearRecentlyCreatedMeshPart(change)
 						continue
@@ -2889,6 +3128,12 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 								error("Failed to apply MeshId on " .. instance:GetFullName() .. ": " .. tostring(applyMeshErr))
 							end
 						else
+							local errText = string.lower(tostring(err))
+							if string.find(errText, "read only", 1, true) or string.find(errText, "lacking capability robloxscript", 1, true) or string.find(errText, "not a valid member", 1, true) then
+								recordProtectedWrite(stats, change, "property", propertyName, rawValue)
+								stats.noops += 1
+								continue
+							end
 							error("Failed to write " .. propertyName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
 						end
 					end
@@ -2913,7 +3158,16 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 			if valuesEqual(current, decoded) then
 				stats.noops += 1
 			else
-				instance:SetAttribute(attributeName, decoded)
+				local okWrite, err = pcall(instance.SetAttribute, instance, attributeName, decoded)
+				if not okWrite then
+					local errText = string.lower(tostring(err))
+					if string.find(errText, "corescript permission required", 1, true) or string.find(errText, "read only", 1, true) then
+						recordProtectedWrite(stats, change, "attribute", attributeName, rawValue)
+						stats.noops += 1
+						continue
+					end
+					error("Failed to write attribute " .. attributeName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
+				end
 				stats.attributeUpdated += 1
 			end
 		end
@@ -2923,6 +3177,380 @@ end
 function BridgeEditorSync.create(ctx: { [string]: any })
 	local api = {}
 	api.stats = ctx.stats
+
+	function api.resolveReviewInstance(change: { [string]: any }): Instance?
+		return resolveInstance(change, ctx)
+	end
+
+	function api.decodeReviewValue(raw: any, enumHint: string?, serviceName: string?): (boolean, any)
+		return decodeValue(raw, enumHint, ctx, serviceName)
+	end
+
+	function api.readReviewProperty(instance: Instance, propertyName: string): (boolean, any)
+		return readProperty(instance, propertyName)
+	end
+
+	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryExports)
+		local exportId = tostring(params.exportId or "")
+		if exportId == "" then
+			error("Invalid native export id")
+		end
+		for key in pairs(binaryExports) do
+			binaryExports[key] = nil
+		end
+		local serviceNames = {}
+		for serviceName, allowed in pairs(ctx.allowedServices) do
+			if allowed == true then
+				serviceNames[#serviceNames + 1] = serviceName
+			end
+		end
+		table.sort(serviceNames)
+		local roots = {}
+		local markers = {}
+		local groups = {}
+		local instanceCount = 0
+		for _, serviceName in ipairs(serviceNames) do
+			local service = game:GetService(serviceName)
+			local marker = Instance.new("Folder")
+			marker.Name = serviceName
+			for name, value in pairs(service:GetAttributes()) do
+				pcall(marker.SetAttribute, marker, name, value)
+			end
+			for _, tag in ipairs(CollectionService:GetTags(service)) do
+				CollectionService:AddTag(marker, tag)
+			end
+			markers[#markers + 1] = marker
+			roots[#roots + 1] = marker
+			local children = service:GetChildren()
+			local rootProperties = {}
+			if type(ctx.readRootProperties) == "function" then
+				local okRootProperties, values = pcall(ctx.readRootProperties, serviceName)
+				if okRootProperties and type(values) == "table" then
+					rootProperties = values
+				end
+			end
+			groups[#groups + 1] = {
+				service = serviceName,
+				targetPath = { serviceName },
+				count = #children,
+				rootProperties = rootProperties,
+			}
+			for _, child in ipairs(children) do
+				roots[#roots + 1] = child
+				instanceCount += 1 + #child:GetDescendants()
+			end
+		end
+		local ok, payload = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
+		for _, marker in ipairs(markers) do
+			marker:Destroy()
+		end
+		if not ok then
+			error(payload, 0)
+		end
+		local totalBytes = buffer.len(payload)
+		if totalBytes > 536870912 then
+			error("Native export exceeds the supported size")
+		end
+		binaryExports[exportId] = {
+			payload = payload,
+			groups = groups,
+			totalBytes = totalBytes,
+			updatedAt = os.clock(),
+		}
+		armSessionExpiry(binaryExports, exportId, binaryExports[exportId])
+		return {
+			ok = true,
+			exportId = exportId,
+			totalBytes = totalBytes,
+			groups = groups,
+			instanceCount = instanceCount,
+		}
+	end
+
+	function api.readBinaryExport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryExports)
+		local exportId = tostring(params.exportId or "")
+		local session = binaryExports[exportId]
+		if type(session) ~= "table" then
+			error("Native export session was not found")
+		end
+		armSessionExpiry(binaryExports, exportId, session)
+		local offset = tonumber(params.offset)
+		local length = tonumber(params.length)
+		if offset == nil or offset < 0 or offset % 1 ~= 0 then
+			error("Invalid native export offset")
+		end
+		if length == nil or length < 1 or length > 4194304 or length % 1 ~= 0 then
+			error("Invalid native export length")
+		end
+		if offset + length > session.totalBytes then
+			error("Native export range exceeds its payload")
+		end
+		local chunk = buffer.create(length)
+		buffer.copy(chunk, 0, session.payload, offset, length)
+		return {
+			ok = true,
+			offset = offset,
+			length = length,
+			data = buffer.tostring(EncodingService:Base64Encode(chunk)),
+		}
+	end
+
+	function api.finishBinaryExport(params: { [string]: any }): { [string]: any }
+		local exportId = tostring(params.exportId or "")
+		local found = binaryExports[exportId] ~= nil
+		binaryExports[exportId] = nil
+		return { ok = true, found = found }
+	end
+
+	function api.beginBinaryImport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryImports)
+		local importId = tostring(params.importId or "")
+		local totalBytes = tonumber(params.totalBytes)
+		local totalChunks = tonumber(params.totalChunks)
+		if importId == "" or totalBytes == nil or totalBytes < 0 or totalBytes > 536870912 then
+			error("Invalid native import size")
+		end
+		if totalChunks == nil or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
+			error("Invalid native import chunk count")
+		end
+		if type(params.groups) ~= "table" then
+			error("Native import groups must be an array")
+		end
+		if binaryImports[importId] == nil and countEntries(binaryImports) >= MAX_BINARY_IMPORT_SESSIONS then
+			error("Too many active native import sessions")
+		end
+		local groups = {}
+		for _, rawGroup in ipairs(params.groups) do
+			local serviceName, service = validatedChangeService({ service = rawGroup.service }, ctx)
+			local targetPath = rawGroup.targetPath
+			if type(targetPath) ~= "table" or #targetPath < 1 or #targetPath > 2 or tostring(targetPath[1]) ~= serviceName then
+				error("Invalid native import target path")
+			end
+			local target = service
+			if #targetPath == 2 then
+				target = service:FindFirstChild(tostring(targetPath[2]))
+				if target == nil then
+					error("Native import target was not found")
+				end
+			end
+			local count = tonumber(rawGroup.count)
+			if count == nil or count < 0 or count % 1 ~= 0 then
+				error("Invalid native import service count")
+			end
+			groups[#groups + 1] = {
+				serviceName = serviceName,
+				service = service,
+				target = target,
+				count = count,
+			}
+		end
+		binaryImports[importId] = {
+			totalBytes = totalBytes,
+			totalChunks = totalChunks,
+			chunks = table.create(totalChunks),
+			receivedBytes = 0,
+			receivedChunks = 0,
+			groups = groups,
+			updatedAt = os.clock(),
+		}
+		armSessionExpiry(binaryImports, importId, binaryImports[importId])
+		return { ok = true, importId = importId }
+	end
+
+	function api.appendBinaryImport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryImports)
+		local importId = tostring(params.importId or "")
+		local session = binaryImports[importId]
+		if type(session) ~= "table" then
+			error("Native import session was not found")
+		end
+		armSessionExpiry(binaryImports, importId, session)
+		local index = tonumber(params.index)
+		if index == nil or index < 1 or index > session.totalChunks or index % 1 ~= 0 then
+			error("Invalid native import chunk index")
+		end
+		if session.chunks[index] ~= nil then
+			return { ok = true, duplicate = true }
+		end
+		local data = tostring(params.data or "")
+		local decoded = EncodingService:Base64Decode(buffer.fromstring(data))
+		local decodedBytes = buffer.len(decoded)
+		if session.receivedBytes + decodedBytes > session.totalBytes then
+			error("Native import exceeds its declared size")
+		end
+		local bufferedBytes = 0
+		for _, active in pairs(binaryImports) do
+			bufferedBytes += tonumber(active.receivedBytes) or 0
+		end
+		if bufferedBytes + decodedBytes > MAX_BINARY_IMPORT_BUFFERED_BYTES then
+			error("Native import sessions exceed the aggregate buffered-byte limit")
+		end
+		session.chunks[index] = decoded
+		session.receivedBytes += decodedBytes
+		session.receivedChunks += 1
+		return { ok = true, receivedBytes = decodedBytes }
+	end
+
+	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryImports)
+		local importId = tostring(params.importId or "")
+		local session = binaryImports[importId]
+		binaryImports[importId] = nil
+		if type(session) ~= "table" then
+			error("Native import session was not found")
+		end
+		if session.receivedChunks ~= session.totalChunks or session.receivedBytes ~= session.totalBytes then
+			error("Native import is incomplete")
+		end
+		local started = os.clock()
+		local payload = buffer.create(session.totalBytes)
+		local offset = 0
+		for index = 1, session.totalChunks do
+			local chunk = session.chunks[index]
+			local length = buffer.len(chunk)
+			buffer.copy(payload, offset, chunk, 0, length)
+			offset += length
+		end
+		local roots = SerializationService:DeserializeInstancesAsync(payload)
+		local expectedRoots = 0
+		for _, group in ipairs(session.groups) do
+			expectedRoots += group.count
+		end
+		if #roots ~= expectedRoots then
+			error("Native import returned an unexpected root count")
+		end
+		local prepared = {}
+		local rootIndex = 1
+		for _, group in ipairs(session.groups) do
+			local incoming = table.create(group.count)
+			for index = 1, group.count do
+				local instance = roots[rootIndex]
+				rootIndex += 1
+				if instance == nil or instance.Parent ~= nil or instance:IsA("Terrain") then
+					error("Native import returned an invalid root")
+				end
+				incoming[index] = instance
+			end
+			local outgoing = {}
+			for _, instance in ipairs(group.target:GetChildren()) do
+				local lockedStarterContainer = group.serviceName == "StarterPlayer"
+					and group.target == group.service
+					and (instance:IsA("StarterPlayerScripts") or instance:IsA("StarterCharacterScripts"))
+				if not instance:IsA("Terrain") and not lockedStarterContainer then
+					outgoing[#outgoing + 1] = instance
+				end
+			end
+			prepared[#prepared + 1] = {
+				serviceName = group.serviceName,
+				service = group.service,
+				target = group.target,
+				incoming = incoming,
+				outgoing = outgoing,
+			}
+		end
+		local explorerSelection = captureExplorerSelection()
+		local selectionPaths = {}
+		for _, instance in ipairs(explorerSelection) do
+			local pathSegments = getInstancePathSegments(instance)
+			if pathSegments ~= nil then
+				selectionPaths[instance] = {
+					pathSegments = pathSegments,
+					pathOrdinals = getInstancePathOrdinals(instance),
+				}
+			end
+		end
+		local historyRecording = beginHistoryRecording("Native filesystem sync")
+		local previousCamera = Workspace.CurrentCamera
+		local parented = {}
+		local removed = {}
+		local created = 0
+		local deleted = 0
+		local importedCamera = nil
+		local okParent, parentErr = pcall(function()
+			for _, group in ipairs(prepared) do
+				for _, instance in ipairs(group.incoming) do
+					instance.Parent = group.target
+					parented[#parented + 1] = instance
+					created += 1 + #instance:GetDescendants()
+					if group.service == Workspace and importedCamera == nil and instance:IsA("Camera") then
+						importedCamera = instance
+					end
+				end
+				for _, instance in ipairs(group.outgoing) do
+					deleted += 1 + #instance:GetDescendants()
+					removeInstanceForUndo(instance)
+					removed[#removed + 1] = { instance = instance, parent = group.target }
+				end
+			end
+			if importedCamera ~= nil then
+				Workspace.CurrentCamera = importedCamera
+			end
+		end)
+		if not okParent then
+			for _, instance in ipairs(parented) do
+				instance.Parent = nil
+			end
+			for _, entry in ipairs(removed) do
+				pcall(function()
+					entry.instance.Parent = entry.parent
+				end)
+			end
+			pcall(function()
+				Workspace.CurrentCamera = previousCamera
+			end)
+			finishHistoryRecording(historyRecording, Enum.FinishRecordingOperation.Cancel)
+			restoreExplorerSelection(explorerSelection, nil)
+			error(parentErr, 0)
+		end
+		local selectionReplacements = {}
+		for instance, path in pairs(selectionPaths) do
+			if instance.Parent == nil then
+				local replacement = resolvePathSegments(path.pathSegments, nil, path.pathOrdinals)
+				if replacement ~= nil then
+					selectionReplacements[instance] = replacement
+				end
+			end
+		end
+		finishHistoryRecording(historyRecording)
+		restoreExplorerSelection(explorerSelection, selectionReplacements)
+		for _, group in ipairs(prepared) do
+			ctx.invalidateService(group.serviceName)
+		end
+		local elapsed = (os.clock() - started) * 1000
+		ctx.stats.requests += 1
+		ctx.stats.lastMs = elapsed
+		ctx.stats.lastAtUnix = os.time()
+		ctx.stats.lastOk = true
+		ctx.stats.instanceCreated += created
+		ctx.stats.instanceDeleted += deleted
+		ctx.updateStatus()
+		return {
+			ok = true,
+			requests = 1,
+			instanceCreated = created,
+			instanceDeleted = deleted,
+			binaryBytes = session.totalBytes,
+			binaryMs = elapsed,
+			undoRecorded = historyRecording ~= nil,
+		}
+	end
+
+	function api.cancelBinaryImport(params: { [string]: any }): { [string]: any }
+		local importId = tostring(params.importId or "")
+		local found = binaryImports[importId] ~= nil
+		binaryImports[importId] = nil
+		return { ok = true, found = found }
+	end
+
+	function api.cancelReconcile(params: { [string]: any }): { [string]: any }
+		local serviceName = tostring(params.service or "")
+		local sessionKey = reconcileSessionKey(serviceName, params.reconcileSession)
+		local found = reconcileSessions[sessionKey] ~= nil
+		reconcileSessions[sessionKey] = nil
+		return { ok = true, found = found }
+	end
 
 	function api.applyChanges(params: { [string]: any }): { [string]: any }
 		if type(params) ~= "table" then
@@ -2948,8 +3576,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local started = os.clock()
 		local previousResolveCache = ctx.resolveCache
 		local previousSettingsIdLookupByService = ctx.settingsIdLookupByService
+		local previousSelectionReplacements = ctx.selectionReplacements
+		local explorerSelection = captureExplorerSelection()
+		local selectionReplacements = {}
 		ctx.resolveCache = {}
 		ctx.settingsIdLookupByService = {}
+		ctx.selectionReplacements = selectionReplacements
+		local historyRecording = beginHistoryRecording("Sync from filesystem")
 		local stats = {
 			ok = true,
 			requests = 1,
@@ -2965,12 +3598,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			attributeUpdated = 0,
 			noops = 0,
 			errors = 0,
+			protectedSkipped = 0,
+			protectedWrites = {},
 			probeItemChanged = 0,
 			probeDescendantAdded = 0,
 			probeDescendantRemoving = 0,
 			probeItemChangedAvailable = 0,
 			probeDescendantAddedAvailable = 0,
 			probeDescendantRemovingAvailable = 0,
+			undoRecorded = historyRecording ~= nil,
 		}
 		local touchedServices = {}
 		local stopEventProbe
@@ -2979,6 +3615,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local instanceChanges = params.instanceChanges
+		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do
 				local ok, err = pcall(applyInstanceChange, change, ctx, stats, touchedServices)
@@ -2997,30 +3634,36 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					stats.ok = false
 					stats.errors += 1
 					warn("[Renium] editor instance sync failed: " .. tostring(err))
+					aborted = true
+					break
 				end
 			end
 		end
 
 		local sourceChanges = params.sourceChanges
-		if type(sourceChanges) == "table" then
+		if not aborted and type(sourceChanges) == "table" then
 			for _, change in ipairs(sourceChanges) do
 				local ok, err = pcall(applySourceChange, change, ctx, stats, touchedServices)
 				if not ok then
 					stats.ok = false
 					stats.errors += 1
 					warn("[Renium] editor source sync failed: " .. tostring(err))
+					aborted = true
+					break
 				end
 			end
 		end
 
 		local propertyChanges = params.propertyChanges
-		if type(propertyChanges) == "table" then
+		if not aborted and type(propertyChanges) == "table" then
 			for _, change in ipairs(propertyChanges) do
 				local ok, err = pcall(applyPropertyChange, change, ctx, stats, touchedServices)
 				if not ok then
 					stats.ok = false
 					stats.errors += 1
 					warn("[Renium] editor property sync failed: " .. tostring(err))
+					aborted = true
+					break
 				end
 			end
 		end
@@ -3029,12 +3672,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			task.wait()
 			stopEventProbe()
 		end
+		finishHistoryRecording(historyRecording)
+		restoreExplorerSelection(explorerSelection, selectionReplacements)
 		stats.lastMs = (os.clock() - started) * 1000
 		for serviceName in pairs(touchedServices) do
 			ctx.invalidateService(serviceName)
 		end
 		ctx.resolveCache = previousResolveCache
 		ctx.settingsIdLookupByService = previousSettingsIdLookupByService
+		ctx.selectionReplacements = previousSelectionReplacements
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
 		ctx.stats.lastAtUnix = os.time()
@@ -3053,6 +3699,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.stats.errors += stats.errors
 		ctx.updateStatus()
 		return stats
+	end
+
+	function api.cleanup()
+		table.clear(reconcileSessions)
+		table.clear(binaryImports)
+		table.clear(binaryExports)
 	end
 
 	return api
@@ -3435,7 +4087,7 @@ return BridgeParallel
       <Item class="ModuleScript" referent="7">
         <Properties>
           <string name="Name">BridgePluginRuntime</string>
-          <string name="Source"><![CDATA[--!nocheck
+          <string name="Source"><![CDATA[
 
 type ServiceState = {
 	instances: { Instance },
@@ -3497,16 +4149,23 @@ function BridgePluginRuntime.start(context)
 	local plugin = context.plugin
 	local rootScript = context.rootScript
 
-	
+
 	local HttpService = game:GetService("HttpService")
 	local RunService = game:GetService("RunService")
-	
+
 	if not plugin then
 		error("Renium must run as a Studio plugin")
 	end
-	
+
 	local Config = {}
-	
+	local okRuntimeId, generatedRuntimeId = pcall(function()
+		return HttpService:GenerateGUID(false)
+	end)
+	if not okRuntimeId or type(generatedRuntimeId) ~= "string" or generatedRuntimeId == "" then
+		error("Renium could not create a bridge runtime identity")
+	end
+	Config.bridgeRuntimeId = generatedRuntimeId
+
 	function Config.isPlayModeActiveForBridge(): boolean
 		local okState, state = pcall(function()
 			return RunService.RunState
@@ -3531,7 +4190,7 @@ function BridgePluginRuntime.start(context)
 		end)
 		return okStudioTest and editModeActive == false
 	end
-	
+
 	function Config.getBridgeRole(): string
 		local okRunning, running = pcall(function()
 			return RunService:IsRunning()
@@ -3547,9 +4206,55 @@ function BridgePluginRuntime.start(context)
 		end
 		return "edit"
 	end
-	
+
 	Config.startedInPlayMode = Config.isPlayModeActiveForBridge()
 	Config.bridgeRole = Config.getBridgeRole()
+	Config.editorReviewUploads = {}
+	local EDITOR_REVIEW_UPLOAD_TTL_SECONDS = 120
+	local MAX_EDITOR_REVIEW_UPLOADS = 4
+	local MAX_EDITOR_REVIEW_CHANGES = 100000
+	local nextEditorReviewExpiryToken = 0
+
+	local function pruneEditorReviewUploads()
+		local now = os.clock()
+		for uploadId, upload in pairs(Config.editorReviewUploads) do
+			if type(upload) ~= "table" or now - (tonumber(upload.updatedAt) or 0) > EDITOR_REVIEW_UPLOAD_TTL_SECONDS then
+				Config.editorReviewUploads[uploadId] = nil
+			end
+		end
+	end
+
+	local function editorReviewUploadCount(): number
+		local count = 0
+		for _ in pairs(Config.editorReviewUploads) do
+			count += 1
+		end
+		return count
+	end
+
+	local function armEditorReviewUploadExpiry(uploadId: string, upload: { [any]: any })
+		upload.updatedAt = os.clock()
+		if upload.expiryArmed == true then
+			return
+		end
+		nextEditorReviewExpiryToken += 1
+		local token = nextEditorReviewExpiryToken
+		upload.expiryToken = token
+		upload.expiryArmed = true
+		local function expireWhenIdle()
+			local current = Config.editorReviewUploads[uploadId]
+			if type(current) ~= "table" or current.expiryToken ~= token then
+				return
+			end
+			local idleSeconds = os.clock() - (tonumber(current.updatedAt) or 0)
+			if idleSeconds > EDITOR_REVIEW_UPLOAD_TTL_SECONDS then
+				Config.editorReviewUploads[uploadId] = nil
+				return
+			end
+			task.delay(math.max(1, EDITOR_REVIEW_UPLOAD_TTL_SECONDS - idleSeconds + 1), expireWhenIdle)
+		end
+		task.delay(EDITOR_REVIEW_UPLOAD_TTL_SECONDS + 1, expireWhenIdle)
+	end
 
 	function Config.getPlayerIdentity(): (string?, number?)
 		if Config.bridgeRole ~= "play-client" then
@@ -3563,7 +4268,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return localPlayer.Name, localPlayer.UserId
 	end
-	
+
 	local SETTINGS_PREFIX = "Renium."
 	local DEFAULT_HOST = "127.0.0.1"
 	local DEFAULT_PORTS = { 8781, 8782, 8783 }
@@ -3687,7 +4392,7 @@ function BridgePluginRuntime.start(context)
 		end
 		error("[Renium] missing child ModuleScript: " .. name)
 	end
-	
+
 	local function tryRequireChildModule(name: string): any?
 		local child = rootScript:FindFirstChild(name)
 		if child and child:IsA("ModuleScript") then
@@ -3699,7 +4404,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return nil
 	end
-	
+
 	local function tryRequireNestedModule(parent: Instance?, name: string): any?
 		if parent == nil then
 			return nil
@@ -3714,7 +4419,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return nil
 	end
-	
+
 	local SettingsModule = requireChildModule("BridgeSettings")
 	local ThemeModule = requireChildModule("BridgeTheme")
 	local StatusModule = requireChildModule("BridgeStatus")
@@ -3731,18 +4436,18 @@ function BridgePluginRuntime.start(context)
 	local RuntimeApi = requireChildModule("BridgeRuntimeApi").create(plugin)
 	local _ = tryRequireChildModule("RbxDom")
 	local RbxDomDatabase = tryRequireNestedModule(rootScript:FindFirstChild("RbxDom"), "database")
-	
+
 	local ui = UiModule.create(plugin, ThemeModule, {
 		version = BRIDGE_VERSION,
 		buildUnix = BRIDGE_BUILD_UNIX,
 		codecVersion = CODEC_VERSION,
 	})
 	ui.setPlayModeHidden(Config.isPlayModeActiveForBridge())
-	
+
 	Config.bridgeHost = DEFAULT_HOST
 	Config.bridgePorts = DEFAULT_PORTS
 	Config.bridgeChannels = {}
-	
+
 	local ALLOWED_SERVICES = {
 		Workspace = true,
 		Players = true,
@@ -3870,7 +4575,7 @@ function BridgePluginRuntime.start(context)
 		"OutdoorAmbient",
 		"Technology",
 	}
-	
+
 	local NO_DEFAULTS = {}
 	local NO_PROPERTIES = {}
 	local DEFAULT_PROPERTY_CACHE: { [string]: any } = {}
@@ -3895,21 +4600,21 @@ function BridgePluginRuntime.start(context)
 	end
 	local PERFORMANCE_MODE = Config.normalizePerformanceMode(plugin:GetSetting(SETTINGS_PREFIX .. "performanceMode"))
 	local NOOP_EXPORT_YIELDER = function() end
-	
+
 	local function makeExportBurstYielder(checkInterval: number?, budgetSeconds: number?)
 		if PERFORMANCE_MODE == "throughput" then
 			return NOOP_EXPORT_YIELDER
 		end
-	
+
 		if PERFORMANCE_MODE == "balanced" then
 			local interval = math.max(1, checkInterval or SERIALIZATION_BURST_CHECK_INTERVAL)
 			local budget = math.max(budgetSeconds or SERIALIZATION_BURST_BUDGET_SECONDS, 1 / 120)
 			return ParallelModule.makeBurstYielder(interval, budget)
 		end
-	
+
 		return ParallelModule.makeBurstYielder(checkInterval, budgetSeconds)
 	end
-	
+
 	local EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
 		PropertySchemaModule.buildSchemasFromRbxDom(RbxDomDatabase, COMPACT_TYPE_IDS, StudioApiSchemaModule)
 	local EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS: { [string]: { string } } = PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
@@ -3924,7 +4629,7 @@ function BridgePluginRuntime.start(context)
 			)
 		end
 	end
-	
+
 	local function configureStudioChangePropertyCandidates()
 		local studioChanges = Config.studioChanges
 		if type(studioChanges) ~= "table" then
@@ -3935,21 +4640,21 @@ function BridgePluginRuntime.start(context)
 			configure(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 		end
 	end
-	
+
 	configureStudioChangePropertyCandidates()
-	
+
 	local stateByService: { [string]: ServiceState }
 	local demandSerializerGate = Instance.new("BindableEvent")
 	local activeDemandSerializers = 0
 	stateByService = {}
-	
+
 	Config.bridgeConnectRequested = false
 	Config.bridgeConnectedOnce = false
 	Config.bridgeConnectSession = 0
 	Config.bridgeConnectDeadline = 0
 	Config.bridgeConnectionStatus = "Disconnected"
 	Config.bridgePausedForPlay = false
-	
+
 	local editorSyncStats = {
 		requests = 0,
 		lastMs = 0,
@@ -3968,9 +4673,9 @@ function BridgePluginRuntime.start(context)
 		lastAtUnix = 0,
 		lastOk = true,
 	}
-	
+
 	local editorSync
-	
+
 	local serializeRefValueCompactV4
 	local serializeValueCompactV4
 	local getClassPropertySchema
@@ -3979,7 +4684,7 @@ function BridgePluginRuntime.start(context)
 	local serializeAttributesCompactV5
 	local prepareService
 	local getState
-	
+
 	function Config.updateStatusText()
 		local statusState = {
 			bridgeVersion = BRIDGE_VERSION,
@@ -4001,7 +4706,7 @@ function BridgePluginRuntime.start(context)
 			ui.statusLabel.Text = StatusModule.render(statusState)
 		end
 	end
-	
+
 	editorSync = EditorSyncModule.create({
 		stats = editorSyncStats,
 		allowedServices = ALLOWED_SERVICES,
@@ -4021,8 +4726,11 @@ function BridgePluginRuntime.start(context)
 		getSyncOptions = function()
 			return Config.getBridgeSettings and Config.getBridgeSettings() or {}
 		end,
+		readRootProperties = function(serviceName: string)
+			return Config.readEditorBinaryRootProperties(serviceName)
+		end,
 	})
-	
+
 	local function tryReadModelPivotProperty(instance: Instance, propertyName: string): (boolean, any)
 		if not (instance:IsA("Model") or instance:IsA("WorldModel")) then
 			return false, nil
@@ -4039,7 +4747,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return false, nil
 	end
-	
+
 	local function tryRead(instance: Instance, propertyName: string): (boolean, any)
 		local okModelPivot, modelPivotValue = tryReadModelPivotProperty(instance, propertyName)
 		if okModelPivot then
@@ -4110,7 +4818,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return hasValue, value
 	end
-	
+
 	function Config.newExportMetrics(): { [string]: number }
 		return {
 			modifiedDefaultChecks = 0,
@@ -4125,7 +4833,7 @@ function BridgePluginRuntime.start(context)
 			safeReadPropertyFallbackCount = 0,
 		}
 	end
-	
+
 	function Config.mergeExportMetrics(state: ServiceState, metrics: { [string]: number })
 		for key, value in pairs(metrics) do
 			if value ~= 0 then
@@ -4134,13 +4842,13 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 	end
-	
+
 	function Config.bumpExportMetric(state: ServiceState, key: string, amount: number?)
 		local delta = amount or 1
 		state.exportMetrics[key] = (state.exportMetrics[key] or 0) + delta
 		state.exportMetricsSinceLastRead[key] = (state.exportMetricsSinceLastRead[key] or 0) + delta
 	end
-	
+
 	function Config.markModifiedDefaultRuntimeDenylist(state: ServiceState, bypassKey: string): boolean
 		if state.modifiedDefaultRuntimeDenylist[bypassKey] ~= true then
 			state.modifiedDefaultRuntimeDenylist[bypassKey] = true
@@ -4148,7 +4856,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return false
 	end
-	
+
 	function Config.getClassPropertyFallbackMap(state: ServiceState, className: string): { [string]: boolean }
 		local fallbackByClass = state.requiresPcallByClassProperty
 		local fallbackMap = fallbackByClass[className]
@@ -4158,7 +4866,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return fallbackMap
 	end
-	
+
 	function Config.collectAndResetExportMetrics(): { [string]: number }
 		local aggregated = Config.newExportMetrics()
 		for _, state in pairs(stateByService) do
@@ -4171,7 +4879,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return aggregated
 	end
-	
+
 	function Config.tryIsPropertyModified(instance: Instance, propertyName: string): (boolean, boolean?)
 		local ok, modified = pcall(function()
 			return instance:IsPropertyModified(propertyName)
@@ -4181,18 +4889,18 @@ function BridgePluginRuntime.start(context)
 		end
 		return false, nil
 	end
-	
+
 	local MODIFIED_DEFAULT_BYPASS_PROPERTY_DENYLIST = {
 		linkedsource = true,
 	}
 	local MODIFIED_DEFAULT_BYPASS_ADAPTIVE_SAMPLES_PER_KEY = 4
 	local MODIFIED_DEFAULT_BYPASS_PROFIT_MARGIN = 1.25
 	local MODIFIED_DEFAULT_BYPASS_MIN_SAVED_US = 0.25
-	
+
 	function Config.modifiedDefaultBypassKey(className: string, propertyName: string): string
 		return className .. "." .. propertyName
 	end
-	
+
 	function Config.canUseModifiedDefaultBypass(
 		className: string,
 		propertyName: string,
@@ -4217,7 +4925,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return true
 	end
-	
+
 	function Config.evaluateModifiedDefaultBypass(
 		state: ServiceState,
 		bypassKey: string,
@@ -4231,14 +4939,14 @@ function BridgePluginRuntime.start(context)
 		if state.modifiedDefaultRuntimeDenylist[bypassKey] == true then
 			return false, nil, nil, false, false, false
 		end
-	
+
 		local decision = state.modifiedDefaultAdaptiveDecisionByKey[bypassKey]
 		if decision == true then
 			return true, nil, nil, false, false, false
 		elseif decision == false then
 			return false, nil, nil, false, false, false
 		end
-	
+
 		local modifiedStarted = os.clock()
 		local hasModified, isModified = Config.tryIsPropertyModified(instance, propertyName)
 		local modifiedUs = (os.clock() - modifiedStarted) * 1000000
@@ -4247,7 +4955,7 @@ function BridgePluginRuntime.start(context)
 			Config.bumpExportMetric(state, "modifiedDefaultAdaptiveRejected")
 			return false, hasModified, isModified, true, false, false
 		end
-	
+
 		local readCompareStarted = os.clock()
 		local gotSample, sampledValue = tryRead(instance, propertyName)
 		local sampleIsDefault = false
@@ -4260,7 +4968,7 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 		local readCompareUs = (os.clock() - readCompareStarted) * 1000000
-	
+
 		local stats = state.modifiedDefaultAdaptiveStatsByKey[bypassKey]
 		if stats == nil then
 			stats = {
@@ -4271,20 +4979,20 @@ function BridgePluginRuntime.start(context)
 			}
 			state.modifiedDefaultAdaptiveStatsByKey[bypassKey] = stats
 		end
-	
+
 		stats.samples += 1
 		stats.modifiedUs += modifiedUs
 		stats.readCompareUs += readCompareUs
 		if isModified == false then
 			stats.unmodified += 1
 		end
-	
+
 		if isModified == false and not sampleIsDefault then
 			state.modifiedDefaultAdaptiveDecisionByKey[bypassKey] = false
 			local added = Config.markModifiedDefaultRuntimeDenylist(state, bypassKey)
 			return false, hasModified, isModified, true, true, added
 		end
-	
+
 		if stats.samples >= MODIFIED_DEFAULT_BYPASS_ADAPTIVE_SAMPLES_PER_KEY then
 			local averageReadCompareUs = stats.readCompareUs / stats.samples
 			local expectedSavedUs = averageReadCompareUs * stats.unmodified
@@ -4298,10 +5006,10 @@ function BridgePluginRuntime.start(context)
 			end
 			return profitable, hasModified, isModified, true, true, false
 		end
-	
+
 		return false, hasModified, isModified, true, true, false
 	end
-	
+
 	local function contentSourceToUri(value: any): string
 		if value.SourceType == Enum.ContentSourceType.Uri then
 			return value.Uri or ""
@@ -4414,7 +5122,7 @@ function BridgePluginRuntime.start(context)
 			+ (if value.Bottom then 16 else 0)
 			+ (if value.Front then 32 else 0)
 	end
-	
+
 	local function deepEqual(a: any, b: any): boolean
 		if a == b then
 			return true
@@ -4437,15 +5145,15 @@ function BridgePluginRuntime.start(context)
 		end
 		return true
 	end
-	
+
 	local function normalizePropertyName(name: string): string
 		return string.match(name, "^%s*(.-)%s*$")
 	end
-	
+
 	propertyKey = function(name: string): string
 		return string.lower(name)
 	end
-	
+
 	local TRANSIENT_TRANSPORT_PROPERTIES: { [string]: boolean } = {
 		absoluteposition = true,
 		absoluterotation = true,
@@ -4511,7 +5219,7 @@ function BridgePluginRuntime.start(context)
 		timelength = true,
 		velocity = true,
 	}
-	
+
 	local function shouldSkipStructuralTransportProperty(className: string, propertyName: string): boolean
 		local key = propertyKey(propertyName)
 		if TRANSIENT_TRANSPORT_PROPERTIES[key] == true then
@@ -4530,7 +5238,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return false
 	end
-	
+
 	local function isAlwaysDefaultSerialized(propertyName: string, serialized: any): boolean
 		if propertyName == "Archivable" and serialized == true then
 			return true
@@ -4540,7 +5248,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return false
 	end
-	
+
 	local function getDefaultSerializedProperties(className: string): any
 		local cached = DEFAULT_PROPERTY_CACHE[className]
 		if cached ~= nil then
@@ -4549,7 +5257,7 @@ function BridgePluginRuntime.start(context)
 			end
 			return cached
 		end
-	
+
 		local ok, probe = pcall(function()
 			return Instance.new(className)
 		end)
@@ -4558,7 +5266,7 @@ function BridgePluginRuntime.start(context)
 			CLASS_PROPERTY_CANDIDATES_CACHE[className] = NO_PROPERTIES
 			return nil
 		end
-	
+
 		local defaults = {}
 		local classCandidates = {}
 		local candidateSource = EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS[className] or PROPERTY_CANDIDATES
@@ -4577,7 +5285,7 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 		probe:Destroy()
-	
+
 		if #classCandidates > 0 then
 			CLASS_PROPERTY_CANDIDATES_CACHE[className] = classCandidates
 		else
@@ -4586,7 +5294,7 @@ function BridgePluginRuntime.start(context)
 		DEFAULT_PROPERTY_CACHE[className] = defaults
 		return defaults
 	end
-	
+
 	local function getDefaultTransportProperties(className: string): any
 		local cached = DEFAULT_TRANSPORT_PROPERTY_CACHE[className]
 		if cached ~= nil then
@@ -4595,7 +5303,7 @@ function BridgePluginRuntime.start(context)
 			end
 			return cached
 		end
-	
+
 		local ok, probe = pcall(function()
 			return Instance.new(className)
 		end)
@@ -4604,7 +5312,7 @@ function BridgePluginRuntime.start(context)
 			DEFAULT_TRANSPORT_FAST_COMPARE_CACHE[className] = NO_DEFAULTS
 			return nil
 		end
-	
+
 		local defaults = {}
 		local fastDefaults = {}
 		local propertySchema = getClassPropertySchema(className) or {}
@@ -4626,12 +5334,12 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 		probe:Destroy()
-	
+
 		DEFAULT_TRANSPORT_PROPERTY_CACHE[className] = defaults
 		DEFAULT_TRANSPORT_FAST_COMPARE_CACHE[className] = fastDefaults
 		return defaults
 	end
-	
+
 	local function getDefaultTransportFastCompareProperties(className: string): any
 		local cached = DEFAULT_TRANSPORT_FAST_COMPARE_CACHE[className]
 		if cached ~= nil then
@@ -4647,12 +5355,12 @@ function BridgePluginRuntime.start(context)
 		end
 		return cached
 	end
-	
+
 	local function configurePropertyCandidates(payload: any): { [string]: any }
 		if type(payload) ~= "table" then
 			error("configurePropertyCandidates expects table payload")
 		end
-	
+
 		local function sanitizeSchemaEntry(className: string, rawEntry: any): { any }?
 			if type(rawEntry) == "string" then
 				local normalized = normalizePropertyName(rawEntry)
@@ -4679,7 +5387,7 @@ function BridgePluginRuntime.start(context)
 			end
 			return { normalized, rawTypeId, enumType }
 		end
-	
+
 		EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS = {}
 		EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS = {}
 		DEFAULT_PROPERTY_CACHE = {}
@@ -4690,7 +5398,7 @@ function BridgePluginRuntime.start(context)
 		for serviceName, _ in pairs(stateByService) do
 			stateByService[serviceName] = nil
 		end
-	
+
 		local classCount = 0
 		local propertyCount = 0
 		for className, names in pairs(payload) do
@@ -4718,16 +5426,16 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-	
+
 		configureStudioChangePropertyCandidates()
-	
+
 		return {
 			ok = true,
 			classCount = classCount,
 			propertyCount = propertyCount,
 		}
 	end
-	
+
 	local function configureExportOptions(payload: any): { [string]: any }
 		local options = payload
 		if type(payload) ~= "table" then
@@ -4777,7 +5485,7 @@ function BridgePluginRuntime.start(context)
 			modifiedDefaultBypass = MODIFIED_DEFAULT_BYPASS_ENABLED,
 		}
 	end
-	
+
 	getClassPropertySchema = function(className: string): { { any } }?
 		local cached = CLASS_PROPERTY_SCHEMA_CACHE[className]
 		if cached == nil then
@@ -4822,7 +5530,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return cached
 	end
-	
+
 	local function getClassPropertyCandidates(className: string): { string }?
 		local cached = CLASS_PROPERTY_CANDIDATES_CACHE[className]
 		if cached == nil then
@@ -4844,19 +5552,19 @@ function BridgePluginRuntime.start(context)
 		end
 		return cached
 	end
-	
+
 	serializeRefValueCompactV4 = function(state: ServiceState?, instance: Instance): any
 		if state ~= nil then
 			local instanceIndex = IdentityModule.getCachedInstanceIndex(state, instance)
 			if instanceIndex ~= nil then
 				return { COMPACT_VALUE_TAGS.Ref, instanceIndex }
 			end
-	
+
 			local pathSegments = IdentityModule.getCachedRefPathSegments(state, instance)
 			if pathSegments == nil or #pathSegments == 0 then
 				return nil
 			end
-	
+
 			local debugId = IdentityModule.getCachedDebugId(state, instance)
 			return {
 				COMPACT_VALUE_TAGS.Ref,
@@ -4865,12 +5573,12 @@ function BridgePluginRuntime.start(context)
 				debugId or false,
 			}
 		end
-	
+
 		local pathSegments = IdentityModule.getRefPathSegments(instance)
 		if pathSegments == nil or #pathSegments == 0 then
 			return nil
 		end
-	
+
 		local debugId = IdentityModule.getDebugId(instance)
 		return {
 			COMPACT_VALUE_TAGS.Ref,
@@ -4879,7 +5587,7 @@ function BridgePluginRuntime.start(context)
 			debugId or false,
 		}
 	end
-	
+
 	serializeValueCompactV4 = function(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
 		if valueType == "number" or valueType == "string" or valueType == "boolean" then
@@ -4961,7 +5669,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return nil
 	end
-	
+
 	local function getOrdinalPathSourceKey(state: ServiceState, instance: Instance): string
 		local ordinals = {}
 		local current: Instance? = instance
@@ -4987,7 +5695,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return "pathord:" .. table.concat(ordinals, ",") .. ":" .. IdentityModule.getCachedInstancePath(state, instance)
 	end
-	
+
 	local function ensureScriptIndex(state: ServiceState)
 		if state.scriptPaths and state.scriptInstances and state.scriptIndices and state.scriptInstancesByIndex then
 			return
@@ -5022,7 +5730,7 @@ function BridgePluginRuntime.start(context)
 		state.scriptInstancesByIndex = scriptInstancesByIndex
 		state.scriptPathsEncoded = nil
 	end
-	
+
 	local function exportInstanceInternal(
 		state: ServiceState,
 		instance: Instance,
@@ -5052,14 +5760,14 @@ function BridgePluginRuntime.start(context)
 		if not EXPORT_ALL_PROPERTIES then
 			defaultProperties = getDefaultSerializedProperties(instance.ClassName)
 		end
-	
+
 		if includePathData ~= false and debugId then
 			entry.debugId = debugId
 		end
 		if instanceId then
 			entry.instanceId = instanceId
 		end
-	
+
 		local fallbackMap = Config.getClassPropertyFallbackMap(state, instance.ClassName)
 		local propertyNames = getClassPropertyCandidates(instance.ClassName) or PROPERTY_CANDIDATES
 		for _, propertyName in ipairs(propertyNames) do
@@ -5074,7 +5782,7 @@ function BridgePluginRuntime.start(context)
 						skipRead = true
 					end
 				end
-	
+
 				if not skipRead then
 					Config.bumpExportMetric(state, "propertiesRead")
 					local value = nil
@@ -5092,7 +5800,7 @@ function BridgePluginRuntime.start(context)
 					if propertyName == "CustomPhysicalProperties" then
 						hasValue, value = normalizeSchemaTransportValue(COMPACT_TYPE_IDS.PhysicalProperties, propertyName, instance, hasValue, value)
 					end
-	
+
 					if hasValue and value ~= nil then
 						local serialized = serializeValue(value, state)
 						if serialized ~= nil then
@@ -5120,7 +5828,7 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-	
+
 		if instance:IsA("LuaSourceContainer") then
 			properties.Source = "__SOURCE_EXTERNAL__"
 			entry.sourceKey = IdentityModule.getCachedScriptSourceKey(state, instance)
@@ -5133,7 +5841,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return entry
 	end
-	
+
 	local function exportInstanceFast(
 		state: ServiceState,
 		instance: Instance,
@@ -5158,13 +5866,13 @@ function BridgePluginRuntime.start(context)
 			includePathData
 		)
 	end
-	
+
 	local function getServicePropertyCandidates(state: ServiceState): { [string]: { string } }
 		local cached = state.servicePropertyCandidatesByClass
 		if cached ~= nil then
 			return cached
 		end
-	
+
 		local byClass = {}
 		for _, className in ipairs(state.classNames) do
 			local sourceNames = getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
@@ -5174,17 +5882,17 @@ function BridgePluginRuntime.start(context)
 			end
 			byClass[className] = names
 		end
-	
+
 		state.servicePropertyCandidatesByClass = byClass
 		return byClass
 	end
-	
+
 	local function getServicePropertySchema(state: ServiceState): { [string]: { { any } } }
 		local cached = state.servicePropertySchemaByClass
 		if cached ~= nil then
 			return cached
 		end
-	
+
 		local byClass = {}
 		for _, className in ipairs(state.classNames) do
 			local sourceSchema = getClassPropertySchema(className) or {}
@@ -5194,11 +5902,28 @@ function BridgePluginRuntime.start(context)
 			end
 			byClass[className] = schemaEntries
 		end
-	
+
 		state.servicePropertySchemaByClass = byClass
 		return byClass
 	end
-	
+
+	function Config.readEditorBinaryRootProperties(serviceName: string): { [string]: any }
+		local service = game:GetService(serviceName)
+		local state = getState(serviceName)
+		local candidates = getClassPropertyCandidates(service.ClassName) or PROPERTY_CANDIDATES
+		local properties = {}
+		for _, propertyName in ipairs(candidates) do
+			local okRead, value = tryRead(service, propertyName)
+			if okRead then
+				local serialized = serializeValue(value, state)
+				if serialized ~= nil then
+					properties[propertyName] = serialized
+				end
+			end
+		end
+		return properties
+	end
+
 	local function enumDatabaseName(enumType: string): string
 		local prefix = "Enum."
 		if string.sub(enumType, 1, #prefix) == prefix then
@@ -5206,7 +5931,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return enumType
 	end
-	
+
 	local function getEnumValueNames(enumType: string): any
 		local cached = ENUM_VALUE_NAMES_BY_TYPE_CACHE[enumType]
 		if cached ~= nil then
@@ -5244,7 +5969,7 @@ function BridgePluginRuntime.start(context)
 		ENUM_VALUE_NAMES_BY_TYPE_CACHE[enumType] = out
 		return out
 	end
-	
+
 	local function getServiceEnumValueNamesByType(state: ServiceState): { [string]: any }
 		local out = {}
 		for _, className in ipairs(state.classNames) do
@@ -5263,7 +5988,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return out
 	end
-	
+
 	function Config.getHotPropertySchema(state: ServiceState, className: string): { [string]: any }
 		local cachedByClass = state.hotPropertySchemaByClass
 		if cachedByClass == nil then
@@ -5274,7 +5999,7 @@ function BridgePluginRuntime.start(context)
 		if cached ~= nil then
 			return cached
 		end
-	
+
 		local sourceSchema = getClassPropertySchema(className) or {}
 		local propertyCount = #sourceSchema
 		local defaultProperties = getDefaultTransportProperties(className)
@@ -5342,7 +6067,7 @@ function BridgePluginRuntime.start(context)
 				encodeFns[i] = Config.encodeValueV5ByTypeId and Config.encodeValueV5ByTypeId[typeId] or false
 				skipEncode[i] = className == "Texture" and propertyName == "Rotation"
 			end
-	
+
 			local hotSchema = {
 				className = className,
 				count = propertyCount,
@@ -5369,7 +6094,7 @@ function BridgePluginRuntime.start(context)
 		cachedByClass[className] = hotSchema
 		return hotSchema
 	end
-	
+
 	function Config.learnClassPropertyFallbacks(
 		state: ServiceState,
 		instance: Instance,
@@ -5392,7 +6117,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return learned
 	end
-	
+
 	local function exportInstanceSafe(
 		state: ServiceState,
 		instance: Instance,
@@ -5417,7 +6142,7 @@ function BridgePluginRuntime.start(context)
 			includePathData
 		)
 	end
-	
+
 	local function exportInstanceWithFallback(
 		state: ServiceState,
 		instance: Instance,
@@ -5445,7 +6170,7 @@ function BridgePluginRuntime.start(context)
 		if ok then
 			return entry
 		end
-	
+
 		local propertyNames = getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
 		local learned = Config.learnClassPropertyFallbacks(state, instance, className, propertyNames)
 		if learned then
@@ -5477,7 +6202,7 @@ function BridgePluginRuntime.start(context)
 			includePathData
 		)
 	end
-	
+
 	local function exportInstanceWithoutSharedFallback(
 		state: ServiceState,
 		instance: Instance,
@@ -5517,7 +6242,7 @@ function BridgePluginRuntime.start(context)
 				includePathData
 			)
 		end
-	
+
 		local ok, entry = pcall(
 			exportInstanceFast,
 			state,
@@ -5534,7 +6259,7 @@ function BridgePluginRuntime.start(context)
 			state.safeReadByClass[className] = false
 			return entry
 		end
-	
+
 		state.safeReadByClass[className] = true
 		return exportInstanceSafe(
 			state,
@@ -5548,7 +6273,7 @@ function BridgePluginRuntime.start(context)
 			includePathData
 		)
 	end
-	
+
 	local function compactInstanceEntry(state: ServiceState, entry: { [string]: any }): { any }
 		local compactProperties = false
 		local properties = entry.properties
@@ -5565,7 +6290,7 @@ function BridgePluginRuntime.start(context)
 					emitted[propertyName] = true
 				end
 			end
-	
+
 			local leftovers = {}
 			for propertyName, _ in pairs(properties) do
 				if propertyName ~= "Source" and emitted[propertyName] ~= true then
@@ -5577,12 +6302,12 @@ function BridgePluginRuntime.start(context)
 				pairsOut[#pairsOut + 1] = propertyName
 				pairsOut[#pairsOut + 1] = properties[propertyName]
 			end
-	
+
 			if #pairsOut > 0 then
 				compactProperties = pairsOut
 			end
 		end
-	
+
 		local classValue = IdentityModule.compactClassValue(state, tostring(entry.className or ""))
 		local instanceIndex = IdentityModule.parseInstanceIndexId(entry.instanceId)
 		local parentIndex = IdentityModule.parseInstanceIndexId(entry.parentInstanceId)
@@ -5596,12 +6321,12 @@ function BridgePluginRuntime.start(context)
 			parentIndex or false,
 		}
 	end
-	
+
 	local function serializeAttributesCompactV4(attributes: { [string]: any }, state: ServiceState): any
 		if type(attributes) ~= "table" or next(attributes) == nil then
 			return false
 		end
-	
+
 		local out = {}
 		local count = 0
 		for name, value in pairs(attributes) do
@@ -5611,13 +6336,13 @@ function BridgePluginRuntime.start(context)
 				count += 1
 			end
 		end
-	
+
 		if count == 0 then
 			return false
 		end
 		return out
 	end
-	
+
 	local function markCompactPropertyMask(maskWords: { number }, propertyIndex: number, maskWordCount: number): number
 		local zeroBased = propertyIndex - 1
 		local wordIndex = math.floor(zeroBased / 32) + 1
@@ -5633,7 +6358,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return maskWordCount
 	end
-	
+
 	local function exportCompactInstanceEntryInternal(
 		state: ServiceState,
 		instance: Instance,
@@ -5661,7 +6386,7 @@ function BridgePluginRuntime.start(context)
 						skipRead = true
 					end
 				end
-	
+
 				if not skipRead then
 					local value = nil
 					local hasValue = false
@@ -5678,7 +6403,7 @@ function BridgePluginRuntime.start(context)
 					if propertyName == "CustomPhysicalProperties" then
 						hasValue, value = normalizeSchemaTransportValue(COMPACT_TYPE_IDS.PhysicalProperties, propertyName, instance, hasValue, value)
 					end
-	
+
 					if hasValue and value ~= nil then
 						local serialized = serializeValueCompactV4(value, state)
 						if serialized ~= nil and instance.ClassName == "Texture" and propertyName == "Rotation" then
@@ -5706,7 +6431,7 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-	
+
 		local compactMask = false
 		if maskWordCount > 0 then
 			local denseMask = table.create(maskWordCount)
@@ -5715,7 +6440,7 @@ function BridgePluginRuntime.start(context)
 			end
 			compactMask = denseMask
 		end
-	
+
 		local compactValues = false
 		if valueWriteIndex > 0 then
 			local denseValues = table.create(valueWriteIndex)
@@ -5724,7 +6449,7 @@ function BridgePluginRuntime.start(context)
 			end
 			compactValues = denseValues
 		end
-	
+
 		return {
 			instance.Name,
 			classValue,
@@ -5734,7 +6459,7 @@ function BridgePluginRuntime.start(context)
 			compactValues,
 		}
 	end
-	
+
 	local function exportCompactInstanceEntryFast(
 		state: ServiceState,
 		inst: Instance,
@@ -5744,7 +6469,7 @@ function BridgePluginRuntime.start(context)
 	): { any }
 		return exportCompactInstanceEntryInternal(state, inst, false, classValue, instanceIndex, parentIndex)
 	end
-	
+
 	local function exportCompactInstanceEntrySafe(
 		state: ServiceState,
 		inst: Instance,
@@ -5754,7 +6479,7 @@ function BridgePluginRuntime.start(context)
 	): { any }
 		return exportCompactInstanceEntryInternal(state, inst, true, classValue, instanceIndex, parentIndex)
 	end
-	
+
 	local function exportCompactInstanceEntry(state: ServiceState, inst: Instance): { any }
 		local className = inst.ClassName
 		local classValue = IdentityModule.compactClassValue(state, inst.ClassName)
@@ -5775,7 +6500,7 @@ function BridgePluginRuntime.start(context)
 		state.safeReadByClass[className] = true
 		return exportCompactInstanceEntrySafe(state, inst, classValue, instanceIndex, parentIndex)
 	end
-	
+
 	function Config.internBatchString(
 		strings: { string },
 		stringIds: { [string]: number },
@@ -5790,7 +6515,7 @@ function BridgePluginRuntime.start(context)
 		stringIds[text] = nextId
 		return nextId
 	end
-	
+
 	local function compactShapeKeyPart(value: any): string
 		local valueType = type(value)
 		if value == false or value == nil then
@@ -5812,7 +6537,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return valueType .. ":" .. tostring(value)
 	end
-	
+
 	local function getCompactInstanceShapeId(
 		shapes: { any },
 		shapeIds: { [string]: number },
@@ -5833,7 +6558,7 @@ function BridgePluginRuntime.start(context)
 		shapeIds[key] = nextId
 		return nextId
 	end
-	
+
 	local function compactV5RowHasPropertyMask(row: { any }): boolean
 		local field4 = row[4]
 		local field5 = row[5]
@@ -5847,7 +6572,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return true
 	end
-	
+
 	local function shapeCompactV5Row(
 		row: { any },
 		shapes: { any },
@@ -5856,14 +6581,14 @@ function BridgePluginRuntime.start(context)
 		if type(row) ~= "table" or row[7] ~= nil then
 			return nil, false
 		end
-	
+
 		local nameId = row[1]
 		local classValue = row[2]
 		local parentIndex = row[3] or false
 		if classValue == nil then
 			return nil, false
 		end
-	
+
 		local field4 = row[4]
 		local field5 = row[5]
 		local field6 = row[6]
@@ -5871,12 +6596,12 @@ function BridgePluginRuntime.start(context)
 			local shapeId = getCompactInstanceShapeId(shapes, shapeIds, classValue, false)
 			return { nameId, parentIndex, shapeId }, false
 		end
-	
+
 		if field5 == nil then
 			local shapeId = getCompactInstanceShapeId(shapes, shapeIds, classValue, false)
 			return { nameId, parentIndex, shapeId, field4 }, false
 		end
-	
+
 		if field6 == nil then
 			local field4Type = type(field4)
 			if field4Type ~= "number" and field4Type ~= "table" then
@@ -5885,16 +6610,16 @@ function BridgePluginRuntime.start(context)
 			local shapeId = getCompactInstanceShapeId(shapes, shapeIds, classValue, field4)
 			return { nameId, parentIndex, shapeId, field5 }, true
 		end
-	
+
 		local shapeId = getCompactInstanceShapeId(shapes, shapeIds, classValue, field5)
 		return { nameId, parentIndex, shapeId, field4, field6 }, true
 	end
-	
+
 	function Config.tryBuildCompactShapeBatch(items: { any }, count: number): ({ any }?, { any }?, number)
 		if not SHAPE_COMPACT_INSTANCE_BATCHES or count < SHAPE_COMPACT_MIN_ITEMS then
 			return nil, nil, 0
 		end
-	
+
 		local shapedItems = table.create(count)
 		local shapes = {}
 		local shapeIds = {}
@@ -5909,15 +6634,15 @@ function BridgePluginRuntime.start(context)
 				propertyRowCount += 1
 			end
 		end
-	
+
 		local estimatedCellSavings = propertyRowCount - (#shapes * 2)
 		if estimatedCellSavings < SHAPE_COMPACT_MIN_CELL_SAVINGS then
 			return nil, nil, estimatedCellSavings
 		end
-	
+
 		return shapedItems, shapes, estimatedCellSavings
 	end
-	
+
 	local function encodeComparableRefValue(state: ServiceState?, instance: Instance): any
 		if state ~= nil then
 			local instanceIndex = IdentityModule.getCachedInstanceIndex(state, instance)
@@ -5925,12 +6650,12 @@ function BridgePluginRuntime.start(context)
 				return instanceIndex
 			end
 		end
-	
+
 		local pathSegments = if state ~= nil then IdentityModule.getCachedRefPathSegments(state, instance) else IdentityModule.getRefPathSegments(instance)
 		if pathSegments == nil or #pathSegments == 0 then
 			return nil
 		end
-	
+
 		local out = table.create(#pathSegments + 2)
 		out[1] = 0
 		local debugId = if state ~= nil then IdentityModule.getCachedDebugId(state, instance) else IdentityModule.getDebugId(instance)
@@ -5940,7 +6665,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return out
 	end
-	
+
 	encodeSchemaComparableValue = function(
 		typeId: number,
 		_enumType: string?,
@@ -6026,7 +6751,7 @@ function BridgePluginRuntime.start(context)
 
 		return nil
 	end
-	
+
 	function Config.valueMatchesComparableDefault(
 		typeId: number,
 		_enumType: string?,
@@ -6162,7 +6887,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return false
 	end
-	
+
 	Config.encodeNumberV5 = function(value: any): any
 		if type(value) ~= "number" then
 			return nil
@@ -6263,7 +6988,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return nil
 	end
-	
+
 	Config.compareDefaultValueV5ByTypeId = {
 		[COMPACT_TYPE_IDS.Bool] = function(value: any, defaultComparable: any): boolean
 			return type(value) == "boolean" and value == defaultComparable
@@ -6408,7 +7133,7 @@ function BridgePluginRuntime.start(context)
 			return true
 		end,
 	}
-	
+
 	Config.encodeValueV5ByTypeId = {
 		[COMPACT_TYPE_IDS.Bool] = function(value: any): any
 			if type(value) == "boolean" then
@@ -6565,7 +7290,7 @@ function BridgePluginRuntime.start(context)
 			return out
 		end,
 	}
-	
+
 	function Config.buildCompactV5Exporter(className: string, hotSchema: { [string]: any }, useFallbackMap: boolean?)
 		local propertyCount = hotSchema.count
 		local propertyNames = hotSchema.names
@@ -6590,7 +7315,7 @@ function BridgePluginRuntime.start(context)
 		local encodeValue = encodeSchemaValueV5
 		local getFallbackMap = Config.getClassPropertyFallbackMap
 		local internBatchString = Config.internBatchString
-	
+
 		if not modifiedDefaultBypassEnabled then
 			return function(
 				state: ServiceState,
@@ -6611,7 +7336,7 @@ function BridgePluginRuntime.start(context)
 				local maskWordCount = 0
 				local valuesOut = nil
 				local valueWriteIndex = 0
-	
+
 				for i = 1, propertyCount do
 					local propertyName = propertyNames[i]
 					local value = nil
@@ -6629,7 +7354,7 @@ function BridgePluginRuntime.start(context)
 					if propertyName == "CustomPhysicalProperties" then
 						hasValue, value = normalizeSchemaTransportValue(typeIds[i], propertyName, instance, hasValue, value)
 					end
-	
+
 					if hasValue and value ~= nil then
 						local isDefault = false
 						if not exportAllProperties then
@@ -6713,7 +7438,7 @@ function BridgePluginRuntime.start(context)
 						end
 					end
 				end
-	
+
 				local compactMask = false
 				if maskWords ~= nil and maskWordCount > 0 then
 					if maskWordCount == 1 then
@@ -6726,12 +7451,12 @@ function BridgePluginRuntime.start(context)
 						compactMask = denseMask
 					end
 				end
-	
+
 				local compactValues = false
 				if valuesOut ~= nil and valueWriteIndex > 0 then
 					compactValues = valuesOut
 				end
-	
+
 				local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
 				if compactMask == false and compactValues == false then
 					if attributes == false then
@@ -6748,7 +7473,7 @@ function BridgePluginRuntime.start(context)
 						attributes,
 					}, 0, 0, 0, 0, 0, 0, 0
 				end
-	
+
 				if attributes == false then
 					return {
 						nameId,
@@ -6758,7 +7483,7 @@ function BridgePluginRuntime.start(context)
 						compactValues,
 					}, 0, 0, 0, 0, 0, 0, 0
 				end
-	
+
 				return {
 					nameId,
 					classValue,
@@ -6769,7 +7494,7 @@ function BridgePluginRuntime.start(context)
 				}, 0, 0, 0, 0, 0, 0, 0
 			end
 		end
-	
+
 		return function(
 			state: ServiceState,
 			instance: Instance,
@@ -6793,7 +7518,7 @@ function BridgePluginRuntime.start(context)
 			local propertiesRead = 0
 			local propertiesEncoded = 0
 			local propertiesDefaultSkipped = 0
-	
+
 			for i = 1, propertyCount do
 				local propertyName = propertyNames[i]
 				local defaultComparable = defaults[i]
@@ -6822,7 +7547,7 @@ function BridgePluginRuntime.start(context)
 					if sampledDenylist then
 						modifiedDefaultRuntimeDenylistCount += 1
 					end
-	
+
 					local hasModified = sampledHasModified
 					local isModified = sampledIsModified
 					if shouldUseBypass and hasModified == nil then
@@ -6841,7 +7566,7 @@ function BridgePluginRuntime.start(context)
 					end
 					end
 				end
-	
+
 				if not skipRead then
 					propertiesRead += 1
 					local value = nil
@@ -6859,7 +7584,7 @@ function BridgePluginRuntime.start(context)
 					if propertyName == "CustomPhysicalProperties" then
 						hasValue, value = normalizeSchemaTransportValue(typeIds[i], propertyName, instance, hasValue, value)
 					end
-	
+
 					if hasValue and value ~= nil then
 						local isDefault = false
 						if not exportAllProperties then
@@ -6946,7 +7671,7 @@ function BridgePluginRuntime.start(context)
 					end
 				end
 			end
-	
+
 			local compactMask = false
 			if maskWords ~= nil and maskWordCount > 0 then
 				if maskWordCount == 1 then
@@ -6959,12 +7684,12 @@ function BridgePluginRuntime.start(context)
 					compactMask = denseMask
 				end
 			end
-	
+
 			local compactValues = false
 			if valuesOut ~= nil and valueWriteIndex > 0 then
 				compactValues = valuesOut
 			end
-	
+
 			local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
 			if compactMask == false and compactValues == false then
 				if attributes == false then
@@ -6995,7 +7720,7 @@ function BridgePluginRuntime.start(context)
 					propertiesEncoded,
 						propertiesDefaultSkipped
 			end
-	
+
 			if attributes == false then
 				return {
 					nameId,
@@ -7012,7 +7737,7 @@ function BridgePluginRuntime.start(context)
 					propertiesEncoded,
 					propertiesDefaultSkipped
 			end
-	
+
 			return {
 				nameId,
 				classValue,
@@ -7030,7 +7755,7 @@ function BridgePluginRuntime.start(context)
 				propertiesDefaultSkipped
 		end
 	end
-	
+
 	local function dynamicCompactTypeIdForValue(value: any): number?
 		local valueType = typeof(value)
 		if valueType == "boolean" then
@@ -7070,7 +7795,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return nil
 	end
-	
+
 	serializeAttributesCompactV5 = function(
 		attributes: { [string]: any },
 		state: ServiceState,
@@ -7080,13 +7805,13 @@ function BridgePluginRuntime.start(context)
 		if type(attributes) ~= "table" or next(attributes) == nil then
 			return false
 		end
-	
+
 		local names = {}
 		for name, _ in pairs(attributes) do
 			names[#names + 1] = name
 		end
 		table.sort(names)
-	
+
 		local out = {}
 		for _, name in ipairs(names) do
 			local value = attributes[name]
@@ -7108,13 +7833,13 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-	
+
 		if #out == 0 then
 			return false
 		end
 		return out
 	end
-	
+
 	local function exportCompactV5InstanceWithHotSchema(
 		state: ServiceState,
 		instance: Instance,
@@ -7134,7 +7859,7 @@ function BridgePluginRuntime.start(context)
 			end
 			return exporter(state, instance, instanceIndex, true, strings, stringIds)
 		end
-	
+
 		exporter = hotSchema.exporter
 		if exporter == false or exporter == nil then
 			exporter = Config.buildCompactV5Exporter(className, hotSchema, false)
@@ -7142,7 +7867,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return exporter(state, instance, instanceIndex, false, strings, stringIds)
 	end
-	
+
 	local function exportCompactV5InstanceInternal(
 		state: ServiceState,
 		instance: Instance,
@@ -7164,7 +7889,7 @@ function BridgePluginRuntime.start(context)
 			stringIds
 		)
 	end
-	
+
 	local function exportCompactV5InstanceIndexed(
 		state: ServiceState,
 		inst: Instance,
@@ -7182,14 +7907,14 @@ function BridgePluginRuntime.start(context)
 		if hotSchema.fastExportSafe == true then
 			return exportCompactV5InstanceWithHotSchema(state, inst, instanceIndex, className, hotSchema, false, strings, stringIds)
 		end
-	
+
 		local ok, entry =
 			pcall(exportCompactV5InstanceWithHotSchema, state, inst, instanceIndex, className, hotSchema, false, strings, stringIds)
 		if ok then
 			hotSchema.fastExportSafe = true
 			return entry
 		end
-	
+
 		local learned = Config.learnClassPropertyFallbacks(state, inst, className, hotSchema.names)
 		if learned then
 			local exporterWithFallback = hotSchema.exporterWithFallback
@@ -7209,7 +7934,7 @@ function BridgePluginRuntime.start(context)
 		hotSchema.forceSafeReads = true
 		return exportCompactV5InstanceWithHotSchema(state, inst, instanceIndex, className, hotSchema, true, strings, stringIds)
 	end
-	
+
 	local function exportCompactV5Instance(
 		state: ServiceState,
 		inst: Instance,
@@ -7219,7 +7944,7 @@ function BridgePluginRuntime.start(context)
 		local instanceIndex = IdentityModule.getCachedInstanceIndex(state, inst) or 1
 		return exportCompactV5InstanceIndexed(state, inst, instanceIndex, strings, stringIds)
 	end
-	
+
 	local function getCompactWarmWorkerCount(total: number): number
 		local frameMs = perfState and tonumber(perfState.frameMs) or 16.67
 		local maxWorkers = PRE_SERIALIZE_WARM_MAX_WORKERS
@@ -7232,27 +7957,27 @@ function BridgePluginRuntime.start(context)
 		end
 		return math.min(maxWorkers, ParallelModule.getParallelChunkWorkerCount(total, PARALLEL_PRE_SERIALIZE_MIN_ITEMS))
 	end
-	
+
 	local function isCompactDemandActive(state: ServiceState): boolean
 		return (state.activeInstanceBatchRequests or state.compactDemandCount or 0) > 0
 	end
-	
+
 	function Config.beginCompactDemand(state: ServiceState)
 		local nextCount = (state.activeInstanceBatchRequests or state.compactDemandCount or 0) + 1
 		state.activeInstanceBatchRequests = nextCount
 		state.compactDemandCount = nextCount
 	end
-	
+
 	function Config.endCompactDemand(state: ServiceState)
 		local nextCount = math.max(0, (state.activeInstanceBatchRequests or state.compactDemandCount or 0) - 1)
 		state.activeInstanceBatchRequests = nextCount
 		state.compactDemandCount = nextCount
 	end
-	
+
 	function Config.getCompactDemandWorkerCount(state: ServiceState, totalItems: number): number
 		return 1
 	end
-	
+
 	function Config.getDemandSerializerLimit(): number
 		if PERFORMANCE_MODE == "throughput" then
 			return MAX_ACTIVE_DEMAND_SERIALIZERS
@@ -7278,32 +8003,32 @@ function BridgePluginRuntime.start(context)
 		end
 		return DEFAULT_ACTIVE_DEMAND_SERIALIZERS
 	end
-	
+
 	function Config.shouldYieldDuringDemandSerialization(): boolean
 		return PERFORMANCE_MODE ~= "throughput"
 	end
-	
+
 	function Config.demandSerializationYieldConfig(): (number, number)
 		if PERFORMANCE_MODE == "smooth" then
 			return DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL, DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS
 		end
 		return BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL, BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS
 	end
-	
+
 	function Config.acquireDemandSerializerSlot()
 		while activeDemandSerializers >= Config.getDemandSerializerLimit() do
 			demandSerializerGate.Event:Wait()
 		end
 		activeDemandSerializers += 1
 	end
-	
+
 	function Config.releaseDemandSerializerSlot()
 		if activeDemandSerializers > 0 then
 			activeDemandSerializers -= 1
 		end
 		demandSerializerGate:Fire()
 	end
-	
+
 	local function ensureCompactSerializedTable(state: ServiceState): { [number]: any }
 		local serialized = state.serializedCompactInstances
 		if serialized == nil then
@@ -7312,7 +8037,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return serialized
 	end
-	
+
 	local function getOrCreateCompactSerializedEntry(state: ServiceState, index: number): any
 		local serialized = ensureCompactSerializedTable(state)
 		while true do
@@ -7333,7 +8058,7 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 	end
-	
+
 	local function startCompactWarm(state: ServiceState)
 		if state.compactWarmStatus == "scheduled" or state.compactWarmStatus == "warming" or state.compactWarmStatus == "ready" then
 			return
@@ -7341,14 +8066,14 @@ function BridgePluginRuntime.start(context)
 		if isCompactDemandActive(state) then
 			return
 		end
-	
+
 		local total = #state.instances
 		if total <= 0 then
 			state.serializedCompactInstances = {}
 			state.compactWarmStatus = "ready"
 			return
 		end
-	
+
 		local serialized = ensureCompactSerializedTable(state)
 		state.compactWarmStatus = "scheduled"
 		task.defer(function()
@@ -7388,7 +8113,7 @@ function BridgePluginRuntime.start(context)
 			end
 		end)
 	end
-	
+
 	prepareService = function(serviceName: string): { [string]: any }
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
@@ -7397,13 +8122,13 @@ function BridgePluginRuntime.start(context)
 		if not service then
 			error("Service not found: " .. serviceName)
 		end
-	
+
 		local descendants = service:GetDescendants()
 		local expectedCount = #descendants + 1
 		local instances = table.create(expectedCount)
 		instances[1] = service
 		local instanceCount = 1
-	
+
 		local scriptObjects = {}
 		local scriptCount = 0
 		local classSeen = {}
@@ -7429,18 +8154,18 @@ function BridgePluginRuntime.start(context)
 		classNameByIndex[1] = serviceClassName
 		classValueByIndex[1] = 0
 		parentIndexByIndex[1] = false
-	
+
 		if serviceIsLuaSourceContainer then
 			scriptCount += 1
 			scriptObjects[scriptCount] = service
 		end
-	
+
 		local yieldIfNeeded = makeExportBurstYielder()
 		for _, inst in ipairs(descendants) do
 			instanceCount += 1
 			instances[instanceCount] = inst
 			instanceIdByInstance[inst] = instanceCount
-	
+
 			local className = inst.ClassName
 			local isLuaSourceContainer = Config.LUA_SOURCE_CLASS[className] == true
 			local parent = inst.Parent
@@ -7462,14 +8187,14 @@ function BridgePluginRuntime.start(context)
 			else
 				parentIndexByIndex[instanceCount] = false
 			end
-	
+
 			if isLuaSourceContainer then
 				scriptCount += 1
 				scriptObjects[scriptCount] = inst
 			end
 			yieldIfNeeded()
 		end
-	
+
 		stateByService[serviceName] = {
 			instances = instances,
 			classNames = classNames,
@@ -7522,7 +8247,7 @@ function BridgePluginRuntime.start(context)
 			exportMetrics = Config.newExportMetrics(),
 			exportMetricsSinceLastRead = Config.newExportMetrics(),
 		}
-	
+
 		local state = stateByService[serviceName]
 		local parentIndexYieldIfNeeded = makeExportBurstYielder()
 		for _, index in ipairs(unresolvedParentIndices) do
@@ -7570,7 +8295,7 @@ function BridgePluginRuntime.start(context)
 				startCompactWarm(state)
 			end
 		end
-	
+
 		local preSerializedMode = "off"
 		if state.serializedInstances ~= nil then
 			preSerializedMode = "full"
@@ -7579,7 +8304,7 @@ function BridgePluginRuntime.start(context)
 		elseif state.compactWarmStatus == "ready" and state.serializedCompactInstances ~= nil then
 			preSerializedMode = "compact"
 		end
-	
+
 		return {
 			service = serviceName,
 			bridgeVersion = BRIDGE_VERSION,
@@ -7602,10 +8327,11 @@ function BridgePluginRuntime.start(context)
 			enumValueNamesByType = getServiceEnumValueNamesByType(state),
 		}
 	end
-	
+
 	function Config.getBridgeInfo(): { [string]: any }
 		local playerName, playerUserId = Config.getPlayerIdentity()
 		return {
+			runtimeId = Config.bridgeRuntimeId,
 			playerName = playerName,
 			playerUserId = playerUserId,
 			placeId = game.PlaceId,
@@ -7629,7 +8355,7 @@ function BridgePluginRuntime.start(context)
 			runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {},
 		}
 	end
-	
+
 	getState = function(serviceName: string): ServiceState
 		local state = stateByService[serviceName]
 		if not state then
@@ -7641,12 +8367,13 @@ function BridgePluginRuntime.start(context)
 		end
 		return state
 	end
-	
+
 	ProfilingModule.install(Config, {
 		httpService = HttpService,
 		identityModule = IdentityModule,
 		compactTypeIds = COMPACT_TYPE_IDS,
 		bridgeVersion = BRIDGE_VERSION,
+		runtimeId = Config.bridgeRuntimeId,
 		bridgeBuildUnix = BRIDGE_BUILD_UNIX,
 		protocolVersion = BRIDGE_PROTOCOL_VERSION,
 		codecVersion = CODEC_VERSION,
@@ -7672,14 +8399,14 @@ function BridgePluginRuntime.start(context)
 		if cachedPayload then
 			return cachedPayload, 0
 		end
-	
+
 		local instances = state.instances
 		local total = #instances
 		local startPos = boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
 		local take = boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
 		local encoded: string
 		local encodeMs = 0
-	
+
 		if startPos > total then
 			encoded, encodeMs = ChunkingModule.jsonEncodeTimed({ start = startPos, nextStart = startPos, total = total, items = {} })
 		else
@@ -7723,7 +8450,7 @@ function BridgePluginRuntime.start(context)
 				items = items,
 			})
 		end
-	
+
 		state.batchCacheByKey[key] = encoded
 		state.batchCacheKeys[#state.batchCacheKeys + 1] = key
 		if #state.batchCacheKeys > 256 then
@@ -7734,7 +8461,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return encoded, encodeMs
 	end
-	
+
 	local function getCompactInstanceBatchVariantCacheKey(
 		startIndex: number?,
 		maxCount: number?,
@@ -7752,7 +8479,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return key
 	end
-	
+
 	local function getInstanceBatchCompact(
 		serviceName: string,
 		startIndex: number?,
@@ -7768,14 +8495,14 @@ function BridgePluginRuntime.start(context)
 		if cachedPayload then
 			return cachedPayload, 0
 		end
-	
+
 		local instances = state.instances
 		local total = #instances
 		local startPos = boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
 		local take = boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
 		local encoded: string
 		local encodeMs = 0
-	
+
 		Config.beginCompactDemand(state)
 		local acquiredSerializerSlot = false
 		local ok, resultOrErr, maybeEncodeMs = pcall(function(): (string, number)
@@ -7793,7 +8520,7 @@ function BridgePluginRuntime.start(context)
 					items = {},
 				})
 			end
-	
+
 			local finish = math.min(total, startPos + take - 1)
 			local count = finish - startPos + 1
 			local items = table.create(count)
@@ -7917,7 +8644,7 @@ function BridgePluginRuntime.start(context)
 					})
 				end
 			end
-	
+
 			return ChunkingModule.jsonEncodeTimed({
 				format = BRIDGE_PROTOCOL_VERSION,
 				codecVersion = CODEC_VERSION,
@@ -7940,7 +8667,7 @@ function BridgePluginRuntime.start(context)
 		end
 		encoded = resultOrErr
 		encodeMs = maybeEncodeMs
-	
+
 		state.batchCacheByKey[key] = encoded
 		state.batchCacheKeys[#state.batchCacheKeys + 1] = key
 		if #state.batchCacheKeys > 256 then
@@ -7951,7 +8678,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return encoded, encodeMs
 	end
-	
+
 	local function getClassDefaults(serviceName: string): (string, number)
 		local state = getState(serviceName)
 		if state.classDefaultsEncoded then
@@ -7971,7 +8698,7 @@ function BridgePluginRuntime.start(context)
 		state.classDefaultsEncoded = encoded
 		return state.classDefaultsEncoded, encodeMs
 	end
-	
+
 	local function getScriptPaths(serviceName: string): (string, number)
 		local state = getState(serviceName)
 		ensureScriptIndex(state)
@@ -7984,13 +8711,13 @@ function BridgePluginRuntime.start(context)
 		end
 		return state.scriptPathsEncoded, 0
 	end
-	
+
 	local function getSourceForKey(state: ServiceState, sourceKey: string): string
 		local src = state.scriptSources[sourceKey]
 		if src ~= nil then
 			return src
 		end
-	
+
 		local scriptInstance = state.scriptInstances and state.scriptInstances[sourceKey] or nil
 		if scriptInstance == nil then
 			src = ""
@@ -8003,13 +8730,13 @@ function BridgePluginRuntime.start(context)
 		state.scriptSources[sourceKey] = src
 		return src
 	end
-	
+
 	local function getSourceForIndex(state: ServiceState, sourceIndex: number): string
 		local src = state.scriptSourcesByIndex[sourceIndex]
 		if src ~= nil then
 			return src
 		end
-	
+
 		local scriptInstance = state.scriptInstancesByIndex and state.scriptInstancesByIndex[sourceIndex] or nil
 		if scriptInstance == nil then
 			src = ""
@@ -8022,7 +8749,7 @@ function BridgePluginRuntime.start(context)
 		state.scriptSourcesByIndex[sourceIndex] = src
 		return src
 	end
-	
+
 	local function getSourceChunk(serviceName: string, instancePath: string, startIndex: number?, maxLen: number?): { [string]: any }
 		local state = getState(serviceName)
 		ensureScriptIndex(state)
@@ -8051,7 +8778,7 @@ function BridgePluginRuntime.start(context)
 		if cachedPayload then
 			return cachedPayload, 0
 		end
-	
+
 		local out = {}
 		local sourcesByIndex = table.create(#normalizedPaths)
 		local workerCount = ParallelModule.getParallelChunkWorkerCount(#normalizedPaths, PARALLEL_SOURCE_BATCH_MIN_ITEMS)
@@ -8064,7 +8791,7 @@ function BridgePluginRuntime.start(context)
 		for i, sourceKey in ipairs(normalizedPaths) do
 			out[sourceKey] = sourcesByIndex[i] or ""
 		end
-	
+
 		local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(out)
 		state.sourceBatchCacheByKey[cacheKey] = encoded
 		state.sourceBatchCacheKeys[#state.sourceBatchCacheKeys + 1] = cacheKey
@@ -8076,7 +8803,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return encoded, encodeMs
 	end
-	
+
 	local function getSourceRangeBatchCompact(serviceName: string, startIndex: number?, maxCount: number?): (string, number)
 		local state = getState(serviceName)
 		ensureScriptIndex(state)
@@ -8088,7 +8815,7 @@ function BridgePluginRuntime.start(context)
 		if cachedPayload then
 			return cachedPayload, 0
 		end
-	
+
 		local encoded: string
 		local encodeMs = 0
 		if startPos > total then
@@ -8113,7 +8840,7 @@ function BridgePluginRuntime.start(context)
 					sourcesByIndex[offset] = getSourceForIndex(state, sourceIndex)
 				end
 			end)
-	
+
 			local items = table.create(count * 2)
 			for offset = 1, count do
 				items[#items + 1] = indicesByIndex[offset] or 0
@@ -8127,7 +8854,7 @@ function BridgePluginRuntime.start(context)
 				items = items,
 			})
 		end
-	
+
 		state.sourceBatchCacheByKey[cacheKey] = encoded
 		state.sourceBatchCacheKeys[#state.sourceBatchCacheKeys + 1] = cacheKey
 		if #state.sourceBatchCacheKeys > 64 then
@@ -8138,7 +8865,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return encoded, encodeMs
 	end
-	
+
 	local function getSourceBatchChunk(
 		serviceName: string,
 		instancePaths: { any },
@@ -8154,7 +8881,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local function getInstanceBatchChunk(serviceName: string, startIndex: number?, maxCount: number?, chunkStart: number?, maxLen: number?): { [string]: any }
 		local state = getState(serviceName)
 		local cacheKey = ChunkingModule.getInstanceBatchCacheKey(startIndex, maxCount)
@@ -8165,7 +8892,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local function getInstanceBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
@@ -8184,7 +8911,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local function getClassDefaultsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
 		local state = getState(serviceName)
 		local encoded, encodeMs = getClassDefaults(serviceName)
@@ -8194,7 +8921,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local function getScriptPathsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
 		local state = getState(serviceName)
 		local encoded, encodeMs = getScriptPaths(serviceName)
@@ -8204,7 +8931,7 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local function getSourceRangeBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
@@ -8221,9 +8948,9 @@ function BridgePluginRuntime.start(context)
 		end
 		return chunk
 	end
-	
+
 	local perfState
-	
+
 	function Config.handleMethod(method: string, params: { [string]: any }?): any
 		local p = params or {}
 		if method == "ping" then
@@ -8264,13 +8991,128 @@ function BridgePluginRuntime.start(context)
 			return configurePropertyCandidates(p.classes)
 		elseif method == "setExportOptions" then
 			return configureExportOptions(p)
+		elseif method == "beginEditorPushReview" then
+			pruneEditorReviewUploads()
+			local uploadId = tostring(p.uploadId or "")
+			local totalChunks = tonumber(p.totalChunks)
+			local changeCount = tonumber(p.changeCount)
+			if uploadId == "" or totalChunks == nil or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
+				error("Invalid editor review upload")
+			end
+			if changeCount == nil or changeCount < 0 or changeCount > MAX_EDITOR_REVIEW_CHANGES or changeCount % 1 ~= 0 then
+				error("Invalid editor review change count")
+			end
+			if Config.editorReviewUploads[uploadId] == nil and editorReviewUploadCount() >= MAX_EDITOR_REVIEW_UPLOADS then
+				error("Too many active editor review uploads")
+			end
+			Config.editorReviewUploads[uploadId] = {
+				changeCount = changeCount,
+				totalChunks = totalChunks,
+				chunks = table.create(totalChunks),
+				receivedChunks = 0,
+				receivedRows = 0,
+				updatedAt = os.clock(),
+			}
+			armEditorReviewUploadExpiry(uploadId, Config.editorReviewUploads[uploadId])
+			return { ok = true, uploadId = uploadId }
+		elseif method == "appendEditorPushReview" then
+			pruneEditorReviewUploads()
+			local uploadId = tostring(p.uploadId or "")
+			local upload = Config.editorReviewUploads[uploadId]
+			if type(upload) ~= "table" then
+				error("Editor review upload was not found")
+			end
+			local index = tonumber(p.index)
+			if index == nil or index < 1 or index > upload.totalChunks or index % 1 ~= 0 or type(p.rows) ~= "table" then
+				error("Invalid editor review upload chunk")
+			end
+			if upload.chunks[index] == nil then
+				if upload.receivedRows + #p.rows > upload.changeCount then
+					error("Editor review upload exceeds its declared change count")
+				end
+				upload.chunks[index] = p.rows
+				upload.receivedChunks += 1
+				upload.receivedRows += #p.rows
+			end
+			armEditorReviewUploadExpiry(uploadId, upload)
+			return { ok = true, rows = #p.rows }
+		elseif method == "finishEditorPushReview" then
+			pruneEditorReviewUploads()
+			local uploadId = tostring(p.uploadId or "")
+			local upload = Config.editorReviewUploads[uploadId]
+			Config.editorReviewUploads[uploadId] = nil
+			if type(upload) ~= "table"
+				or upload.receivedChunks ~= upload.totalChunks
+				or upload.receivedRows ~= upload.changeCount
+			then
+				error("Editor review upload is incomplete")
+			end
+			local rows = {}
+			for index = 1, upload.totalChunks do
+				for _, row in ipairs(upload.chunks[index]) do
+					table.insert(rows, row)
+				end
+			end
+			return ui.requestEditorPushReview({
+				changeCount = upload.changeCount,
+				rows = rows,
+			}, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
+				decodeValue = editorSync.decodeReviewValue,
+				readProperty = editorSync.readReviewProperty,
+				valuesEqual = EditorSyncModule.valuesEqual,
+				resolveInstance = editorSync.resolveReviewInstance,
+			})
+		elseif method == "cancelEditorPushReview" then
+			local uploadId = tostring(p.uploadId or "")
+			local found = Config.editorReviewUploads[uploadId] ~= nil
+			Config.editorReviewUploads[uploadId] = nil
+			return { ok = true, found = found }
 		elseif method == "requestEditorPushReview" then
 			return ui.requestEditorPushReview(p, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
-				decodeValue = EditorSyncModule.decodeValue,
+				decodeValue = editorSync.decodeReviewValue,
+				readProperty = editorSync.readReviewProperty,
 				valuesEqual = EditorSyncModule.valuesEqual,
+				resolveInstance = editorSync.resolveReviewInstance,
+			})
+		elseif method == "requestProtectedWriteReview" then
+			return ui.requestProtectedWriteReview(p, {
+				decodeValue = editorSync.decodeReviewValue,
+				readProperty = editorSync.readReviewProperty,
+				valuesEqual = EditorSyncModule.valuesEqual,
+				resolveInstance = editorSync.resolveReviewInstance,
 			})
 		elseif method == "getEditorPushReviewDecision" then
 			return ui.getEditorPushReviewDecision(p)
+		elseif method == "setEditorPushReviewDecision" then
+			return ui.setEditorPushReviewDecision(p)
+		elseif method == "savePlace" then
+			return { ok = game:SavePlace(Enum.SaveFilter.SaveAll) }
+		elseif method == "beginEditorBinaryExport" then
+			return editorSync.beginBinaryExport(p)
+		elseif method == "readEditorBinaryExport" then
+			return editorSync.readBinaryExport(p)
+		elseif method == "finishEditorBinaryExport" then
+			return editorSync.finishBinaryExport(p)
+		elseif method == "beginEditorBinaryImport" then
+			return editorSync.beginBinaryImport(p)
+		elseif method == "appendEditorBinaryImport" then
+			return editorSync.appendBinaryImport(p)
+		elseif method == "cancelEditorBinaryImport" then
+			return editorSync.cancelBinaryImport(p)
+		elseif method == "cancelEditorReconcile" then
+			return editorSync.cancelReconcile(p)
+		elseif method == "finishEditorBinaryImport" then
+			Config.studioChanges.beginSuppress()
+			local ok, result = pcall(function()
+				return editorSync.finishBinaryImport(p)
+			end)
+			task.defer(function()
+				Config.studioChanges.endSuppress(0)
+			end)
+			if not ok then
+				error(result, 0)
+			end
+			return result
 		elseif method == "applyEditorChanges" then
 			Config.studioChanges.beginSuppress()
 			local ok, result = pcall(function()
@@ -8320,6 +9162,10 @@ function BridgePluginRuntime.start(context)
 			return RuntimeApi.getWorldPoint(p)
 		elseif method == "getMouseLocation" then
 			return RuntimeApi.getMouseLocation(p)
+		elseif method == "deviceSimulator" then
+			return RuntimeApi.deviceSimulator(p)
+		elseif method == "captureViewportProbe" then
+			return RuntimeApi.captureViewportProbe(p)
 		elseif method == "executeLuau" then
 			return RuntimeApi.executeLuau(p)
 		elseif method == "startStopPlay" then
@@ -8428,7 +9274,7 @@ function BridgePluginRuntime.start(context)
 			error("Unknown method: " .. tostring(method))
 		end
 	end
-	
+
 	perfState = {
 		fps = 60.0,
 		frameMs = 16.67,
@@ -8441,7 +9287,7 @@ function BridgePluginRuntime.start(context)
 		stallCountOver50MsSinceLastRead = 0,
 		stallCountOver100MsSinceLastRead = 0,
 	}
-	
+
 	RunService.Heartbeat:Connect(function(dt: number)
 		if dt <= 0 then
 			return
@@ -8469,7 +9315,7 @@ function BridgePluginRuntime.start(context)
 			perfState.stallCountOver100MsSinceLastRead += 1
 		end
 	end)
-	
+
 	local BRIDGE_ALLOWED_METHODS = {
 		ping = true,
 		getBridgeInfo = true,
@@ -8477,8 +9323,23 @@ function BridgePluginRuntime.start(context)
 		configurePropertyCandidates = true,
 		setExportOptions = true,
 		applyEditorChanges = true,
+		beginEditorBinaryImport = true,
+		appendEditorBinaryImport = true,
+		cancelEditorBinaryImport = true,
+		cancelEditorReconcile = true,
+		finishEditorBinaryImport = true,
+		beginEditorPushReview = true,
+		appendEditorPushReview = true,
+		finishEditorPushReview = true,
+		cancelEditorPushReview = true,
 		requestEditorPushReview = true,
+		requestProtectedWriteReview = true,
 		getEditorPushReviewDecision = true,
+		setEditorPushReviewDecision = true,
+		savePlace = true,
+		beginEditorBinaryExport = true,
+		readEditorBinaryExport = true,
+		finishEditorBinaryExport = true,
 		getStudioChangeState = true,
 		setConflictResolution = true,
 		getConsoleOutput = true,
@@ -8486,6 +9347,8 @@ function BridgePluginRuntime.start(context)
 		getGuiInventory = true,
 		getWorldPoint = true,
 		getMouseLocation = true,
+		deviceSimulator = true,
+		captureViewportProbe = true,
 		executeLuau = true,
 		startStopPlay = true,
 		prepareForNextRun = true,
@@ -8504,7 +9367,12 @@ function BridgePluginRuntime.start(context)
 		configurePropertyCandidates = true,
 		setExportOptions = true,
 		applyEditorChanges = true,
+		finishEditorBinaryImport = true,
+		beginEditorBinaryExport = true,
+		savePlace = true,
 		setConflictResolution = true,
+		deviceSimulator = true,
+		captureViewportProbe = true,
 		executeLuau = true,
 		startStopPlay = true,
 		prepareForNextRun = true,
@@ -8551,6 +9419,15 @@ function BridgePluginRuntime.start(context)
 		handleMethod = Config.handleMethod,
 		updateStatusText = Config.updateStatusText,
 		onRuntimeSettingsChanged = Config.applyBridgeRuntimeSettings,
+		onUnload = function()
+			table.clear(Config.editorReviewUploads)
+			if Config.studioChanges ~= nil and type(Config.studioChanges.stop) == "function" then
+				Config.studioChanges.stop()
+			end
+			if editorSync ~= nil and type(editorSync.cleanup) == "function" then
+				editorSync.cleanup()
+			end
+		end,
 	})
 end
 
@@ -8561,7 +9438,7 @@ return BridgePluginRuntime
       <Item class="ModuleScript" referent="8">
         <Properties>
           <string name="Name">BridgeProfiling</string>
-          <string name="Source"><![CDATA[--!nocheck
+          <string name="Source"><![CDATA[
 
 local BridgeProfiling = {}
 
@@ -9941,7 +10818,7 @@ return BridgePropertySchema
       <Item class="ModuleScript" referent="10">
         <Properties>
           <string name="Name">BridgeRuntimeApi</string>
-          <string name="Source"><![CDATA[--!nocheck
+          <string name="Source"><![CDATA[
 
 local BridgeRuntimeApi = {}
 
@@ -10045,6 +10922,9 @@ function BridgeRuntimeApi.create(plugin)
 		lastStartedAt = 0,
 		lastStoppedAt = 0,
 	}
+	local deviceSimulatorReadyAt = os.clock() + 4
+	local captureProbeGui = nil
+	local captureProbeFrame = nil
 
 	local function appendConsoleEntry(message, messageType)
 		consoleSeq += 1
@@ -10075,6 +10955,128 @@ function BridgeRuntimeApi.create(plugin)
 	end)
 
 	local api = {}
+
+	local function executeWithRunner(parent, className, baseName, runContext, code, timeoutSeconds, context)
+		local scriptInstance = Instance.new(className)
+		scriptInstance.Name = baseName .. "_" .. tostring(runnerSequence + 1)
+		pcall(function()
+			scriptInstance.Enabled = false
+		end)
+		if runContext ~= nil then
+			scriptInstance.RunContext = runContext
+		end
+		local resultEvent = Instance.new("BindableEvent")
+		resultEvent.Name = "__ReniumResult"
+		resultEvent.Parent = scriptInstance
+		local status = nil
+		local values = nil
+		local resultConnection = resultEvent.Event:Connect(function(nextStatus, ...)
+			if status == nil then
+				status = tostring(nextStatus)
+				values = table.pack(...)
+			end
+		end)
+		local logError = nil
+		local logConnection = LogService.MessageOut:Connect(function(message, messageType)
+			if logError == nil
+				and string.find(tostring(message), scriptInstance.Name, 1, true)
+				and string.find(string.lower(consoleTypeName(messageType)), "error", 1, true)
+			then
+				logError = tostring(message)
+			end
+		end)
+		scriptInstance.Parent = parent
+		local path = compactInstancePath(scriptInstance)
+		local wrapped = ([==[
+local resultEvent = script:FindFirstChild("__ReniumResult")
+if resultEvent == nil then return end
+local output = {}
+local basePrint = print
+local baseWarn = warn
+local function capture(kind, ...)
+	local values = table.pack(...)
+	local parts = table.create(values.n)
+	for index = 1, values.n do parts[index] = tostring(values[index]) end
+	output[#output + 1] = { type = kind, message = table.concat(parts, "\t") }
+	if kind == "print" then basePrint(...) else baseWarn(...) end
+end
+local print = function(...) capture("print", ...) end
+local warn = function(...) capture("warn", ...) end
+local finished = false
+local worker
+worker = task.spawn(function()
+	local packed = table.pack(xpcall(function()
+%s
+	end, function(message)
+		local ok, trace = pcall(function() return debug.traceback(tostring(message), 2) end)
+		return if ok then trace else tostring(message)
+	end))
+	if finished then return end
+	finished = true
+	if packed[1] then
+		resultEvent:Fire("ok", output, table.unpack(packed, 2, packed.n))
+	else
+		resultEvent:Fire("error", tostring(packed[2]), output)
+	end
+end)
+task.delay(%.6f, function()
+	if finished then return end
+	finished = true
+	pcall(task.cancel, worker)
+	resultEvent:Fire("timeout", output)
+end)
+]==]):format(code, timeoutSeconds)
+		setRunnerSource(scriptInstance, wrapped)
+		local deadline = os.clock() + timeoutSeconds + 1
+		while status == nil and logError == nil and scriptInstance.Parent ~= nil and os.clock() < deadline do
+			task.wait()
+		end
+		resultConnection:Disconnect()
+		logConnection:Disconnect()
+		pcall(function()
+			scriptInstance.Enabled = false
+		end)
+		scriptInstance:Destroy()
+		if logError ~= nil then
+			return { ok = false, error = logError, output = {}, runner = true, path = path, context = context }
+		end
+		if status == "error" then
+			return {
+				ok = false,
+				error = tostring(values and values[1] or "Luau runner failed"),
+				output = if values and type(values[2]) == "table" then values[2] else {},
+				runner = true,
+				path = path,
+				context = context,
+			}
+		end
+		if status ~= "ok" then
+			return {
+				ok = false,
+				error = ("Luau runner timed out after %.1fs and was stopped"):format(timeoutSeconds),
+				timedOut = true,
+				stopped = true,
+				output = if values and type(values[1]) == "table" then values[1] else {},
+				runner = true,
+				path = path,
+				context = context,
+			}
+		end
+		local results = {}
+		if values ~= nil then
+			for index = 2, values.n do
+				results[#results + 1] = serializeApiValue(values[index])
+			end
+		end
+		return {
+			ok = true,
+			results = results,
+			output = if values and type(values[1]) == "table" then values[1] else {},
+			runner = true,
+			path = path,
+			context = context,
+		}
+	end
 
 	local function currentRunStateText()
 		local okState, state = pcall(function()
@@ -10667,42 +11669,358 @@ end)
 		}
 	end
 
+	function api.captureViewportProbe(params)
+		params = params or {}
+		local action = string.lower(tostring(params.action or "start"))
+		if action == "stop" or action == "clear" then
+			if captureProbeGui ~= nil then
+				captureProbeGui:Destroy()
+			end
+			captureProbeGui = nil
+			captureProbeFrame = nil
+			task.wait()
+			return { ok = true, action = "stop" }
+		end
+		local colors = params.colors
+		if type(colors) ~= "table" or #colors ~= 16 then
+			return { ok = false, error = "Capture probe requires 16 colors" }
+		end
+		if action == "start" then
+			if captureProbeGui ~= nil then
+				captureProbeGui:Destroy()
+			end
+			local screen = Instance.new("ScreenGui")
+			screen.Name = "__ReniumCaptureProbe"
+			screen.Archivable = false
+			screen.DisplayOrder = 2147483647
+			screen.IgnoreGuiInset = true
+			screen.ResetOnSpawn = false
+			screen.ZIndexBehavior = Enum.ZIndexBehavior.Global
+			pcall(function()
+				screen.ScreenInsets = Enum.ScreenInsets.None
+				screen.ClipToDeviceSafeArea = false
+				screen.SafeAreaCompatibility = Enum.SafeAreaCompatibility.None
+			end)
+			local frame = Instance.new("Frame")
+			frame.Name = "Probe"
+			frame.Archivable = false
+			frame.BackgroundTransparency = 1
+			frame.BorderSizePixel = 0
+			frame.ClipsDescendants = true
+			frame.Size = UDim2.fromScale(1, 1)
+			frame.ZIndex = 2147483647
+			for index = 1, 16 do
+				local packed = tonumber(colors[index]) or 0
+				local tile = Instance.new("Frame")
+				tile.Name = tostring(index)
+				tile.Archivable = false
+				tile.BackgroundColor3 = Color3.fromRGB(
+					bit32.extract(packed, 16, 8),
+					bit32.extract(packed, 8, 8),
+					bit32.extract(packed, 0, 8)
+				)
+				tile.BackgroundTransparency = 0.98
+				tile.BorderSizePixel = 0
+				tile.Position = UDim2.fromScale(((index - 1) % 4) / 4, math.floor((index - 1) / 4) / 4)
+				tile.Size = UDim2.fromScale(0.25, 0.25)
+				tile.ZIndex = 2147483647
+				tile.Parent = frame
+			end
+			frame.Parent = screen
+			screen.Parent = game:GetService("CoreGui")
+			captureProbeGui = screen
+			captureProbeFrame = frame
+		elseif action == "phase" then
+			if captureProbeFrame == nil or captureProbeFrame.Parent == nil then
+				return { ok = false, error = "Capture probe is not active" }
+			end
+			for index = 1, 16 do
+				local packed = tonumber(colors[index]) or 0
+				local tile = captureProbeFrame:FindFirstChild(tostring(index))
+				if tile == nil then
+					return { ok = false, error = "Capture probe tile is missing" }
+				end
+				tile.BackgroundColor3 = Color3.fromRGB(
+					bit32.extract(packed, 16, 8),
+					bit32.extract(packed, 8, 8),
+					bit32.extract(packed, 0, 8)
+				)
+			end
+		else
+			return { ok = false, error = "Unknown capture probe action '" .. action .. "'" }
+		end
+		task.wait()
+		return { ok = true, action = action }
+	end
+
+	function api.deviceSimulator(params)
+		params = params or {}
+		local action = string.lower(tostring(params.action or "status"))
+		local service = game:GetService("StudioDeviceSimulatorService")
+
+		local function enumName(value)
+			local text = tostring(value)
+			return string.match(text, "[^%.]+$") or text
+		end
+
+		local function deviceInfo(deviceId)
+			local info = service:GetDeviceInfoAsync(deviceId)
+			return {
+				id = tostring(info.DeviceId or deviceId),
+				name = tostring(info.Name or deviceId),
+				form = enumName(info.DeviceForm),
+				custom = info.IsCustom == true,
+				width = tonumber(info.Width),
+				height = tonumber(info.Height),
+				pixelDensity = tonumber(info.PixelDensity),
+				resolutionScale = tonumber(info.ResolutionScale),
+				portraitKeyboardHeight = tonumber(info.PortraitKeyboardHeight),
+				landscapeKeyboardHeight = tonumber(info.LandscapeKeyboardHeight),
+			}
+		end
+
+		local function status()
+			local camera = workspace.CurrentCamera
+			local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+			local inactive = {
+				ok = true,
+				action = "status",
+				simulating = false,
+				viewport = { width = viewport.X, height = viewport.Y },
+			}
+			local okDevice, deviceId = pcall(function()
+				return service:GetDeviceAsync()
+			end)
+			if not okDevice or type(deviceId) ~= "string" or deviceId == "" then
+				return inactive
+			end
+			local okConfig, resolution, orientation, scalingMode, pixelDensity = pcall(function()
+				return service:GetResolutionAsync(),
+					service:GetOrientationAsync(),
+					service:GetScalingModeAsync(),
+					service:GetPixelDensityAsync()
+			end)
+			if not okConfig then
+				return inactive
+			end
+			local result = {
+				ok = true,
+				action = "status",
+				simulating = true,
+				settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock()),
+				viewport = { width = viewport.X, height = viewport.Y },
+				deviceId = deviceId,
+				orientation = enumName(orientation),
+				scalingMode = enumName(scalingMode),
+				resolution = {
+					width = resolution.X,
+					height = resolution.Y,
+				},
+				pixelDensity = pixelDensity,
+			}
+			if type(deviceId) == "string" and deviceId ~= "" then
+				local okInfo, info = pcall(deviceInfo, deviceId)
+				if okInfo then
+					result.device = info
+				end
+			end
+			return result
+		end
+
+		local function listDevices()
+			local devices = {}
+			for _, deviceId in ipairs(service:GetDeviceListAsync()) do
+				local okInfo, info = pcall(deviceInfo, deviceId)
+				if okInfo then
+					devices[#devices + 1] = info
+				else
+					devices[#devices + 1] = { id = tostring(deviceId), name = tostring(deviceId) }
+				end
+			end
+			return devices
+		end
+
+		local function normalized(value)
+			return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
+		end
+
+		local function resolveDevice(requested, devices)
+			local key = normalized(requested)
+			if key == "" then
+				return nil, "Missing device name or id"
+			end
+			for _, device in ipairs(devices) do
+				if normalized(device.id) == key or normalized(device.name) == key then
+					return device
+				end
+			end
+			local matches = {}
+			for _, device in ipairs(devices) do
+				if string.find(normalized(device.id), key, 1, true)
+					or string.find(normalized(device.name), key, 1, true)
+				then
+					matches[#matches + 1] = device
+				end
+			end
+			if #matches == 1 then
+				return matches[1]
+			end
+			if #matches == 0 then
+				return nil, "Unknown device '" .. tostring(requested) .. "'"
+			end
+			local names = {}
+			for _, device in ipairs(matches) do
+				names[#names + 1] = device.name .. " (" .. device.id .. ")"
+			end
+			return nil, "Device '" .. tostring(requested) .. "' is ambiguous: " .. table.concat(names, ", ")
+		end
+
+		if action == "list" then
+			local devices = listDevices()
+			return { ok = true, action = "list", count = #devices, devices = devices }
+		end
+
+		if action == "status" or action == "get" then
+			return status()
+		end
+
+		if action == "stop" or action == "reset" then
+			local before = status()
+			if before.simulating ~= true then
+				return { ok = true, action = "stop", stopped = true, alreadyStopped = true }
+			end
+			local okStop, stopError = pcall(function()
+				service:StopSimulationAsync()
+			end)
+			if not okStop and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true) then
+				return { ok = false, error = tostring(stopError) }
+			end
+			deviceSimulatorReadyAt = 0
+			return { ok = true, action = "stop", stopped = true, alreadyStopped = false }
+		end
+
+		if action ~= "set" and action ~= "select" and action ~= "apply" then
+			return { ok = false, error = "Unknown device action '" .. action .. "'" }
+		end
+
+		local selectedDevice = nil
+		if params.device ~= nil and tostring(params.device) ~= "" then
+			local device, resolveError = resolveDevice(params.device, listDevices())
+			if device == nil then
+				return { ok = false, error = resolveError }
+			end
+			selectedDevice = device
+		end
+
+		local orientation = nil
+		if params.orientation ~= nil and tostring(params.orientation) ~= "" then
+			local key = normalized(params.orientation)
+			local orientations = {
+				portrait = Enum.ScreenOrientation.Portrait,
+				landscape = Enum.ScreenOrientation.LandscapeRight,
+				landscaperight = Enum.ScreenOrientation.LandscapeRight,
+				landscapeleft = Enum.ScreenOrientation.LandscapeLeft,
+				landscapesensor = Enum.ScreenOrientation.LandscapeSensor,
+				sensor = Enum.ScreenOrientation.Sensor,
+			}
+			orientation = orientations[key]
+			if orientation == nil then
+				return { ok = false, error = "Unknown orientation '" .. tostring(params.orientation) .. "'" }
+			end
+		end
+
+		local scalingMode = nil
+		if params.scalingMode ~= nil and tostring(params.scalingMode) ~= "" then
+			local key = normalized(params.scalingMode)
+			local scalingModes = {
+				physical = Enum.DeviceSimulatorScalingMode.ScaleToPhysicalSize,
+				scaletophysicalsize = Enum.DeviceSimulatorScalingMode.ScaleToPhysicalSize,
+				actual = Enum.DeviceSimulatorScalingMode.ActualResolution,
+				actualresolution = Enum.DeviceSimulatorScalingMode.ActualResolution,
+				fit = Enum.DeviceSimulatorScalingMode.FitToWindow,
+				fittowindow = Enum.DeviceSimulatorScalingMode.FitToWindow,
+			}
+			scalingMode = scalingModes[key]
+			if scalingMode == nil then
+				return { ok = false, error = "Unknown scaling mode '" .. tostring(params.scalingMode) .. "'" }
+			end
+		end
+
+		local width = tonumber(params.width)
+		local height = tonumber(params.height)
+		if width ~= nil or height ~= nil then
+			if width == nil or height == nil or width < 1 or height < 1 then
+				return { ok = false, error = "Resolution requires positive width and height" }
+			end
+		end
+
+		local density = nil
+		if params.pixelDensity ~= nil then
+			density = tonumber(params.pixelDensity)
+			if density == nil or density <= 0 then
+				return { ok = false, error = "Pixel density must be greater than zero" }
+			end
+		end
+
+		if selectedDevice == nil and orientation == nil and scalingMode == nil and width == nil and density == nil then
+			return { ok = false, error = "Set requires a device or configuration option" }
+		end
+
+		local changed = {}
+		if selectedDevice ~= nil then
+			service:SetDeviceAsync(selectedDevice.id)
+			changed[#changed + 1] = "device"
+		end
+		if orientation ~= nil then
+			service:SetOrientationAsync(orientation)
+			changed[#changed + 1] = "orientation"
+		end
+		if scalingMode ~= nil then
+			service:SetScalingModeAsync(scalingMode)
+			changed[#changed + 1] = "scalingMode"
+		end
+		if width ~= nil then
+			service:SetResolutionAsync(math.floor(width), math.floor(height))
+			changed[#changed + 1] = "resolution"
+		end
+		if density ~= nil then
+			service:SetPixelDensityAsync(density)
+			changed[#changed + 1] = "pixelDensity"
+		end
+
+		local wantsPortrait = orientation == Enum.ScreenOrientation.Portrait
+		local wantsLandscape = orientation == Enum.ScreenOrientation.LandscapeLeft
+			or orientation == Enum.ScreenOrientation.LandscapeRight
+			or orientation == Enum.ScreenOrientation.LandscapeSensor
+		if wantsPortrait or wantsLandscape then
+			local deadline = os.clock() + 2
+			while os.clock() < deadline do
+				local camera = workspace.CurrentCamera
+				local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+				if (wantsPortrait and viewport.Y >= viewport.X) or (wantsLandscape and viewport.X >= viewport.Y) then
+					break
+				end
+				RunService.Heartbeat:Wait()
+			end
+		end
+		deviceSimulatorReadyAt = os.clock() + 4
+
+		local result = status()
+		result.action = "set"
+		result.changed = changed
+		return result
+	end
+
 	function api.executeLuau(params)
 		params = params or {}
 		local code = tostring(params.code or "")
 		if code == "" then
 			return { ok = false, error = "Missing Luau code" }
 		end
+		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 20)
 
 		local context = string.lower(tostring(params.context or params.target or "plugin"))
 		if context == "client" or context == "local" then
-			local okClient, isClient = pcall(function()
-				return RunService:IsClient()
-			end)
-			local okRunning, running = pcall(function()
-				return RunService:IsRunning()
-			end)
-			if okClient and isClient == true and okRunning and running == true then
-				local directParams = {}
-				for key, value in pairs(params) do
-					directParams[key] = value
-				end
-				directParams.context = "plugin"
-				local directResult = api.executeLuau(directParams)
-				if type(directResult) == "table" then
-					if directResult.ok ~= false then
-						directResult.context = "client"
-						directResult.direct = true
-						return directResult
-					end
-					if not string.find(tostring(directResult.error or ""), "loadstring", 1, true) then
-						directResult.context = "client"
-						directResult.direct = true
-						return directResult
-					end
-				end
-			end
-
 			local players = game:GetService("Players")
 			local localPlayer = players.LocalPlayer
 			if localPlayer == nil then
@@ -10713,24 +12031,25 @@ end)
 				return { ok = false, error = "PlayerScripts is not available on the play client" }
 			end
 
-			local scriptInstance = playerScripts:FindFirstChild(CLIENT_RUNNER_NAME)
-			if scriptInstance ~= nil and not scriptInstance:IsA("LocalScript") then
-				scriptInstance:Destroy()
-				scriptInstance = nil
-			end
-			if scriptInstance == nil then
-				scriptInstance = Instance.new("LocalScript")
-				scriptInstance.Name = CLIENT_RUNNER_NAME
-				scriptInstance.Parent = playerScripts
-			end
-			setRunnerSource(scriptInstance, code)
+			return executeWithRunner(playerScripts, "LocalScript", CLIENT_RUNNER_NAME, nil, code, timeoutSeconds, "client")
+		end
 
-			return {
-				ok = true,
-				context = "client",
-				runner = true,
-				path = compactInstancePath(scriptInstance),
-			}
+		local okRunning, running = pcall(function()
+			return RunService:IsRunning()
+		end)
+		local okServer, isServer = pcall(function()
+			return RunService:IsServer()
+		end)
+		if okRunning and running == true and okServer and isServer == true then
+			return executeWithRunner(
+				game:GetService("ServerScriptService"),
+				"Script",
+				SERVER_RUNNER_NAME,
+				Enum.RunContext.Server,
+				code,
+				timeoutSeconds,
+				"server"
+			)
 		end
 
 		if type(loadstring) ~= "function" then
@@ -10756,35 +12075,6 @@ end)
 			end
 		end
 		if chunk == nil then
-			local errorText = tostring(compileError)
-			local okRunning, running = pcall(function()
-				return RunService:IsRunning()
-			end)
-			local okServer, isServer = pcall(function()
-				return RunService:IsServer()
-			end)
-			if string.find(errorText, "loadstring", 1, true) and okRunning and running == true and okServer and isServer == true then
-				local serverScriptService = game:GetService("ServerScriptService")
-				local scriptInstance = serverScriptService:FindFirstChild(SERVER_RUNNER_NAME)
-				if scriptInstance ~= nil and not scriptInstance:IsA("Script") then
-					scriptInstance:Destroy()
-					scriptInstance = nil
-				end
-				if scriptInstance == nil then
-					scriptInstance = Instance.new("Script")
-					scriptInstance.Name = SERVER_RUNNER_NAME
-					scriptInstance.RunContext = Enum.RunContext.Server
-					scriptInstance.Parent = serverScriptService
-				end
-				setRunnerSource(scriptInstance, code)
-
-				return {
-					ok = true,
-					context = "server",
-					runner = true,
-					path = compactInstancePath(scriptInstance),
-				}
-			end
 			return { ok = false, error = tostring(compileError) }
 		end
 
@@ -10815,7 +12105,24 @@ end)
 		}, { __index = baseEnv })
 		pcall(setfenv, chunk, env)
 
-		local packed = table.pack(pcall(chunk))
+		local packed = nil
+		local executionThread = task.spawn(function()
+			packed = table.pack(pcall(chunk))
+		end)
+		local deadline = os.clock() + timeoutSeconds
+		while packed == nil and os.clock() < deadline do
+			task.wait()
+		end
+		if packed == nil then
+			pcall(task.cancel, executionThread)
+			return {
+				ok = false,
+				error = ("Luau execution timed out after %.1fs and was stopped"):format(timeoutSeconds),
+				timedOut = true,
+				stopped = true,
+				output = output,
+			}
+		end
 		if packed[1] ~= true then
 			return {
 				ok = false,
@@ -13106,6 +14413,9 @@ return BridgeStatus
 	["EditableService"] = {
 		{ "Archivable", "Bool" },
 	},
+	["EditorSourceService"] = {
+		{ "Archivable", "Bool" },
+	},
 	["EncodingService"] = {
 		{ "Archivable", "Bool" },
 	},
@@ -14203,6 +15513,8 @@ return BridgeStatus
 		{ "Backward", "Enum.KeyCode" },
 		{ "Right", "Enum.KeyCode" },
 		{ "Archivable", "Bool" },
+		{ "DisplayImage", "ContentId" },
+		{ "DisplayName", "String" },
 	},
 	["InputContext"] = {
 		{ "Enabled", "Bool" },
@@ -18087,6 +19399,7 @@ return BridgeStatus
 		{ "EnableSLIMAvatars", "Enum.RolloutState" },
 		{ "MeshStreamingAndImprovedLods", "Enum.RolloutState" },
 		{ "ModelStreamingBehavior", "Enum.ModelStreamingBehavior" },
+		{ "PredictiveStreamingMode", "Enum.PredictiveStreamingMode" },
 		{ "StreamOutBehavior", "Enum.StreamOutBehavior" },
 		{ "StreamingEnabled", "Bool" },
 		{ "StreamingIntegrityMode", "Enum.StreamingIntegrityMode" },
@@ -18164,10 +19477,11 @@ return BridgeStatus
       <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">BridgeStudioChanges</string>
-          <string name="Source"><![CDATA[--!strict
+          <string name="Source"><![CDATA[
 
 local BridgeStudioChanges = {}
-local CHANGE_TRACKER_VERSION = 3
+local CHANGE_TRACKER_VERSION = 4
+local CollectionService = game:GetService("CollectionService")
 
 type AllowedServices = { [string]: boolean }
 type DirtySeqMap = { [string]: number }
@@ -18272,8 +19586,12 @@ type State = {
 	watchedServices: { [string]: boolean },
 	serviceRoots: { [string]: Instance },
 	rootConnections: { [string]: { RBXScriptConnection } },
+	globalConnections: { RBXScriptConnection },
 	instanceConnections: ConnectionMap,
 	itemChangedAvailable: boolean,
+	tagSignalsAvailable: boolean,
+	tagConnections: { [string]: { RBXScriptConnection } },
+	taggedInstancesByTag: { [string]: { [Instance]: boolean } },
 	changeEvent: BindableEvent,
 	suppressUntil: number,
 	suppressDepth: number,
@@ -18340,8 +19658,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		watchedServices = {},
 		serviceRoots = {},
 		rootConnections = {},
+		globalConnections = {},
 		instanceConnections = {},
 		itemChangedAvailable = false,
+		tagSignalsAvailable = false,
+		tagConnections = {},
+		taggedInstancesByTag = {},
 		changeEvent = Instance.new("BindableEvent"),
 		suppressUntil = 0,
 		suppressDepth = 0,
@@ -18746,6 +20068,102 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return nil
 	end
 
+	local function serviceNameForTrackedInstance(instance: Instance): string?
+		if shouldIgnoreInstance(instance) then
+			return nil
+		end
+		for serviceName, service in pairs(state.serviceRoots) do
+			if instance == service then
+				return serviceName
+			end
+			local ok, isDescendant = pcall(function()
+				return instance:IsDescendantOf(service)
+			end)
+			if ok and isDescendant then
+				return serviceName
+			end
+		end
+		return nil
+	end
+
+	local function tagChangeRelevant(instance: Instance): boolean
+		return not state.onlyCodeMode or hasLuaSourceDescendant(instance)
+	end
+
+	local function markTagChange(instance: Instance, tag: string, added: boolean)
+		local serviceName = serviceNameForTrackedInstance(instance)
+		if serviceName == nil or not tagChangeRelevant(instance) then
+			return
+		end
+		markDirty(
+			serviceName,
+			true,
+			changeDetailsForInstance(
+				instance,
+				"tag",
+				"Tags",
+				nil,
+				if added then "tag added" else "tag removed"
+			)
+		)
+	end
+
+	local function connectTag(tag: string, markExisting: boolean)
+		if state.tagConnections[tag] ~= nil then
+			return
+		end
+		local tracked = setmetatable({}, { __mode = "k" }) :: any
+		state.taggedInstancesByTag[tag] = tracked
+		local okTagged, tagged = pcall(CollectionService.GetTagged, CollectionService, tag)
+		if okTagged and type(tagged) == "table" then
+			for _, instance in ipairs(tagged) do
+				if typeof(instance) == "Instance" then
+					tracked[instance] = true
+					if markExisting then
+						markTagChange(instance, tag, true)
+					end
+				end
+			end
+		end
+		local connections = {}
+		local okAdded, addedSignal = pcall(CollectionService.GetInstanceAddedSignal, CollectionService, tag)
+		if okAdded and addedSignal ~= nil then
+			connections[#connections + 1] = addedSignal:Connect(function(instance: Instance)
+				if tracked[instance] ~= true then
+					tracked[instance] = true
+					markTagChange(instance, tag, true)
+				end
+			end)
+		end
+		local okRemoved, removedSignal = pcall(CollectionService.GetInstanceRemovedSignal, CollectionService, tag)
+		if okRemoved and removedSignal ~= nil then
+			connections[#connections + 1] = removedSignal:Connect(function(instance: Instance)
+				if tracked[instance] == true then
+					tracked[instance] = nil
+					markTagChange(instance, tag, false)
+				end
+			end)
+		end
+		if #connections > 0 then
+			state.tagConnections[tag] = connections
+			state.tagSignalsAvailable = true
+		else
+			state.taggedInstancesByTag[tag] = nil
+		end
+	end
+
+	local function discoverTags(markExisting: boolean)
+		local okTags, tags = pcall(CollectionService.GetAllTags, CollectionService)
+		if not okTags or type(tags) ~= "table" then
+			return
+		end
+		for _, tag in ipairs(tags) do
+			if type(tag) == "string" and tag ~= "" then
+				connectTag(tag, markExisting)
+			end
+		end
+	end
+
 	local function shouldIgnoreRootProperty(service: Instance, serviceName: string, propertyName: string): boolean
 		local lowered = string.lower(propertyName)
 		local ignoredProperties = ROOT_PROPERTY_IGNORES[serviceName]
@@ -19090,7 +20508,34 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, serviceName in ipairs(services) do
 			ensureService(serviceName)
 		end
-		state.started = true
+		if not state.started then
+			local okItemChanged, itemChanged = pcall(function()
+				return (game :: any).ItemChanged
+			end)
+			if okItemChanged and itemChanged ~= nil then
+				local okConnect, connection = pcall(function()
+					return itemChanged:Connect(function(instance: Instance, propertyName: any)
+						if typeof(instance) == "Instance" and string.lower(tostring(propertyName or "")) == "tags" then
+							markTagChange(instance, "Tags", true)
+						end
+					end)
+				end)
+				if okConnect and connection ~= nil then
+					state.globalConnections[#state.globalConnections + 1] = connection
+					state.itemChangedAvailable = true
+				end
+			end
+			discoverTags(false)
+			state.started = true
+			task.spawn(function()
+				while state.started do
+					task.wait(0.5)
+					if state.started then
+						discoverTags(true)
+					end
+				end
+			end)
+		end
 	end
 
 	function api.configurePropertyCandidates(rawCandidatesByClass: any): { [string]: any }
@@ -19272,6 +20717,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			propertyChanges = propertyChanges,
 			changes = changes,
 			itemChangedAvailable = state.itemChangedAvailable,
+			tagSignalsAvailable = state.tagSignalsAvailable,
 			propertyFilterClasses = state.propertyFilterClassCount,
 			propertyFilterProperties = state.propertyFilterPropertyCount,
 			connectedInstances = state.connectedInstanceCount,
@@ -19304,6 +20750,46 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			response.waitTimedOut = waitTimedOut
 		end
 		return response
+	end
+
+	function api.stop()
+		if not state.started then
+			return
+		end
+		state.started = false
+		for _, connections in pairs(state.rootConnections) do
+			for _, connection in ipairs(connections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+		end
+		table.clear(state.rootConnections)
+		for _, connection in ipairs(state.globalConnections) do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(state.globalConnections)
+		local connectedInstances = {}
+		for instance in pairs(state.instanceConnections) do
+			connectedInstances[#connectedInstances + 1] = instance
+		end
+		for _, instance in ipairs(connectedInstances) do
+			disconnectInstance(instance)
+		end
+		for _, connections in pairs(state.tagConnections) do
+			for _, connection in ipairs(connections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+		end
+		table.clear(state.tagConnections)
+		table.clear(state.taggedInstancesByTag)
+		pcall(function()
+			state.changeEvent:Destroy()
+		end)
 	end
 
 	return api
@@ -19523,7 +21009,6 @@ local APPLY_GREEN = Color3.fromRGB(46, 158, 91)
 local REVIEW_COUNTDOWN_SECONDS = 90
 local REVIEW_ROW = 24
 local REVIEW_OVERSCAN = 6
-local REVIEW_AUTO_EXPAND_LEAVES = 12
 
 local CORNER = 6
 local CONTROL_HEIGHT = 32
@@ -20572,15 +22057,50 @@ local function truncateValueText(text)
 	return text
 end
 
+local function formatStringValue(value)
+	local okUtf8, length = pcall(utf8.len, value)
+	if not okUtf8 or length == nil then
+		return string.format("Binary data (%d bytes)", #value)
+	end
+	for index = 1, #value do
+		local byte = string.byte(value, index)
+		if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+			return string.format("Binary data (%d bytes)", #value)
+		end
+	end
+	return truncateValueText(value)
+end
+
+local function shortFontFamily(value)
+	local family = tostring(value or "")
+	local name = string.match(family, "([^/]+)%.json$") or string.match(family, "([^/]+)$") or family
+	return name ~= "" and name or "Default"
+end
+
+local function formatFontValue(value)
+	if typeof(value) == "Font" then
+		return string.format("%s, %s, %s", shortFontFamily(value.Family), value.Weight.Name, value.Style.Name)
+	end
+	return string.format(
+		"%s, %s, %s",
+		shortFontFamily(value.family or value.Family),
+		(tostring(value.weight or value.Weight or "Regular"):gsub("^Enum%.FontWeight%.", "")),
+		(tostring(value.style or value.Style or "Normal"):gsub("^Enum%.FontStyle%.", ""))
+	)
+end
+
 local function formatPushValue(raw)
 	local kind = typeof(raw)
 	if kind == "boolean" or kind == "number" then
 		return tostring(raw)
 	end
 	if kind == "string" then
-		return truncateValueText(raw)
+		return formatStringValue(raw)
 	end
 	if kind == "table" then
+		if raw.family ~= nil or raw.Family ~= nil then
+			return formatFontValue(raw)
+		end
 		local tag = tostring(raw._type or "")
 		if tag == "Color3" then
 			return string.format(
@@ -20607,9 +22127,36 @@ local function formatPushValue(raw)
 		if tag ~= "" then
 			return tag
 		end
-		return "…"
+		return "Structured value"
 	end
 	return tostring(raw)
+end
+
+local function formatInstancePath(instance)
+	local segments = {}
+	local current = instance
+	while current ~= nil and current ~= game do
+		local name = current.Name
+		local parent = current.Parent
+		if parent ~= nil then
+			local matching = 0
+			local ordinal = 0
+			for _, sibling in ipairs(parent:GetChildren()) do
+				if sibling.Name == name then
+					matching += 1
+					if sibling == current then
+						ordinal = matching
+					end
+				end
+			end
+			if matching > 1 then
+				name = string.format("%s[%d]", name, ordinal)
+			end
+		end
+		table.insert(segments, 1, name)
+		current = parent
+	end
+	return table.concat(segments, ".")
 end
 
 local function formatLiveValue(value)
@@ -20624,7 +22171,7 @@ local function formatLiveValue(value)
 		return string.format("%.6g", value)
 	end
 	if kind == "string" then
-		return truncateValueText(value)
+		return formatStringValue(value)
 	end
 	if kind == "Color3" then
 		return string.format(
@@ -20644,7 +22191,7 @@ local function formatLiveValue(value)
 		return value.Name
 	end
 	if kind == "Instance" then
-		return value.Name
+		return truncateValueText(formatInstancePath(value))
 	end
 	if kind == "BrickColor" then
 		return value.Name
@@ -20655,7 +22202,19 @@ local function formatLiveValue(value)
 	if kind == "PhysicalProperties" then
 		return string.format("%.6g, %.6g, %.6g", value.Density, value.Friction, value.Elasticity)
 	end
+	if kind == "Font" then
+		return formatFontValue(value)
+	end
+	if kind == "CFrame" then
+		return string.format("%.6g, %.6g, %.6g", value.X, value.Y, value.Z)
+	end
+	if kind == "UDim" or kind == "NumberRange" or kind == "Rect" then
+		return tostring(value)
+	end
 	if kind == "table" then
+		if value.family ~= nil or value.Family ~= nil then
+			return formatFontValue(value)
+		end
 		if value.density ~= nil then
 			return string.format(
 				"%.6g, %.6g, %.6g",
@@ -20671,9 +22230,154 @@ local function formatLiveValue(value)
 		if tag ~= "" then
 			return tag
 		end
-		return "…"
+		return "Structured value"
 	end
 	return kind
+end
+
+local function reviewValueParts(value)
+	local kind = typeof(value)
+	if kind == "Vector3" then
+		return { { "X", value.X }, { "Y", value.Y }, { "Z", value.Z } }
+	end
+	if kind == "Vector2" then
+		return { { "X", value.X }, { "Y", value.Y } }
+	end
+	if kind == "Color3" then
+		return {
+			{ "R", math.floor(value.R * 255 + 0.5) },
+			{ "G", math.floor(value.G * 255 + 0.5) },
+			{ "B", math.floor(value.B * 255 + 0.5) },
+		}
+	end
+	if kind == "UDim" then
+		return { { "Scale", value.Scale }, { "Offset", value.Offset } }
+	end
+	if kind == "UDim2" then
+		return {
+			{ "X Scale", value.X.Scale },
+			{ "X Offset", value.X.Offset },
+			{ "Y Scale", value.Y.Scale },
+			{ "Y Offset", value.Y.Offset },
+		}
+	end
+	if kind == "NumberRange" then
+		return { { "Min", value.Min }, { "Max", value.Max } }
+	end
+	if kind == "Rect" then
+		return {
+			{ "Min X", value.Min.X },
+			{ "Min Y", value.Min.Y },
+			{ "Max X", value.Max.X },
+			{ "Max Y", value.Max.Y },
+		}
+	end
+	if kind == "PhysicalProperties" then
+		return {
+			{ "Density", value.Density },
+			{ "Friction", value.Friction },
+			{ "Elasticity", value.Elasticity },
+			{ "Friction weight", value.FrictionWeight },
+			{ "Elasticity weight", value.ElasticityWeight },
+			{ "Acoustic absorption", value.AcousticAbsorption },
+		}
+	end
+	if kind == "Font" then
+		return {
+			{ "Family", shortFontFamily(value.Family) },
+			{ "Weight", value.Weight.Name },
+			{ "Style", value.Style.Name },
+		}
+	end
+	if kind ~= "table" then
+		return nil
+	end
+	if value.family ~= nil or value.Family ~= nil then
+		return {
+			{ "Family", shortFontFamily(value.family or value.Family) },
+			{ "Weight", (tostring(value.weight or value.Weight or "Regular"):gsub("^Enum%.FontWeight%.", "")) },
+			{ "Style", (tostring(value.style or value.Style or "Normal"):gsub("^Enum%.FontStyle%.", "")) },
+		}
+	end
+	local tag = tostring(value._type or "")
+	if tag == "Vector3" or tag == "Vector2" then
+		local parts = { { "X", value.x }, { "Y", value.y } }
+		if tag == "Vector3" then
+			table.insert(parts, { "Z", value.z })
+		end
+		return parts
+	end
+	if tag == "Color3" then
+		return {
+			{ "R", math.floor((tonumber(value.r) or 0) * 255 + 0.5) },
+			{ "G", math.floor((tonumber(value.g) or 0) * 255 + 0.5) },
+			{ "B", math.floor((tonumber(value.b) or 0) * 255 + 0.5) },
+		}
+	end
+	if tag == "UDim" then
+		return { { "Scale", value.scale }, { "Offset", value.offset } }
+	end
+	if tag == "UDim2" then
+		return {
+			{ "X Scale", value.xScale },
+			{ "X Offset", value.xOffset },
+			{ "Y Scale", value.yScale },
+			{ "Y Offset", value.yOffset },
+		}
+	end
+	if tag == "NumberRange" or value.min ~= nil and value.max ~= nil then
+		return { { "Min", value.min }, { "Max", value.max } }
+	end
+	if value.density ~= nil then
+		return {
+			{ "Density", value.density },
+			{ "Friction", value.friction },
+			{ "Elasticity", value.elasticity },
+			{ "Friction weight", value.frictionWeight },
+			{ "Elasticity weight", value.elasticityWeight },
+			{ "Acoustic absorption", value.acousticAbsorption },
+		}
+	end
+	return nil
+end
+
+local function reviewValueComponents(oldValue, newValue)
+	local oldParts = reviewValueParts(oldValue)
+	local newParts = reviewValueParts(newValue)
+	if oldParts == nil and newParts == nil then
+		return nil
+	end
+	local oldByName = {}
+	local newByName = {}
+	local order = {}
+	local seen = {}
+	for _, part in ipairs(oldParts or {}) do
+		oldByName[part[1]] = part[2]
+		if not seen[part[1]] then
+			seen[part[1]] = true
+			table.insert(order, part[1])
+		end
+	end
+	for _, part in ipairs(newParts or {}) do
+		newByName[part[1]] = part[2]
+		if not seen[part[1]] then
+			seen[part[1]] = true
+			table.insert(order, part[1])
+		end
+	end
+	local components = {}
+	for _, name in ipairs(order) do
+		local oldPart = oldByName[name]
+		local newPart = newByName[name]
+		if oldPart ~= newPart then
+			table.insert(components, {
+				name = name,
+				oldText = oldPart ~= nil and formatLiveValue(oldPart) or nil,
+				newText = newPart ~= nil and formatLiveValue(newPart) or "Not set",
+			})
+		end
+	end
+	return #components > 0 and components or nil
 end
 
 local reviewIconCache = {}
@@ -20731,7 +22435,7 @@ local function newReviewNode(name, className, instance)
 		children = {},
 		childByKey = {},
 		props = {},
-		expanded = true,
+		expanded = false,
 		changeTotal = 0,
 	}
 end
@@ -20771,6 +22475,13 @@ local function buildReviewTree(summaryRows, groups, helpers)
 	for _, group in ipairs(groups) do
 		local segments = group.pathSegments
 		local node = serviceNode(tostring(segments[1]))
+		local resolvedInstance = nil
+		if helpers ~= nil and type(helpers.resolveInstance) == "function" then
+			local okResolve, instance = pcall(helpers.resolveInstance, group)
+			if okResolve and typeof(instance) == "Instance" then
+				resolvedInstance = instance
+			end
+		end
 		for i = 2, #segments do
 			local name = tostring(segments[i])
 			local ordinal = 1
@@ -20780,7 +22491,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 			local key = name .. "\1" .. tostring(ordinal)
 			local child = node.childByKey[key]
 			if child == nil then
-				local liveChild = findOrdinalChild(node.instance, name, ordinal)
+				local liveChild = i == #segments and resolvedInstance or findOrdinalChild(node.instance, name, ordinal)
 				local className
 				if liveChild ~= nil then
 					className = liveChild.ClassName
@@ -20792,14 +22503,29 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				child = newReviewNode(name, className, liveChild)
 				node.childByKey[key] = child
 				table.insert(node.children, child)
-			elseif i == #segments and child.instance == nil then
-				child.className = tostring(group.className or child.className)
+			elseif i == #segments then
+				if resolvedInstance ~= nil then
+					child.instance = resolvedInstance
+					child.className = resolvedInstance.ClassName
+				elseif child.instance == nil then
+					child.className = tostring(group.className or child.className)
+				end
 			end
 			node = child
 		end
 		for _, entry in ipairs(group.entries) do
 			if entry.kind == "instanceRemove" or (entry.kind == "source" and entry.deleted == true) then
 				node.status = "removed"
+			elseif entry.kind == "instanceReconcile" then
+				if node.instance == nil then
+					node.status = "added"
+				elseif node.instance.ClassName ~= tostring(entry.className or node.instance.ClassName) then
+					table.insert(node.props, {
+						name = "ClassName",
+						oldText = node.instance.ClassName,
+						newText = tostring(entry.className),
+					})
+				end
 			elseif entry.kind == "instanceAdd" and node.instance == nil and node.status == nil then
 				node.status = "added"
 			elseif entry.kind == "instanceReplace" then
@@ -20823,22 +22549,46 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				local name = tostring(entry.name or "")
 				local haveOld = false
 				local oldValue = nil
-				if node.instance ~= nil then
+				local oldValueMissing = entry.oldValueMissing == true
+				if entry.oldValueKnown == true then
+					if oldValueMissing then
+						haveOld = true
+					elseif helpers ~= nil and type(helpers.decodeValue) == "function" then
+						local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.oldValue, name, group.service)
+						if okCall and okDecode then
+							haveOld = true
+							oldValue = decoded
+						end
+					else
+						haveOld = true
+						oldValue = entry.oldValue
+					end
+				elseif node.instance ~= nil then
 					local instance = node.instance
 					if entry.kind == "attribute" then
 						haveOld, oldValue = pcall(function()
 							return instance:GetAttribute(name)
 						end)
+					elseif helpers ~= nil and type(helpers.readProperty) == "function" then
+						local okCall, okRead, value = pcall(helpers.readProperty, instance, name)
+						if okCall and okRead then
+							haveOld = true
+							oldValue = value
+						end
 					else
 						haveOld, oldValue = pcall(function()
 							return (instance :: any)[name]
 						end)
 					end
+					if haveOld and oldValue == nil then
+						oldValueMissing = true
+					end
 				end
 				local haveNew = false
 				local newValue = nil
-				if helpers ~= nil and type(helpers.decodeValue) == "function" then
-					local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.value)
+				local truncated = type(entry.value) == "table" and entry.value._reviewTruncated == true
+				if not truncated and helpers ~= nil and type(helpers.decodeValue) == "function" then
+					local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.value, name, group.service)
 					if okCall and okDecode then
 						haveNew = true
 						newValue = decoded
@@ -20860,17 +22610,29 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				then
 					isNoop = true
 				end
+				if node.instance ~= nil and (not haveOld or not haveNew) then
+					isNoop = true
+				end
 				if not isNoop then
-					local oldText = haveOld and formatLiveValue(oldValue) or nil
+					local oldText = haveOld and (oldValueMissing and "Not set" or formatLiveValue(oldValue)) or nil
 					local newText
 					if haveNew then
 						newText = formatLiveValue(newValue) or "Default"
+					elseif truncated then
+						newText = tostring(entry.value.summary or "Structured value")
 					else
 						newText = formatPushValue(entry.value)
 					end
-					if oldText == nil or oldText ~= newText then
-						table.insert(node.props, { name = name, oldText = oldText, newText = newText })
-					end
+					local componentOldValue = haveOld and not oldValueMissing and oldValue or nil
+					local componentNewValue = haveNew and newValue or entry.value
+					local components = reviewValueComponents(componentOldValue, componentNewValue)
+					table.insert(node.props, {
+						name = name,
+						oldText = oldText,
+						newText = newText,
+						components = components,
+						expanded = false,
+					})
 				end
 			end
 		end
@@ -20915,22 +22677,6 @@ local function buildReviewTree(summaryRows, groups, helpers)
 		end
 	end
 
-	local function applyExpansion(node, depth)
-		if #node.children == 0 then
-			node.expanded = instanceCount <= REVIEW_AUTO_EXPAND_LEAVES
-		else
-			node.expanded = not (depth >= 3 and instanceCount > 50)
-			for _, child in ipairs(node.children) do
-				applyExpansion(child, depth + 1)
-			end
-		end
-	end
-	for _, node in ipairs(keptRoots) do
-		if not node.summary then
-			applyExpansion(node, 1)
-		end
-	end
-
 	return { roots = keptRoots, effectiveCount = effectiveCount, instanceCount = instanceCount }
 end
 
@@ -20949,10 +22695,26 @@ local function flattenReviewTree(roots)
 			tail = tail.children[1]
 			table.insert(names, tail.name)
 		end
-		table.insert(visible, { kind = "node", node = tail, depth = depth, chain = names })
+		table.insert(visible, {
+			kind = "node",
+			node = tail,
+			depth = depth,
+			chain = names,
+			iconClassName = node.className,
+		})
 		if tail.expanded then
 			for _, prop in ipairs(tail.props) do
 				table.insert(visible, { kind = "prop", prop = prop, node = tail, depth = depth + 1 })
+				if prop.expanded and prop.components ~= nil then
+					for _, component in ipairs(prop.components) do
+						table.insert(visible, {
+							kind = "component",
+							prop = component,
+							node = tail,
+							depth = depth + 2,
+						})
+					end
+				end
 			end
 			for _, child in ipairs(tail.children) do
 				visit(child, depth + 1)
@@ -21023,6 +22785,9 @@ local function ensureReviewRow(reviewUi, index)
 		if item ~= nil and item.kind == "node" and (#item.node.children > 0 or #item.node.props > 0) then
 			item.node.expanded = not item.node.expanded
 			reviewUi.refreshList()
+		elseif item ~= nil and item.kind == "prop" and item.prop.components ~= nil then
+			item.prop.expanded = not item.prop.expanded
+			reviewUi.refreshList()
 		end
 	end)
 	reviewUi.rowPool[index] = row
@@ -21049,7 +22814,7 @@ local function bindReviewRow(reviewUi, row, item)
 		end
 		row.icon.Visible = true
 		row.icon.Position = UDim2.new(0, indent + 16, 0.5, -8)
-		local data = reviewClassIconData(node.className)
+		local data = reviewClassIconData(item.iconClassName or node.className)
 		row.icon.Image = tostring(data.Image or "")
 		row.icon.ImageRectOffset = data.ImageRectOffset or Vector2.zero
 		row.icon.ImageRectSize = data.ImageRectSize or Vector2.zero
@@ -21082,6 +22847,41 @@ local function bindReviewRow(reviewUi, row, item)
 		row.label.Position = UDim2.fromOffset(labelX, 0)
 		row.label.Size = UDim2.new(1, -labelX - 4, 1, 0)
 	elseif item.kind == "prop" then
+		local prop = item.prop
+		local hasComponents = prop.components ~= nil and #prop.components > 0
+		row.twisty.Visible = hasComponents
+		row.twisty.Position = UDim2.fromOffset(indent, 0)
+		row.twisty.Rotation = prop.expanded and 0 or -90
+		for _, bar in ipairs(row.twistyBars) do
+			bar.BackgroundColor3 = p.Dimmed
+		end
+		row.icon.Visible = false
+		local html
+		if prop.oldText ~= nil and item.node.status == nil then
+			html = string.format(
+				'<font color="%s">%s</font>  <s><font color="%s">%s</font></s> <font color="%s">→</font> <font color="%s">%s</font>',
+				dimHex,
+				escapeRich(prop.name),
+				redHex,
+				escapeRich(prop.oldText),
+				dimHex,
+				greenHex,
+				escapeRich(prop.newText)
+			)
+		else
+			html = string.format(
+				'<font color="%s">%s</font>  <font color="%s">%s</font>',
+				dimHex,
+				escapeRich(prop.name),
+				textHex,
+				escapeRich(prop.newText)
+			)
+		end
+		row.label.Text = html
+		local labelX = indent + 22
+		row.label.Position = UDim2.fromOffset(labelX, 0)
+		row.label.Size = UDim2.new(1, -labelX - 4, 1, 0)
+	elseif item.kind == "component" then
 		row.twisty.Visible = false
 		row.icon.Visible = false
 		local prop = item.prop
@@ -21110,18 +22910,12 @@ local function bindReviewRow(reviewUi, row, item)
 		local labelX = indent + 22
 		row.label.Position = UDim2.fromOffset(labelX, 0)
 		row.label.Size = UDim2.new(1, -labelX - 4, 1, 0)
-	else
-		row.twisty.Visible = false
-		row.icon.Visible = false
-		row.label.Text = string.format('<font color="%s">+%d more</font>', dimHex, item.count)
-		row.label.Position = UDim2.fromOffset(indent + 4, 0)
-		row.label.Size = UDim2.new(1, -indent - 8, 1, 0)
 	end
 end
 
 local function buildReviewWidget(plugin)
 	local refs = newRefs()
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 500, 620, 430, 460)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 660, 620, 560, 460)
 	local widget = createWidget(plugin, "ReniumReview", info, "Renium Review")
 	widget.Enabled = false
 
@@ -21205,17 +22999,24 @@ local function buildReviewWidget(plugin)
 	local barCorner = Instance.new("UICorner")
 	barCorner.CornerRadius = UDim.new(1, 0)
 	barCorner.Parent = countdownBar
+	local countdownMask = Instance.new("UIGradient")
+	countdownMask.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.995, 0),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	countdownMask.Parent = countdownBar
 
 	local countdownLabel = makeText(footer, "CountdownLabel", "", { size = DESCRIPTION_TEXT })
 	countdownLabel.Position = UDim2.new(0, 0, 0, 12)
-	countdownLabel.Size = UDim2.new(1, -220, 1, -12)
+	countdownLabel.Size = UDim2.new(1, -236, 1, -12)
 	table.insert(refs.dimmed, countdownLabel)
 
 	local applyButton = Instance.new("TextButton")
 	applyButton.Name = "Apply"
 	applyButton.AnchorPoint = Vector2.new(1, 1)
 	applyButton.Position = UDim2.new(1, 0, 1, 0)
-	applyButton.Size = UDim2.new(0, 88, 0, CONTROL_HEIGHT)
+	applyButton.Size = UDim2.new(0, 124, 0, CONTROL_HEIGHT)
 	applyButton.Text = "Apply"
 	applyButton.BorderSizePixel = 0
 	applyButton.AutoButtonColor = true
@@ -21229,7 +23030,7 @@ local function buildReviewWidget(plugin)
 	local skipButton = Instance.new("TextButton")
 	skipButton.Name = "Skip"
 	skipButton.AnchorPoint = Vector2.new(1, 1)
-	skipButton.Position = UDim2.new(1, -96, 1, 0)
+	skipButton.Position = UDim2.new(1, -132, 1, 0)
 	skipButton.Size = UDim2.new(0, 96, 0, CONTROL_HEIGHT)
 	skipButton.Text = "Skip batch"
 	skipButton.Parent = footer
@@ -21239,16 +23040,18 @@ local function buildReviewWidget(plugin)
 		widget = widget,
 		refs = refs,
 		root = root,
+		title = title,
 		subtitle = subtitle,
 		scroll = scroll,
+		countdownTrack = countdownTrack,
 		countdownBar = countdownBar,
+		countdownMask = countdownMask,
 		countdownLabel = countdownLabel,
 		skipButton = skipButton,
 		applyButton = applyButton,
 		rowPool = {},
 		visibleItems = {},
 		treeRoots = {},
-		moreCount = 0,
 	}
 
 	local function renderWindow()
@@ -21274,9 +23077,6 @@ local function buildReviewWidget(plugin)
 
 	function reviewUi.refreshList()
 		local items = flattenReviewTree(reviewUi.treeRoots)
-		if reviewUi.moreCount > 0 then
-			table.insert(items, { kind = "more", count = reviewUi.moreCount, depth = 0 })
-		end
 		reviewUi.visibleItems = items
 		renderWindow()
 	end
@@ -21393,12 +23193,20 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 	local reviewState = nil
 	local finishedReviewDecisions = {}
 	local reviewCounter = 0
-	local reviewCountdown = { connection = nil, remaining = 0, paused = false }
+	local reviewCountdown = { connection = nil, tween = nil, colorTween = nil, remaining = 0 }
 
 	local function stopReviewCountdown()
 		if reviewCountdown.connection ~= nil then
 			reviewCountdown.connection:Disconnect()
 			reviewCountdown.connection = nil
+		end
+		if reviewCountdown.tween ~= nil then
+			reviewCountdown.tween:Cancel()
+			reviewCountdown.tween = nil
+		end
+		if reviewCountdown.colorTween ~= nil then
+			reviewCountdown.colorTween:Cancel()
+			reviewCountdown.colorTween = nil
 		end
 	end
 
@@ -21425,50 +23233,48 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		reviewUi.skipButton.MouseButton1Click:Connect(function()
 			decideReview("skip")
 		end)
-		reviewUi.root.MouseEnter:Connect(function()
-			reviewCountdown.paused = true
-		end)
-		reviewUi.root.MouseLeave:Connect(function()
-			reviewCountdown.paused = false
-		end)
 		reviewUi.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 			if not reviewUi.widget.Enabled then
-				decideReview("apply")
+				decideReview("skip")
 			end
 		end)
 		return reviewUi
 	end
 
-	local function startReviewCountdown()
+	local function startReviewCountdown(decision, label)
 		stopReviewCountdown()
 		reviewCountdown.remaining = REVIEW_COUNTDOWN_SECONDS
-		reviewCountdown.paused = false
+		reviewUi.countdownBar.Size = UDim2.new(1, 0, 0, 3)
+		reviewUi.countdownBar.BackgroundColor3 = OK_GREEN
+		reviewUi.countdownMask.Offset = Vector2.zero
+		reviewCountdown.tween = TweenService:Create(
+			reviewUi.countdownMask,
+			TweenInfo.new(REVIEW_COUNTDOWN_SECONDS, Enum.EasingStyle.Linear),
+			{
+				Offset = Vector2.new(-1, 0),
+			}
+		)
+		reviewCountdown.colorTween = TweenService:Create(
+			reviewUi.countdownBar,
+			TweenInfo.new(REVIEW_COUNTDOWN_SECONDS, Enum.EasingStyle.Linear),
+			{ BackgroundColor3 = ERROR_RED }
+		)
+		reviewCountdown.tween:Play()
+		reviewCountdown.colorTween:Play()
 		local lastShown = nil
 		reviewCountdown.connection = RunService.Heartbeat:Connect(function(dt)
 			if reviewUi == nil or reviewState == nil or reviewState.decision ~= nil then
 				stopReviewCountdown()
 				return
 			end
-			if not reviewCountdown.paused then
-				reviewCountdown.remaining = math.max(reviewCountdown.remaining - dt, 0)
-			end
-			local fraction = reviewCountdown.remaining / REVIEW_COUNTDOWN_SECONDS
-			reviewUi.countdownBar.Size = UDim2.new(fraction, 0, 0, 3)
-			reviewUi.countdownBar.BackgroundColor3 = Color3.fromHSV(fraction * 0.33, 0.62, 0.66)
-			if reviewCountdown.paused then
-				if lastShown ~= "paused" then
-					lastShown = "paused"
-					reviewUi.countdownLabel.Text = "Auto-apply paused"
-				end
-			else
-				local seconds = math.ceil(reviewCountdown.remaining)
-				if seconds ~= lastShown then
-					lastShown = seconds
-					reviewUi.countdownLabel.Text = string.format("Applies in %ds", seconds)
-				end
+			reviewCountdown.remaining = math.max(reviewCountdown.remaining - dt, 0)
+			local seconds = math.ceil(reviewCountdown.remaining)
+			if seconds ~= lastShown then
+				lastShown = seconds
+				reviewUi.countdownLabel.Text = string.format("%s in %ds", label, seconds)
 			end
 			if reviewCountdown.remaining <= 0 then
-				decideReview("apply")
+				decideReview(decision)
 			end
 		end)
 	end
@@ -21499,7 +23305,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		local groupOrder = {}
 		local seenServices = {}
 		local serviceList = {}
-		local sentUnits = 0
 		for _, row in ipairs(rows) do
 			if type(row) == "table" then
 				local service = tostring(row.service or "")
@@ -21508,7 +23313,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 					table.insert(serviceList, service)
 				end
 				if row.kind == "instances" then
-					sentUnits = sentUnits + (tonumber(row.count) or 0)
 					table.insert(summaryRows, row)
 				elseif type(row.pathSegments) == "table" and #row.pathSegments > 0 then
 					local key = table.concat(row.pathSegments, "\1")
@@ -21518,6 +23322,8 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 					local group = groups[key]
 					if group == nil then
 						group = {
+							service = service,
+							settingsId = row.settingsId,
 							pathSegments = row.pathSegments,
 							pathOrdinals = row.pathOrdinals,
 							className = tostring(row.className or "Instance"),
@@ -21526,8 +23332,13 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 						groups[key] = group
 						table.insert(groupOrder, group)
 					end
-					table.insert(group.entries, row)
-					sentUnits = sentUnits + 1
+					if type(row.entries) == "table" then
+						for _, entry in ipairs(row.entries) do
+							table.insert(group.entries, entry)
+						end
+					else
+						table.insert(group.entries, row)
+					end
 				end
 			end
 		end
@@ -21543,6 +23354,11 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		local reviewId = string.format("review-%d-%d", os.time(), reviewCounter)
 		reviewState = { id = reviewId, decision = nil }
 		local panel = ensureReviewUi()
+		panel.title.Text = "Editor changes awaiting review"
+		panel.applyButton.Text = "Apply"
+		panel.skipButton.Text = "Skip batch"
+		panel.countdownTrack.Visible = true
+		panel.countdownLabel.Visible = true
 		local changeWord = tree.effectiveCount == 1 and "change" or "changes"
 		local subtitleText
 		if tree.instanceCount > 0 then
@@ -21570,15 +23386,65 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 				threshold
 			)
 		panel.treeRoots = tree.roots
-		panel.moreCount = math.max(changeCount - sentUnits, 0)
 		panel.scroll.CanvasPosition = Vector2.zero
 		panel.refreshList()
 		panel.widget.Enabled = true
 		pcall(function()
 			panel.widget:RequestRaise()
 		end)
-		startReviewCountdown()
-		return { required = true, reviewId = reviewId }
+		startReviewCountdown("skip", "Skips")
+		return { required = true, reviewId = reviewId, effectiveCount = tree.effectiveCount }
+	end
+
+	function ui.requestProtectedWriteReview(params, helpers)
+		if type(params) ~= "table" or type(params.rows) ~= "table" or #params.rows == 0 then
+			return { required = false }
+		end
+		local result = ui.requestEditorPushReview({
+			changeCount = #params.rows,
+			rows = params.rows,
+		}, {
+			changesThreshold = 0,
+			displayPrompts = "always",
+			initialSyncPriority = "studio",
+		}, helpers)
+		if result.required == true then
+			local panel = ensureReviewUi()
+			stopReviewCountdown()
+			panel.title.Text = "Some changes need Studio to restart"
+			panel.subtitle.Text = string.format(
+				'<font color="%s">%d</font> read-only %s could not be changed while Studio is open.',
+				colorHex(WARN_AMBER),
+				result.effectiveCount,
+				result.effectiveCount == 1 and "property" or "properties"
+			)
+			panel.applyButton.Text = "Apply anyway"
+			panel.skipButton.Text = "Not now"
+			panel.countdownTrack.Visible = true
+			panel.countdownLabel.Visible = true
+			startReviewCountdown("apply", "Applies anyway")
+		end
+		return result
+	end
+
+	function ui.setEditorPushReviewDecision(params)
+		if type(params) ~= "table" then
+			params = {}
+		end
+		local reviewId = tostring(params.reviewId or "")
+		local decision = tostring(params.decision or "apply")
+		if decision ~= "apply" and decision ~= "skip" then
+			return { ok = false, accepted = false, error = "Decision must be apply or skip" }
+		end
+		if reviewState == nil or reviewState.decision ~= nil then
+			return { ok = false, accepted = false, error = "No review is awaiting a decision" }
+		end
+		if reviewId ~= "" and reviewState.id ~= reviewId then
+			return { ok = false, accepted = false, error = "Review id does not match the active review" }
+		end
+		local activeId = reviewState.id
+		decideReview(decision)
+		return { ok = true, accepted = true, reviewId = activeId, decision = decision }
 	end
 
 	function ui.getEditorPushReviewDecision(params)
@@ -21764,8 +23630,8 @@ local function unpackDecoder(f)
 end
 
 local function serializeFloat(value)
-	-- TODO: Figure out a better way to serialize infinity and NaN, neither of
-	-- which fit into JSON.
+
+
 	if value == math.huge or value == -math.huge then
 		return 999999999 * math.sign(value)
 	end
@@ -21870,7 +23736,7 @@ types = {
 			local pos = pod.position
 			local orient = pod.orientation
 
-			--stylua: ignore
+
 			return CFrame.new(
 				pos[1], pos[2], pos[3],
 				orient[1][1], orient[1][2], orient[1][3],
@@ -21981,7 +23847,7 @@ types = {
 		fromPod = identity,
 
 		toPod = function(roblox)
-			-- FIXME: More robust handling of enums
+
 			if typeof(roblox) == "number" then
 				return roblox
 			else
@@ -22103,9 +23969,9 @@ types = {
 			local keypoints = {}
 
 			for index, keypoint in ipairs(pod.keypoints) do
-				-- TODO: Add a test for NaN or Infinity values and envelopes
-				-- Right now it isn't possible because it'd fail the roundtrip.
-				-- It's more important that it works right now, though.
+
+
+
 				local value = keypoint.value or 0
 				local envelope = keypoint.envelope or 0
 				keypoints[index] = NumberSequenceKeypoint.new(keypoint.time, value, envelope)
@@ -22136,8 +24002,8 @@ types = {
 			if pod == "Default" then
 				return nil
 			else
-				-- Passing `nil` instead of not passing anything gives
-				-- different results, so we have to branch here.
+
+
 				if pod.acousticAbsorption then
 					return (PhysicalProperties.new :: any)(
 						pod.density,
@@ -22337,7 +24203,7 @@ function EncodedValue.decode(encodedValue)
 	local ty, value = next(encodedValue)
 
 	if ty == nil then
-		-- If the encoded pair is empty, assume it is an unoccupied optional value
+
 		return true, nil
 	end
 
@@ -22422,13 +24288,13 @@ return Error
             <string name="Source"><![CDATA[local Error = require(script.Parent.Error)
 local customProperties = require(script.Parent.customProperties)
 
--- A wrapper around a property descriptor from the reflection database with some
--- extra convenience methods.
---
--- The aim of this API is to facilitate looking up a property once, then reading
--- from it or writing to it multiple times. It's also useful when a consumer
--- wants to check additional constraints on the property before trying to use
--- it, like scriptability.
+
+
+
+
+
+
+
 local PropertyDescriptor = {}
 PropertyDescriptor.__index = PropertyDescriptor
 
@@ -22444,16 +24310,16 @@ function PropertyDescriptor.fromRaw(data, className, propertyName)
 	local key, value = next(data.DataType)
 
 	return setmetatable({
-		-- The meanings of the key and value in DataType differ when the type of
-		-- the property is Enum. When the property is of type Enum, the key is
-		-- the name of the type:
-		--
-		-- { Enum = "<name of enum>" }
-		--
-		-- When the property is not of type Enum, the value is the name of the
-		-- type:
-		--
-		-- { Value = "<data type>" }
+
+
+
+
+
+
+
+
+
+
 		dataType = key == "Enum" and key or value,
 		enumType = key == "Enum" and ("Enum." .. value) or nil,
 
@@ -22889,7 +24755,7 @@ local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local Error = require(script.Parent.Error)
 
---- A list of `Enum.Material` values that are used for Terrain.MaterialColors
+
 local TERRAIN_MATERIAL_COLORS = {
 	Enum.Material.Grass,
 	Enum.Material.Slate,
@@ -22915,23 +24781,23 @@ local TERRAIN_MATERIAL_COLORS = {
 }
 
 local function isAttributeNameValid(attributeName)
-	-- For SetAttribute to succeed, the attribute name must be less than or
-	-- equal to 100 characters...
+
+
 	return #attributeName <= 100
-		-- ...and must only contain alphanumeric characters, periods, hyphens,
-		-- underscores, or forward slashes.
+
+
 		and attributeName:match("[^%w%.%-_/]") == nil
 end
 
 local function isAttributeNameReserved(attributeName)
-	-- For SetAttribute to succeed, attribute names must not use the RBX
-	-- prefix, which is reserved by Roblox.
+
+
 	return attributeName:sub(1, 3) == "RBX"
 end
 
--- Defines how to read and write properties that aren't directly scriptable.
---
--- The reflection database refers to these as having scriptability = "Custom"
+
+
+
 return {
 	Instance = {
 		Attributes = {
@@ -22948,9 +24814,9 @@ return {
 
 				for attributeName, attributeValue in pairs(value) do
 					if isAttributeNameReserved(attributeName) then
-						-- If the attribute name is reserved, then we don't
-						-- really care about reporting any failures about
-						-- it.
+
+
+
 						continue
 					end
 
@@ -23060,8 +24926,8 @@ return {
 	Terrain = {
 		MaterialColors = {
 			read = function(instance: Terrain)
-				-- There's no way to get a list of every color, so we have to
-				-- make one.
+
+
 				local colors = {}
 				for _, material in TERRAIN_MATERIAL_COLORS do
 					colors[material] = instance:GetMaterialColor(material)

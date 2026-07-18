@@ -1,7 +1,8 @@
---!strict
+
 
 local BridgeStudioChanges = {}
-local CHANGE_TRACKER_VERSION = 3
+local CHANGE_TRACKER_VERSION = 4
+local CollectionService = game:GetService("CollectionService")
 
 type AllowedServices = { [string]: boolean }
 type DirtySeqMap = { [string]: number }
@@ -106,8 +107,12 @@ type State = {
 	watchedServices: { [string]: boolean },
 	serviceRoots: { [string]: Instance },
 	rootConnections: { [string]: { RBXScriptConnection } },
+	globalConnections: { RBXScriptConnection },
 	instanceConnections: ConnectionMap,
 	itemChangedAvailable: boolean,
+	tagSignalsAvailable: boolean,
+	tagConnections: { [string]: { RBXScriptConnection } },
+	taggedInstancesByTag: { [string]: { [Instance]: boolean } },
 	changeEvent: BindableEvent,
 	suppressUntil: number,
 	suppressDepth: number,
@@ -174,8 +179,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		watchedServices = {},
 		serviceRoots = {},
 		rootConnections = {},
+		globalConnections = {},
 		instanceConnections = {},
 		itemChangedAvailable = false,
+		tagSignalsAvailable = false,
+		tagConnections = {},
+		taggedInstancesByTag = {},
 		changeEvent = Instance.new("BindableEvent"),
 		suppressUntil = 0,
 		suppressDepth = 0,
@@ -580,6 +589,102 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return nil
 	end
 
+	local function serviceNameForTrackedInstance(instance: Instance): string?
+		if shouldIgnoreInstance(instance) then
+			return nil
+		end
+		for serviceName, service in pairs(state.serviceRoots) do
+			if instance == service then
+				return serviceName
+			end
+			local ok, isDescendant = pcall(function()
+				return instance:IsDescendantOf(service)
+			end)
+			if ok and isDescendant then
+				return serviceName
+			end
+		end
+		return nil
+	end
+
+	local function tagChangeRelevant(instance: Instance): boolean
+		return not state.onlyCodeMode or hasLuaSourceDescendant(instance)
+	end
+
+	local function markTagChange(instance: Instance, tag: string, added: boolean)
+		local serviceName = serviceNameForTrackedInstance(instance)
+		if serviceName == nil or not tagChangeRelevant(instance) then
+			return
+		end
+		markDirty(
+			serviceName,
+			true,
+			changeDetailsForInstance(
+				instance,
+				"tag",
+				"Tags",
+				nil,
+				if added then "tag added" else "tag removed"
+			)
+		)
+	end
+
+	local function connectTag(tag: string, markExisting: boolean)
+		if state.tagConnections[tag] ~= nil then
+			return
+		end
+		local tracked = setmetatable({}, { __mode = "k" }) :: any
+		state.taggedInstancesByTag[tag] = tracked
+		local okTagged, tagged = pcall(CollectionService.GetTagged, CollectionService, tag)
+		if okTagged and type(tagged) == "table" then
+			for _, instance in ipairs(tagged) do
+				if typeof(instance) == "Instance" then
+					tracked[instance] = true
+					if markExisting then
+						markTagChange(instance, tag, true)
+					end
+				end
+			end
+		end
+		local connections = {}
+		local okAdded, addedSignal = pcall(CollectionService.GetInstanceAddedSignal, CollectionService, tag)
+		if okAdded and addedSignal ~= nil then
+			connections[#connections + 1] = addedSignal:Connect(function(instance: Instance)
+				if tracked[instance] ~= true then
+					tracked[instance] = true
+					markTagChange(instance, tag, true)
+				end
+			end)
+		end
+		local okRemoved, removedSignal = pcall(CollectionService.GetInstanceRemovedSignal, CollectionService, tag)
+		if okRemoved and removedSignal ~= nil then
+			connections[#connections + 1] = removedSignal:Connect(function(instance: Instance)
+				if tracked[instance] == true then
+					tracked[instance] = nil
+					markTagChange(instance, tag, false)
+				end
+			end)
+		end
+		if #connections > 0 then
+			state.tagConnections[tag] = connections
+			state.tagSignalsAvailable = true
+		else
+			state.taggedInstancesByTag[tag] = nil
+		end
+	end
+
+	local function discoverTags(markExisting: boolean)
+		local okTags, tags = pcall(CollectionService.GetAllTags, CollectionService)
+		if not okTags or type(tags) ~= "table" then
+			return
+		end
+		for _, tag in ipairs(tags) do
+			if type(tag) == "string" and tag ~= "" then
+				connectTag(tag, markExisting)
+			end
+		end
+	end
+
 	local function shouldIgnoreRootProperty(service: Instance, serviceName: string, propertyName: string): boolean
 		local lowered = string.lower(propertyName)
 		local ignoredProperties = ROOT_PROPERTY_IGNORES[serviceName]
@@ -924,7 +1029,34 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, serviceName in ipairs(services) do
 			ensureService(serviceName)
 		end
-		state.started = true
+		if not state.started then
+			local okItemChanged, itemChanged = pcall(function()
+				return (game :: any).ItemChanged
+			end)
+			if okItemChanged and itemChanged ~= nil then
+				local okConnect, connection = pcall(function()
+					return itemChanged:Connect(function(instance: Instance, propertyName: any)
+						if typeof(instance) == "Instance" and string.lower(tostring(propertyName or "")) == "tags" then
+							markTagChange(instance, "Tags", true)
+						end
+					end)
+				end)
+				if okConnect and connection ~= nil then
+					state.globalConnections[#state.globalConnections + 1] = connection
+					state.itemChangedAvailable = true
+				end
+			end
+			discoverTags(false)
+			state.started = true
+			task.spawn(function()
+				while state.started do
+					task.wait(0.5)
+					if state.started then
+						discoverTags(true)
+					end
+				end
+			end)
+		end
 	end
 
 	function api.configurePropertyCandidates(rawCandidatesByClass: any): { [string]: any }
@@ -1106,6 +1238,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			propertyChanges = propertyChanges,
 			changes = changes,
 			itemChangedAvailable = state.itemChangedAvailable,
+			tagSignalsAvailable = state.tagSignalsAvailable,
 			propertyFilterClasses = state.propertyFilterClassCount,
 			propertyFilterProperties = state.propertyFilterPropertyCount,
 			connectedInstances = state.connectedInstanceCount,
@@ -1138,6 +1271,46 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			response.waitTimedOut = waitTimedOut
 		end
 		return response
+	end
+
+	function api.stop()
+		if not state.started then
+			return
+		end
+		state.started = false
+		for _, connections in pairs(state.rootConnections) do
+			for _, connection in ipairs(connections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+		end
+		table.clear(state.rootConnections)
+		for _, connection in ipairs(state.globalConnections) do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(state.globalConnections)
+		local connectedInstances = {}
+		for instance in pairs(state.instanceConnections) do
+			connectedInstances[#connectedInstances + 1] = instance
+		end
+		for _, instance in ipairs(connectedInstances) do
+			disconnectInstance(instance)
+		end
+		for _, connections in pairs(state.tagConnections) do
+			for _, connection in ipairs(connections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+		end
+		table.clear(state.tagConnections)
+		table.clear(state.taggedInstancesByTag)
+		pcall(function()
+			state.changeEvent:Destroy()
+		end)
 	end
 
 	return api

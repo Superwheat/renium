@@ -6,11 +6,11 @@ import * as path from "path";
 
 export type DecodeResult = { ok: true; tree: unknown } | { ok: false; error: string };
 
-/**
- * These limits keep a malformed or unexpectedly large store from monopolizing
- * the extension host. The actual binary decoding still happens in the CLI,
- * outside VS Code's renderer process.
- */
+
+
+
+
+
 export const MAX_RBSYNC_INPUT_BYTES = 64 * 1024 * 1024;
 export const MAX_RBSYNC_DROPPED_BYTES = 16 * 1024 * 1024;
 export const MAX_RBSYNC_VIEW_OUTPUT_BYTES = 32 * 1024 * 1024;
@@ -189,7 +189,7 @@ async function runViewCommand(
   });
 }
 
-/** Decode a .renium file to the viewer's JSON tree via `renium view --json`. */
+
 export async function decodeRbsyncToTree(
   cliPath: string,
   cwd: string,
@@ -216,8 +216,8 @@ export async function decodeRbsyncToTree(
   return await runViewCommand(cliPath, cwd, filePath, maxOutputBytes, timeoutMs);
 }
 
-/** Decode raw bytes (a dropped file) by round-tripping through a private temp
- * directory so the same file-based CLI path handles both drops and opened files. */
+
+
 export async function decodeRbsyncBytes(
   cliPath: string,
   cwd: string,
