@@ -85,7 +85,6 @@ type DisplayPrompts = "always" | "initial" | "never";
 
 type SyncConfig = {
   exportCliPath: string;
-  editorSyncCliPath: string;
   rustCliPath: string;
   projectRoot: string;
   snapshotDir: string;
@@ -121,7 +120,6 @@ type SyncConfig = {
   importMode: "direct" | "snapshot";
   performanceMode: "throughput" | "balanced" | "smooth";
   modifiedDefaultBypass: boolean;
-  watchConfigPath: string;
   wsWaitSeconds: number;
   progressHeartbeatSeconds: number;
   benchmarkRuns: number;
@@ -8194,19 +8192,11 @@ class RobloxSyncController {
       cfg.get<string>("configTomlPath", "${userHome}/.codex/config.toml"),
       root,
     );
-    const watchConfigPath = this.resolveConfigPath(
-      cfg.get<string>("watchConfigPath", "${workspaceFolder}/tools/editor_to_studio_sync.json"),
-      root,
-    );
     const configuredExportCliPath = this.resolveConfigPath(
       cfg.get<string>("exportCliPath", "${workspaceFolder}/renium.exe"),
       root,
     );
     const exportCliPath = resolveExistingRustCliPath(root, projectRoot, configuredExportCliPath);
-    const editorSyncCliPath = this.resolveConfigPath(
-      cfg.get<string>("editorSyncCliPath", "${workspaceFolder}/dist/editor_to_studio_sync.exe"),
-      root,
-    );
 
     const servicesRaw = cfg.get<string[]>("services", DEFAULT_SERVICES);
     const services = (Array.isArray(servicesRaw) ? servicesRaw : DEFAULT_SERVICES)
@@ -8286,7 +8276,6 @@ class RobloxSyncController {
 
     return {
       exportCliPath,
-      editorSyncCliPath,
       rustCliPath,
       projectRoot,
       snapshotDir: cfg.get<string>("snapshotDir", "snapshots"),
@@ -8334,7 +8323,6 @@ class RobloxSyncController {
       importMode,
       performanceMode,
       modifiedDefaultBypass,
-      watchConfigPath,
       wsWaitSeconds,
       progressHeartbeatSeconds: this.configNumber(cfg, "progressHeartbeatSeconds", 2, { min: 2 }),
       benchmarkRuns: this.configNumber(cfg, "benchmarkRuns", 5, { min: 1, integer: true }),

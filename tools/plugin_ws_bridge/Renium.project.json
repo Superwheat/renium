@@ -34,6 +34,18 @@
       "BridgeContent": {
         "$path": "BridgeContent.module.lua"
       },
+      "BridgeCandidateMatch": {
+        "$path": "BridgeCandidateMatch.module.lua"
+      },
+      "BridgeInstanceSwap": {
+        "$path": "BridgeInstanceSwap.module.lua"
+      },
+      "BridgeReferenceRetarget": {
+        "$path": "BridgeReferenceRetarget.module.lua"
+      },
+      "BridgeValueEquality": {
+        "$path": "BridgeValueEquality.module.lua"
+      },
       "BridgeUi": {
         "$path": "BridgeUi.module.lua"
       },

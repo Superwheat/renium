@@ -383,11 +383,6 @@
           "default": "${workspaceFolder}/renium.exe",
           "description": "Path to the Renium executable used for Studio export and sync."
         },
-        "renium.editorSyncCliPath": {
-          "type": "string",
-          "default": "${workspaceFolder}/dist/editor_to_studio_sync.exe",
-          "description": "Path to live-sync executable."
-        },
         "renium.rustCliPath": {
           "type": "string",
           "default": "${workspaceFolder}/renium.exe",
@@ -622,11 +617,6 @@
           "type": "boolean",
           "default": false,
           "description": "Compact-v5 fast path that adaptively uses IsPropertyModified to avoid reading defaulted properties after guarded validation. Disabled by default."
-        },
-        "renium.watchConfigPath": {
-          "type": "string",
-          "default": "${workspaceFolder}/tools/editor_to_studio_sync.json",
-          "description": "Reserved config path for future live-sync support."
         },
         "renium.wsWaitSeconds": {
           "type": "number",
