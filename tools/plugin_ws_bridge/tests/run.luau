@@ -2,10 +2,14 @@ local roblox = require("@lune/roblox")
 
 game = roblox.Instance.new("DataModel")
 
+local CandidateMatch = require("../BridgeCandidateMatch.module")
 local Chunking = require("../BridgeChunking.module")
 local Content = require("../BridgeContent.module")
 local Identity = require("../BridgeIdentity.module")
+local InstanceSwap = require("../BridgeInstanceSwap.module")
+local ReferenceRetarget = require("../BridgeReferenceRetarget.module")
 local Settings = require("../BridgeSettings.module")
+local ValueEquality = require("../BridgeValueEquality.module")
 
 local function equal(actual, expected, label)
 	if actual ~= expected then
@@ -71,6 +75,248 @@ equal(reference.instanceId, "2a", "reference id")
 local hash = Identity.shortenIdentifier("renium")
 equal(#hash, 16, "short identifier length")
 equal(hash, Identity.shortenIdentifier("renium"), "short identifier stability")
+
+equal(ValueEquality.valuesEqual(1, 1.00005), true, "number epsilon")
+equal(ValueEquality.valuesEqual(1, 1.001), false, "number difference")
+equal(ValueEquality.valuesEqual(0 / 0, 0 / 0), true, "NaN equality")
+equal(
+	ValueEquality.valuesEqual(roblox.Vector3.new(1, 2, 3), roblox.Vector3.new(1.00005, 2, 3)),
+	true,
+	"Vector3 epsilon"
+)
+equal(
+	ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)),
+	true,
+	"CFrame epsilon"
+)
+equal(
+	ValueEquality.valuesEqual(roblox.Color3.new(0.5, 0.25, 0.75), roblox.Color3.new(0.50001, 0.25, 0.75)),
+	true,
+	"Color3 quantization"
+)
+equal(
+	ValueEquality.valuesEqual(roblox.UDim2.new(0.5, 2, 0.25, 4), roblox.UDim2.new(0.50005, 2, 0.25, 4)),
+	true,
+	"UDim2 epsilon"
+)
+equal(
+	ValueEquality.valuesEqual(roblox.NumberRange.new(1, 2), roblox.NumberRange.new(1.00005, 2)),
+	true,
+	"NumberRange epsilon"
+)
+equal(
+	ValueEquality.valuesEqual(
+		roblox.PhysicalProperties.new(0.7, 0.3, 0.5, 1, 1),
+		roblox.PhysicalProperties.new(0.70005, 0.3, 0.5, 1, 1)
+	),
+	true,
+	"PhysicalProperties epsilon"
+)
+equal(
+	ValueEquality.valuesEqual(
+		roblox.NumberSequence.new({
+			roblox.NumberSequenceKeypoint.new(0, 0, 0),
+			roblox.NumberSequenceKeypoint.new(1, 1, 0),
+		}),
+		roblox.NumberSequence.new({
+			roblox.NumberSequenceKeypoint.new(0, 0.00005, 0),
+			roblox.NumberSequenceKeypoint.new(1, 1, 0),
+		})
+	),
+	true,
+	"NumberSequence epsilon"
+)
+equal(ValueEquality.valuesEqual({ value = 1 }, { value = 1.00005 }), true, "table epsilon")
+
+local matchCandidates = {
+	{ Value = "first", Marker = "one" },
+	{ Value = "second", Marker = "two" },
+}
+local matchedCandidate = CandidateMatch.choose(
+	matchCandidates,
+	{ Value = "second" },
+	{ Marker = "two" },
+	function(candidate, name, value)
+		return candidate[name] == value
+	end,
+	function(candidate, name, value)
+		return candidate[name] == value
+	end
+)
+equal(matchedCandidate, matchCandidates[2], "candidate property scoring")
+
+local tiedCandidate = CandidateMatch.choose(
+	matchCandidates,
+	{ Target = { _type = "Ref", settingsId = "second" } },
+	{},
+	function(candidate, name, value)
+		return candidate[name] == value
+	end,
+	function(candidate, name, value)
+		return candidate[name] == value
+	end
+)
+equal(tiedCandidate, matchCandidates[1], "candidate reference tie")
+
+local oversizedCandidates = {}
+for index = 1, 33 do
+	oversizedCandidates[index] = { Value = index }
+end
+local cappedCandidate = CandidateMatch.choose(
+	oversizedCandidates,
+	{ Value = 33 },
+	{},
+	function(candidate, name, value)
+		return candidate[name] == value
+	end,
+	function(candidate, name, value)
+		return candidate[name] == value
+	end
+)
+equal(cappedCandidate, oversizedCandidates[1], "candidate scoring cap")
+
+local FakeInstance = {}
+local FakeInstanceMetatable = {}
+function FakeInstanceMetatable.__index(instance, key)
+	if key == "Parent" then
+		return rawget(instance, "_parent")
+	end
+	return FakeInstance[key] or rawget(instance, key)
+end
+function FakeInstanceMetatable.__newindex(instance, key, value)
+	if key ~= "Parent" then
+		rawset(instance, key, value)
+		return
+	end
+	local parent = rawget(instance, "_parent")
+	if parent ~= nil then
+		table.remove(parent._children, table.find(parent._children, instance))
+	end
+	rawset(instance, "_parent", value)
+	if value ~= nil then
+		value._children[#value._children + 1] = instance
+	end
+end
+function FakeInstance.new(className)
+	return setmetatable({
+		ClassName = className,
+		Name = className,
+		_attributes = {},
+		_children = {},
+	}, FakeInstanceMetatable)
+end
+function FakeInstance:GetChildren()
+	return table.clone(self._children)
+end
+function FakeInstance:GetDescendants()
+	local descendants = {}
+	local function visit(instance)
+		for _, childInstance in ipairs(instance:GetChildren()) do
+			descendants[#descendants + 1] = childInstance
+			visit(childInstance)
+		end
+	end
+	visit(self)
+	return descendants
+end
+function FakeInstance:GetAttributes()
+	return table.clone(self._attributes)
+end
+function FakeInstance:SetAttribute(name, value)
+	self._attributes[name] = value
+end
+function FakeInstance:GetAttribute(name)
+	return self._attributes[name]
+end
+function FakeInstance:GetFullName()
+	return self.Name
+end
+function FakeInstance:Destroy()
+	self.Parent = nil
+end
+
+local tagsByInstance = {}
+local tagService = {}
+function tagService:GetTags(instance)
+	return table.clone(tagsByInstance[instance] or {})
+end
+function tagService:AddTag(instance, tag)
+	local tags = tagsByInstance[instance] or {}
+	tagsByInstance[instance] = tags
+	tags[#tags + 1] = tag
+end
+
+local swapParent = FakeInstance.new("Folder")
+local before = FakeInstance.new("Folder")
+before.Name = "Value"
+before.Parent = swapParent
+local replaced = FakeInstance.new("Folder")
+replaced.Name = "Value"
+replaced:SetAttribute("Marker", "middle")
+replaced.Parent = swapParent
+tagsByInstance[replaced] = { "Synced" }
+local nested = FakeInstance.new("Folder")
+nested.Name = "Nested"
+nested.Parent = replaced
+local nestedTail = FakeInstance.new("Folder")
+nestedTail.Name = "NestedTail"
+nestedTail.Parent = replaced
+local after = FakeInstance.new("Folder")
+after.Name = "Value"
+after.Parent = swapParent
+
+local replacement = InstanceSwap.replace(replaced, "StringValue", tagService, function(instance)
+	instance.Parent = nil
+end, FakeInstance.new)
+local swappedChildren = swapParent:GetChildren()
+equal(swappedChildren[1], before, "replacement first sibling")
+equal(swappedChildren[2], replacement, "replacement original position")
+equal(swappedChildren[3], after, "replacement trailing sibling")
+equal(nested.Parent, replacement, "replacement child parent")
+equal(nestedTail.Parent, replacement, "replacement trailing child parent")
+equal(replacement:GetAttribute("Marker"), "middle", "replacement attribute")
+equal(tagsByInstance[replacement][1], "Synced", "replacement tag")
+
+local nestedReplacement = InstanceSwap.replace(nested, "StringValue", tagService, function(instance)
+	instance.Parent = nil
+end, FakeInstance.new)
+local nestedChildren = replacement:GetChildren()
+equal(nestedChildren[1], nestedReplacement, "nested replacement position")
+equal(nestedChildren[2], nestedTail, "nested replacement trailing sibling")
+
+local referenceHolder = FakeInstance.new("ObjectValue")
+referenceHolder.Reference = replaced
+referenceHolder.Parent = swapParent
+local referenceUpdated, referenceFailed = ReferenceRetarget.apply(
+	{ swapParent },
+	{ [replaced] = replacement },
+	function(className)
+		return if className == "ObjectValue" then { "Reference" } else {}
+	end,
+	function(instance, propertyName)
+		return true, instance[propertyName]
+	end,
+	function(instance, propertyName, value)
+		instance[propertyName] = value
+		return true
+	end
+)
+equal(referenceUpdated, 1, "replacement reference update")
+equal(referenceFailed, 0, "replacement reference failure count")
+equal(referenceHolder.Reference, replacement, "replacement reference target")
+
+local lockedParent = FakeInstance.new("Folder")
+local lockedTarget = FakeInstance.new("Folder")
+lockedTarget.Parent = lockedParent
+local lockedSibling = FakeInstance.new("Terrain")
+lockedSibling.RobloxLocked = true
+lockedSibling.Parent = lockedParent
+local lockedReplacement = InstanceSwap.replace(lockedTarget, "StringValue", tagService, function(instance)
+	instance.Parent = nil
+end, FakeInstance.new)
+local lockedChildren = lockedParent:GetChildren()
+equal(lockedChildren[1], lockedSibling, "locked sibling retained")
+equal(lockedChildren[2], lockedReplacement, "locked sibling replacement fallback")
 
 equal(Content.serializeSource("None", nil), "", "empty content")
 equal(Content.serializeSource("Uri", "rbxassetid://123"), "rbxassetid://123", "URI content")

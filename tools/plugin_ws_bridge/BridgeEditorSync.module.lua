@@ -1,5 +1,9 @@
 local BridgeEditorSync = {}
 
+local BridgeCandidateMatch = require(script.Parent.BridgeCandidateMatch)
+local BridgeInstanceSwap = require(script.Parent.BridgeInstanceSwap)
+local BridgeReferenceRetarget = require(script.Parent.BridgeReferenceRetarget)
+local BridgeValueEquality = require(script.Parent.BridgeValueEquality)
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local EncodingService = game:GetService("EncodingService")
@@ -248,11 +252,68 @@ local function settingsIdText(raw: any): string?
 	return text
 end
 
+local function strongSettingsId(raw: any): boolean
+	local settingsId = settingsIdText(raw)
+	return settingsId ~= nil and string.sub(settingsId, 1, 6) == "debug:"
+end
+
 local function liveInstance(value: any): Instance?
 	if typeof(value) == "Instance" and value.Parent ~= nil and value:IsDescendantOf(game) then
 		return value
 	end
 	return nil
+end
+
+local function matchedSettingsInstance(serviceName: string, rawSettingsId: any, ctx: { [string]: any }): Instance?
+	local settingsId = settingsIdText(rawSettingsId)
+	if settingsId == nil or type(ctx.matchedSettingsInstancesByService) ~= "table" then
+		return nil
+	end
+	local serviceMatches = ctx.matchedSettingsInstancesByService[serviceName]
+	if type(serviceMatches) ~= "table" then
+		return nil
+	end
+	local instance = liveInstance(serviceMatches[settingsId])
+	if instance == nil then
+		serviceMatches[settingsId] = nil
+	end
+	return instance
+end
+
+local function rememberMatchedSettingsInstance(
+	serviceName: string,
+	rawSettingsId: any,
+	instance: Instance,
+	ctx: { [string]: any }
+)
+	local settingsId = settingsIdText(rawSettingsId)
+	if settingsId == nil or liveInstance(instance) == nil then
+		return
+	end
+	if type(ctx.matchedSettingsInstancesByService) ~= "table" then
+		ctx.matchedSettingsInstancesByService = {}
+	end
+	local serviceMatches = ctx.matchedSettingsInstancesByService[serviceName]
+	if type(serviceMatches) ~= "table" then
+		serviceMatches = {}
+		ctx.matchedSettingsInstancesByService[serviceName] = serviceMatches
+	end
+	serviceMatches[settingsId] = instance
+	if type(ctx.settingsIdLookupByService) == "table" then
+		local cached = ctx.settingsIdLookupByService[serviceName]
+		if type(cached) == "table" and type(cached.lookup) == "table" then
+			cached.lookup[settingsId] = instance
+		end
+	end
+end
+
+local function clearMatchedSettingsInstances(serviceName: string, ctx: { [string]: any })
+	if type(ctx.matchedSettingsInstancesByService) == "table" then
+		ctx.matchedSettingsInstancesByService[serviceName] = nil
+	end
+	if type(ctx.settingsIdLookupByService) == "table" then
+		ctx.settingsIdLookupByService[serviceName] = nil
+	end
 end
 
 local function getStateForService(serviceName: string, ctx: { [string]: any }): any
@@ -288,35 +349,42 @@ local function settingsIdLookupForService(serviceName: string, ctx: { [string]: 
 		return cached.lookup, cached.state
 	end
 
-	local state = getStateForService(serviceName, ctx)
-	if state == nil or type(state.instances) ~= "table" then
-		ctx.settingsIdLookupByService[serviceName] = {
-			lookup = {},
-			state = state,
-		}
-		return ctx.settingsIdLookupByService[serviceName].lookup, state
-	end
-
 	local lookup = {}
-	local identityModule = ctx.identityModule
-	for index, candidate in ipairs(state.instances) do
-		local instance = liveInstance(candidate)
-		if instance ~= nil then
-			lookup[tostring(index)] = instance
-			lookup[string.format("%x", index)] = instance
-			if type(state.instanceIdByInstance) == "table" then
-				local instanceId = state.instanceIdByInstance[instance]
-				if type(instanceId) == "number" and instanceId >= 1 then
-					lookup[tostring(instanceId)] = instance
-					lookup[string.format("%x", instanceId)] = instance
-				elseif type(instanceId) == "string" and instanceId ~= "" then
-					lookup[instanceId] = instance
+	local state = getStateForService(serviceName, ctx)
+	if state ~= nil and type(state.instances) == "table" then
+		local identityModule = ctx.identityModule
+		for index, candidate in ipairs(state.instances) do
+			local instance = liveInstance(candidate)
+			if instance ~= nil then
+				lookup[tostring(index)] = instance
+				lookup[string.format("%x", index)] = instance
+				if type(state.instanceIdByInstance) == "table" then
+					local instanceId = state.instanceIdByInstance[instance]
+					if type(instanceId) == "number" and instanceId >= 1 then
+						lookup[tostring(instanceId)] = instance
+						lookup[string.format("%x", instanceId)] = instance
+					elseif type(instanceId) == "string" and instanceId ~= "" then
+						lookup[instanceId] = instance
+					end
+				end
+				if type(identityModule) == "table" and type(identityModule.getCachedDebugId) == "function" then
+					local okDebug, debugId = pcall(identityModule.getCachedDebugId, state, instance)
+					if okDebug and type(debugId) == "string" and debugId ~= "" then
+						lookup["debug:" .. debugId] = instance
+					end
 				end
 			end
-			if type(identityModule) == "table" and type(identityModule.getCachedDebugId) == "function" then
-				local okDebug, debugId = pcall(identityModule.getCachedDebugId, state, instance)
-				if okDebug and type(debugId) == "string" and debugId ~= "" then
-					lookup["debug:" .. debugId] = instance
+		end
+	end
+	if type(ctx.matchedSettingsInstancesByService) == "table" then
+		local serviceMatches = ctx.matchedSettingsInstancesByService[serviceName]
+		if type(serviceMatches) == "table" then
+			for settingsId, candidate in pairs(serviceMatches) do
+				local instance = liveInstance(candidate)
+				if instance ~= nil then
+					lookup[settingsId] = instance
+				else
+					serviceMatches[settingsId] = nil
 				end
 			end
 		end
@@ -357,7 +425,7 @@ local function instanceMatchesExpectedClass(instance: Instance, expectedClassNam
 	return className == "" or instance.ClassName == className
 end
 
-local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }): Instance?
+local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }, allowClassMismatch: boolean?): Instance?
 	local serviceName = tostring(change.service or "")
 	local pathSegments = change.pathSegments
 	if type(pathSegments) == "table" and #pathSegments > 0 then
@@ -370,20 +438,32 @@ local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }
 				return service
 			end
 		end
-		local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
-		if instance ~= nil and instanceMatchesExpectedClass(instance, change.className) then
-			return instance
-		end
+	end
+	local persistent = matchedSettingsInstance(serviceName, change.settingsId, ctx)
+	if
+		persistent ~= nil
+		and (allowClassMismatch == true or instanceMatchesExpectedClass(persistent, change.className))
+	then
+		return persistent
+	end
+	local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
+	if
+		instance ~= nil
+		and strongSettingsId(change.settingsId)
+		and (allowClassMismatch == true or instanceMatchesExpectedClass(instance, change.className))
+	then
+		return instance
+	end
+	if type(pathSegments) == "table" and #pathSegments > 0 then
 		local pathInstance = resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
-		if pathInstance ~= nil and instanceMatchesExpectedClass(pathInstance, change.className) then
+		if pathInstance ~= nil and (allowClassMismatch == true or instanceMatchesExpectedClass(pathInstance, change.className)) then
 			return pathInstance
 		end
 	end
-	local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
-	if instance ~= nil and not instanceMatchesExpectedClass(instance, change.className) then
-		instance = nil
-	end
-	if instance ~= nil then
+	if
+		instance ~= nil
+		and (allowClassMismatch == true or instanceMatchesExpectedClass(instance, change.className))
+	then
 		return instance
 	end
 	return nil
@@ -430,18 +510,6 @@ local function resolveEntryParent(entry: { [string]: any }, resolvedEntries: { [
 		end
 	end
 	return resolvePathSegments(parentPathSegments(entry.pathSegments), nil, parentPathOrdinals(entry.pathOrdinals))
-end
-
-local function resolveEntryInstance(entry: { [string]: any }, serviceName: string, ctx: { [string]: any }): Instance?
-	local pathInstance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
-	if pathInstance ~= nil and instanceMatchesExpectedClass(pathInstance, entry.className) then
-		return pathInstance
-	end
-	local instance = resolveInstanceBySettingsId(serviceName, entry.settingsId, ctx)
-	if instance ~= nil then
-		return instance
-	end
-	return pathInstance
 end
 
 local function syncEntryPlacement(entry: { [string]: any }, instance: Instance, stats: { [string]: any }, resolvedEntries: { [string]: any }?)
@@ -508,6 +576,7 @@ local function rememberReplacementIdentity(
 	replacement: Instance,
 	ctx: { [string]: any }
 )
+	rememberMatchedSettingsInstance(serviceName, rawSettingsId, replacement, ctx)
 	local state = getStateForService(serviceName, ctx)
 	if state == nil then
 		return
@@ -573,6 +642,7 @@ end
 local function recordDesiredStableEntry(
 	entry: { [string]: any },
 	serviceName: string,
+	instance: Instance?,
 	ctx: { [string]: any },
 	desiredSettingsIds: { [string]: boolean },
 	desiredStableKeys: { [string]: boolean }
@@ -581,7 +651,6 @@ local function recordDesiredStableEntry(
 	if settingsId == nil then
 		return
 	end
-	local instance = resolveInstanceBySettingsId(serviceName, settingsId, ctx)
 	if instance == nil then
 		return
 	end
@@ -796,19 +865,29 @@ local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boole
 end
 
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
+	local targetServiceName = serviceName
+	if type(raw.pathSegments) == "table" and #raw.pathSegments > 0 then
+		targetServiceName = tostring(raw.pathSegments[1])
+	end
+	local settingsInstance: Instance? = nil
+	if type(ctx) == "table" and type(targetServiceName) == "string" and targetServiceName ~= "" then
+		local settingsId = raw.settingsId or raw.instanceId
+		local persistent = matchedSettingsInstance(targetServiceName, settingsId, ctx)
+		if persistent ~= nil then
+			return persistent
+		end
+		settingsInstance = resolveInstanceBySettingsId(targetServiceName, settingsId, ctx)
+		if settingsInstance ~= nil and strongSettingsId(settingsId) then
+			return settingsInstance
+		end
+	end
 	if type(raw.pathSegments) == "table" then
 		local instance = resolvePathSegments(raw.pathSegments, nil, raw.pathOrdinals)
 		if instance ~= nil then
 			return instance
 		end
 	end
-	if type(ctx) == "table" and type(serviceName) == "string" and serviceName ~= "" then
-		local instance = resolveInstanceBySettingsId(serviceName, raw.settingsId or raw.instanceId, ctx)
-		if instance ~= nil then
-			return instance
-		end
-	end
-	return nil
+	return settingsInstance
 end
 
 local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?, serviceName: string?): (boolean, any)
@@ -1042,38 +1121,7 @@ local function decodePropertyValue(instance: Instance, propertyName: string, raw
 	return decodeValue(rawValue, enumHintForProperty(instance, propertyName), ctx, serviceName)
 end
 
-local valuesEqual
-
-local function tableValuesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: any }): boolean
-	if seen[a] == b then
-		return true
-	end
-	seen[a] = b
-	for key, value in pairs(a) do
-		if not valuesEqual(value, b[key], seen) then
-			return false
-		end
-	end
-	for key in pairs(b) do
-		if a[key] == nil then
-			return false
-		end
-	end
-	return true
-end
-
-valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
-	if a == b then
-		return true
-	end
-	if type(a) == "number" and type(b) == "number" and a ~= a and b ~= b then
-		return true
-	end
-	if type(a) == "table" and type(b) == "table" then
-		return tableValuesEqual(a, b, seen or {})
-	end
-	return false
-end
+local valuesEqual = BridgeValueEquality.valuesEqual
 
 BridgeEditorSync.decodeValue = decodeValue
 BridgeEditorSync.valuesEqual = valuesEqual
@@ -1130,6 +1178,127 @@ local function readProperty(instance: Instance, propertyName: string): (boolean,
 	return pcall(function()
 		return (instance :: any)[propertyName]
 	end)
+end
+
+local function candidateBucketsForParent(parent: Instance, ctx: { [string]: any }): { [string]: any }
+	if type(ctx.matchCandidateBuckets) ~= "table" then
+		ctx.matchCandidateBuckets = {}
+	end
+	local cached = ctx.matchCandidateBuckets[parent]
+	if type(cached) == "table" then
+		return cached
+	end
+	local buckets = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		local okRead, name, className = pcall(function()
+			return child.Name, child.ClassName
+		end)
+		if okRead then
+			local byClass = buckets[name]
+			if byClass == nil then
+				byClass = {}
+				buckets[name] = byClass
+			end
+			local candidates = byClass[className]
+			if candidates == nil then
+				candidates = {}
+				byClass[className] = candidates
+			end
+			candidates[#candidates + 1] = child
+		end
+	end
+	ctx.matchCandidateBuckets[parent] = buckets
+	return buckets
+end
+
+local function rememberEntryResolution(
+	entry: { [string]: any },
+	serviceName: string,
+	instance: Instance,
+	claimedInstances: { [Instance]: boolean },
+	ctx: { [string]: any }
+)
+	claimedInstances[instance] = true
+	if entry.ambiguousSiblings == true then
+		rememberMatchedSettingsInstance(serviceName, entry.settingsId, instance, ctx)
+	end
+end
+
+local function resolveEntryInstance(
+	entry: { [string]: any },
+	serviceName: string,
+	ctx: { [string]: any },
+	resolvedEntries: { [string]: any },
+	claimedInstances: { [Instance]: boolean }
+): Instance?
+	local persistent = matchedSettingsInstance(serviceName, entry.settingsId, ctx)
+	if persistent ~= nil and claimedInstances[persistent] ~= true then
+		return persistent
+	end
+
+	local settingsInstance = resolveInstanceBySettingsId(serviceName, entry.settingsId, ctx)
+	if
+		settingsInstance ~= nil
+		and claimedInstances[settingsInstance] ~= true
+		and strongSettingsId(entry.settingsId)
+	then
+		return settingsInstance
+	end
+
+	local pathInstance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+	if entry.ambiguousSiblings ~= true then
+		if pathInstance ~= nil and claimedInstances[pathInstance] ~= true then
+			return pathInstance
+		end
+		if settingsInstance ~= nil and claimedInstances[settingsInstance] ~= true then
+			return settingsInstance
+		end
+		return nil
+	end
+
+	local parent = resolveEntryParent(entry, resolvedEntries)
+	local expectedName = tostring(entry.pathSegments[#entry.pathSegments] or "")
+	local candidates = {}
+	local included = {}
+	local function include(candidate: Instance?)
+		if candidate == nil or claimedInstances[candidate] == true or included[candidate] == true then
+			return
+		end
+		if parent ~= nil and candidate.Parent ~= parent then
+			return
+		end
+		included[candidate] = true
+		candidates[#candidates + 1] = candidate
+	end
+	include(pathInstance)
+	if parent ~= nil then
+		local byClass = candidateBucketsForParent(parent, ctx)[expectedName]
+		local bucket = byClass and byClass[entry.className]
+		if type(bucket) == "table" then
+			for _, candidate in ipairs(bucket) do
+				include(candidate)
+			end
+		end
+	end
+	include(settingsInstance)
+
+	return BridgeCandidateMatch.choose(
+		candidates,
+		entry.matchProperties,
+		entry.matchAttributes,
+		function(candidate, propertyName, rawValue)
+			if not classHasProperty(candidate, propertyName) then
+				return false
+			end
+			local okRead, current = readProperty(candidate, propertyName)
+			local okDecode, decoded = decodePropertyValue(candidate, propertyName, rawValue, ctx, serviceName)
+			return okRead and okDecode and valuesEqual(current, decoded)
+		end,
+		function(candidate, attributeName, rawValue)
+			local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
+			return okDecode and valuesEqual(candidate:GetAttribute(attributeName), decoded)
+		end
+	)
 end
 
 local function writeProperty(instance: Instance, propertyName: string, value: any): (boolean, any)
@@ -1268,61 +1437,47 @@ local function replaceInstanceClass(
 		return instance
 	end
 
-	local parent = instance.Parent
-	if parent == nil then
-		error("Cannot replace service root class for " .. instance:GetFullName())
-	end
-	local okCreate, replacement = pcall(Instance.new, className)
-	if not okCreate or replacement == nil then
-		error("Cannot create replacement " .. className .. " for " .. instance:GetFullName() .. ": " .. tostring(replacement))
-	end
-	replacement.Name = instance.Name
-	local okAttributes, attributes = pcall(function()
-		return instance:GetAttributes()
-	end)
-	if okAttributes and type(attributes) == "table" then
-		for attributeName, attributeValue in pairs(attributes) do
-			pcall(function()
-				replacement:SetAttribute(attributeName, attributeValue)
-			end)
-		end
-	end
-	for _, tag in ipairs(CollectionService:GetTags(instance)) do
-		pcall(function()
-			CollectionService:AddTag(replacement, tag)
-		end)
-	end
-	local movedChildren = {}
-	local okSwap, swapErr = pcall(function()
-		replacement.Parent = parent
-		for _, child in ipairs(instance:GetChildren()) do
-			child.Parent = replacement
-			movedChildren[#movedChildren + 1] = child
-		end
-		removeInstanceForUndo(instance)
-	end)
-	if not okSwap then
-		for i = #movedChildren, 1, -1 do
-			pcall(function()
-				movedChildren[i].Parent = instance
-			end)
-		end
-		pcall(function()
-			instance.Parent = parent
-		end)
-		pcall(function()
-			replacement:Destroy()
-		end)
-		error(
-			"Cannot replace " .. instance:GetFullName() .. " with " .. className .. ": " .. tostring(swapErr),
-			0
-		)
-	end
+	local replacement = BridgeInstanceSwap.replace(instance, className, CollectionService, removeInstanceForUndo)
 	if selectionReplacements ~= nil then
 		selectionReplacements[instance] = replacement
 	end
 	stats.instanceReplaced += 1
 	return replacement
+end
+
+local function retargetReplacementReferences(
+	replacements: { [Instance]: Instance },
+	ctx: { [string]: any },
+	stats: { [string]: any }
+)
+	if next(replacements) == nil or RbxDomModule == nil or RbxDomModule.getReferencePropertyNames == nil then
+		return
+	end
+	local roots = {}
+	for serviceName, allowed in pairs(ctx.allowedServices) do
+		if allowed == true then
+			local okService, service = pcall(game.GetService, game, serviceName)
+			if okService and service ~= nil then
+				roots[#roots + 1] = service
+			end
+		end
+	end
+	local okRetarget, updated, failed = pcall(
+		BridgeReferenceRetarget.apply,
+		roots,
+		replacements,
+		RbxDomModule.getReferencePropertyNames,
+		readProperty,
+		writeProperty
+	)
+	if not okRetarget then
+		warn("[Renium] could not retarget references after class replacement: " .. tostring(updated))
+		return
+	end
+	stats.propertyUpdated += updated
+	if failed > 0 then
+		warn("[Renium] could not retarget " .. tostring(failed) .. " references after class replacement")
+	end
 end
 
 local function findScriptDocument(instance: Instance): any?
@@ -1519,7 +1674,7 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		error("Editor source mutation exceeds safe size limit")
 	end
 
-	local instance = resolveInstance(change, ctx)
+	local instance = resolveInstance(change, ctx, true)
 	if instance ~= nil then
 		assertInstanceInService(instance, service)
 	end
@@ -1572,7 +1727,9 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 	end
 
 	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] == true then
+		local oldInstance = instance
 		instance = replaceInstanceClass(instance, tostring(change.className), stats, ctx.selectionReplacements)
+		rememberReplacementIdentity(serviceName, change.settingsId, oldInstance, instance, ctx)
 		if type(ctx.resolveCache) == "table" then
 			ctx.resolveCache[pathCacheKey(change.pathSegments, change.pathOrdinals)] = instance
 		end
@@ -1606,6 +1763,7 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 	if tostring(change.mode or "reconcileService") ~= "reconcileService" then
 		error("Unsupported instance sync mode: " .. tostring(change.mode))
 	end
+	clearMatchedSettingsInstances(serviceName, ctx)
 
 	local rawInstances = change.instances
 	if type(rawInstances) ~= "table" then
@@ -1636,9 +1794,11 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 					key = pathCacheKey(pathSegments, raw.pathOrdinals),
 					className = className,
 					settingsId = settingsIdText(raw.settingsId),
+					ambiguousSiblings = raw.ambiguousSiblings == true,
+					matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
+					matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
 				}
 				desiredKeys[entry.key] = true
-				recordDesiredStableEntry(entry, service.Name, ctx, desiredSettingsIds, desiredStableKeys)
 				table.insert(desiredEntries, entry)
 			end
 		end
@@ -1652,35 +1812,40 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 	end)
 
 	local resolvedEntries = {}
+	local claimedInstances = {}
 	for _, entry in ipairs(desiredEntries) do
 		if #entry.pathSegments > 1 then
-			local instance = resolveEntryInstance(entry, service.Name, ctx)
 			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
 				stats.noops += 1
-			elseif instance == nil then
-				local parent = resolveEntryParent(entry, resolvedEntries)
-				if parent == nil then
-					error("Cannot create instance; parent path was not found: " .. entry.key)
-				end
-				local okCreate, created = pcall(Instance.new, entry.className)
-				if not okCreate or created == nil then
-					error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
-				end
-				created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-				created.Parent = parent
-				if created:IsA("MeshPart") then
-					recentlyCreatedMeshPartKeys[entry.key] = true
-				end
-				resolvedEntries[entry.key] = created
-				stats.instanceCreated += 1
 			else
-				syncEntryPlacement(entry, instance, stats, resolvedEntries)
-				if instance.ClassName ~= entry.className then
-					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
-					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+				local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
+				if instance == nil then
+					local parent = resolveEntryParent(entry, resolvedEntries)
+					if parent == nil then
+						error("Cannot create instance; parent path was not found: " .. entry.key)
+					end
+					local okCreate, created = pcall(Instance.new, entry.className)
+					if not okCreate or created == nil then
+						error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
+					end
+					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
+					created.Parent = parent
+					if created:IsA("MeshPart") then
+						recentlyCreatedMeshPartKeys[entry.key] = true
+					end
+					instance = created
+					stats.instanceCreated += 1
+				else
+					syncEntryPlacement(entry, instance, stats, resolvedEntries)
+					if instance.ClassName ~= entry.className then
+						local oldInstance = instance
+						instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
+						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+					end
 				end
 				resolvedEntries[entry.key] = instance
+				rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
+				recordDesiredStableEntry(entry, service.Name, instance, ctx, desiredSettingsIds, desiredStableKeys)
 			end
 		end
 	end
@@ -1729,6 +1894,9 @@ local function sortedInstanceEntries(change: { [string]: any }, serviceName: str
 						key = pathCacheKey(pathSegments, raw.pathOrdinals),
 						className = className,
 						settingsId = settingsIdText(raw.settingsId),
+						ambiguousSiblings = raw.ambiguousSiblings == true,
+						matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
+						matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
 					})
 				end
 			end
@@ -1764,10 +1932,12 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 			desiredSettingsIds = {},
 			desiredStableKeys = {},
 			resolvedEntries = {},
+			claimedInstances = {},
 			failed = false,
 			entryCount = 0,
 			updatedAt = os.clock(),
 		}
+		clearMatchedSettingsInstances(serviceName, ctx)
 	elseif reconcileSessions[sessionKey] == nil then
 		error("Editor reconcile session was not found or expired; restart the reconcile")
 	end
@@ -1797,35 +1967,46 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 	session.entryCount += newEntries
 	for _, entry in ipairs(entries) do
 		session.desiredKeys[entry.key] = true
-		recordDesiredStableEntry(entry, service.Name, ctx, session.desiredSettingsIds, session.desiredStableKeys)
 		if #entry.pathSegments > 1 then
-			local instance = resolveEntryInstance(entry, service.Name, ctx)
 			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
 				stats.noops += 1
-			elseif instance == nil then
-				local parent = resolveEntryParent(entry, session.resolvedEntries)
-				if parent == nil then
-					error("Cannot create instance; parent path was not found: " .. entry.key)
-				end
-				local okCreate, created = pcall(Instance.new, entry.className)
-				if not okCreate or created == nil then
-					error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
-				end
-				created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-				created.Parent = parent
-				if created:IsA("MeshPart") then
-					recentlyCreatedMeshPartKeys[entry.key] = true
-				end
-				session.resolvedEntries[entry.key] = created
-				stats.instanceCreated += 1
 			else
-				syncEntryPlacement(entry, instance, stats, session.resolvedEntries)
-				if instance.ClassName ~= entry.className then
-					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
-					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+				local instance =
+					resolveEntryInstance(entry, service.Name, ctx, session.resolvedEntries, session.claimedInstances)
+				if instance == nil then
+					local parent = resolveEntryParent(entry, session.resolvedEntries)
+					if parent == nil then
+						error("Cannot create instance; parent path was not found: " .. entry.key)
+					end
+					local okCreate, created = pcall(Instance.new, entry.className)
+					if not okCreate or created == nil then
+						error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
+					end
+					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
+					created.Parent = parent
+					if created:IsA("MeshPart") then
+						recentlyCreatedMeshPartKeys[entry.key] = true
+					end
+					instance = created
+					stats.instanceCreated += 1
+				else
+					syncEntryPlacement(entry, instance, stats, session.resolvedEntries)
+					if instance.ClassName ~= entry.className then
+						local oldInstance = instance
+						instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
+						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+					end
 				end
 				session.resolvedEntries[entry.key] = instance
+				rememberEntryResolution(entry, service.Name, instance, session.claimedInstances, ctx)
+				recordDesiredStableEntry(
+					entry,
+					service.Name,
+					instance,
+					ctx,
+					session.desiredSettingsIds,
+					session.desiredStableKeys
+				)
 			end
 		end
 	end
@@ -1859,37 +2040,43 @@ local function applyInstanceUpserts(change: { [string]: any }, ctx: { [string]: 
 	local beforeCreated = stats.instanceCreated
 	local beforeReplaced = stats.instanceReplaced
 	local resolvedEntries = {}
+	local claimedInstances = {}
 	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
 		if #entry.pathSegments > 1 then
-			local instance = resolveEntryInstance(entry, service.Name, ctx)
 			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
 				stats.noops += 1
-			elseif instance == nil and not liveHydrateEnabled(ctx) then
-				stats.noops += 1
-			elseif instance == nil then
-				local parent = resolveEntryParent(entry, resolvedEntries)
-				if parent == nil then
-					error("Cannot create instance; parent path was not found: " .. entry.key)
-				end
-				local okCreate, created = pcall(Instance.new, entry.className)
-				if not okCreate or created == nil then
-					error("Cannot create instance " .. entry.key .. ": " .. tostring(created))
-				end
-				created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-				created.Parent = parent
-				if created:IsA("MeshPart") then
-					recentlyCreatedMeshPartKeys[entry.key] = true
-				end
-				resolvedEntries[entry.key] = created
-				stats.instanceCreated += 1
 			else
-				syncEntryPlacement(entry, instance, stats, resolvedEntries)
-				if instance.ClassName ~= entry.className then
-					local oldInstance = instance
-					instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
-					rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+				local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
+				if instance == nil and not liveHydrateEnabled(ctx) then
+					stats.noops += 1
+				elseif instance == nil then
+					local parent = resolveEntryParent(entry, resolvedEntries)
+					if parent == nil then
+						error("Cannot create instance; parent path was not found: " .. entry.key)
+					end
+					local okCreate, created = pcall(Instance.new, entry.className)
+					if not okCreate or created == nil then
+						error("Cannot create instance " .. entry.key .. ": " .. tostring(created))
+					end
+					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
+					created.Parent = parent
+					if created:IsA("MeshPart") then
+						recentlyCreatedMeshPartKeys[entry.key] = true
+					end
+					instance = created
+					stats.instanceCreated += 1
+				else
+					syncEntryPlacement(entry, instance, stats, resolvedEntries)
+					if instance.ClassName ~= entry.className then
+						local oldInstance = instance
+						instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements)
+						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
+					end
 				end
-				resolvedEntries[entry.key] = instance
+				if instance ~= nil then
+					resolvedEntries[entry.key] = instance
+					rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
+				end
 			end
 		end
 	end
@@ -1910,9 +2097,12 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
-		local instance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+		local instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
+		if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
+			instance = nil
+		end
 		if instance == nil then
-			instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
+			instance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
 			if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
 				instance = nil
 			end
@@ -2491,11 +2681,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local started = os.clock()
 		local previousResolveCache = ctx.resolveCache
 		local previousSettingsIdLookupByService = ctx.settingsIdLookupByService
+		local previousMatchCandidateBuckets = ctx.matchCandidateBuckets
 		local previousSelectionReplacements = ctx.selectionReplacements
 		local explorerSelection = captureExplorerSelection()
 		local selectionReplacements = {}
 		ctx.resolveCache = {}
 		ctx.settingsIdLookupByService = {}
+		ctx.matchCandidateBuckets = {}
 		ctx.selectionReplacements = selectionReplacements
 		local historyRecording = beginHistoryRecording("Sync from filesystem")
 		local stats = {
@@ -2568,6 +2760,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 		end
+		if not aborted then
+			retargetReplacementReferences(selectionReplacements, ctx, stats)
+		end
 
 		local propertyChanges = params.propertyChanges
 		if not aborted and type(propertyChanges) == "table" then
@@ -2595,6 +2790,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		ctx.resolveCache = previousResolveCache
 		ctx.settingsIdLookupByService = previousSettingsIdLookupByService
+		ctx.matchCandidateBuckets = previousMatchCandidateBuckets
 		ctx.selectionReplacements = previousSelectionReplacements
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
@@ -2620,6 +2816,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		table.clear(reconcileSessions)
 		table.clear(binaryImports)
 		table.clear(binaryExports)
+		if type(ctx.matchedSettingsInstancesByService) == "table" then
+			table.clear(ctx.matchedSettingsInstancesByService)
+		end
 	end
 
 	return api

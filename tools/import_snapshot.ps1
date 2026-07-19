@@ -56,6 +56,15 @@ if (-not (Test-Path -LiteralPath $SnapshotDir)) {
 
 $srcRoot = Join-Path $ProjectRoot "src"
 New-Item -ItemType Directory -Force -Path $srcRoot | Out-Null
+$projectRootFullPath = [System.IO.Path]::GetFullPath($ProjectRoot)
+$trimmedProjectRoot = $projectRootFullPath.TrimEnd([char[]]@(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+))
+$projectName = [System.IO.Path]::GetFileName($trimmedProjectRoot)
+if ([string]::IsNullOrWhiteSpace($projectName)) {
+    $projectName = "ReniumProject"
+}
 
 function Sanitize-Name {
     param([string]$Name)
@@ -1020,7 +1029,7 @@ if (-not $NoProjectWrite) {
     }
 
     $project = [ordered]@{
-        name = "projest"
+        name = $projectName
         tree = $tree
     }
 

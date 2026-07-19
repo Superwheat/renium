@@ -137,7 +137,6 @@ before Marketplace publication.
 ## Key settings
 
 - `renium.exportCliPath`
-- `renium.editorSyncCliPath`
 - `renium.rustCliPath` (path to `renium.exe`)
 - `renium.projectRoot` (default: `${workspaceFolder}`)
 - `renium.transport` (`ws` or `mcp`)

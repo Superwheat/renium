@@ -2583,7 +2583,7 @@ struct EditorPropertyChange {
     allow_protected_mesh_id_apply: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 struct EditorInstanceDescriptor {
     #[serde(rename = "settingsId")]
     settings_id: String,
@@ -2593,6 +2593,24 @@ struct EditorInstanceDescriptor {
     path_ordinals: Vec<usize>,
     #[serde(rename = "className")]
     class_name: String,
+    #[serde(
+        rename = "ambiguousSiblings",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    ambiguous_siblings: bool,
+    #[serde(
+        rename = "matchProperties",
+        default,
+        skip_serializing_if = "Map::is_empty"
+    )]
+    match_properties: Map<String, Value>,
+    #[serde(
+        rename = "matchAttributes",
+        default,
+        skip_serializing_if = "Map::is_empty"
+    )]
+    match_attributes: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8278,6 +8296,7 @@ fn collect_direct_editor_delete_change(args: ApplyEditorDeleteArgs) -> Result<Ed
             path_segments,
             path_ordinals,
             class_name: args.class_name,
+            ..EditorInstanceDescriptor::default()
         }],
     });
     Ok(changes)
@@ -8572,16 +8591,19 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
                     });
                     document.instances[index].class_name = "Folder".to_string();
                     dirty_services.insert(service.clone());
+                    settings_changed_services.insert(service.clone());
+                    let descriptor = editor_instance_descriptor_for_known_path(
+                        document,
+                        index,
+                        target.path_segments.clone(),
+                        target.path_ordinals.clone(),
+                    )
+                    .context("Failed to describe the replaced source instance")?;
                     changes.instance_changes.push(EditorInstanceChange {
                         mode: "replaceInstances".to_string(),
                         service: service.clone(),
                         allow_deletes: false,
-                        instances: vec![EditorInstanceDescriptor {
-                            settings_id: settings_id.to_string(),
-                            path_segments: target.path_segments.clone(),
-                            path_ordinals: target.path_ordinals.clone(),
-                            class_name: "Folder".to_string(),
-                        }],
+                        instances: vec![descriptor],
                     });
                     source_maps.remove(&service);
                 }
@@ -8989,8 +9011,8 @@ fn ensure_editor_source_target_in_bytecode(
     spec: &EditorSourcePathSpec,
 ) -> Result<EditorSourceEnsureResult> {
     let mut changed = false;
-    let mut upsert_instances = Vec::new();
-    let mut replace_instances = Vec::new();
+    let mut upsert_instance_paths = Vec::new();
+    let mut replace_instance_paths = Vec::new();
     let mut target_class_replaced = false;
     let root_index = if let Some(index) = editor_service_root_index(document, &spec.service) {
         index
@@ -9022,12 +9044,11 @@ fn ensure_editor_source_target_in_bytecode(
             current_index = child_index;
             path_segments.push(document.instances[current_index].name.clone());
             path_ordinals.push(child_ordinal);
-            upsert_instances.push(EditorInstanceDescriptor {
-                settings_id: document.instances[current_index].settings_id.clone(),
-                path_segments: path_segments.clone(),
-                path_ordinals: path_ordinals.clone(),
-                class_name: document.instances[current_index].class_name.clone(),
-            });
+            upsert_instance_paths.push((
+                current_index,
+                path_segments.clone(),
+                path_ordinals.clone(),
+            ));
             continue;
         }
 
@@ -9053,12 +9074,7 @@ fn ensure_editor_source_target_in_bytecode(
         ));
         changed = true;
 
-        upsert_instances.push(EditorInstanceDescriptor {
-            settings_id: document.instances[current_index].settings_id.clone(),
-            path_segments: path_segments.clone(),
-            path_ordinals: path_ordinals.clone(),
-            class_name: document.instances[current_index].class_name.clone(),
-        });
+        upsert_instance_paths.push((current_index, path_segments.clone(), path_ordinals.clone()));
     }
 
     let target_index = if let Some(child_index) =
@@ -9118,17 +9134,38 @@ fn ensure_editor_source_target_in_bytecode(
         path_ordinals: path_ordinals.clone(),
         class_name: document.instances[target_index].class_name.clone(),
     };
-    let target_descriptor = EditorInstanceDescriptor {
-        settings_id: document.instances[target_index].settings_id.clone(),
-        path_segments: path_segments.clone(),
-        path_ordinals: path_ordinals.clone(),
-        class_name: document.instances[target_index].class_name.clone(),
-    };
     if target_class_replaced {
-        replace_instances.push(target_descriptor);
+        replace_instance_paths.push((target_index, path_segments.clone(), path_ordinals.clone()));
     } else {
-        upsert_instances.push(target_descriptor);
+        upsert_instance_paths.push((target_index, path_segments.clone(), path_ordinals.clone()));
     }
+    let sibling_counts = editor_sibling_group_counts(document);
+    let upsert_instances = upsert_instance_paths
+        .into_iter()
+        .map(|(index, segments, ordinals)| {
+            editor_instance_descriptor_from_path(
+                document,
+                index,
+                segments,
+                ordinals,
+                &sibling_counts,
+            )
+            .context("Failed to describe a source upsert")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let replace_instances = replace_instance_paths
+        .into_iter()
+        .map(|(index, segments, ordinals)| {
+            editor_instance_descriptor_from_path(
+                document,
+                index,
+                segments,
+                ordinals,
+                &sibling_counts,
+            )
+            .context("Failed to describe a source replacement")
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(EditorSourceEnsureResult {
         target,
         upsert_instances,
@@ -9220,13 +9257,169 @@ fn document_instance_index_by_settings_id(
         .position(|instance| instance.settings_id == settings_id)
 }
 
+const MAX_EDITOR_MATCH_FIELDS: usize = 64;
+const MAX_EDITOR_MATCH_VALUE_BYTES: usize = 256;
+const MAX_EDITOR_MATCH_TOTAL_BYTES: usize = 512;
+const MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE: usize = 32;
+
+type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str, &'a str), usize>;
+
+fn editor_sibling_group_counts(document: &SettingsBytecode) -> EditorSiblingGroupCounts<'_> {
+    let mut counts = HashMap::new();
+    for instance in &document.instances {
+        let Some(parent_index) = instance.parent_index else {
+            continue;
+        };
+        *counts
+            .entry((
+                parent_index,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            ))
+            .or_insert(0) += 1;
+    }
+    counts
+}
+
+fn editor_match_field_priority(attribute: bool, name: &str) -> usize {
+    if attribute {
+        return 0;
+    }
+    if matches!(
+        name,
+        "Value"
+            | "Text"
+            | "CFrame"
+            | "Position"
+            | "Orientation"
+            | "Size"
+            | "Color"
+            | "Transparency"
+            | "Enabled"
+    ) {
+        return 1;
+    }
+    2
+}
+
+fn editor_match_records(
+    instance: &SettingsBytecodeInstance,
+) -> (Map<String, Value>, Map<String, Value>) {
+    let mut candidates = Vec::new();
+    for (attribute, records) in [(false, &instance.properties), (true, &instance.attributes)] {
+        for (name, value) in records {
+            if !attribute
+                && matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "source" | "classname" | "name" | "parent" | "tags" | "meshsize"
+                )
+            {
+                continue;
+            }
+            if settings_value_contains_reference(value) {
+                continue;
+            }
+            let normalized = normalize_editor_bridge_value(value, None, &[], &[]);
+            let Ok(value_bytes) = serde_json::to_vec(&normalized) else {
+                continue;
+            };
+            let encoded_bytes = name.len().saturating_add(value_bytes.len());
+            if encoded_bytes > MAX_EDITOR_MATCH_VALUE_BYTES {
+                continue;
+            }
+            candidates.push((
+                editor_match_field_priority(attribute, name),
+                encoded_bytes,
+                attribute,
+                name.clone(),
+                normalized,
+            ));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let mut properties = Map::new();
+    let mut attributes = Map::new();
+    let mut total_bytes = 0usize;
+    for (_, encoded_bytes, attribute, name, value) in candidates {
+        if properties.len() + attributes.len() >= MAX_EDITOR_MATCH_FIELDS
+            || total_bytes.saturating_add(encoded_bytes) > MAX_EDITOR_MATCH_TOTAL_BYTES
+        {
+            continue;
+        }
+        total_bytes += encoded_bytes;
+        if attribute {
+            attributes.insert(name, value);
+        } else {
+            properties.insert(name, value);
+        }
+    }
+    (properties, attributes)
+}
+
+fn editor_instance_descriptor_from_path(
+    document: &SettingsBytecode,
+    index: usize,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+    sibling_counts: &EditorSiblingGroupCounts<'_>,
+) -> Option<EditorInstanceDescriptor> {
+    let instance = document.instances.get(index)?;
+    let sibling_count = instance.parent_index.map_or(0, |parent_index| {
+        sibling_counts
+            .get(&(
+                parent_index,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            ))
+            .copied()
+            .unwrap_or(0)
+    });
+    let ambiguous_siblings = sibling_count > 1;
+    let (match_properties, match_attributes) =
+        if ambiguous_siblings && sibling_count <= MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE {
+            editor_match_records(instance)
+        } else {
+            (Map::new(), Map::new())
+        };
+    Some(EditorInstanceDescriptor {
+        settings_id: instance.settings_id.clone(),
+        path_segments,
+        path_ordinals,
+        class_name: instance.class_name.clone(),
+        ambiguous_siblings,
+        match_properties,
+        match_attributes,
+    })
+}
+
+fn editor_instance_descriptor_for_known_path(
+    document: &SettingsBytecode,
+    index: usize,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+) -> Option<EditorInstanceDescriptor> {
+    editor_instance_descriptor_from_path(
+        document,
+        index,
+        path_segments,
+        path_ordinals,
+        &editor_sibling_group_counts(document),
+    )
+}
+
 fn editor_instance_descriptor(
     document: &SettingsBytecode,
     paths_by_index: &[Option<EditorInstancePath>],
     service: &str,
     index: usize,
+    sibling_counts: &EditorSiblingGroupCounts<'_>,
 ) -> Option<EditorInstanceDescriptor> {
-    let instance = document.instances.get(index)?;
     let path_info = paths_by_index.get(index)?.clone()?;
     if path_info.path_segments.len() <= 1
         || path_info
@@ -9236,12 +9429,13 @@ fn editor_instance_descriptor(
     {
         return None;
     }
-    Some(EditorInstanceDescriptor {
-        settings_id: instance.settings_id.clone(),
-        path_segments: path_info.path_segments,
-        path_ordinals: path_info.path_ordinals,
-        class_name: instance.class_name.clone(),
-    })
+    editor_instance_descriptor_from_path(
+        document,
+        index,
+        path_info.path_segments,
+        path_info.path_ordinals,
+        sibling_counts,
+    )
 }
 
 fn push_editor_instance_change(
@@ -9278,13 +9472,14 @@ fn append_editor_instance_reconcile(
     service: &str,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
+    let sibling_counts = editor_sibling_group_counts(document);
     let instances = document
         .instances
         .iter()
         .enumerate()
         .filter_map(|(index, instance)| {
             instance.parent_index?;
-            editor_instance_descriptor(document, &paths_by_index, service, index)
+            editor_instance_descriptor(document, &paths_by_index, service, index, &sibling_counts)
         })
         .collect::<Vec<_>>();
     push_editor_instance_change(changes, "reconcileService", service, true, instances);
@@ -9297,6 +9492,7 @@ fn append_editor_target_instance_upserts(
     filter: &EditorPropertyFilter,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
+    let sibling_counts = editor_sibling_group_counts(document);
     let mut selected_indices = HashSet::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
@@ -9320,7 +9516,9 @@ fn append_editor_target_instance_upserts(
 
     let instances = selected_indices
         .into_iter()
-        .filter_map(|index| editor_instance_descriptor(document, &paths_by_index, service, index))
+        .filter_map(|index| {
+            editor_instance_descriptor(document, &paths_by_index, service, index, &sibling_counts)
+        })
         .collect::<Vec<_>>();
     push_editor_instance_change(changes, "upsertInstances", service, false, instances);
 }
@@ -9375,6 +9573,11 @@ fn append_editor_property_changes(
     filter: &EditorPropertyFilter,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
+    let settings_ids_by_index = document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<Vec<_>>();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
             continue;
@@ -9409,7 +9612,12 @@ fn append_editor_property_changes(
                 property_schema_entry(property_schema_by_class, &instance.class_name, name);
             properties.insert(
                 name.clone(),
-                normalize_editor_bridge_value(value, schema_entry, &paths_by_index),
+                normalize_editor_bridge_value(
+                    value,
+                    schema_entry,
+                    &paths_by_index,
+                    &settings_ids_by_index,
+                ),
             );
         }
 
@@ -9418,7 +9626,12 @@ fn append_editor_property_changes(
             for (name, value) in &instance.attributes {
                 attributes.insert(
                     name.clone(),
-                    normalize_editor_bridge_value(value, None, &paths_by_index),
+                    normalize_editor_bridge_value(
+                        value,
+                        None,
+                        &paths_by_index,
+                        &settings_ids_by_index,
+                    ),
                 );
             }
         }
@@ -9545,17 +9758,23 @@ fn normalize_editor_bridge_value(
     value: &Value,
     schema_entry: Option<&PropertySchemaEntry>,
     paths_by_index: &[Option<EditorInstancePath>],
+    settings_ids_by_index: &[&str],
 ) -> Value {
     match value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| normalize_editor_bridge_value(item, None, paths_by_index))
+                .map(|item| {
+                    normalize_editor_bridge_value(item, None, paths_by_index, settings_ids_by_index)
+                })
                 .collect(),
         ),
-        Value::Object(object) => {
-            normalize_editor_bridge_object(object, schema_entry, paths_by_index)
-        }
+        Value::Object(object) => normalize_editor_bridge_object(
+            object,
+            schema_entry,
+            paths_by_index,
+            settings_ids_by_index,
+        ),
         _ => value.clone(),
     }
 }
@@ -9564,12 +9783,13 @@ fn normalize_editor_bridge_object(
     object: &Map<String, Value>,
     schema_entry: Option<&PropertySchemaEntry>,
     paths_by_index: &[Option<EditorInstancePath>],
+    settings_ids_by_index: &[&str],
 ) -> Value {
     if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-        return normalize_editor_ref_value(object, paths_by_index);
+        return normalize_editor_ref_value(object, paths_by_index, settings_ids_by_index);
     }
     if let Some(ref_object) = object.get("Ref").and_then(Value::as_object) {
-        return normalize_editor_ref_value(ref_object, paths_by_index);
+        return normalize_editor_ref_value(ref_object, paths_by_index, settings_ids_by_index);
     }
     if let Some(number) = object.get("BrickColor") {
         let mut out = Map::new();
@@ -9594,7 +9814,7 @@ fn normalize_editor_bridge_object(
     for (key, nested) in object {
         out.insert(
             key.clone(),
-            normalize_editor_bridge_value(nested, None, paths_by_index),
+            normalize_editor_bridge_value(nested, None, paths_by_index, settings_ids_by_index),
         );
     }
     if object.get("_type").and_then(Value::as_str) == Some("EnumItem")
@@ -9609,37 +9829,45 @@ fn normalize_editor_bridge_object(
 fn normalize_editor_ref_value(
     object: &Map<String, Value>,
     paths_by_index: &[Option<EditorInstancePath>],
+    settings_ids_by_index: &[&str],
 ) -> Value {
-    let mut out = Map::with_capacity(object.len() + 2);
+    let mut out = Map::with_capacity(object.len() + 3);
     for (key, nested) in object {
         out.insert(
             key.clone(),
-            normalize_editor_bridge_value(nested, None, paths_by_index),
+            normalize_editor_bridge_value(nested, None, paths_by_index, settings_ids_by_index),
         );
     }
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
     if let Some(instance_index) = object.get("instanceIndex").and_then(Value::as_u64)
         && let Some(zero_index) = instance_index.checked_sub(1).map(|value| value as usize)
-        && let Some(Some(path)) = paths_by_index.get(zero_index)
     {
-        out.insert(
-            "pathSegments".to_string(),
-            Value::Array(
-                path.path_segments
-                    .iter()
-                    .map(|segment| Value::String(segment.clone()))
-                    .collect(),
-            ),
-        );
-        out.insert(
-            "pathOrdinals".to_string(),
-            Value::Array(
-                path.path_ordinals
-                    .iter()
-                    .map(|ordinal| Value::Number(serde_json::Number::from(*ordinal as u64)))
-                    .collect(),
-            ),
-        );
+        if let Some(settings_id) = settings_ids_by_index.get(zero_index) {
+            out.insert(
+                "settingsId".to_string(),
+                Value::String((*settings_id).to_string()),
+            );
+        }
+        if let Some(Some(path)) = paths_by_index.get(zero_index) {
+            out.insert(
+                "pathSegments".to_string(),
+                Value::Array(
+                    path.path_segments
+                        .iter()
+                        .map(|segment| Value::String(segment.clone()))
+                        .collect(),
+                ),
+            );
+            out.insert(
+                "pathOrdinals".to_string(),
+                Value::Array(
+                    path.path_ordinals
+                        .iter()
+                        .map(|ordinal| Value::Number(serde_json::Number::from(*ordinal as u64)))
+                        .collect(),
+                ),
+            );
+        }
     }
     Value::Object(out)
 }
@@ -10559,6 +10787,60 @@ struct NativeSettingsOverlayDocument {
     root_index: usize,
 }
 
+const MAX_NATIVE_MAPPING_CANDIDATES_TO_SCORE: usize = 32;
+
+fn settings_value_contains_reference(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(settings_value_contains_reference),
+        Value::Object(object) => {
+            object.get("_type").and_then(Value::as_str) == Some("Ref")
+                || object.contains_key("Ref")
+                || object.values().any(settings_value_contains_reference)
+        }
+        _ => false,
+    }
+}
+
+fn settings_record_match_score(
+    expected: &Map<String, Value>,
+    native: &Map<String, Value>,
+) -> usize {
+    expected
+        .iter()
+        .filter(|(name, value)| {
+            !settings_value_contains_reference(value)
+                && native
+                    .get(*name)
+                    .is_some_and(|candidate| settings_values_equivalent(value, candidate))
+        })
+        .count()
+}
+
+fn native_settings_candidate_position(
+    candidates: &VecDeque<usize>,
+    document: &SettingsBytecode,
+    native_properties: &Map<String, Value>,
+    native_attributes: &Map<String, Value>,
+) -> usize {
+    if candidates.len() <= 1 || candidates.len() > MAX_NATIVE_MAPPING_CANDIDATES_TO_SCORE {
+        return 0;
+    }
+    let mut best_position = 0;
+    let mut best_score = 0;
+    for (position, index) in candidates.iter().enumerate() {
+        let Some(instance) = document.instances.get(*index) else {
+            continue;
+        };
+        let score = settings_record_match_score(&instance.properties, native_properties)
+            + settings_record_match_score(&instance.attributes, native_attributes);
+        if score > best_score {
+            best_position = position;
+            best_score = score;
+        }
+    }
+    best_position
+}
+
 fn map_native_children_to_settings(
     dom: &RbxWeakDom,
     native_children: &[RbxRef],
@@ -10567,6 +10849,33 @@ fn map_native_children_to_settings(
     settings_parent: usize,
     service: &str,
     targets: &mut HashMap<RbxRef, (String, usize)>,
+) -> Result<()> {
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    map_native_children_to_settings_inner(
+        dom,
+        native_children,
+        document,
+        settings_children,
+        settings_parent,
+        service,
+        targets,
+        database,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native hierarchy mapping carries explicit document and reflection state"
+)]
+fn map_native_children_to_settings_inner(
+    dom: &RbxWeakDom,
+    native_children: &[RbxRef],
+    document: &SettingsBytecode,
+    settings_children: &[Vec<usize>],
+    settings_parent: usize,
+    service: &str,
+    targets: &mut HashMap<RbxRef, (String, usize)>,
+    database: &ReflectionDatabase<'_>,
 ) -> Result<()> {
     let mut candidates = HashMap::<(String, String), VecDeque<usize>>::new();
     for index in settings_children
@@ -10586,17 +10895,33 @@ fn map_native_children_to_settings(
             .get_by_ref(*referent)
             .context("Native Studio export contains a missing instance")?;
         let key = (native.name.clone(), native.class.to_string());
-        let index = candidates
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front)
-            .with_context(|| {
-                format!(
-                    "Native Studio export does not match {service}: missing {} {}",
-                    native.class, native.name
-                )
-            })?;
+        let queue = candidates.get_mut(&key).with_context(|| {
+            format!(
+                "Native Studio export does not match {service}: missing {} {}",
+                native.class, native.name
+            )
+        })?;
+        let position = if queue.len() <= 1 || queue.len() > MAX_NATIVE_MAPPING_CANDIDATES_TO_SCORE {
+            0
+        } else {
+            let refs = BytecodeModelImportRefs {
+                new_index_by_ref: HashMap::new(),
+                settings_id_by_ref: HashMap::new(),
+                path_segments_by_index: Vec::new(),
+                path_segments_by_ref: HashMap::new(),
+            };
+            let (properties, attributes, _) =
+                rbx_instance_to_settings_records(native, database, &refs);
+            native_settings_candidate_position(queue, document, &properties, &attributes)
+        };
+        let index = queue.remove(position).with_context(|| {
+            format!(
+                "Native Studio export does not match {service}: missing {} {}",
+                native.class, native.name
+            )
+        })?;
         targets.insert(*referent, (service.to_string(), index));
-        map_native_children_to_settings(
+        map_native_children_to_settings_inner(
             dom,
             native.children(),
             document,
@@ -10604,6 +10929,7 @@ fn map_native_children_to_settings(
             index,
             service,
             targets,
+            database,
         )?;
     }
 
@@ -31861,7 +32187,7 @@ fn write_generated_project(project_root: &Path, services: &[String], compact: bo
     }
 
     let content = json!({
-        "name": "projest",
+        "name": sourcemap_root_name(project_root),
         "tree": tree
     });
     write_json_file(
@@ -31993,21 +32319,27 @@ fn write_bytes_if_changed(path: &Path, content: &[u8]) -> Result<()> {
     }
 
     let temp_path = sibling_temp_path(path);
-    fs::write(&temp_path, content)
-        .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+    if let Err(error) = fs::write(&temp_path, content) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("Failed to write {}", temp_path.display()));
+    }
 
+    publish_sibling_temp(&temp_path, path)
+}
+
+fn publish_sibling_temp(temp_path: &Path, path: &Path) -> Result<()> {
     let was_readonly = fs::metadata(path)
         .map(|meta| meta.permissions().readonly())
         .unwrap_or(false);
     if was_readonly {
         set_path_readonly(path, false)?;
     }
-    let renamed = fs::rename(&temp_path, path);
+    let renamed = fs::rename(temp_path, path);
     if was_readonly {
         let _ = set_path_readonly(path, true);
     }
     if let Err(error) = renamed {
-        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path);
         return Err(error).with_context(|| format!("Failed to write {}", path.display()));
     }
     Ok(())
@@ -32060,15 +32392,28 @@ fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    let file = File::create(path).with_context(|| format!("Failed to write {}", path.display()))?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-    serde_json::to_writer(&mut writer, value).context("Failed to serialize JSON")?;
-    writer
-        .write_all(b"\n")
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    writer
-        .flush()
-        .with_context(|| format!("Failed to write {}", path.display()))
+    let temp_path = sibling_temp_path(path);
+    let result = (|| -> Result<()> {
+        let file = File::create(&temp_path)
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        serde_json::to_writer(&mut writer, value).context("Failed to serialize JSON")?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("Failed to write {}", temp_path.display()))
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    publish_sibling_temp(&temp_path, path)
 }
 
 fn sanitize_name(input: &str) -> String {
@@ -35390,6 +35735,78 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_instance_changes_describe_ambiguous_siblings() {
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance {
+                    settings_id: "root".to_string(),
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    parent_index: None,
+                    properties: Map::new(),
+                    attributes: Map::new(),
+                },
+                SettingsBytecodeInstance {
+                    settings_id: "first".to_string(),
+                    name: "Value".to_string(),
+                    class_name: "StringValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([
+                        ("Value".to_string(), json!("first")),
+                        (
+                            "Target".to_string(),
+                            json!({ "_type": "Ref", "instanceIndex": 3 }),
+                        ),
+                    ]),
+                    attributes: Map::from_iter([("Marker".to_string(), json!("one"))]),
+                },
+                SettingsBytecodeInstance {
+                    settings_id: "second".to_string(),
+                    name: "Value".to_string(),
+                    class_name: "StringValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Value".to_string(), json!("second"))]),
+                    attributes: Map::from_iter([("Marker".to_string(), json!("two"))]),
+                },
+                SettingsBytecodeInstance {
+                    settings_id: "unique".to_string(),
+                    name: "Unique".to_string(),
+                    class_name: "StringValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Value".to_string(), json!("unique"))]),
+                    attributes: Map::new(),
+                },
+            ],
+        };
+        let mut changes = EditorChangeSet::default();
+
+        append_editor_instance_reconcile(&mut changes, &document, "Workspace");
+
+        let instances = &changes.instance_changes[0].instances;
+        let first = instances
+            .iter()
+            .find(|instance| instance.settings_id == "first")
+            .unwrap();
+        assert!(first.ambiguous_siblings);
+        assert_eq!(first.match_properties.get("Value"), Some(&json!("first")));
+        assert!(!first.match_properties.contains_key("Target"));
+        assert_eq!(first.match_attributes.get("Marker"), Some(&json!("one")));
+        let unique = instances
+            .iter()
+            .find(|instance| instance.settings_id == "unique")
+            .unwrap();
+        assert!(!unique.ambiguous_siblings);
+        assert!(unique.match_properties.is_empty());
+        let payload = serde_json::to_value(first).unwrap();
+        assert_eq!(payload.get("ambiguousSiblings"), Some(&json!(true)));
+        assert_eq!(
+            payload.pointer("/matchProperties/Value"),
+            Some(&json!("first"))
+        );
+    }
+
+    #[test]
     fn editor_review_payload_keeps_every_instance_row() {
         let instances = (0..5001)
             .map(|index| EditorInstanceDescriptor {
@@ -35397,6 +35814,7 @@ mod tests {
                 path_segments: vec!["Workspace".to_string(), format!("Part{index}")],
                 path_ordinals: Vec::new(),
                 class_name: "Part".to_string(),
+                ..EditorInstanceDescriptor::default()
             })
             .collect();
         let changes = EditorChangeSet {
@@ -35420,6 +35838,62 @@ mod tests {
                 .and_then(|entry| entry.get("kind"))
                 == Some(&json!("instanceReconcile"))
         }));
+    }
+
+    #[test]
+    fn native_mapping_scores_duplicate_siblings_by_properties() {
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance {
+                    settings_id: "root".to_string(),
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    parent_index: None,
+                    properties: Map::new(),
+                    attributes: Map::new(),
+                },
+                SettingsBytecodeInstance {
+                    settings_id: "first".to_string(),
+                    name: "Value".to_string(),
+                    class_name: "StringValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Value".to_string(), json!("first"))]),
+                    attributes: Map::new(),
+                },
+                SettingsBytecodeInstance {
+                    settings_id: "second".to_string(),
+                    name: "Value".to_string(),
+                    class_name: "StringValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Value".to_string(), json!("second"))]),
+                    attributes: Map::new(),
+                },
+            ],
+        };
+        let candidates = VecDeque::from([1, 2]);
+        let native_properties = Map::from_iter([("Value".to_string(), json!("second"))]);
+
+        assert_eq!(
+            native_settings_candidate_position(
+                &candidates,
+                &document,
+                &native_properties,
+                &Map::new(),
+            ),
+            1
+        );
+
+        let oversized = VecDeque::from_iter(0..=MAX_NATIVE_MAPPING_CANDIDATES_TO_SCORE);
+        assert_eq!(
+            native_settings_candidate_position(
+                &oversized,
+                &document,
+                &native_properties,
+                &Map::new(),
+            ),
+            0
+        );
     }
 
     #[test]
@@ -35450,6 +35924,7 @@ mod tests {
             }),
             None,
             &paths,
+            &["root", "ads", "first-ad", "second-ad"],
         );
 
         assert_eq!(
@@ -35457,6 +35932,7 @@ mod tests {
             Some(&json!(["Workspace", "Ads", "Ad"]))
         );
         assert_eq!(normalized.get("pathOrdinals"), Some(&json!([1, 1, 2])));
+        assert_eq!(normalized.get("settingsId"), Some(&json!("second-ad")));
     }
 
     #[test]
@@ -35717,6 +36193,17 @@ mod tests {
                     properties: Map::new(),
                     attributes: Map::new(),
                 },
+                SettingsBytecodeInstance {
+                    settings_id: "reference".to_string(),
+                    name: "Reference".to_string(),
+                    class_name: "ObjectValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([(
+                        "Value".to_string(),
+                        json!({ "_type": "Ref", "instanceIndex": 2 }),
+                    )]),
+                    attributes: Map::new(),
+                },
             ],
         };
         let settings_path = service_settings_path(&service_dir);
@@ -35761,8 +36248,21 @@ mod tests {
             changes.history_entries[0].settings_id.as_deref(),
             Some("script")
         );
+        let reference_change = changes
+            .property_changes
+            .iter()
+            .find(|change| change.settings_id.as_deref() == Some("reference"))
+            .unwrap();
+        assert_eq!(
+            reference_change
+                .properties
+                .get("Value")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("settingsId")),
+            Some(&json!("script"))
+        );
         let after = SettingsBytecode::read_file(&settings_path).unwrap();
-        assert_eq!(after.instances.len(), 3);
+        assert_eq!(after.instances.len(), 4);
         assert_eq!(after.instances[1].name, "LoadingScreen");
         assert_eq!(after.instances[1].class_name, "Folder");
         assert_eq!(after.instances[2].name, "Frame");
@@ -38330,6 +38830,53 @@ mod tests {
         assert!(fs::metadata(&path).unwrap().permissions().readonly());
         let _ = set_path_readonly(&path, false);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn streaming_json_failure_preserves_the_existing_file() {
+        struct BrokenJson;
+
+        impl Serialize for BrokenJson {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+
+        let root = link_test_dir("atomic-json");
+        let path = root.join("cache.json");
+        fs::write(&path, "existing\n").unwrap();
+
+        assert!(write_json_streaming(&path, &BrokenJson).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing\n");
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".renium-tmp")
+        }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generated_project_uses_the_project_folder_name() {
+        let root = link_test_dir("generated-name").join("MyGame");
+        fs::create_dir_all(&root).unwrap();
+
+        write_generated_project(&root, &["Workspace".to_string()], true).unwrap();
+        let value: Value = read_json_file(&root.join("default.project.generated.json")).unwrap();
+
+        assert_eq!(value.get("name"), Some(&json!("MyGame")));
+        assert_eq!(
+            value.pointer("/tree/Workspace/$path"),
+            Some(&json!("src/Workspace"))
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]

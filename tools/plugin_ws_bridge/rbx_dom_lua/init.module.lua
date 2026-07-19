@@ -2,6 +2,41 @@ local database = require(script.database)
 local Error = require(script.Error)
 local PropertyDescriptor = require(script.PropertyDescriptor)
 
+local referencePropertiesByClass = {}
+
+local function getReferencePropertyNames(className)
+	local cached = referencePropertiesByClass[className]
+	if cached ~= nil then
+		return cached
+	end
+	local names = {}
+	local seen = {}
+	local currentClassName = className
+	repeat
+		local currentClass = database.Classes[currentClassName]
+		if currentClass == nil then
+			break
+		end
+		for propertyName, propertyData in pairs(currentClass.Properties) do
+			if seen[propertyName] == nil then
+				seen[propertyName] = true
+				local scriptability = propertyData.Scriptability
+				if
+					propertyData.Kind.Canonical ~= nil
+					and propertyData.DataType.Value == "Ref"
+					and (scriptability == "ReadWrite" or scriptability == "Custom")
+				then
+					names[#names + 1] = propertyName
+				end
+			end
+		end
+		currentClassName = currentClass.Superclass
+	until currentClassName == nil
+	table.sort(names)
+	referencePropertiesByClass[className] = names
+	return names
+end
+
 local function findCanonicalPropertyDescriptor(className, propertyName)
 	local currentClassName = className
 
@@ -65,6 +100,7 @@ return {
 	readProperty = readProperty,
 	writeProperty = writeProperty,
 	findCanonicalPropertyDescriptor = findCanonicalPropertyDescriptor,
+	getReferencePropertyNames = getReferencePropertyNames,
 	Error = Error,
 	EncodedValue = require(script.EncodedValue),
 }
