@@ -46,6 +46,9 @@
       "BridgeValueEquality": {
         "$path": "BridgeValueEquality.module.lua"
       },
+      "BridgeValueCodec": {
+        "$path": "BridgeValueCodec.module.lua"
+      },
       "BridgeUi": {
         "$path": "BridgeUi.module.lua"
       },

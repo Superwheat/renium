@@ -69,48 +69,26 @@ function BridgePluginRuntime.start(context)
 	end
 
 	local Config = {}
-	local okRuntimeId, generatedRuntimeId = pcall(function()
-		return HttpService:GenerateGUID(false)
-	end)
-	if not okRuntimeId or type(generatedRuntimeId) ~= "string" or generatedRuntimeId == "" then
+	local generatedRuntimeId = HttpService:GenerateGUID(false)
+	if type(generatedRuntimeId) ~= "string" or generatedRuntimeId == "" then
 		error("Renium could not create a bridge runtime identity")
 	end
 	Config.bridgeRuntimeId = generatedRuntimeId
 
 	function Config.isPlayModeActiveForBridge(): boolean
-		local okState, state = pcall(function()
-			return RunService.RunState
-		end)
-		if okState and state == Enum.RunState.Stopped then
+		if RunService.RunState == Enum.RunState.Stopped then
 			return false
-		end
-		local okRunning, running = pcall(function()
-			return RunService:IsRunning()
-		end)
-		if okRunning and running == true then
+		elseif RunService:IsRunning() then
+			return true
+		elseif not RunService:IsEdit() then
 			return true
 		end
-		local okEdit, isEdit = pcall(function()
-			return RunService:IsEdit()
-		end)
-		if okEdit and isEdit == false then
-			return true
-		end
-		local okStudioTest, editModeActive = pcall(function()
-			return (game:GetService("StudioTestService") :: any).EditModeActive
-		end)
-		return okStudioTest and editModeActive == false
+		return not (game:GetService("StudioTestService") :: any).EditModeActive
 	end
 
 	function Config.getBridgeRole(): string
-		local okRunning, running = pcall(function()
-			return RunService:IsRunning()
-		end)
-		if okRunning and running == true then
-			local okClient, isClient = pcall(function()
-				return RunService:IsClient()
-			end)
-			if okClient and isClient == true then
+		if RunService:IsRunning() then
+			if RunService:IsClient() then
 				return "play-client"
 			end
 			return "play-server"
@@ -145,7 +123,7 @@ function BridgePluginRuntime.start(context)
 
 	local function armEditorReviewUploadExpiry(uploadId: string, upload: { [any]: any })
 		upload.updatedAt = os.clock()
-		if upload.expiryArmed == true then
+		if upload.expiryArmed then
 			return
 		end
 		nextEditorReviewExpiryToken += 1
@@ -171,10 +149,8 @@ function BridgePluginRuntime.start(context)
 		if Config.bridgeRole ~= "play-client" then
 			return nil, nil
 		end
-		local ok, localPlayer = pcall(function()
-			return game:GetService("Players").LocalPlayer
-		end)
-		if not ok or localPlayer == nil then
+		local localPlayer = game:GetService("Players").LocalPlayer
+		if localPlayer == nil then
 			return nil, nil
 		end
 		return localPlayer.Name, localPlayer.UserId
@@ -208,7 +184,7 @@ function BridgePluginRuntime.start(context)
 	local PRE_SERIALIZE_WARM_MAX_WORKERS = 4
 	local BRIDGE_VERSION = "0.1.2"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local CODEC_VERSION = "compact-v5-schema-7"
+	local CODEC_VERSION = "compact-v5-schema-8"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs1"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
@@ -223,17 +199,12 @@ function BridgePluginRuntime.start(context)
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local MAX_SOURCE_KEY_BYTES = 4096
 	local DEFAULT_PERFORMANCE_MODE = "throughput"
-	local MODIFIED_DEFAULT_BYPASS_ENABLED = plugin:GetSetting(SETTINGS_PREFIX .. "modifiedDefaultBypass")
-	if type(MODIFIED_DEFAULT_BYPASS_ENABLED) ~= "boolean" then
-		MODIFIED_DEFAULT_BYPASS_ENABLED = false
-	end
-	local SHAPE_COMPACT_INSTANCE_BATCHES = plugin:GetSetting(SETTINGS_PREFIX .. "shapeCompactInstanceBatches")
-	if type(SHAPE_COMPACT_INSTANCE_BATCHES) ~= "boolean" then
-		SHAPE_COMPACT_INSTANCE_BATCHES = true
-	end
+	local MODIFIED_DEFAULT_BYPASS_ENABLED =
+		plugin:GetSetting(SETTINGS_PREFIX .. "modifiedDefaultBypass") == true
+	local SHAPE_COMPACT_INSTANCE_BATCHES =
+		plugin:GetSetting(SETTINGS_PREFIX .. "shapeCompactInstanceBatches") ~= false
 	local SHAPE_COMPACT_MIN_ITEMS = 128
 	local SHAPE_COMPACT_MIN_CELL_SAVINGS = 32
-	local COMPACT_SLOT_IN_PROGRESS = {}
 	local COMPACT_TYPE_IDS = {
 		Absent = 0,
 		Bool = 1,
@@ -295,23 +266,23 @@ function BridgePluginRuntime.start(context)
 	local function requireChildModule(name: string): any
 		local child = rootScript:FindFirstChild(name)
 		if child and child:IsA("ModuleScript") then
-			local ok, result = pcall(require, child)
-			if ok and type(result) == "table" then
+			local result = require(child)
+			if type(result) == "table" then
 				return result
 			end
-			error("[Renium] failed to require module " .. name .. ": " .. tostring(result))
+			error(`Renium module {name} must return a table`)
 		end
-		error("[Renium] missing child ModuleScript: " .. name)
+		error(`Renium is missing child ModuleScript {name}`)
 	end
 
 	local function tryRequireChildModule(name: string): any?
 		local child = rootScript:FindFirstChild(name)
 		if child and child:IsA("ModuleScript") then
-			local ok, result = pcall(require, child)
-			if ok and type(result) == "table" then
+			local result = require(child)
+			if type(result) == "table" then
 				return result
 			end
-			warn("[Renium] failed optional module " .. name .. ": " .. tostring(result))
+			error(`Renium module {name} must return a table`)
 		end
 		return nil
 	end
@@ -322,11 +293,11 @@ function BridgePluginRuntime.start(context)
 		end
 		local child = parent:FindFirstChild(name)
 		if child and child:IsA("ModuleScript") then
-			local ok, result = pcall(require, child)
-			if ok and type(result) == "table" then
+			local result = require(child)
+			if type(result) == "table" then
 				return result
 			end
-			warn("[Renium] failed optional nested module " .. name .. ": " .. tostring(result))
+			error(`Renium nested module {name} must return a table`)
 		end
 		return nil
 	end
@@ -337,6 +308,7 @@ function BridgePluginRuntime.start(context)
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
 	local ContentModule = requireChildModule("BridgeContent")
+	local ValueCodecModule = requireChildModule("BridgeValueCodec")
 	local TransportModule = requireChildModule("BridgeTransport")
 	local ConnectionModule = requireChildModule("BridgeConnection")
 	local IdentityModule = requireChildModule("BridgeIdentity")
@@ -346,7 +318,6 @@ function BridgePluginRuntime.start(context)
 	local EditorSyncModule = requireChildModule("BridgeEditorSync")
 	local ProfilingModule = requireChildModule("BridgeProfiling")
 	local RuntimeApi = requireChildModule("BridgeRuntimeApi").create(plugin)
-	local _ = tryRequireChildModule("RbxDom")
 	local RbxDomDatabase = tryRequireNestedModule(rootScript:FindFirstChild("RbxDom"), "database")
 
 	local ui = UiModule.create(plugin, ThemeModule, {
@@ -380,7 +351,7 @@ function BridgePluginRuntime.start(context)
 		if type(runtimeSettings) ~= "table" then
 			return
 		end
-		if Config.studioChanges ~= nil and type(Config.studioChanges.setOptions) == "function" then
+		if Config.studioChanges and type(Config.studioChanges.setOptions) == "function" then
 			Config.studioChanges.setOptions({
 				syncbackProperties = runtimeSettings.syncbackProperties,
 				onlyCodeMode = runtimeSettings.onlyCodeMode,
@@ -390,7 +361,7 @@ function BridgePluginRuntime.start(context)
 	do
 		local storedConflictResolution =
 			SettingsModule.loadConflictResolution(plugin, SETTINGS_PREFIX, nil)
-		if storedConflictResolution ~= nil then
+		if storedConflictResolution then
 			Config.studioChanges.setConflictResolution(storedConflictResolution)
 		end
 	end
@@ -516,9 +487,7 @@ function BridgePluginRuntime.start(context)
 	local function makeExportBurstYielder(checkInterval: number?, budgetSeconds: number?)
 		if PERFORMANCE_MODE == "throughput" then
 			return NOOP_EXPORT_YIELDER
-		end
-
-		if PERFORMANCE_MODE == "balanced" then
+		elseif PERFORMANCE_MODE == "balanced" then
 			local interval = math.max(1, checkInterval or SERIALIZATION_BURST_CHECK_INTERVAL)
 			local budget = math.max(budgetSeconds or SERIALIZATION_BURST_BUDGET_SECONDS, 1 / 120)
 			return ParallelModule.makeBurstYielder(interval, budget)
@@ -527,8 +496,10 @@ function BridgePluginRuntime.start(context)
 		return ParallelModule.makeBurstYielder(checkInterval, budgetSeconds)
 	end
 
-	local EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
+	local BUNDLED_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
 		PropertySchemaModule.buildSchemasFromRbxDom(RbxDomDatabase, COMPACT_TYPE_IDS, StudioApiSchemaModule)
+	local EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
+		PropertySchemaModule.mergeSchemas(BUNDLED_PROPERTY_SCHEMAS_BY_CLASS, {})
 	local EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS: { [string]: { string } } = PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
 	do
 		local classCount, propertyCount = PropertySchemaModule.countCandidates(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
@@ -612,7 +583,7 @@ function BridgePluginRuntime.start(context)
 			editorSyncStats = editorSyncStats,
 			bridgeRole = Config.bridgeRole,
 		}
-		if ui.updateStatus ~= nil then
+		if ui.updateStatus then
 			ui.updateStatus(StatusModule.view(statusState))
 		else
 			ui.statusLabel.Text = StatusModule.render(statusState)
@@ -648,14 +619,9 @@ function BridgePluginRuntime.start(context)
 			return false, nil
 		end
 		if propertyName == "Scale" then
-			return pcall(function()
-				return (instance :: any):GetScale()
-			end)
-		end
-		if propertyName == "WorldPivotData" or propertyName == "WorldPivot" or propertyName == "Origin" then
-			return pcall(function()
-				return (instance :: any):GetPivot()
-			end)
+			return true, (instance :: any):GetScale()
+		elseif propertyName == "WorldPivotData" or propertyName == "WorldPivot" or propertyName == "Origin" then
+			return true, (instance :: any):GetPivot()
 		end
 		return false, nil
 	end
@@ -674,20 +640,13 @@ function BridgePluginRuntime.start(context)
 		if typeof(value) ~= "PhysicalProperties" then
 			return nil
 		end
-		local acousticAbsorption = 1
-		local okAcoustic, rawAcoustic = pcall(function()
-			return (value :: any).AcousticAbsorption
-		end)
-		if okAcoustic and type(rawAcoustic) == "number" then
-			acousticAbsorption = rawAcoustic
-		end
 		return {
 			(value :: any).Density,
 			(value :: any).Friction,
 			(value :: any).Elasticity,
 			(value :: any).FrictionWeight,
 			(value :: any).ElasticityWeight,
-			acousticAbsorption,
+			(value :: any).AcousticAbsorption,
 		}
 	end
 
@@ -696,15 +655,16 @@ function BridgePluginRuntime.start(context)
 		if comparable == nil then
 			return nil
 		end
+		local encoded = ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6))
 		return {
 			_type = "PhysicalProperties",
 			customPhysics = true,
-			density = comparable[1],
-			friction = comparable[2],
-			elasticity = comparable[3],
-			frictionWeight = comparable[4],
-			elasticityWeight = comparable[5],
-			acousticAbsorption = comparable[6],
+			density = encoded[1],
+			friction = encoded[2],
+			elasticity = encoded[3],
+			frictionWeight = encoded[4],
+			elasticityWeight = encoded[5],
+			acousticAbsorption = encoded[6],
 		}
 	end
 
@@ -721,10 +681,7 @@ function BridgePluginRuntime.start(context)
 			and typeId == COMPACT_TYPE_IDS.PhysicalProperties
 			and propertyName == "CustomPhysicalProperties"
 		then
-			local okIsBasePart, isBasePart = pcall(function()
-				return instance:IsA("BasePart")
-			end)
-			if okIsBasePart and isBasePart == true then
+			if instance:IsA("BasePart") then
 				return true, false
 			end
 		end
@@ -762,7 +719,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	function Config.markModifiedDefaultRuntimeDenylist(state: ServiceState, bypassKey: string): boolean
-		if state.modifiedDefaultRuntimeDenylist[bypassKey] ~= true then
+		if not state.modifiedDefaultRuntimeDenylist[bypassKey] then
 			state.modifiedDefaultRuntimeDenylist[bypassKey] = true
 			return true
 		end
@@ -826,7 +783,7 @@ function BridgePluginRuntime.start(context)
 			return false
 		end
 		local key = string.lower(propertyName)
-		if MODIFIED_DEFAULT_BYPASS_PROPERTY_DENYLIST[key] == true then
+		if MODIFIED_DEFAULT_BYPASS_PROPERTY_DENYLIST[key] then
 			return false
 		end
 		if key == "rotation" and className == "Texture" then
@@ -848,7 +805,7 @@ function BridgePluginRuntime.start(context)
 		defaultComparable: any,
 		compareFn: any
 	): (boolean, boolean?, boolean?, boolean, boolean, boolean)
-		if state.modifiedDefaultRuntimeDenylist[bypassKey] == true then
+		if state.modifiedDefaultRuntimeDenylist[bypassKey] then
 			return false, nil, nil, false, false, false
 		end
 
@@ -870,15 +827,11 @@ function BridgePluginRuntime.start(context)
 
 		local readCompareStarted = os.clock()
 		local gotSample, sampledValue = tryRead(instance, propertyName)
-		local sampleIsDefault = false
-		if gotSample and sampledValue ~= nil then
-			if compareFn ~= false then
-				sampleIsDefault = compareFn(sampledValue, defaultComparable, state)
-			else
-				sampleIsDefault =
-					Config.valueMatchesComparableDefault(typeId, enumType, sampledValue, defaultComparable, state)
-			end
-		end
+		local sampleIsDefault = if gotSample and sampledValue ~= nil
+			then if compareFn
+				then compareFn(sampledValue, defaultComparable, state)
+				else Config.valueMatchesComparableDefault(typeId, enumType, sampledValue, defaultComparable, state)
+			else false
 		local readCompareUs = (os.clock() - readCompareStarted) * 1000000
 
 		local stats = state.modifiedDefaultAdaptiveStatsByKey[bypassKey]
@@ -895,11 +848,11 @@ function BridgePluginRuntime.start(context)
 		stats.samples += 1
 		stats.modifiedUs += modifiedUs
 		stats.readCompareUs += readCompareUs
-		if isModified == false then
+		if not isModified then
 			stats.unmodified += 1
 		end
 
-		if isModified == false and not sampleIsDefault then
+		if not isModified and not sampleIsDefault then
 			state.modifiedDefaultAdaptiveDecisionByKey[bypassKey] = false
 			local added = Config.markModifiedDefaultRuntimeDenylist(state, bypassKey)
 			return false, hasModified, isModified, true, true, added
@@ -924,46 +877,74 @@ function BridgePluginRuntime.start(context)
 
 	local function serializeValue(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
-		if valueType == "number" or valueType == "string" or valueType == "boolean" then
+		if valueType == "string" or valueType == "boolean" then
 			return value
+		elseif valueType == "number" then
+			return ValueCodecModule.encodeNumber(value)
 		elseif valueType == "Vector2" then
-			return { _type = "Vector2", x = value.X, y = value.Y }
+			local components = ValueCodecModule.encodeComponents(value.X, value.Y)
+			return { _type = "Vector2", x = components[1], y = components[2] }
 		elseif valueType == "Vector3" then
-			return { _type = "Vector3", x = value.X, y = value.Y, z = value.Z }
+			local components = ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
+			return { _type = "Vector3", x = components[1], y = components[2], z = components[3] }
 		elseif valueType == "UDim" then
-			return { _type = "UDim", scale = value.Scale, offset = value.Offset }
+			local components = ValueCodecModule.encodeComponents(value.Scale, value.Offset)
+			return { _type = "UDim", scale = components[1], offset = components[2] }
 		elseif valueType == "UDim2" then
+			local components =
+				ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 			return {
 				_type = "UDim2",
-				xScale = value.X.Scale,
-				xOffset = value.X.Offset,
-				yScale = value.Y.Scale,
-				yOffset = value.Y.Offset,
+				xScale = components[1],
+				xOffset = components[2],
+				yScale = components[3],
+				yOffset = components[4],
 			}
 		elseif valueType == "Color3" then
-			return { _type = "Color3", r = value.R, g = value.G, b = value.B }
+			local components = ValueCodecModule.encodeComponents(value.R, value.G, value.B)
+			return { _type = "Color3", r = components[1], g = components[2], b = components[3] }
 		elseif valueType == "BrickColor" then
 			return { _type = "BrickColor", number = value.Number }
 		elseif valueType == "NumberRange" then
-			return { _type = "NumberRange", min = value.Min, max = value.Max }
+			local components = ValueCodecModule.encodeComponents(value.Min, value.Max)
+			return { _type = "NumberRange", min = components[1], max = components[2] }
 		elseif valueType == "PhysicalProperties" then
 			return physicalPropertiesObject(value)
 		elseif valueType == "ColorSequence" then
 			local keypoints = {}
 			for i, keypoint in ipairs(value.Keypoints) do
-				keypoints[i] = { time = keypoint.Time, value = { r = keypoint.Value.R, g = keypoint.Value.G, b = keypoint.Value.B } }
+				local components = ValueCodecModule.encodeComponents(
+					keypoint.Time,
+					keypoint.Value.R,
+					keypoint.Value.G,
+					keypoint.Value.B
+				)
+				keypoints[i] = {
+					time = components[1],
+					value = { r = components[2], g = components[3], b = components[4] },
+				}
 			end
 			return { _type = "ColorSequence", keypoints = keypoints }
 		elseif valueType == "NumberSequence" then
 			local keypoints = {}
 			for i, keypoint in ipairs(value.Keypoints) do
-				keypoints[i] = { time = keypoint.Time, value = keypoint.Value, envelope = keypoint.Envelope }
+				local components =
+					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+				keypoints[i] = { time = components[1], value = components[2], envelope = components[3] }
 			end
 			return { _type = "NumberSequence", keypoints = keypoints }
 		elseif valueType == "CFrame" then
-			return { _type = "CFrame", components = { value:GetComponents() } }
+			return { _type = "CFrame", components = ValueCodecModule.encodeComponents(value:GetComponents()) }
 		elseif valueType == "Rect" then
-			return { _type = "Rect", minX = value.Min.X, minY = value.Min.Y, maxX = value.Max.X, maxY = value.Max.Y }
+			local components =
+				ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+			return {
+				_type = "Rect",
+				minX = components[1],
+				minY = components[2],
+				maxX = components[3],
+				maxY = components[4],
+			}
 		elseif valueType == "EnumItem" then
 			return { _type = "EnumItem", enumType = tostring(value.EnumType), name = value.Name }
 		elseif valueType == "Font" then
@@ -1002,15 +983,33 @@ function BridgePluginRuntime.start(context)
 			end
 			return { _type = "Faces", faces = faces }
 		elseif valueType == "Ray" then
+			local components = ValueCodecModule.encodeComponents(
+				value.Origin.X,
+				value.Origin.Y,
+				value.Origin.Z,
+				value.Direction.X,
+				value.Direction.Y,
+				value.Direction.Z
+			)
 			return {
 				_type = "Ray",
-				origin = { x = value.Origin.X, y = value.Origin.Y, z = value.Origin.Z },
-				direction = { x = value.Direction.X, y = value.Direction.Y, z = value.Direction.Z },
+				origin = { x = components[1], y = components[2], z = components[3] },
+				direction = { x = components[4], y = components[5], z = components[6] },
 			}
 		elseif valueType == "Content" then
 			return ContentModule.serialize(value)
 		elseif valueType == "Instance" then
 			return IdentityModule.serializeRefValue(state, value)
+		end
+		return nil
+	end
+
+	local function serializeContentValue(value: any): string?
+		if type(value) == "string" then
+			return value
+		end
+		if typeof(value) == "Content" then
+			return ContentModule.serialize(value)
 		end
 		return nil
 	end
@@ -1127,7 +1126,7 @@ function BridgePluginRuntime.start(context)
 
 	local function shouldSkipStructuralTransportProperty(className: string, propertyName: string): boolean
 		local key = propertyKey(propertyName)
-		if TRANSIENT_TRANSPORT_PROPERTIES[key] == true then
+		if TRANSIENT_TRANSPORT_PROPERTIES[key] then
 			return true
 		end
 		if key == "source"
@@ -1269,104 +1268,155 @@ function BridgePluginRuntime.start(context)
 		local function sanitizeSchemaEntry(className: string, rawEntry: any): { any }?
 			if type(rawEntry) == "string" then
 				local normalized = normalizePropertyName(rawEntry)
-				if normalized == "" or shouldSkipStructuralTransportProperty(className, normalized) then
+				if normalized == "" then
+					error("Property candidate names must not be empty")
+				end
+				if shouldSkipStructuralTransportProperty(className, normalized) then
 					return nil
 				end
 				return { normalized, COMPACT_TYPE_IDS.String, false }
 			end
 			if type(rawEntry) ~= "table" then
-				return nil
+				error("Property candidate entries must be strings or arrays")
 			end
 			local rawName = rawEntry[1]
 			local rawTypeId = rawEntry[2]
-			if type(rawName) ~= "string" or type(rawTypeId) ~= "number" then
-				return nil
+			if type(rawName) ~= "string" or rawName == "" then
+				error("Property candidate names must be non-empty strings")
+			end
+			if
+				type(rawTypeId) ~= "number"
+				or rawTypeId ~= rawTypeId
+				or rawTypeId % 1 ~= 0
+				or rawTypeId < COMPACT_TYPE_IDS.Bool
+				or rawTypeId > COMPACT_TYPE_IDS.Ray
+			then
+				error("Property candidate type IDs must be supported integers")
 			end
 			local normalized = normalizePropertyName(rawName)
-			if normalized == "" or shouldSkipStructuralTransportProperty(className, normalized) then
+			if normalized == "" then
+				error("Property candidate names must not be empty")
+			end
+			if shouldSkipStructuralTransportProperty(className, normalized) then
 				return nil
 			end
-			local enumType = rawEntry[3]
-			if type(enumType) ~= "string" or enumType == "" then
-				enumType = false
+			local rawEnumType = rawEntry[3]
+			if rawEnumType ~= nil and rawEnumType ~= false and (type(rawEnumType) ~= "string" or rawEnumType == "") then
+				error("Property candidate enum types must be non-empty strings")
 			end
+			local enumType = if type(rawEnumType) == "string" then rawEnumType else false
 			return { normalized, rawTypeId, enumType }
 		end
 
-		EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS = {}
-		EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS = {}
+		local configuredSchemas = {}
+		local configuredClassCount = 0
+		local configuredPropertyCount = 0
+		for className, names in pairs(payload) do
+			if type(className) ~= "string" or className == "" or type(names) ~= "table" then
+				error("Property candidate classes must map non-empty class names to arrays")
+			end
+			local numericEntryCount = 0
+			for key in pairs(names) do
+				if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+					error("Property candidate class entries must be dense arrays")
+				end
+				numericEntryCount += 1
+			end
+			if numericEntryCount == 0 or numericEntryCount ~= #names then
+				error("Property candidate class entries must be non-empty dense arrays")
+			end
+
+			local sanitizedSchema = {}
+			local seen: { [string]: boolean } = {}
+			for _, rawEntry in ipairs(names) do
+				local schemaEntry = sanitizeSchemaEntry(className, rawEntry)
+				if schemaEntry then
+					local key = propertyKey(schemaEntry[1])
+					if not seen[key] then
+						seen[key] = true
+						sanitizedSchema[#sanitizedSchema + 1] = schemaEntry
+					end
+				end
+			end
+			if #sanitizedSchema > 0 then
+				configuredSchemas[className] = sanitizedSchema
+				configuredClassCount += 1
+				configuredPropertyCount += #sanitizedSchema
+			end
+		end
+		if configuredPropertyCount == 0 then
+			error("Property candidate payload contains no usable properties")
+		end
+
+		EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS =
+			PropertySchemaModule.mergeSchemas(BUNDLED_PROPERTY_SCHEMAS_BY_CLASS, configuredSchemas)
+		EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS =
+			PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
 		DEFAULT_PROPERTY_CACHE = {}
 		DEFAULT_TRANSPORT_PROPERTY_CACHE = {}
 		DEFAULT_TRANSPORT_FAST_COMPARE_CACHE = {}
 		CLASS_PROPERTY_CANDIDATES_CACHE = {}
 		CLASS_PROPERTY_SCHEMA_CACHE = {}
-		for serviceName, _ in pairs(stateByService) do
+		for serviceName in pairs(stateByService) do
 			stateByService[serviceName] = nil
 		end
 
-		local classCount = 0
-		local propertyCount = 0
-		for className, names in pairs(payload) do
-			if type(className) == "string" and type(names) == "table" then
-				local sanitizedSchema = {}
-				local sanitized = {}
-				local seen: { [string]: boolean } = {}
-				for _, rawEntry in ipairs(names) do
-					local schemaEntry = sanitizeSchemaEntry(className, rawEntry)
-					if schemaEntry ~= nil then
-						local normalized = schemaEntry[1]
-						local key = propertyKey(normalized)
-						if not seen[key] then
-							seen[key] = true
-							sanitized[#sanitized + 1] = normalized
-							sanitizedSchema[#sanitizedSchema + 1] = schemaEntry
-						end
-					end
-				end
-				if #sanitized > 0 then
-					EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS[className] = sanitizedSchema
-					EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS[className] = sanitized
-					classCount += 1
-					propertyCount += #sanitized
-				end
-			end
-		end
-
 		configureStudioChangePropertyCandidates()
+		local classCount, propertyCount = PropertySchemaModule.countCandidates(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
 
 		return {
 			ok = true,
 			classCount = classCount,
 			propertyCount = propertyCount,
+			configuredClassCount = configuredClassCount,
+			configuredPropertyCount = configuredPropertyCount,
 		}
 	end
 
 	local function configureExportOptions(payload: any): { [string]: any }
-		local options = payload
 		if type(payload) ~= "table" then
-			options = {}
+			error("setExportOptions expects an object")
 		end
-		if options.preSerializeOnPrepare ~= nil then
-			PRE_SERIALIZE_ON_PREPARE = options.preSerializeOnPrepare == true
+		local booleanOptions = {
+			preSerializeOnPrepare = true,
+			preSerializeLargeServiceWarm = true,
+			modifiedDefaultBypass = true,
+			exportAllProperties = true,
+		}
+		for key, value in pairs(payload) do
+			if booleanOptions[key] then
+				if type(value) ~= "boolean" then
+					error(key .. " must be a boolean")
+				end
+			elseif key == "performanceMode" then
+				if value ~= "throughput" and value ~= "balanced" and value ~= "smooth" then
+					error("performanceMode must be throughput, balanced, or smooth")
+				end
+			else
+				error("Unknown export option " .. tostring(key))
+			end
 		end
-		if options.preSerializeLargeServiceWarm ~= nil then
-			PRE_SERIALIZE_LARGE_SERVICE_WARM = options.preSerializeLargeServiceWarm == true
+		if payload.preSerializeOnPrepare ~= nil then
+			PRE_SERIALIZE_ON_PREPARE = payload.preSerializeOnPrepare
 		end
-		if options.performanceMode ~= nil then
-			PERFORMANCE_MODE = Config.normalizePerformanceMode(options.performanceMode)
+		if payload.preSerializeLargeServiceWarm ~= nil then
+			PRE_SERIALIZE_LARGE_SERVICE_WARM = payload.preSerializeLargeServiceWarm
 		end
-		if options.modifiedDefaultBypass ~= nil then
+		if payload.performanceMode ~= nil then
+			PERFORMANCE_MODE = Config.normalizePerformanceMode(payload.performanceMode)
+		end
+		if payload.modifiedDefaultBypass ~= nil then
 			local previousModifiedDefaultBypass = MODIFIED_DEFAULT_BYPASS_ENABLED
-			MODIFIED_DEFAULT_BYPASS_ENABLED = options.modifiedDefaultBypass == true
+			MODIFIED_DEFAULT_BYPASS_ENABLED = payload.modifiedDefaultBypass
 			if MODIFIED_DEFAULT_BYPASS_ENABLED ~= previousModifiedDefaultBypass then
 				for _, serviceState in pairs(stateByService) do
 					serviceState.hotPropertySchemaByClass = nil
 				end
 			end
 		end
-		if options.exportAllProperties ~= nil then
+		if payload.exportAllProperties ~= nil then
 			local previousExportAllProperties = EXPORT_ALL_PROPERTIES
-			EXPORT_ALL_PROPERTIES = options.exportAllProperties == true
+			EXPORT_ALL_PROPERTIES = payload.exportAllProperties
 			if EXPORT_ALL_PROPERTIES ~= previousExportAllProperties then
 				table.clear(CLASS_PROPERTY_SCHEMA_CACHE)
 				table.clear(CLASS_PROPERTY_CANDIDATES_CACHE)
@@ -1495,39 +1545,49 @@ function BridgePluginRuntime.start(context)
 
 	serializeValueCompactV4 = function(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
-		if valueType == "number" or valueType == "string" or valueType == "boolean" then
+		if valueType == "string" or valueType == "boolean" then
 			return value
+		elseif valueType == "number" then
+			return ValueCodecModule.encodeNumber(value)
 		elseif valueType == "Vector2" then
-			return { COMPACT_VALUE_TAGS.Vector2, value.X, value.Y }
+			local components = ValueCodecModule.encodeComponents(value.X, value.Y)
+			return { COMPACT_VALUE_TAGS.Vector2, components[1], components[2] }
 		elseif valueType == "Vector3" then
-			return { COMPACT_VALUE_TAGS.Vector3, value.X, value.Y, value.Z }
+			local components = ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
+			return { COMPACT_VALUE_TAGS.Vector3, components[1], components[2], components[3] }
 		elseif valueType == "UDim" then
-			return { COMPACT_VALUE_TAGS.UDim, value.Scale, value.Offset }
+			local components = ValueCodecModule.encodeComponents(value.Scale, value.Offset)
+			return { COMPACT_VALUE_TAGS.UDim, components[1], components[2] }
 		elseif valueType == "UDim2" then
+			local components =
+				ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 			return {
 				COMPACT_VALUE_TAGS.UDim2,
-				value.X.Scale,
-				value.X.Offset,
-				value.Y.Scale,
-				value.Y.Offset,
+				components[1],
+				components[2],
+				components[3],
+				components[4],
 			}
 		elseif valueType == "Color3" then
-			return { COMPACT_VALUE_TAGS.Color3, value.R, value.G, value.B }
+			local components = ValueCodecModule.encodeComponents(value.R, value.G, value.B)
+			return { COMPACT_VALUE_TAGS.Color3, components[1], components[2], components[3] }
 		elseif valueType == "BrickColor" then
 			return { COMPACT_VALUE_TAGS.BrickColor, value.Number }
 		elseif valueType == "NumberRange" then
-			return { COMPACT_VALUE_TAGS.NumberRange, value.Min, value.Max }
+			local components = ValueCodecModule.encodeComponents(value.Min, value.Max)
+			return { COMPACT_VALUE_TAGS.NumberRange, components[1], components[2] }
 		elseif valueType == "PhysicalProperties" then
 			local comparable = physicalPropertiesComparable(value)
 			if comparable ~= nil then
+				local components = ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6))
 				return {
 					COMPACT_VALUE_TAGS.PhysicalProperties,
-					comparable[1],
-					comparable[2],
-					comparable[3],
-					comparable[4],
-					comparable[5],
-					comparable[6],
+					components[1],
+					components[2],
+					components[3],
+					components[4],
+					components[5],
+					components[6],
 				}
 			end
 		elseif valueType == "ColorSequence" then
@@ -1535,10 +1595,16 @@ function BridgePluginRuntime.start(context)
 			out[1] = COMPACT_VALUE_TAGS.ColorSequence
 			local writeIndex = 2
 			for _, keypoint in ipairs(value.Keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value.R
-				out[writeIndex + 2] = keypoint.Value.G
-				out[writeIndex + 3] = keypoint.Value.B
+				local components = ValueCodecModule.encodeComponents(
+					keypoint.Time,
+					keypoint.Value.R,
+					keypoint.Value.G,
+					keypoint.Value.B
+				)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
+				out[writeIndex + 3] = components[4]
 				writeIndex += 4
 			end
 			return out
@@ -1547,14 +1613,16 @@ function BridgePluginRuntime.start(context)
 			out[1] = COMPACT_VALUE_TAGS.NumberSequence
 			local writeIndex = 2
 			for _, keypoint in ipairs(value.Keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value
-				out[writeIndex + 2] = keypoint.Envelope
+				local components =
+					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
 				writeIndex += 3
 			end
 			return out
 		elseif valueType == "CFrame" then
-			local components = { value:GetComponents() }
+			local components = ValueCodecModule.encodeComponents(value:GetComponents())
 			local out = table.create(#components + 1)
 			out[1] = COMPACT_VALUE_TAGS.CFrame
 			for i, component in ipairs(components) do
@@ -1562,7 +1630,15 @@ function BridgePluginRuntime.start(context)
 			end
 			return out
 		elseif valueType == "Rect" then
-			return { COMPACT_VALUE_TAGS.Rect, value.Min.X, value.Min.Y, value.Max.X, value.Max.Y }
+			local components =
+				ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+			return {
+				COMPACT_VALUE_TAGS.Rect,
+				components[1],
+				components[2],
+				components[3],
+				components[4],
+			}
 		elseif valueType == "EnumItem" then
 			return { COMPACT_VALUE_TAGS.EnumItem, tostring(value.EnumType), value.Name }
 		elseif valueType == "Font" then
@@ -1601,38 +1677,47 @@ function BridgePluginRuntime.start(context)
 		return "pathord:" .. table.concat(ordinals, ",") .. ":" .. IdentityModule.getCachedInstancePath(state, instance)
 	end
 
-	local function ensureScriptIndex(state: ServiceState)
-		if state.scriptPaths and state.scriptInstances and state.scriptIndices and state.scriptInstancesByIndex then
+	local function ensureScriptRangeIndex(state: ServiceState)
+		if state.scriptIndices and state.scriptInstancesByIndex then
+			return
+		end
+		local scriptIndices = table.create(#state.scriptObjects)
+		local scriptInstancesByIndex = {}
+		local yieldIfNeeded = makeExportBurstYielder()
+		for _, inst in ipairs(state.scriptObjects) do
+			local sourceIndex = IdentityModule.getCachedInstanceIndex(state, inst)
+			if sourceIndex then
+				scriptIndices[#scriptIndices + 1] = sourceIndex
+				scriptInstancesByIndex[sourceIndex] = inst
+			end
+			yieldIfNeeded()
+		end
+		state.scriptIndices = scriptIndices
+		state.scriptInstancesByIndex = scriptInstancesByIndex
+	end
+
+	local function ensureScriptKeyIndex(state: ServiceState)
+		if state.scriptPaths and state.scriptInstances then
 			return
 		end
 		local scriptPaths = table.create(#state.scriptObjects)
-		local scriptIndices = table.create(#state.scriptObjects)
 		local scriptInstances = {}
-		local scriptInstancesByIndex = {}
 		local yieldIfNeeded = makeExportBurstYielder()
 		for i, inst in ipairs(state.scriptObjects) do
 			local sourceKey = IdentityModule.getCachedScriptSourceKey(state, inst)
 			local pathSourceKey = "path:" .. IdentityModule.getCachedInstancePath(state, inst)
 			local ordinalPathSourceKey = getOrdinalPathSourceKey(state, inst)
-			local sourceIndex = IdentityModule.getCachedInstanceIndex(state, inst)
 			scriptPaths[i] = sourceKey
 			scriptInstances[sourceKey] = inst
-			if scriptInstances[pathSourceKey] == nil then
+			if not scriptInstances[pathSourceKey] then
 				scriptInstances[pathSourceKey] = inst
 			end
 			scriptInstances[ordinalPathSourceKey] = inst
-			if sourceIndex ~= nil then
-				scriptIndices[i] = sourceIndex
-				scriptInstancesByIndex[sourceIndex] = inst
-			end
 			yieldIfNeeded()
 		end
 		table.sort(scriptPaths)
-		table.sort(scriptIndices)
 		state.scriptPaths = scriptPaths
-		state.scriptIndices = scriptIndices
 		state.scriptInstances = scriptInstances
-		state.scriptInstancesByIndex = scriptInstancesByIndex
 		state.scriptPathsEncoded = nil
 	end
 
@@ -1661,10 +1746,8 @@ function BridgePluginRuntime.start(context)
 			entry.parentDebugId = parentDebugId
 		end
 		local properties = {}
-		local defaultProperties = nil
-		if not EXPORT_ALL_PROPERTIES then
-			defaultProperties = getDefaultSerializedProperties(instance.ClassName)
-		end
+		local defaultProperties =
+			if EXPORT_ALL_PROPERTIES then nil else getDefaultSerializedProperties(instance.ClassName)
 
 		if includePathData ~= false and debugId then
 			entry.debugId = debugId
@@ -1692,7 +1775,7 @@ function BridgePluginRuntime.start(context)
 					Config.bumpExportMetric(state, "propertiesRead")
 					local value = nil
 					local hasValue = false
-					if forceSafeReads or fallbackMap[propertyName] == true then
+					if forceSafeReads or fallbackMap[propertyName] then
 						local got, safeValue = tryRead(instance, propertyName)
 						if got then
 							value = safeValue
@@ -1884,7 +1967,7 @@ function BridgePluginRuntime.start(context)
 					local enumType = schemaEntry[3]
 					if out[enumType] == nil then
 						local valueNames = getEnumValueNames(enumType)
-						if valueNames ~= false then
+						if valueNames then
 							out[enumType] = valueNames
 						end
 					end
@@ -1922,12 +2005,13 @@ function BridgePluginRuntime.start(context)
 		local compareFns = table.create(propertyCount)
 		local encodeFns = table.create(propertyCount)
 		local skipEncode = table.create(propertyCount)
-			for i, schemaEntry in ipairs(sourceSchema) do
-				local propertyName = schemaEntry[1]
+		for i, schemaEntry in ipairs(sourceSchema) do
+			local propertyName = schemaEntry[1]
 			local typeId = schemaEntry[2]
 			local enumType = if type(schemaEntry[3]) == "string" then schemaEntry[3] else false
-			local defaultComparable = if defaultProperties ~= nil then defaultProperties[propertyName] else nil
-			local defaultFastComparable = if defaultFastCompareProperties ~= nil then defaultFastCompareProperties[propertyName] else defaultComparable
+			local defaultComparable = if defaultProperties then defaultProperties[propertyName] else nil
+			local defaultFastComparable =
+				if defaultFastCompareProperties then defaultFastCompareProperties[propertyName] else defaultComparable
 			names[i] = propertyName
 			typeIds[i] = typeId
 			enumTypes[i] = enumType
@@ -1969,14 +2053,14 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 			compareFns[i] = Config.compareDefaultValueV5ByTypeId and Config.compareDefaultValueV5ByTypeId[typeId] or false
-				encodeFns[i] = Config.encodeValueV5ByTypeId and Config.encodeValueV5ByTypeId[typeId] or false
-				skipEncode[i] = className == "Texture" and propertyName == "Rotation"
-			end
+			encodeFns[i] = Config.encodeValueV5ByTypeId and Config.encodeValueV5ByTypeId[typeId] or false
+			skipEncode[i] = className == "Texture" and propertyName == "Rotation"
+		end
 
-			local hotSchema = {
-				className = className,
-				count = propertyCount,
-				maxMaskWords = math.ceil(propertyCount / 31),
+		local hotSchema = {
+			className = className,
+			count = propertyCount,
+			maxMaskWords = math.ceil(propertyCount / 31),
 			names = names,
 			typeIds = typeIds,
 			enumTypes = enumTypes,
@@ -1986,15 +2070,14 @@ function BridgePluginRuntime.start(context)
 			bypassKeys = bypassKeys,
 			maskWordIndices = maskWordIndices,
 			maskBitValues = maskBitValues,
-				fastCompareModes = fastCompareModes,
-				compareFns = compareFns,
-				encodeFns = encodeFns,
-				skipEncode = skipEncode,
-				exporter = false,
-				exporterWithFallback = false,
-				fastExportSafe = false,
-			fallbackExportSafe = false,
-			forceSafeReads = false,
+			fastCompareModes = fastCompareModes,
+			compareFns = compareFns,
+			encodeFns = encodeFns,
+			skipEncode = skipEncode,
+			exporter = false,
+			exporterWithFallback = false,
+			fallbacksLearned = false,
+			usesFallbackMap = false,
 		}
 		cachedByClass[className] = hotSchema
 		return hotSchema
@@ -2009,7 +2092,7 @@ function BridgePluginRuntime.start(context)
 		local fallbackMap = Config.getClassPropertyFallbackMap(state, className)
 		local learned = false
 		for _, propertyName in ipairs(propertyNames) do
-			if fallbackMap[propertyName] ~= true then
+			if not fallbackMap[propertyName] then
 				local ok = pcall(function()
 					return (instance :: any)[propertyName]
 				end)
@@ -2038,66 +2121,6 @@ function BridgePluginRuntime.start(context)
 			state,
 			instance,
 			true,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
-	end
-
-	local function exportInstanceWithFallback(
-		state: ServiceState,
-		instance: Instance,
-		path: string,
-		parentPath: string?,
-		debugId: string?,
-		parentDebugId: string?,
-		instanceId: string?,
-		parentInstanceId: string?,
-		includePathData: boolean?
-	): { [string]: any }
-		local className = instance.ClassName
-		local ok, entry = pcall(
-			exportInstanceFast,
-			state,
-			instance,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
-		if ok then
-			return entry
-		end
-
-		local propertyNames = getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
-		local learned = Config.learnClassPropertyFallbacks(state, instance, className, propertyNames)
-		if learned then
-			local retryOk, retryEntry = pcall(
-				exportInstanceFast,
-				state,
-				instance,
-				path,
-				parentPath,
-				debugId,
-				parentDebugId,
-				instanceId,
-				parentInstanceId,
-				includePathData
-			)
-			if retryOk then
-				return retryEntry
-			end
-		end
-		return exportInstanceSafe(
-			state,
-			instance,
 			path,
 			parentPath,
 			debugId,
@@ -2148,8 +2171,14 @@ function BridgePluginRuntime.start(context)
 			)
 		end
 
-		local ok, entry = pcall(
-			exportInstanceFast,
+		Config.learnClassPropertyFallbacks(
+			state,
+			instance,
+			className,
+			getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
+		)
+		state.safeReadByClass[className] = false
+		return exportInstanceFast(
 			state,
 			instance,
 			path,
@@ -2160,71 +2189,6 @@ function BridgePluginRuntime.start(context)
 			parentInstanceId,
 			includePathData
 		)
-		if ok then
-			state.safeReadByClass[className] = false
-			return entry
-		end
-
-		state.safeReadByClass[className] = true
-		return exportInstanceSafe(
-			state,
-			instance,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
-	end
-
-	local function compactInstanceEntry(state: ServiceState, entry: { [string]: any }): { any }
-		local compactProperties = false
-		local properties = entry.properties
-		if type(properties) == "table" and next(properties) ~= nil then
-			local servicePropertyCandidates = getServicePropertyCandidates(state)
-			local propertyNames = servicePropertyCandidates[entry.className or ""] or PROPERTY_CANDIDATES
-			local pairsOut = table.create(#propertyNames * 2)
-			local emitted = {}
-			for i, propertyName in ipairs(propertyNames) do
-				local value = properties[propertyName]
-				if value ~= nil then
-					pairsOut[#pairsOut + 1] = i - 1
-					pairsOut[#pairsOut + 1] = value
-					emitted[propertyName] = true
-				end
-			end
-
-			local leftovers = {}
-			for propertyName, _ in pairs(properties) do
-				if propertyName ~= "Source" and emitted[propertyName] ~= true then
-					leftovers[#leftovers + 1] = propertyName
-				end
-			end
-			table.sort(leftovers)
-			for _, propertyName in ipairs(leftovers) do
-				pairsOut[#pairsOut + 1] = propertyName
-				pairsOut[#pairsOut + 1] = properties[propertyName]
-			end
-
-			if #pairsOut > 0 then
-				compactProperties = pairsOut
-			end
-		end
-
-		local classValue = IdentityModule.compactClassValue(state, tostring(entry.className or ""))
-		local instanceIndex = IdentityModule.parseInstanceIndexId(entry.instanceId)
-		local parentIndex = IdentityModule.parseInstanceIndexId(entry.parentInstanceId)
-		return {
-			entry.name or "",
-			classValue,
-			compactProperties,
-			entry.sourceKey or false,
-			entry.attributes or false,
-			instanceIndex or false,
-			parentIndex or false,
-		}
 	end
 
 	local function serializeAttributesCompactV4(attributes: { [string]: any }, state: ServiceState): any
@@ -2275,6 +2239,7 @@ function BridgePluginRuntime.start(context)
 		local attributes = serializeAttributesCompactV4(instance:GetAttributes(), state)
 		local defaultProperties = if not EXPORT_ALL_PROPERTIES then getDefaultTransportProperties(instance.ClassName) else nil
 		local propertyNames = getClassPropertyCandidates(instance.ClassName) or PROPERTY_CANDIDATES
+		local fallbackMap = Config.getClassPropertyFallbackMap(state, instance.ClassName)
 		local maskWords = table.create(math.ceil(#propertyNames / 32))
 		local maskWordCount = 0
 		local valuesOut = table.create(#propertyNames)
@@ -2295,7 +2260,7 @@ function BridgePluginRuntime.start(context)
 				if not skipRead then
 					local value = nil
 					local hasValue = false
-					if safeReads then
+					if safeReads or fallbackMap[propertyName] then
 						local got, safeValue = tryRead(instance, propertyName)
 						if got then
 							value = safeValue
@@ -2397,13 +2362,14 @@ function BridgePluginRuntime.start(context)
 		if safeMode == false then
 			return exportCompactInstanceEntryFast(state, inst, classValue, instanceIndex, parentIndex)
 		end
-		local ok, entry = pcall(exportCompactInstanceEntryFast, state, inst, classValue, instanceIndex, parentIndex)
-		if ok then
-			state.safeReadByClass[className] = false
-			return entry
-		end
-		state.safeReadByClass[className] = true
-		return exportCompactInstanceEntrySafe(state, inst, classValue, instanceIndex, parentIndex)
+		Config.learnClassPropertyFallbacks(
+			state,
+			inst,
+			className,
+			getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
+		)
+		state.safeReadByClass[className] = false
+		return exportCompactInstanceEntryFast(state, inst, classValue, instanceIndex, parentIndex)
 	end
 
 	function Config.internBatchString(
@@ -2423,16 +2389,13 @@ function BridgePluginRuntime.start(context)
 
 	local function compactShapeKeyPart(value: any): string
 		local valueType = type(value)
-		if value == false or value == nil then
+		if not value then
 			return "f"
-		end
-		if valueType == "number" then
+		elseif valueType == "number" then
 			return "n:" .. tostring(value)
-		end
-		if valueType == "string" then
+		elseif valueType == "string" then
 			return "s:" .. value
-		end
-		if valueType == "table" then
+		elseif valueType == "table" then
 			local count = #value
 			local parts = table.create(count)
 			for i = 1, count do
@@ -2449,13 +2412,10 @@ function BridgePluginRuntime.start(context)
 		classValue: any,
 		mask: any
 	): number
-		local compactMask = mask
-		if compactMask == nil then
-			compactMask = false
-		end
+		local compactMask = mask or false
 		local key = compactShapeKeyPart(classValue) .. "|" .. compactShapeKeyPart(compactMask)
 		local existing = shapeIds[key]
-		if existing ~= nil then
+		if existing then
 			return existing
 		end
 		local nextId = #shapes + 1
@@ -2464,18 +2424,28 @@ function BridgePluginRuntime.start(context)
 		return nextId
 	end
 
-	local function compactV5RowHasPropertyMask(row: { any }): boolean
+	local function compactV5RowShapeKey(row: { any }): (string?, boolean)
+		if type(row) ~= "table" or row[7] ~= nil then
+			return nil, false
+		end
+		local classValue = row[2]
+		if classValue == nil then
+			return nil, false
+		end
 		local field4 = row[4]
 		local field5 = row[5]
 		local field6 = row[6]
 		if field4 == nil or field5 == nil then
-			return false
+			return compactShapeKeyPart(classValue) .. "|f", false
 		end
 		if field6 == nil then
 			local field4Type = type(field4)
-			return field4Type == "number" or field4Type == "table"
+			if field4Type ~= "number" and field4Type ~= "table" then
+				return nil, false
+			end
+			return compactShapeKeyPart(classValue) .. "|" .. compactShapeKeyPart(field4), true
 		end
-		return true
+		return compactShapeKeyPart(classValue) .. "|" .. compactShapeKeyPart(field5), true
 	end
 
 	local function shapeCompactV5Row(
@@ -2525,26 +2495,38 @@ function BridgePluginRuntime.start(context)
 			return nil, nil, 0
 		end
 
-		local shapedItems = table.create(count)
-		local shapes = {}
-		local shapeIds = {}
+		local shapeKeys = {}
+		local shapeCount = 0
 		local propertyRowCount = 0
 		for i = 1, count do
-			local shapedRow, rowHasPropertyMask = shapeCompactV5Row(items[i], shapes, shapeIds)
-			if shapedRow == nil then
+			local shapeKey, rowHasPropertyMask = compactV5RowShapeKey(items[i])
+			if not shapeKey then
 				return nil, nil, 0
 			end
-			shapedItems[i] = shapedRow
+			if not shapeKeys[shapeKey] then
+				shapeKeys[shapeKey] = true
+				shapeCount += 1
+			end
 			if rowHasPropertyMask then
 				propertyRowCount += 1
 			end
 		end
 
-		local estimatedCellSavings = propertyRowCount - (#shapes * 2)
+		local estimatedCellSavings = propertyRowCount - (shapeCount * 2)
 		if estimatedCellSavings < SHAPE_COMPACT_MIN_CELL_SAVINGS then
 			return nil, nil, estimatedCellSavings
 		end
 
+		local shapedItems = table.create(count)
+		local shapes = table.create(shapeCount)
+		local shapeIds = {}
+		for i = 1, count do
+			local shapedRow = shapeCompactV5Row(items[i], shapes, shapeIds)
+			if not shapedRow then
+				return nil, nil, 0
+			end
+			shapedItems[i] = shapedRow
+		end
 		return shapedItems, shapes, estimatedCellSavings
 	end
 
@@ -2583,47 +2565,56 @@ function BridgePluginRuntime.start(context)
 			end
 		elseif typeId == COMPACT_TYPE_IDS.Number then
 			if type(value) == "number" then
-				return value
+				return ValueCodecModule.encodeNumber(value)
 			end
-		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.ContentId or typeId == COMPACT_TYPE_IDS.BinaryString then
+		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.BinaryString then
 			if type(value) == "string" then
 				return value
 			end
+		elseif typeId == COMPACT_TYPE_IDS.ContentId then
+			return serializeContentValue(value)
 		elseif typeId == COMPACT_TYPE_IDS.Vector2 and typeof(value) == "Vector2" then
-			return { value.X, value.Y }
+			return ValueCodecModule.encodeComponents(value.X, value.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Vector3 and typeof(value) == "Vector3" then
-			return { value.X, value.Y, value.Z }
+			return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
 		elseif typeId == COMPACT_TYPE_IDS.UDim and typeof(value) == "UDim" then
-			return { value.Scale, value.Offset }
+			return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.UDim2 and typeof(value) == "UDim2" then
-			return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
+			return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.Color3 and typeof(value) == "Color3" then
-			return { value.R, value.G, value.B }
+			return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
 		elseif typeId == COMPACT_TYPE_IDS.BrickColor and typeof(value) == "BrickColor" then
 			return value.Number
 		elseif typeId == COMPACT_TYPE_IDS.NumberRange and typeof(value) == "NumberRange" then
-			return { value.Min, value.Max }
+			return ValueCodecModule.encodeComponents(value.Min, value.Max)
 		elseif typeId == COMPACT_TYPE_IDS.PhysicalProperties then
 			if value == false then
 				return false
 			end
-			return physicalPropertiesComparable(value)
+			local comparable = physicalPropertiesComparable(value)
+			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
 		elseif typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem" then
 			return value.Name
 		elseif typeId == COMPACT_TYPE_IDS.CFrame and typeof(value) == "CFrame" then
-			return { value:GetComponents() }
+			return ValueCodecModule.encodeComponents(value:GetComponents())
 		elseif typeId == COMPACT_TYPE_IDS.Rect and typeof(value) == "Rect" then
-			return { value.Min.X, value.Min.Y, value.Max.X, value.Max.Y }
+			return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Font and typeof(value) == "Font" then
 			return { value.Family, tostring(value.Weight), tostring(value.Style) }
 		elseif typeId == COMPACT_TYPE_IDS.ColorSequence and typeof(value) == "ColorSequence" then
 			local out = table.create(#value.Keypoints * 4)
 			local writeIndex = 1
 			for _, keypoint in ipairs(value.Keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value.R
-				out[writeIndex + 2] = keypoint.Value.G
-				out[writeIndex + 3] = keypoint.Value.B
+				local components = ValueCodecModule.encodeComponents(
+					keypoint.Time,
+					keypoint.Value.R,
+					keypoint.Value.G,
+					keypoint.Value.B
+				)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
+				out[writeIndex + 3] = components[4]
 				writeIndex += 4
 			end
 			return out
@@ -2631,9 +2622,11 @@ function BridgePluginRuntime.start(context)
 			local out = table.create(#value.Keypoints * 3)
 			local writeIndex = 1
 			for _, keypoint in ipairs(value.Keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value
-				out[writeIndex + 2] = keypoint.Envelope
+				local components =
+					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
 				writeIndex += 3
 			end
 			return out
@@ -2642,14 +2635,14 @@ function BridgePluginRuntime.start(context)
 		elseif typeId == COMPACT_TYPE_IDS.Faces and typeof(value) == "Faces" then
 			return facesBitmask(value)
 		elseif typeId == COMPACT_TYPE_IDS.Ray and typeof(value) == "Ray" then
-			return {
+			return ValueCodecModule.encodeComponents(
 				value.Origin.X,
 				value.Origin.Y,
 				value.Origin.Z,
 				value.Direction.X,
 				value.Direction.Y,
-				value.Direction.Z,
-			}
+				value.Direction.Z
+			)
 		elseif typeId == COMPACT_TYPE_IDS.Ref and typeof(value) == "Instance" then
 			return encodeComparableRefValue(state, value)
 		end
@@ -2671,8 +2664,10 @@ function BridgePluginRuntime.start(context)
 			return type(value) == "boolean" and value == defaultComparable
 		elseif typeId == COMPACT_TYPE_IDS.Number then
 			return type(value) == "number" and value == defaultComparable
-		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.ContentId or typeId == COMPACT_TYPE_IDS.BinaryString then
+		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.BinaryString then
 			return type(value) == "string" and value == defaultComparable
+		elseif typeId == COMPACT_TYPE_IDS.ContentId then
+			return serializeContentValue(value) == defaultComparable
 		elseif typeId == COMPACT_TYPE_IDS.Vector2 and typeof(value) == "Vector2" then
 			return type(defaultComparable) == "table" and value.X == defaultComparable[1] and value.Y == defaultComparable[2]
 		elseif typeId == COMPACT_TYPE_IDS.Vector3 and typeof(value) == "Vector3" then
@@ -2793,21 +2788,7 @@ function BridgePluginRuntime.start(context)
 		return false
 	end
 
-	Config.encodeNumberV5 = function(value: any): any
-		if type(value) ~= "number" then
-			return nil
-		end
-		if value ~= value then
-			return { _type = "Float", value = "nan" }
-		end
-		if value == math.huge then
-			return { _type = "Float", value = "inf" }
-		end
-		if value == -math.huge then
-			return { _type = "Float", value = "-inf" }
-		end
-		return value
-	end
+	Config.encodeNumberV5 = ValueCodecModule.encodeNumber
 
 	local function encodeSchemaValueV5(
 		typeId: number,
@@ -2823,35 +2804,41 @@ function BridgePluginRuntime.start(context)
 			end
 		elseif typeId == COMPACT_TYPE_IDS.Number then
 			return Config.encodeNumberV5(value)
-		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.ContentId or typeId == COMPACT_TYPE_IDS.BinaryString then
+		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.BinaryString then
 			if type(value) == "string" then
 				return Config.internBatchString(strings, stringIds, value)
 			end
+		elseif typeId == COMPACT_TYPE_IDS.ContentId then
+			local serialized = serializeContentValue(value)
+			if serialized then
+				return Config.internBatchString(strings, stringIds, serialized)
+			end
 		elseif typeId == COMPACT_TYPE_IDS.Vector2 and typeof(value) == "Vector2" then
-			return { value.X, value.Y }
+			return ValueCodecModule.encodeComponents(value.X, value.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Vector3 and typeof(value) == "Vector3" then
-			return { value.X, value.Y, value.Z }
+			return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
 		elseif typeId == COMPACT_TYPE_IDS.UDim and typeof(value) == "UDim" then
-			return { value.Scale, value.Offset }
+			return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.UDim2 and typeof(value) == "UDim2" then
-			return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
+			return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.Color3 and typeof(value) == "Color3" then
-			return { value.R, value.G, value.B }
+			return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
 		elseif typeId == COMPACT_TYPE_IDS.BrickColor and typeof(value) == "BrickColor" then
 			return value.Number
 		elseif typeId == COMPACT_TYPE_IDS.NumberRange and typeof(value) == "NumberRange" then
-			return { value.Min, value.Max }
+			return ValueCodecModule.encodeComponents(value.Min, value.Max)
 		elseif typeId == COMPACT_TYPE_IDS.PhysicalProperties then
 			if value == false then
 				return false
 			end
-			return physicalPropertiesComparable(value)
+			local comparable = physicalPropertiesComparable(value)
+			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
 		elseif typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem" then
 			return value.Value
 		elseif typeId == COMPACT_TYPE_IDS.CFrame and typeof(value) == "CFrame" then
-			return { value:GetComponents() }
+			return ValueCodecModule.encodeComponents(value:GetComponents())
 		elseif typeId == COMPACT_TYPE_IDS.Rect and typeof(value) == "Rect" then
-			return { value.Min.X, value.Min.Y, value.Max.X, value.Max.Y }
+			return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Font and typeof(value) == "Font" then
 			return {
 				Config.internBatchString(strings, stringIds, value.Family),
@@ -2867,14 +2854,14 @@ function BridgePluginRuntime.start(context)
 		elseif typeId == COMPACT_TYPE_IDS.Faces and typeof(value) == "Faces" then
 			return facesBitmask(value)
 		elseif typeId == COMPACT_TYPE_IDS.Ray and typeof(value) == "Ray" then
-			return {
+			return ValueCodecModule.encodeComponents(
 				value.Origin.X,
 				value.Origin.Y,
 				value.Origin.Z,
 				value.Direction.X,
 				value.Direction.Y,
-				value.Direction.Z,
-			}
+				value.Direction.Z
+			)
 		elseif typeId == COMPACT_TYPE_IDS.Ref and typeof(value) == "Instance" then
 			local comparable = encodeComparableRefValue(state, value)
 			if comparable == nil then
@@ -2905,7 +2892,7 @@ function BridgePluginRuntime.start(context)
 			return type(value) == "string" and value == defaultComparable
 		end,
 		[COMPACT_TYPE_IDS.ContentId] = function(value: any, defaultComparable: any): boolean
-			return type(value) == "string" and value == defaultComparable
+			return serializeContentValue(value) == defaultComparable
 		end,
 		[COMPACT_TYPE_IDS.BinaryString] = function(value: any, defaultComparable: any): boolean
 			return type(value) == "string" and value == defaultComparable
@@ -3056,8 +3043,9 @@ function BridgePluginRuntime.start(context)
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.ContentId] = function(value: any, _state: ServiceState?, strings: { string }, stringIds: { [string]: number }): any
-			if type(value) == "string" then
-				return Config.internBatchString(strings, stringIds, value)
+			local serialized = serializeContentValue(value)
+			if serialized then
+				return Config.internBatchString(strings, stringIds, serialized)
 			end
 			return nil
 		end,
@@ -3069,31 +3057,31 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.Vector2] = function(value: any): any
 			if typeof(value) == "Vector2" then
-				return { value.X, value.Y }
+				return ValueCodecModule.encodeComponents(value.X, value.Y)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Vector3] = function(value: any): any
 			if typeof(value) == "Vector3" then
-				return { value.X, value.Y, value.Z }
+				return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.UDim] = function(value: any): any
 			if typeof(value) == "UDim" then
-				return { value.Scale, value.Offset }
+				return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.UDim2] = function(value: any): any
 			if typeof(value) == "UDim2" then
-				return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
+				return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Color3] = function(value: any): any
 			if typeof(value) == "Color3" then
-				return { value.R, value.G, value.B }
+				return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
 			end
 			return nil
 		end,
@@ -3105,7 +3093,7 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.NumberRange] = function(value: any): any
 			if typeof(value) == "NumberRange" then
-				return { value.Min, value.Max }
+				return ValueCodecModule.encodeComponents(value.Min, value.Max)
 			end
 			return nil
 		end,
@@ -3113,7 +3101,8 @@ function BridgePluginRuntime.start(context)
 			if value == false then
 				return false
 			end
-			return physicalPropertiesComparable(value)
+			local comparable = physicalPropertiesComparable(value)
+			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
 		end,
 		[COMPACT_TYPE_IDS.EnumItem] = function(value: any, _state: ServiceState?, strings: { string }, stringIds: { [string]: number }): any
 			if typeof(value) == "EnumItem" then
@@ -3123,14 +3112,13 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.CFrame] = function(value: any): any
 			if typeof(value) == "CFrame" then
-				local c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = value:GetComponents()
-				return { c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 }
+				return ValueCodecModule.encodeComponents(value:GetComponents())
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Rect] = function(value: any): any
 			if typeof(value) == "Rect" then
-				return { value.Min.X, value.Min.Y, value.Max.X, value.Max.Y }
+				return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 			end
 			return nil
 		end,
@@ -3152,10 +3140,16 @@ function BridgePluginRuntime.start(context)
 			local out = table.create(#keypoints * 4)
 			local writeIndex = 1
 			for _, keypoint in ipairs(keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value.R
-				out[writeIndex + 2] = keypoint.Value.G
-				out[writeIndex + 3] = keypoint.Value.B
+				local components = ValueCodecModule.encodeComponents(
+					keypoint.Time,
+					keypoint.Value.R,
+					keypoint.Value.G,
+					keypoint.Value.B
+				)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
+				out[writeIndex + 3] = components[4]
 				writeIndex += 4
 			end
 			return out
@@ -3168,9 +3162,11 @@ function BridgePluginRuntime.start(context)
 			local out = table.create(#keypoints * 3)
 			local writeIndex = 1
 			for _, keypoint in ipairs(keypoints) do
-				out[writeIndex] = keypoint.Time
-				out[writeIndex + 1] = keypoint.Value
-				out[writeIndex + 2] = keypoint.Envelope
+				local components =
+					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+				out[writeIndex] = components[1]
+				out[writeIndex + 1] = components[2]
+				out[writeIndex + 2] = components[3]
 				writeIndex += 3
 			end
 			return out
@@ -3211,7 +3207,7 @@ function BridgePluginRuntime.start(context)
 		local compareFns = hotSchema.compareFns
 		local encodeFns = hotSchema.encodeFns
 		local skipEncode = hotSchema.skipEncode
-		local shouldUseFallbackMap = useFallbackMap == true
+		local shouldUseFallbackMap = not not useFallbackMap
 		local exportAllProperties = EXPORT_ALL_PROPERTIES
 		local modifiedDefaultBypassEnabled = MODIFIED_DEFAULT_BYPASS_ENABLED and not exportAllProperties
 		local evaluateModifiedDefaultBypass = Config.evaluateModifiedDefaultBypass
@@ -3233,10 +3229,7 @@ function BridgePluginRuntime.start(context)
 				local classValue = state.classValueByIndex[instanceIndex] or IdentityModule.compactClassValue(state, className)
 				local parentIndex = state.parentIndexByIndex[instanceIndex]
 				local attributes = serializeAttributesCompactV5(instance:GetAttributes(), state, strings, stringIds)
-				local fallbackMap = nil
-				if shouldUseFallbackMap then
-					fallbackMap = getFallbackMap(state, className)
-				end
+				local fallbackMap = if shouldUseFallbackMap then getFallbackMap(state, className) else nil
 				local maskWords = nil
 				local maskWordCount = 0
 				local valuesOut = nil
@@ -3246,7 +3239,7 @@ function BridgePluginRuntime.start(context)
 					local propertyName = propertyNames[i]
 					local value = nil
 					local hasValue = false
-					if forceSafeReads or (fallbackMap ~= nil and fallbackMap[propertyName] == true) then
+					if forceSafeReads or (fallbackMap and fallbackMap[propertyName]) then
 						local got, safeValue = tryRead(instance, propertyName)
 						if got then
 							value = safeValue
@@ -3310,7 +3303,7 @@ function BridgePluginRuntime.start(context)
 									and value.Max.Y == defaultFastComparable[4]
 							else
 								local compareFn = compareFns[i]
-								if compareFn ~= false then
+								if compareFn then
 									isDefault = compareFn(value, defaultComparable, state)
 								else
 									isDefault = valueMatchesComparableDefault(typeIds[i], enumTypes[i], value, defaultComparable, state)
@@ -3318,14 +3311,11 @@ function BridgePluginRuntime.start(context)
 							end
 						end
 						if not isDefault then
-							if skipEncode[i] ~= true then
+							if not skipEncode[i] then
 								local encodeFn = encodeFns[i]
-								local encoded = nil
-								if encodeFn ~= false then
-									encoded = encodeFn(value, state, strings, stringIds, enumTypes[i])
-								else
-									encoded = encodeValue(typeIds[i], enumTypes[i], value, state, strings, stringIds)
-								end
+								local encoded = if encodeFn
+									then encodeFn(value, state, strings, stringIds, enumTypes[i])
+									else encodeValue(typeIds[i], enumTypes[i], value, state, strings, stringIds)
 								if encoded ~= nil then
 									if maskWords == nil then
 										maskWords = table.create(hotSchema.maxMaskWords)
@@ -3357,14 +3347,11 @@ function BridgePluginRuntime.start(context)
 					end
 				end
 
-				local compactValues = false
-				if valuesOut ~= nil and valueWriteIndex > 0 then
-					compactValues = valuesOut
-				end
+				local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
 
 				local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
-				if compactMask == false and compactValues == false then
-					if attributes == false then
+				if not compactMask and not compactValues then
+					if not attributes then
 						return {
 							nameId,
 							classValue,
@@ -3379,7 +3366,7 @@ function BridgePluginRuntime.start(context)
 					}, 0, 0, 0, 0, 0, 0, 0
 				end
 
-				if attributes == false then
+				if not attributes then
 					return {
 						nameId,
 						classValue,
@@ -3430,7 +3417,7 @@ function BridgePluginRuntime.start(context)
 				local skipRead = false
 				if modifiedDefaultBypassEnabled then
 					local bypassKey = bypassKeys[i]
-					if bypassKey ~= false and state.modifiedDefaultRuntimeDenylist[bypassKey] ~= true and canModifiedBypass[i] then
+					if bypassKey and not state.modifiedDefaultRuntimeDenylist[bypassKey] and canModifiedBypass[i] then
 					local shouldUseBypass, sampledHasModified, sampledIsModified, sampledCheck, sampledValidationRead, sampledDenylist =
 						evaluateModifiedDefaultBypass(
 							state,
@@ -3476,7 +3463,7 @@ function BridgePluginRuntime.start(context)
 					propertiesRead += 1
 					local value = nil
 					local hasValue = false
-					if forceSafeReads or (fallbackMap ~= nil and fallbackMap[propertyName] == true) then
+					if forceSafeReads or (fallbackMap and fallbackMap[propertyName]) then
 						local got, safeValue = tryRead(instance, propertyName)
 						if got then
 							value = safeValue
@@ -3539,7 +3526,7 @@ function BridgePluginRuntime.start(context)
 									and value.Max.Y == defaultFastComparable[4]
 							else
 								local compareFn = compareFns[i]
-								if compareFn ~= false then
+								if compareFn then
 									isDefault = compareFn(value, defaultComparable, state)
 								else
 									isDefault = valueMatchesComparableDefault(typeIds[i], enumTypes[i], value, defaultComparable, state)
@@ -3547,14 +3534,11 @@ function BridgePluginRuntime.start(context)
 							end
 						end
 						if not isDefault then
-							if skipEncode[i] ~= true then
+							if not skipEncode[i] then
 								local encodeFn = encodeFns[i]
-								local encoded = nil
-								if encodeFn ~= false then
-									encoded = encodeFn(value, state, strings, stringIds, enumTypes[i])
-								else
-									encoded = encodeValue(typeIds[i], enumTypes[i], value, state, strings, stringIds)
-								end
+								local encoded = if encodeFn
+									then encodeFn(value, state, strings, stringIds, enumTypes[i])
+									else encodeValue(typeIds[i], enumTypes[i], value, state, strings, stringIds)
 								if encoded ~= nil then
 									if maskWords == nil then
 										maskWords = table.create(hotSchema.maxMaskWords)
@@ -3590,14 +3574,11 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 
-			local compactValues = false
-			if valuesOut ~= nil and valueWriteIndex > 0 then
-				compactValues = valuesOut
-			end
+			local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
 
 			local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
-			if compactMask == false and compactValues == false then
-				if attributes == false then
+			if not compactMask and not compactValues then
+				if not attributes then
 					return {
 						nameId,
 						classValue,
@@ -3626,7 +3607,7 @@ function BridgePluginRuntime.start(context)
 						propertiesDefaultSkipped
 			end
 
-			if attributes == false then
+			if not attributes then
 				return {
 					nameId,
 					classValue,
@@ -3722,15 +3703,12 @@ function BridgePluginRuntime.start(context)
 			local value = attributes[name]
 			local typeId = dynamicCompactTypeIdForValue(value)
 			if typeId ~= nil then
-				local encoded
-				if typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem" then
-					encoded = {
+				local encoded = if typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem"
+					then {
 						Config.internBatchString(strings, stringIds, tostring(value.EnumType)),
 						Config.internBatchString(strings, stringIds, value.Name),
 					}
-				else
-					encoded = encodeSchemaValueV5(typeId, nil, value, state, strings, stringIds)
-				end
+					else encodeSchemaValueV5(typeId, nil, value, state, strings, stringIds)
 				if encoded ~= nil then
 					out[#out + 1] = Config.internBatchString(strings, stringIds, name)
 					out[#out + 1] = typeId
@@ -3755,22 +3733,14 @@ function BridgePluginRuntime.start(context)
 		strings: { string },
 		stringIds: { [string]: number }
 	): { any }
-		local exporter
-		if forceSafeReads or hotSchema.forceSafeReads == true then
-			exporter = hotSchema.exporterWithFallback
-			if exporter == false or exporter == nil then
-				exporter = Config.buildCompactV5Exporter(className, hotSchema, true)
-				hotSchema.exporterWithFallback = exporter
-			end
-			return exporter(state, instance, instanceIndex, true, strings, stringIds)
+		local useFallbackMap = forceSafeReads or hotSchema.usesFallbackMap
+		local cacheKey = if useFallbackMap then "exporterWithFallback" else "exporter"
+		local exporter = hotSchema[cacheKey]
+		if not exporter then
+			exporter = Config.buildCompactV5Exporter(className, hotSchema, useFallbackMap)
+			hotSchema[cacheKey] = exporter
 		end
-
-		exporter = hotSchema.exporter
-		if exporter == false or exporter == nil then
-			exporter = Config.buildCompactV5Exporter(className, hotSchema, false)
-			hotSchema.exporter = exporter
-		end
-		return exporter(state, instance, instanceIndex, false, strings, stringIds)
+		return exporter(state, instance, instanceIndex, forceSafeReads, strings, stringIds)
 	end
 
 	local function exportCompactV5InstanceInternal(
@@ -3806,60 +3776,32 @@ function BridgePluginRuntime.start(context)
 	)
 		local className = knownClassName or state.classNameByIndex[instanceIndex] or inst.ClassName
 		local hotSchema = knownHotSchema or Config.getHotPropertySchema(state, className)
-		if hotSchema.forceSafeReads == true then
-			return exportCompactV5InstanceWithHotSchema(state, inst, instanceIndex, className, hotSchema, true, strings, stringIds)
+		if not hotSchema.fallbacksLearned then
+			Config.learnClassPropertyFallbacks(state, inst, className, hotSchema.names)
+			hotSchema.usesFallbackMap = not not next(Config.getClassPropertyFallbackMap(state, className))
+			hotSchema.fallbacksLearned = true
 		end
-		if hotSchema.fastExportSafe == true then
-			return exportCompactV5InstanceWithHotSchema(state, inst, instanceIndex, className, hotSchema, false, strings, stringIds)
-		end
-
-		local ok, entry =
-			pcall(exportCompactV5InstanceWithHotSchema, state, inst, instanceIndex, className, hotSchema, false, strings, stringIds)
-		if ok then
-			hotSchema.fastExportSafe = true
-			return entry
-		end
-
-		local learned = Config.learnClassPropertyFallbacks(state, inst, className, hotSchema.names)
-		if learned then
-			local exporterWithFallback = hotSchema.exporterWithFallback
-			if exporterWithFallback == false or exporterWithFallback == nil then
-				exporterWithFallback = Config.buildCompactV5Exporter(className, hotSchema, true)
-				hotSchema.exporterWithFallback = exporterWithFallback
-			end
-			if hotSchema.fallbackExportSafe == true then
-				return exporterWithFallback(state, inst, instanceIndex, false, strings, stringIds)
-			end
-			local retryOk, retryEntry = pcall(exporterWithFallback, state, inst, instanceIndex, false, strings, stringIds)
-			if retryOk then
-				hotSchema.fallbackExportSafe = true
-				return retryEntry
-			end
-		end
-		hotSchema.forceSafeReads = true
-		return exportCompactV5InstanceWithHotSchema(state, inst, instanceIndex, className, hotSchema, true, strings, stringIds)
-	end
-
-	local function exportCompactV5Instance(
-		state: ServiceState,
-		inst: Instance,
-		strings: { string },
-		stringIds: { [string]: number }
-	)
-		local instanceIndex = IdentityModule.getCachedInstanceIndex(state, inst) or 1
-		return exportCompactV5InstanceIndexed(state, inst, instanceIndex, strings, stringIds)
+		return exportCompactV5InstanceWithHotSchema(
+			state,
+			inst,
+			instanceIndex,
+			className,
+			hotSchema,
+			false,
+			strings,
+			stringIds
+		)
 	end
 
 	local function getCompactWarmWorkerCount(total: number): number
 		local frameMs = perfState and tonumber(perfState.frameMs) or 16.67
-		local maxWorkers = PRE_SERIALIZE_WARM_MAX_WORKERS
-		if frameMs >= LAG_FRAME_MS then
-			maxWorkers = 1
-		elseif frameMs >= FAST_WARM_FRAME_MS then
-			maxWorkers = math.min(maxWorkers, 2)
-		elseif frameMs >= FAST_WARM_FRAME_MS * 0.75 then
-			maxWorkers = math.min(maxWorkers, 3)
-		end
+		local maxWorkers = if frameMs >= LAG_FRAME_MS
+			then 1
+			elseif frameMs >= FAST_WARM_FRAME_MS
+			then math.min(PRE_SERIALIZE_WARM_MAX_WORKERS, 2)
+			elseif frameMs >= FAST_WARM_FRAME_MS * 0.75
+			then math.min(PRE_SERIALIZE_WARM_MAX_WORKERS, 3)
+			else PRE_SERIALIZE_WARM_MAX_WORKERS
 		return math.min(maxWorkers, ParallelModule.getParallelChunkWorkerCount(total, PARALLEL_PRE_SERIALIZE_MIN_ITEMS))
 	end
 
@@ -3889,7 +3831,7 @@ function BridgePluginRuntime.start(context)
 		elseif PERFORMANCE_MODE == "balanced" then
 			return DEFAULT_ACTIVE_DEMAND_SERIALIZERS
 		end
-		if perfState == nil then
+		if not perfState then
 			return DEFAULT_ACTIVE_DEMAND_SERIALIZERS
 		end
 		local maxFrameMs = tonumber(perfState.maxFrameMsSinceLastRead) or 0
@@ -3945,23 +3887,13 @@ function BridgePluginRuntime.start(context)
 
 	local function getOrCreateCompactSerializedEntry(state: ServiceState, index: number): any
 		local serialized = ensureCompactSerializedTable(state)
-		while true do
-			local cached = serialized[index]
-			if cached == nil then
-				serialized[index] = COMPACT_SLOT_IN_PROGRESS
-				local ok, entry = pcall(exportCompactInstanceEntry, state, state.instances[index])
-				if ok then
-					serialized[index] = entry
-					return entry
-				end
-				serialized[index] = nil
-				error(entry)
-			elseif cached == COMPACT_SLOT_IN_PROGRESS then
-				task.wait()
-			else
-				return cached
-			end
+		local cached = serialized[index]
+		if cached then
+			return cached
 		end
+		local entry = exportCompactInstanceEntry(state, state.instances[index])
+		serialized[index] = entry
+		return entry
 	end
 
 	local function startCompactWarm(state: ServiceState)
@@ -3987,35 +3919,23 @@ function BridgePluginRuntime.start(context)
 				return
 			end
 			state.compactWarmStatus = "warming"
-			local ok, err = pcall(function()
-				local workerCount = getCompactWarmWorkerCount(total)
-				ParallelModule.runParallelChunks(total, workerCount, function(startIndex, endIndex)
-					local yieldIfNeeded = ParallelModule.makeBurstYielder(32, SERIALIZATION_BURST_BUDGET_SECONDS)
-					for i = startIndex, endIndex do
-						if isCompactDemandActive(state) then
-							return
-						end
-						if perfState and perfState.frameMs >= LAG_FRAME_MS then
-							task.wait()
-						end
-						local cached = serialized[i]
-						if cached == nil or cached == COMPACT_SLOT_IN_PROGRESS then
-							getOrCreateCompactSerializedEntry(state, i)
-						end
-						yieldIfNeeded()
+			local workerCount = getCompactWarmWorkerCount(total)
+			ParallelModule.runParallelChunks(total, workerCount, function(startIndex, endIndex)
+				local yieldIfNeeded = ParallelModule.makeBurstYielder(32, SERIALIZATION_BURST_BUDGET_SECONDS)
+				for i = startIndex, endIndex do
+					if isCompactDemandActive(state) then
+						return
 					end
-				end)
-			end)
-			if ok then
-				if isCompactDemandActive(state) then
-					state.compactWarmStatus = "idle"
-				else
-					state.compactWarmStatus = "ready"
+					if perfState and perfState.frameMs >= LAG_FRAME_MS then
+						task.wait()
+					end
+					if not serialized[i] then
+						getOrCreateCompactSerializedEntry(state, i)
+					end
+					yieldIfNeeded()
 				end
-			else
-				state.compactWarmStatus = "idle"
-				warn("[Renium] compact warm failed for " .. tostring(state.rootName) .. ": " .. tostring(err))
-			end
+			end)
+			state.compactWarmStatus = if isCompactDemandActive(state) then "idle" else "ready"
 		end)
 	end
 
@@ -4045,7 +3965,7 @@ function BridgePluginRuntime.start(context)
 		local parentIndexByIndex = table.create(expectedCount)
 		local unresolvedParentIndices = {}
 		local serviceClassName = service.ClassName
-		local serviceIsLuaSourceContainer = Config.LUA_SOURCE_CLASS[serviceClassName] == true
+		local serviceIsLuaSourceContainer = not not Config.LUA_SOURCE_CLASS[serviceClassName]
 		classSeen[serviceClassName] = true
 		classNames[1] = serviceClassName
 		classIdByName[serviceClassName] = 0
@@ -4072,7 +3992,7 @@ function BridgePluginRuntime.start(context)
 			instanceIdByInstance[inst] = instanceCount
 
 			local className = inst.ClassName
-			local isLuaSourceContainer = Config.LUA_SOURCE_CLASS[className] == true
+			local isLuaSourceContainer = not not Config.LUA_SOURCE_CLASS[className]
 			local parent = inst.Parent
 			if not classSeen[className] then
 				classSeen[className] = true
@@ -4201,14 +4121,13 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 
-		local preSerializedMode = "off"
-		if state.serializedInstances ~= nil then
-			preSerializedMode = "full"
-		elseif state.compactWarmStatus == "scheduled" or state.compactWarmStatus == "warming" then
-			preSerializedMode = "warming"
-		elseif state.compactWarmStatus == "ready" and state.serializedCompactInstances ~= nil then
-			preSerializedMode = "compact"
-		end
+		local preSerializedMode = if state.serializedInstances
+			then "full"
+			elseif state.compactWarmStatus == "scheduled" or state.compactWarmStatus == "warming"
+			then "warming"
+			elseif state.compactWarmStatus == "ready" and state.serializedCompactInstances
+			then "compact"
+			else "off"
 
 		return {
 			service = serviceName,
@@ -4241,7 +4160,7 @@ function BridgePluginRuntime.start(context)
 			playerUserId = playerUserId,
 			placeId = game.PlaceId,
 			gameId = game.GameId,
-			placeName = workspace:GetAttribute("__ReniumPlace") or game.Name,
+			placeName = game.Name,
 			bridgeVersion = BRIDGE_VERSION,
 			bridgeBuildUnix = BRIDGE_BUILD_UNIX,
 			protocolVersion = BRIDGE_PROTOCOL_VERSION,
@@ -4291,7 +4210,7 @@ function BridgePluginRuntime.start(context)
 	})
 	local function boundedPositiveInteger(value: any, defaultValue: number, maximum: number): number
 		local numeric = tonumber(value)
-		if numeric == nil or numeric ~= numeric then
+		if not numeric or numeric ~= numeric then
 			return defaultValue
 		end
 		return math.clamp(math.floor(numeric), 1, maximum)
@@ -4374,12 +4293,12 @@ function BridgePluginRuntime.start(context)
 		stableIdsEnabled: boolean?
 	): string
 		local key = ChunkingModule.getCompactInstanceBatchCacheKey(startIndex, maxCount)
-		if shapeBatchesEnabled == true then
+		if shapeBatchesEnabled then
 			key ..= ":shape-v1"
 		else
 			key ..= ":plain-v1"
 		end
-		if stableIdsEnabled == true then
+		if stableIdsEnabled then
 			key ..= ":stable-v1"
 		end
 		return key
@@ -4393,8 +4312,8 @@ function BridgePluginRuntime.start(context)
 		stableIdsEnabled: boolean?
 	): (string, number)
 		local state = getState(serviceName)
-		local useShapeBatches = shapeBatchesEnabled == true
-		local includeStableIds = stableIdsEnabled == true
+		local useShapeBatches = not not shapeBatchesEnabled
+		local includeStableIds = not not stableIdsEnabled
 		local key = getCompactInstanceBatchVariantCacheKey(startIndex, maxCount, useShapeBatches, includeStableIds)
 		local cachedPayload = state.batchCacheByKey[key]
 		if cachedPayload then
@@ -4405,16 +4324,10 @@ function BridgePluginRuntime.start(context)
 		local total = #instances
 		local startPos = boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
 		local take = boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
-		local encoded: string
-		local encodeMs = 0
 
-		Config.beginCompactDemand(state)
-		local acquiredSerializerSlot = false
-		local ok, resultOrErr, maybeEncodeMs = pcall(function(): (string, number)
-			Config.acquireDemandSerializerSlot()
-			acquiredSerializerSlot = true
+		local function buildPayload(): { [string]: any }
 			if startPos > total then
-				return ChunkingModule.jsonEncodeTimed({
+				return {
 					format = BRIDGE_PROTOCOL_VERSION,
 					codecVersion = CODEC_VERSION,
 					start = startPos,
@@ -4423,7 +4336,7 @@ function BridgePluginRuntime.start(context)
 					strings = {},
 					debugIds = if includeStableIds then {} else nil,
 					items = {},
-				})
+				}
 			end
 
 			local finish = math.min(total, startPos + take - 1)
@@ -4455,7 +4368,7 @@ function BridgePluginRuntime.start(context)
 						local inst = instances[i]
 						local className = state.classNameByIndex[i] or inst.ClassName
 						local hotSchema = lastHotSchema
-						if debugIds ~= nil then
+						if debugIds then
 							local debugId = IdentityModule.getCachedDebugId(state, inst)
 							debugIds[offset] = if debugId ~= nil then Config.internBatchString(strings, stringIds, debugId) else false
 						end
@@ -4480,7 +4393,7 @@ function BridgePluginRuntime.start(context)
 						propertiesRead += itemPropertiesRead or 0
 						propertiesEncoded += itemPropertiesEncoded or 0
 						propertiesDefaultSkipped += itemPropertiesDefaultSkipped or 0
-						if yieldIfNeeded ~= nil then
+						if yieldIfNeeded then
 							yieldIfNeeded()
 						end
 					end
@@ -4515,7 +4428,7 @@ function BridgePluginRuntime.start(context)
 						local inst = instances[i]
 						local className = state.classNameByIndex[i] or inst.ClassName
 						local hotSchema = lastHotSchema
-						if debugIds ~= nil then
+						if debugIds then
 							local debugId = IdentityModule.getCachedDebugId(state, inst)
 							debugIds[offset] = if debugId ~= nil then Config.internBatchString(strings, stringIds, debugId) else false
 						end
@@ -4525,7 +4438,7 @@ function BridgePluginRuntime.start(context)
 							lastHotSchema = hotSchema
 						end
 						items[offset] = exportCompactV5InstanceIndexed(state, inst, i, strings, stringIds, className, hotSchema)
-						if yieldIfNeeded ~= nil then
+						if yieldIfNeeded then
 							yieldIfNeeded()
 						end
 					end
@@ -4533,8 +4446,8 @@ function BridgePluginRuntime.start(context)
 			end
 			if useShapeBatches then
 				local shapedItems, shapes = Config.tryBuildCompactShapeBatch(items, count)
-				if shapedItems ~= nil and shapes ~= nil then
-					return ChunkingModule.jsonEncodeTimed({
+				if shapedItems and shapes then
+					return {
 						format = "compact-v5-shape",
 						codecVersion = CODEC_VERSION,
 						start = startPos,
@@ -4546,11 +4459,11 @@ function BridgePluginRuntime.start(context)
 						shapes = shapes,
 						debugIds = debugIds,
 						items = shapedItems,
-					})
+					}
 				end
 			end
 
-			return ChunkingModule.jsonEncodeTimed({
+			return {
 				format = BRIDGE_PROTOCOL_VERSION,
 				codecVersion = CODEC_VERSION,
 				start = startPos,
@@ -4561,17 +4474,15 @@ function BridgePluginRuntime.start(context)
 				strings = strings,
 				debugIds = debugIds,
 				items = items,
-			})
-		end)
-		if acquiredSerializerSlot then
-			Config.releaseDemandSerializerSlot()
+			}
 		end
+
+		Config.beginCompactDemand(state)
+		Config.acquireDemandSerializerSlot()
+		local payload = buildPayload()
+		Config.releaseDemandSerializerSlot()
 		Config.endCompactDemand(state)
-		if not ok then
-			error(resultOrErr)
-		end
-		encoded = resultOrErr
-		encodeMs = maybeEncodeMs
+		local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(payload)
 
 		state.batchCacheByKey[key] = encoded
 		state.batchCacheKeys[#state.batchCacheKeys + 1] = key
@@ -4584,7 +4495,7 @@ function BridgePluginRuntime.start(context)
 		return encoded, encodeMs
 	end
 
-	local function getClassDefaults(serviceName: string): (string, number)
+	function Config.getClassDefaults(serviceName: string): (string, number)
 		local state = getState(serviceName)
 		if state.classDefaultsEncoded then
 			return state.classDefaultsEncoded, 0
@@ -4593,7 +4504,7 @@ function BridgePluginRuntime.start(context)
 			local classDefaults = {}
 			for _, className in ipairs(state.classNames) do
 				local defaults = getDefaultSerializedProperties(className)
-				if defaults ~= nil and next(defaults) ~= nil then
+				if defaults and next(defaults) then
 					classDefaults[className] = defaults
 				end
 			end
@@ -4604,69 +4515,69 @@ function BridgePluginRuntime.start(context)
 		return state.classDefaultsEncoded, encodeMs
 	end
 
-	local function getScriptPaths(serviceName: string): (string, number)
+	function Config.getScriptPaths(serviceName: string): (string, number)
 		local state = getState(serviceName)
-		ensureScriptIndex(state)
+		ensureScriptKeyIndex(state)
 		if not state.scriptPathsEncoded then
-			local encoded = nil
-			local encodeMs = 0
-			encoded, encodeMs = ChunkingModule.jsonEncodeTimed(state.scriptPaths)
+			local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(state.scriptPaths)
 			state.scriptPathsEncoded = encoded
 			return state.scriptPathsEncoded, encodeMs
 		end
 		return state.scriptPathsEncoded, 0
 	end
 
-	local function getSourceForKey(state: ServiceState, sourceKey: string): string
+	function Config.readScriptSource(scriptInstance: Instance?, description: string): string
+		if not scriptInstance then
+			error(description .. " no longer exists in the export snapshot")
+		end
+		local ok, source = pcall(function()
+			return scriptInstance.Source
+		end)
+		if not ok then
+			error(`Unable to read {description}: {source}`)
+		end
+		if type(source) ~= "string" then
+			error(description .. " returned a non-string Source value")
+		end
+		return source
+	end
+
+	function Config.getSourceForKey(state: ServiceState, sourceKey: string): string
 		local src = state.scriptSources[sourceKey]
-		if src ~= nil then
+		if src then
 			return src
 		end
 
 		local scriptInstance = state.scriptInstances and state.scriptInstances[sourceKey] or nil
-		if scriptInstance == nil then
-			src = ""
-		else
-			local ok, loaded = pcall(function()
-				return scriptInstance.Source
-			end)
-			src = ok and loaded or ""
-		end
+		src = Config.readScriptSource(scriptInstance, "script source " .. sourceKey)
 		state.scriptSources[sourceKey] = src
 		return src
 	end
 
-	local function getSourceForIndex(state: ServiceState, sourceIndex: number): string
+	function Config.getSourceForIndex(state: ServiceState, sourceIndex: number): string
 		local src = state.scriptSourcesByIndex[sourceIndex]
-		if src ~= nil then
+		if src then
 			return src
 		end
 
 		local scriptInstance = state.scriptInstancesByIndex and state.scriptInstancesByIndex[sourceIndex] or nil
-		if scriptInstance == nil then
-			src = ""
-		else
-			local ok, loaded = pcall(function()
-				return scriptInstance.Source
-			end)
-			src = ok and loaded or ""
-		end
+		src = Config.readScriptSource(scriptInstance, "script source index " .. tostring(sourceIndex))
 		state.scriptSourcesByIndex[sourceIndex] = src
 		return src
 	end
 
-	local function getSourceChunk(serviceName: string, instancePath: string, startIndex: number?, maxLen: number?): { [string]: any }
+	function Config.getSourceChunk(serviceName: string, instancePath: string, startIndex: number?, maxLen: number?): { [string]: any }
 		local state = getState(serviceName)
-		ensureScriptIndex(state)
+		ensureScriptKeyIndex(state)
 		if #instancePath > MAX_SOURCE_KEY_BYTES then
 			error("Source key exceeds safe size limit")
 		end
-		return ChunkingModule.chunkEncodedString(getSourceForKey(state, instancePath), startIndex, maxLen, 0)
+		return ChunkingModule.chunkEncodedString(Config.getSourceForKey(state, instancePath), startIndex, maxLen, 0)
 	end
 
-	local function getSourceBatchEncoded(serviceName: string, instancePaths: { any }): (string, number)
+	function Config.getSourceBatchEncoded(serviceName: string, instancePaths: { any }): (string, number)
 		local state = getState(serviceName)
-		ensureScriptIndex(state)
+		ensureScriptKeyIndex(state)
 		if type(instancePaths) ~= "table" or #instancePaths > MAX_SOURCE_BATCH_PATHS then
 			error("Source batch has too many paths")
 		end
@@ -4690,11 +4601,11 @@ function BridgePluginRuntime.start(context)
 		ParallelModule.runParallelChunks(#normalizedPaths, workerCount, function(startIndex, endIndex)
 			for i = startIndex, endIndex do
 				local sourceKey = normalizedPaths[i]
-				sourcesByIndex[i] = getSourceForKey(state, sourceKey)
+				sourcesByIndex[i] = Config.getSourceForKey(state, sourceKey)
 			end
 		end)
 		for i, sourceKey in ipairs(normalizedPaths) do
-			out[sourceKey] = sourcesByIndex[i] or ""
+			out[sourceKey] = sourcesByIndex[i]
 		end
 
 		local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(out)
@@ -4709,9 +4620,9 @@ function BridgePluginRuntime.start(context)
 		return encoded, encodeMs
 	end
 
-	local function getSourceRangeBatchCompact(serviceName: string, startIndex: number?, maxCount: number?): (string, number)
+	function Config.getSourceRangeBatchCompact(serviceName: string, startIndex: number?, maxCount: number?): (string, number)
 		local state = getState(serviceName)
-		ensureScriptIndex(state)
+		ensureScriptRangeIndex(state)
 		local total = state.scriptIndices and #state.scriptIndices or 0
 		local startPos = boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
 		local take = boundedPositiveInteger(maxCount, 64, MAX_SOURCE_BATCH_PATHS)
@@ -4742,14 +4653,14 @@ function BridgePluginRuntime.start(context)
 					local scriptIndex = startPos + offset - 1
 					local sourceIndex = state.scriptIndices and state.scriptIndices[scriptIndex] or 0
 					indicesByIndex[offset] = sourceIndex
-					sourcesByIndex[offset] = getSourceForIndex(state, sourceIndex)
+					sourcesByIndex[offset] = Config.getSourceForIndex(state, sourceIndex)
 				end
 			end)
 
 			local items = table.create(count * 2)
 			for offset = 1, count do
-				items[#items + 1] = indicesByIndex[offset] or 0
-				items[#items + 1] = sourcesByIndex[offset] or ""
+				items[#items + 1] = indicesByIndex[offset]
+				items[#items + 1] = sourcesByIndex[offset]
 			end
 			encoded, encodeMs = ChunkingModule.jsonEncodeTimed({
 				format = "source-pairs-v2",
@@ -4771,34 +4682,22 @@ function BridgePluginRuntime.start(context)
 		return encoded, encodeMs
 	end
 
-	local function getSourceBatchChunk(
+	function Config.getSourceBatchChunk(
 		serviceName: string,
 		instancePaths: { any },
 		startIndex: number?,
 		maxLen: number?
 	): { [string]: any }
-		local state = getState(serviceName)
-		local encoded, encodeMs = getSourceBatchEncoded(serviceName, instancePaths)
-		local cacheKey = ChunkingModule.getSourceBatchCacheKey(instancePaths)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			ChunkingModule.removeCachedPayload(state.sourceBatchCacheByKey, state.sourceBatchCacheKeys, cacheKey)
-		end
-		return chunk
+		local encoded, encodeMs = Config.getSourceBatchEncoded(serviceName, instancePaths)
+		return ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
 	end
 
-	local function getInstanceBatchChunk(serviceName: string, startIndex: number?, maxCount: number?, chunkStart: number?, maxLen: number?): { [string]: any }
-		local state = getState(serviceName)
-		local cacheKey = ChunkingModule.getInstanceBatchCacheKey(startIndex, maxCount)
+	function Config.getInstanceBatchChunk(serviceName: string, startIndex: number?, maxCount: number?, chunkStart: number?, maxLen: number?): { [string]: any }
 		local encoded, encodeMs = getInstanceBatch(serviceName, startIndex, maxCount)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			ChunkingModule.removeCachedPayload(state.batchCacheByKey, state.batchCacheKeys, cacheKey)
-		end
-		return chunk
+		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
 	end
 
-	local function getInstanceBatchCompactChunk(
+	function Config.getInstanceBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
 		maxCount: number?,
@@ -4807,377 +4706,346 @@ function BridgePluginRuntime.start(context)
 		shapeBatchesEnabled: boolean?,
 		stableIdsEnabled: boolean?
 	): { [string]: any }
-		local state = getState(serviceName)
-		local cacheKey = getCompactInstanceBatchVariantCacheKey(startIndex, maxCount, shapeBatchesEnabled == true, stableIdsEnabled == true)
-		local encoded, encodeMs = getInstanceBatchCompact(serviceName, startIndex, maxCount, shapeBatchesEnabled == true, stableIdsEnabled == true)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			ChunkingModule.removeCachedPayload(state.batchCacheByKey, state.batchCacheKeys, cacheKey)
-		end
-		return chunk
+		local encoded, encodeMs =
+			getInstanceBatchCompact(serviceName, startIndex, maxCount, not not shapeBatchesEnabled, not not stableIdsEnabled)
+		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
 	end
 
-	local function getClassDefaultsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
-		local state = getState(serviceName)
-		local encoded, encodeMs = getClassDefaults(serviceName)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			state.classDefaultsEncoded = nil
-		end
-		return chunk
+	function Config.getClassDefaultsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
+		local encoded, encodeMs = Config.getClassDefaults(serviceName)
+		return ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
 	end
 
-	local function getScriptPathsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
-		local state = getState(serviceName)
-		local encoded, encodeMs = getScriptPaths(serviceName)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			state.scriptPathsEncoded = nil
-		end
-		return chunk
+	function Config.getScriptPathsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
+		local encoded, encodeMs = Config.getScriptPaths(serviceName)
+		return ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
 	end
 
-	local function getSourceRangeBatchCompactChunk(
+	function Config.getSourceRangeBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
 		maxCount: number?,
 		chunkStart: number?,
 		maxLen: number?
 	): { [string]: any }
-		local state = getState(serviceName)
-		local cacheKey = ChunkingModule.getSourceRangeBatchCacheKey(startIndex, maxCount)
-		local encoded, encodeMs = getSourceRangeBatchCompact(serviceName, startIndex, maxCount)
-		local chunk = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-		if chunk.nextStart > chunk.total then
-			ChunkingModule.removeCachedPayload(state.sourceBatchCacheByKey, state.sourceBatchCacheKeys, cacheKey)
-		end
-		return chunk
+		local encoded, encodeMs = Config.getSourceRangeBatchCompact(serviceName, startIndex, maxCount)
+		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
 	end
 
 	local perfState
+	local BRIDGE_METHOD_HANDLERS = {}
 
-	function Config.handleMethod(method: string, params: { [string]: any }?): any
-		local p = params or {}
-		if method == "ping" then
-			return { ok = true, timestamp = os.time() }
-		elseif method == "getBridgeInfo" then
-			return Config.getBridgeInfo()
-		elseif method == "getPerformanceStats" then
-			local exportMetrics = Config.collectAndResetExportMetrics()
-			local stats = {
-				fps = perfState.fps,
-				frameMs = perfState.frameMs,
-				lastFrameMs = perfState.lastFrameMs,
-				maxFrameMs = perfState.maxFrameMsSinceLastRead,
-				lastHeartbeat = perfState.lastHeartbeat,
-				sampleCount = perfState.sampleCount,
-				sampleCountSinceLastRead = perfState.sampleCountSinceLastRead,
-				stallCountOver33Ms = perfState.stallCountOver33MsSinceLastRead,
-				stallCountOver50Ms = perfState.stallCountOver50MsSinceLastRead,
-				stallCountOver100Ms = perfState.stallCountOver100MsSinceLastRead,
-				modifiedDefaultChecks = exportMetrics.modifiedDefaultChecks,
-				modifiedDefaultElided = exportMetrics.modifiedDefaultElided,
-				modifiedDefaultValidationReads = exportMetrics.modifiedDefaultValidationReads,
-				modifiedDefaultRuntimeDenylistCount = exportMetrics.modifiedDefaultRuntimeDenylistCount,
-				propertiesRead = exportMetrics.propertiesRead,
-				propertiesEncoded = exportMetrics.propertiesEncoded,
-				propertiesDefaultSkipped = exportMetrics.propertiesDefaultSkipped,
-				safeReadClassFallbackCount = exportMetrics.safeReadClassFallbackCount,
-				safeReadPropertyFallbackCount = exportMetrics.safeReadPropertyFallbackCount,
-				editorSync = editorSyncStats,
+	BRIDGE_METHOD_HANDLERS.ping = function()
+		return { ok = true, timestamp = os.time() }
+	end
+
+	BRIDGE_METHOD_HANDLERS.getBridgeInfo = function()
+		return Config.getBridgeInfo()
+	end
+
+	BRIDGE_METHOD_HANDLERS.getPerformanceStats = function()
+		local exportMetrics = Config.collectAndResetExportMetrics()
+		local stats = {
+			fps = perfState.fps,
+			frameMs = perfState.frameMs,
+			lastFrameMs = perfState.lastFrameMs,
+			maxFrameMs = perfState.maxFrameMsSinceLastRead,
+			lastHeartbeat = perfState.lastHeartbeat,
+			sampleCount = perfState.sampleCount,
+			sampleCountSinceLastRead = perfState.sampleCountSinceLastRead,
+			stallCountOver33Ms = perfState.stallCountOver33MsSinceLastRead,
+			stallCountOver50Ms = perfState.stallCountOver50MsSinceLastRead,
+			stallCountOver100Ms = perfState.stallCountOver100MsSinceLastRead,
+			modifiedDefaultChecks = exportMetrics.modifiedDefaultChecks,
+			modifiedDefaultElided = exportMetrics.modifiedDefaultElided,
+			modifiedDefaultValidationReads = exportMetrics.modifiedDefaultValidationReads,
+			modifiedDefaultRuntimeDenylistCount = exportMetrics.modifiedDefaultRuntimeDenylistCount,
+			propertiesRead = exportMetrics.propertiesRead,
+			propertiesEncoded = exportMetrics.propertiesEncoded,
+			propertiesDefaultSkipped = exportMetrics.propertiesDefaultSkipped,
+			safeReadClassFallbackCount = exportMetrics.safeReadClassFallbackCount,
+			safeReadPropertyFallbackCount = exportMetrics.safeReadPropertyFallbackCount,
+			editorSync = editorSyncStats,
+		}
+		perfState.maxFrameMsSinceLastRead = 0
+		perfState.sampleCountSinceLastRead = 0
+		perfState.stallCountOver33MsSinceLastRead = 0
+		perfState.stallCountOver50MsSinceLastRead = 0
+		perfState.stallCountOver100MsSinceLastRead = 0
+		return stats
+	end
+
+	BRIDGE_METHOD_HANDLERS.configurePropertyCandidates = function(p)
+		return configurePropertyCandidates(p.classes)
+	end
+
+	BRIDGE_METHOD_HANDLERS.setExportOptions = configureExportOptions
+
+	BRIDGE_METHOD_HANDLERS.beginEditorPushReview = function(p)
+		pruneEditorReviewUploads()
+		local uploadId = tostring(p.uploadId or "")
+		local totalChunks = tonumber(p.totalChunks)
+		local changeCount = tonumber(p.changeCount)
+		local rowCount = tonumber(p.rowCount)
+		if uploadId == "" or not totalChunks or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
+			error("Invalid editor review upload")
+		end
+		if not changeCount or changeCount < 0 or changeCount > MAX_EDITOR_REVIEW_CHANGES or changeCount % 1 ~= 0 then
+			error("Invalid editor review change count")
+		end
+		if not rowCount or rowCount < 1 or rowCount > MAX_EDITOR_REVIEW_CHANGES or rowCount % 1 ~= 0 then
+			error("Invalid editor review row count")
+		end
+		if not Config.editorReviewUploads[uploadId] and editorReviewUploadCount() >= MAX_EDITOR_REVIEW_UPLOADS then
+			error("Too many active editor review uploads")
+		end
+		Config.editorReviewUploads[uploadId] = {
+			changeCount = changeCount,
+			rowCount = rowCount,
+			totalChunks = totalChunks,
+			chunks = table.create(totalChunks),
+			receivedChunks = 0,
+			receivedRows = 0,
+			updatedAt = os.clock(),
+		}
+		armEditorReviewUploadExpiry(uploadId, Config.editorReviewUploads[uploadId])
+		return { ok = true, uploadId = uploadId }
+	end
+
+	BRIDGE_METHOD_HANDLERS.appendEditorPushReview = function(p)
+		pruneEditorReviewUploads()
+		local uploadId = tostring(p.uploadId or "")
+		local upload = Config.editorReviewUploads[uploadId]
+		if type(upload) ~= "table" then
+			error("Editor review upload was not found")
+		end
+		local index = tonumber(p.index)
+		if not index or index < 1 or index > upload.totalChunks or index % 1 ~= 0 or type(p.rows) ~= "table" then
+			error("Invalid editor review upload chunk")
+		end
+		if not upload.chunks[index] then
+			if upload.receivedRows + #p.rows > upload.rowCount then
+				error("Editor review upload exceeds its declared row count")
+			end
+			upload.chunks[index] = p.rows
+			upload.receivedChunks += 1
+			upload.receivedRows += #p.rows
+		end
+		armEditorReviewUploadExpiry(uploadId, upload)
+		return { ok = true, rows = #p.rows }
+	end
+
+	BRIDGE_METHOD_HANDLERS.finishEditorPushReview = function(p)
+		pruneEditorReviewUploads()
+		local uploadId = tostring(p.uploadId or "")
+		local upload = Config.editorReviewUploads[uploadId]
+		Config.editorReviewUploads[uploadId] = nil
+		if type(upload) ~= "table"
+			or upload.receivedChunks ~= upload.totalChunks
+			or upload.receivedRows ~= upload.rowCount
+		then
+			error("Editor review upload is incomplete")
+		end
+		local rows = {}
+		for index = 1, upload.totalChunks do
+			for _, row in ipairs(upload.chunks[index]) do
+				rows[#rows + 1] = row
+			end
+		end
+		return ui.requestEditorPushReview({
+			changeCount = upload.changeCount,
+			rows = rows,
+		}, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
+			decodeValue = editorSync.decodeReviewValue,
+			readProperty = editorSync.readReviewProperty,
+			valuesEqual = EditorSyncModule.valuesEqual,
+			resolveInstance = editorSync.resolveReviewInstance,
+		})
+	end
+
+	BRIDGE_METHOD_HANDLERS.cancelEditorPushReview = function(p)
+		local uploadId = tostring(p.uploadId or "")
+		local found = Config.editorReviewUploads[uploadId] ~= nil
+		Config.editorReviewUploads[uploadId] = nil
+		return { ok = true, found = found }
+	end
+
+	BRIDGE_METHOD_HANDLERS.requestEditorPushReview = function(p)
+		return ui.requestEditorPushReview(p, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
+			decodeValue = editorSync.decodeReviewValue,
+			readProperty = editorSync.readReviewProperty,
+			valuesEqual = EditorSyncModule.valuesEqual,
+			resolveInstance = editorSync.resolveReviewInstance,
+		})
+	end
+
+	BRIDGE_METHOD_HANDLERS.requestProtectedWriteReview = function(p)
+		return ui.requestProtectedWriteReview(p, {
+			decodeValue = editorSync.decodeReviewValue,
+			readProperty = editorSync.readReviewProperty,
+			valuesEqual = EditorSyncModule.valuesEqual,
+			resolveInstance = editorSync.resolveReviewInstance,
+		})
+	end
+
+	BRIDGE_METHOD_HANDLERS.getEditorPushReviewDecision = ui.getEditorPushReviewDecision
+	BRIDGE_METHOD_HANDLERS.setEditorPushReviewDecision = ui.setEditorPushReviewDecision
+
+	BRIDGE_METHOD_HANDLERS.savePlace = function()
+		return { ok = game:SavePlace(Enum.SaveFilter.SaveAll) }
+	end
+
+	BRIDGE_METHOD_HANDLERS.beginEditorBinaryExport = editorSync.beginBinaryExport
+	BRIDGE_METHOD_HANDLERS.readEditorBinaryExport = editorSync.readBinaryExport
+	BRIDGE_METHOD_HANDLERS.finishEditorBinaryExport = editorSync.finishBinaryExport
+	BRIDGE_METHOD_HANDLERS.beginEditorBinaryImport = editorSync.beginBinaryImport
+	BRIDGE_METHOD_HANDLERS.appendEditorBinaryImport = editorSync.appendBinaryImport
+	BRIDGE_METHOD_HANDLERS.cancelEditorBinaryImport = editorSync.cancelBinaryImport
+	BRIDGE_METHOD_HANDLERS.cancelEditorReconcile = editorSync.cancelReconcile
+
+	BRIDGE_METHOD_HANDLERS.finishEditorBinaryImport = function(p)
+		Config.studioChanges.beginSuppress()
+		local ok, result = pcall(editorSync.finishBinaryImport, p)
+		task.defer(Config.studioChanges.endSuppress, 0)
+		if not ok then
+			error(result, 0)
+		end
+		return result
+	end
+
+	BRIDGE_METHOD_HANDLERS.applyEditorChanges = function(p)
+		Config.studioChanges.beginSuppress()
+		local ok, result = pcall(editorSync.applyChanges, p)
+		task.defer(Config.studioChanges.endSuppress, 0)
+		if not ok then
+			error(result, 0)
+		end
+		return result
+	end
+
+	BRIDGE_METHOD_HANDLERS.getStudioChangeState = function(p)
+		local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
+		if runtimeSettings.twoWaySync == false then
+			return {
+				ok = true,
+				tracking = false,
+				role = Config.bridgeRole,
+				dirtyServices = {},
+				fullSyncServices = {},
+				propertyChanges = {},
+				changes = {},
+				twoWaySyncEnabled = false,
+				runtimeSettings = runtimeSettings,
 			}
-			perfState.maxFrameMsSinceLastRead = 0
-			perfState.sampleCountSinceLastRead = 0
-			perfState.stallCountOver33MsSinceLastRead = 0
-			perfState.stallCountOver50MsSinceLastRead = 0
-			perfState.stallCountOver100MsSinceLastRead = 0
-			return stats
-		elseif method == "configurePropertyCandidates" then
-			return configurePropertyCandidates(p.classes)
-		elseif method == "setExportOptions" then
-			return configureExportOptions(p)
-		elseif method == "beginEditorPushReview" then
-			pruneEditorReviewUploads()
-			local uploadId = tostring(p.uploadId or "")
-			local totalChunks = tonumber(p.totalChunks)
-			local changeCount = tonumber(p.changeCount)
-			if uploadId == "" or totalChunks == nil or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
-				error("Invalid editor review upload")
-			end
-			if changeCount == nil or changeCount < 0 or changeCount > MAX_EDITOR_REVIEW_CHANGES or changeCount % 1 ~= 0 then
-				error("Invalid editor review change count")
-			end
-			if Config.editorReviewUploads[uploadId] == nil and editorReviewUploadCount() >= MAX_EDITOR_REVIEW_UPLOADS then
-				error("Too many active editor review uploads")
-			end
-			Config.editorReviewUploads[uploadId] = {
-				changeCount = changeCount,
-				totalChunks = totalChunks,
-				chunks = table.create(totalChunks),
-				receivedChunks = 0,
-				receivedRows = 0,
-				updatedAt = os.clock(),
-			}
-			armEditorReviewUploadExpiry(uploadId, Config.editorReviewUploads[uploadId])
-			return { ok = true, uploadId = uploadId }
-		elseif method == "appendEditorPushReview" then
-			pruneEditorReviewUploads()
-			local uploadId = tostring(p.uploadId or "")
-			local upload = Config.editorReviewUploads[uploadId]
-			if type(upload) ~= "table" then
-				error("Editor review upload was not found")
-			end
-			local index = tonumber(p.index)
-			if index == nil or index < 1 or index > upload.totalChunks or index % 1 ~= 0 or type(p.rows) ~= "table" then
-				error("Invalid editor review upload chunk")
-			end
-			if upload.chunks[index] == nil then
-				if upload.receivedRows + #p.rows > upload.changeCount then
-					error("Editor review upload exceeds its declared change count")
-				end
-				upload.chunks[index] = p.rows
-				upload.receivedChunks += 1
-				upload.receivedRows += #p.rows
-			end
-			armEditorReviewUploadExpiry(uploadId, upload)
-			return { ok = true, rows = #p.rows }
-		elseif method == "finishEditorPushReview" then
-			pruneEditorReviewUploads()
-			local uploadId = tostring(p.uploadId or "")
-			local upload = Config.editorReviewUploads[uploadId]
-			Config.editorReviewUploads[uploadId] = nil
-			if type(upload) ~= "table"
-				or upload.receivedChunks ~= upload.totalChunks
-				or upload.receivedRows ~= upload.changeCount
-			then
-				error("Editor review upload is incomplete")
-			end
-			local rows = {}
-			for index = 1, upload.totalChunks do
-				for _, row in ipairs(upload.chunks[index]) do
-					table.insert(rows, row)
+		end
+		local changeState = Config.studioChanges.getState(p)
+		changeState.twoWaySyncEnabled = true
+		changeState.runtimeSettings = runtimeSettings
+		return changeState
+	end
+
+	BRIDGE_METHOD_HANDLERS.setConflictResolution = function(p)
+		if type(p.value) ~= "string" then
+			error("setConflictResolution requires a string value")
+		end
+		local conflictResolution = Config.studioChanges.setConflictResolution(p.value)
+		SettingsModule.saveConflictResolution(plugin, SETTINGS_PREFIX, conflictResolution)
+		return { ok = true, conflictResolution = conflictResolution }
+	end
+
+	BRIDGE_METHOD_HANDLERS.getConsoleOutput = RuntimeApi.getConsoleOutput
+	BRIDGE_METHOD_HANDLERS.getGuiBounds = RuntimeApi.getGuiBounds
+	BRIDGE_METHOD_HANDLERS.getGuiInventory = RuntimeApi.getGuiInventory
+	BRIDGE_METHOD_HANDLERS.getWorldPoint = RuntimeApi.getWorldPoint
+	BRIDGE_METHOD_HANDLERS.getMouseLocation = RuntimeApi.getMouseLocation
+	BRIDGE_METHOD_HANDLERS.deviceSimulator = RuntimeApi.deviceSimulator
+	BRIDGE_METHOD_HANDLERS.captureViewportProbe = RuntimeApi.captureViewportProbe
+	BRIDGE_METHOD_HANDLERS.executeLuau = RuntimeApi.executeLuau
+	BRIDGE_METHOD_HANDLERS.startStopPlay = RuntimeApi.startStopPlay
+
+	BRIDGE_METHOD_HANDLERS.recordSyncCompletion = function()
+		editorSyncStats.lastAtUnix = os.time()
+		editorSyncStats.lastOk = true
+		Config.updateStatusText()
+		return { ok = true }
+	end
+
+	BRIDGE_METHOD_HANDLERS.prepareForNextRun = function()
+		return "ok"
+	end
+
+	BRIDGE_METHOD_HANDLERS.prepare = function(p)
+		return prepareService(tostring(p.service))
+	end
+
+	BRIDGE_METHOD_HANDLERS.profilePluginOps = function(p)
+		return Config.profilePluginOps(tostring(p.service), tonumber(p.sampleCount), tonumber(p.iterations), p.flags)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getInstanceBatchChunk = function(p)
+		return Config.getInstanceBatchChunk(tostring(p.service), p.startIndex, p.maxCount, p.chunkStart, p.maxLen)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getInstanceBatchCompactChunk = function(p)
+		local shapeBatchesEnabled = p.supportsShapeBatches == true
+			or p.shapeCompact == true
+			or p.shapeCompactV5 == true
+		if not shapeBatchesEnabled and type(p.supportedFormats) == "table" then
+			for _, formatName in pairs(p.supportedFormats) do
+				if formatName == "compact-v5-shape" or formatName == "compact-v6-shape" then
+					shapeBatchesEnabled = true
+					break
 				end
 			end
-			return ui.requestEditorPushReview({
-				changeCount = upload.changeCount,
-				rows = rows,
-			}, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
-				decodeValue = editorSync.decodeReviewValue,
-				readProperty = editorSync.readReviewProperty,
-				valuesEqual = EditorSyncModule.valuesEqual,
-				resolveInstance = editorSync.resolveReviewInstance,
-			})
-		elseif method == "cancelEditorPushReview" then
-			local uploadId = tostring(p.uploadId or "")
-			local found = Config.editorReviewUploads[uploadId] ~= nil
-			Config.editorReviewUploads[uploadId] = nil
-			return { ok = true, found = found }
-		elseif method == "requestEditorPushReview" then
-			return ui.requestEditorPushReview(p, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
-				decodeValue = editorSync.decodeReviewValue,
-				readProperty = editorSync.readReviewProperty,
-				valuesEqual = EditorSyncModule.valuesEqual,
-				resolveInstance = editorSync.resolveReviewInstance,
-			})
-		elseif method == "requestProtectedWriteReview" then
-			return ui.requestProtectedWriteReview(p, {
-				decodeValue = editorSync.decodeReviewValue,
-				readProperty = editorSync.readReviewProperty,
-				valuesEqual = EditorSyncModule.valuesEqual,
-				resolveInstance = editorSync.resolveReviewInstance,
-			})
-		elseif method == "getEditorPushReviewDecision" then
-			return ui.getEditorPushReviewDecision(p)
-		elseif method == "setEditorPushReviewDecision" then
-			return ui.setEditorPushReviewDecision(p)
-		elseif method == "savePlace" then
-			return { ok = game:SavePlace(Enum.SaveFilter.SaveAll) }
-		elseif method == "beginEditorBinaryExport" then
-			return editorSync.beginBinaryExport(p)
-		elseif method == "readEditorBinaryExport" then
-			return editorSync.readBinaryExport(p)
-		elseif method == "finishEditorBinaryExport" then
-			return editorSync.finishBinaryExport(p)
-		elseif method == "beginEditorBinaryImport" then
-			return editorSync.beginBinaryImport(p)
-		elseif method == "appendEditorBinaryImport" then
-			return editorSync.appendBinaryImport(p)
-		elseif method == "cancelEditorBinaryImport" then
-			return editorSync.cancelBinaryImport(p)
-		elseif method == "cancelEditorReconcile" then
-			return editorSync.cancelReconcile(p)
-		elseif method == "finishEditorBinaryImport" then
-			Config.studioChanges.beginSuppress()
-			local ok, result = pcall(function()
-				return editorSync.finishBinaryImport(p)
-			end)
-			task.defer(function()
-				Config.studioChanges.endSuppress(0)
-			end)
-			if not ok then
-				error(result, 0)
-			end
-			return result
-		elseif method == "applyEditorChanges" then
-			Config.studioChanges.beginSuppress()
-			local ok, result = pcall(function()
-				return editorSync.applyChanges(p)
-			end)
-			task.defer(function()
-				Config.studioChanges.endSuppress(0)
-			end)
-			if not ok then
-				error(result, 0)
-			end
-			return result
-		elseif method == "getStudioChangeState" then
-			local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
-			if runtimeSettings.twoWaySync == false then
-				return {
-					ok = true,
-					tracking = false,
-					role = Config.bridgeRole,
-					dirtyServices = {},
-					fullSyncServices = {},
-					propertyChanges = {},
-					changes = {},
-					twoWaySyncEnabled = false,
-					runtimeSettings = runtimeSettings,
-				}
-			end
-			local changeState = Config.studioChanges.getState(p)
-			changeState.twoWaySyncEnabled = true
-			changeState.runtimeSettings = runtimeSettings
-			return changeState
-		elseif method == "setConflictResolution" then
-			Config.studioChanges.setConflictResolution(tostring(p.value or ""))
-			SettingsModule.saveConflictResolution(
-				plugin,
-				SETTINGS_PREFIX,
-				Config.studioChanges.getConflictResolution()
-			)
-			return { ok = true, conflictResolution = Config.studioChanges.getConflictResolution() }
-		elseif method == "getConsoleOutput" then
-			return RuntimeApi.getConsoleOutput(p)
-		elseif method == "getGuiBounds" then
-			return RuntimeApi.getGuiBounds(p)
-		elseif method == "getGuiInventory" then
-			return RuntimeApi.getGuiInventory(p)
-		elseif method == "getWorldPoint" then
-			return RuntimeApi.getWorldPoint(p)
-		elseif method == "getMouseLocation" then
-			return RuntimeApi.getMouseLocation(p)
-		elseif method == "deviceSimulator" then
-			return RuntimeApi.deviceSimulator(p)
-		elseif method == "captureViewportProbe" then
-			return RuntimeApi.captureViewportProbe(p)
-		elseif method == "executeLuau" then
-			return RuntimeApi.executeLuau(p)
-		elseif method == "startStopPlay" then
-			return RuntimeApi.startStopPlay(p)
-		elseif method == "prepareForNextRun" then
-			return "ok"
-		elseif method == "prepare" then
-			return prepareService(tostring(p.service))
-		elseif method == "profilePluginOps" then
-			return Config.profilePluginOps(tostring(p.service), tonumber(p.sampleCount), tonumber(p.iterations), p.flags)
-		elseif method == "getInstanceBatchChunk" then
-			return getInstanceBatchChunk(tostring(p.service), p.startIndex, p.maxCount, p.chunkStart, p.maxLen)
-		elseif method == "getInstanceBatchCompactChunk" then
-			local shapeBatchesEnabled = p.supportsShapeBatches == true
-				or p.shapeCompact == true
-				or p.shapeCompactV5 == true
-			if not shapeBatchesEnabled and type(p.supportedFormats) == "table" then
-				for _, formatName in pairs(p.supportedFormats) do
-					if formatName == "compact-v5-shape" or formatName == "compact-v6-shape" then
-						shapeBatchesEnabled = true
-						break
-					end
-				end
-			end
-			return getInstanceBatchCompactChunk(
-				tostring(p.service),
-				p.startIndex,
-				p.maxCount,
-				p.chunkStart,
-				p.maxLen,
-				shapeBatchesEnabled,
-				p.supportsStableInstanceIds == true or p.stableInstanceIds == true
-			)
-		elseif method == "getClassDefaultsChunk" then
-			return getClassDefaultsChunk(tostring(p.service), p.startIndex, p.maxLen)
-		elseif method == "getScriptPathsChunk" then
-			return getScriptPathsChunk(tostring(p.service), p.startIndex, p.maxLen)
-		elseif method == "getSourceBatchChunk" then
-			return getSourceBatchChunk(tostring(p.service), p.instancePaths or {}, p.startIndex, p.maxLen)
-		elseif method == "getSourceRangeBatchCompactChunk" then
-			return getSourceRangeBatchCompactChunk(tostring(p.service), p.startIndex, p.maxCount, p.chunkStart, p.maxLen)
-		elseif method == "getSourceChunk" then
-			return getSourceChunk(tostring(p.service), tostring(p.instancePath), p.startIndex, p.maxLen)
-		elseif method == "release" then
-			local serviceName = tostring(p.service)
-			local state = stateByService[serviceName]
-			if state ~= nil then
-				if stateByService[serviceName] == state then
-					stateByService[serviceName] = nil
-				end
-				local metrics = state.exportMetrics
-				local hasMetrics = state.modifiedDefaultElidedCount > 0
-					or (metrics.modifiedDefaultChecks or 0) > 0
-					or (metrics.modifiedDefaultElided or 0) > 0
-					or (metrics.modifiedDefaultValidationReads or 0) > 0
-					or (metrics.modifiedDefaultRuntimeDenylistCount or 0) > 0
-					or (metrics.propertiesRead or 0) > 0
-					or (metrics.propertiesEncoded or 0) > 0
-					or (metrics.propertiesDefaultSkipped or 0) > 0
-					or (metrics.safeReadClassFallbackCount or 0) > 0
-					or (metrics.safeReadPropertyFallbackCount or 0) > 0
-				if false and hasMetrics then
-					print(
-						("[Renium] %s export metrics: modified_checks=%d modified_elided=%d modified_validation_reads=%d modified_denylist=%d properties_read=%d properties_encoded=%d properties_default_skipped=%d pcall_class_fallbacks=%d pcall_property_fallbacks=%d"):format(
-							serviceName,
-							metrics.modifiedDefaultChecks or 0,
-							metrics.modifiedDefaultElided or 0,
-							metrics.modifiedDefaultValidationReads or 0,
-							metrics.modifiedDefaultRuntimeDenylistCount or 0,
-							metrics.propertiesRead or 0,
-							metrics.propertiesEncoded or 0,
-							metrics.propertiesDefaultSkipped or 0,
-							metrics.safeReadClassFallbackCount or 0,
-							metrics.safeReadPropertyFallbackCount or 0
-						)
-					)
-					if state.modifiedDefaultElidedCount > 0 then
-						local classPairs = {}
-						for className, count in pairs(state.modifiedDefaultElidedByClass) do
-							classPairs[#classPairs + 1] = { className, count }
-						end
-						table.sort(classPairs, function(a, b)
-							if a[2] == b[2] then
-								return tostring(a[1]) < tostring(b[1])
-							end
-							return a[2] > b[2]
-						end)
-						local topParts = {}
-						for i = 1, math.min(5, #classPairs) do
-							local pair = classPairs[i]
-							topParts[i] = tostring(pair[1]) .. ":" .. tostring(pair[2])
-						end
-						print(
-							("[Renium] %s modified-default bypass: checks=%d omitted=%d top=%s"):format(
-								serviceName,
-								state.modifiedDefaultCheckCount,
-								state.modifiedDefaultElidedCount,
-								#topParts > 0 and table.concat(topParts, ",") or "none"
-							)
-						)
-					end
-				end
-			end
-			return "ok"
-		else
+		end
+		return Config.getInstanceBatchCompactChunk(
+			tostring(p.service),
+			p.startIndex,
+			p.maxCount,
+			p.chunkStart,
+			p.maxLen,
+			shapeBatchesEnabled,
+			p.supportsStableInstanceIds == true or p.stableInstanceIds == true
+		)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getClassDefaultsChunk = function(p)
+		return Config.getClassDefaultsChunk(tostring(p.service), p.startIndex, p.maxLen)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getScriptPathsChunk = function(p)
+		return Config.getScriptPathsChunk(tostring(p.service), p.startIndex, p.maxLen)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getSourceBatchChunk = function(p)
+		return Config.getSourceBatchChunk(tostring(p.service), p.instancePaths or {}, p.startIndex, p.maxLen)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getSourceRangeBatchCompactChunk = function(p)
+		return Config.getSourceRangeBatchCompactChunk(
+			tostring(p.service),
+			p.startIndex,
+			p.maxCount,
+			p.chunkStart,
+			p.maxLen
+		)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getSourceChunk = function(p)
+		return Config.getSourceChunk(tostring(p.service), tostring(p.instancePath), p.startIndex, p.maxLen)
+	end
+
+	BRIDGE_METHOD_HANDLERS.release = function(p)
+		stateByService[tostring(p.service)] = nil
+		return "ok"
+	end
+
+	function Config.handleMethod(method: string, params: { [string]: any }): any
+		local handler = BRIDGE_METHOD_HANDLERS[method]
+		if not handler then
 			error("Unknown method: " .. tostring(method))
 		end
+		return handler(params)
 	end
 
 	perfState = {
@@ -5221,9 +5089,23 @@ function BridgePluginRuntime.start(context)
 		end
 	end)
 
-	local BRIDGE_ALLOWED_METHODS = {
-		ping = true,
-		getBridgeInfo = true,
+	local BRIDGE_EXCLUSIVE_METHODS = {
+		configurePropertyCandidates = true,
+		setExportOptions = true,
+		applyEditorChanges = true,
+		finishEditorBinaryImport = true,
+		beginEditorBinaryExport = true,
+		savePlace = true,
+		setConflictResolution = true,
+		deviceSimulator = true,
+		captureViewportProbe = true,
+		executeLuau = true,
+		startStopPlay = true,
+		prepareForNextRun = true,
+		prepare = true,
+		release = true,
+	}
+	local BRIDGE_REPLAY_PROTECTED_METHODS = {
 		getPerformanceStats = true,
 		configurePropertyCandidates = true,
 		setExportOptions = true,
@@ -5239,18 +5121,14 @@ function BridgePluginRuntime.start(context)
 		cancelEditorPushReview = true,
 		requestEditorPushReview = true,
 		requestProtectedWriteReview = true,
-		getEditorPushReviewDecision = true,
 		setEditorPushReviewDecision = true,
 		savePlace = true,
 		beginEditorBinaryExport = true,
-		readEditorBinaryExport = true,
 		finishEditorBinaryExport = true,
 		getStudioChangeState = true,
 		setConflictResolution = true,
 		getConsoleOutput = true,
 		getGuiBounds = true,
-		getGuiInventory = true,
-		getWorldPoint = true,
 		getMouseLocation = true,
 		deviceSimulator = true,
 		captureViewportProbe = true,
@@ -5259,29 +5137,6 @@ function BridgePluginRuntime.start(context)
 		prepareForNextRun = true,
 		prepare = true,
 		profilePluginOps = true,
-		getInstanceBatchChunk = true,
-		getInstanceBatchCompactChunk = true,
-		getClassDefaultsChunk = true,
-		getScriptPathsChunk = true,
-		getSourceBatchChunk = true,
-		getSourceRangeBatchCompactChunk = true,
-		getSourceChunk = true,
-		release = true,
-	}
-	local BRIDGE_EXCLUSIVE_METHODS = {
-		configurePropertyCandidates = true,
-		setExportOptions = true,
-		applyEditorChanges = true,
-		finishEditorBinaryImport = true,
-		beginEditorBinaryExport = true,
-		savePlace = true,
-		setConflictResolution = true,
-		deviceSimulator = true,
-		captureViewportProbe = true,
-		executeLuau = true,
-		startStopPlay = true,
-		prepareForNextRun = true,
-		prepare = true,
 		release = true,
 	}
 
@@ -5317,19 +5172,22 @@ function BridgePluginRuntime.start(context)
 		serializerWorkerMode = SERIALIZER_WORKER_MODE,
 		maxRequestBytes = 16 * 1024 * 1024,
 		maxQueuedExclusiveRequests = 16,
-		allowedMethods = BRIDGE_ALLOWED_METHODS,
+		allowedMethods = BRIDGE_METHOD_HANDLERS,
 		isExclusiveMethod = function(method)
-			return BRIDGE_EXCLUSIVE_METHODS[method] == true
+			return not not BRIDGE_EXCLUSIVE_METHODS[method]
+		end,
+		isReplayProtectedMethod = function(method)
+			return not not BRIDGE_REPLAY_PROTECTED_METHODS[method]
 		end,
 		handleMethod = Config.handleMethod,
 		updateStatusText = Config.updateStatusText,
 		onRuntimeSettingsChanged = Config.applyBridgeRuntimeSettings,
 		onUnload = function()
 			table.clear(Config.editorReviewUploads)
-			if Config.studioChanges ~= nil and type(Config.studioChanges.stop) == "function" then
+			if Config.studioChanges and type(Config.studioChanges.stop) == "function" then
 				Config.studioChanges.stop()
 			end
-			if editorSync ~= nil and type(editorSync.cleanup) == "function" then
+			if editorSync and type(editorSync.cleanup) == "function" then
 				editorSync.cleanup()
 			end
 		end,

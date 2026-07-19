@@ -466,6 +466,47 @@ function BridgePropertySchema.buildCandidatesFromSchemas(byClass)
 	return out
 end
 
+function BridgePropertySchema.mergeSchemas(baseSchemas, overrideSchemas)
+	local out = {}
+
+	local function mergeSource(source, replaceExisting)
+		for className, schemaEntries in pairs(source) do
+			local merged = out[className]
+			if not merged then
+				merged = {}
+				out[className] = merged
+			end
+
+			local indexByName = {}
+			for index, entry in ipairs(merged) do
+				indexByName[string.lower(entry[1])] = index
+			end
+
+			for _, entry in ipairs(schemaEntries) do
+				local copied = { entry[1], entry[2], entry[3] }
+				local key = string.lower(copied[1])
+				local existingIndex = indexByName[key]
+				if existingIndex then
+					if replaceExisting then
+						merged[existingIndex] = copied
+					end
+				else
+					merged[#merged + 1] = copied
+					indexByName[key] = #merged
+				end
+			end
+
+			table.sort(merged, function(a, b)
+				return a[1] < b[1]
+			end)
+		end
+	end
+
+	mergeSource(baseSchemas, false)
+	mergeSource(overrideSchemas, true)
+	return out
+end
+
 function BridgePropertySchema.countCandidates(byClass)
 	local classCount = 0
 	local propertyCount = 0

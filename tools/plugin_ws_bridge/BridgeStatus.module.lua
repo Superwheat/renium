@@ -25,36 +25,27 @@ function BridgeStatus.view(state)
 	local openChannels, connectingChannels = countChannels(channels)
 	local editor = state.editorSyncStats or {}
 	local connectionStatus = tostring(state.connectionStatus or "Disconnected")
-	local connectRequested = state.connectRequested == true
+	local connectRequested = not not state.connectRequested
 
-	local mode = "disconnected"
-	if openChannels > 0 then
-		mode = "connected"
-	elseif connectRequested or connectingChannels > 0 or string.find(connectionStatus, "Connecting", 1, true) ~= nil then
-		mode = "connecting"
-	end
+	local mode = if openChannels > 0
+		then "connected"
+		elseif connectRequested or connectingChannels > 0 or string.find(connectionStatus, "Connecting", 1, true)
+		then "connecting"
+		else "disconnected"
 
-	local title = "Disconnected"
-	local subtitle = connectionStatus
-	if mode == "connected" then
-		title = "Connected"
-		subtitle = "Listening for editor and export sync requests."
-	elseif mode == "connecting" then
-		title = "Connecting..."
-		subtitle = "Connecting to local sync server."
-	end
+	local title = if mode == "connected" then "Connected" elseif mode == "connecting" then "Connecting..." else "Disconnected"
+	local subtitle = if mode == "connected"
+		then "Listening for editor and export sync requests."
+		elseif mode == "connecting" then "Connecting to local sync server."
+		else connectionStatus
 
 	local lastSyncUnix = tonumber(editor.lastAtUnix) or 0
-	local syncText = "Waiting for sync"
-	if lastSyncUnix > 0 then
-		if editor.lastOk == false then
-			syncText = "Last sync failed at " .. formatClock(lastSyncUnix)
-		else
-			syncText = "Synced at " .. formatClock(lastSyncUnix)
-		end
-	elseif mode == "disconnected" then
-		syncText = "Not connected"
-	end
+	local syncText = if lastSyncUnix > 0
+		then if editor.lastOk == false
+			then "Last sync failed at " .. formatClock(lastSyncUnix)
+			else "Synced at " .. formatClock(lastSyncUnix)
+		elseif mode == "disconnected" then "Not connected"
+		else "Waiting for sync"
 
 	local ports = state.ports or {}
 	local address = tostring(state.host or "127.0.0.1") .. "  " .. table.concat(ports, ", ")

@@ -3,6 +3,9 @@ local BridgeValueEquality = {}
 local EPSILON = 0.0001
 
 local function numbersEqual(a: number, b: number): boolean
+	if a == b then
+		return true
+	end
 	if a ~= a and b ~= b then
 		return true
 	end
@@ -112,13 +115,26 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
 	elseif typeA == "ColorSequence" then
 		return keypointsEqual(a.Keypoints, b.Keypoints, true)
 	elseif typeA == "PhysicalProperties" then
-		return vectorsEqual(a, b, {
+		local baseEqual = vectorsEqual(a, b, {
 			"Density",
 			"Friction",
 			"Elasticity",
 			"FrictionWeight",
 			"ElasticityWeight",
 		})
+		if not baseEqual then
+			return false
+		end
+		local okAcousticA, acousticA = pcall(function()
+			return a.AcousticAbsorption
+		end)
+		local okAcousticB, acousticB = pcall(function()
+			return b.AcousticAbsorption
+		end)
+		if okAcousticA ~= okAcousticB then
+			return false
+		end
+		return not okAcousticA or numbersEqual(acousticA, acousticB)
 	elseif typeA == "Ray" then
 		return valuesEqual(a.Origin, b.Origin) and valuesEqual(a.Direction, b.Direction)
 	elseif typeA == "Font" then

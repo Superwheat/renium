@@ -28,7 +28,7 @@ export function getPropertiesHtml(extensionUri: vscode.Uri, options: PropertiesH
         sortersContent = fs.readFileSync(sortersPath, 'utf8');
     } catch (sortersError) {
         console.error("Failed to read robloxPropertySorters.js:", sortersError);
-        sortersContent = '// Failed to load sorters';
+        sortersContent = '';
     }
 
     try {

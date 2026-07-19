@@ -10,7 +10,7 @@ local function containsReference(value: any, seen: { [any]: boolean }?): boolean
 		return true
 	end
 	local visited = seen or {}
-	if visited[value] == true then
+	if visited[value] then
 		return false
 	end
 	visited[value] = true

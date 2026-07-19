@@ -120,13 +120,23 @@ const DEFAULT_EXPORT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
 const BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION: &str = "rbs1";
 const BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION: &str = "compact-v5-schema-4";
+const BRIDGE_CODEC_VERSION_SCHEMA8: &str = "compact-v5-schema-8";
 const BRIDGE_CODEC_VERSION_SCHEMA7: &str = "compact-v5-schema-7";
-const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA7;
+const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA8;
 const BRIDGE_CODEC_VERSION_SCHEMA6: &str = "compact-v5-schema-6";
-const BRIDGE_CODEC_VERSION_SCHEMA4: &str = "compact-v5-schema-4";
+const BRIDGE_CODEC_VERSION_SCHEMA4: &str = BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION;
 const BRIDGE_CODEC_VERSION_SCHEMA5: &str = "compact-v5-schema-5";
 const BRIDGE_CODEC_VERSION_SCHEMA3: &str = "compact-v5-schema-3";
 const BRIDGE_CODEC_VERSION_SCHEMA2: &str = "compact-v5-schema-2";
+const SUPPORTED_BRIDGE_CODEC_VERSIONS: [&str; 7] = [
+    BRIDGE_CODEC_VERSION,
+    BRIDGE_CODEC_VERSION_SCHEMA7,
+    BRIDGE_CODEC_VERSION_SCHEMA6,
+    BRIDGE_CODEC_VERSION_SCHEMA5,
+    BRIDGE_CODEC_VERSION_SCHEMA4,
+    BRIDGE_CODEC_VERSION_SCHEMA3,
+    BRIDGE_CODEC_VERSION_SCHEMA2,
+];
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_HASH: &str = match option_env!("BUILD_GIT_HASH") {
     Some(value) => value,
@@ -1217,8 +1227,12 @@ struct StudioChangeStateArgs {
     reset: bool,
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
     no_start: bool,
+    #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
+    stop: bool,
     #[arg(long, value_name = "SEQ")]
     ack_seq: Option<u64>,
+    #[arg(long, value_name = "RUNTIME_ID")]
+    runtime_id: Option<String>,
     #[arg(long, value_name = "SECONDS")]
     suppress_seconds: Option<f64>,
     #[arg(long, alias = "event-wait-seconds", value_name = "SECONDS")]
@@ -2576,6 +2590,12 @@ struct EditorPropertyChange {
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     attributes: Map<String, Value>,
     #[serde(
+        rename = "deletedAttributes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    deleted_attributes: Vec<String>,
+    #[serde(
         rename = "allowProtectedMeshIdApply",
         default,
         skip_serializing_if = "is_false"
@@ -3221,6 +3241,7 @@ struct BridgeSocket {
     last_focused_at: Instant,
     hello_build_unix: Option<i64>,
     bridge_info: BridgeInfoPayload,
+    request_session_id: String,
     socket: WebSocket<TcpStream>,
 }
 
@@ -3312,6 +3333,14 @@ impl BridgeServer {
         let bind_started = Instant::now();
         let alive = Arc::new(AtomicBool::new(true));
         let mut channels: Vec<Arc<BridgeChannel>> = Vec::with_capacity(ports.len());
+        let request_session_id = format!(
+            "{:x}-{:x}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
 
         for port in ports {
             let listener = TcpListener::bind((bind_host.as_str(), *port))
@@ -3331,6 +3360,7 @@ impl BridgeServer {
                 listener,
                 channel.clone(),
                 alive.clone(),
+                request_session_id.clone(),
             );
             channels.push(channel);
         }
@@ -3410,13 +3440,20 @@ impl BridgeServer {
         listener: TcpListener,
         channel: Arc<BridgeChannel>,
         alive: Arc<AtomicBool>,
+        request_session_id: String,
     ) {
         thread::spawn(move || {
             while alive.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, addr)) => {
                         let peer = addr.to_string();
-                        match Self::accept_ready_socket(&bind_host, port, stream, peer.clone()) {
+                        match Self::accept_ready_socket(
+                            &bind_host,
+                            port,
+                            stream,
+                            peer.clone(),
+                            &request_session_id,
+                        ) {
                             Ok(socket) => {
                                 let mut guard = match channel.sockets.lock() {
                                     Ok(guard) => guard,
@@ -3530,6 +3567,7 @@ impl BridgeServer {
         port: u16,
         stream: TcpStream,
         peer: String,
+        request_session_id: &str,
     ) -> Result<BridgeSocket> {
         let accepted_at = Instant::now();
         let _ = stream.set_nonblocking(false);
@@ -3554,6 +3592,7 @@ impl BridgeServer {
             last_focused_at: accepted_at,
             hello_build_unix: None,
             bridge_info: BridgeInfoPayload::default(),
+            request_session_id: request_session_id.to_string(),
             socket,
         };
 
@@ -4612,11 +4651,17 @@ impl BridgeServer {
         #[derive(Serialize)]
         struct BridgeRequest<'a> {
             id: u64,
+            session_id: &'a str,
             method: &'a str,
             params: &'a Value,
         }
 
-        let payload = serde_json::to_string(&BridgeRequest { id, method, params })?;
+        let payload = serde_json::to_string(&BridgeRequest {
+            id,
+            session_id: &bridge_socket.request_session_id,
+            method,
+            params,
+        })?;
         if payload.len() > MAX_BRIDGE_REQUEST_BYTES {
             bail!(
                 "Bridge request for {method} is {} bytes, above the {MAX_BRIDGE_REQUEST_BYTES}-byte safety limit",
@@ -6633,7 +6678,9 @@ fn studio_change_state_result(args: StudioChangeStateArgs, bridge: &BridgeServer
             "services": services,
             "reset": args.reset,
             "start": !args.no_start,
+            "stop": args.stop,
             "ackSeq": args.ack_seq,
+            "runtimeId": args.runtime_id,
             "suppressSeconds": args.suppress_seconds,
             "waitSeconds": args.wait_seconds,
         }),
@@ -6719,6 +6766,9 @@ fn start_single_play_result(bridge: &BridgeServer) -> Result<Value> {
 }
 
 fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<Value> {
+    if !(1..=8).contains(&players) {
+        bail!("Multiplayer tests require between 1 and 8 players");
+    }
     let start_result = bridge.call(
         "startStopPlay",
         json!({
@@ -6726,7 +6776,8 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
             "players": players,
             "timeoutSeconds": 1.0,
         }),
-    );
+    )?;
+    ensure_plugin_api_ok(&start_result)?;
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let clients = bridge.list_bridge_clients();
@@ -6745,14 +6796,10 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
             }));
         }
         if Instant::now() >= deadline {
-            let start_note = match &start_result {
-                Ok(value) => value.clone(),
-                Err(err) => json!({ "error": format!("{err:#}") }),
-            };
             bail!(
                 "Timed out waiting for the multiplayer test instances to connect \
                  (server ready: {server_ready}, clients connected: {client_count}/{players}). \
-                 Start request result: {start_note}; connected bridges: {}",
+                 Start request result: {start_result}; connected bridges: {}",
                 serde_json::to_string(&clients)?
             );
         }
@@ -7214,7 +7261,7 @@ fn run_console_task(
 ) -> Result<ConsoleTaskOutcome> {
     let seed = bridge.call_for_selector(
         "getConsoleOutput",
-        json!({ "limit": 1, "sinceSeq": 0 }),
+        json!({ "cursorOnly": true }),
         target,
         player,
     )?;
@@ -7226,6 +7273,7 @@ fn run_console_task(
             "code": code,
             "chunkName": "ReniumTask",
             "context": if client_context { "client" } else { "plugin" },
+            "backgroundLifetimeSeconds": poll_timeout,
         }),
         target,
         player,
@@ -7244,6 +7292,13 @@ fn run_console_task(
             player,
         )?;
         ensure_plugin_api_ok(&console)?;
+        if console
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("Task output was overwritten before Renium could read its completion marker");
+        }
         since_seq = console
             .get("nextSeq")
             .and_then(Value::as_u64)
@@ -8218,8 +8273,13 @@ fn collect_direct_editor_property_change(
 
     let mut properties = Map::new();
     let mut attributes = Map::new();
+    let mut deleted_attributes = Vec::new();
     if args.scope.eq_ignore_ascii_case("attribute") {
-        attributes.insert(property, value);
+        if value.is_null() {
+            deleted_attributes.push(property);
+        } else {
+            attributes.insert(property, value);
+        }
     } else {
         properties.insert(property, value);
     }
@@ -8238,6 +8298,7 @@ fn collect_direct_editor_property_change(
         class_name: args.class_name.clone(),
         properties,
         attributes,
+        deleted_attributes,
         allow_protected_mesh_id_apply: args.allow_protected_mesh_id_apply,
     });
     Ok(changes)
@@ -8544,6 +8605,7 @@ fn collect_editor_changes(args: &PushEditorChangesArgs) -> Result<EditorChangeSe
                             class_name: target.class_name.clone(),
                             properties,
                             attributes: Map::new(),
+                            deleted_attributes: Vec::new(),
                             allow_protected_mesh_id_apply: false,
                         });
                     }
@@ -9648,6 +9710,7 @@ fn append_editor_property_changes(
             class_name: instance.class_name.clone(),
             properties,
             attributes,
+            deleted_attributes: Vec::new(),
             allow_protected_mesh_id_apply: filter.explicitly_targets_property("MeshId")
                 || (filter.has_settings_targets() && instance.class_name == "MeshPart"),
         });
@@ -10121,6 +10184,25 @@ fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Value>) {
                 );
             }
         }
+        for name in &change.deleted_attributes {
+            change_count += 1;
+            append_editor_review_entry(
+                &mut rows,
+                &mut row_index_by_key,
+                EditorReviewTarget {
+                    service: &change.service,
+                    settings_id: change.settings_id.as_deref(),
+                    path_segments: &change.path_segments,
+                    path_ordinals: &change.path_ordinals,
+                    class_name: &change.class_name,
+                },
+                json!({
+                    "kind": "attribute",
+                    "name": name,
+                    "deleted": true,
+                }),
+            );
+        }
     }
     (change_count, rows)
 }
@@ -10152,6 +10234,7 @@ fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) 
     if change_count == 0 {
         return Ok(true);
     }
+    let row_count = rows.len();
     if std::env::var("RENIUM_DEBUG_REVIEW").is_ok() {
         println!(
             "[renium] review rows: {}",
@@ -10174,6 +10257,7 @@ fn request_editor_push_review(bridge: &BridgeServer, changes: &EditorChangeSet) 
             json!({
                 "uploadId": &upload_id,
                 "changeCount": change_count,
+                "rowCount": row_count,
                 "totalChunks": chunks.len(),
             }),
         )?;
@@ -10234,8 +10318,14 @@ fn request_protected_write_review(bridge: &BridgeServer, rows: &[Value]) -> Resu
 }
 
 fn protected_write_matches_previous(row: &Value) -> bool {
-    row.get("oldValueKnown").and_then(Value::as_bool) == Some(true)
-        && row.get("oldValueMissing").and_then(Value::as_bool) != Some(true)
+    if row.get("oldValueKnown").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let old_value_missing = row.get("oldValueMissing").and_then(Value::as_bool) == Some(true);
+    if row.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return old_value_missing;
+    }
+    !old_value_missing
         && row
             .get("oldValue")
             .zip(row.get("value"))
@@ -10491,17 +10581,17 @@ fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
             .get("name")
             .and_then(Value::as_str)
             .context("Protected write is missing its name")?;
-        let value = row
-            .get("value")
-            .context("Protected write is missing its value")?;
         let referent = rbx_dom_instance_by_path_unique(&dom, &path_segments, &path_ordinals)?;
         let kind = row
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("property");
+        let deleted = row.get("deleted").and_then(Value::as_bool) == Some(true);
+        let value = row.get("value");
+        if deleted && kind != "attribute" {
+            bail!("Only protected attributes can be deleted");
+        }
         if kind == "attribute" {
-            let variant = json_to_rbx_attribute_variant(value, database, &refs)
-                .with_context(|| format!("Could not encode protected attribute {name}"))?;
             let instance = dom
                 .get_by_ref_mut(referent)
                 .context("Protected write target disappeared")?;
@@ -10514,7 +10604,17 @@ fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
                     _ => None,
                 })
                 .unwrap_or_default();
-            attributes.insert(name.to_string(), variant);
+            if deleted {
+                attributes.remove(name);
+            } else {
+                let variant = json_to_rbx_attribute_variant(
+                    value.context("Protected write is missing its value")?,
+                    database,
+                    &refs,
+                )
+                .with_context(|| format!("Could not encode protected attribute {name}"))?;
+                attributes.insert(name.to_string(), variant);
+            }
             instance
                 .properties
                 .insert(attributes_key, RbxVariant::Attributes(attributes));
@@ -10524,9 +10624,13 @@ fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
                 .map(|instance| instance.class.to_string())
                 .context("Protected write target disappeared")?;
             let descriptor = rbx_model_property_descriptor(database, &class_name, name);
-            let legacy_variant =
-                json_to_rbx_property_variant(value, descriptor, database, &refs)
-                    .with_context(|| format!("Could not encode protected property {name}"))?;
+            let legacy_variant = json_to_rbx_property_variant(
+                value.context("Protected write is missing its value")?,
+                descriptor,
+                database,
+                &refs,
+            )
+            .with_context(|| format!("Could not encode protected property {name}"))?;
             let mut serialized_name = descriptor.map(|value| value.name).unwrap_or(name);
             let mut variant = legacy_variant;
             if let Some(RbxPropertyDescriptor {
@@ -11543,10 +11647,11 @@ fn write_live_editor_place_snapshot(
             .context("Studio native place snapshot lost a service root")?
             .properties = properties;
     }
+    let total_instances = dom.descendants().count();
     let build = RbxPlaceBuild {
         dom,
         service_roots,
-        total_instances: export.instance_count + export.groups.len(),
+        total_instances,
     };
     write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(output_path)?)?;
     Ok(build.total_instances)
@@ -11616,6 +11721,7 @@ fn send_editor_binary_import(
             "importId": &import_id,
             "totalBytes": binary_import.bytes.len(),
             "totalChunks": chunks.len(),
+            "instanceCount": binary_import.instance_count,
             "groups": &binary_import.groups,
         }),
     )?;
@@ -17986,6 +18092,9 @@ fn build_editor_binary_import(
                         instance.class.as_str(),
                         "StarterPlayerScripts" | "StarterCharacterScripts"
                     ))
+                || (service == "Workspace"
+                    && instance.class.as_str() == "Camera"
+                    && matches!(instance.name.as_str(), "Camera" | "CurrentCamera"))
             {
                 nested_groups.push((instance.name.clone(), instance.children().to_vec()));
             } else {
@@ -24034,6 +24143,12 @@ fn prepare_bridge_for_next_run(bridge: &BridgeServer) {
     }
 }
 
+fn record_bridge_sync_completion(bridge: &BridgeServer) {
+    if let Err(err) = bridge.call("recordSyncCompletion", json!({})) {
+        println!("[renium] warning: failed to update the Studio sync timestamp: {err:#}");
+    }
+}
+
 fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
     let message = err
         .chain()
@@ -24134,13 +24249,9 @@ fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
     }
     if !is_supported_bridge_codec(&info.codec_version) {
         bail!(
-            "Unsupported plugin codec {} (expected {}, {}, {}, {}, or {})",
+            "Unsupported plugin codec {} (expected one of {})",
             info.codec_version,
-            BRIDGE_CODEC_VERSION,
-            BRIDGE_CODEC_VERSION_SCHEMA4,
-            BRIDGE_CODEC_VERSION_SCHEMA5,
-            BRIDGE_CODEC_VERSION_SCHEMA3,
-            BRIDGE_CODEC_VERSION_SCHEMA2
+            SUPPORTED_BRIDGE_CODEC_VERSIONS.join(", ")
         );
     }
     if !info
@@ -24162,29 +24273,21 @@ fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
     }
     if !is_supported_bridge_codec(&info.compact_value_protocol_version) {
         bail!(
-            "Unsupported plugin compact value protocol {} (expected {}, {}, {}, {}, or {})",
+            "Unsupported plugin compact value protocol {} (expected one of {})",
             info.compact_value_protocol_version,
-            BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION,
-            BRIDGE_CODEC_VERSION_SCHEMA6,
-            BRIDGE_CODEC_VERSION_SCHEMA5,
-            BRIDGE_CODEC_VERSION_SCHEMA3,
-            BRIDGE_CODEC_VERSION_SCHEMA2
+            SUPPORTED_BRIDGE_CODEC_VERSIONS.join(", ")
         );
     }
     Ok(())
 }
 
 fn is_supported_bridge_codec(value: &str) -> bool {
-    value == BRIDGE_CODEC_VERSION
-        || value == BRIDGE_CODEC_VERSION_SCHEMA6
-        || value == BRIDGE_CODEC_VERSION_SCHEMA4
-        || value == BRIDGE_CODEC_VERSION_SCHEMA5
-        || value == BRIDGE_CODEC_VERSION_SCHEMA3
-        || value == BRIDGE_CODEC_VERSION_SCHEMA2
+    SUPPORTED_BRIDGE_CODEC_VERSIONS.contains(&value)
 }
 
 fn compact_v5_codec_uses_numeric_enum_values(value: &str) -> bool {
     value == BRIDGE_CODEC_VERSION
+        || value == BRIDGE_CODEC_VERSION_SCHEMA7
         || value == BRIDGE_CODEC_VERSION_SCHEMA6
         || value == BRIDGE_CODEC_VERSION_SCHEMA5
 }
@@ -25064,6 +25167,7 @@ fn export_snapshots_core(
         unmeasured_or_scheduler_gap_ms
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
+    record_bridge_sync_completion(bridge);
     if let ExportBridgeMode::Warm {
         prepare_next_run: true,
     } = mode
