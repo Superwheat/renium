@@ -4,7 +4,7 @@ local function canReparent(instance: Instance): boolean
 	local okRead, locked = pcall(function()
 		return (instance :: any).RobloxLocked
 	end)
-	return okRead and locked ~= true
+	return okRead and not locked
 end
 
 local function restoreOrder(parent: Instance, desired: { Instance }): boolean
@@ -14,7 +14,7 @@ local function restoreOrder(parent: Instance, desired: { Instance }): boolean
 		desiredSet[child] = true
 	end
 	for _, child in ipairs(parent:GetChildren()) do
-		if desiredSet[child] ~= true then
+		if not desiredSet[child] then
 			order[#order + 1] = child
 		end
 	end
@@ -61,18 +61,15 @@ function BridgeInstanceSwap.replace(
 
 	local okCreate, replacement = pcall(createInstance or Instance.new, className)
 	if not okCreate or replacement == nil then
-		error("Cannot create replacement " .. className .. " for " .. instance:GetFullName() .. ": " .. tostring(replacement))
+		error(`Cannot create replacement {className} for {instance:GetFullName()}: {tostring(replacement)}`)
 	end
 	replacement.Name = instance.Name
 
-	local okAttributes, attributes = pcall(instance.GetAttributes, instance)
-	if okAttributes and type(attributes) == "table" then
-		for attributeName, attributeValue in pairs(attributes) do
-			pcall(replacement.SetAttribute, replacement, attributeName, attributeValue)
-		end
+	for attributeName, attributeValue in pairs(instance:GetAttributes()) do
+		pcall(replacement.SetAttribute, replacement, attributeName, attributeValue)
 	end
 	for _, tag in ipairs(collectionService:GetTags(instance)) do
-		pcall(collectionService.AddTag, collectionService, replacement, tag)
+		collectionService:AddTag(replacement, tag)
 	end
 
 	local desiredSiblings = table.clone(originalSiblings)
@@ -99,8 +96,8 @@ function BridgeInstanceSwap.replace(
 			instance.Parent = parent
 			restoreOrder(parent, originalSiblings)
 		end)
-		pcall(replacement.Destroy, replacement)
-		error("Cannot replace " .. instance:GetFullName() .. " with " .. className .. ": " .. tostring(swapErr), 0)
+		replacement:Destroy()
+		error(`Cannot replace {instance:GetFullName()} with {className}: {tostring(swapErr)}`, 0)
 	end
 
 	return replacement

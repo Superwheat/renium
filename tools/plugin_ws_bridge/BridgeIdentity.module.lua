@@ -1,13 +1,8 @@
 local BridgeIdentity = {}
 
 function BridgeIdentity.getDebugId(instance)
-	local ok, debugId = pcall(function()
-		return instance:GetDebugId(32)
-	end)
-	if ok and type(debugId) == "string" and #debugId > 0 then
-		return debugId
-	end
-	return nil
+	local debugId = instance:GetDebugId(32)
+	return if type(debugId) == "string" and #debugId > 0 then debugId else nil
 end
 
 local function hashString32(text, seed)
@@ -133,12 +128,9 @@ function BridgeIdentity.getCachedInstancePath(state, instance)
 		return cached
 	end
 	local parent = instance.Parent
-	local path
-	if parent == nil or parent == game then
-		path = instance.Name
-	else
-		path = BridgeIdentity.getCachedInstancePath(state, parent) .. "." .. instance.Name
-	end
+	local path = if parent == nil or parent == game
+		then instance.Name
+		else BridgeIdentity.getCachedInstancePath(state, parent) .. "." .. instance.Name
 	state.pathByInstance[instance] = path
 	return path
 end
@@ -257,13 +249,10 @@ function BridgeIdentity.getCachedScriptSourceKey(state, instance)
 		return cached
 	end
 
-	local key
 	local instanceId = BridgeIdentity.getCachedInstanceId(state, instance)
-	if instanceId ~= nil and #instanceId > 0 then
-		key = "id:" .. instanceId
-	else
-		key = "path:" .. BridgeIdentity.getCachedInstancePath(state, instance)
-	end
+	local key = if instanceId ~= nil and #instanceId > 0
+		then "id:" .. instanceId
+		else "path:" .. BridgeIdentity.getCachedInstancePath(state, instance)
 
 	state.scriptKeyByInstance[instance] = key
 	return key

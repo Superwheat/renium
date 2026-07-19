@@ -1,4 +1,5 @@
 local BridgeSettings = {}
+local MAX_BRIDGE_PORTS = 4
 
 local RUNTIME_DEFAULTS = {
 	autoConnect = true,
@@ -57,12 +58,48 @@ local function trim(value)
 	return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
 end
 
+local function normalizePorts(values, maximumCount)
+	if type(values) ~= "table" then
+		return nil
+	end
+	local count = 0
+	for key in pairs(values) do
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+			return nil
+		end
+		count += 1
+	end
+	if count < 1 or count ~= #values then
+		return nil
+	end
+	local out = table.create(math.min(count, maximumCount))
+	local seen = {}
+	for _, port in ipairs(values) do
+		if
+			type(port) ~= "number"
+			or port ~= port
+			or port % 1 ~= 0
+			or port < 1
+			or port > 65535
+		then
+			return nil
+		end
+		if not seen[port] then
+			if #out >= maximumCount then
+				return nil
+			end
+			seen[port] = true
+			out[#out + 1] = port
+		end
+	end
+	return out
+end
+
 function BridgeSettings.normalizeLoopbackHost(raw)
 	local host = string.lower(trim(raw))
 	if host == "" or host == "localhost" or host == "127.0.0.1" then
 		return "127.0.0.1"
-	end
-	if host == "[::1]" or host == "::1" then
+	elseif host == "[::1]" or host == "::1" then
 		return "::1"
 	end
 	return nil
@@ -77,33 +114,22 @@ end
 
 function BridgeSettings.parsePortsCsv(raw)
 	local out = {}
-	local seen = {}
 	for piece in string.gmatch(raw or "", "[^,]+") do
 		local text = string.gsub(piece, "^%s*(.-)%s*$", "%1")
 		local num = tonumber(text)
-		if num == nil then
+		if not num then
 			return nil
 		end
-		local port = math.floor(num)
-		if port <= 0 or port > 65535 then
-			return nil
-		end
-		if not seen[port] then
-			seen[port] = true
-			table.insert(out, port)
-		end
+		out[#out + 1] = num
 	end
-	if #out == 0 then
-		return nil
-	end
-	return out
+	return normalizePorts(out, MAX_BRIDGE_PORTS)
 end
 
 function BridgeSettings.loadHost(plugin, prefix, defaultHost)
 	local value = plugin:GetSetting(prefix .. "host")
 	if type(value) == "string" then
 		local normalized = BridgeSettings.normalizeLoopbackHost(value)
-		if normalized ~= nil then
+		if normalized then
 			return normalized
 		end
 	end
@@ -112,67 +138,58 @@ end
 
 function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 	local configuredPorts = plugin:GetSetting(prefix .. "ports")
-	if type(configuredPorts) == "table" and #configuredPorts > 0 then
-		local valid = {}
-		local seen = {}
-		for _, value in ipairs(configuredPorts) do
-			if type(value) == "number" and value > 0 then
-				local port = math.floor(value)
-				if port <= 65535 and not seen[port] then
-					seen[port] = true
-					table.insert(valid, port)
-				end
-			end
+	local valid = normalizePorts(configuredPorts, 8)
+	if valid then
+		if
+			#valid == 4
+			and valid[1] == 8781
+			and valid[2] == 8782
+			and valid[3] == 8783
+			and valid[4] == 8784
+			and #defaultPorts == 3
+		then
+			return defaultPorts
+		elseif
+			#valid == 3
+			and valid[1] == 8781
+			and valid[2] == 8782
+			and valid[3] == 8783
+			and #defaultPorts == 4
+			and defaultPorts[1] == 8781
+			and defaultPorts[2] == 8782
+			and defaultPorts[3] == 8783
+			and defaultPorts[4] == 8784
+		then
+			return defaultPorts
+		elseif
+			#valid == 8
+			and valid[1] == 8781
+			and valid[2] == 8782
+			and valid[3] == 8783
+			and valid[4] == 8784
+			and valid[5] == 8785
+			and valid[6] == 8786
+			and valid[7] == 8787
+			and valid[8] == 8788
+			and (#defaultPorts == 3 or #defaultPorts == 4)
+		then
+			return defaultPorts
+		elseif #valid > MAX_BRIDGE_PORTS then
+			return defaultPorts
 		end
-		if #valid > 0 then
-			if
-				#valid == 4
-				and valid[1] == 8781
-				and valid[2] == 8782
-				and valid[3] == 8783
-				and valid[4] == 8784
-				and #defaultPorts == 3
-			then
-				return defaultPorts
-			end
-			if
-				#valid == 3
-				and valid[1] == 8781
-				and valid[2] == 8782
-				and valid[3] == 8783
-				and #defaultPorts == 4
-				and defaultPorts[1] == 8781
-				and defaultPorts[2] == 8782
-				and defaultPorts[3] == 8783
-				and defaultPorts[4] == 8784
-			then
-				return defaultPorts
-			end
-			if #valid == 8
-				and valid[1] == 8781
-				and valid[2] == 8782
-				and valid[3] == 8783
-				and valid[4] == 8784
-				and valid[5] == 8785
-				and valid[6] == 8786
-				and valid[7] == 8787
-				and valid[8] == 8788
-				and (#defaultPorts == 3 or #defaultPorts == 4) then
-				return defaultPorts
-			end
-			return valid
-		end
+		return valid
 	end
 	return defaultPorts
 end
 
 function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
 	local normalizedHost = BridgeSettings.normalizeLoopbackHost(host)
-	if normalizedHost == nil then
+	local normalizedPorts = normalizePorts(ports, MAX_BRIDGE_PORTS)
+	if not normalizedHost or not normalizedPorts then
 		return false
 	end
 	plugin:SetSetting(prefix .. "host", normalizedHost)
-	plugin:SetSetting(prefix .. "ports", ports)
+	plugin:SetSetting(prefix .. "ports", normalizedPorts)
 	return true
 end
 
@@ -193,18 +210,16 @@ function BridgeSettings.normalizeRuntimeSetting(key, value)
 	end
 
 	local enum = RUNTIME_ENUMS[key]
-	if enum ~= nil then
+	if enum then
 		local normalized = string.lower(trim(value))
 		if enum[normalized] then
 			return normalized
 		end
 		return RUNTIME_DEFAULTS[key]
-	end
-
-	local numberSettings = RUNTIME_NUMBERS[key]
-	if numberSettings ~= nil then
+	elseif RUNTIME_NUMBERS[key] then
+		local numberSettings = RUNTIME_NUMBERS[key]
 		local numeric = tonumber(value)
-		if numeric == nil or numeric ~= numeric then
+		if not numeric or numeric ~= numeric then
 			return RUNTIME_DEFAULTS[key]
 		end
 		return math.clamp(math.floor(numeric), numberSettings.minimum, numberSettings.maximum)

@@ -317,6 +317,7 @@ type StudioChangeState = {
   tracking?: boolean;
   role?: string;
   seq?: number;
+  runtimeId?: string;
   dirtyServices?: string[];
   fullSyncServices?: string[];
   propertyChanges?: StudioPropertyChange[];
@@ -4258,7 +4259,7 @@ class RobloxSyncController {
       const observedSeq = this.studioChangeSeq(state);
       if (dirtyServices.length > 0) {
         nextDelayMs = this.resetStudioLiveSyncPollDelay(runtimeCfg);
-        const ackObservedDirty = this.studioChangeAckOptions(observedSeq);
+        const ackObservedDirty = this.studioChangeAckOptions(observedSeq, state.runtimeId);
         if (this.shouldDropLikelySelfDirtyStudioState(dirtyServices, runtimeCfg)) {
           ackObservedDirty.suppressSeconds = Math.max(1, Math.min(4, runtimeCfg.studioLiveSyncPollMs / 1000 + 1.5));
           await this.getStudioChangeState(runtimeCfg, dirtyServices, ackObservedDirty);
@@ -4294,7 +4295,15 @@ class RobloxSyncController {
   private async getStudioChangeState(
     cfg: SyncConfig,
     services: string[],
-    options: { reset?: boolean; ackSeq?: number; start?: boolean; suppressSeconds?: number; waitSeconds?: number } = {},
+    options: {
+      reset?: boolean;
+      ackSeq?: number;
+      runtimeId?: string;
+      start?: boolean;
+      stop?: boolean;
+      suppressSeconds?: number;
+      waitSeconds?: number;
+    } = {},
   ): Promise<StudioChangeState> {
     const command = cfg.exportCliPath;
     this.ensureFileExists(command);
@@ -4312,8 +4321,15 @@ class RobloxSyncController {
     if (options.start === false) {
       args.push("--no-start");
     }
+    if (options.stop === true) {
+      args.push("--stop");
+    }
     if (typeof options.ackSeq === "number" && Number.isFinite(options.ackSeq)) {
       args.push("--ack-seq", String(Math.max(0, Math.floor(options.ackSeq))));
+      if (typeof options.runtimeId !== "string" || options.runtimeId.length === 0) {
+        throw new Error("Studio change acknowledgment is missing its plugin runtime id.");
+      }
+      args.push("--runtime-id", options.runtimeId);
     }
     if (typeof options.suppressSeconds === "number" && Number.isFinite(options.suppressSeconds) && options.suppressSeconds > 0) {
       args.push("--suppress-seconds", String(Math.max(0.05, options.suppressSeconds)));
@@ -4398,10 +4414,20 @@ class RobloxSyncController {
     return Math.max(0, Math.floor(state.seq));
   }
 
-  private studioChangeAckOptions(observedSeq: number | undefined): { reset?: boolean; ackSeq?: number; start?: boolean; suppressSeconds?: number } {
-    const options: { reset?: boolean; ackSeq?: number; start?: boolean; suppressSeconds?: number } = { start: true };
+  private studioChangeAckOptions(
+    observedSeq: number | undefined,
+    runtimeId: string | undefined,
+  ): { reset?: boolean; ackSeq?: number; runtimeId?: string; start?: boolean; suppressSeconds?: number } {
+    const options: {
+      reset?: boolean;
+      ackSeq?: number;
+      runtimeId?: string;
+      start?: boolean;
+      suppressSeconds?: number;
+    } = { start: true };
     if (observedSeq !== undefined) {
       options.ackSeq = observedSeq;
+      options.runtimeId = runtimeId;
     } else {
       options.reset = true;
     }
@@ -6485,6 +6511,16 @@ class RobloxSyncController {
     this.liveSyncStopRequested = true;
     const wasRunning = this.liveSyncWatcher !== undefined || this.liveSyncStartPromise !== undefined || this.editorLiveSyncRuntimeEnabled;
     const startup = this.liveSyncStartPromise;
+    if (this.studioLiveSyncStarted) {
+      const cfg = this.getConfig();
+      try {
+        await this.getStudioChangeState(cfg, cfg.services, { start: false, stop: true });
+      } catch (err) {
+        this.output.appendLine(
+          `[renium] Studio change tracking stop failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     this.disposeLiveSyncRuntime();
     await this.setEditorLiveSyncEnabled(false);
     if (startup) {
@@ -7188,6 +7224,7 @@ class RobloxSyncController {
       tracking: typeof record.tracking === "boolean" ? record.tracking : undefined,
       role: typeof record.role === "string" ? record.role : undefined,
       seq: typeof record.seq === "number" ? record.seq : undefined,
+      runtimeId: typeof record.runtimeId === "string" ? record.runtimeId : undefined,
       dirtyServices: Array.isArray(record.dirtyServices)
         ? record.dirtyServices.map((value) => String(value))
         : undefined,

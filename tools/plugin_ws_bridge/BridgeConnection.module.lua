@@ -17,7 +17,7 @@ function BridgeConnection.create(context)
 	local channels = {}
 	local connectChannel
 	local prepareChannelsForNextRun
-	local reconnectWatchdogStarted = false
+	local pauseWatcherStarted = false
 	local pluginUnloading = false
 	local maxReconnectSeconds = math.max(tonumber(context.maxReconnectSeconds) or 4.0, tonumber(context.reconnectSeconds) or 0.5)
 	local stableConnectionSeconds = math.max(tonumber(context.stableConnectionSeconds) or 1.0, 0)
@@ -25,6 +25,10 @@ function BridgeConnection.create(context)
 	local maxQueuedExclusiveRequests = math.max(1, tonumber(context.maxQueuedExclusiveRequests) or 16)
 	local exclusiveRequestBusy = false
 	local exclusiveRequestQueue = {}
+	local replayRequestsByKey = {}
+	local completedReplayRequests = {}
+	local replayRequestTtlSeconds = 120
+	local maxCompletedReplayRequests = 64
 	local logLevelRank = {
 		off = 0,
 		error = 1,
@@ -105,12 +109,8 @@ function BridgeConnection.create(context)
 	end
 
 	local function conciseConnectionError(reason)
-		local text = tostring(reason or "connection failed")
-		text = string.gsub(text, "[%c\r\n]+", " ")
-		if #text > 140 then
-			text = string.sub(text, 1, 137) .. "..."
-		end
-		return text
+		local text = string.gsub(tostring(reason or "connection failed"), "[%c\r\n]+", " ")
+		return if #text > 140 then string.sub(text, 1, 137) .. "..." else text
 	end
 
 	local function markConnectionFailure(channel, reason)
@@ -141,51 +141,146 @@ function BridgeConnection.create(context)
 		})
 	end
 
-	local function executeRequest(channel, client, id, method, params)
-		if pluginUnloading or channel.client ~= client then
-			return
+	local function isJsonObject(value)
+		if type(value) ~= "table" then
+			return false
 		end
-		local started = os.clock()
-		local okCall, result = pcall(context.handleMethod, method, params)
-		local serverMs = (os.clock() - started) * 1000
-		if okCall then
-			local sent, sendError = TransportModule.sendSuccessResponse(channel.id, client, id, method, result, serverMs)
-			if not sent then
-				local responseError = conciseConnectionError(sendError or "could not send bridge response")
-				local errorSent = TransportModule.sendEnvelope(client, {
-					id = id,
-					ok = false,
-					error = responseError,
-					channel = channel.id,
-					timings = {
-						serverMs = serverMs,
-					},
-				})
-				if not errorSent then
-					pcall(function()
-						client:Close()
-					end)
+		for key in pairs(value) do
+			if type(key) ~= "string" then
+				return false
+			end
+		end
+		return true
+	end
+
+	local function isReplayProtectedMethod(method)
+		return type(context.isReplayProtectedMethod) == "function"
+			and context.isReplayProtectedMethod(method)
+	end
+
+	local function pruneReplayRequests()
+		local now = os.clock()
+		local firstRetained = 1
+		for index, completed in ipairs(completedReplayRequests) do
+			if
+				index <= #completedReplayRequests - maxCompletedReplayRequests
+				or now - completed.completedAt > replayRequestTtlSeconds
+			then
+				if replayRequestsByKey[completed.key] == completed then
+					replayRequestsByKey[completed.key] = nil
 				end
+				firstRetained = index + 1
+			else
+				break
+			end
+		end
+		if firstRetained > 1 then
+			table.move(
+				completedReplayRequests,
+				firstRetained,
+				#completedReplayRequests,
+				1,
+				completedReplayRequests
+			)
+			for index = #completedReplayRequests - firstRetained + 2, #completedReplayRequests do
+				completedReplayRequests[index] = nil
+			end
+		end
+	end
+
+	local function addReplayRecipient(request, channel, client)
+		for _, recipient in ipairs(request.recipients) do
+			if recipient.client == client then
 				return
 			end
-			if method == "prepareForNextRun" then
-				local channelClients = captureChannelClients()
-				task.delay(context.nextRunCloseDelaySeconds, function()
-					if prepareChannelsForNextRun ~= nil then
-						prepareChannelsForNextRun(channelClients)
-					end
-				end)
+		end
+		request.recipients[#request.recipients + 1] = {
+			channel = channel,
+			client = client,
+		}
+	end
+
+	local function sendRequestResult(channel, client, id, method, okCall, result, serverMs)
+		if okCall then
+			local sent, sendError =
+				TransportModule.sendSuccessResponse(channel.id, client, id, method, result, serverMs)
+			if sent then
+				return
 			end
-		else
-			TransportModule.sendEnvelope(client, {
+			local responseError = conciseConnectionError(sendError or "could not send bridge response")
+			local errorSent = TransportModule.sendEnvelope(client, {
 				id = id,
 				ok = false,
-				error = tostring(result),
+				error = responseError,
 				channel = channel.id,
 				timings = {
 					serverMs = serverMs,
 				},
 			})
+			if not errorSent then
+				pcall(function()
+					client:Close()
+				end)
+			end
+			return
+		end
+		TransportModule.sendEnvelope(client, {
+			id = id,
+			ok = false,
+			error = tostring(result),
+			channel = channel.id,
+			timings = {
+				serverMs = serverMs,
+			},
+		})
+	end
+
+	local function executeRequest(channel, client, id, method, params, replayRequest)
+		if pluginUnloading or (not replayRequest and channel.client ~= client) then
+			return
+		end
+		local started = os.clock()
+		local okCall, result = pcall(context.handleMethod, method, params)
+		local serverMs = (os.clock() - started) * 1000
+		local recipients
+		if replayRequest then
+			replayRequest.completed = true
+			replayRequest.okCall = okCall
+			replayRequest.result = result
+			replayRequest.serverMs = serverMs
+			replayRequest.completedAt = os.clock()
+			completedReplayRequests[#completedReplayRequests + 1] = replayRequest
+			recipients = replayRequest.recipients
+			pruneReplayRequests()
+		else
+			recipients = {
+				{
+					channel = channel,
+					client = client,
+				},
+			}
+		end
+		for _, recipient in ipairs(recipients) do
+			sendRequestResult(
+				recipient.channel,
+				recipient.client,
+				id,
+				method,
+				okCall,
+				result,
+				serverMs
+			)
+		end
+		if replayRequest then
+			replayRequest.recipients = {}
+		end
+		if okCall and method == "prepareForNextRun" then
+			local channelClients = captureChannelClients()
+			task.delay(context.nextRunCloseDelaySeconds, function()
+				if prepareChannelsForNextRun ~= nil then
+					prepareChannelsForNextRun(channelClients)
+				end
+			end)
 		end
 	end
 
@@ -200,7 +295,14 @@ function BridgeConnection.create(context)
 		end
 		exclusiveRequestBusy = true
 		task.spawn(function()
-			executeRequest(request.channel, request.client, request.id, request.method, request.params)
+			executeRequest(
+				request.channel,
+				request.client,
+				request.id,
+				request.method,
+				request.params,
+				request.replayRequest
+			)
 			exclusiveRequestBusy = false
 			drainExclusiveRequestQueue()
 		end)
@@ -219,7 +321,7 @@ function BridgeConnection.create(context)
 		local okDecode, payload = pcall(function()
 			return HttpService:JSONDecode(message)
 		end)
-		if not okDecode or type(payload) ~= "table" then
+		if not okDecode or not isJsonObject(payload) then
 			sendRequestError(channelId, client, nil, "Invalid JSON payload")
 			return
 		end
@@ -229,22 +331,70 @@ function BridgeConnection.create(context)
 			sendRequestError(channelId, client, nil, "Bridge request has an invalid id")
 			return
 		end
+		local sessionId = payload.session_id
+		if sessionId == nil then
+			sessionId = ""
+		elseif type(sessionId) ~= "string" or #sessionId > 128 then
+			sendRequestError(channelId, client, id, "Bridge request has an invalid session id")
+			return
+		end
 		local method = payload.method
 		if type(method) ~= "string" or method == "" or #method > 96 then
 			sendRequestError(channelId, client, id, "Missing or invalid bridge method")
 			return
 		end
-		if type(context.allowedMethods) == "table" and context.allowedMethods[method] ~= true then
+		if type(context.allowedMethods) == "table" and not context.allowedMethods[method] then
 			sendRequestError(channelId, client, id, "Unsupported bridge method")
 			return
 		end
 		local params = payload.params
-		if params ~= nil and type(params) ~= "table" then
+		if params == nil then
+			params = {}
+		elseif not isJsonObject(params) then
 			sendRequestError(channelId, client, id, "Bridge request params must be an object")
 			return
 		end
+		local replayRequest = nil
+		if isReplayProtectedMethod(method) then
+			pruneReplayRequests()
+			local replayKey = ("%d:%s:%d"):format(#sessionId, sessionId, id)
+			replayRequest = replayRequestsByKey[replayKey]
+			if replayRequest then
+				if replayRequest.signature ~= message then
+					sendRequestError(channelId, client, id, "Bridge request id was reused for different content")
+					return
+				end
+				if replayRequest.completed then
+					sendRequestResult(
+						channel,
+						client,
+						id,
+						method,
+						replayRequest.okCall,
+						replayRequest.result,
+						replayRequest.serverMs
+					)
+				else
+					addReplayRecipient(replayRequest, channel, client)
+				end
+				return
+			end
+			replayRequest = {
+				id = id,
+				key = replayKey,
+				method = method,
+				signature = message,
+				recipients = {},
+				completed = false,
+			}
+			addReplayRecipient(replayRequest, channel, client)
+			replayRequestsByKey[replayKey] = replayRequest
+		end
 		if type(context.isExclusiveMethod) == "function" and context.isExclusiveMethod(method) then
 			if #exclusiveRequestQueue >= maxQueuedExclusiveRequests then
+				if replayRequest then
+					replayRequestsByKey[replayRequest.key] = nil
+				end
 				sendRequestError(channelId, client, id, "Bridge mutation queue is full; retry shortly")
 				return
 			end
@@ -254,11 +404,12 @@ function BridgeConnection.create(context)
 				id = id,
 				method = method,
 				params = params,
+				replayRequest = replayRequest,
 			})
 			drainExclusiveRequestQueue()
 			return
 		end
-		task.spawn(executeRequest, channel, client, id, method, params)
+		task.spawn(executeRequest, channel, client, id, method, params, replayRequest)
 	end
 
 	local function scheduleReconnect(channel)
@@ -283,10 +434,9 @@ function BridgeConnection.create(context)
 		local now = os.clock()
 		local channelCount = math.max(#channels, 1)
 		local failures = math.max(0, tonumber(channel.reconnectFailureCount) or 0)
-		local period = tonumber(context.reconnectSeconds) or 0.5
-		if failures == 0 and channel.fastReconnectUntil > now then
-			period = context.fastReconnectSeconds
-		end
+		local period = if failures == 0 and channel.fastReconnectUntil > now
+			then context.fastReconnectSeconds
+			else tonumber(context.reconnectSeconds) or 0.5
 		if failures > 0 then
 			local backoffPower = math.min(failures - 1, 4)
 			local backoff = math.max(tonumber(context.reconnectSeconds) or 0.5, 0.1) * (2 ^ backoffPower)
@@ -449,16 +599,14 @@ function BridgeConnection.create(context)
 		channel.open = false
 		channel.connectAttempt += 1
 		local attempt = channel.connectAttempt
-		local openTimeoutSeconds = context.connectOpenTimeoutSeconds
-		if channel.fastReconnectUntil > now then
-			openTimeoutSeconds = context.fastConnectOpenTimeoutSeconds
-		end
-		if channel.nextRunFastUntil > now then
-			openTimeoutSeconds = context.nextRunConnectTimeoutSeconds
-		end
-		if Config.bridgeConnectDeadline > now then
-			openTimeoutSeconds = math.max(openTimeoutSeconds, Config.bridgeConnectDeadline - now)
-		end
+		local baseOpenTimeoutSeconds = if channel.nextRunFastUntil > now
+			then context.nextRunConnectTimeoutSeconds
+			elseif channel.fastReconnectUntil > now
+			then context.fastConnectOpenTimeoutSeconds
+			else context.connectOpenTimeoutSeconds
+		local openTimeoutSeconds = if Config.bridgeConnectDeadline > now
+			then math.max(baseOpenTimeoutSeconds, Config.bridgeConnectDeadline - now)
+			else baseOpenTimeoutSeconds
 		if not pluginUnloading then
 			updateStatusText()
 		end
@@ -594,21 +742,18 @@ function BridgeConnection.create(context)
 		end)
 
 		client.Closed:Connect(function()
-			local wasOpen = channel.open
-			debugBridgeConnection(
-				("channel %d closed wasOpen=%s shouldReconnect=%s clientMatch=%s"):format(
-					channel.id,
-					tostring(wasOpen),
-					tostring(channel.shouldReconnect),
-					tostring(channel.client == client)
-				)
-			)
-			if channel.client == client then
-				channel.client = nil
-			end
-			if channel.client ~= nil then
+			if channel.client ~= client then
 				return
 			end
+			local wasOpen = channel.open
+			debugBridgeConnection(
+				("channel %d closed wasOpen=%s shouldReconnect=%s"):format(
+					channel.id,
+					tostring(wasOpen),
+					tostring(channel.shouldReconnect)
+				)
+			)
+			channel.client = nil
 			channel.connecting = false
 			channel.open = false
 			recordReconnectClose(channel, wasOpen)
@@ -633,39 +778,23 @@ function BridgeConnection.create(context)
 		end
 	end
 
-	local function ensureReconnectWatchdog()
-		if pluginUnloading or reconnectWatchdogStarted then
+	local function ensurePauseWatcher()
+		if pluginUnloading or pauseWatcherStarted then
 			return
 		end
-		reconnectWatchdogStarted = true
+		pauseWatcherStarted = true
 		task.spawn(function()
-			local lastPauseCheck = 0
 			while not pluginUnloading do
-				task.wait(0.05)
-				local now = os.clock()
-				if Config.bridgePausedForPlay and now - lastPauseCheck >= 1 then
-					lastPauseCheck = now
+				if Config.bridgePausedForPlay then
+					task.wait(1)
 					if not Config.isPlayModeActiveForBridge() then
 						Config.setPausedForPlay(false)
 					end
-				end
-				if Config.bridgeConnectRequested and not Config.bridgePausedForPlay then
-					if Config.bridgeConnectDeadline > 0 and os.clock() >= Config.bridgeConnectDeadline and not Config.bridgeConnectedOnce then
-						Config.bridgeConnectDeadline = 0
-						if channels[1] ~= nil then
-							markConnectionFailure(channels[1], "connection timed out")
-						else
-							Config.bridgeConnectionStatus = "Connecting..."
-						end
-						updateStatusText()
-					end
-					for _, channel in ipairs(channels) do
-						if channel.shouldReconnect and channel.client == nil and not channel.connecting and not channel.reconnectScheduled then
-							connectChannel(channel)
-						end
-					end
+				else
+					break
 				end
 			end
+			pauseWatcherStarted = false
 		end)
 	end
 
@@ -679,7 +808,6 @@ function BridgeConnection.create(context)
 		Config.bridgeConnectDeadline = os.clock() + context.connectSessionTimeoutSeconds
 		local session = Config.bridgeConnectSession
 		Config.bridgeConnectionStatus = "Connecting..."
-		ensureReconnectWatchdog()
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = true
 			closeChannel(channel)
@@ -731,6 +859,7 @@ function BridgeConnection.create(context)
 				channel.reconnectScheduled = false
 				closeChannel(channel)
 			end
+			ensurePauseWatcher()
 			updateStatusText()
 			return
 		end
@@ -752,7 +881,6 @@ function BridgeConnection.create(context)
 		if pluginUnloading or Config.bridgePausedForPlay or not Config.bridgeConnectRequested then
 			return
 		end
-		ensureReconnectWatchdog()
 		local now = os.clock()
 		local channelCount = math.max(#channels, 1)
 		for i, channel in ipairs(channels) do
@@ -804,10 +932,8 @@ function BridgeConnection.create(context)
 	end
 
 	function Config.applyWidgetSettings(reconnectIfRequested)
-		local typedHost = string.gsub(ui.hostBox.Text or "", "^%s*(.-)%s*$", "%1")
-		if typedHost == "" then
-			typedHost = context.defaultHost
-		end
+		local rawHost = string.gsub(ui.hostBox.Text or "", "^%s*(.-)%s*$", "%1")
+		local typedHost = if rawHost == "" then context.defaultHost else rawHost
 		local nextHost = SettingsModule.normalizeLoopbackHost(typedHost)
 		if nextHost == nil then
 			bridgeLog("warn", "bridge host must be loopback (127.0.0.1 or ::1)")
@@ -817,7 +943,7 @@ function BridgeConnection.create(context)
 
 		local parsedPorts = Config.parsePortsCsv(ui.portsBox.Text or "")
 		if parsedPorts == nil then
-			bridgeLog("warn", "invalid ports list, expected comma-separated numbers")
+			bridgeLog("warn", "ports must be 1 to 4 unique comma-separated integers from 1 through 65535")
 			ui.portsBox.Text = table.concat(ports, ",")
 			return false
 		end
@@ -866,12 +992,7 @@ function BridgeConnection.create(context)
 					if pluginUnloading then
 						return
 					end
-					local value: any = rawValue
-					if rawValue == "true" then
-						value = true
-					elseif rawValue == "false" then
-						value = false
-					end
+					local value: any = if rawValue == "true" then true elseif rawValue == "false" then false else rawValue
 					Config.setBridgeSetting(setting, value)
 				end)
 			end
@@ -931,25 +1052,21 @@ function BridgeConnection.create(context)
 		Config.setPausedForPlay(playModeActive)
 	end
 
-	pcall(function()
-		(game:GetService("StudioTestService") :: any):GetPropertyChangedSignal("EditModeActive"):Connect(Config.updatePlayModeBridgeState)
-	end)
-	pcall(function()
-		RunService:GetPropertyChangedSignal("RunState"):Connect(Config.updatePlayModeBridgeState)
-	end)
+	(game:GetService("StudioTestService") :: any):GetPropertyChangedSignal("EditModeActive"):Connect(Config.updatePlayModeBridgeState)
+	RunService:GetPropertyChangedSignal("RunState"):Connect(Config.updatePlayModeBridgeState)
 	Config.updatePlayModeBridgeState()
 
 	plugin.Unloading:Connect(function()
 		pluginUnloading = true
-		if type(context.onUnload) == "function" then
-			pcall(context.onUnload)
-		end
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = false
 			closeChannel(channel)
 		end
 		table.clear(channels)
 		syncConfigState()
+		if type(context.onUnload) == "function" then
+			context.onUnload()
+		end
 	end)
 
 	Config.resetChannels()

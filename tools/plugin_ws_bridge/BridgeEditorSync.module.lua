@@ -4,6 +4,7 @@ local BridgeCandidateMatch = require(script.Parent.BridgeCandidateMatch)
 local BridgeInstanceSwap = require(script.Parent.BridgeInstanceSwap)
 local BridgeReferenceRetarget = require(script.Parent.BridgeReferenceRetarget)
 local BridgeValueEquality = require(script.Parent.BridgeValueEquality)
+local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local EncodingService = game:GetService("EncodingService")
@@ -11,22 +12,9 @@ local InsertService = game:GetService("InsertService")
 local Selection = game:GetService("Selection")
 local SerializationService = game:GetService("SerializationService")
 local Workspace = game:GetService("Workspace")
-local ScriptEditorService = nil
-pcall(function()
-	ScriptEditorService = game:GetService("ScriptEditorService")
-end)
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
-local RbxDomModule = nil
-do
-	local parent = script.Parent
-	local rbxDom = parent and parent:FindFirstChild("RbxDom")
-	if rbxDom and rbxDom:IsA("ModuleScript") then
-		local ok, result = pcall(require, rbxDom)
-		if ok and type(result) == "table" then
-			RbxDomModule = result
-		end
-	end
-end
+local RbxDomModule = require(script.Parent.RbxDom)
 
 local function cloneArray(raw: any): { any }
 	local out = {}
@@ -39,16 +27,33 @@ local function cloneArray(raw: any): { any }
 	return out
 end
 
+local function denseArrayLength(raw: any): (boolean, number)
+	if type(raw) ~= "table" then
+		return false, 0
+	end
+	local length = #raw
+	for key in pairs(raw) do
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > length then
+			return false, 0
+		end
+	end
+	return true, length
+end
+
 local PATH_SEPARATOR = "\0"
 local reconcileSessions = {}
-local recentlyCreatedMeshPartKeys = {}
+local recentlyCreatedMeshParts = setmetatable({}, { __mode = "k" })
 local binaryImports = {}
+local completedBinaryImports = {}
 local binaryExports = {}
 local SESSION_TTL_SECONDS = 120
 local MAX_RECONCILE_SESSIONS = 16
 local MAX_RECONCILE_ENTRIES = 1000000
 local MAX_BINARY_IMPORT_SESSIONS = 4
 local MAX_BINARY_IMPORT_BUFFERED_BYTES = 536870912
+local BINARY_IMPORT_CHUNK_BYTES = 524288
+local COMPLETED_BINARY_IMPORT_TTL_SECONDS = 300
+local MAX_COMPLETED_BINARY_IMPORTS = 64
 local nextSessionExpiryToken = 0
 
 local function countEntries(values: { [any]: any }): number
@@ -64,13 +69,40 @@ local function pruneExpiredSessions(values: { [any]: any })
 	for key, session in pairs(values) do
 		if type(session) ~= "table" or now - (tonumber(session.updatedAt) or 0) > SESSION_TTL_SECONDS then
 			values[key] = nil
+			if type(session) == "table" and type(session.onExpire) == "function" then
+				local okExpire, expireError = pcall(session.onExpire)
+				if not okExpire then
+					warn("[Renium] session expiry cleanup failed: " .. tostring(expireError))
+				end
+			end
 		end
+	end
+end
+
+local function pruneCompletedBinaryImports()
+	local now = os.clock()
+	local records = {}
+	for importId, record in pairs(completedBinaryImports) do
+		if type(record) ~= "table" or (tonumber(record.expiresAt) or 0) <= now then
+			completedBinaryImports[importId] = nil
+		else
+			table.insert(records, { importId = importId, completedAt = tonumber(record.completedAt) or 0 })
+		end
+	end
+	if #records <= MAX_COMPLETED_BINARY_IMPORTS then
+		return
+	end
+	table.sort(records, function(a, b)
+		return a.completedAt < b.completedAt
+	end)
+	for index = 1, #records - MAX_COMPLETED_BINARY_IMPORTS do
+		completedBinaryImports[records[index].importId] = nil
 	end
 end
 
 local function armSessionExpiry(values: { [any]: any }, key: any, session: { [any]: any })
 	session.updatedAt = os.clock()
-	if session.expiryArmed == true then
+	if session.expiryArmed then
 		return
 	end
 	nextSessionExpiryToken += 1
@@ -85,6 +117,12 @@ local function armSessionExpiry(values: { [any]: any }, key: any, session: { [an
 		local idleSeconds = os.clock() - (tonumber(current.updatedAt) or 0)
 		if idleSeconds > SESSION_TTL_SECONDS then
 			values[key] = nil
+			if type(current.onExpire) == "function" then
+				local okExpire, expireError = pcall(current.onExpire)
+				if not okExpire then
+					warn("[Renium] session expiry cleanup failed: " .. tostring(expireError))
+				end
+			end
 			return
 		end
 		task.delay(math.max(1, SESSION_TTL_SECONDS - idleSeconds + 1), expireWhenIdle)
@@ -93,17 +131,10 @@ local function armSessionExpiry(values: { [any]: any }, key: any, session: { [an
 end
 
 local function beginHistoryRecording(label: string): any?
-	local ok, recording = pcall(function()
-		return ChangeHistoryService:TryBeginRecording(
-			("Renium:%s:%s"):format(label, tostring(os.clock())),
-			"Renium: " .. label
-		)
-	end)
-	if ok then
-		return recording
-	end
-	warn("[Renium] could not begin undo recording: " .. tostring(recording))
-	return nil
+	return ChangeHistoryService:TryBeginRecording(
+		("Renium:%s:%s"):format(label, tostring(os.clock())),
+		"Renium: " .. label
+	)
 end
 
 local function finishHistoryRecording(recording: any?, operation: any?)
@@ -111,20 +142,12 @@ local function finishHistoryRecording(recording: any?, operation: any?)
 		return
 	end
 	local finishOperation = operation or Enum.FinishRecordingOperation.Commit
-	local ok, err = pcall(function()
-		ChangeHistoryService:FinishRecording(recording, finishOperation)
-	end)
-	if not ok then
-		warn("[Renium] could not finish undo recording: " .. tostring(err))
-	end
+	ChangeHistoryService:FinishRecording(recording, finishOperation)
 end
 
 local function captureExplorerSelection(): { Instance }
-	local ok, selected = pcall(Selection.Get, Selection)
-	if ok and type(selected) == "table" then
-		return selected
-	end
-	return {}
+	local selected = Selection:Get()
+	return if type(selected) == "table" then selected else {}
 end
 
 local function restoreExplorerSelection(selected: { Instance }, replacements: { [Instance]: Instance }?)
@@ -135,7 +158,7 @@ local function restoreExplorerSelection(selected: { Instance }, replacements: { 
 			restored[#restored + 1] = candidate
 		end
 	end
-	pcall(Selection.Set, Selection, restored)
+	Selection:Set(restored)
 end
 
 local function removeInstanceForUndo(instance: Instance)
@@ -209,12 +232,7 @@ local function resolvePathSegments(pathSegments: any, resolveCache: { [string]: 
 	end
 
 	local first = tostring(pathSegments[1])
-	local okService, current = pcall(function()
-		return game:GetService(first)
-	end)
-	if not okService or current == nil then
-		current = game:FindFirstChild(first)
-	end
+	local current = game:GetService(first)
 	if current == nil then
 		if resolveCache ~= nil and cacheKey ~= nil then
 			resolveCache[cacheKey] = false
@@ -223,10 +241,7 @@ local function resolvePathSegments(pathSegments: any, resolveCache: { [string]: 
 	end
 
 	for i = 2, #pathSegments do
-		local ordinal = 1
-		if type(pathOrdinals) == "table" then
-			ordinal = tonumber(pathOrdinals[i]) or 1
-		end
+		local ordinal = if type(pathOrdinals) == "table" then tonumber(pathOrdinals[i]) or 1 else 1
 		current = resolveOrdinalChild(current, tostring(pathSegments[i]), ordinal)
 		if current == nil then
 			if resolveCache ~= nil and cacheKey ~= nil then
@@ -320,21 +335,17 @@ local function getStateForService(serviceName: string, ctx: { [string]: any }): 
 	if serviceName == "" or type(ctx.getState) ~= "function" then
 		return nil
 	end
-	local okState, state = pcall(ctx.getState, serviceName)
-	if okState and state ~= nil then
-		return state
-	end
-	return nil
+	return ctx.getState(serviceName)
 end
 
 local function parseInstanceIndexId(settingsId: string, identityModule: any): number?
 	if type(identityModule) == "table" and type(identityModule.parseInstanceIndexId) == "function" then
-		local okIndex, index = pcall(identityModule.parseInstanceIndexId, settingsId)
-		if okIndex and type(index) == "number" then
+		local index = identityModule.parseInstanceIndexId(settingsId)
+		if type(index) == "number" then
 			return index
 		end
 	end
-	return tonumber(settingsId, 16) or tonumber(settingsId)
+	return tonumber(settingsId, 16)
 end
 
 local function settingsIdLookupForService(serviceName: string, ctx: { [string]: any })
@@ -356,20 +367,18 @@ local function settingsIdLookupForService(serviceName: string, ctx: { [string]: 
 		for index, candidate in ipairs(state.instances) do
 			local instance = liveInstance(candidate)
 			if instance ~= nil then
-				lookup[tostring(index)] = instance
 				lookup[string.format("%x", index)] = instance
 				if type(state.instanceIdByInstance) == "table" then
 					local instanceId = state.instanceIdByInstance[instance]
 					if type(instanceId) == "number" and instanceId >= 1 then
-						lookup[tostring(instanceId)] = instance
 						lookup[string.format("%x", instanceId)] = instance
 					elseif type(instanceId) == "string" and instanceId ~= "" then
 						lookup[instanceId] = instance
 					end
 				end
 				if type(identityModule) == "table" and type(identityModule.getCachedDebugId) == "function" then
-					local okDebug, debugId = pcall(identityModule.getCachedDebugId, state, instance)
-					if okDebug and type(debugId) == "string" and debugId ~= "" then
+					local debugId = identityModule.getCachedDebugId(state, instance)
+					if type(debugId) == "string" and debugId ~= "" then
 						lookup["debug:" .. debugId] = instance
 					end
 				end
@@ -412,7 +421,7 @@ local function resolveInstanceBySettingsId(serviceName: string, rawSettingsId: a
 	end
 	local index = parseInstanceIndexId(settingsId, ctx.identityModule)
 	if index ~= nil and index >= 1 then
-		instance = liveInstance(lookup[tostring(index)] or lookup[string.format("%x", index)])
+		instance = liveInstance(lookup[string.format("%x", index)])
 		if instance ~= nil then
 			return instance
 		end
@@ -430,10 +439,7 @@ local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }
 	local pathSegments = change.pathSegments
 	if type(pathSegments) == "table" and #pathSegments > 0 then
 		if #pathSegments == 1 and tostring(pathSegments[1]) == serviceName then
-			local okService, service = pcall(game.GetService, game, serviceName)
-			if not okService then
-				service = game:FindFirstChild(serviceName)
-			end
+			local service = game:GetService(serviceName)
 			if service ~= nil and instanceMatchesExpectedClass(service, change.className) then
 				return service
 			end
@@ -442,7 +448,7 @@ local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }
 	local persistent = matchedSettingsInstance(serviceName, change.settingsId, ctx)
 	if
 		persistent ~= nil
-		and (allowClassMismatch == true or instanceMatchesExpectedClass(persistent, change.className))
+		and (allowClassMismatch or instanceMatchesExpectedClass(persistent, change.className))
 	then
 		return persistent
 	end
@@ -450,19 +456,19 @@ local function resolveInstance(change: { [string]: any }, ctx: { [string]: any }
 	if
 		instance ~= nil
 		and strongSettingsId(change.settingsId)
-		and (allowClassMismatch == true or instanceMatchesExpectedClass(instance, change.className))
+		and (allowClassMismatch or instanceMatchesExpectedClass(instance, change.className))
 	then
 		return instance
 	end
 	if type(pathSegments) == "table" and #pathSegments > 0 then
 		local pathInstance = resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
-		if pathInstance ~= nil and (allowClassMismatch == true or instanceMatchesExpectedClass(pathInstance, change.className)) then
+		if pathInstance ~= nil and (allowClassMismatch or instanceMatchesExpectedClass(pathInstance, change.className)) then
 			return pathInstance
 		end
 	end
 	if
 		instance ~= nil
-		and (allowClassMismatch == true or instanceMatchesExpectedClass(instance, change.className))
+		and (allowClassMismatch or instanceMatchesExpectedClass(instance, change.className))
 	then
 		return instance
 	end
@@ -537,7 +543,6 @@ local function instanceSettingsIdKeys(serviceName: string, instance: Instance, c
 	if type(state.instanceIdByInstance) == "table" then
 		local instanceId = state.instanceIdByInstance[instance]
 		if type(instanceId) == "number" and instanceId >= 1 then
-			keys[tostring(instanceId)] = true
 			keys[string.format("%x", instanceId)] = true
 		elseif type(instanceId) == "string" and instanceId ~= "" then
 			keys[instanceId] = true
@@ -546,22 +551,20 @@ local function instanceSettingsIdKeys(serviceName: string, instance: Instance, c
 	if type(state.instanceIndexByInstance) == "table" then
 		local instanceIndex = state.instanceIndexByInstance[instance]
 		if type(instanceIndex) == "number" and instanceIndex >= 1 then
-			keys[tostring(instanceIndex)] = true
 			keys[string.format("%x", instanceIndex)] = true
 		end
 	end
 	local identityModule = ctx.identityModule
 	if type(identityModule) == "table" then
 		if type(identityModule.getCachedInstanceIndex) == "function" then
-			local okIndex, index = pcall(identityModule.getCachedInstanceIndex, state, instance)
-			if okIndex and type(index) == "number" and index >= 1 then
-				keys[tostring(index)] = true
+			local index = identityModule.getCachedInstanceIndex(state, instance)
+			if type(index) == "number" and index >= 1 then
 				keys[string.format("%x", index)] = true
 			end
 		end
 		if type(identityModule.getCachedDebugId) == "function" then
-			local okDebug, debugId = pcall(identityModule.getCachedDebugId, state, instance)
-			if okDebug and type(debugId) == "string" and debugId ~= "" then
+			local debugId = identityModule.getCachedDebugId(state, instance)
+			if type(debugId) == "string" and debugId ~= "" then
 				keys["debug:" .. debugId] = true
 			end
 		end
@@ -587,10 +590,8 @@ local function rememberReplacementIdentity(
 		keys[settingsId] = true
 	end
 
-	local index = if settingsId ~= nil then parseInstanceIndexId(settingsId, ctx.identityModule) else nil
-	if type(index) ~= "number" or index < 1 then
-		index = nil
-	end
+	local parsedIndex = if settingsId ~= nil then parseInstanceIndexId(settingsId, ctx.identityModule) else nil
+	local index = if type(parsedIndex) == "number" and parsedIndex >= 1 then parsedIndex else nil
 	if type(state.instances) == "table" then
 		local indexedInstance = if index ~= nil then liveInstance(state.instances[index]) else nil
 		if index == nil or indexedInstance ~= oldInstance then
@@ -603,7 +604,6 @@ local function rememberReplacementIdentity(
 		end
 		if index ~= nil then
 			state.instances[index] = replacement
-			keys[tostring(index)] = true
 			keys[string.format("%x", index)] = true
 		end
 	end
@@ -671,7 +671,7 @@ local function instanceMatchesDesiredSettingsId(
 		return false
 	end
 	for key in pairs(instanceSettingsIdKeys(serviceName, instance, ctx)) do
-		if desiredSettingsIds[key] == true then
+		if desiredSettingsIds[key] then
 			return true
 		end
 	end
@@ -693,10 +693,10 @@ local function shouldKeepInstanceByDesiredEntry(
 	end
 	local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
 	local legacyKey = pathSegments and pathKey(pathSegments) or ""
-	if key ~= "" and desiredStableKeys[key] == true then
+	if key ~= "" and desiredStableKeys[key] then
 		return false
 	end
-	return key ~= "" and (desiredKeys[key] == true or desiredKeys[legacyKey] == true)
+	return key ~= "" and (desiredKeys[key] or desiredKeys[legacyKey]) or false
 end
 
 local function getInstancePathSegments(instance: Instance): { string }?
@@ -746,17 +746,11 @@ local function getServiceRoot(serviceName: string): Instance?
 	if serviceName == "" then
 		return nil
 	end
-	local okService, service = pcall(function()
-		return game:GetService(serviceName)
-	end)
-	if okService and service ~= nil then
-		return service
-	end
-	return game:FindFirstChild(serviceName)
+	return game:GetService(serviceName)
 end
 
 local function assertAllowedService(serviceName: string, ctx: { [string]: any }): Instance
-	if serviceName == "" or type(ctx.allowedServices) ~= "table" or ctx.allowedServices[serviceName] ~= true then
+	if serviceName == "" or type(ctx.allowedServices) ~= "table" or not ctx.allowedServices[serviceName] then
 		error("Refusing editor mutation outside an allowed service: " .. tostring(serviceName))
 	end
 	local service = getServiceRoot(serviceName)
@@ -822,37 +816,51 @@ local function isProtectedWorkspaceCameraInstance(instance: Instance?): boolean
 	return instance.Name == "Camera" or instance.Name == "CurrentCamera"
 end
 
-local function numberField(raw: { [string]: any }, name: string, fallback: number?): number
-	local value = tonumber(raw[name])
-	if value == nil then
-		return fallback or 0
+local function decodeNumberFields(raw: any, fields: { any }): (boolean, any)
+	if type(raw) ~= "table" then
+		return false, "Typed numeric value must be an object"
 	end
-	return value
+	local values = table.create(#fields)
+	for index, field in ipairs(fields) do
+		local names = if type(field) == "table" then field else { field }
+		local rawValue = nil
+		for _, name in ipairs(names) do
+			if raw[name] ~= nil then
+				rawValue = raw[name]
+				break
+			end
+		end
+		local value = BridgeValueCodec.decodeNumber(rawValue)
+		if not value then
+			return false, tostring(names[1]) .. " must be a number"
+		end
+		values[index] = value
+	end
+	return true, values
 end
 
 local function decodeColor3(raw: any): (boolean, any)
 	if typeof(raw) == "Color3" then
 		return true, raw
 	end
-	if type(raw) ~= "table" then
-		return false, "Color3 value must be a table"
+	local ok, values = decodeNumberFields(raw, {
+		{ "r", "R", 1 },
+		{ "g", "G", 2 },
+		{ "b", "B", 3 },
+	})
+	if not ok then
+		return false, "Color3 " .. tostring(values)
 	end
-	return true, Color3.new(
-		tonumber(raw.r or raw.R or raw[1]) or 0,
-		tonumber(raw.g or raw.G or raw[2]) or 0,
-		tonumber(raw.b or raw.B or raw[3]) or 0
-	)
+	return true, Color3.new(values[1], values[2], values[3])
 end
 
 local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boolean, any)
-	local enumType = tostring(raw.enumType or "")
-	if enumType == "" and enumHint ~= nil and enumHint ~= "" then
-		if string.sub(enumHint, 1, 5) == "Enum." then
-			enumType = enumHint
-		else
-			enumType = "Enum." .. enumHint
-		end
-	end
+	local rawEnumType = tostring(raw.enumType or "")
+	local enumType = if rawEnumType ~= "" or not enumHint or enumHint == ""
+		then rawEnumType
+		elseif string.sub(enumHint, 1, 5) == "Enum."
+		then enumHint
+		else "Enum." .. enumHint
 	local enumName = string.gsub(enumType, "^Enum%.", "")
 	local itemName = tostring(raw.name or "")
 	local ok, item = pcall(function()
@@ -865,13 +873,15 @@ local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boole
 end
 
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
-	local targetServiceName = serviceName
-	if type(raw.pathSegments) == "table" and #raw.pathSegments > 0 then
-		targetServiceName = tostring(raw.pathSegments[1])
-	end
+	local targetServiceName = if type(raw.pathSegments) == "table" and #raw.pathSegments > 0
+		then tostring(raw.pathSegments[1])
+		else serviceName
 	local settingsInstance: Instance? = nil
 	if type(ctx) == "table" and type(targetServiceName) == "string" and targetServiceName ~= "" then
 		local settingsId = raw.settingsId or raw.instanceId
+		if settingsId == nil and type(raw.debugId) == "string" and raw.debugId ~= "" then
+			settingsId = "debug:" .. raw.debugId
+		end
 		local persistent = matchedSettingsInstance(targetServiceName, settingsId, ctx)
 		if persistent ~= nil then
 			return persistent
@@ -898,27 +908,21 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 	local typeName = raw._type
 	if typeName == nil and enumHint == "FontFace" and raw.family ~= nil then
 		typeName = "Font"
-	end
-	if typeName == nil and raw.BrickColor ~= nil then
+	elseif typeName == nil and raw.BrickColor ~= nil then
 		typeName = "BrickColor"
-	end
-	if typeName == nil and type(raw.ColorSequence) == "table" then
+	elseif typeName == nil and type(raw.ColorSequence) == "table" then
 		raw = raw.ColorSequence
 		typeName = "ColorSequence"
-	end
-	if typeName == nil and type(raw.NumberSequence) == "table" then
+	elseif typeName == nil and type(raw.NumberSequence) == "table" then
 		raw = raw.NumberSequence
 		typeName = "NumberSequence"
-	end
-	if typeName == nil and type(raw.NumberRange) == "table" then
+	elseif typeName == nil and type(raw.NumberRange) == "table" then
 		raw = raw.NumberRange
 		typeName = "NumberRange"
-	end
-	if typeName == nil and type(raw.Ref) == "table" then
+	elseif typeName == nil and type(raw.Ref) == "table" then
 		raw = raw.Ref
 		typeName = "Ref"
-	end
-	if typeName == nil and raw.customPhysics ~= nil then
+	elseif typeName == nil and raw.customPhysics ~= nil then
 		typeName = "PhysicalProperties"
 	end
 	if typeName == nil then
@@ -927,15 +931,11 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 	typeName = tostring(typeName)
 
 	if typeName == "Float" then
-		local text = raw.value
-		if text == "nan" then
-			return true, 0 / 0
-		elseif text == "inf" then
-			return true, math.huge
-		elseif text == "-inf" then
-			return true, -math.huge
+		local value = BridgeValueCodec.decodeNumber(raw)
+		if not value then
+			return false, "Float value must be a number or non-finite marker"
 		end
-		return true, tonumber(text) or 0
+		return true, value
 	elseif typeName == "BinaryString" then
 		local encoded = raw.base64
 		if type(encoded) ~= "string" then
@@ -950,37 +950,77 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		if raw.customPhysics == false or raw.density == nil then
 			return true, nil
 		end
-		return true,
-			PhysicalProperties.new(
-				numberField(raw, "density", 0.7),
-				numberField(raw, "friction", 0.3),
-				numberField(raw, "elasticity", 0.5),
-				numberField(raw, "frictionWeight", 1),
-				numberField(raw, "elasticityWeight", 1)
+		local okNumbers, values = decodeNumberFields(raw, {
+			"density",
+			"friction",
+			"elasticity",
+			"frictionWeight",
+			"elasticityWeight",
+		})
+		if not okNumbers then
+			return false, "PhysicalProperties " .. tostring(values)
+		end
+		if raw.acousticAbsorption ~= nil then
+			local acousticAbsorption = tonumber(raw.acousticAbsorption)
+			if not acousticAbsorption then
+				return false, "PhysicalProperties acousticAbsorption must be a number"
+			end
+			local okCreate, physicalProperties = pcall(
+				PhysicalProperties.new :: any,
+				values[1],
+				values[2],
+				values[3],
+				values[4],
+				values[5],
+				acousticAbsorption
 			)
+			if not okCreate then
+				return false, physicalProperties
+			end
+			return true, physicalProperties
+		end
+		return true, PhysicalProperties.new(values[1], values[2], values[3], values[4], values[5])
 	elseif typeName == "NumberRange" then
-		return true,
-			NumberRange.new(
-				tonumber(raw.min or raw.Min or raw[1]) or 0,
-				tonumber(raw.max or raw.Max or raw[2]) or 0
-			)
+		local okNumbers, values = decodeNumberFields(raw, {
+			{ "min", "Min", 1 },
+			{ "max", "Max", 2 },
+		})
+		if not okNumbers then
+			return false, "NumberRange " .. tostring(values)
+		end
+		return true, NumberRange.new(values[1], values[2])
 	elseif typeName == "Vector2" then
-		return true, Vector2.new(numberField(raw, "x"), numberField(raw, "y"))
+		local okNumbers, values = decodeNumberFields(raw, { "x", "y" })
+		if not okNumbers then
+			return false, "Vector2 " .. tostring(values)
+		end
+		return true, Vector2.new(values[1], values[2])
 	elseif typeName == "Vector3" then
-		return true, Vector3.new(numberField(raw, "x"), numberField(raw, "y"), numberField(raw, "z"))
+		local okNumbers, values = decodeNumberFields(raw, { "x", "y", "z" })
+		if not okNumbers then
+			return false, "Vector3 " .. tostring(values)
+		end
+		return true, Vector3.new(values[1], values[2], values[3])
 	elseif typeName == "UDim" then
-		return true, UDim.new(numberField(raw, "scale"), numberField(raw, "offset"))
+		local okNumbers, values = decodeNumberFields(raw, { "scale", "offset" })
+		if not okNumbers then
+			return false, "UDim " .. tostring(values)
+		end
+		return true, UDim.new(values[1], values[2])
 	elseif typeName == "UDim2" then
-		return true, UDim2.new(
-			numberField(raw, "xScale"),
-			numberField(raw, "xOffset"),
-			numberField(raw, "yScale"),
-			numberField(raw, "yOffset")
-		)
+		local okNumbers, values = decodeNumberFields(raw, { "xScale", "xOffset", "yScale", "yOffset" })
+		if not okNumbers then
+			return false, "UDim2 " .. tostring(values)
+		end
+		return true, UDim2.new(values[1], values[2], values[3], values[4])
 	elseif typeName == "Color3" then
 		return decodeColor3(raw)
 	elseif typeName == "BrickColor" then
-		return true, BrickColor.new(tonumber(raw.number or raw.BrickColor) or 0)
+		local number = tonumber(raw.number or raw.BrickColor)
+		if not number then
+			return false, "BrickColor number must be numeric"
+		end
+		return true, BrickColor.new(number)
 	elseif typeName == "EnumItem" then
 		return decodeEnumItem(raw, enumHint)
 	elseif typeName == "CFrame" then
@@ -990,11 +1030,19 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		end
 		local values = table.create(12)
 		for i = 1, 12 do
-			values[i] = tonumber(components[i]) or 0
+			local component = BridgeValueCodec.decodeNumber(components[i])
+			if not component then
+				return false, string.format("CFrame component %d must be a number", i)
+			end
+			values[i] = component
 		end
 		return true, CFrame.new(table.unpack(values))
 	elseif typeName == "Rect" then
-		return true, Rect.new(numberField(raw, "minX"), numberField(raw, "minY"), numberField(raw, "maxX"), numberField(raw, "maxY"))
+		local okNumbers, values = decodeNumberFields(raw, { "minX", "minY", "maxX", "maxY" })
+		if not okNumbers then
+			return false, "Rect " .. tostring(values)
+		end
+		return true, Rect.new(values[1], values[2], values[3], values[4])
 	elseif typeName == "Font" then
 		local ok, font = pcall(function()
 			return Font.new(
@@ -1014,17 +1062,26 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		end
 		local decoded = table.create(#keypoints)
 		for i, keypoint in ipairs(keypoints) do
-			local colorRaw = keypoint.value
-			if colorRaw == nil then
-				colorRaw = keypoint.color or keypoint.Value
+			if type(keypoint) ~= "table" then
+				return false, string.format("ColorSequence keypoint %d must be an object", i)
 			end
+			local colorRaw = if keypoint.value ~= nil then keypoint.value else keypoint.color or keypoint.Value
 			local okColor, color = decodeColor3(colorRaw)
 			if not okColor then
 				return false, color
 			end
-			decoded[i] = ColorSequenceKeypoint.new(numberField(keypoint, "time"), color)
+			local okNumbers, values = decodeNumberFields(keypoint, { "time" })
+			if not okNumbers then
+				return false, string.format("ColorSequence keypoint %d %s", i, tostring(values))
+			end
+			local okKeypoint, decodedKeypoint = pcall(ColorSequenceKeypoint.new, values[1], color)
+			if not okKeypoint then
+				return false, decodedKeypoint
+			end
+			decoded[i] = decodedKeypoint
 		end
-		return true, ColorSequence.new(decoded)
+		local okSequence, sequence = pcall(ColorSequence.new, decoded)
+		return okSequence, sequence
 	elseif typeName == "NumberSequence" then
 		local keypoints = raw.keypoints
 		if type(keypoints) ~= "table" then
@@ -1032,37 +1089,64 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 		end
 		local decoded = table.create(#keypoints)
 		for i, keypoint in ipairs(keypoints) do
-			decoded[i] = NumberSequenceKeypoint.new(
-				numberField(keypoint, "time"),
-				numberField(keypoint, "value"),
-				numberField(keypoint, "envelope")
-			)
-		end
-		return true, NumberSequence.new(decoded)
-	elseif typeName == "Axes" then
-		local axes = {}
-		for _, name in ipairs(raw.axes or {}) do
-			local item = (Enum.Axis :: any)[tostring(name)]
-			if item ~= nil then
-				axes[#axes + 1] = item
+			if type(keypoint) ~= "table" then
+				return false, string.format("NumberSequence keypoint %d must be an object", i)
 			end
+			local okNumbers, values = decodeNumberFields(keypoint, { "time", "value", "envelope" })
+			if not okNumbers then
+				return false, string.format("NumberSequence keypoint %d %s", i, tostring(values))
+			end
+			local okKeypoint, decodedKeypoint = pcall(
+				NumberSequenceKeypoint.new,
+				values[1],
+				values[2],
+				values[3]
+			)
+			if not okKeypoint then
+				return false, decodedKeypoint
+			end
+			decoded[i] = decodedKeypoint
+		end
+		local okSequence, sequence = pcall(NumberSequence.new, decoded)
+		return okSequence, sequence
+	elseif typeName == "Axes" then
+		if type(raw.axes) ~= "table" then
+			return false, "Axes axes must be an array"
+		end
+		local axes = {}
+		for _, name in ipairs(raw.axes) do
+			local item = (Enum.Axis :: any)[tostring(name)]
+			if item == nil then
+				return false, "Unknown axis " .. tostring(name)
+			end
+			axes[#axes + 1] = item
 		end
 		return true, Axes.new(table.unpack(axes))
 	elseif typeName == "Faces" then
+		if type(raw.faces) ~= "table" then
+			return false, "Faces faces must be an array"
+		end
 		local faces = {}
-		for _, name in ipairs(raw.faces or {}) do
+		for _, name in ipairs(raw.faces) do
 			local item = (Enum.NormalId :: any)[tostring(name)]
-			if item ~= nil then
-				faces[#faces + 1] = item
+			if item == nil then
+				return false, "Unknown face " .. tostring(name)
 			end
+			faces[#faces + 1] = item
 		end
 		return true, Faces.new(table.unpack(faces))
 	elseif typeName == "Ray" then
-		local origin = raw.origin or {}
-		local direction = raw.direction or {}
+		local okOrigin, origin = decodeNumberFields(raw.origin, { "x", "y", "z" })
+		if not okOrigin then
+			return false, "Ray origin " .. tostring(origin)
+		end
+		local okDirection, direction = decodeNumberFields(raw.direction, { "x", "y", "z" })
+		if not okDirection then
+			return false, "Ray direction " .. tostring(direction)
+		end
 		return true, Ray.new(
-			Vector3.new(numberField(origin, "x"), numberField(origin, "y"), numberField(origin, "z")),
-			Vector3.new(numberField(direction, "x"), numberField(direction, "y"), numberField(direction, "z"))
+			Vector3.new(origin[1], origin[2], origin[3]),
+			Vector3.new(direction[1], direction[2], direction[3])
 		)
 	elseif typeName == "Ref" then
 		return true, decodeRefValue(raw, ctx, serviceName)
@@ -1072,11 +1156,9 @@ local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?,
 end
 
 local function enumHintForProperty(instance: Instance, propertyName: string): string?
-	if RbxDomModule ~= nil and RbxDomModule.findCanonicalPropertyDescriptor ~= nil then
-		local ok, descriptor = pcall(RbxDomModule.findCanonicalPropertyDescriptor, instance.ClassName, propertyName)
-		if ok and descriptor ~= nil and type(descriptor.enumType) == "string" and descriptor.enumType ~= "" then
-			return descriptor.enumType
-		end
+	local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
+	if descriptor ~= nil and type(descriptor.enumType) == "string" and descriptor.enumType ~= "" then
+		return descriptor.enumType
 	end
 	local okRead, current = pcall(function()
 		return (instance :: any)[propertyName]
@@ -1093,16 +1175,7 @@ local function classHasProperty(instance: Instance, propertyName: string): boole
 			return true
 		end
 	end
-	if RbxDomModule ~= nil and RbxDomModule.findCanonicalPropertyDescriptor ~= nil then
-		local ok, descriptor = pcall(RbxDomModule.findCanonicalPropertyDescriptor, instance.ClassName, propertyName)
-		if ok then
-			return descriptor ~= nil
-		end
-	end
-	local okRead = pcall(function()
-		return (instance :: any)[propertyName]
-	end)
-	return okRead
+	return RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, propertyName) ~= nil
 end
 
 local function decodePropertyValue(instance: Instance, propertyName: string, rawValue: any, ctx: { [string]: any }, serviceName: string): (boolean, any)
@@ -1111,11 +1184,14 @@ local function decodePropertyValue(instance: Instance, propertyName: string, raw
 			return (instance :: any)[propertyName]
 		end)
 		if okCurrent and typeof(current) == "NumberRange" then
-			return true,
-				NumberRange.new(
-					tonumber(rawValue.min or rawValue.Min or rawValue[1]) or 0,
-					tonumber(rawValue.max or rawValue.Max or rawValue[2]) or 0
-				)
+			local okNumbers, values = decodeNumberFields(rawValue, {
+				{ "min", "Min", 1 },
+				{ "max", "Max", 2 },
+			})
+			if not okNumbers then
+				return false, "NumberRange " .. tostring(values)
+			end
+			return true, NumberRange.new(values[1], values[2])
 		end
 	end
 	return decodeValue(rawValue, enumHintForProperty(instance, propertyName), ctx, serviceName)
@@ -1127,21 +1203,15 @@ BridgeEditorSync.decodeValue = decodeValue
 BridgeEditorSync.valuesEqual = valuesEqual
 
 local function connectProbeSignal(stats: { [string]: any }, eventName: string, countField: string, availableField: string, connections: { RBXScriptConnection })
-	local okSignal, signal = pcall(function()
-		return (game :: any)[eventName]
-	end)
-	if not okSignal or signal == nil then
+	local signal = (game :: any)[eventName]
+	if not signal then
 		return
 	end
-	local okConnect, connection = pcall(function()
-		return signal:Connect(function()
-			stats[countField] += 1
-		end)
+	local connection = signal:Connect(function()
+		stats[countField] += 1
 	end)
-	if okConnect and connection ~= nil then
-		stats[availableField] = 1
-		table.insert(connections, connection)
-	end
+	stats[availableField] = 1
+	table.insert(connections, connection)
 end
 
 local function startEventProbe(stats: { [string]: any }): () -> ()
@@ -1160,20 +1230,14 @@ end
 local function readProperty(instance: Instance, propertyName: string): (boolean, any)
 	if instance:IsA("Model") or instance:IsA("WorldModel") then
 		if propertyName == "Scale" then
-			return pcall(function()
-				return (instance :: any):GetScale()
-			end)
+			return true, (instance :: any):GetScale()
 		elseif propertyName == "WorldPivot" or propertyName == "WorldPivotData" or propertyName == "Origin" then
-			return pcall(function()
-				return (instance :: any):GetPivot()
-			end)
+			return true, (instance :: any):GetPivot()
 		end
 	end
-	if RbxDomModule ~= nil then
-		local okCall, okRead, value = pcall(RbxDomModule.readProperty, instance, propertyName)
-		if okCall and okRead then
-			return true, value
-		end
+	local okCall, okRead, value = pcall(RbxDomModule.readProperty, instance, propertyName)
+	if okCall and okRead then
+		return true, value
 	end
 	return pcall(function()
 		return (instance :: any)[propertyName]
@@ -1190,22 +1254,19 @@ local function candidateBucketsForParent(parent: Instance, ctx: { [string]: any 
 	end
 	local buckets = {}
 	for _, child in ipairs(parent:GetChildren()) do
-		local okRead, name, className = pcall(function()
-			return child.Name, child.ClassName
-		end)
-		if okRead then
-			local byClass = buckets[name]
-			if byClass == nil then
-				byClass = {}
-				buckets[name] = byClass
-			end
-			local candidates = byClass[className]
-			if candidates == nil then
-				candidates = {}
-				byClass[className] = candidates
-			end
-			candidates[#candidates + 1] = child
+		local name = child.Name
+		local className = child.ClassName
+		local byClass = buckets[name]
+		if byClass == nil then
+			byClass = {}
+			buckets[name] = byClass
 		end
+		local candidates = byClass[className]
+		if candidates == nil then
+			candidates = {}
+			byClass[className] = candidates
+		end
+		candidates[#candidates + 1] = child
 	end
 	ctx.matchCandidateBuckets[parent] = buckets
 	return buckets
@@ -1219,7 +1280,7 @@ local function rememberEntryResolution(
 	ctx: { [string]: any }
 )
 	claimedInstances[instance] = true
-	if entry.ambiguousSiblings == true then
+	if entry.ambiguousSiblings then
 		rememberMatchedSettingsInstance(serviceName, entry.settingsId, instance, ctx)
 	end
 end
@@ -1232,25 +1293,25 @@ local function resolveEntryInstance(
 	claimedInstances: { [Instance]: boolean }
 ): Instance?
 	local persistent = matchedSettingsInstance(serviceName, entry.settingsId, ctx)
-	if persistent ~= nil and claimedInstances[persistent] ~= true then
+	if persistent ~= nil and not claimedInstances[persistent] then
 		return persistent
 	end
 
 	local settingsInstance = resolveInstanceBySettingsId(serviceName, entry.settingsId, ctx)
 	if
 		settingsInstance ~= nil
-		and claimedInstances[settingsInstance] ~= true
+		and not claimedInstances[settingsInstance]
 		and strongSettingsId(entry.settingsId)
 	then
 		return settingsInstance
 	end
 
 	local pathInstance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
-	if entry.ambiguousSiblings ~= true then
-		if pathInstance ~= nil and claimedInstances[pathInstance] ~= true then
+	if not entry.ambiguousSiblings then
+		if pathInstance ~= nil and not claimedInstances[pathInstance] then
 			return pathInstance
 		end
-		if settingsInstance ~= nil and claimedInstances[settingsInstance] ~= true then
+		if settingsInstance ~= nil and not claimedInstances[settingsInstance] then
 			return settingsInstance
 		end
 		return nil
@@ -1261,7 +1322,7 @@ local function resolveEntryInstance(
 	local candidates = {}
 	local included = {}
 	local function include(candidate: Instance?)
-		if candidate == nil or claimedInstances[candidate] == true or included[candidate] == true then
+		if not candidate or claimedInstances[candidate] or included[candidate] then
 			return
 		end
 		if parent ~= nil and candidate.Parent ~= parent then
@@ -1317,11 +1378,9 @@ local function writeProperty(instance: Instance, propertyName: string, value: an
 			end)
 		end
 	end
-	if RbxDomModule ~= nil then
-		local okCall, okWrite = pcall(RbxDomModule.writeProperty, instance, propertyName, value)
-		if okCall and okWrite then
-			return true, nil
-		end
+	local okCall, okDomWrite = pcall(RbxDomModule.writeProperty, instance, propertyName, value)
+	if okCall and okDomWrite then
+		return true, nil
 	end
 	local okWrite, writeErr = pcall(function()
 		(instance :: any)[propertyName] = value
@@ -1352,14 +1411,8 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any): (boolean, a
 		return false, "Cannot apply empty MeshId through CreateMeshPartAsync"
 	end
 
-	local collisionFidelity = Enum.CollisionFidelity.Default
-	pcall(function()
-		collisionFidelity = (instance :: any).CollisionFidelity
-	end)
-	local renderFidelity = Enum.RenderFidelity.Automatic
-	pcall(function()
-		renderFidelity = (instance :: any).RenderFidelity
-	end)
+	local collisionFidelity = (instance :: MeshPart).CollisionFidelity
+	local renderFidelity = (instance :: MeshPart).RenderFidelity
 
 	local okCreate, meshPartOrErr = pcall(function()
 		return InsertService:CreateMeshPartAsync(meshIdText, collisionFidelity, renderFidelity)
@@ -1372,9 +1425,7 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any): (boolean, a
 	local okApply, applyErr = pcall(function()
 		(instance :: MeshPart):ApplyMesh(sourceMeshPart)
 	end)
-	pcall(function()
-		sourceMeshPart:Destroy()
-	end)
+	sourceMeshPart:Destroy()
 	if not okApply then
 		return false, applyErr
 	end
@@ -1388,13 +1439,11 @@ local function canApplyProtectedMeshId(change: { [string]: any }, instance: Inst
 	if not instance:IsA("MeshPart") then
 		return false
 	end
-	return recentlyCreatedMeshPartKeys[pathCacheKey(change.pathSegments, change.pathOrdinals)] == true
-		or recentlyCreatedMeshPartKeys[pathKey(change.pathSegments)] == true
+	return not not recentlyCreatedMeshParts[instance]
 end
 
-local function clearRecentlyCreatedMeshPart(change: { [string]: any })
-	recentlyCreatedMeshPartKeys[pathCacheKey(change.pathSegments, change.pathOrdinals)] = nil
-	recentlyCreatedMeshPartKeys[pathKey(change.pathSegments)] = nil
+local function clearRecentlyCreatedMeshPart(instance: Instance)
+	recentlyCreatedMeshParts[instance] = nil
 end
 
 local function applyTags(instance: Instance, rawTags: any, stats: { [string]: any })
@@ -1409,7 +1458,7 @@ local function applyTags(instance: Instance, rawTags: any, stats: { [string]: an
 
 	local changed = false
 	for _, tag in ipairs(CollectionService:GetTags(instance)) do
-		if desired[tag] ~= true then
+		if not desired[tag] then
 			CollectionService:RemoveTag(instance, tag)
 			changed = true
 		end
@@ -1450,40 +1499,29 @@ local function retargetReplacementReferences(
 	ctx: { [string]: any },
 	stats: { [string]: any }
 )
-	if next(replacements) == nil or RbxDomModule == nil or RbxDomModule.getReferencePropertyNames == nil then
+	if next(replacements) == nil then
 		return
 	end
 	local roots = {}
 	for serviceName, allowed in pairs(ctx.allowedServices) do
-		if allowed == true then
-			local okService, service = pcall(game.GetService, game, serviceName)
-			if okService and service ~= nil then
-				roots[#roots + 1] = service
-			end
+		if allowed then
+			roots[#roots + 1] = game:GetService(serviceName)
 		end
 	end
-	local okRetarget, updated, failed = pcall(
-		BridgeReferenceRetarget.apply,
+	local updated, failed = BridgeReferenceRetarget.apply(
 		roots,
 		replacements,
 		RbxDomModule.getReferencePropertyNames,
 		readProperty,
 		writeProperty
 	)
-	if not okRetarget then
-		warn("[Renium] could not retarget references after class replacement: " .. tostring(updated))
-		return
-	end
 	stats.propertyUpdated += updated
 	if failed > 0 then
-		warn("[Renium] could not retarget " .. tostring(failed) .. " references after class replacement")
+		warn(`[Renium] could not retarget {failed} references after class replacement`)
 	end
 end
 
 local function findScriptDocument(instance: Instance): any?
-	if ScriptEditorService == nil then
-		return nil
-	end
 	local ok, document = pcall(function()
 		return (ScriptEditorService :: any):FindScriptDocument(instance)
 	end)
@@ -1494,13 +1532,11 @@ local function findScriptDocument(instance: Instance): any?
 end
 
 local function readScriptSource(instance: Instance): (boolean, any)
-	if ScriptEditorService ~= nil then
-		local okEditor, editorSource = pcall(function()
-			return (ScriptEditorService :: any):GetEditorSource(instance)
-		end)
-		if okEditor then
-			return true, editorSource
-		end
+	local okEditor, editorSource = pcall(function()
+		return (ScriptEditorService :: any):GetEditorSource(instance)
+	end)
+	if okEditor then
+		return true, editorSource
 	end
 	return pcall(function()
 		return (instance :: any).Source
@@ -1537,13 +1573,9 @@ local function getDocumentSelection(document: any): { number }?
 	if not okSelection or type(cursorLine) ~= "number" or type(cursorCharacter) ~= "number" then
 		return nil
 	end
-	if type(anchorLine) ~= "number" then
-		anchorLine = cursorLine
-	end
-	if type(anchorCharacter) ~= "number" then
-		anchorCharacter = cursorCharacter
-	end
-	return { cursorLine, cursorCharacter, anchorLine, anchorCharacter }
+	local resolvedAnchorLine = if type(anchorLine) == "number" then anchorLine else cursorLine
+	local resolvedAnchorCharacter = if type(anchorCharacter) == "number" then anchorCharacter else cursorCharacter
+	return { cursorLine, cursorCharacter, resolvedAnchorLine, resolvedAnchorCharacter }
 end
 
 local function restoreDocumentSelection(document: any, selection: { number }?)
@@ -1602,15 +1634,13 @@ local function setSource(instance: Instance, source: string): (boolean, any, str
 		end
 	end
 
-	if ScriptEditorService ~= nil then
-		local updateOk, updateErr = pcall(function()
-			(ScriptEditorService :: any):UpdateSourceAsync(instance, function()
-				return source
-			end)
+	local updateOk = pcall(function()
+		(ScriptEditorService :: any):UpdateSourceAsync(instance, function()
+			return source
 		end)
-		if updateOk then
-			return true, nil, "UpdateSourceAsync"
-		end
+	end)
+	if updateOk then
+		return true, nil, "UpdateSourceAsync"
 	end
 	local ok, err = pcall(function()
 		(instance :: any).Source = source
@@ -1626,8 +1656,8 @@ local function syncOptions(ctx: { [string]: any }): { [string]: any }
 		return ctx.syncOptions
 	end
 	if type(ctx.getSyncOptions) == "function" then
-		local ok, options = pcall(ctx.getSyncOptions)
-		if ok and type(options) == "table" then
+		local options = ctx.getSyncOptions()
+		if type(options) == "table" then
 			return options
 		end
 	end
@@ -1650,17 +1680,23 @@ local function ensureSourceParentPath(change: { [string]: any }, service: Instan
 	local current = service
 	for i = 2, #pathSegments - 1 do
 		local name = tostring(pathSegments[i])
-		local ordinal = 1
-		if type(change.pathOrdinals) == "table" then
-			ordinal = tonumber(change.pathOrdinals[i]) or 1
-		end
+		local ordinal = if type(change.pathOrdinals) == "table" then tonumber(change.pathOrdinals[i]) or 1 else 1
 		local child = resolveOrdinalChild(current, name, ordinal)
 		if child == nil then
-			local folder = Instance.new("Folder")
-			folder.Name = name
-			folder.Parent = current
-			stats.instanceCreated += 1
-			child = folder
+			local existing = 0
+			for _, sibling in ipairs(current:GetChildren()) do
+				if sibling.Name == name then
+					existing += 1
+				end
+			end
+			while existing < ordinal do
+				local folder = Instance.new("Folder")
+				folder.Name = name
+				folder.Parent = current
+				stats.instanceCreated += 1
+				existing += 1
+				child = folder
+			end
 		end
 		current = child
 	end
@@ -1680,12 +1716,12 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 	end
 	if change.deleted == true then
 		if instance ~= nil then
-			if ctx.luaSourceClass[instance.ClassName] ~= true then
+			if not ctx.luaSourceClass[instance.ClassName] then
 				error("Target is not a Lua source container: " .. instance:GetFullName())
 			end
 			local okWrite, err, writeMethod = setSource(instance, "")
 			if not okWrite then
-				error("Failed to clear Source for " .. instance:GetFullName() .. ": " .. tostring(err))
+				error(`Failed to clear Source for {instance:GetFullName()}: {err}`)
 			end
 			if writeMethod == "UpdateSourceAsync" then
 				stats.sourceUpdateAsync += 1
@@ -1726,7 +1762,7 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 		stats.sourceCreated += 1
 	end
 
-	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] == true then
+	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] then
 		local oldInstance = instance
 		instance = replaceInstanceClass(instance, tostring(change.className), stats, ctx.selectionReplacements)
 		rememberReplacementIdentity(serviceName, change.settingsId, oldInstance, instance, ctx)
@@ -1734,7 +1770,7 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 			ctx.resolveCache[pathCacheKey(change.pathSegments, change.pathOrdinals)] = instance
 		end
 	end
-	if ctx.luaSourceClass[instance.ClassName] ~= true then
+	if not ctx.luaSourceClass[instance.ClassName] then
 		error("Target is not a Lua source container: " .. instance:GetFullName())
 	end
 
@@ -1747,7 +1783,7 @@ local function applySourceChange(change: { [string]: any }, ctx: { [string]: any
 
 	local okWrite, err, writeMethod = setSource(instance, nextSource)
 	if not okWrite then
-		error("Failed to write Source for " .. instance:GetFullName() .. ": " .. tostring(err))
+		error(`Failed to write Source for {instance:GetFullName()}: {err}`)
 	end
 	if writeMethod == "UpdateSourceAsync" then
 		stats.sourceUpdateAsync += 1
@@ -1826,12 +1862,12 @@ local function applyInstanceReconcile(change: { [string]: any }, ctx: { [string]
 					end
 					local okCreate, created = pcall(Instance.new, entry.className)
 					if not okCreate or created == nil then
-						error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
+						error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
 					end
 					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 					created.Parent = parent
 					if created:IsA("MeshPart") then
-						recentlyCreatedMeshPartKeys[entry.key] = true
+						recentlyCreatedMeshParts[created] = true
 					end
 					instance = created
 					stats.instanceCreated += 1
@@ -1928,6 +1964,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 			error("Too many active editor reconcile sessions")
 		end
 		reconcileSessions[sessionKey] = {
+			serviceName = serviceName,
 			desiredKeys = {},
 			desiredSettingsIds = {},
 			desiredStableKeys = {},
@@ -1943,7 +1980,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 	end
 	local session = reconcileSessions[sessionKey]
 	armSessionExpiry(reconcileSessions, sessionKey, session)
-	if session.failed == true then
+	if session.failed then
 		if mode == "finishReconcileService" then
 			reconcileSessions[sessionKey] = nil
 		end
@@ -1956,7 +1993,7 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 	local entries = sortedInstanceEntries(change, service.Name)
 	local newEntries = 0
 	for _, entry in ipairs(entries) do
-		if session.desiredKeys[entry.key] ~= true then
+		if not session.desiredKeys[entry.key] then
 			newEntries += 1
 		end
 	end
@@ -1980,12 +2017,12 @@ local function applyInstanceReconcileChunk(change: { [string]: any }, ctx: { [st
 					end
 					local okCreate, created = pcall(Instance.new, entry.className)
 					if not okCreate or created == nil then
-						error("Cannot create " .. entry.className .. " at " .. pathKey(entry.pathSegments) .. ": " .. tostring(created))
+						error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
 					end
 					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 					created.Parent = parent
 					if created:IsA("MeshPart") then
-						recentlyCreatedMeshPartKeys[entry.key] = true
+						recentlyCreatedMeshParts[created] = true
 					end
 					instance = created
 					stats.instanceCreated += 1
@@ -2056,12 +2093,12 @@ local function applyInstanceUpserts(change: { [string]: any }, ctx: { [string]: 
 					end
 					local okCreate, created = pcall(Instance.new, entry.className)
 					if not okCreate or created == nil then
-						error("Cannot create instance " .. entry.key .. ": " .. tostring(created))
+						error(`Cannot create instance {entry.key}: {created}`)
 					end
 					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 					created.Parent = parent
 					if created:IsA("MeshPart") then
-						recentlyCreatedMeshPartKeys[entry.key] = true
+						recentlyCreatedMeshParts[created] = true
 					end
 					instance = created
 					stats.instanceCreated += 1
@@ -2107,7 +2144,7 @@ local function applyInstanceDeletes(change: { [string]: any }, ctx: { [string]: 
 				instance = nil
 			end
 		end
-		if instance == nil or isProtectedWorkspaceCameraInstance(instance) or seenTargets[instance] == true then
+		if instance == nil or isProtectedWorkspaceCameraInstance(instance) or seenTargets[instance] then
 			stats.noops += 1
 		else
 			seenTargets[instance] = true
@@ -2139,9 +2176,9 @@ local function applyInstanceChange(change: { [string]: any }, ctx: { [string]: a
 	end
 end
 
-local function recordProtectedWrite(stats, change, kind, name, value)
+local function recordProtectedWrite(stats, change, kind, name, value, deleted)
 	stats.protectedSkipped += 1
-	table.insert(stats.protectedWrites, {
+	local row = {
 		kind = kind,
 		service = change.service,
 		settingsId = change.settingsId,
@@ -2149,8 +2186,14 @@ local function recordProtectedWrite(stats, change, kind, name, value)
 		pathOrdinals = change.pathOrdinals,
 		className = change.className,
 		name = name,
-		value = value,
-	})
+	}
+	if value ~= nil then
+		row.value = value
+	end
+	if deleted then
+		row.deleted = true
+	end
+	table.insert(stats.protectedWrites, row)
 end
 
 local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: any }, stats: { [string]: any }, touchedServices: { [string]: boolean })
@@ -2163,7 +2206,7 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 
 	local instance = resolveInstance(change, ctx)
 	if instance == nil then
-		error("Target instance was not found: " .. pathKey(cloneArray(change.pathSegments)) .. " [" .. tostring(change.className or "") .. "]")
+		error(`Target instance was not found: {pathKey(cloneArray(change.pathSegments))} [{change.className or ""}]`)
 	end
 	assertInstanceInService(instance, service)
 	if isProtectedWorkspaceCameraPath(change.pathSegments) or isProtectedWorkspaceCameraInstance(instance) then
@@ -2210,19 +2253,19 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 				end
 				local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
 				if not okDecode then
-					error("Failed to decode " .. propertyName .. ": " .. tostring(decoded))
+					error(`Failed to decode {propertyName}: {decoded}`)
 				end
 				local okRead, current = readProperty(instance, propertyName)
 				if okRead and valuesEqual(current, decoded) then
 					stats.noops += 1
 					if propertyName == "MeshId" then
-						clearRecentlyCreatedMeshPart(change)
+						clearRecentlyCreatedMeshPart(instance)
 					end
 				else
 					if propertyName == "MeshId" and instance:IsA("MeshPart") and not canApplyProtectedMeshId(change, instance) then
 						recordProtectedWrite(stats, change, "property", propertyName, rawValue)
 						stats.noops += 1
-						clearRecentlyCreatedMeshPart(change)
+						clearRecentlyCreatedMeshPart(instance)
 						continue
 					end
 					local okWrite, err = writeProperty(instance, propertyName, decoded)
@@ -2230,7 +2273,7 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 						if propertyName == "MeshId" and instance:IsA("MeshPart") then
 							local okApplyMesh, applyMeshErr = applyMeshPartMeshId(instance, decoded)
 							if not okApplyMesh then
-								error("Failed to apply MeshId on " .. instance:GetFullName() .. ": " .. tostring(applyMeshErr))
+								error(`Failed to apply MeshId on {instance:GetFullName()}: {applyMeshErr}`)
 							end
 						else
 							local errText = string.lower(tostring(err))
@@ -2239,14 +2282,36 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 								stats.noops += 1
 								continue
 							end
-							error("Failed to write " .. propertyName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
+							error(`Failed to write {propertyName} on {instance:GetFullName()}: {err}`)
 						end
 					end
 					stats.propertyUpdated += 1
 					if propertyName == "MeshId" then
-						clearRecentlyCreatedMeshPart(change)
+						clearRecentlyCreatedMeshPart(instance)
 					end
 				end
+			end
+		end
+	end
+
+	local deletedAttributes = change.deletedAttributes
+	if type(deletedAttributes) == "table" then
+		for _, attributeName in ipairs(deletedAttributes) do
+			local current = instance:GetAttribute(attributeName)
+			if current == nil then
+				stats.noops += 1
+			else
+				local okWrite, err = pcall(instance.SetAttribute, instance, attributeName, nil)
+				if not okWrite then
+					local errText = string.lower(tostring(err))
+					if string.find(errText, "corescript permission required", 1, true) or string.find(errText, "read only", 1, true) then
+						recordProtectedWrite(stats, change, "attribute", attributeName, nil, true)
+						stats.noops += 1
+						continue
+					end
+					error(`Failed to delete attribute {attributeName} on {instance:GetFullName()}: {err}`)
+				end
+				stats.attributeUpdated += 1
 			end
 		end
 	end
@@ -2257,7 +2322,7 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 			attributeName = tostring(attributeName)
 			local okDecode, decoded = decodeValue(rawValue, nil)
 			if not okDecode then
-				error("Failed to decode attribute " .. attributeName .. ": " .. tostring(decoded))
+				error(`Failed to decode attribute {attributeName}: {decoded}`)
 			end
 			local current = instance:GetAttribute(attributeName)
 			if valuesEqual(current, decoded) then
@@ -2271,7 +2336,7 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 						stats.noops += 1
 						continue
 					end
-					error("Failed to write attribute " .. attributeName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
+					error(`Failed to write attribute {attributeName} on {instance:GetFullName()}: {err}`)
 				end
 				stats.attributeUpdated += 1
 			end
@@ -2279,9 +2344,508 @@ local function applyPropertyChange(change: { [string]: any }, ctx: { [string]: a
 	end
 end
 
+local function validateObjectTable(raw: any, label: string)
+	if type(raw) ~= "table" then
+		error(label .. " must be an object")
+	end
+	for key in pairs(raw) do
+		if type(key) ~= "string" or key == "" then
+			error(label .. " must use non-empty string keys")
+		end
+	end
+end
+
+local function validateMutationPath(change: { [string]: any }, serviceName: string, label: string)
+	local pathIsArray, pathLength = denseArrayLength(change.pathSegments)
+	if not pathIsArray or pathLength == 0 then
+		error(label .. " pathSegments must be a non-empty array")
+	end
+	for index, segment in ipairs(change.pathSegments) do
+		if type(segment) ~= "string" or segment == "" then
+			error(string.format("%s path segment %d must be a non-empty string", label, index))
+		end
+	end
+	if change.pathSegments[1] ~= serviceName then
+		error(label .. " path root does not match its service")
+	end
+	if change.pathOrdinals ~= nil then
+		local ordinalsAreArray, ordinalCount = denseArrayLength(change.pathOrdinals)
+		if not ordinalsAreArray or ordinalCount > pathLength then
+			error(label .. " pathOrdinals must be a path-sized array")
+		end
+		for index, ordinal in ipairs(change.pathOrdinals) do
+			if type(ordinal) ~= "number" or ordinal < 1 or ordinal % 1 ~= 0 then
+				error(string.format("%s path ordinal %d must be a positive integer", label, index))
+			end
+		end
+	end
+end
+
+local function validateCreatableClass(className: any, cache: { [string]: boolean }, label: string): string
+	if type(className) ~= "string" or className == "" then
+		error(label .. " className must be a non-empty string")
+	end
+	if not cache[className] then
+		local okCreate, instance = pcall(Instance.new, className)
+		if not okCreate or instance == nil then
+			error(`{label} className is not creatable: {className}`)
+		end
+		instance:Destroy()
+		cache[className] = true
+	end
+	return className
+end
+
+local function validateMutationRequest(params: any, ctx: { [string]: any }): { string }
+	if type(params) ~= "table" then
+		error("Editor mutation request must be an object")
+	end
+	if params.probeEvents ~= nil and type(params.probeEvents) ~= "boolean" then
+		error("Editor mutation probeEvents must be a boolean")
+	end
+	local serviceSet = {}
+	local classCache = {}
+	local maxChanges = tonumber(ctx.maxChangesPerRequest) or 5000
+	local function validateList(rawChanges: any, kind: string)
+		if rawChanges == nil then
+			return
+		end
+		local changesAreArray, changeCount = denseArrayLength(rawChanges)
+		if not changesAreArray then
+			error(`Editor {kind} changes must be an array`)
+		end
+		if changeCount > maxChanges then
+			error(`Editor mutation request has too many {kind} changes`)
+		end
+		for changeIndex, change in ipairs(rawChanges) do
+			if type(change) ~= "table" then
+				error(string.format("Editor %s change %d must be an object", kind, changeIndex))
+			end
+			if type(change.service) ~= "string" or not ctx.allowedServices[change.service] then
+				error(string.format("Editor %s change %d has an invalid service", kind, changeIndex))
+			end
+			local serviceName = change.service
+			serviceSet[serviceName] = true
+			if kind ~= "instance" then
+				validateMutationPath(change, serviceName, string.format("Editor %s change %d", kind, changeIndex))
+			end
+			if kind == "instance" then
+				local mode = change.mode
+				if
+					mode ~= "reconcileService"
+					and mode ~= "beginReconcileService"
+					and mode ~= "reconcileServiceChunk"
+					and mode ~= "finishReconcileService"
+					and mode ~= "upsertInstances"
+					and mode ~= "replaceInstances"
+					and mode ~= "deleteInstances"
+				then
+					error("Editor instance change has an unsupported mode")
+				end
+				if change.allowDeletes ~= nil and type(change.allowDeletes) ~= "boolean" then
+					error("Editor instance allowDeletes must be a boolean")
+				end
+				if
+					(mode == "beginReconcileService" or mode == "reconcileServiceChunk" or mode == "finishReconcileService")
+					and (type(change.reconcileSession) ~= "string" or change.reconcileSession == "")
+				then
+					error("Editor chunked reconcile requires a session id")
+				end
+				local instancesAreArray, instanceCount = denseArrayLength(change.instances)
+				if not instancesAreArray or instanceCount > (tonumber(ctx.maxInstanceEntriesPerChange) or 5000) then
+					error("Editor instance entries must be a bounded array")
+				end
+				for entryIndex, entry in ipairs(change.instances) do
+					if type(entry) ~= "table" then
+						error(string.format("Editor instance entry %d must be an object", entryIndex))
+					end
+					validateMutationPath(
+						{
+							pathSegments = entry.pathSegments,
+							pathOrdinals = entry.pathOrdinals,
+						},
+						serviceName,
+						string.format("Editor instance entry %d", entryIndex)
+					)
+					validateCreatableClass(entry.className, classCache, "Editor instance entry")
+					if entry.matchProperties ~= nil then
+						validateObjectTable(entry.matchProperties, "Editor instance matchProperties")
+					end
+					if entry.matchAttributes ~= nil then
+						validateObjectTable(entry.matchAttributes, "Editor instance matchAttributes")
+					end
+				end
+			elseif kind == "source" then
+				local className = validateCreatableClass(change.className, classCache, "Editor source change")
+				if not ctx.luaSourceClass[className] then
+					error("Editor source class is not a Lua source container")
+				end
+				if change.deleted ~= nil and type(change.deleted) ~= "boolean" then
+					error("Editor source deleted must be a boolean")
+				end
+				if change.deleted ~= true and type(change.source) ~= "string" then
+					error("Editor source must be a string")
+				end
+				if type(change.source) == "string" and #change.source > (tonumber(ctx.maxSourceBytes) or 8 * 1024 * 1024) then
+					error("Editor source mutation exceeds safe size limit")
+				end
+			elseif kind == "property" then
+				if type(change.className) ~= "string" or change.className == "" then
+					error("Editor property className must be a non-empty string")
+				end
+				if change.properties ~= nil then
+					validateObjectTable(change.properties, "Editor properties")
+				end
+				if change.attributes ~= nil then
+					validateObjectTable(change.attributes, "Editor attributes")
+					for attributeName, rawValue in pairs(change.attributes) do
+						local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
+						if not okDecode then
+							error(`Editor attribute {attributeName} is invalid: {decoded}`)
+						end
+						if decoded ~= nil and typeof(decoded) == "table" then
+							error(`Editor attribute {attributeName} has an unsupported value`)
+						end
+					end
+				end
+				if change.deletedAttributes ~= nil then
+					local deletionsAreArray = denseArrayLength(change.deletedAttributes)
+					if not deletionsAreArray then
+						error("Editor deletedAttributes must be an array")
+					end
+					local seenDeletedAttributes = {}
+					for index, attributeName in ipairs(change.deletedAttributes) do
+						if type(attributeName) ~= "string" or attributeName == "" then
+							error(string.format("Editor deleted attribute %d must be a non-empty string", index))
+						end
+						if seenDeletedAttributes[attributeName] then
+							error("Editor deletedAttributes must not contain duplicates")
+						end
+						if type(change.attributes) == "table" and change.attributes[attributeName] ~= nil then
+							error("Editor attribute cannot be updated and deleted in one change")
+						end
+						seenDeletedAttributes[attributeName] = true
+					end
+				end
+			end
+		end
+	end
+	validateList(params.instanceChanges, "instance")
+	validateList(params.sourceChanges, "source")
+	validateList(params.propertyChanges, "property")
+	local services = {}
+	for serviceName in pairs(serviceSet) do
+		table.insert(services, serviceName)
+	end
+	table.sort(services)
+	return services
+end
+
+local function addSnapshotMetadataTarget(targets: { any }, seen: { [Instance]: boolean }, instance: Instance?)
+	if instance ~= nil and not seen[instance] then
+		seen[instance] = true
+		table.insert(targets, instance)
+	end
+end
+
+local function mutationSnapshotLayout(serviceNames: { string })
+	local groups = {}
+	local roots = {}
+	local metadataTargets = {}
+	local metadataSeen = {}
+	for _, serviceName in ipairs(serviceNames) do
+		local service = game:GetService(serviceName)
+		local preserved = {}
+		addSnapshotMetadataTarget(metadataTargets, metadataSeen, service)
+		if service == Workspace then
+			local terrain = Workspace:FindFirstChildOfClass("Terrain")
+			if terrain ~= nil then
+				preserved[terrain] = true
+				addSnapshotMetadataTarget(metadataTargets, metadataSeen, terrain)
+			end
+			local currentCamera = Workspace.CurrentCamera
+			if currentCamera ~= nil then
+				preserved[currentCamera] = true
+				addSnapshotMetadataTarget(metadataTargets, metadataSeen, currentCamera)
+			end
+		end
+		if serviceName == "StarterPlayer" then
+			for _, className in ipairs({ "StarterPlayerScripts", "StarterCharacterScripts" }) do
+				local container = service:FindFirstChildOfClass(className)
+				if container ~= nil then
+					preserved[container] = true
+					addSnapshotMetadataTarget(metadataTargets, metadataSeen, container)
+					local children = container:GetChildren()
+					table.insert(groups, {
+						serviceName = serviceName,
+						target = container,
+						count = #children,
+						preserved = {},
+					})
+					for _, child in ipairs(children) do
+						table.insert(roots, child)
+					end
+				end
+			end
+		end
+		local children = {}
+		for _, child in ipairs(service:GetChildren()) do
+			if not preserved[child] then
+				table.insert(children, child)
+			end
+		end
+		table.insert(groups, {
+			serviceName = serviceName,
+			target = service,
+			count = #children,
+			preserved = preserved,
+		})
+		for _, child in ipairs(children) do
+			table.insert(roots, child)
+		end
+	end
+	return groups, roots, metadataTargets, metadataSeen
+end
+
+local function captureMutationSnapshot(serviceNames: { string }, params: { [string]: any }, ctx: { [string]: any })
+	local groups, roots, metadataTargets, metadataSeen = mutationSnapshotLayout(serviceNames)
+	local payload = nil
+	if #roots > 0 then
+		local okSerialize, serialized = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
+		if not okSerialize then
+			error("Cannot create an editor rollback snapshot: " .. tostring(serialized))
+		end
+		payload = serialized
+	end
+	local metadata = table.create(#metadataTargets)
+	for index, instance in ipairs(metadataTargets) do
+		metadata[index] = {
+			instance = instance,
+			attributes = instance:GetAttributes(),
+			tags = CollectionService:GetTags(instance),
+		}
+	end
+	local properties = {}
+	local propertySeen = {}
+	for _, change in ipairs(params.propertyChanges or {}) do
+		local instance = resolveInstance(change, ctx, true)
+		if instance ~= nil and metadataSeen[instance] then
+			local seenNames = propertySeen[instance]
+			if seenNames == nil then
+				seenNames = {}
+				propertySeen[instance] = seenNames
+			end
+			for propertyName in pairs(change.properties or {}) do
+				propertyName = tostring(propertyName)
+				if propertyName ~= "Tags" and not seenNames[propertyName] then
+					local okRead, value = readProperty(instance, propertyName)
+					if not okRead then
+						error(`Cannot snapshot {instance:GetFullName()}.{propertyName}`)
+					end
+					seenNames[propertyName] = true
+					table.insert(properties, {
+						instance = instance,
+						name = propertyName,
+						value = value,
+					})
+				end
+			end
+		end
+	end
+	local originalByPath = {}
+	local originalRoots = {}
+	for _, group in ipairs(groups) do
+		for _, child in ipairs(group.target:GetChildren()) do
+			if not group.preserved[child] then
+				table.insert(originalRoots, child)
+				local instances = { child }
+				for _, descendant in ipairs(child:GetDescendants()) do
+					table.insert(instances, descendant)
+				end
+				for _, instance in ipairs(instances) do
+					local pathSegments = getInstancePathSegments(instance)
+					if pathSegments ~= nil then
+						originalByPath[pathCacheKey(pathSegments, getInstancePathOrdinals(instance))] = instance
+					end
+				end
+			end
+		end
+	end
+	return {
+		groups = groups,
+		payload = payload,
+		rootCount = #roots,
+		metadata = metadata,
+		properties = properties,
+		originalByPath = originalByPath,
+		originalRoots = originalRoots,
+		currentCamera = Workspace.CurrentCamera,
+	}
+end
+
+local function restoreSnapshotMetadata(snapshot: { [string]: any }, replacements: { [Instance]: Instance })
+	for _, entry in ipairs(snapshot.metadata) do
+		local instance = replacements[entry.instance] or entry.instance
+		local desiredAttributes = entry.attributes
+		for name in pairs(instance:GetAttributes()) do
+			if desiredAttributes[name] == nil then
+				instance:SetAttribute(name, nil)
+			end
+		end
+		for name, value in pairs(desiredAttributes) do
+			instance:SetAttribute(name, value)
+		end
+		local desiredTags = {}
+		for _, tag in ipairs(entry.tags) do
+			desiredTags[tag] = true
+		end
+		for _, tag in ipairs(CollectionService:GetTags(instance)) do
+			if not desiredTags[tag] then
+				CollectionService:RemoveTag(instance, tag)
+			end
+		end
+		for tag in pairs(desiredTags) do
+			if not CollectionService:HasTag(instance, tag) then
+				CollectionService:AddTag(instance, tag)
+			end
+		end
+	end
+	for _, entry in ipairs(snapshot.properties) do
+		local instance = replacements[entry.instance] or entry.instance
+		local value = if typeof(entry.value) == "Instance" then replacements[entry.value] or entry.value else entry.value
+		local okWrite, writeError = writeProperty(instance, entry.name, value)
+		if not okWrite then
+			error(`Could not restore {instance:GetFullName()}.{entry.name}: {writeError}`)
+		end
+	end
+end
+
+local function restoreMutationSnapshot(
+	snapshot: { [string]: any },
+	ctx: { [string]: any },
+	mutationReplacements: { [Instance]: Instance }?
+): { [Instance]: Instance }
+	local roots = {}
+	if snapshot.payload ~= nil then
+		roots = SerializationService:DeserializeInstancesAsync(snapshot.payload)
+	end
+	if #roots ~= snapshot.rootCount then
+		error("Editor rollback snapshot returned an unexpected root count")
+	end
+	local incomingByGroup = {}
+	local rootIndex = 1
+	for groupIndex, group in ipairs(snapshot.groups) do
+		local incoming = table.create(group.count)
+		for index = 1, group.count do
+			local instance = roots[rootIndex]
+			rootIndex += 1
+			if instance == nil or instance.Parent ~= nil then
+				error("Editor rollback snapshot returned an invalid root")
+			end
+			incoming[index] = instance
+		end
+		incomingByGroup[groupIndex] = incoming
+	end
+	local removed = {}
+	local parented = {}
+	local okRestore, restoreError = pcall(function()
+		for groupIndex, group in ipairs(snapshot.groups) do
+			for _, child in ipairs(group.target:GetChildren()) do
+				if not group.preserved[child] then
+					child.Parent = nil
+					table.insert(removed, { instance = child, parent = group.target })
+				end
+			end
+			for _, instance in ipairs(incomingByGroup[groupIndex]) do
+				instance.Parent = group.target
+				table.insert(parented, instance)
+			end
+		end
+	end)
+	if not okRestore then
+		for _, instance in ipairs(parented) do
+			instance.Parent = nil
+		end
+		for _, entry in ipairs(removed) do
+			entry.instance.Parent = entry.parent
+		end
+		error(restoreError, 0)
+	end
+	local replacements = {}
+	for key, original in pairs(snapshot.originalByPath) do
+		local separator = string.find(key, PATH_SEPARATOR .. "ord" .. PATH_SEPARATOR, 1, true)
+		local pathText = if separator ~= nil then string.sub(key, 1, separator - 1) else key
+		local ordinalText = if separator ~= nil then string.sub(key, separator + 5) else ""
+		local pathSegments = string.split(pathText, PATH_SEPARATOR)
+		local pathOrdinals = {}
+		if ordinalText ~= "" then
+			for index, value in ipairs(string.split(ordinalText, ",")) do
+				pathOrdinals[index] = tonumber(value)
+			end
+		end
+		local replacement = resolvePathSegments(pathSegments, nil, pathOrdinals)
+		if replacement ~= nil then
+			replacements[original] = replacement
+		end
+	end
+	if mutationReplacements ~= nil then
+		for original, mutationReplacement in pairs(mutationReplacements) do
+			local restored = replacements[original]
+			if restored ~= nil then
+				replacements[mutationReplacement] = restored
+			end
+		end
+	end
+	if next(replacements) ~= nil then
+		local scanRoots = {}
+		for serviceName, allowed in pairs(ctx.allowedServices) do
+			if allowed then
+				table.insert(scanRoots, game:GetService(serviceName))
+			end
+		end
+		local updated, failed = BridgeReferenceRetarget.apply(
+			scanRoots,
+			replacements,
+			RbxDomModule.getReferencePropertyNames,
+			readProperty,
+			writeProperty
+		)
+		if failed > 0 then
+			error(string.format("Could not restore %d external instance references", failed))
+		end
+	end
+	restoreSnapshotMetadata(snapshot, replacements)
+	if snapshot.currentCamera ~= nil then
+		Workspace.CurrentCamera = replacements[snapshot.currentCamera] or snapshot.currentCamera
+	end
+	local destroyed = {}
+	for _, root in ipairs(removed) do
+		destroyed[root.instance] = true
+		root.instance:Destroy()
+	end
+	for _, root in ipairs(snapshot.originalRoots) do
+		if root.Parent == nil and not destroyed[root] then
+			root:Destroy()
+		end
+	end
+	return replacements
+end
+
 function BridgeEditorSync.create(ctx: { [string]: any })
 	local api = {}
 	api.stats = ctx.stats
+
+	local function rollbackReconcileSnapshot(snapshot: { [string]: any }, serviceName: string)
+		local selected = captureExplorerSelection()
+		local recording = beginHistoryRecording("Cancel filesystem reconcile")
+		local okRestore, replacements = pcall(restoreMutationSnapshot, snapshot, ctx, nil)
+		finishHistoryRecording(recording, Enum.FinishRecordingOperation.Cancel)
+		if not okRestore then
+			error("Could not roll back the editor reconcile: " .. tostring(replacements))
+		end
+		restoreExplorerSelection(selected, replacements)
+		ctx.invalidateService(serviceName)
+	end
 
 	function api.resolveReviewInstance(change: { [string]: any }): Instance?
 		return resolveInstance(change, ctx)
@@ -2306,7 +2870,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local serviceNames = {}
 		for serviceName, allowed in pairs(ctx.allowedServices) do
-			if allowed == true then
+			if allowed then
 				serviceNames[#serviceNames + 1] = serviceName
 			end
 		end
@@ -2314,7 +2878,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local roots = {}
 		local markers = {}
 		local groups = {}
-		local instanceCount = 0
 		for _, serviceName in ipairs(serviceNames) do
 			local service = game:GetService(serviceName)
 			local marker = Instance.new("Folder")
@@ -2330,8 +2893,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local children = service:GetChildren()
 			local rootProperties = {}
 			if type(ctx.readRootProperties) == "function" then
-				local okRootProperties, values = pcall(ctx.readRootProperties, serviceName)
-				if okRootProperties and type(values) == "table" then
+				local values = ctx.readRootProperties(serviceName)
+				if type(values) == "table" then
 					rootProperties = values
 				end
 			end
@@ -2343,7 +2906,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			}
 			for _, child in ipairs(children) do
 				roots[#roots + 1] = child
-				instanceCount += 1 + #child:GetDescendants()
 			end
 		end
 		local ok, payload = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
@@ -2369,7 +2931,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			exportId = exportId,
 			totalBytes = totalBytes,
 			groups = groups,
-			instanceCount = instanceCount,
 		}
 	end
 
@@ -2411,31 +2972,78 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	function api.beginBinaryImport(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(binaryImports)
+		pruneCompletedBinaryImports()
 		local importId = tostring(params.importId or "")
 		local totalBytes = tonumber(params.totalBytes)
 		local totalChunks = tonumber(params.totalChunks)
-		if importId == "" or totalBytes == nil or totalBytes < 0 or totalBytes > 536870912 then
+		if
+			importId == ""
+			or totalBytes == nil
+			or totalBytes < 1
+			or totalBytes > 536870912
+			or totalBytes % 1 ~= 0
+		then
 			error("Invalid native import size")
 		end
-		if totalChunks == nil or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
+		local expectedChunks = math.ceil(totalBytes / BINARY_IMPORT_CHUNK_BYTES)
+		if
+			totalChunks == nil
+			or totalChunks ~= expectedChunks
+			or totalChunks < 1
+			or totalChunks > 4096
+			or totalChunks % 1 ~= 0
+		then
 			error("Invalid native import chunk count")
 		end
-		if type(params.groups) ~= "table" then
+		local groupsAreArray, groupCount = denseArrayLength(params.groups)
+		if not groupsAreArray or groupCount == 0 then
 			error("Native import groups must be an array")
+		end
+		local instanceCount = tonumber(params.instanceCount)
+		if
+			not instanceCount
+			or instanceCount ~= instanceCount
+			or instanceCount < 0
+			or instanceCount % 1 ~= 0
+		then
+			error("Invalid native import instance count")
+		end
+		if completedBinaryImports[importId] ~= nil then
+			error("Native import id was already completed")
 		end
 		if binaryImports[importId] == nil and countEntries(binaryImports) >= MAX_BINARY_IMPORT_SESSIONS then
 			error("Too many active native import sessions")
 		end
+		local bufferedBytes = totalBytes
+		for activeId, active in pairs(binaryImports) do
+			if activeId ~= importId then
+				bufferedBytes += tonumber(active.totalBytes) or 0
+			end
+		end
+		if bufferedBytes > MAX_BINARY_IMPORT_BUFFERED_BYTES then
+			error("Native import sessions exceed the aggregate buffered-byte limit")
+		end
 		local groups = {}
 		for _, rawGroup in ipairs(params.groups) do
+			validateObjectTable(rawGroup, "Native import group")
 			local serviceName, service = validatedChangeService({ service = rawGroup.service }, ctx)
 			local targetPath = rawGroup.targetPath
-			if type(targetPath) ~= "table" or #targetPath < 1 or #targetPath > 2 or tostring(targetPath[1]) ~= serviceName then
+			local targetPathIsArray, targetPathLength = denseArrayLength(targetPath)
+			if
+				not targetPathIsArray
+				or targetPathLength < 1
+				or targetPathLength > 2
+				or type(targetPath[1]) ~= "string"
+				or targetPath[1] ~= serviceName
+			then
 				error("Invalid native import target path")
 			end
 			local target = service
-			if #targetPath == 2 then
-				target = service:FindFirstChild(tostring(targetPath[2]))
+			if targetPathLength == 2 then
+				if type(targetPath[2]) ~= "string" or targetPath[2] == "" then
+					error("Invalid native import nested target")
+				end
+				target = service:FindFirstChild(targetPath[2])
 				if target == nil then
 					error("Native import target was not found")
 				end
@@ -2454,9 +3062,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		binaryImports[importId] = {
 			totalBytes = totalBytes,
 			totalChunks = totalChunks,
-			chunks = table.create(totalChunks),
+			payload = buffer.create(totalBytes),
+			received = table.create(totalChunks),
 			receivedBytes = 0,
 			receivedChunks = 0,
+			instanceCount = instanceCount,
 			groups = groups,
 			updatedAt = os.clock(),
 		}
@@ -2476,23 +3086,19 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if index == nil or index < 1 or index > session.totalChunks or index % 1 ~= 0 then
 			error("Invalid native import chunk index")
 		end
-		if session.chunks[index] ~= nil then
+		if session.received[index] then
 			return { ok = true, duplicate = true }
 		end
 		local data = tostring(params.data or "")
 		local decoded = EncodingService:Base64Decode(buffer.fromstring(data))
 		local decodedBytes = buffer.len(decoded)
-		if session.receivedBytes + decodedBytes > session.totalBytes then
-			error("Native import exceeds its declared size")
+		local offset = (index - 1) * BINARY_IMPORT_CHUNK_BYTES
+		local expectedBytes = math.min(BINARY_IMPORT_CHUNK_BYTES, session.totalBytes - offset)
+		if decodedBytes ~= expectedBytes then
+			error("Native import chunk has the wrong decoded size")
 		end
-		local bufferedBytes = 0
-		for _, active in pairs(binaryImports) do
-			bufferedBytes += tonumber(active.receivedBytes) or 0
-		end
-		if bufferedBytes + decodedBytes > MAX_BINARY_IMPORT_BUFFERED_BYTES then
-			error("Native import sessions exceed the aggregate buffered-byte limit")
-		end
-		session.chunks[index] = decoded
+		buffer.copy(session.payload, offset, decoded, 0, decodedBytes)
+		session.received[index] = true
 		session.receivedBytes += decodedBytes
 		session.receivedChunks += 1
 		return { ok = true, receivedBytes = decodedBytes }
@@ -2500,9 +3106,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(binaryImports)
+		pruneCompletedBinaryImports()
 		local importId = tostring(params.importId or "")
+		local completed = completedBinaryImports[importId]
+		if type(completed) == "table" then
+			return completed.response
+		end
 		local session = binaryImports[importId]
-		binaryImports[importId] = nil
 		if type(session) ~= "table" then
 			error("Native import session was not found")
 		end
@@ -2510,15 +3120,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Native import is incomplete")
 		end
 		local started = os.clock()
-		local payload = buffer.create(session.totalBytes)
-		local offset = 0
-		for index = 1, session.totalChunks do
-			local chunk = session.chunks[index]
-			local length = buffer.len(chunk)
-			buffer.copy(payload, offset, chunk, 0, length)
-			offset += length
-		end
-		local roots = SerializationService:DeserializeInstancesAsync(payload)
+		local roots = SerializationService:DeserializeInstancesAsync(session.payload)
 		local expectedRoots = 0
 		for _, group in ipairs(session.groups) do
 			expectedRoots += group.count
@@ -2526,24 +3128,40 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if #roots ~= expectedRoots then
 			error("Native import returned an unexpected root count")
 		end
+		local previousCamera = Workspace.CurrentCamera
 		local prepared = {}
 		local rootIndex = 1
+		local skippedIncomingInstanceCount = 0
 		for _, group in ipairs(session.groups) do
 			local incoming = table.create(group.count)
-			for index = 1, group.count do
+			for _ = 1, group.count do
 				local instance = roots[rootIndex]
 				rootIndex += 1
 				if instance == nil or instance.Parent ~= nil or instance:IsA("Terrain") then
 					error("Native import returned an invalid root")
 				end
-				incoming[index] = instance
+				local protectedCamera = group.target == Workspace
+					and instance:IsA("Camera")
+					and (
+						instance.Name == "Camera"
+						or instance.Name == "CurrentCamera"
+						or previousCamera ~= nil and instance.Name == previousCamera.Name
+					)
+				if protectedCamera then
+					skippedIncomingInstanceCount += 1 + #instance:GetDescendants()
+					instance:Destroy()
+				else
+					incoming[#incoming + 1] = instance
+				end
 			end
 			local outgoing = {}
 			for _, instance in ipairs(group.target:GetChildren()) do
 				local lockedStarterContainer = group.serviceName == "StarterPlayer"
 					and group.target == group.service
 					and (instance:IsA("StarterPlayerScripts") or instance:IsA("StarterCharacterScripts"))
-				if not instance:IsA("Terrain") and not lockedStarterContainer then
+				local protectedCamera = group.target == Workspace
+					and (instance == previousCamera or isProtectedWorkspaceCameraInstance(instance))
+				if not instance:IsA("Terrain") and not lockedStarterContainer and not protectedCamera then
 					outgoing[#outgoing + 1] = instance
 				end
 			end
@@ -2567,30 +3185,20 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		local historyRecording = beginHistoryRecording("Native filesystem sync")
-		local previousCamera = Workspace.CurrentCamera
 		local parented = {}
 		local removed = {}
-		local created = 0
-		local deleted = 0
-		local importedCamera = nil
+		local removedRootCount = 0
 		local okParent, parentErr = pcall(function()
 			for _, group in ipairs(prepared) do
 				for _, instance in ipairs(group.incoming) do
 					instance.Parent = group.target
 					parented[#parented + 1] = instance
-					created += 1 + #instance:GetDescendants()
-					if group.service == Workspace and importedCamera == nil and instance:IsA("Camera") then
-						importedCamera = instance
-					end
 				end
 				for _, instance in ipairs(group.outgoing) do
-					deleted += 1 + #instance:GetDescendants()
+					removedRootCount += 1
 					removeInstanceForUndo(instance)
 					removed[#removed + 1] = { instance = instance, parent = group.target }
 				end
-			end
-			if importedCamera ~= nil then
-				Workspace.CurrentCamera = importedCamera
 			end
 		end)
 		if not okParent then
@@ -2602,9 +3210,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					entry.instance.Parent = entry.parent
 				end)
 			end
-			pcall(function()
-				Workspace.CurrentCamera = previousCamera
-			end)
 			finishHistoryRecording(historyRecording, Enum.FinishRecordingOperation.Cancel)
 			restoreExplorerSelection(explorerSelection, nil)
 			error(parentErr, 0)
@@ -2628,18 +3233,26 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.stats.lastMs = elapsed
 		ctx.stats.lastAtUnix = os.time()
 		ctx.stats.lastOk = true
-		ctx.stats.instanceCreated += created
-		ctx.stats.instanceDeleted += deleted
+		local createdInstanceCount = math.max(0, session.instanceCount - skippedIncomingInstanceCount)
+		ctx.stats.instanceCreated += createdInstanceCount
 		ctx.updateStatus()
-		return {
+		local response = {
 			ok = true,
 			requests = 1,
-			instanceCreated = created,
-			instanceDeleted = deleted,
+			instanceCreated = createdInstanceCount,
+			rootDeleted = removedRootCount,
 			binaryBytes = session.totalBytes,
 			binaryMs = elapsed,
-			undoRecorded = historyRecording ~= nil,
+			undoRecorded = not not historyRecording,
 		}
+		binaryImports[importId] = nil
+		completedBinaryImports[importId] = {
+			response = response,
+			completedAt = os.clock(),
+			expiresAt = os.clock() + COMPLETED_BINARY_IMPORT_TTL_SECONDS,
+		}
+		pruneCompletedBinaryImports()
+		return response
 	end
 
 	function api.cancelBinaryImport(params: { [string]: any }): { [string]: any }
@@ -2650,34 +3263,64 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.cancelReconcile(params: { [string]: any }): { [string]: any }
-		local serviceName = tostring(params.service or "")
+		if type(params.service) ~= "string" or not ctx.allowedServices[params.service] then
+			error("Invalid editor reconcile service")
+		end
+		if type(params.reconcileSession) ~= "string" or params.reconcileSession == "" then
+			error("Invalid editor reconcile session id")
+		end
+		local serviceName = params.service
 		local sessionKey = reconcileSessionKey(serviceName, params.reconcileSession)
-		local found = reconcileSessions[sessionKey] ~= nil
+		local session = reconcileSessions[sessionKey]
+		local found = session ~= nil
 		reconcileSessions[sessionKey] = nil
+		if type(session) == "table" and session.rollbackSnapshot ~= nil then
+			rollbackReconcileSnapshot(session.rollbackSnapshot, serviceName)
+		end
 		return { ok = true, found = found }
 	end
 
 	function api.applyChanges(params: { [string]: any }): { [string]: any }
-		if type(params) ~= "table" then
-			error("Editor mutation request must be an object")
+		local serviceNames = validateMutationRequest(params, ctx)
+		local chunkChange = nil
+		for _, change in ipairs(params.instanceChanges or {}) do
+			local mode = change.mode
+			if mode == "beginReconcileService" or mode == "reconcileServiceChunk" or mode == "finishReconcileService" then
+				if
+					chunkChange ~= nil
+					or #(params.instanceChanges or {}) ~= 1
+					or #(params.sourceChanges or {}) > 0
+					or #(params.propertyChanges or {}) > 0
+				then
+					error("A chunked reconcile request must contain exactly one instance change")
+				end
+				chunkChange = change
+			end
 		end
-		local function validateChangeList(rawChanges: any, label: string)
-			if rawChanges == nil then
-				return
+		local chunkSessionKey = nil
+		local transactionSnapshot = nil
+		if chunkChange ~= nil then
+			chunkSessionKey = reconcileSessionKey(chunkChange.service, chunkChange.reconcileSession)
+			if chunkChange.mode == "beginReconcileService" then
+				if reconcileSessions[chunkSessionKey] ~= nil then
+					error("Editor reconcile session already exists")
+				end
+				for _, activeSession in pairs(reconcileSessions) do
+					if type(activeSession) == "table" and activeSession.serviceName == chunkChange.service then
+						error("Another editor reconcile is already active for this service")
+					end
+				end
+				transactionSnapshot = captureMutationSnapshot(serviceNames, params, ctx)
+			else
+				local session = reconcileSessions[chunkSessionKey]
+				if type(session) ~= "table" or session.rollbackSnapshot == nil then
+					error("Editor reconcile session was not found or cannot be rolled back")
+				end
+				transactionSnapshot = session.rollbackSnapshot
 			end
-			if type(rawChanges) ~= "table" then
-				error("Editor " .. label .. " changes must be an array")
-			end
-			if #rawChanges > (tonumber(ctx.maxChangesPerRequest) or 5000) then
-				error("Editor mutation request has too many " .. label .. " changes")
-			end
-			for _, change in ipairs(rawChanges) do
-				validatedChangeService(change, ctx)
-			end
+		elseif #serviceNames > 0 then
+			transactionSnapshot = captureMutationSnapshot(serviceNames, params, ctx)
 		end
-		validateChangeList(params.instanceChanges, "instance")
-		validateChangeList(params.sourceChanges, "source")
-		validateChangeList(params.propertyChanges, "property")
 		local started = os.clock()
 		local previousResolveCache = ctx.resolveCache
 		local previousSettingsIdLookupByService = ctx.settingsIdLookupByService
@@ -2713,7 +3356,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			probeItemChangedAvailable = 0,
 			probeDescendantAddedAvailable = 0,
 			probeDescendantRemovingAvailable = 0,
-			undoRecorded = historyRecording ~= nil,
+			undoRecorded = not not historyRecording,
 		}
 		local touchedServices = {}
 		local stopEventProbe
@@ -2778,12 +3421,57 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
+		if not aborted and chunkChange ~= nil and chunkChange.mode == "beginReconcileService" then
+			local session = reconcileSessions[chunkSessionKey]
+			if type(session) ~= "table" then
+				stats.ok = false
+				stats.errors += 1
+				aborted = true
+			else
+				session.rollbackSnapshot = transactionSnapshot
+				session.onExpire = function()
+					rollbackReconcileSnapshot(transactionSnapshot, chunkChange.service)
+				end
+			end
+		end
+
 		if stopEventProbe ~= nil then
 			task.wait()
 			stopEventProbe()
 		end
-		finishHistoryRecording(historyRecording)
-		restoreExplorerSelection(explorerSelection, selectionReplacements)
+		local restoredSelectionReplacements = selectionReplacements
+		if aborted and transactionSnapshot ~= nil then
+			if chunkSessionKey ~= nil then
+				reconcileSessions[chunkSessionKey] = nil
+			end
+			local okRollback, replacements = pcall(
+				restoreMutationSnapshot,
+				transactionSnapshot,
+				ctx,
+				selectionReplacements
+			)
+			if okRollback then
+				restoredSelectionReplacements = replacements
+				stats.sourceCreated = 0
+				stats.sourceUpdated = 0
+				stats.sourceDeleted = 0
+				stats.sourceUpdateAsync = 0
+				stats.sourceDirect = 0
+				stats.instanceCreated = 0
+				stats.instanceReplaced = 0
+				stats.instanceDeleted = 0
+				stats.propertyUpdated = 0
+				stats.attributeUpdated = 0
+			else
+				stats.errors += 1
+				warn("[Renium] editor rollback failed: " .. tostring(replacements))
+			end
+		end
+		finishHistoryRecording(
+			historyRecording,
+			if aborted then Enum.FinishRecordingOperation.Cancel else Enum.FinishRecordingOperation.Commit
+		)
+		restoreExplorerSelection(explorerSelection, restoredSelectionReplacements)
 		stats.lastMs = (os.clock() - started) * 1000
 		for serviceName in pairs(touchedServices) do
 			ctx.invalidateService(serviceName)
@@ -2795,7 +3483,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
 		ctx.stats.lastAtUnix = os.time()
-		ctx.stats.lastOk = stats.ok == true
+		ctx.stats.lastOk = stats.ok
 		ctx.stats.sourceCreated += stats.sourceCreated
 		ctx.stats.sourceUpdated += stats.sourceUpdated
 		ctx.stats.sourceDeleted += stats.sourceDeleted
@@ -2813,8 +3501,25 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.cleanup()
+		local activeReconciles = {}
+		for _, session in pairs(reconcileSessions) do
+			if type(session) == "table" and session.rollbackSnapshot ~= nil then
+				table.insert(activeReconciles, session)
+			end
+		end
 		table.clear(reconcileSessions)
+		for _, session in ipairs(activeReconciles) do
+			local okRollback, rollbackError = pcall(
+				rollbackReconcileSnapshot,
+				session.rollbackSnapshot,
+				session.serviceName
+			)
+			if not okRollback then
+				warn("[Renium] reconcile cleanup failed: " .. tostring(rollbackError))
+			end
+		end
 		table.clear(binaryImports)
+		table.clear(completedBinaryImports)
 		table.clear(binaryExports)
 		if type(ctx.matchedSettingsInstancesByService) == "table" then
 			table.clear(ctx.matchedSettingsInstancesByService)

@@ -1,25 +1,25 @@
 local BridgeTheme = {}
 
 local function setBackground(instance, color)
-	if instance ~= nil then
+	if instance then
 		instance.BackgroundColor3 = color
 	end
 end
 
 local function setText(instance, color)
-	if instance ~= nil then
+	if instance then
 		instance.TextColor3 = color
 	end
 end
 
 local function setStroke(instance, color)
-	if instance ~= nil then
+	if instance then
 		instance.Color = color
 	end
 end
 
 local function setImageColor(instance, color)
-	if instance ~= nil then
+	if instance then
 		instance.ImageColor3 = color
 	end
 end
@@ -31,19 +31,8 @@ local function applyList(list, callback, color)
 end
 
 local function studioColor(theme, name, fallback)
-	local okStyle, style = pcall(function()
-		return Enum.StudioStyleGuideColor[name]
-	end)
-	if not okStyle or style == nil then
-		return fallback
-	end
-	local okColor, color = pcall(function()
-		return theme:GetColor(style)
-	end)
-	if okColor then
-		return color
-	end
-	return fallback
+	local style = Enum.StudioStyleGuideColor[name]
+	return if style then theme:GetColor(style) else fallback
 end
 
 function BridgeTheme.apply(theme, refs)

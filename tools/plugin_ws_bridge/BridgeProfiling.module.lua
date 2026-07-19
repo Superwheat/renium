@@ -61,13 +61,13 @@ function BridgeProfiling.install(Config, context)
 		local emptyTotalUs = 0
 		local warmupIterations = math.min(2, iterations)
 		for i = 1, warmupIterations do
-			if emptyBody ~= nil then
+			if emptyBody then
 				emptyBody(i)
 			end
 			body(i)
 		end
 		for i = 1, iterations do
-			if emptyBody ~= nil then
+			if emptyBody then
 				local started = os.clock()
 				emptyBody(i)
 				local elapsed = (os.clock() - started) * 1000000
@@ -80,10 +80,7 @@ function BridgeProfiling.install(Config, context)
 		for i = 1, iterations do
 			local started = os.clock()
 			local calls = body(i) or 0
-			local elapsed = (os.clock() - started) * 1000000 - (emptyTimes[i] or 0)
-			if elapsed < 0 then
-				elapsed = 0
-			end
+			local elapsed = math.max((os.clock() - started) * 1000000 - (emptyTimes[i] or 0), 0)
 			times[i] = elapsed
 			totalUs += elapsed
 			totalCalls += calls
@@ -107,7 +104,7 @@ function BridgeProfiling.install(Config, context)
 				callback(sample, i)
 			end
 			return #samples
-		end, if emptyCallback ~= nil then function()
+		end, if emptyCallback then function()
 			for i, sample in ipairs(samples) do
 				emptyCallback(sample, i)
 			end
@@ -126,7 +123,7 @@ function BridgeProfiling.install(Config, context)
 				callback(i)
 			end
 			return callCount
-		end, if emptyCallback ~= nil then function()
+		end, if emptyCallback then function()
 			for i = 1, callCount do
 				emptyCallback(i)
 			end
@@ -145,7 +142,7 @@ function BridgeProfiling.install(Config, context)
 
 	function Config.appendUniqueProfileSample(out, seen, state, index)
 		local instances = state.instances
-		if index < 1 or index > #instances or seen[index] == true then
+		if index < 1 or index > #instances or seen[index] then
 			return
 		end
 		seen[index] = true
@@ -283,17 +280,17 @@ function BridgeProfiling.install(Config, context)
 				nil
 			),
 		}
-		local okFont, fontValue = pcall(function()
-			return Font.new("rbxasset://fonts/families/SourceSansPro.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
-		end)
-		if okFont then
-			cases[#cases + 1] = Config.makeSerializerProfileCase("font", COMPACT_TYPE_IDS.Font, fontValue, nil)
-		end
+		local fontValue = Font.new(
+			"rbxasset://fonts/families/SourceSansPro.json",
+			Enum.FontWeight.Regular,
+			Enum.FontStyle.Normal
+		)
+		cases[#cases + 1] = Config.makeSerializerProfileCase("font", COMPACT_TYPE_IDS.Font, fontValue, nil)
 		if #samples > 0 then
 			cases[#cases + 1] = Config.makeSerializerProfileCase("ref_internal", COMPACT_TYPE_IDS.Ref, samples[1].instance, nil)
 		end
 		local workspaceService = game:FindFirstChild("Workspace")
-		if workspaceService ~= nil and #samples > 0 and workspaceService ~= samples[1].instance then
+		if workspaceService and #samples > 0 and workspaceService ~= samples[1].instance then
 			cases[#cases + 1] = Config.makeSerializerProfileCase("ref_external", COMPACT_TYPE_IDS.Ref, workspaceService, nil)
 		end
 		return cases
@@ -369,7 +366,7 @@ function BridgeProfiling.install(Config, context)
 		local projectedCallCount = 0
 		for i = 1, #state.instances do
 			local className = state.classNameByIndex[i]
-			if className ~= nil then
+			if className then
 				projectedCallCount += Config.getHotPropertySchema(state, className).count
 			end
 		end
@@ -543,7 +540,7 @@ function BridgeProfiling.install(Config, context)
 				local _ = sample.instance:IsA("LuaSourceContainer")
 			end))
 			Config.appendProfileOperation(operations, "instance.lua_source_class_lookup", Config.profileSampleOperation(combined, profileIterations, function(sample)
-				local _ = Config.LUA_SOURCE_CLASS[sample.className] == true
+				local _ = not not Config.LUA_SOURCE_CLASS[sample.className]
 			end))
 			local withAttributes = {}
 			local withoutAttributes = {}
@@ -621,7 +618,7 @@ function BridgeProfiling.install(Config, context)
 					local ok, modified = pcall(function()
 						return pair.instance:IsPropertyModified(pair.propertyName)
 					end)
-					if ok and modified == false then
+					if ok and not modified then
 						context.tryRead(pair.instance, pair.propertyName)
 					end
 				end))
@@ -630,79 +627,61 @@ function BridgeProfiling.install(Config, context)
 
 		if Config.profileFlagEnabled(flags, "engine") then
 			local serviceInstance = game:FindFirstChild(serviceName)
-			if serviceInstance ~= nil then
-				local okSerializationService, serializationService = pcall(function()
-					return game:GetService("SerializationService")
-				end)
-				if okSerializationService and serializationService ~= nil then
-					local serializedLen = 0
-					local serializeError = nil
-					Config.appendProfileOperation(operations, "engine.serialization_service", Config.profileTimedOperation(1, function()
-						local okSerialize, payload = pcall(function()
-							return serializationService:SerializeInstancesAsync({ serviceInstance })
-						end)
-						if okSerialize and type(buffer) == "table" and typeof(payload) == "buffer" then
-							serializedLen = buffer.len(payload)
-						elseif not okSerialize then
-							serializeError = tostring(payload)
-						end
-						return 1
-					end))
-					summary.engineSerializationServiceBytes = serializedLen
-					if serializeError ~= nil then
-						summary.engineSerializationServiceError = serializeError
+			if serviceInstance then
+				local serializationService = game:GetService("SerializationService")
+				local serializedLen = 0
+				local serializeError = nil
+				Config.appendProfileOperation(operations, "engine.serialization_service", Config.profileTimedOperation(1, function()
+					local okSerialize, payload = pcall(function()
+						return serializationService:SerializeInstancesAsync({ serviceInstance })
+					end)
+					if okSerialize and type(buffer) == "table" and typeof(payload) == "buffer" then
+						serializedLen = buffer.len(payload)
+					elseif not okSerialize then
+						serializeError = tostring(payload)
 					end
-					local childrenPayloadLen = 0
-					local childrenSerializeError = nil
-					Config.appendProfileOperation(operations, "engine.serialization_service_children", Config.profileTimedOperation(1, function()
-						local children = serviceInstance:GetChildren()
-						local okSerialize, payload = pcall(function()
-							return serializationService:SerializeInstancesAsync(children)
-						end)
-						if okSerialize and type(buffer) == "table" and typeof(payload) == "buffer" then
-							childrenPayloadLen = buffer.len(payload)
-						elseif not okSerialize then
-							childrenSerializeError = tostring(payload)
-						end
-						return 1
-					end))
-					summary.engineSerializationServiceChildrenBytes = childrenPayloadLen
-					if childrenSerializeError ~= nil then
-						summary.engineSerializationServiceChildrenError = childrenSerializeError
+					return 1
+				end))
+				summary.engineSerializationServiceBytes = serializedLen
+				if serializeError then
+					summary.engineSerializationServiceError = serializeError
+				end
+				local childrenPayloadLen = 0
+				local childrenSerializeError = nil
+				Config.appendProfileOperation(operations, "engine.serialization_service_children", Config.profileTimedOperation(1, function()
+					local children = serviceInstance:GetChildren()
+					local okSerialize, payload = pcall(function()
+						return serializationService:SerializeInstancesAsync(children)
+					end)
+					if okSerialize and type(buffer) == "table" and typeof(payload) == "buffer" then
+						childrenPayloadLen = buffer.len(payload)
+					elseif not okSerialize then
+						childrenSerializeError = tostring(payload)
 					end
-				else
-					operations["engine.serialization_service"] = {
-						skipped = true,
-						error = tostring(serializationService),
-					}
+					return 1
+				end))
+				summary.engineSerializationServiceChildrenBytes = childrenPayloadLen
+				if childrenSerializeError then
+					summary.engineSerializationServiceChildrenError = childrenSerializeError
 				end
 
-				local okStudioService, studioService = pcall(function()
-					return game:GetService("StudioService")
-				end)
-				if okStudioService and studioService ~= nil then
-					local serializedLen = 0
-					local serializeError = nil
-					Config.appendProfileOperation(operations, "engine.studio_service_serialize", Config.profileTimedOperation(1, function()
-						local okSerialize, payload = pcall(function()
-							return studioService:SerializeInstances({ serviceInstance })
-						end)
-						if okSerialize and type(payload) == "string" then
-							serializedLen = #payload
-						elseif not okSerialize then
-							serializeError = tostring(payload)
-						end
-						return 1
-					end))
-					summary.engineStudioServiceBytes = serializedLen
-					if serializeError ~= nil then
-						summary.engineStudioServiceError = serializeError
+				local studioService = game:GetService("StudioService")
+				local studioSerializedLen = 0
+				local studioSerializeError = nil
+				Config.appendProfileOperation(operations, "engine.studio_service_serialize", Config.profileTimedOperation(1, function()
+					local okSerialize, payload = pcall(function()
+						return studioService:SerializeInstances({ serviceInstance })
+					end)
+					if okSerialize and type(payload) == "string" then
+						studioSerializedLen = #payload
+					elseif not okSerialize then
+						studioSerializeError = tostring(payload)
 					end
-				else
-					operations["engine.studio_service_serialize"] = {
-						skipped = true,
-						error = tostring(studioService),
-					}
+					return 1
+				end))
+				summary.engineStudioServiceBytes = studioSerializedLen
+				if studioSerializeError then
+					summary.engineStudioServiceError = studioSerializeError
 				end
 			else
 				operations["engine.serialization_service"] = {
@@ -727,7 +706,7 @@ function BridgeProfiling.install(Config, context)
 					local strings = {}
 					local stringIds = {}
 					for _ = 1, calls do
-						context.encodeSchemaValueV5(caseInfo.typeId, caseInfo.enumType ~= false and caseInfo.enumType or nil, caseInfo.value, state, strings, stringIds)
+						context.encodeSchemaValueV5(caseInfo.typeId, caseInfo.enumType or nil, caseInfo.value, state, strings, stringIds)
 					end
 					return calls
 				end))

@@ -1,12 +1,52 @@
 
 
 local BridgeRuntimeApi = {}
+local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
 
 local CONSOLE_BUFFER_LIMIT = 1000
+local CONSOLE_MESSAGE_BYTE_LIMIT = 256 * 1024
+local COMMAND_OUTPUT_ENTRY_LIMIT = 256
+local COMMAND_OUTPUT_BYTE_LIMIT = 256 * 1024
+local COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT = 64 * 1024
 local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
 local runnerSequence = 0
+
+local function truncateText(text, maxBytes)
+	if #text <= maxBytes then
+		return text, false
+	end
+	local suffix = "\n[Renium truncated this message.]"
+	local contentBytes = math.max(0, maxBytes - #suffix)
+	local ok, boundary = pcall(utf8.offset, text, 0, contentBytes + 1)
+	local finish = if ok and boundary then boundary - 1 else contentBytes
+	return string.sub(text, 1, finish) .. suffix, true
+end
+
+local function appendCapturedOutput(output, state, kind, ...)
+	if state.truncated then
+		return
+	end
+	local values = table.pack(...)
+	local parts = table.create(values.n)
+	for index = 1, values.n do
+		parts[index] = tostring(values[index])
+	end
+	local message = table.concat(parts, "\t")
+	message = truncateText(message, COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT)
+	local nextBytes = state.bytes + #message
+	if #output >= COMMAND_OUTPUT_ENTRY_LIMIT or nextBytes > COMMAND_OUTPUT_BYTE_LIMIT then
+		output[#output + 1] = {
+			type = "warn",
+			message = "[Renium stopped capturing command output at its size limit.]",
+		}
+		state.truncated = true
+		return
+	end
+	state.bytes = nextBytes
+	output[#output + 1] = { type = kind, message = message }
+end
 
 local function consoleTypeName(messageType)
 	local text = tostring(messageType or "")
@@ -17,11 +57,75 @@ local function consoleTypeName(messageType)
 	return text
 end
 
+local function escapePathSegment(name)
+	if name == "" then
+		return "\\0"
+	end
+	return (string.gsub(name, "[\\%.%[%]]", function(character)
+		return "\\" .. character
+	end))
+end
+
+local function unescapePathSegment(text)
+	if text == "\\0" then
+		return ""
+	end
+	local out = {}
+	local index = 1
+	while index <= #text do
+		local character = string.sub(text, index, index)
+		if character == "\\" and index < #text then
+			index += 1
+			character = string.sub(text, index, index)
+		end
+		out[#out + 1] = character
+		index += 1
+	end
+	return table.concat(out)
+end
+
+local function splitAutomationPath(text)
+	local segments = {}
+	local segmentStart = 1
+	local index = 1
+	while index <= #text do
+		local character = string.sub(text, index, index)
+		if character == "\\" then
+			index += 2
+		elseif character == "." then
+			segments[#segments + 1] = string.sub(text, segmentStart, index - 1)
+			segmentStart = index + 1
+			index += 1
+		else
+			index += 1
+		end
+	end
+	segments[#segments + 1] = string.sub(text, segmentStart)
+	return segments
+end
+
 local function compactInstancePath(instance)
 	local parts = {}
 	local current = instance
 	while current ~= nil and current ~= game do
-		table.insert(parts, 1, current.Name)
+		local parent = current.Parent
+		local ordinal = 0
+		local duplicateCount = 0
+		if parent then
+			for _, sibling in ipairs(parent:GetChildren()) do
+				if sibling.Name == current.Name then
+					duplicateCount += 1
+					if sibling == current then
+						ordinal = duplicateCount
+					end
+				end
+			end
+		end
+		local segment = escapePathSegment(current.Name)
+		if duplicateCount > 1 then
+			segment ..= ("[%d]"):format(ordinal)
+		end
+		table.insert(parts, 1, segment)
 		current = current.Parent
 	end
 	return "game." .. table.concat(parts, ".")
@@ -29,23 +133,25 @@ end
 
 local function setRunnerSource(runner, code)
 	runnerSequence += 1
-	pcall(function()
-		runner.Enabled = false
-	end)
-	runner.Source = ("-- Renium run %d %.6f\n%s"):format(runnerSequence, os.clock(), code)
-	pcall(function()
-		runner.Enabled = true
-	end)
+	runner.Enabled = false
+	runner.Source = code
+	runner.Enabled = true
 end
 
-local function serializeApiValue(value, depth)
+local function serializeApiValue(value, depth, seen)
 	depth = depth or 0
 	if depth > 6 then
-		return tostring(value)
+		return { _type = "Truncated", value = tostring(value) }
 	end
 	local valueType = typeof(value)
-	if value == nil or valueType == "boolean" or valueType == "number" or valueType == "string" then
+	if value == nil then
+		return { _type = "Nil" }
+	end
+	if valueType == "boolean" or valueType == "string" then
 		return value
+	end
+	if valueType == "number" then
+		return BridgeValueCodec.encodeNumber(value)
 	end
 	if valueType == "Instance" then
 		return {
@@ -56,41 +162,224 @@ local function serializeApiValue(value, depth)
 		}
 	end
 	if valueType == "Vector2" then
-		return { _type = "Vector2", x = value.X, y = value.Y }
+		local components = BridgeValueCodec.encodeComponents(value.X, value.Y)
+		return { _type = "Vector2", x = components[1], y = components[2] }
 	end
 	if valueType == "Vector3" then
-		return { _type = "Vector3", x = value.X, y = value.Y, z = value.Z }
+		local components = BridgeValueCodec.encodeComponents(value.X, value.Y, value.Z)
+		return { _type = "Vector3", x = components[1], y = components[2], z = components[3] }
 	end
 	if valueType == "Color3" then
-		return { _type = "Color3", r = value.R, g = value.G, b = value.B }
+		local components = BridgeValueCodec.encodeComponents(value.R, value.G, value.B)
+		return { _type = "Color3", r = components[1], g = components[2], b = components[3] }
 	end
 	if valueType == "CFrame" then
-		return { _type = "CFrame", value = { value:GetComponents() } }
+		return { _type = "CFrame", components = BridgeValueCodec.encodeComponents(value:GetComponents()) }
+	end
+	if valueType == "UDim" then
+		local components = BridgeValueCodec.encodeComponents(value.Scale, value.Offset)
+		return { _type = "UDim", scale = components[1], offset = components[2] }
+	end
+	if valueType == "UDim2" then
+		local components =
+			BridgeValueCodec.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+		return {
+			_type = "UDim2",
+			xScale = components[1],
+			xOffset = components[2],
+			yScale = components[3],
+			yOffset = components[4],
+		}
+	end
+	if valueType == "Rect" then
+		local components =
+			BridgeValueCodec.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+		return {
+			_type = "Rect",
+			minX = components[1],
+			minY = components[2],
+			maxX = components[3],
+			maxY = components[4],
+		}
+	end
+	if valueType == "NumberRange" then
+		local components = BridgeValueCodec.encodeComponents(value.Min, value.Max)
+		return { _type = "NumberRange", min = components[1], max = components[2] }
+	end
+	if valueType == "BrickColor" then
+		return { _type = "BrickColor", number = value.Number }
+	end
+	if valueType == "PhysicalProperties" then
+		local components = BridgeValueCodec.encodeComponents(
+			value.Density,
+			value.Friction,
+			value.Elasticity,
+			value.FrictionWeight,
+			value.ElasticityWeight
+		)
+		return {
+			_type = "PhysicalProperties",
+			density = components[1],
+			friction = components[2],
+			elasticity = components[3],
+			frictionWeight = components[4],
+			elasticityWeight = components[5],
+			acousticAbsorption = BridgeValueCodec.encodeNumber(value.AcousticAbsorption),
+		}
+	end
+	if valueType == "ColorSequence" then
+		local keypoints = table.create(#value.Keypoints)
+		for index, keypoint in ipairs(value.Keypoints) do
+			local components = BridgeValueCodec.encodeComponents(
+				keypoint.Time,
+				keypoint.Value.R,
+				keypoint.Value.G,
+				keypoint.Value.B
+			)
+			keypoints[index] = {
+				time = components[1],
+				color = {
+					_type = "Color3",
+					r = components[2],
+					g = components[3],
+					b = components[4],
+				},
+			}
+		end
+		return { _type = "ColorSequence", keypoints = keypoints }
+	end
+	if valueType == "NumberSequence" then
+		local keypoints = table.create(#value.Keypoints)
+		for index, keypoint in ipairs(value.Keypoints) do
+			local components =
+				BridgeValueCodec.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+			keypoints[index] = {
+				time = components[1],
+				value = components[2],
+				envelope = components[3],
+			}
+		end
+		return { _type = "NumberSequence", keypoints = keypoints }
 	end
 	if valueType == "EnumItem" then
 		return { _type = "EnumItem", value = tostring(value) }
 	end
 	if valueType == "table" then
-		local out = {}
+		seen = seen or {}
+		if seen[value] then
+			return { _type = "Cycle", value = tostring(value) }
+		end
+		seen[value] = true
+
+		local length = #value
 		local count = 0
+		local dense = true
+		for key in pairs(value) do
+			count += 1
+			if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > length then
+				dense = false
+			end
+		end
+		if dense and count == length then
+			local out = table.create(length)
+			for index = 1, length do
+				out[index] = serializeApiValue(value[index], depth + 1, seen)
+			end
+			seen[value] = nil
+			return out
+		end
+
+		local entries = {}
+		local truncated = false
+		count = 0
 		for key, nested in pairs(value) do
 			count += 1
 			if count > 128 then
-				out._truncated = true
+				truncated = true
 				break
 			end
-			out[tostring(key)] = serializeApiValue(nested, depth + 1)
+			entries[#entries + 1] = {
+				key = serializeApiValue(key, depth + 1, seen),
+				value = serializeApiValue(nested, depth + 1, seen),
+			}
+		end
+		seen[value] = nil
+		local out = { _type = "Table", entries = entries }
+		if truncated then
+			out.truncated = true
 		end
 		return out
 	end
 	return { _type = valueType, value = tostring(value) }
 end
 
+local function cancelTrackedThreads(threads)
+	for thread in pairs(threads) do
+		threads[thread] = nil
+		if coroutine.status(thread) ~= "dead" then
+			pcall(task.cancel, thread)
+		end
+	end
+end
+
+local function createTrackedTaskProxy(trackedThreads)
+	local proxy = table.clone(task)
+
+	local function schedule(scheduleCallback, callback, ...)
+		local completed = false
+		local scheduledThread = nil
+		local arguments = table.pack(...)
+		scheduledThread = scheduleCallback(function()
+			local result = table.pack(pcall(function()
+				if type(callback) == "thread" then
+					local resumed = table.pack(coroutine.resume(callback, table.unpack(arguments, 1, arguments.n)))
+					if not resumed[1] then
+						error(resumed[2], 0)
+					end
+					return table.unpack(resumed, 2, resumed.n)
+				end
+				return callback(table.unpack(arguments, 1, arguments.n))
+			end))
+			completed = true
+			if scheduledThread then
+				trackedThreads[scheduledThread] = nil
+			end
+			if not result[1] then
+				error(result[2], 0)
+			end
+			return table.unpack(result, 2, result.n)
+		end)
+		if not completed then
+			trackedThreads[scheduledThread] = true
+		end
+		return scheduledThread
+	end
+
+	proxy.spawn = function(callback, ...)
+		return schedule(task.spawn, callback, ...)
+	end
+	proxy.defer = function(callback, ...)
+		return schedule(task.defer, callback, ...)
+	end
+	proxy.delay = function(duration, callback, ...)
+		return schedule(function(worker)
+			return task.delay(duration, worker)
+		end, callback, ...)
+	end
+	proxy.cancel = function(thread)
+		trackedThreads[thread] = nil
+		return task.cancel(thread)
+	end
+	return proxy
+end
+
 function BridgeRuntimeApi.create(plugin)
 	local LogService = game:GetService("LogService")
 	local RunService = game:GetService("RunService")
 	local StudioTestService = game:GetService("StudioTestService")
-	local consoleBuffer = {}
+	local consoleBuffer = table.create(CONSOLE_BUFFER_LIMIT)
+	local consoleStart = 1
+	local consoleCount = 0
 	local consoleSeq = 21335
 	local playSession = {
 		token = 0,
@@ -105,25 +394,39 @@ function BridgeRuntimeApi.create(plugin)
 	local deviceSimulatorReadyAt = os.clock() + 4
 	local captureProbeGui = nil
 	local captureProbeFrame = nil
+	local activeEditThreads = {}
+	local editExecutionToken = 0
 
 	local function appendConsoleEntry(message, messageType)
 		consoleSeq += 1
-		consoleBuffer[#consoleBuffer + 1] = {
+		local text = truncateText(tostring(message), CONSOLE_MESSAGE_BYTE_LIMIT)
+		local entry = {
 			seq = consoleSeq,
 			time = os.clock(),
 			unix = os.time(),
-			message = tostring(message),
+			message = text,
 			type = consoleTypeName(messageType),
 		}
-		while #consoleBuffer > CONSOLE_BUFFER_LIMIT do
-			table.remove(consoleBuffer, 1)
+		if consoleCount < CONSOLE_BUFFER_LIMIT then
+			local index = ((consoleStart + consoleCount - 1) % CONSOLE_BUFFER_LIMIT) + 1
+			consoleBuffer[index] = entry
+			consoleCount += 1
+		else
+			consoleBuffer[consoleStart] = entry
+			consoleStart = (consoleStart % CONSOLE_BUFFER_LIMIT) + 1
 		end
 	end
 
-	local okHistory, history = pcall(function()
-		return LogService:GetLogHistory()
-	end)
-	if okHistory and type(history) == "table" then
+	local function consoleEntryAt(position)
+		if position < 1 or position > consoleCount then
+			return nil
+		end
+		local index = ((consoleStart + position - 2) % CONSOLE_BUFFER_LIMIT) + 1
+		return consoleBuffer[index]
+	end
+
+	local history = LogService:GetLogHistory()
+	if type(history) == "table" then
 		for _, entry in ipairs(history) do
 			if type(entry) == "table" then
 				appendConsoleEntry(entry.message or entry.Message or "", entry.messageType or entry.MessageType)
@@ -136,12 +439,19 @@ function BridgeRuntimeApi.create(plugin)
 
 	local api = {}
 
-	local function executeWithRunner(parent, className, baseName, runContext, code, timeoutSeconds, context)
+	local function executeWithRunner(
+		parent,
+		className,
+		baseName,
+		runContext,
+		code,
+		timeoutSeconds,
+		context,
+		backgroundLifetimeSeconds
+	)
 		local scriptInstance = Instance.new(className)
 		scriptInstance.Name = baseName .. "_" .. tostring(runnerSequence + 1)
-		pcall(function()
-			scriptInstance.Enabled = false
-		end)
+		scriptInstance.Enabled = false
 		if runContext ~= nil then
 			scriptInstance.RunContext = runContext
 		end
@@ -171,13 +481,32 @@ function BridgeRuntimeApi.create(plugin)
 local resultEvent = script:FindFirstChild("__ReniumResult")
 if resultEvent == nil then return end
 local output = {}
+local outputBytes = 0
+local outputTruncated = false
 local basePrint = print
 local baseWarn = warn
+local function truncate(text, maxBytes)
+	if #text <= maxBytes then return text end
+	local suffix = "\n[Renium truncated this message.]"
+	local contentBytes = math.max(0, maxBytes - #suffix)
+	local ok, boundary = pcall(utf8.offset, text, 0, contentBytes + 1)
+	local finish = if ok and boundary then boundary - 1 else contentBytes
+	return string.sub(text, 1, finish) .. suffix
+end
 local function capture(kind, ...)
 	local values = table.pack(...)
 	local parts = table.create(values.n)
 	for index = 1, values.n do parts[index] = tostring(values[index]) end
-	output[#output + 1] = { type = kind, message = table.concat(parts, "\t") }
+	if not outputTruncated then
+		local message = truncate(table.concat(parts, "\t"), %d)
+		if #output >= %d or outputBytes + #message > %d then
+			output[#output + 1] = { type = "warn", message = "[Renium stopped capturing command output at its size limit.]" }
+			outputTruncated = true
+		else
+			outputBytes += #message
+			output[#output + 1] = { type = kind, message = message }
+		end
+	end
 	if kind == "print" then basePrint(...) else baseWarn(...) end
 end
 local print = function(...) capture("print", ...) end
@@ -188,8 +517,7 @@ worker = task.spawn(function()
 	local packed = table.pack(xpcall(function()
 %s
 	end, function(message)
-		local ok, trace = pcall(function() return debug.traceback(tostring(message), 2) end)
-		return if ok then trace else tostring(message)
+		return debug.traceback(tostring(message), 2)
 	end))
 	if finished then return end
 	finished = true
@@ -205,7 +533,13 @@ task.delay(%.6f, function()
 	pcall(task.cancel, worker)
 	resultEvent:Fire("timeout", output)
 end)
-]==]):format(code, timeoutSeconds)
+]==]):format(
+			COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT,
+			COMMAND_OUTPUT_ENTRY_LIMIT,
+			COMMAND_OUTPUT_BYTE_LIMIT,
+			code,
+			timeoutSeconds
+		)
 		setRunnerSource(scriptInstance, wrapped)
 		local deadline = os.clock() + timeoutSeconds + 1
 		while status == nil and logError == nil and scriptInstance.Parent ~= nil and os.clock() < deadline do
@@ -213,10 +547,17 @@ end)
 		end
 		resultConnection:Disconnect()
 		logConnection:Disconnect()
-		pcall(function()
+		local retained = status == "ok" and backgroundLifetimeSeconds and backgroundLifetimeSeconds > 0
+		if retained then
+			task.delay(backgroundLifetimeSeconds, function()
+				if scriptInstance.Parent then
+					scriptInstance:Destroy()
+				end
+			end)
+		else
 			scriptInstance.Enabled = false
-		end)
-		scriptInstance:Destroy()
+			scriptInstance:Destroy()
+		end
 		if logError ~= nil then
 			return { ok = false, error = logError, output = {}, runner = true, path = path, context = context }
 		end
@@ -253,58 +594,36 @@ end)
 			results = results,
 			output = if values and type(values[1]) == "table" then values[1] else {},
 			runner = true,
+			background = not not retained,
 			path = path,
 			context = context,
 		}
 	end
 
 	local function currentRunStateText()
-		local okState, state = pcall(function()
-			return RunService.RunState
-		end)
-		if okState then
-			return tostring(state)
-		end
-		return nil
+		return tostring(RunService.RunState)
 	end
 
 	local function currentStudioTestState()
-		local editModeActive = nil
-		local canLeaveTest = nil
-		local okEditMode, editModeValue = pcall(function()
-			return (StudioTestService :: any).EditModeActive
-		end)
-		if okEditMode and type(editModeValue) == "boolean" then
-			editModeActive = editModeValue
-		end
-		local okCanLeave, canLeaveValue = pcall(function()
-			return (StudioTestService :: any):CanLeaveTest()
-		end)
-		if okCanLeave and type(canLeaveValue) == "boolean" then
-			canLeaveTest = canLeaveValue
-		end
+		local editModeValue = (StudioTestService :: any).EditModeActive
+		local canLeaveValue = (StudioTestService :: any):CanLeaveTest()
 		return {
-			editModeActive = editModeActive,
-			canLeaveTest = canLeaveTest,
+			editModeActive = if type(editModeValue) == "boolean" then editModeValue else nil,
+			canLeaveTest = if type(canLeaveValue) == "boolean" then canLeaveValue else nil,
 		}
 	end
 
 	local function getInstanceDebugId(instance)
-		local ok, debugId = pcall(function()
-			return instance:GetDebugId(32)
-		end)
-		if ok and type(debugId) == "string" then
-			return debugId
-		end
-		return nil
+		local debugId = instance:GetDebugId(32)
+		return if type(debugId) == "string" then debugId else nil
 	end
 
 	local function parseGuiSegment(text)
 		local name, ordinalText = string.match(text, "^(.-)%[(%d+)%]$")
 		if name ~= nil and name ~= "" then
-			return name, tonumber(ordinalText)
+			return unescapePathSegment(name), tonumber(ordinalText)
 		end
-		return text, nil
+		return unescapePathSegment(text), nil
 	end
 
 	local function sameNameChildren(parent, name)
@@ -321,11 +640,11 @@ end)
 		local current = instance
 		while current ~= nil do
 			if current:IsA("GuiObject") then
-				if current.Visible ~= true then
+				if not current.Visible then
 					return false
 				end
 			elseif current:IsA("ScreenGui") then
-				return current.Enabled == true
+				return current.Enabled
 			end
 			current = current.Parent
 		end
@@ -348,7 +667,7 @@ end)
 		end
 		local current = instance.Parent
 		while current ~= nil and not current:IsA("ScreenGui") do
-			if current:IsA("GuiObject") and (current.ClipsDescendants == true or current:IsA("ScrollingFrame")) then
+			if current:IsA("GuiObject") and (current.ClipsDescendants or current:IsA("ScrollingFrame")) then
 				local clipPos = current.AbsolutePosition
 				local clipSize = current.AbsoluteSize
 				if
@@ -410,11 +729,11 @@ end)
 				break
 			end
 			local siblings = sameNameChildren(parent, current.Name)
-			local segment = current.Name
+			local segment = escapePathSegment(current.Name)
 			if #siblings > 1 then
 				for position, sibling in ipairs(siblings) do
 					if sibling == current then
-						segment = ("%s[%d]"):format(current.Name, position)
+						segment ..= ("[%d]"):format(position)
 						break
 					end
 				end
@@ -430,11 +749,9 @@ end)
 		local absSize = current.AbsoluteSize
 		local insetX, insetY = 0, 0
 		local screenGui = current:FindFirstAncestorWhichIsA("ScreenGui")
-		if screenGui == nil or screenGui.IgnoreGuiInset ~= true then
-			local okInset, topLeft = pcall(function()
-				return (game:GetService("GuiService") :: any):GetGuiInset()
-			end)
-			if okInset and typeof(topLeft) == "Vector2" then
+		if not screenGui or not screenGui.IgnoreGuiInset then
+			local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
+			if typeof(topLeft) == "Vector2" then
 				insetX = topLeft.X
 				insetY = topLeft.Y
 			end
@@ -461,7 +778,6 @@ end)
 	end
 
 	function api.getGuiBounds(params)
-		params = params or {}
 		local idText = tostring(params.id or "")
 		if idText ~= "" then
 			local localPlayerForId = game:GetService("Players").LocalPlayer
@@ -486,10 +802,7 @@ end)
 		if pathText == "" then
 			return { ok = false, error = "Missing gui path or id" }
 		end
-		local segments = {}
-		for segment in string.gmatch(pathText, "[^%.]+") do
-			segments[#segments + 1] = segment
-		end
+		local segments = splitAutomationPath(pathText)
 		local localPlayer = game:GetService("Players").LocalPlayer
 		local root
 		local index = 1
@@ -626,7 +939,6 @@ end)
 	end
 
 	function api.getGuiInventory(params)
-		params = params or {}
 		local limit = math.clamp(tonumber(params.limit) or 200, 1, 500)
 		local localPlayer = game:GetService("Players").LocalPlayer
 		if localPlayer == nil then
@@ -637,24 +949,147 @@ end)
 			return { ok = false, error = "PlayerGui is not available" }
 		end
 		local insetX, insetY = 0, 0
-		local okInset, topLeft = pcall(function()
-			return (game:GetService("GuiService") :: any):GetGuiInset()
-		end)
-		if okInset and typeof(topLeft) == "Vector2" then
+		local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
+		if typeof(topLeft) == "Vector2" then
 			insetX = topLeft.X
 			insetY = topLeft.Y
 		end
+		local visibilityByInstance = { [playerGui] = true }
+		local screenGuiByInstance = { [playerGui] = false }
+		local pathByInstance = { [playerGui] = "" }
+		local ordinalSegmentByInstance = {}
+		local ordinalReadyByParent = {}
+		local clipByInstance = {}
+		local clipReadyByInstance = {}
+
+		local function inventoryVisibility(instance)
+			local cached = visibilityByInstance[instance]
+			if cached ~= nil then
+				local screenGui = screenGuiByInstance[instance]
+				return cached, if screenGui then screenGui else nil
+			end
+			local parent = instance.Parent
+			if not parent then
+				return false, nil
+			end
+			local parentVisible, screenGui = inventoryVisibility(parent)
+			local visible = parentVisible
+			if instance:IsA("ScreenGui") then
+				screenGui = instance
+				visible = instance.Enabled
+			elseif instance:IsA("GuiObject") then
+				visible = parentVisible and screenGui ~= nil and instance.Visible
+			end
+			visibilityByInstance[instance] = visible
+			screenGuiByInstance[instance] = screenGui or false
+			return visible, screenGui
+		end
+
+		local function ensureOrdinalSegments(parent)
+			if ordinalReadyByParent[parent] then
+				return
+			end
+			ordinalReadyByParent[parent] = true
+			local children = parent:GetChildren()
+			local totals = {}
+			for _, child in ipairs(children) do
+				totals[child.Name] = (totals[child.Name] or 0) + 1
+			end
+			local positions = {}
+			for _, child in ipairs(children) do
+				local name = child.Name
+				positions[name] = (positions[name] or 0) + 1
+				local escapedName = escapePathSegment(name)
+				ordinalSegmentByInstance[child] = if totals[name] > 1
+					then ("%s[%d]"):format(escapedName, positions[name])
+					else escapedName
+			end
+		end
+
+		local function inventoryPath(instance)
+			local cached = pathByInstance[instance]
+			if cached then
+				return cached
+			end
+			local parent = instance.Parent
+			if not parent then
+				return instance.Name
+			end
+			ensureOrdinalSegments(parent)
+			local parentPath = inventoryPath(parent)
+			local segment = ordinalSegmentByInstance[instance] or instance.Name
+			local path = if parentPath == "" then segment else parentPath .. "." .. segment
+			pathByInstance[instance] = path
+			return path
+		end
+
+		local function inheritedClip(instance)
+			if clipReadyByInstance[instance] then
+				local cached = clipByInstance[instance]
+				return if cached then cached else nil
+			end
+			clipReadyByInstance[instance] = true
+			local parent = instance.Parent
+			local clip = if parent then inheritedClip(parent) else nil
+			if parent and parent:IsA("GuiObject") and (parent.ClipsDescendants or parent:IsA("ScrollingFrame")) then
+				local position = parent.AbsolutePosition
+				local size = parent.AbsoluteSize
+				local nextClip = {
+					left = position.X,
+					top = position.Y,
+					right = position.X + size.X,
+					bottom = position.Y + size.Y,
+				}
+				if clip then
+					nextClip.left = math.max(nextClip.left, clip.left)
+					nextClip.top = math.max(nextClip.top, clip.top)
+					nextClip.right = math.min(nextClip.right, clip.right)
+					nextClip.bottom = math.min(nextClip.bottom, clip.bottom)
+				end
+				clip = nextClip
+			end
+			clipByInstance[instance] = clip or false
+			return clip
+		end
+
+		local function inventoryOnScreen(instance, offX, offY)
+			local position = instance.AbsolutePosition
+			local size = instance.AbsoluteSize
+			local centerX = position.X + size.X / 2
+			local centerY = position.Y + size.Y / 2
+			local camera = workspace.CurrentCamera
+			if camera then
+				local viewport = camera.ViewportSize
+				local viewportX = centerX + offX
+				local viewportY = centerY + offY
+				if viewportX < 0 or viewportY < 0 or viewportX > viewport.X or viewportY > viewport.Y then
+					return false
+				end
+			end
+			local clip = inheritedClip(instance)
+			return not clip
+				or (
+					centerX >= clip.left
+					and centerX <= clip.right
+					and centerY >= clip.top
+					and centerY <= clip.bottom
+				)
+		end
+
 		local items = {}
 		local truncated = false
 		local includeOffscreen = params.includeOffscreen == true
 		for _, descendant in ipairs(playerGui:GetDescendants()) do
-			if (descendant:IsA("GuiButton") or descendant:IsA("TextBox")) and isEffectivelyVisible(descendant) then
-				local screenGui = descendant:FindFirstAncestorWhichIsA("ScreenGui")
+			if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+				local visible, screenGui = inventoryVisibility(descendant)
+				if not visible then
+					continue
+				end
 				local offX, offY = insetX, insetY
-				if screenGui ~= nil and screenGui.IgnoreGuiInset == true then
+				if screenGui and screenGui.IgnoreGuiInset then
 					offX, offY = 0, 0
 				end
-				if not includeOffscreen and not guiCenterOnScreen(descendant, offX, offY) then
+				if not includeOffscreen and not inventoryOnScreen(descendant, offX, offY) then
 					continue
 				end
 				if #items >= limit then
@@ -663,12 +1098,11 @@ end)
 				end
 				local absPos = descendant.AbsolutePosition
 				local absSize = descendant.AbsoluteSize
-				local text = nil
-				if descendant:IsA("TextButton") or descendant:IsA("TextBox") then
-					text = string.sub(descendant.Text, 1, 60)
-				end
+				local text = if descendant:IsA("TextButton") or descendant:IsA("TextBox")
+					then string.sub(descendant.Text, 1, 60)
+					else nil
 				items[#items + 1] = {
-					p = guiOrdinalPath(playerGui, descendant),
+					p = inventoryPath(descendant),
 					c = descendant.ClassName,
 					t = text,
 					id = getInstanceDebugId(descendant),
@@ -683,15 +1117,11 @@ end)
 	end
 
 	function api.getWorldPoint(params)
-		params = params or {}
 		local pathText = tostring(params.path or "")
 		if pathText == "" then
 			return { ok = false, error = "Missing world instance path" }
 		end
-		local segments = {}
-		for segment in string.gmatch(pathText, "[^%.]+") do
-			segments[#segments + 1] = segment
-		end
+		local segments = splitAutomationPath(pathText)
 		local current = game
 		local index = 1
 		local firstName = parseGuiSegment(segments[1] or "")
@@ -770,6 +1200,10 @@ end)
 			return { ok = false, error = "PlayerScripts is not available" }
 		end
 		local probe = playerScripts:FindFirstChild(MOUSE_PROBE_NAME)
+		if probe and probe:GetAttribute("ProbeVersion") ~= 2 then
+			probe:Destroy()
+			probe = nil
+		end
 		if probe == nil then
 			probe = Instance.new("LocalScript")
 			probe.Name = MOUSE_PROBE_NAME
@@ -779,6 +1213,7 @@ end)
 local probe = script
 local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
+probe:SetAttribute("ProbeVersion", 2)
 UserInputService.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton3 then
 		local inset = GuiService:GetGuiInset()
@@ -787,14 +1222,23 @@ UserInputService.InputBegan:Connect(function(input)
 		probe:SetAttribute("ProbeSeq", (probe:GetAttribute("ProbeSeq") or 0) + 1)
 	end
 end)
-game:GetService("RunService").RenderStepped:Connect(function()
+local function updateMouse()
 	local location = UserInputService:GetMouseLocation()
 	probe:SetAttribute("MouseX", location.X)
 	probe:SetAttribute("MouseY", location.Y)
-end)
+	probe:SetAttribute("ResponseSeq", probe:GetAttribute("RequestSeq") or 0)
+end
+probe:GetAttributeChangedSignal("RequestSeq"):Connect(updateMouse)
+updateMouse()
 ]==]
 			)
 			probe.Parent = playerScripts
+		end
+		local requestSeq = (probe:GetAttribute("RequestSeq") or 0) + 1
+		probe:SetAttribute("RequestSeq", requestSeq)
+		local deadline = os.clock() + 1
+		while probe.Parent and probe:GetAttribute("ResponseSeq") ~= requestSeq and os.clock() < deadline do
+			task.wait()
 		end
 		local x = probe:GetAttribute("MouseX")
 		local y = probe:GetAttribute("MouseY")
@@ -821,36 +1265,54 @@ end)
 	end
 
 	function api.getConsoleOutput(params)
-		params = params or {}
 		local limit = math.clamp(tonumber(params.limit) or 200, 1, CONSOLE_BUFFER_LIMIT)
 		local sinceSeq = tonumber(params.sinceSeq) or tonumber(params.since) or tonumber(params.cursorSeq) or 0
 		local entries = {}
-		local startIndex = math.max(1, #consoleBuffer - limit + 1)
-		for i = startIndex, #consoleBuffer do
-			local entry = consoleBuffer[i]
-			if entry ~= nil and (entry.seq or 0) > sinceSeq then
-				entries[#entries + 1] = entry
-			end
-		end
 		local truncated = false
-		if startIndex > 1 then
-			local previous = consoleBuffer[startIndex - 1]
-			truncated = previous ~= nil and (previous.seq or 0) > sinceSeq
+		local hasMore = false
+		local nextSeq = consoleSeq
+
+		if params.cursorOnly ~= true then
+			if sinceSeq > 0 then
+				local oldest = consoleEntryAt(1)
+				truncated = oldest ~= nil and sinceSeq < oldest.seq - 1
+				for position = 1, consoleCount do
+					local entry = consoleEntryAt(position)
+					if entry and entry.seq > sinceSeq then
+						if #entries >= limit then
+							hasMore = true
+							break
+						end
+						entries[#entries + 1] = entry
+					end
+				end
+				if #entries > 0 then
+					nextSeq = entries[#entries].seq
+				end
+			else
+				local startPosition = math.max(1, consoleCount - limit + 1)
+				truncated = startPosition > 1
+				for position = startPosition, consoleCount do
+					entries[#entries + 1] = consoleEntryAt(position)
+				end
+			end
 		end
 		if params.clear == true then
 			table.clear(consoleBuffer)
+			consoleStart = 1
+			consoleCount = 0
 		end
 		return {
 			ok = true,
 			entries = entries,
 			count = #entries,
-			nextSeq = consoleSeq,
+			nextSeq = nextSeq,
 			truncated = truncated,
+			hasMore = hasMore,
 		}
 	end
 
 	function api.captureViewportProbe(params)
-		params = params or {}
 		local action = string.lower(tostring(params.action or "start"))
 		if action == "stop" or action == "clear" then
 			if captureProbeGui ~= nil then
@@ -865,6 +1327,14 @@ end)
 		if type(colors) ~= "table" or #colors ~= 16 then
 			return { ok = false, error = "Capture probe requires 16 colors" }
 		end
+		local packedColors = table.create(16)
+		for index = 1, 16 do
+			local packed = tonumber(colors[index])
+			if not packed or packed % 1 ~= 0 or packed < 0 or packed > 0xFFFFFF then
+				return { ok = false, error = ("Capture probe color %d must be a 24-bit integer"):format(index) }
+			end
+			packedColors[index] = packed
+		end
 		if action == "start" then
 			if captureProbeGui ~= nil then
 				captureProbeGui:Destroy()
@@ -876,11 +1346,9 @@ end)
 			screen.IgnoreGuiInset = true
 			screen.ResetOnSpawn = false
 			screen.ZIndexBehavior = Enum.ZIndexBehavior.Global
-			pcall(function()
-				screen.ScreenInsets = Enum.ScreenInsets.None
-				screen.ClipToDeviceSafeArea = false
-				screen.SafeAreaCompatibility = Enum.SafeAreaCompatibility.None
-			end)
+			screen.ScreenInsets = Enum.ScreenInsets.None
+			screen.ClipToDeviceSafeArea = false
+			screen.SafeAreaCompatibility = Enum.SafeAreaCompatibility.None
 			local frame = Instance.new("Frame")
 			frame.Name = "Probe"
 			frame.Archivable = false
@@ -890,7 +1358,7 @@ end)
 			frame.Size = UDim2.fromScale(1, 1)
 			frame.ZIndex = 2147483647
 			for index = 1, 16 do
-				local packed = tonumber(colors[index]) or 0
+				local packed = packedColors[index]
 				local tile = Instance.new("Frame")
 				tile.Name = tostring(index)
 				tile.Archivable = false
@@ -915,7 +1383,7 @@ end)
 				return { ok = false, error = "Capture probe is not active" }
 			end
 			for index = 1, 16 do
-				local packed = tonumber(colors[index]) or 0
+				local packed = packedColors[index]
 				local tile = captureProbeFrame:FindFirstChild(tostring(index))
 				if tile == nil then
 					return { ok = false, error = "Capture probe tile is missing" }
@@ -927,14 +1395,13 @@ end)
 				)
 			end
 		else
-			return { ok = false, error = "Unknown capture probe action '" .. action .. "'" }
+			return { ok = false, error = `Unknown capture probe action '{action}'` }
 		end
 		task.wait()
 		return { ok = true, action = action }
 	end
 
 	function api.deviceSimulator(params)
-		params = params or {}
 		local action = string.lower(tostring(params.action or "status"))
 		local service = game:GetService("StudioDeviceSimulatorService")
 
@@ -949,7 +1416,7 @@ end)
 				id = tostring(info.DeviceId or deviceId),
 				name = tostring(info.Name or deviceId),
 				form = enumName(info.DeviceForm),
-				custom = info.IsCustom == true,
+				custom = not not info.IsCustom,
 				width = tonumber(info.Width),
 				height = tonumber(info.Height),
 				pixelDensity = tonumber(info.PixelDensity),
@@ -1046,27 +1513,23 @@ end)
 				return matches[1]
 			end
 			if #matches == 0 then
-				return nil, "Unknown device '" .. tostring(requested) .. "'"
+				return nil, `Unknown device '{requested}'`
 			end
 			local names = {}
 			for _, device in ipairs(matches) do
-				names[#names + 1] = device.name .. " (" .. device.id .. ")"
+				names[#names + 1] = `{device.name} ({device.id})`
 			end
-			return nil, "Device '" .. tostring(requested) .. "' is ambiguous: " .. table.concat(names, ", ")
+			return nil, `Device '{requested}' is ambiguous: {table.concat(names, ", ")}`
 		end
 
 		if action == "list" then
 			local devices = listDevices()
 			return { ok = true, action = "list", count = #devices, devices = devices }
-		end
-
-		if action == "status" or action == "get" then
+		elseif action == "status" or action == "get" then
 			return status()
-		end
-
-		if action == "stop" or action == "reset" then
+		elseif action == "stop" or action == "reset" then
 			local before = status()
-			if before.simulating ~= true then
+			if not before.simulating then
 				return { ok = true, action = "stop", stopped = true, alreadyStopped = true }
 			end
 			local okStop, stopError = pcall(function()
@@ -1077,10 +1540,8 @@ end)
 			end
 			deviceSimulatorReadyAt = 0
 			return { ok = true, action = "stop", stopped = true, alreadyStopped = false }
-		end
-
-		if action ~= "set" and action ~= "select" and action ~= "apply" then
-			return { ok = false, error = "Unknown device action '" .. action .. "'" }
+		elseif action ~= "set" and action ~= "select" and action ~= "apply" then
+			return { ok = false, error = `Unknown device action '{action}'` }
 		end
 
 		local selectedDevice = nil
@@ -1105,7 +1566,7 @@ end)
 			}
 			orientation = orientations[key]
 			if orientation == nil then
-				return { ok = false, error = "Unknown orientation '" .. tostring(params.orientation) .. "'" }
+				return { ok = false, error = `Unknown orientation '{params.orientation}'` }
 			end
 		end
 
@@ -1122,7 +1583,7 @@ end)
 			}
 			scalingMode = scalingModes[key]
 			if scalingMode == nil then
-				return { ok = false, error = "Unknown scaling mode '" .. tostring(params.scalingMode) .. "'" }
+				return { ok = false, error = `Unknown scaling mode '{params.scalingMode}'` }
 			end
 		end
 
@@ -1192,12 +1653,15 @@ end)
 	end
 
 	function api.executeLuau(params)
-		params = params or {}
 		local code = tostring(params.code or "")
 		if code == "" then
 			return { ok = false, error = "Missing Luau code" }
 		end
 		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 20)
+		local backgroundLifetimeSeconds = BridgeValueCodec.decodeNumber(params.backgroundLifetimeSeconds)
+		if backgroundLifetimeSeconds then
+			backgroundLifetimeSeconds = math.clamp(backgroundLifetimeSeconds, 0.1, 610)
+		end
 
 		local context = string.lower(tostring(params.context or params.target or "plugin"))
 		if context == "client" or context == "local" then
@@ -1211,16 +1675,19 @@ end)
 				return { ok = false, error = "PlayerScripts is not available on the play client" }
 			end
 
-			return executeWithRunner(playerScripts, "LocalScript", CLIENT_RUNNER_NAME, nil, code, timeoutSeconds, "client")
+			return executeWithRunner(
+				playerScripts,
+				"LocalScript",
+				CLIENT_RUNNER_NAME,
+				nil,
+				code,
+				timeoutSeconds,
+				"client",
+				backgroundLifetimeSeconds
+			)
 		end
 
-		local okRunning, running = pcall(function()
-			return RunService:IsRunning()
-		end)
-		local okServer, isServer = pcall(function()
-			return RunService:IsServer()
-		end)
-		if okRunning and running == true and okServer and isServer == true then
+		if RunService:IsRunning() and RunService:IsServer() then
 			return executeWithRunner(
 				game:GetService("ServerScriptService"),
 				"Script",
@@ -1228,7 +1695,8 @@ end)
 				Enum.RunContext.Server,
 				code,
 				timeoutSeconds,
-				"server"
+				"server",
+				backgroundLifetimeSeconds
 			)
 		end
 
@@ -1236,10 +1704,8 @@ end)
 			return { ok = false, error = "loadstring is not available in this Studio session" }
 		end
 
-		local chunkName = tostring(params.chunkName or params.name or "Renium")
-		if chunkName == "" then
-			chunkName = "Renium"
-		end
+		local requestedChunkName = tostring(params.chunkName or params.name or "Renium")
+		local chunkName = if requestedChunkName == "" then "Renium" else requestedChunkName
 
 		local loadOk, loadedChunk, loadedError = pcall(loadstring, code, chunkName)
 		local chunk = loadedChunk
@@ -1259,21 +1725,21 @@ end)
 		end
 
 		local output = {}
+		local outputState = { bytes = 0, truncated = false }
 		local function capture(kind, ...)
-			local values = table.pack(...)
-			local parts = table.create(values.n)
-			for i = 1, values.n do
-				parts[i] = tostring(values[i])
-			end
-			output[#output + 1] = {
-				type = kind,
-				message = table.concat(parts, "\t"),
-			}
+			appendCapturedOutput(output, outputState, kind, ...)
 		end
 
 		local baseEnv = getfenv(0)
+		cancelTrackedThreads(activeEditThreads)
+		activeEditThreads = {}
+		editExecutionToken += 1
+		local executionToken = editExecutionToken
+		local trackedThreads = {}
+		local trackedTask = createTrackedTaskProxy(trackedThreads)
 		local env = setmetatable({
 			plugin = plugin,
+			task = trackedTask,
 			print = function(...)
 				capture("print", ...)
 				print(...)
@@ -1283,18 +1749,23 @@ end)
 				warn(...)
 			end,
 		}, { __index = baseEnv })
-		pcall(setfenv, chunk, env)
+		setfenv(chunk, env)
 
 		local packed = nil
-		local executionThread = task.spawn(function()
-			packed = table.pack(pcall(chunk))
-		end)
+		local finishedAt = nil
 		local deadline = os.clock() + timeoutSeconds
+		local executionThread = task.defer(function()
+			packed = table.pack(pcall(chunk))
+			finishedAt = os.clock()
+		end)
 		while packed == nil and os.clock() < deadline do
 			task.wait()
 		end
-		if packed == nil then
-			pcall(task.cancel, executionThread)
+		if packed == nil or (finishedAt and finishedAt > deadline) then
+			if coroutine.status(executionThread) ~= "dead" then
+				pcall(task.cancel, executionThread)
+			end
+			cancelTrackedThreads(trackedThreads)
 			return {
 				ok = false,
 				error = ("Luau execution timed out after %.1fs and was stopped"):format(timeoutSeconds),
@@ -1303,55 +1774,51 @@ end)
 				output = output,
 			}
 		end
-		if packed[1] ~= true then
+		if not packed[1] then
+			cancelTrackedThreads(trackedThreads)
 			return {
 				ok = false,
 				error = tostring(packed[2]),
 				output = output,
 			}
 		end
+		activeEditThreads = trackedThreads
+		if backgroundLifetimeSeconds then
+			task.delay(backgroundLifetimeSeconds, function()
+				if editExecutionToken == executionToken then
+					cancelTrackedThreads(activeEditThreads)
+					activeEditThreads = {}
+				end
+			end)
+		end
 
-		local results = {}
+		local results = table.create(packed.n - 1)
 		for i = 2, packed.n do
-			results[#results + 1] = serializeApiValue(packed[i])
+			results[i - 1] = serializeApiValue(packed[i])
 		end
 		return {
 			ok = true,
 			results = results,
 			output = output,
+			background = backgroundLifetimeSeconds ~= nil,
 		}
 	end
 
 	function api.isPlayModeRunning()
 		local studioTestState = currentStudioTestState()
-		local okEdit, editMode = pcall(function()
-			return RunService:IsEdit()
-		end)
-		local okRunning, running = pcall(function()
-			return RunService:IsRunning()
-		end)
-		local okState, state = pcall(function()
-			return RunService.RunState
-		end)
-		if okState and state == Enum.RunState.Stopped and studioTestState.editModeActive ~= false then
+		local editMode = RunService:IsEdit()
+		local running = RunService:IsRunning()
+		local state = RunService.RunState
+		if state == Enum.RunState.Stopped and studioTestState.editModeActive ~= false then
 			return false
-		end
-		if studioTestState.editModeActive == true then
+		elseif studioTestState.editModeActive == true then
 			return false
-		end
-		if okRunning and running == true then
+		elseif running then
+			return true
+		elseif studioTestState.editModeActive == false then
 			return true
 		end
-		if studioTestState.editModeActive == false then
-			return true
-		end
-		if okEdit and editMode == true then
-			return false
-		end
-		if okEdit and editMode == false then
-			return true
-		end
-		return okState and state ~= nil and state ~= Enum.RunState.Stopped and (not okEdit or editMode == false)
+		return not editMode
 	end
 
 	local function waitForRunning(timeoutSeconds)
@@ -1361,7 +1828,7 @@ end)
 				playSession.starting = false
 				return true
 			end
-			if playSession.starting ~= true and playSession.lastError ~= nil then
+			if not playSession.starting and playSession.lastError ~= nil then
 				return false
 			end
 			task.wait(0.05)
@@ -1385,12 +1852,10 @@ end)
 	end
 
 	local function executeStudioTest(token, mode, testArgs, numPlayers)
-		workspace:SetAttribute("__ReniumPlace", game.Name)
 		local ok, result = pcall(function()
 			if mode == "run" then
 				return StudioTestService:ExecuteRunModeAsync(testArgs)
-			end
-			if mode == "multi" then
+			elseif mode == "multi" then
 				return (StudioTestService :: any):ExecuteMultiplayerTestAsync(numPlayers, testArgs)
 			end
 			return StudioTestService:ExecutePlayModeAsync(testArgs)
@@ -1411,7 +1876,6 @@ end)
 	end
 
 	function api.startStopPlay(params)
-		params = params or {}
 		local shouldStart = params.start == true or params.isStart == true or params.playing == true
 		local shouldStop = params.stop == true or params.isStart == false or params.playing == false
 		if shouldStart and shouldStop then
@@ -1421,7 +1885,7 @@ end)
 		local action = "status"
 		if shouldStart then
 			action = "start"
-			if playSession.starting == true
+			if playSession.starting
 				and not api.isPlayModeRunning()
 				and os.clock() - (playSession.lastStartedAt or 0) > 60
 			then
@@ -1429,17 +1893,17 @@ end)
 				playSession.starting = false
 				playSession.active = false
 			end
-			if not api.isPlayModeRunning() and playSession.starting ~= true then
+			if not api.isPlayModeRunning() and not playSession.starting then
 				local numPlayers = tonumber(params.players)
-				if numPlayers ~= nil then
-					numPlayers = math.clamp(math.floor(numPlayers), 1, 8)
+				if numPlayers and (numPlayers % 1 ~= 0 or numPlayers < 1 or numPlayers > 8) then
+					return { ok = false, error = "Multiplayer tests require an integer from 1 through 8" }
 				end
 				playSession.token += 1
 				playSession.active = true
 				playSession.starting = true
 				if params.mode == "run" then
 					playSession.mode = "run"
-				elseif numPlayers ~= nil and numPlayers >= 1 then
+				elseif numPlayers then
 					playSession.mode = "multi"
 				else
 					playSession.mode = "play"
@@ -1483,10 +1947,7 @@ end)
 			local attempts = {}
 			local function attempt(label, callback)
 				local attemptOk, attemptErr = pcall(callback)
-				local errorMessage = nil
-				if not attemptOk then
-					errorMessage = tostring(attemptErr)
-				end
+				local errorMessage = if attemptOk then nil else tostring(attemptErr)
 				attempts[#attempts + 1] = {
 					method = label,
 					ok = attemptOk,
@@ -1495,7 +1956,7 @@ end)
 				return attemptOk
 			end
 
-			if api.isPlayModeRunning() or playSession.active == true or playSession.starting == true then
+			if api.isPlayModeRunning() or playSession.active or playSession.starting then
 				attempt("EndTest", function()
 					(StudioTestService :: any):EndTest(true)
 				end)
@@ -1540,19 +2001,6 @@ end)
 			runState = currentRunStateText(),
 			studioTest = currentStudioTestState(),
 		}
-	end
-
-	function api.bindRunStateHidden(ui)
-		local function update()
-			ui.setPlayModeHidden(api.isPlayModeRunning())
-		end
-		pcall(function()
-			(StudioTestService :: any):GetPropertyChangedSignal("EditModeActive"):Connect(update)
-		end)
-		pcall(function()
-			RunService:GetPropertyChangedSignal("RunState"):Connect(update)
-		end)
-		update()
 	end
 
 	return api
