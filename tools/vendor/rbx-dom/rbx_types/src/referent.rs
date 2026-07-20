@@ -45,6 +45,15 @@ impl Ref {
         self.0.is_none()
     }
 
+    #[allow(missing_docs)]
+    #[inline]
+    pub const fn as_u128(self) -> Option<u128> {
+        match self.0 {
+            Some(value) => Some(value.get()),
+            None => None,
+        }
+    }
+
     fn value(&self) -> u128 {
         match self.0 {
             Some(value) => value.get(),

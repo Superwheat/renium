@@ -70,6 +70,37 @@ impl InstanceBuilder {
         }
     }
 
+    #[allow(missing_docs)]
+    pub fn with_referent_and_property_capacity<S: Into<Ustr>>(
+        class: S,
+        referent: Ref,
+        capacity: usize,
+    ) -> Self {
+        InstanceBuilder {
+            referent,
+            name: String::new(),
+            class: class.into(),
+            properties: Vec::with_capacity(capacity),
+            children: Vec::new(),
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn empty_without_referent() -> Self {
+        InstanceBuilder {
+            referent: Ref::none(),
+            name: String::new(),
+            class: Ustr::default(),
+            properties: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn set_name_to_class(&mut self) {
+        self.name = self.class.to_string();
+    }
+
     /// Create a new `InstanceBuilder` with all values set to empty.
     pub fn empty() -> Self {
         InstanceBuilder {
@@ -191,6 +222,25 @@ impl InstanceBuilder {
         I: IntoIterator<Item = InstanceBuilder>,
     {
         self.children.extend(children);
+    }
+
+    #[allow(missing_docs)]
+    pub fn into_raw_parts(
+        self,
+    ) -> (
+        Ref,
+        String,
+        Ustr,
+        Vec<(Ustr, Variant)>,
+        Vec<InstanceBuilder>,
+    ) {
+        (
+            self.referent,
+            self.name,
+            self.class,
+            self.properties,
+            self.children,
+        )
     }
 }
 

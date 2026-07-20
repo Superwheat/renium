@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::thread;
@@ -13,8 +13,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::{
     SETTINGS_BINARY_MAGIC, SETTINGS_BINARY_VERSION, SETTINGS_BINARY_VERSION_LEGACY, ServiceState,
-    child_indices_for_instance, instance_settings_id, log_timing, should_skip_binary_property,
-    write_bytes_if_changed,
+    child_indices_for_instance, instance_settings_id, log_timing, nonfinite_float_from_json,
+    should_skip_binary_property, write_bytes_if_changed,
 };
 
 const MAX_SETTINGS_BYTECODE_BYTES: usize = 128 * 1024 * 1024;
@@ -22,6 +22,8 @@ const MAX_SETTINGS_COLLECTION_ITEMS: usize = 500_000;
 const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
+const SETTINGS_BINARY_GROUP_LENGTH_VERSION: u8 = 9;
+const SETTINGS_BINARY_NUMERIC_ID_VERSION: u8 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SettingsBytecode {
@@ -106,7 +108,7 @@ pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode>
     let version = reader
         .read_u8()
         .context("Missing settings bytecode version")?;
-    if version != SETTINGS_BINARY_VERSION && version != SETTINGS_BINARY_VERSION_LEGACY {
+    if version < SETTINGS_BINARY_VERSION_LEGACY || version > SETTINGS_BINARY_VERSION {
         bail!("Unsupported settings bytecode version {version}");
     }
 
@@ -170,9 +172,13 @@ fn decode_settings_bytecode_payload(
     let instance_count = reader.read_collection_len("instance count")?;
     let mut instances = Vec::with_capacity(instance_count);
     for instance_index in 0..instance_count {
-        let settings_id = reader
-            .read_string(&strings, "instance settings id")?
-            .to_string();
+        let settings_id = if version >= SETTINGS_BINARY_NUMERIC_ID_VERSION {
+            read_compact_settings_id(reader, &strings)?
+        } else {
+            reader
+                .read_string(&strings, "instance settings id")?
+                .to_string()
+        };
         let name = reader.read_string(&strings, "instance name")?.to_string();
         let class_id = reader.read_len("instance class id")?;
         let class_name = classes
@@ -193,7 +199,7 @@ fn decode_settings_bytecode_payload(
     validate_settings_hierarchy(&instances)?;
 
     let group_count = reader.read_collection_len("property group count")?;
-    if version >= SETTINGS_BINARY_VERSION {
+    if version >= SETTINGS_BINARY_GROUP_LENGTH_VERSION {
         let mut specs = Vec::with_capacity(group_count);
         for _ in 0..group_count {
             let property_id = reader.read_len("property id")?;
@@ -388,12 +394,13 @@ fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result
 }
 
 fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
-    encode_settings_bytecode_payload_with_layout(document, true)
+    encode_settings_bytecode_payload_with_layout(document, true, true)
 }
 
 fn encode_settings_bytecode_payload_with_layout(
     document: &SettingsBytecode,
     group_len_prefix: bool,
+    numeric_ids: bool,
 ) -> Result<Vec<u8>> {
     let lookup = build_bytecode_instance_lookup(document);
     let mut string_counts: SettingsStringCounts<'_> = HashMap::new();
@@ -402,7 +409,9 @@ fn encode_settings_bytecode_payload_with_layout(
     let mut property_groups: SettingsPropertyGroups<'_> = HashMap::new();
 
     for (instance_index, instance) in document.instances.iter().enumerate() {
-        add_count(&mut string_counts, instance.settings_id.as_str(), 1);
+        if !numeric_ids || parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
+            add_count(&mut string_counts, instance.settings_id.as_str(), 1);
+        }
         add_count(&mut string_counts, instance.name.as_str(), 1);
         add_count(&mut string_counts, instance.class_name.as_str(), 1);
         add_count(&mut class_counts, instance.class_name.as_str(), 1);
@@ -478,7 +487,11 @@ fn encode_settings_bytecode_payload_with_layout(
     }
     write_var_u64(&mut writer, document.instances.len() as u64)?;
     for (instance_index, instance) in document.instances.iter().enumerate() {
-        write_binary_string_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
+        if numeric_ids {
+            write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
+        } else {
+            write_binary_string_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
+        }
         write_binary_string_id(&mut writer, &string_ids, instance.name.as_str())?;
         write_lookup_id(
             &mut writer,
@@ -492,13 +505,20 @@ fn encode_settings_bytecode_payload_with_layout(
         )?;
     }
     write_var_u64(&mut writer, property_group_entries.len() as u64)?;
-    let mut group_body: Vec<u8> = Vec::new();
-    for ((property_name, kind), values) in &property_group_entries {
+    let group_bodies = property_group_entries
+        .par_iter()
+        .map(|((_, kind), values)| {
+            let mut body = Vec::new();
+            write_property_group_values(values, *kind, &string_ids, &lookup, &mut body)?;
+            Ok(body)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (((property_name, kind), values), group_body) in
+        property_group_entries.iter().zip(group_bodies)
+    {
         write_lookup_id(&mut writer, &property_ids, property_name, "property")?;
         writer.write_all(&[*kind])?;
         write_var_u64(&mut writer, values.len() as u64)?;
-        group_body.clear();
-        write_property_group_values(values, *kind, &string_ids, &lookup, &mut group_body)?;
         if group_len_prefix {
             write_var_u64(&mut writer, group_body.len() as u64)?;
         }
@@ -515,7 +535,7 @@ fn wrap_settings_bytecode_payload(payload: Vec<u8>) -> Result<Vec<u8>> {
             MAX_SETTINGS_BYTECODE_BYTES
         );
     }
-    let zstd = zstd::bulk::compress(&payload, 0)?;
+    let zstd = zstd::bulk::compress(&payload, 1)?;
     if zstd.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
             "Compressed settings bytecode payload exceeds safe size limit of {} bytes",
@@ -1068,10 +1088,15 @@ type SettingsIndexMap<K> = HashMap<K, usize>;
 
 struct SettingsBinaryInstance<'a> {
     source_index: usize,
-    settings_id: SettingsString<'a>,
+    settings_id: SettingsBinaryId<'a>,
     name: &'a str,
     class_name: &'a str,
     parent_index: Option<usize>,
+}
+
+enum SettingsBinaryId<'a> {
+    Text(SettingsString<'a>),
+    NumericDebug(u64),
 }
 
 struct SettingsBinaryValue<'a> {
@@ -1104,6 +1129,7 @@ enum SettingsBinaryValueSource<'a> {
 }
 
 struct SettingsBinaryInstanceLookup {
+    dense_instance_count: usize,
     by_instance_index: SettingsIndexMap<usize>,
     by_instance_id: SettingsIndexMap<String>,
     by_debug_id: SettingsIndexMap<String>,
@@ -1135,7 +1161,9 @@ fn collect_settings_binary_chunk<'a>(
 
     for (offset, record) in instances.iter().enumerate() {
         let instance_index = base_index + offset;
-        add_count(&mut out.string_counts, record.settings_id.as_ref(), 1);
+        if let SettingsBinaryId::Text(settings_id) = &record.settings_id {
+            add_count(&mut out.string_counts, settings_id.as_ref(), 1);
+        }
         add_count(&mut out.string_counts, record.name, 1);
         add_count(&mut out.string_counts, record.class_name, 1);
         add_count(&mut out.class_counts, record.class_name, 1);
@@ -1236,6 +1264,21 @@ fn collect_settings_binary_data<'a>(
 }
 
 pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceState) -> Result<()> {
+    write_service_settings_binary_file_inner(path, state, false)
+}
+
+pub(crate) fn write_fresh_service_settings_binary_file(
+    path: &Path,
+    state: &ServiceState,
+) -> Result<()> {
+    write_service_settings_binary_file_inner(path, state, true)
+}
+
+fn write_service_settings_binary_file_inner(
+    path: &Path,
+    state: &ServiceState,
+    fresh: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -1263,7 +1306,6 @@ pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceSta
         let b_id = property_ids.get(b.0.0).copied().unwrap_or(u64::MAX);
         a_id.cmp(&b_id).then_with(|| a.0.1.cmp(&b.0.1))
     });
-
     let estimated_capacity = instances
         .len()
         .saturating_mul(96)
@@ -1284,29 +1326,71 @@ pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceSta
         write_binary_string_id(&mut payload, &string_ids, property_name)?;
     }
     write_var_u64(&mut payload, instances.len() as u64)?;
-    for (instance_index, record) in instances.iter().enumerate() {
-        write_binary_string_id(&mut payload, &string_ids, record.settings_id.as_ref())?;
-        write_binary_string_id(&mut payload, &string_ids, record.name)?;
-        write_lookup_id(&mut payload, &class_ids, record.class_name, "class")?;
-        write_var_u64(
-            &mut payload,
-            encode_parent_index(record.parent_index, instance_index)?,
-        )?;
+    if instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES && rayon::current_num_threads() > 1
+    {
+        let bodies = instances
+            .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+            .enumerate()
+            .map(|(chunk_index, records)| {
+                let base_index = chunk_index * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                let mut body = Vec::with_capacity(records.len().saturating_mul(12));
+                for (offset, record) in records.iter().enumerate() {
+                    write_settings_binary_id(&mut body, &string_ids, &record.settings_id)?;
+                    write_binary_string_id(&mut body, &string_ids, record.name)?;
+                    write_lookup_id(&mut body, &class_ids, record.class_name, "class")?;
+                    write_var_u64(
+                        &mut body,
+                        encode_parent_index(record.parent_index, base_index + offset)?,
+                    )?;
+                }
+                Ok(body)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for body in bodies {
+            payload.extend_from_slice(&body);
+        }
+    } else {
+        for (instance_index, record) in instances.iter().enumerate() {
+            write_settings_binary_id(&mut payload, &string_ids, &record.settings_id)?;
+            write_binary_string_id(&mut payload, &string_ids, record.name)?;
+            write_lookup_id(&mut payload, &class_ids, record.class_name, "class")?;
+            write_var_u64(
+                &mut payload,
+                encode_parent_index(record.parent_index, instance_index)?,
+            )?;
+        }
     }
     write_var_u64(&mut payload, property_group_entries.len() as u64)?;
-    let mut group_body: Vec<u8> = Vec::new();
-    for ((property_name, kind), values) in &property_group_entries {
+    let group_bodies = property_group_entries
+        .par_iter()
+        .map(|((_, kind), values)| {
+            let mut body = Vec::new();
+            write_property_group_values(values, *kind, &string_ids, &lookup, &mut body)?;
+            Ok(body)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (((property_name, kind), values), group_body) in
+        property_group_entries.iter().zip(group_bodies)
+    {
         write_lookup_id(&mut payload, &property_ids, property_name, "property")?;
         payload.write_all(&[*kind])?;
         write_var_u64(&mut payload, values.len() as u64)?;
-        group_body.clear();
-        write_property_group_values(values, *kind, &string_ids, &lookup, &mut group_body)?;
         write_var_u64(&mut payload, group_body.len() as u64)?;
         payload.extend_from_slice(&group_body);
     }
 
     let writer = wrap_settings_bytecode_payload(payload)?;
-    write_bytes_if_changed(path, &writer)?;
+    if fresh {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(&writer)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    } else {
+        write_bytes_if_changed(path, &writer)?;
+    }
     log_timing(
         &format!("settings binary write {}", path.display()),
         write_started,
@@ -1320,10 +1404,9 @@ fn collect_service_settings_binary_instances<'a>(
     if state.properties_default_elided && state.dense_index_topology {
         let mut out = Vec::with_capacity(state.instances.len());
         for (source_index, instance) in state.instances.iter().enumerate() {
-            let settings_id = Cow::Owned(instance_settings_id(source_index, instance));
             out.push(SettingsBinaryInstance {
                 source_index,
-                settings_id,
+                settings_id: settings_binary_id(source_index, instance),
                 name: instance.name.as_str(),
                 class_name: instance.class_name.as_str(),
                 parent_index: instance.parent_index.map(|parent_index| parent_index - 1),
@@ -1344,7 +1427,7 @@ fn collect_service_settings_binary_instances<'a>(
         let current_index = out.len();
         out.push(SettingsBinaryInstance {
             source_index,
-            settings_id: Cow::Owned(instance_settings_id(source_index, instance)),
+            settings_id: settings_binary_id(source_index, instance),
             name: instance.name.as_str(),
             class_name: instance.class_name.as_str(),
             parent_index,
@@ -1357,10 +1440,48 @@ fn collect_service_settings_binary_instances<'a>(
     out
 }
 
+fn parse_numeric_debug_id(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix("0_")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.parse::<u64>().ok()?;
+    (format!("0_{value}") == text && value <= (u64::MAX >> 1)).then_some(value)
+}
+
+fn parse_numeric_debug_settings_id(text: &str) -> Option<u64> {
+    parse_numeric_debug_id(text.strip_prefix("debug:")?)
+}
+
+fn settings_binary_id<'a>(
+    source_index: usize,
+    instance: &'a crate::SnapshotInstance,
+) -> SettingsBinaryId<'a> {
+    if instance.instance_index == Some(1) && instance.parent_index.is_none() {
+        return SettingsBinaryId::Text(Cow::Borrowed("1"));
+    }
+    if let Some(debug_id) = instance
+        .debug_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(value) = parse_numeric_debug_id(debug_id) {
+            return SettingsBinaryId::NumericDebug(value);
+        }
+    }
+    SettingsBinaryId::Text(Cow::Owned(instance_settings_id(source_index, instance)))
+}
+
 fn build_settings_binary_instance_lookup(
     state: &ServiceState,
     instances: &[SettingsBinaryInstance<'_>],
 ) -> SettingsBinaryInstanceLookup {
+    if state.dense_index_topology {
+        return SettingsBinaryInstanceLookup {
+            dense_instance_count: instances.len(),
+            ..empty_settings_binary_lookup()
+        };
+    }
     let mut by_instance_index = HashMap::with_capacity(instances.len());
     let mut by_instance_id = if state.properties_default_elided {
         HashMap::new()
@@ -1417,6 +1538,7 @@ fn build_settings_binary_instance_lookup(
     }
 
     SettingsBinaryInstanceLookup {
+        dense_instance_count: 0,
         by_instance_index,
         by_instance_id,
         by_debug_id,
@@ -1680,7 +1802,7 @@ fn cframe_component_bits(value: &Value) -> Result<[u32; 12]> {
 
     let mut out = [0_u32; 12];
     for (index, item) in items.iter().enumerate() {
-        let number = item.as_f64().context("Expected numeric CFrame component")?;
+        let number = settings_number(item).context("Expected numeric CFrame component")?;
         out[index] = fixed_numeric_component_bits(number);
     }
     Ok(out)
@@ -1743,14 +1865,14 @@ fn binary_number_kind(number: &serde_json::Number) -> Result<u8> {
 }
 
 fn is_numeric_array(items: &[Value]) -> bool {
-    !items.is_empty() && items.iter().all(Value::is_number)
+    !items.is_empty() && items.iter().all(|item| settings_number(item).is_some())
 }
 
 fn is_numeric_array_f32_exact(items: &[Value]) -> bool {
     !items.is_empty()
         && items
             .iter()
-            .all(|item| item.as_f64().and_then(exact_f32).is_some())
+            .all(|item| settings_number(item).and_then(exact_f32).is_some())
 }
 
 fn exact_f32(value: f64) -> Option<f32> {
@@ -1760,6 +1882,10 @@ fn exact_f32(value: f64) -> Option<f32> {
     } else {
         None
     }
+}
+
+fn settings_number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| nonfinite_float_from_json(value))
 }
 
 fn fixed_numeric_kind_from_tag(kind: u8) -> Option<FixedNumericKind> {
@@ -1795,7 +1921,7 @@ fn write_named_numbers<W: Write + ?Sized>(
     for name in names {
         let number = obj
             .get(*name)
-            .and_then(Value::as_f64)
+            .and_then(settings_number)
             .with_context(|| format!("Expected numeric field {name}"))?;
         write_fixed_numeric_component(number, writer)?;
     }
@@ -1809,11 +1935,12 @@ fn write_fixed_numeric_component<W: Write + ?Sized>(number: f64, writer: &mut W)
 }
 
 fn fixed_numeric_component_f32(number: f64) -> f32 {
+    if !number.is_finite() {
+        return number as f32;
+    }
     let value = number as f32;
     if value.is_finite() {
         value
-    } else if value.is_nan() {
-        0.0
     } else if value.is_sign_positive() {
         f32::MAX
     } else {
@@ -1850,7 +1977,7 @@ fn write_fixed_numeric_components<W: Write + ?Sized>(
                 bail!("Invalid CFrame component count");
             }
             for item in items {
-                let number = item.as_f64().context("Expected numeric CFrame component")?;
+                let number = settings_number(item).context("Expected numeric CFrame component")?;
                 write_fixed_numeric_component(number, writer)?;
             }
         }
@@ -1872,9 +1999,8 @@ fn write_numeric_array_components<W: Write + ?Sized>(
         bail!("Expected numeric array binary settings value");
     }
     for item in items {
-        let number = item
-            .as_f64()
-            .context("Expected numeric array binary settings value")?;
+        let number =
+            settings_number(item).context("Expected numeric array binary settings value")?;
         writer.write_all(&number.to_le_bytes())?;
     }
     Ok(items.len())
@@ -1891,8 +2017,7 @@ fn write_numeric_array_f32_components<W: Write + ?Sized>(
         bail!("Expected exactly representable f32 numeric array binary settings value");
     }
     for item in items {
-        let number = item
-            .as_f64()
+        let number = settings_number(item)
             .and_then(exact_f32)
             .context("Expected exactly representable f32 numeric array item")?;
         writer.write_all(&number.to_le_bytes())?;
@@ -1920,9 +2045,9 @@ fn write_numeric_slice_payload<W: Write + ?Sized>(numbers: &[f64], writer: &mut 
 fn color_components(value: &Value) -> Option<[f64; 3]> {
     let obj = value.as_object()?;
     Some([
-        obj.get("r")?.as_f64()?,
-        obj.get("g")?.as_f64()?,
-        obj.get("b")?.as_f64()?,
+        settings_number(obj.get("r")?)?,
+        settings_number(obj.get("g")?)?,
+        settings_number(obj.get("b")?)?,
     ])
 }
 
@@ -1938,10 +2063,14 @@ fn resolve_ref_index(
     ref_value: &Map<String, Value>,
     lookup: &SettingsBinaryInstanceLookup,
 ) -> Option<usize> {
-    if let Some(instance_index) = ref_value.get("instanceIndex").and_then(Value::as_u64)
-        && let Some(index) = lookup.by_instance_index.get(&(instance_index as usize))
-    {
-        return Some(*index);
+    if let Some(instance_index) = ref_value.get("instanceIndex").and_then(Value::as_u64) {
+        let instance_index = instance_index as usize;
+        if instance_index > 0 && instance_index <= lookup.dense_instance_count {
+            return Some(instance_index - 1);
+        }
+        if let Some(index) = lookup.by_instance_index.get(&instance_index) {
+            return Some(*index);
+        }
     }
     if let Some(instance_id) = ref_value.get("instanceId").and_then(Value::as_str)
         && let Some(index) = lookup.by_instance_id.get(instance_id)
@@ -2469,6 +2598,13 @@ fn binary_attribute_value_kind(value: &Value) -> Option<u8> {
 
 fn attribute_type_key(obj: &Map<String, Value>) -> Option<&'static str> {
     let type_name = obj.get("_type").and_then(Value::as_str)?;
+    if type_name == "Float" {
+        return matches!(
+            obj.get("value").and_then(Value::as_str),
+            Some("nan" | "inf" | "-inf")
+        )
+        .then_some("Float64");
+    }
     let supported = [
         "Vector2",
         "Vector3",
@@ -2633,6 +2769,7 @@ fn write_enum_item_attribute_payload<W: Write + ?Sized>(
 
 fn empty_settings_binary_lookup() -> SettingsBinaryInstanceLookup {
     SettingsBinaryInstanceLookup {
+        dense_instance_count: 0,
         by_instance_index: HashMap::new(),
         by_instance_id: HashMap::new(),
         by_debug_id: HashMap::new(),
@@ -2662,6 +2799,51 @@ fn write_binary_string_id<W: Write + ?Sized>(
         .get(text)
         .with_context(|| format!("Missing binary string id for {text:?}"))?;
     write_var_u64(writer, *id)
+}
+
+fn read_compact_settings_id(reader: &mut BytecodeReader<'_>, strings: &[String]) -> Result<String> {
+    let token = reader
+        .read_var_u64()
+        .context("Missing compact instance settings id")?;
+    if token & 1 == 1 {
+        return Ok(format!("debug:0_{}", token >> 1));
+    }
+    let string_id = usize::try_from(token >> 1).context("Settings string id does not fit usize")?;
+    strings
+        .get(string_id)
+        .cloned()
+        .with_context(|| format!("Invalid instance settings string id {string_id}"))
+}
+
+fn write_compact_settings_id<W: Write + ?Sized>(
+    writer: &mut W,
+    string_ids: &SettingsStringIdMap<'_>,
+    text: &str,
+) -> Result<()> {
+    if let Some(value) = parse_numeric_debug_settings_id(text) {
+        return write_var_u64(writer, (value << 1) | 1);
+    }
+    let id = string_ids
+        .get(text)
+        .with_context(|| format!("Missing binary string id for {text:?}"))?;
+    write_var_u64(
+        writer,
+        id.checked_shl(1)
+            .context("Settings string id exceeds compact range")?,
+    )
+}
+
+fn write_settings_binary_id<W: Write + ?Sized>(
+    writer: &mut W,
+    string_ids: &SettingsStringIdMap<'_>,
+    settings_id: &SettingsBinaryId<'_>,
+) -> Result<()> {
+    match settings_id {
+        SettingsBinaryId::Text(text) => {
+            write_compact_settings_id(writer, string_ids, text.as_ref())
+        }
+        SettingsBinaryId::NumericDebug(value) => write_var_u64(writer, (value << 1) | 1),
+    }
 }
 
 pub(crate) fn write_var_u64<W: Write + ?Sized>(writer: &mut W, mut value: u64) -> Result<()> {
@@ -2698,13 +2880,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_numeric_component_clamps_instead_of_erroring() {
+    fn fixed_numeric_component_preserves_special_values_and_clamps_overflow() {
         assert_eq!(fixed_numeric_component_f32(1.5), 1.5_f32);
         assert_eq!(fixed_numeric_component_f32(1e39), f32::MAX);
         assert_eq!(fixed_numeric_component_f32(-1e39), f32::MIN);
-        assert_eq!(fixed_numeric_component_f32(f64::INFINITY), f32::MAX);
-        assert_eq!(fixed_numeric_component_f32(f64::NEG_INFINITY), f32::MIN);
-        assert_eq!(fixed_numeric_component_f32(f64::NAN), 0.0_f32);
+        assert_eq!(fixed_numeric_component_f32(f64::INFINITY), f32::INFINITY);
+        assert_eq!(
+            fixed_numeric_component_f32(f64::NEG_INFINITY),
+            f32::NEG_INFINITY
+        );
+        assert!(fixed_numeric_component_f32(f64::NAN).is_nan());
     }
 
     #[test]
@@ -2973,7 +3158,8 @@ mod tests {
             ],
         };
 
-        let payload = encode_settings_bytecode_payload_with_layout(&document, false).unwrap();
+        let payload =
+            encode_settings_bytecode_payload_with_layout(&document, false, false).unwrap();
         let zstd = zstd::bulk::compress(&payload, 0).unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SETTINGS_BINARY_MAGIC);

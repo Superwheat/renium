@@ -46,7 +46,7 @@ pub(crate) enum InnerError {
     },
 
     #[error(
-        "Type mismatch: Property {type_name}.{prop_name} should be {valid_type_names}, but it was {actual_type_name}",
+        "Type mismatch: Property {type_name}.{prop_name} should be {valid_type_names}, but it was {actual_type_name}"
     )]
     PropTypeMismatch {
         type_name: String,
@@ -55,7 +55,9 @@ pub(crate) enum InnerError {
         actual_type_name: String,
     },
 
-    #[error("Invalid property data: Property {type_name}.{prop_name} was expected to be {valid_value}, but it was {actual_value}")]
+    #[error(
+        "Invalid property data: Property {type_name}.{prop_name} was expected to be {valid_value}, but it was {actual_value}"
+    )]
     InvalidPropData {
         type_name: String,
         prop_name: String,
@@ -66,14 +68,18 @@ pub(crate) enum InnerError {
     #[error("File referred to type ID {type_id}, which was not declared")]
     InvalidTypeId { type_id: u32 },
 
-    #[error("Invalid property data: CFrame property {type_name}.{prop_name} had an invalid rotation ID {id:02x}")]
+    #[error(
+        "Invalid property data: CFrame property {type_name}.{prop_name} had an invalid rotation ID {id:02x}"
+    )]
     BadRotationId {
         type_name: String,
         prop_name: String,
         id: u8,
     },
 
-    #[error("Expected type id for {expected_type_name} ({expected_type_id:02x}) when reading OptionalCFrame; got {actual_type_id:02x}")]
+    #[error(
+        "Expected type id for {expected_type_name} ({expected_type_id:02x}) when reading OptionalCFrame; got {actual_type_id:02x}"
+    )]
     BadOptionalCFrameFormat {
         expected_type_name: String,
         expected_type_id: u8,
@@ -88,6 +94,9 @@ pub(crate) enum InnerError {
 
     #[error("Malformed file: Referent {referent} has already appeared in the file")]
     DuplicateReferent { referent: i32 },
+
+    #[error("Malformed file: Referent {referent} was not declared")]
+    MissingReferent { referent: i32 },
 
     #[error("Malformed file: INST Chunk with type_id {type_id} has already appeared in the file")]
     DuplicateInstChunk { type_id: u32 },

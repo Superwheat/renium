@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError, mpsc};
+use std::sync::{Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,8 +82,10 @@ impl OutputMode {
         matches!(self, Self::Compact)
     }
 }
-use settings_bytecode::write_service_settings_binary_file;
 use settings_bytecode::{SettingsBytecode, SettingsBytecodeInstance};
+use settings_bytecode::{
+    write_fresh_service_settings_binary_file, write_service_settings_binary_file,
+};
 
 const DEFAULT_SYNC_SERVICES: [&str; 13] = [
     "Workspace",
@@ -118,18 +120,21 @@ fn explorer_service_order(class_name: &str) -> Option<usize> {
 
 const DEFAULT_EXPORT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
+const NATIVE_OVERLAY_PROTOCOL_VERSION: &str = "native-overlay-v2";
 const BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION: &str = "rbs1";
 const BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION: &str = "compact-v5-schema-4";
+const BRIDGE_CODEC_VERSION_SCHEMA9: &str = "compact-v5-schema-9";
 const BRIDGE_CODEC_VERSION_SCHEMA8: &str = "compact-v5-schema-8";
 const BRIDGE_CODEC_VERSION_SCHEMA7: &str = "compact-v5-schema-7";
-const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA8;
+const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA9;
 const BRIDGE_CODEC_VERSION_SCHEMA6: &str = "compact-v5-schema-6";
 const BRIDGE_CODEC_VERSION_SCHEMA4: &str = BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION;
 const BRIDGE_CODEC_VERSION_SCHEMA5: &str = "compact-v5-schema-5";
 const BRIDGE_CODEC_VERSION_SCHEMA3: &str = "compact-v5-schema-3";
 const BRIDGE_CODEC_VERSION_SCHEMA2: &str = "compact-v5-schema-2";
-const SUPPORTED_BRIDGE_CODEC_VERSIONS: [&str; 7] = [
+const SUPPORTED_BRIDGE_CODEC_VERSIONS: [&str; 8] = [
     BRIDGE_CODEC_VERSION,
+    BRIDGE_CODEC_VERSION_SCHEMA8,
     BRIDGE_CODEC_VERSION_SCHEMA7,
     BRIDGE_CODEC_VERSION_SCHEMA6,
     BRIDGE_CODEC_VERSION_SCHEMA5,
@@ -187,7 +192,7 @@ const LEGACY_SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.rbsync";
 const RENIUM_STORE_EXTENSION: &str = "renium";
 const LEGACY_STORE_EXTENSION: &str = "rbsync";
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
-const SETTINGS_BINARY_VERSION: u8 = 9;
+const SETTINGS_BINARY_VERSION: u8 = 10;
 const SETTINGS_BINARY_VERSION_LEGACY: u8 = 8;
 const PROPERTY_SCHEMA_CACHE_VERSION: u32 = 7;
 const MATERIAL_SERVICE_CLASS: &str = "MaterialService";
@@ -281,9 +286,12 @@ fn bridge_response_timeout(method: &str) -> Duration {
         | "appendEditorBinaryImport"
         | "appendEditorPushReview"
         | "finishEditorBinaryImport"
+        | "awaitEditorBinaryExport"
         | "profilePluginOps"
         | "getInstanceBatchChunk"
         | "getInstanceBatchCompactChunk"
+        | "getEditorBinaryOverlayChunk"
+        | "getEditorBinaryDebugIds"
         | "getSourceBatchChunk"
         | "getSourceRangeBatchCompactChunk" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
         _ => BRIDGE_DEFAULT_RESPONSE_TIMEOUT,
@@ -2763,6 +2771,10 @@ struct EditorBinaryServiceGroup {
     #[serde(rename = "targetPath")]
     target_path: Vec<String>,
     count: usize,
+    #[serde(default, rename = "instanceCount")]
+    instance_count: usize,
+    #[serde(default, rename = "classNames")]
+    class_names: Vec<String>,
     #[serde(default, rename = "rootProperties")]
     root_properties: Map<String, Value>,
 }
@@ -2771,6 +2783,9 @@ struct EditorBinaryImport {
     bytes: Vec<u8>,
     groups: Vec<EditorBinaryServiceGroup>,
     instance_count: usize,
+    export_id: Option<String>,
+    property_schema_by_class: PropertySchemaMap,
+    enum_value_names_by_type: EnumValueNameMap,
 }
 
 #[derive(Debug, Clone)]
@@ -3116,6 +3131,21 @@ struct InstanceBatchFetch {
     items: Vec<SnapshotInstance>,
 }
 
+struct NativeOverlayFetch {
+    metrics: ChunkFetchMetrics,
+    compact_expand_ms: f64,
+    request_ms: f64,
+    items: Vec<NativeOverlayItem>,
+}
+
+#[derive(Default)]
+struct NativeOverlayItem {
+    instance_index: usize,
+    class_name: String,
+    properties: Map<String, Value>,
+    attributes: Map<String, Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CompactBatchPayload {
     #[serde(default)]
@@ -3130,6 +3160,10 @@ struct CompactBatchPayload {
     shapes: Vec<Value>,
     #[serde(default, rename = "debugIds")]
     debug_ids: Vec<Value>,
+    #[serde(default, rename = "debugIdBuffer")]
+    debug_id_buffer: Value,
+    #[serde(default, rename = "debugIdFallbacks")]
+    debug_id_fallbacks: Vec<Value>,
     #[serde(default, rename = "defaultElided")]
     default_elided: bool,
     #[serde(default, rename = "defaultElisionVersion")]
@@ -4120,6 +4154,40 @@ impl BridgeServer {
         self.cached_bridge_info_for_target(BridgeTarget::Main)
     }
 
+    fn cache_export_options_for_target(
+        &self,
+        target: BridgeTarget,
+        performance_mode: &str,
+        modified_default_bypass: bool,
+        export_all_properties: bool,
+    ) {
+        let Ok(runtime_pin) = self.runtime_pin_for_selector(target, None) else {
+            return;
+        };
+        for channel in &self.channels {
+            let mut guard = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for (role_key, socket) in guard.iter_mut() {
+                if Self::socket_matches_selector(role_key, socket, target, None)
+                    && Self::socket_matches_runtime_pin(
+                        channel.port,
+                        role_key,
+                        socket,
+                        &runtime_pin,
+                    )
+                {
+                    socket.bridge_info.performance_mode = performance_mode.to_string();
+                    socket.bridge_info.modified_default_bypass = modified_default_bypass;
+                    socket.bridge_info.export_all_properties = export_all_properties;
+                    socket.bridge_info.pre_serialize_on_prepare = false;
+                    socket.bridge_info.pre_serialize_large_service_warm = false;
+                }
+            }
+        }
+    }
+
     fn expected_channel_count(&self) -> usize {
         self.channels.len()
     }
@@ -4721,9 +4789,10 @@ impl BridgeServer {
                         continue;
                     }
 
-                    let parsed: Value = serde_json::from_str(text.as_str()).with_context(|| {
-                        format!("Invalid bridge JSON message ({} bytes)", text.len())
-                    })?;
+                    let mut parsed: Value =
+                        serde_json::from_str(text.as_str()).with_context(|| {
+                            format!("Invalid bridge JSON message ({} bytes)", text.len())
+                        })?;
                     let msg_id = parsed.get("id").and_then(Value::as_u64);
                     if msg_id != Some(id) {
                         unrelated_messages = unrelated_messages.saturating_add(1);
@@ -4736,9 +4805,11 @@ impl BridgeServer {
                     }
                     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     if ok {
-                        return Ok(BridgeResponse::Json(
-                            parsed.get("result").cloned().unwrap_or(Value::Null),
-                        ));
+                        let result = parsed
+                            .as_object_mut()
+                            .and_then(|object| object.remove("result"))
+                            .unwrap_or(Value::Null);
+                        return Ok(BridgeResponse::Json(result));
                     }
                     let err = parsed
                         .get("error")
@@ -5374,13 +5445,6 @@ fn spawn_daemon_control_server(
             return;
         }
     };
-    if let Err(err) = listener.set_nonblocking(true) {
-        println!(
-            "[renium] warning: daemon control could not set nonblocking on {}:{}: {}",
-            bind_host, port, err
-        );
-        return;
-    }
     println!(
         "[renium] daemon control listening on {}:{}",
         bind_host, port
@@ -5410,9 +5474,6 @@ fn spawn_daemon_control_server(
                             eprintln!("[renium] daemon control error: {err:#}");
                         }
                     });
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
                 }
                 Err(err) => {
                     if bridge.alive.load(Ordering::Relaxed) {
@@ -10403,8 +10464,9 @@ fn protected_write_rows_with_previous_values(path: &Path, rows: &[Value]) -> Res
             .iter()
             .map(|referent| path_segments_by_ref.get(referent).cloned())
             .collect(),
-        path_segments_by_ref,
+        path_segments_by_ref: Arc::new(path_segments_by_ref),
         new_index_by_ref,
+        new_index_by_dense_ref: None,
         settings_id_by_ref: HashMap::new(),
     };
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
@@ -10818,82 +10880,906 @@ fn write_rbx_place_build(
     }
 }
 
-fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryImport> {
-    const RAW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-    const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+fn begin_editor_binary_export(
+    bridge: &BridgeServer,
+    partitioned: bool,
+    service_order: Option<&[String]>,
+) -> Result<EditorBinaryImport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
-    let begin = bridge.call("beginEditorBinaryExport", json!({ "exportId": &export_id }))?;
-    let total_bytes = begin
+    let begin = bridge.call(
+        "beginEditorBinaryExport",
+        json!({
+            "exportId": &export_id,
+            "partitioned": partitioned,
+            "serviceOrder": service_order,
+            "serializationWorkers": partitioned.then_some(2),
+        }),
+    )?;
+    let result = (|| -> Result<EditorBinaryImport> {
+        if begin.get("supported").and_then(Value::as_bool) == Some(false) {
+            let reason = begin
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("Studio cannot represent this place with native serialization");
+            bail!("{reason}");
+        }
+        let instance_count = begin
+            .get("instanceCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(0);
+        let groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
+            begin
+                .get("groups")
+                .cloned()
+                .context("Studio native export omitted its service groups")?,
+        )
+        .context("Studio returned invalid native export groups")?;
+        if groups.is_empty()
+            || groups.iter().any(|group| {
+                group.service.is_empty()
+                    || group.target_path.len() != 1
+                    || group.target_path[0] != group.service
+                    || group.instance_count == 0
+            })
+        {
+            bail!("Studio returned invalid native export groups");
+        }
+        let property_schema_by_class =
+            parse_property_schema_map(begin.get("propertySchemaByClass"))?;
+        let enum_value_names_by_type =
+            parse_enum_value_name_map(begin.get("enumValueNamesByType"))?;
+        if property_schema_by_class.is_empty() {
+            bail!("Studio native export omitted its property schema");
+        }
+        Ok(EditorBinaryImport {
+            bytes: Vec::new(),
+            groups,
+            instance_count,
+            export_id: Some(export_id.clone()),
+            property_schema_by_class,
+            enum_value_names_by_type,
+        })
+    })();
+    if result.is_err() {
+        let _ = bridge.call("finishEditorBinaryExport", json!({ "exportId": export_id }));
+    }
+    result
+}
+
+#[derive(Clone, Copy)]
+struct EditorBinaryExportReady {
+    total_bytes: usize,
+    chunk_bytes: usize,
+}
+
+fn wait_editor_binary_export(
+    bridge: &BridgeServer,
+    export_id: &str,
+    service: Option<&str>,
+) -> Result<EditorBinaryExportReady> {
+    const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+    let service_label = service.map_or(String::new(), |value| format!("{value} "));
+    let raw_chunk_bytes = std::env::var("RENIUM_NATIVE_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024)
+        .clamp(256 * 1024, 8 * 1024 * 1024);
+    let wait_started = Instant::now();
+    let ready = bridge.call(
+        "awaitEditorBinaryExport",
+        json!({
+            "exportId": export_id,
+            "service": service,
+            "timeoutSeconds": 80,
+        }),
+    )?;
+    log_timing(
+        &format!("native editor {service_label}serialization wait"),
+        wait_started,
+    );
+    let total_bytes = ready
         .get("totalBytes")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .filter(|value| *value > 0 && *value <= MAX_EXPORT_BYTES)
         .context("Studio returned an invalid native export size")?;
-    let instance_count = begin
-        .get("instanceCount")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(0);
-    let groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
-        begin
-            .get("groups")
-            .cloned()
-            .context("Studio native export omitted its service groups")?,
-    )
-    .context("Studio returned invalid native export groups")?;
-    if groups.is_empty()
-        || groups.iter().any(|group| {
-            group.service.is_empty()
-                || group.target_path.len() != 1
-                || group.target_path[0] != group.service
-        })
-    {
-        bail!("Studio returned invalid native export groups");
+    if verbose_timing_logs() {
+        println!(
+            "[renium] native editor {}binary payload: bytes={total_bytes}, chunk_bytes={raw_chunk_bytes}",
+            service_label
+        );
     }
+    Ok(EditorBinaryExportReady {
+        total_bytes,
+        chunk_bytes: raw_chunk_bytes,
+    })
+}
+
+fn decode_bridge_buffer(value: &Value, expected_len: usize, label: &str) -> Result<Vec<u8>> {
+    let encoded = if let Some(encoded) = value.as_str() {
+        let bytes =
+            base64::decode(encoded).with_context(|| format!("{label} is not valid base64"))?;
+        if bytes.len() != expected_len {
+            bail!("{label} has {} bytes; expected {expected_len}", bytes.len());
+        }
+        return Ok(bytes);
+    } else {
+        let object = value
+            .as_object()
+            .with_context(|| format!("{label} is not a string or buffer"))?;
+        if object.get("t").and_then(Value::as_str) != Some("buffer") {
+            bail!("{label} has an invalid buffer type");
+        }
+        object
+    };
+    if let Some(raw) = encoded.get("base64").and_then(Value::as_str) {
+        let bytes = base64::decode(raw).with_context(|| format!("{label} is not valid base64"))?;
+        if bytes.len() != expected_len {
+            bail!("{label} has {} bytes; expected {expected_len}", bytes.len());
+        }
+        return Ok(bytes);
+    }
+    let compressed = encoded
+        .get("zbase64")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{label} buffer omitted its data"))?;
+    let compressed =
+        base64::decode(compressed).with_context(|| format!("{label} is not valid zbase64"))?;
+    let bytes = zstd::bulk::decompress(&compressed, expected_len)
+        .with_context(|| format!("{label} has invalid zstd data"))?;
+    if bytes.len() != expected_len {
+        bail!("{label} has {} bytes; expected {expected_len}", bytes.len());
+    }
+    Ok(bytes)
+}
+
+fn receive_ready_editor_binary_export_bytes(
+    bridge: &BridgeServer,
+    export_id: &str,
+    service: Option<&str>,
+    ready: EditorBinaryExportReady,
+) -> Result<Vec<u8>> {
+    let service_label = service.map_or(String::new(), |value| format!("{value} "));
+    let total_bytes = ready.total_bytes;
+    let raw_chunk_bytes = ready.chunk_bytes;
     let ranges = (0..total_bytes)
-        .step_by(RAW_CHUNK_BYTES)
-        .map(|offset| (offset, (total_bytes - offset).min(RAW_CHUNK_BYTES)))
+        .step_by(raw_chunk_bytes)
+        .map(|offset| (offset, (total_bytes - offset).min(raw_chunk_bytes)))
         .collect::<Vec<_>>();
-    let result = ranges
+    let read_started = Instant::now();
+    let chunks = ranges
         .par_iter()
         .map(|(offset, length)| -> Result<Vec<u8>> {
             let response = bridge.call(
                 "readEditorBinaryExport",
                 json!({
-                    "exportId": &export_id,
+                    "exportId": export_id,
+                    "service": service,
                     "offset": offset,
                     "length": length,
                 }),
             )?;
             let data = response
                 .get("data")
-                .and_then(Value::as_str)
                 .context("Studio native export chunk omitted its data")?;
-            let decoded =
-                base64::decode(data).context("Studio returned invalid native export data")?;
-            if decoded.len() != *length {
-                bail!("Studio native export chunk has the wrong length");
-            }
-            Ok(decoded)
+            decode_bridge_buffer(data, *length, "Studio native export chunk")
         })
-        .collect::<Result<Vec<_>>>()
-        .map(|chunks| {
-            let mut bytes = Vec::with_capacity(total_bytes);
-            for chunk in chunks {
-                bytes.extend_from_slice(&chunk);
-            }
-            bytes
-        });
-    let _ = bridge.call("finishEditorBinaryExport", json!({ "exportId": export_id }));
-    let bytes = result?;
+        .collect::<Result<Vec<_>>>()?;
+    log_timing(
+        &format!("native editor {service_label}binary transfer"),
+        read_started,
+    );
+    let mut bytes = Vec::with_capacity(total_bytes);
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.len() != total_bytes {
         bail!("Studio native export is incomplete");
     }
-    Ok(EditorBinaryImport {
-        bytes,
-        groups,
-        instance_count,
+    Ok(bytes)
+}
+
+fn receive_editor_binary_export_bytes(
+    bridge: &BridgeServer,
+    export_id: &str,
+    service: Option<&str>,
+) -> Result<Vec<u8>> {
+    let ready = wait_editor_binary_export(bridge, export_id, service)?;
+    receive_ready_editor_binary_export_bytes(bridge, export_id, service, ready)
+}
+
+fn fetch_native_debug_ids(
+    bridge: &BridgeServer,
+    export_id: &str,
+    service: &str,
+    instance_count: usize,
+) -> Result<Vec<Option<String>>> {
+    let response = bridge.call(
+        "getEditorBinaryDebugIds",
+        json!({
+            "overlayId": export_id,
+            "service": service,
+        }),
+    )?;
+    let total = response
+        .get("total")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .context("Native debug id response omitted its instance count")?;
+    if total != instance_count {
+        bail!(
+            "Native debug id response for {service} contains {total} instances; expected {instance_count}"
+        );
+    }
+    let encoded = response
+        .get("data")
+        .context("Native debug id response omitted its buffer")?;
+    let fallbacks = response
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    decode_native_overlay_debug_ids(encoded, fallbacks, &[], instance_count)
+        .with_context(|| format!("Invalid native debug ids for {service}"))
+}
+
+struct EditorBinaryExportFinishGuard<'a> {
+    bridge: &'a BridgeServer,
+    export_id: Option<String>,
+}
+
+impl EditorBinaryExportFinishGuard<'_> {
+    fn finish(&mut self, record_sync_completion: bool) -> Result<bool> {
+        let Some(export_id) = self.export_id.as_deref() else {
+            return Ok(false);
+        };
+        let result = self.bridge.call(
+            "finishEditorBinaryExport",
+            json!({
+                "exportId": export_id,
+                "recordSyncCompletion": record_sync_completion,
+            }),
+        )?;
+        self.export_id = None;
+        Ok(result
+            .get("syncCompletionRecorded")
+            .and_then(Value::as_bool)
+            == Some(true))
+    }
+}
+
+impl Drop for EditorBinaryExportFinishGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish(false);
+    }
+}
+
+fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryImport> {
+    let mut export = begin_editor_binary_export(bridge, false, None)?;
+    let _finish_guard = EditorBinaryExportFinishGuard {
+        bridge,
+        export_id: export.export_id.clone(),
+    };
+    export.bytes = receive_editor_binary_export_bytes(
+        bridge,
+        export
+            .export_id
+            .as_deref()
+            .context("Native export id is missing")?,
+        None,
+    )?;
+    Ok(export)
+}
+
+fn rbx_variant_referent(value: &RbxVariant) -> Option<RbxRef> {
+    match value {
+        RbxVariant::Ref(referent) => Some(*referent),
+        RbxVariant::Content(content) => match content.value() {
+            RbxContentType::Object(referent) => Some(*referent),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+struct NativeServiceDom {
+    instances: Vec<rbx_binary::FlatInstance>,
+}
+
+struct NativeServiceExportResult {
+    output: ServiceExportOutput,
+    metrics: ChunkFetchMetrics,
+    compact_expand_ms: f64,
+}
+
+struct NativePriorityWorkerGate {
+    released: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl NativePriorityWorkerGate {
+    fn new(released: bool) -> Self {
+        Self {
+            released: Mutex::new(released),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut released = match self.released.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !*released {
+            released = match self.ready.wait(released) {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn release(&self) {
+        let mut released = match self.released.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !*released {
+            *released = true;
+            self.ready.notify_all();
+        }
+    }
+}
+
+struct NativePriorityWorkerRelease<'a> {
+    gate: &'a NativePriorityWorkerGate,
+    armed: bool,
+}
+
+impl NativePriorityWorkerRelease<'_> {
+    fn release(&mut self) {
+        if self.armed {
+            self.gate.release();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for NativePriorityWorkerRelease<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn decode_native_service_dom(
+    bytes: Vec<u8>,
+    group: &EditorBinaryServiceGroup,
+    property_filter: Arc<HashMap<String, HashSet<String>>>,
+) -> Result<NativeServiceDom> {
+    let decode_started = Instant::now();
+    let mut flat = rbx_binary::Deserializer::new()
+        .elide_defaults(true)
+        .flat_property_filter(property_filter)
+        .deserialize_flat(std::io::Cursor::new(bytes))
+        .with_context(|| {
+            format!(
+                "Studio returned an invalid native {} snapshot",
+                group.service
+            )
+        })?;
+    log_timing(
+        &format!("{}: native binary decode", group.service),
+        decode_started,
+    );
+    if flat.root_indices.len() != group.count + 1 {
+        bail!(
+            "Studio native {} snapshot contains {} roots; expected {}",
+            group.service,
+            flat.root_indices.len(),
+            group.count + 1
+        );
+    }
+    let marker_index = flat.root_indices[0];
+    if marker_index != 0 {
+        bail!("Studio native {} marker is out of order", group.service);
+    }
+    flat.instances[marker_index].class = group.service.as_str().into();
+    flat.instances[marker_index].name = group.service.clone();
+    for root_index in flat.root_indices.iter().skip(1) {
+        flat.instances[*root_index].parent_index = Some(marker_index);
+    }
+    if flat.instances.len() != group.instance_count {
+        bail!(
+            "Studio native {} snapshot contains {} instances; expected {}",
+            group.service,
+            flat.instances.len(),
+            group.instance_count
+        );
+    }
+    Ok(NativeServiceDom {
+        instances: flat.instances,
     })
+}
+
+fn native_overlay_reference_debug_id(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    (object.get("_type").and_then(Value::as_str) == Some("Ref"))
+        .then(|| object.get("debugId").and_then(Value::as_str))
+        .flatten()
+}
+
+fn normalize_native_overlay_internal_references(
+    overlays: &mut [NativeOverlayItem],
+    debug_ids: &[Option<String>],
+) {
+    let requested = overlays
+        .iter()
+        .flat_map(|overlay| overlay.properties.values())
+        .filter_map(native_overlay_reference_debug_id)
+        .collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return;
+    }
+    let internal_indices = debug_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, debug_id)| {
+            let debug_id = debug_id.as_deref()?;
+            requested
+                .contains(debug_id)
+                .then(|| (debug_id.to_string(), index + 1))
+        })
+        .collect::<HashMap<_, _>>();
+    drop(requested);
+    if internal_indices.is_empty() {
+        return;
+    }
+    for overlay in overlays {
+        for value in overlay.properties.values_mut() {
+            let Some(instance_index) = native_overlay_reference_debug_id(value)
+                .and_then(|debug_id| internal_indices.get(debug_id))
+                .copied()
+            else {
+                continue;
+            };
+            *value = json!({
+                "_type": "Ref",
+                "instanceIndex": instance_index,
+            });
+        }
+    }
+}
+
+fn convert_native_service_output(
+    group: &EditorBinaryServiceGroup,
+    native: NativeServiceDom,
+    mut overlay_instances: Vec<NativeOverlayItem>,
+    debug_ids: Vec<Option<String>>,
+    database: &ReflectionDatabase<'_>,
+    native_filters: &HashMap<String, NativePropertyFilter>,
+    export_started_ms: f64,
+    run_started: Instant,
+) -> Result<ServiceExportOutput> {
+    let NativeServiceDom {
+        instances: native_instances,
+    } = native;
+    if debug_ids.len() != native_instances.len() {
+        bail!(
+            "Native debug ids contain {} {} instances; expected {}",
+            debug_ids.len(),
+            group.service,
+            native_instances.len()
+        );
+    }
+    normalize_native_overlay_internal_references(&mut overlay_instances, &debug_ids);
+    let mut overlay_by_index = Vec::with_capacity(native_instances.len());
+    overlay_by_index.resize_with(native_instances.len(), || None);
+    for overlay in overlay_instances {
+        let index = overlay
+            .instance_index
+            .checked_sub(1)
+            .filter(|index| *index < overlay_by_index.len())
+            .context("Native overlay instance index is out of range")?;
+        if overlay_by_index[index].replace(overlay).is_some() {
+            bail!("Native overlay instance index {} is duplicated", index + 1);
+        }
+    }
+    let mut new_index_by_dense_ref = vec![usize::MAX; native_instances.len()];
+    for (index, instance) in native_instances.iter().enumerate() {
+        let dense_index = instance
+            .referent
+            .as_u128()
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|value| value.checked_sub(1))
+            .filter(|value| *value < native_instances.len())
+            .context("Native snapshot contains an invalid dense referent")?;
+        if new_index_by_dense_ref[dense_index] != usize::MAX {
+            bail!("Native snapshot contains a duplicate dense referent");
+        }
+        new_index_by_dense_ref[dense_index] = index;
+    }
+    if new_index_by_dense_ref.contains(&usize::MAX) {
+        bail!("Native snapshot has an incomplete dense referent map");
+    }
+    let refs = BytecodeModelImportRefs {
+        settings_id_by_ref: HashMap::new(),
+        path_segments_by_ref: Arc::new(HashMap::new()),
+        new_index_by_ref: HashMap::new(),
+        new_index_by_dense_ref: Some(new_index_by_dense_ref),
+        path_segments_by_index: Vec::new(),
+    };
+    let conversion_started = Instant::now();
+    let instances = native_instances
+        .into_par_iter()
+        .zip(overlay_by_index.into_par_iter())
+        .zip(debug_ids.into_par_iter())
+        .enumerate()
+        .map(
+            |(index, ((rbx_instance, overlay), debug_id))| -> Result<SnapshotInstance> {
+                let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
+                let (mut overlay_properties, overlay_attributes) = if let Some(overlay) = overlay {
+                    if overlay.instance_index != index + 1
+                        || (!overlay.class_name.is_empty()
+                            && overlay.class_name != rbx_instance.class.as_str())
+                    {
+                        bail!(
+                            "Native snapshot and overlay disagree at {} instance {}",
+                            group.service,
+                            index + 1
+                        );
+                    }
+                    (overlay.properties, overlay.attributes)
+                } else {
+                    (Map::new(), Map::new())
+                };
+                let debug_id = debug_id.filter(|value| !value.is_empty());
+                let native_filter = native_filters.get(rbx_instance.class.as_str());
+                let (mut properties, mut attributes, source) = rbx_properties_to_settings_records(
+                    rbx_instance.class.as_str(),
+                    rbx_instance
+                        .properties
+                        .iter()
+                        .map(|(name, value)| (name, value)),
+                    database,
+                    &refs,
+                    true,
+                    true,
+                    true,
+                    native_filter,
+                );
+                if native_filter.is_some_and(|filter| filter.reconstruct_decal_color_map) {
+                    let value = properties
+                        .get("TextureContent")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                    properties.insert("ColorMapContent".to_string(), value);
+                }
+                if native_filter.is_some_and(|filter| filter.reconstruct_weld_enabled)
+                    && let Some(state) = properties.remove("State")
+                    && json_i64(&state) == Some(0)
+                {
+                    properties.insert("Enabled".to_string(), Value::Bool(false));
+                }
+                overlay_properties.remove("Source");
+                if index == 0 {
+                    let tags = properties.remove("Tags");
+                    properties = group.root_properties.clone();
+                    if let Some(tags) = tags {
+                        properties.insert("Tags".to_string(), tags);
+                    }
+                }
+                properties.extend(overlay_properties);
+                attributes.extend(overlay_attributes);
+                if let Some(source) = source {
+                    properties.insert("Source".to_string(), Value::String(source));
+                }
+                Ok(SnapshotInstance {
+                    path: String::new(),
+                    path_segments: Vec::new(),
+                    name: rbx_instance.name,
+                    class_name: rbx_instance.class.to_string(),
+                    properties,
+                    source_key: None,
+                    parent_path: None,
+                    attributes,
+                    debug_id,
+                    parent_debug_id: None,
+                    instance_id: None,
+                    parent_instance_id: None,
+                    instance_index: Some(index + 1),
+                    parent_index,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let script_count = instances
+        .iter()
+        .filter(|instance| is_lua_source_class(&instance.class_name))
+        .count();
+    log_timing(
+        &format!("{}: native instance conversion", group.service),
+        conversion_started,
+    );
+    let export_end_ms = elapsed_ms(run_started);
+    Ok(ServiceExportOutput {
+        parts: ExportedSnapshotParts {
+            service_name: group.service.clone(),
+            service_class: group.service.clone(),
+            service_path: format!("game.{}", group.service),
+            generated_at: current_unix_ts(),
+            script_count,
+            class_defaults: Value::Object(Map::new()),
+            instances,
+            adaptive_tune: None,
+        },
+        span: ServiceExecutionSpan {
+            service: group.service.clone(),
+            export_start_ms: export_started_ms,
+            export_end_ms,
+            export_duration_ms: export_end_ms - export_started_ms,
+        },
+        tune: None,
+    })
+}
+
+fn editor_binary_export_parts<'a>(
+    bridge: &'a BridgeServer,
+    requested_services: &[String],
+    run_started: Instant,
+    on_output: &mut (impl FnMut(ServiceExportOutput) -> Result<()> + Send),
+) -> Result<EditorBinaryExportFinishGuard<'a>> {
+    let export_started_ms = elapsed_ms(run_started);
+    let begin_started = Instant::now();
+    let export = begin_editor_binary_export(bridge, true, Some(requested_services))?;
+    let _finish_guard = EditorBinaryExportFinishGuard {
+        bridge,
+        export_id: export.export_id.clone(),
+    };
+    log_timing("native editor export begin", begin_started);
+
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let native_filters = export
+        .property_schema_by_class
+        .keys()
+        .map(|class_name| {
+            (
+                class_name.clone(),
+                native_property_filter(database, class_name),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let native_decode_filter = Arc::new(
+        native_filters
+            .iter()
+            .map(|(class_name, filter)| {
+                let mut allowed = filter.decode_allowed.clone();
+                allowed.insert("Attributes".to_string());
+                allowed.insert("Source".to_string());
+                allowed.insert("Tags".to_string());
+                (class_name.clone(), allowed)
+            })
+            .collect::<HashMap<_, _>>(),
+    );
+    let (overlay_schema, direct_overlay_schema, conditional_ref_schema) =
+        native_overlay_property_schemas(
+            database,
+            &export.property_schema_by_class,
+            &native_filters,
+        );
+    if verbose_timing_logs() {
+        let property_count = overlay_schema.values().map(Vec::len).sum::<usize>();
+        let mesh_part = overlay_schema
+            .get("MeshPart")
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        println!(
+            "[renium] native editor overlay schema: classes={}, properties={}, MeshPart=[{}]",
+            overlay_schema.len(),
+            property_count,
+            mesh_part
+        );
+    }
+    let stream_started = Instant::now();
+    let export_id = export
+        .export_id
+        .as_deref()
+        .context("Native export id is missing")?;
+    let overlay_names = overlay_property_names_value(&overlay_schema, &native_filters);
+    let direct_overlay_names =
+        overlay_property_names_value(&direct_overlay_schema, &native_filters);
+    let requested_groups = requested_services
+        .iter()
+        .map(|service| {
+            export
+                .groups
+                .iter()
+                .find(|group| group.service == *service)
+                .with_context(|| format!("Native export omitted {service}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let worker_count = std::env::var("RENIUM_NATIVE_SERVICE_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| bridge.channel_count())
+        .max(1)
+        .min(bridge.channel_count().max(1))
+        .min(requested_groups.len().max(1));
+    let (sender, receiver) = mpsc::channel::<Result<NativeServiceExportResult>>();
+    let receiver = Mutex::new(receiver);
+    let mut metrics = ChunkFetchMetrics::default();
+    let mut compact_expand_ms = 0.0;
+    let priority_worker_count = if worker_count == 4
+        && requested_groups
+            .first()
+            .is_some_and(|group| group.instance_count >= 25_000)
+    {
+        2
+    } else {
+        worker_count
+    };
+    let priority_groups = requested_groups
+        .iter()
+        .take(priority_worker_count)
+        .copied()
+        .collect::<Vec<_>>();
+    let service_queue = Mutex::new(
+        requested_groups
+            .into_iter()
+            .skip(priority_worker_count)
+            .collect::<VecDeque<_>>(),
+    );
+    let priority_gate = NativePriorityWorkerGate::new(priority_worker_count == worker_count);
+    rayon::scope_fifo(|scope| -> Result<()> {
+        for worker_index in 0..worker_count {
+            let sender = sender.clone();
+            let overlay_names = &overlay_names;
+            let overlay_schema = &overlay_schema;
+            let direct_overlay_names = &direct_overlay_names;
+            let direct_overlay_schema = &direct_overlay_schema;
+            let conditional_ref_schema = &conditional_ref_schema;
+            let enum_value_names_by_type = &export.enum_value_names_by_type;
+            let native_filters = &native_filters;
+            let native_decode_filter = &native_decode_filter;
+            let priority_groups = &priority_groups;
+            let service_queue = &service_queue;
+            let priority_gate = &priority_gate;
+            scope.spawn_fifo(move |_| {
+                if worker_index >= priority_worker_count {
+                    priority_gate.wait();
+                }
+                let mut priority_release = NativePriorityWorkerRelease {
+                    gate: priority_gate,
+                    armed: priority_worker_count < worker_count && worker_index == 0,
+                };
+                let mut priority_service = priority_groups.get(worker_index).copied();
+                loop {
+                    let service = priority_service.take().or_else(|| match service_queue.lock() {
+                        Ok(mut queue) => queue.pop_front(),
+                        Err(poisoned) => poisoned.into_inner().pop_front(),
+                    });
+                    let Some(group) = service else {
+                        break;
+                    };
+                    let result = (|| -> Result<NativeServiceExportResult> {
+                        let selective_refs = group.instance_count >= 4_096
+                            && group.class_names.iter().any(|class_name| {
+                                conditional_ref_schema.contains_key(class_name)
+                            });
+                        let first_overlay_names = if selective_refs {
+                            direct_overlay_names
+                        } else {
+                            overlay_names
+                        };
+                        let first_overlay_schema = if selective_refs {
+                            direct_overlay_schema
+                        } else {
+                            overlay_schema
+                        };
+                        let (native_and_debug_ids, overlay) = rayon::join(
+                            || -> Result<(NativeServiceDom, Vec<Option<String>>)> {
+                                let (bytes, debug_ids) = rayon::join(
+                                    || {
+                                        receive_editor_binary_export_bytes(
+                                            bridge,
+                                            export_id,
+                                            Some(&group.service),
+                                        )
+                                    },
+                                    || {
+                                        fetch_native_debug_ids(
+                                            bridge,
+                                            export_id,
+                                            &group.service,
+                                            group.instance_count,
+                                        )
+                                    },
+                                );
+                                let bytes = bytes?;
+                                let debug_ids = debug_ids?;
+                                Ok((
+                                    decode_native_service_dom(
+                                        bytes,
+                                        group,
+                                        Arc::clone(native_decode_filter),
+                                    )?,
+                                    debug_ids,
+                                ))
+                            },
+                            || {
+                                fetch_native_overlay_batch_once(
+                                    bridge,
+                                    &group.service,
+                                    1,
+                                    group.instance_count,
+                                    group.instance_count,
+                                    export_id,
+                                    if selective_refs { "direct" } else { "combined" },
+                                    first_overlay_names,
+                                    first_overlay_schema,
+                                    enum_value_names_by_type,
+                                    &group.class_names,
+                                )
+                            },
+                        );
+                        if let Ok(overlay) = &overlay && verbose_timing_logs() {
+                            println!(
+                                "[renium] timing: native editor {} overlay fetch took {:.1}ms -> bytes={}, chunks={}, parse_ms={:.1}, expand_ms={:.1}",
+                                group.service,
+                                overlay.request_ms,
+                                overlay.metrics.bytes,
+                                overlay.metrics.chunks,
+                                overlay.metrics.json_parse_ms,
+                                overlay.compact_expand_ms
+                            );
+                        }
+                        let (native, debug_ids) = native_and_debug_ids?;
+                        let overlay = overlay?;
+                        finish_native_service_export(
+                            bridge,
+                            export_id,
+                            group,
+                            native,
+                            debug_ids,
+                            overlay,
+                            selective_refs,
+                            conditional_ref_schema,
+                            enum_value_names_by_type,
+                            database,
+                            native_filters,
+                            export_started_ms,
+                            run_started,
+                        )
+                    })();
+                    priority_release.release();
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for _ in 0..requested_services.len() {
+            let result = receiver
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Native service export receiver was poisoned"))?
+                .recv()
+                .context("Native service export worker closed")??;
+            merge_chunk_fetch_metrics(&mut metrics, result.metrics);
+            compact_expand_ms += result.compact_expand_ms;
+            on_output(result.output)?;
+        }
+        Ok(())
+    })?;
+    log_chunk_fetch_metrics("native editor overlay payloads", metrics);
+    log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
+    log_timing("native editor streaming export", stream_started);
+    Ok(_finish_guard)
 }
 
 fn rbx_dom_import_refs(dom: &RbxWeakDom) -> BytecodeModelImportRefs {
@@ -10913,12 +11799,13 @@ fn rbx_dom_import_refs(dom: &RbxWeakDom) -> BytecodeModelImportRefs {
             .enumerate()
             .map(|(index, referent)| (referent, index))
             .collect(),
+        new_index_by_dense_ref: None,
         settings_id_by_ref: HashMap::new(),
         path_segments_by_index: refs_preorder
             .iter()
             .map(|referent| path_segments_by_ref.get(referent).cloned())
             .collect(),
-        path_segments_by_ref,
+        path_segments_by_ref: Arc::new(path_segments_by_ref),
     }
 }
 
@@ -10974,6 +11861,85 @@ fn rbx_dom_service_root_property_values(
         result.insert(service, values);
     }
     result
+}
+
+fn finish_native_service_export(
+    bridge: &BridgeServer,
+    export_id: &str,
+    group: &EditorBinaryServiceGroup,
+    native: NativeServiceDom,
+    debug_ids: Vec<Option<String>>,
+    overlay: NativeOverlayFetch,
+    selective_refs: bool,
+    conditional_ref_schema: &PropertySchemaMap,
+    enum_value_names_by_type: &EnumValueNameMap,
+    database: &ReflectionDatabase<'_>,
+    native_filters: &HashMap<String, NativePropertyFilter>,
+    export_started_ms: f64,
+    run_started: Instant,
+) -> Result<NativeServiceExportResult> {
+    let mut service_metrics = overlay.metrics;
+    let mut service_compact_expand_ms = overlay.compact_expand_ms;
+    let reference_request = if selective_refs {
+        let request = conditional_ref_overlay_request(&native.instances, conditional_ref_schema);
+        (request.2 > 0).then_some(request)
+    } else {
+        None
+    };
+    let convert = move || {
+        convert_native_service_output(
+            group,
+            native,
+            overlay.items,
+            debug_ids,
+            database,
+            native_filters,
+            export_started_ms,
+            run_started,
+        )
+    };
+    let output = if let Some((reference_schema, reference_names, candidate_count)) =
+        reference_request
+    {
+        let (output, reference_overlay) = rayon::join(convert, || {
+            fetch_native_overlay_batch_once(
+                bridge,
+                &group.service,
+                1,
+                group.instance_count,
+                group.instance_count,
+                export_id,
+                "conditional-references",
+                &reference_names,
+                &reference_schema,
+                enum_value_names_by_type,
+                &group.class_names,
+            )
+        });
+        let mut output = output?;
+        let reference_overlay = reference_overlay?;
+        if verbose_timing_logs() {
+            println!(
+                "[renium] timing: native editor {} conditional reference overlay took {:.1}ms -> candidates={}, bytes={}, chunks={}",
+                group.service,
+                reference_overlay.request_ms,
+                candidate_count,
+                reference_overlay.metrics.bytes,
+                reference_overlay.metrics.chunks
+            );
+        }
+        merge_native_overlay_items(&mut output.parts.instances, reference_overlay.items)?;
+        merge_chunk_fetch_metrics(&mut service_metrics, reference_overlay.metrics);
+        service_compact_expand_ms += reference_overlay.compact_expand_ms;
+        output
+    } else {
+        convert()?
+    };
+    Ok(NativeServiceExportResult {
+        output,
+        metrics: service_metrics,
+        compact_expand_ms: service_compact_expand_ms,
+    })
 }
 
 fn read_place_service_root_property_values(
@@ -17213,9 +18179,21 @@ struct BytecodeModelExportRefs {
 
 struct BytecodeModelImportRefs {
     new_index_by_ref: HashMap<RbxRef, usize>,
+    new_index_by_dense_ref: Option<Vec<usize>>,
     settings_id_by_ref: HashMap<RbxRef, String>,
     path_segments_by_index: Vec<Option<Vec<String>>>,
-    path_segments_by_ref: HashMap<RbxRef, Vec<String>>,
+    path_segments_by_ref: Arc<HashMap<RbxRef, Vec<String>>>,
+}
+
+fn imported_instance_index(refs: &BytecodeModelImportRefs, referent: RbxRef) -> Option<usize> {
+    if let Some(dense) = refs.new_index_by_dense_ref.as_ref() {
+        return referent
+            .as_u128()
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|value| value.checked_sub(1))
+            .and_then(|index| dense.get(index).copied());
+    }
+    refs.new_index_by_ref.get(&referent).copied()
 }
 
 struct BytecodeModelImportOutcome {
@@ -17594,6 +18572,8 @@ fn build_editor_binary_import(
             service: service.clone(),
             target_path: vec![service.clone()],
             count: children.len(),
+            instance_count: 0,
+            class_names: Vec::new(),
             root_properties: Map::new(),
         });
         for referent in &children {
@@ -17607,6 +18587,8 @@ fn build_editor_binary_import(
                 service: service.clone(),
                 target_path: vec![service.clone(), target_name],
                 count: nested_children.len(),
+                instance_count: 0,
+                class_names: Vec::new(),
                 root_properties: Map::new(),
             });
             for referent in &nested_children {
@@ -17624,6 +18606,9 @@ fn build_editor_binary_import(
         bytes,
         groups,
         instance_count,
+        export_id: None,
+        property_schema_by_class: HashMap::new(),
+        enum_value_names_by_type: HashMap::new(),
     }))
 }
 
@@ -18029,16 +19014,19 @@ fn import_rbx_model_into_document(
 
     let path_segments_by_index = build_editor_instance_path_segments(document, service);
     let import_refs = BytecodeModelImportRefs {
-        path_segments_by_ref: new_index_by_ref
-            .iter()
-            .filter_map(|(referent, index)| {
-                path_segments_by_index
-                    .get(*index)
-                    .and_then(|path| path.clone())
-                    .map(|path| (*referent, path))
-            })
-            .collect(),
+        path_segments_by_ref: Arc::new(
+            new_index_by_ref
+                .iter()
+                .filter_map(|(referent, index)| {
+                    path_segments_by_index
+                        .get(*index)
+                        .and_then(|path| path.clone())
+                        .map(|path| (*referent, path))
+                })
+                .collect(),
+        ),
         new_index_by_ref,
+        new_index_by_dense_ref: None,
         settings_id_by_ref,
         path_segments_by_index,
     };
@@ -18052,7 +19040,7 @@ fn import_rbx_model_into_document(
             .get_by_ref(referent)
             .ok_or_else(|| anyhow::anyhow!("Model contains a missing referent"))?;
         let (properties, attributes, source) =
-            rbx_instance_to_settings_records(rbx_instance, database, &import_refs);
+            rbx_instance_to_settings_records(rbx_instance, database, &import_refs, false, None);
         if let Some(instance) = document.instances.get_mut(new_index) {
             instance.properties = properties;
             instance.attributes = attributes;
@@ -22000,6 +22988,7 @@ fn json_to_rbx_inferred_variant(
         Value::Number(_) => json_f64(value).map(RbxVariant::Float64),
         Value::String(value) => Some(RbxVariant::String(value.clone())),
         Value::Object(object) => match object.get("_type").and_then(Value::as_str) {
+            Some("Float") => json_f64(value).map(RbxVariant::Float64),
             Some("Vector2") => json_to_rbx_vector2(value).map(RbxVariant::Vector2),
             Some("Vector3") => json_to_rbx_vector3(value).map(RbxVariant::Vector3),
             Some("Vector2int16") => json_to_rbx_vector2int16(value).map(RbxVariant::Vector2int16),
@@ -22620,17 +23609,546 @@ fn settings_root_indices(document: &SettingsBytecode) -> Vec<usize> {
         .collect()
 }
 
+struct NativePropertyFilter {
+    allowed: HashSet<String>,
+    decode_allowed: HashSet<String>,
+    renamed: HashMap<String, String>,
+    output_names: HashSet<String>,
+    reconstruct_decal_color_map: bool,
+    reconstruct_weld_enabled: bool,
+}
+
+fn native_property_data_type_supported(data_type: &RbxDataType<'_>) -> bool {
+    match data_type {
+        RbxDataType::Enum(_) => true,
+        RbxDataType::Value(value_type) => matches!(
+            value_type,
+            RbxVariantType::Bool
+                | RbxVariantType::Int32
+                | RbxVariantType::Int64
+                | RbxVariantType::Float32
+                | RbxVariantType::Float64
+                | RbxVariantType::String
+                | RbxVariantType::BinaryString
+                | RbxVariantType::ContentId
+                | RbxVariantType::Content
+                | RbxVariantType::Ref
+                | RbxVariantType::Vector2
+                | RbxVariantType::Vector3
+                | RbxVariantType::UDim
+                | RbxVariantType::UDim2
+                | RbxVariantType::Color3
+                | RbxVariantType::Color3uint8
+                | RbxVariantType::ColorSequence
+                | RbxVariantType::NumberSequence
+                | RbxVariantType::NumberRange
+                | RbxVariantType::CFrame
+                | RbxVariantType::OptionalCFrame
+                | RbxVariantType::Rect
+                | RbxVariantType::Font
+                | RbxVariantType::BrickColor
+                | RbxVariantType::PhysicalProperties
+                | RbxVariantType::Axes
+                | RbxVariantType::Faces
+                | RbxVariantType::Ray
+        ),
+        _ => false,
+    }
+}
+
+fn native_property_descriptor_supported(descriptor: &RbxPropertyDescriptor<'_>) -> bool {
+    let RbxPropertyKind::Canonical { serialization } = &descriptor.kind else {
+        return false;
+    };
+    if matches!(serialization, RbxPropertySerialization::DoesNotSerialize) {
+        return false;
+    }
+    let serializes_as = matches!(serialization, RbxPropertySerialization::SerializesAs(_));
+    if descriptor.tags.iter().any(|tag| {
+        matches!(
+            tag,
+            RbxPropertyTag::Deprecated
+                | RbxPropertyTag::Hidden
+                | RbxPropertyTag::NotBrowsable
+                | RbxPropertyTag::WriteOnly
+        ) || (*tag == RbxPropertyTag::ReadOnly && !serializes_as)
+    }) {
+        return false;
+    }
+    if !matches!(
+        descriptor.scriptability,
+        RbxScriptability::ReadWrite | RbxScriptability::Read | RbxScriptability::Custom
+    ) {
+        return false;
+    }
+    native_property_data_type_supported(&descriptor.data_type)
+}
+
+fn rbx_reflection_class_is_a(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    target: &str,
+) -> bool {
+    let Some(class) = database.classes.get(class_name) else {
+        return false;
+    };
+    database
+        .superclasses_iter(class)
+        .any(|descriptor| descriptor.name == target)
+}
+
+fn native_property_filter(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+) -> NativePropertyFilter {
+    let mut allowed = HashSet::new();
+    let mut decode_allowed = HashSet::new();
+    let mut renamed = HashMap::new();
+    if let Some(class) = database.classes.get(class_name) {
+        for descriptor in database.superclasses_iter(class) {
+            for property in descriptor.properties.values() {
+                if !native_property_descriptor_supported(property) {
+                    continue;
+                }
+                match &property.kind {
+                    RbxPropertyKind::Canonical {
+                        serialization: RbxPropertySerialization::Migrate(migration),
+                    } => {
+                        decode_allowed.insert(property.name.to_string());
+                        allowed.extend(
+                            migration
+                                .new_property_names()
+                                .iter()
+                                .map(|name| (*name).to_string()),
+                        );
+                    }
+                    RbxPropertyKind::Canonical {
+                        serialization: RbxPropertySerialization::SerializesAs(serialized_name),
+                    } => {
+                        allowed.insert(property.name.to_string());
+                        allowed.insert((*serialized_name).to_string());
+                        decode_allowed.insert(property.name.to_string());
+                        decode_allowed.insert((*serialized_name).to_string());
+                        renamed.insert((*serialized_name).to_string(), property.name.to_string());
+                    }
+                    RbxPropertyKind::Canonical { .. } => {
+                        allowed.insert(property.name.to_string());
+                        decode_allowed.insert(property.name.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    allowed.insert("Tags".to_string());
+    decode_allowed.insert("Tags".to_string());
+    if rbx_reflection_class_is_a(database, class_name, "TriangleMeshPart") {
+        allowed.insert("InitialSize".to_string());
+        decode_allowed.insert("InitialSize".to_string());
+        renamed.insert("InitialSize".to_string(), "MeshSize".to_string());
+    }
+    if rbx_reflection_class_is_a(database, class_name, "Model") {
+        allowed.insert("WorldPivotData".to_string());
+        decode_allowed.insert("WorldPivotData".to_string());
+        renamed.insert("WorldPivotData".to_string(), "WorldPivot".to_string());
+    }
+    let reconstruct_decal_color_map = rbx_reflection_class_is_a(database, class_name, "Decal");
+    let reconstruct_weld_enabled = class_name == "WeldConstraint";
+    if reconstruct_weld_enabled {
+        decode_allowed.insert("State".to_string());
+    }
+    let output_names = allowed
+        .iter()
+        .map(|name| renamed.get(name).unwrap_or(name).clone())
+        .collect();
+    NativePropertyFilter {
+        allowed,
+        decode_allowed,
+        renamed,
+        output_names,
+        reconstruct_decal_color_map,
+        reconstruct_weld_enabled,
+    }
+}
+
+fn native_overlay_property_is_reconstructed(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    property_name: &str,
+) -> bool {
+    if rbx_reflection_class_is_a(database, class_name, "BasePart")
+        && matches!(property_name, "Position" | "Orientation" | "Rotation")
+    {
+        return true;
+    }
+    if rbx_reflection_class_is_a(database, class_name, "TriangleMeshPart")
+        && property_name == "MeshSize"
+    {
+        return true;
+    }
+    if rbx_reflection_class_is_a(database, class_name, "Attachment")
+        && matches!(
+            property_name,
+            "Position"
+                | "Orientation"
+                | "Axis"
+                | "SecondaryAxis"
+                | "WorldPosition"
+                | "WorldOrientation"
+                | "WorldAxis"
+                | "WorldSecondaryAxis"
+                | "WorldCFrame"
+        )
+    {
+        return true;
+    }
+    if rbx_reflection_class_is_a(database, class_name, "BaseScript") && property_name == "Enabled" {
+        return true;
+    }
+    if class_name == "BodyColors"
+        && matches!(
+            property_name,
+            "HeadColor"
+                | "LeftArmColor"
+                | "LeftLegColor"
+                | "RightArmColor"
+                | "RightLegColor"
+                | "TorsoColor"
+        )
+    {
+        return true;
+    }
+    if class_name == "Camera"
+        && matches!(property_name, "DiagonalFieldOfView" | "MaxAxisFieldOfView")
+    {
+        return true;
+    }
+    if rbx_reflection_class_is_a(database, class_name, "PVInstance") && property_name == "Origin" {
+        return true;
+    }
+    if rbx_reflection_class_is_a(database, class_name, "Decal")
+        && property_name == "ColorMapContent"
+    {
+        return true;
+    }
+    if class_name == "WeldConstraint" && property_name == "Enabled" {
+        return true;
+    }
+    false
+}
+
+fn native_overlay_property_schemas(
+    database: &ReflectionDatabase<'_>,
+    property_schema_by_class: &PropertySchemaMap,
+    native_filters: &HashMap<String, NativePropertyFilter>,
+) -> (PropertySchemaMap, PropertySchemaMap, PropertySchemaMap) {
+    let combined = property_schema_by_class
+        .iter()
+        .filter_map(|(class_name, entries)| {
+            let native_outputs = native_filters
+                .get(class_name)
+                .map(|filter| &filter.output_names);
+            let overlay = entries
+                .iter()
+                .filter(|entry| {
+                    let Some(descriptor) =
+                        rbx_property_descriptor(database, class_name, &entry.name)
+                    else {
+                        return true;
+                    };
+                    match &descriptor.kind {
+                        RbxPropertyKind::Alias { .. } => false,
+                        RbxPropertyKind::Canonical {
+                            serialization: RbxPropertySerialization::Migrate(_),
+                        } => false,
+                        RbxPropertyKind::Canonical {
+                            serialization: RbxPropertySerialization::DoesNotSerialize,
+                        } => !native_overlay_property_is_reconstructed(
+                            database,
+                            class_name,
+                            &entry.name,
+                        ),
+                        RbxPropertyKind::Canonical { .. } => {
+                            entry.type_id == TYPE_ID_REF
+                                || native_outputs
+                                    .is_none_or(|outputs| !outputs.contains(&entry.name))
+                        }
+                        _ => true,
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!overlay.is_empty()).then(|| (class_name.clone(), overlay))
+        })
+        .collect::<PropertySchemaMap>();
+    let mut direct = PropertySchemaMap::new();
+    let mut conditional_refs = PropertySchemaMap::new();
+    for (class_name, entries) in &combined {
+        let native_outputs = native_filters
+            .get(class_name)
+            .map(|filter| &filter.output_names);
+        for entry in entries {
+            let target = if entry.type_id == TYPE_ID_REF
+                && native_outputs.is_some_and(|outputs| outputs.contains(&entry.name))
+            {
+                &mut conditional_refs
+            } else {
+                &mut direct
+            };
+            target
+                .entry(class_name.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+    }
+    (combined, direct, conditional_refs)
+}
+
+fn overlay_property_names_value(
+    schema: &PropertySchemaMap,
+    native_filters: &HashMap<String, NativePropertyFilter>,
+) -> Value {
+    Value::Object(
+        schema
+            .iter()
+            .map(|(class_name, entries)| {
+                (
+                    class_name.clone(),
+                    Value::Array(
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                if entry.type_id == TYPE_ID_REF
+                                    && native_filters.get(class_name).is_some_and(|filter| {
+                                        filter.output_names.contains(&entry.name)
+                                    })
+                                {
+                                    Value::Array(vec![
+                                        Value::String(entry.name.clone()),
+                                        Value::Bool(true),
+                                    ])
+                                } else {
+                                    Value::String(entry.name.clone())
+                                }
+                            })
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn conditional_ref_overlay_request(
+    instances: &[rbx_binary::FlatInstance],
+    schema: &PropertySchemaMap,
+) -> (PropertySchemaMap, Value, usize) {
+    let mut candidates = HashMap::<(&str, &str), Vec<usize>>::new();
+    for (index, instance) in instances.iter().enumerate() {
+        let class_name = instance.class.as_str();
+        let Some(entries) = schema.get(class_name) else {
+            continue;
+        };
+        for entry in entries {
+            let has_native_ref = instance
+                .properties
+                .iter()
+                .find(|(name, _)| name.as_str() == entry.name)
+                .map(|(_, value)| value)
+                .and_then(rbx_variant_referent)
+                .and_then(|referent| referent.as_u128())
+                .is_some();
+            if !has_native_ref {
+                candidates
+                    .entry((class_name, entry.name.as_str()))
+                    .or_default()
+                    .push(index + 1);
+            }
+        }
+    }
+
+    let mut request_schema = PropertySchemaMap::new();
+    let mut request_names = Map::new();
+    let mut candidate_count = 0;
+    for (class_name, entries) in schema {
+        let mut class_schema = Vec::new();
+        let mut class_names = Vec::new();
+        for entry in entries {
+            let Some(indices) = candidates.remove(&(class_name.as_str(), entry.name.as_str()))
+            else {
+                continue;
+            };
+            candidate_count += indices.len();
+            let mut packed = Vec::with_capacity(indices.len() * 3);
+            for index in &indices {
+                let index = *index as u32;
+                packed.push(index as u8);
+                packed.push((index >> 8) as u8);
+                packed.push((index >> 16) as u8);
+            }
+            class_schema.push(entry.clone());
+            class_names.push(Value::Array(vec![
+                Value::String(entry.name.clone()),
+                json!({
+                    "packed": base64::encode(packed),
+                    "count": indices.len(),
+                }),
+            ]));
+        }
+        if !class_schema.is_empty() {
+            request_schema.insert(class_name.clone(), class_schema);
+            request_names.insert(class_name.clone(), Value::Array(class_names));
+        }
+    }
+    (
+        request_schema,
+        Value::Object(request_names),
+        candidate_count,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native overlay decoding keeps its transport schema explicit"
+)]
+fn fetch_native_overlay_batch_once(
+    bridge: &BridgeServer,
+    service: &str,
+    start_index: usize,
+    take_count: usize,
+    instance_count: usize,
+    overlay_id: &str,
+    overlay_variant: &str,
+    overlay_names: &Value,
+    overlay_schema: &PropertySchemaMap,
+    enum_value_names_by_type: &EnumValueNameMap,
+    class_names: &[String],
+) -> Result<NativeOverlayFetch> {
+    let started = Instant::now();
+    let (batch, metrics) = fetch_typed_payload_with_size::<CompactBatchPayload, _>(
+        DEFAULT_EXPORT_CHUNK_SIZE,
+        |chunk_start, max_len| {
+            bridge.call_chunk(
+                "getEditorBinaryOverlayChunk",
+                json!({
+                    "service": service,
+                    "startIndex": start_index,
+                    "maxCount": take_count,
+                    "chunkStart": chunk_start,
+                    "maxLen": max_len,
+                    "overlayId": overlay_id,
+                    "overlayVariant": overlay_variant,
+                    "overlayPropertiesByClass": overlay_names,
+                    "supportsStableInstanceIds": false,
+                }),
+            )
+        },
+    )?;
+    if batch.format != NATIVE_OVERLAY_PROTOCOL_VERSION
+        || !is_supported_bridge_codec(&batch.codec_version)
+    {
+        bail!(
+            "Invalid native overlay format {} with codec {} for {}",
+            batch.format,
+            batch.codec_version,
+            service
+        );
+    }
+    if !batch.debug_ids.is_empty() {
+        bail!("Native overlay for {service} used the legacy debug id array");
+    }
+    if !batch.debug_id_buffer.is_null() || !batch.debug_id_fallbacks.is_empty() {
+        bail!("Native overlay for {service} returned unexpected debug id data");
+    }
+    let compact_expand_started = Instant::now();
+    let numeric_enum_values = compact_v5_codec_uses_numeric_enum_values(&batch.codec_version);
+    let flat_fixed_values = batch.codec_version == BRIDGE_CODEC_VERSION_SCHEMA5;
+    let items = parse_native_overlay_items(
+        Value::Array(batch.items),
+        batch.strings,
+        start_index,
+        take_count,
+        overlay_schema,
+        enum_value_names_by_type,
+        numeric_enum_values,
+        flat_fixed_values,
+        class_names,
+    )
+    .with_context(|| format!("Invalid native overlay items for {service}"))?;
+    if batch.total != instance_count {
+        bail!(
+            "Native overlay range for {service} returned total={}; expected total={} at start={start_index}",
+            batch.total,
+            instance_count,
+        );
+    }
+    Ok(NativeOverlayFetch {
+        metrics,
+        compact_expand_ms: elapsed_ms(compact_expand_started),
+        request_ms: elapsed_ms(started),
+        items,
+    })
+}
+
+fn merge_native_overlay_items(
+    target: &mut [SnapshotInstance],
+    additional: Vec<NativeOverlayItem>,
+) -> Result<()> {
+    for additional in additional {
+        let target_instance = additional
+            .instance_index
+            .checked_sub(1)
+            .and_then(|index| target.get_mut(index))
+            .context("Native overlay instance index is out of range")?;
+        if target_instance.instance_index != Some(additional.instance_index)
+            || (!additional.class_name.is_empty()
+                && additional.class_name != target_instance.class_name)
+        {
+            bail!(
+                "Native overlay passes disagree at instance {}",
+                additional.instance_index
+            );
+        }
+        target_instance.properties.extend(additional.properties);
+        target_instance.attributes.extend(additional.attributes);
+    }
+    Ok(())
+}
+
 fn rbx_instance_to_settings_records(
     instance: &rbx_dom_weak::Instance,
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
+    elide_defaults: bool,
+    native_filter: Option<&NativePropertyFilter>,
 ) -> (Map<String, Value>, Map<String, Value>, Option<String>) {
-    let class_name = instance.class.as_str();
+    rbx_properties_to_settings_records(
+        instance.class.as_str(),
+        instance.properties.iter(),
+        database,
+        refs,
+        elide_defaults,
+        false,
+        false,
+        native_filter,
+    )
+}
+
+fn rbx_properties_to_settings_records<'a>(
+    class_name: &str,
+    property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+    elide_defaults: bool,
+    defaults_already_elided: bool,
+    native_properties_pre_filtered: bool,
+    native_filter: Option<&NativePropertyFilter>,
+) -> (Map<String, Value>, Map<String, Value>, Option<String>) {
     let mut properties = Map::new();
     let mut attributes = Map::new();
     let mut source = None;
 
-    for (property_name, variant) in &instance.properties {
+    for (property_name, variant) in property_entries {
         let property_name = property_name.as_str();
         if let RbxVariant::Attributes(rbx_attributes) = variant {
             attributes.extend(rbx_attributes_to_settings_map(
@@ -22647,9 +24165,36 @@ fn rbx_instance_to_settings_records(
             source = rbx_variant_to_source_string(variant);
             continue;
         }
+        if !native_properties_pre_filtered
+            && native_filter.is_some_and(|filter| !filter.allowed.contains(property_name))
+        {
+            continue;
+        }
+        if elide_defaults
+            && rbx_variant_referent(variant).is_some_and(|referent| {
+                imported_instance_index(refs, referent).is_none()
+                    && !refs.path_segments_by_ref.contains_key(&referent)
+            })
+        {
+            continue;
+        }
+        if elide_defaults
+            && !defaults_already_elided
+            && database
+                .classes
+                .get(class_name)
+                .and_then(|class| database.find_default_property(class, property_name))
+                == Some(variant)
+        {
+            continue;
+        }
         let descriptor = rbx_model_property_descriptor(database, class_name, property_name);
         if let Some(value) = rbx_variant_to_settings_json(variant, descriptor, database, refs) {
-            properties.insert(property_name.to_string(), value);
+            let output_name = native_filter
+                .and_then(|filter| filter.renamed.get(property_name))
+                .map(String::as_str)
+                .unwrap_or(property_name);
+            properties.insert(output_name.to_string(), value);
         }
     }
 
@@ -22681,7 +24226,26 @@ fn rbx_attributes_to_settings_map(
 ) -> Map<String, Value> {
     let mut out = Map::new();
     for (name, value) in attributes.iter() {
-        if let Some(value) = rbx_variant_to_settings_json(value, None, database, refs) {
+        let value = match value {
+            RbxVariant::BinaryString(value) => Some(Value::String(
+                String::from_utf8_lossy(value.as_ref()).into_owned(),
+            )),
+            RbxVariant::EnumItem(value) => {
+                let mut encoded = rbx_enum_to_settings_json(Some(&value.ty), value.value, database);
+                if let Some(enum_type) = encoded
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("enumType"))
+                    .and_then(|value| value.as_str())
+                    .map(strip_enum_prefix)
+                    .map(ToString::to_string)
+                {
+                    encoded["enumType"] = Value::String(enum_type);
+                }
+                Some(encoded)
+            }
+            _ => rbx_variant_to_settings_json(value, None, database, refs),
+        };
+        if let Some(value) = value {
             out.insert(name.clone(), value);
         }
     }
@@ -22823,15 +24387,25 @@ fn nonfinite_float_json(value: f64) -> Value {
 
 fn nonfinite_float_from_json(value: &Value) -> Option<f64> {
     let object = value.as_object()?;
-    if object.get("_type").and_then(Value::as_str) != Some("Float") {
-        return None;
-    }
-    match object.get("value").and_then(Value::as_str)? {
+    let encoded = if object.get("_type").and_then(Value::as_str) == Some("Float") {
+        object.get("value").and_then(Value::as_str)
+    } else if object.get("t").and_then(Value::as_str) == Some("numeric") {
+        object.get("v").and_then(Value::as_str)
+    } else {
+        None
+    }?;
+    match encoded {
         "nan" => Some(f64::NAN),
         "inf" => Some(f64::INFINITY),
         "-inf" => Some(f64::NEG_INFINITY),
         _ => None,
     }
+}
+
+fn canonicalize_nonfinite_float_json(value: Value) -> Value {
+    nonfinite_float_from_json(&value)
+        .map(nonfinite_float_json)
+        .unwrap_or(value)
 }
 
 fn rbx_cframe_to_settings_json(value: RbxCFrame) -> Value {
@@ -22869,7 +24443,7 @@ fn rbx_content_to_settings_json(
 fn rbx_ref_to_settings_json(referent: RbxRef, refs: &BytecodeModelImportRefs) -> Value {
     let mut out = Map::new();
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
-    if let Some(new_index) = refs.new_index_by_ref.get(&referent).copied() {
+    if let Some(new_index) = imported_instance_index(refs, referent) {
         out.insert(
             "instanceIndex".to_string(),
             Value::Number(Number::from((new_index + 1) as u64)),
@@ -22879,9 +24453,8 @@ fn rbx_ref_to_settings_json(referent: RbxRef, refs: &BytecodeModelImportRefs) ->
         }
     }
     let path_segments = refs.path_segments_by_ref.get(&referent).or_else(|| {
-        refs.new_index_by_ref
-            .get(&referent)
-            .and_then(|index| refs.path_segments_by_index.get(*index))
+        imported_instance_index(refs, referent)
+            .and_then(|index| refs.path_segments_by_index.get(index))
             .and_then(Option::as_ref)
     });
     if let Some(path_segments) = path_segments {
@@ -23183,7 +24756,119 @@ enum DirectImportTask {
         parts: ExportedSnapshotParts,
     },
     Subtree(DirectImportSubtreeTask),
-    Shutdown,
+}
+
+struct DirectImportTaskQueueState {
+    services: VecDeque<DirectImportTask>,
+    subtrees: VecDeque<DirectImportTask>,
+    prefer_subtree: bool,
+    active_workers: usize,
+    closed: bool,
+}
+
+struct DirectImportTaskQueue {
+    state: Mutex<DirectImportTaskQueueState>,
+    ready: Condvar,
+    worker_gate: Condvar,
+}
+
+impl DirectImportTaskQueue {
+    fn new(active_workers: usize) -> Self {
+        Self {
+            state: Mutex::new(DirectImportTaskQueueState {
+                services: VecDeque::new(),
+                subtrees: VecDeque::new(),
+                prefer_subtree: false,
+                active_workers: active_workers.max(1),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            worker_gate: Condvar::new(),
+        }
+    }
+
+    fn enqueue_service(&self, task: DirectImportTask) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.closed {
+            return false;
+        }
+        state.services.push_back(task);
+        self.ready.notify_one();
+        true
+    }
+
+    fn enqueue_subtree(&self, task: DirectImportTask) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.closed {
+            return false;
+        }
+        state.subtrees.push_back(task);
+        self.ready.notify_one();
+        true
+    }
+
+    fn receive(&self, worker_index: usize) -> Option<DirectImportTask> {
+        let mut state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            if worker_index >= state.active_workers && !state.closed {
+                state = match self.worker_gate.wait(state) {
+                    Ok(lock) => lock,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                continue;
+            }
+            if !state.services.is_empty() && !state.subtrees.is_empty() {
+                state.prefer_subtree = !state.prefer_subtree;
+                return if state.prefer_subtree {
+                    state.subtrees.pop_front()
+                } else {
+                    state.services.pop_front()
+                };
+            }
+            if let Some(task) = state.services.pop_front() {
+                return Some(task);
+            }
+            if let Some(task) = state.subtrees.pop_front() {
+                return Some(task);
+            }
+            if state.closed {
+                return None;
+            }
+            state = match self.ready.wait(state) {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn activate_workers(&self, active_workers: usize) {
+        let mut state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active_workers = state.active_workers.max(active_workers);
+        self.worker_gate.notify_all();
+        self.ready.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        self.worker_gate.notify_all();
+        self.ready.notify_all();
+    }
 }
 
 struct DirectImportSubtreeTask {
@@ -23212,6 +24897,9 @@ struct SplitNodeAssembly {
 struct SplitDirectImportState {
     service: String,
     service_dir: PathBuf,
+    final_service_dir: PathBuf,
+    fresh_stage: bool,
+    cleanup_required: bool,
     project_root: PathBuf,
     compact_meta_json: bool,
     state: Arc<ServiceState>,
@@ -23308,8 +24996,11 @@ impl SourcemapWriter {
         self.sender.clone()
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn request_finish(&self) {
         let _ = self.sender.send(SourcemapWriterMessage::Finish);
+    }
+
+    fn join(mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
             match handle.join() {
                 Ok(result) => result,
@@ -23322,19 +25013,27 @@ impl SourcemapWriter {
 }
 
 struct DirectImportDispatcher {
-    sender: Option<mpsc::Sender<DirectImportTask>>,
+    queue: Option<Arc<DirectImportTaskQueue>>,
     workers: Vec<thread::JoinHandle<()>>,
     first_error: Arc<Mutex<Option<String>>>,
     service_nodes: Arc<Mutex<HashMap<String, SourcemapNode>>>,
     pending_tasks: Arc<AtomicUsize>,
-    worker_count: usize,
+    pending_signal: Arc<(Mutex<()>, Condvar)>,
 }
 
-struct PendingTaskGuard<'a>(&'a AtomicUsize);
+struct PendingTaskGuard<'a> {
+    pending_tasks: &'a AtomicUsize,
+    pending_signal: &'a (Mutex<()>, Condvar),
+}
 
 impl Drop for PendingTaskGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let _guard = match self.pending_signal.0.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
+        self.pending_signal.1.notify_all();
     }
 }
 
@@ -23342,43 +25041,35 @@ impl DirectImportDispatcher {
     fn start(
         project_root: PathBuf,
         compact_meta_json: bool,
-        worker_count: usize,
+        active_worker_count: usize,
+        drain_worker_count: usize,
         sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
         run_started: Instant,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel::<DirectImportTask>();
-        let shared_receiver = Arc::new(Mutex::new(receiver));
+        let active_worker_count = active_worker_count.max(1);
+        let worker_count = drain_worker_count.max(active_worker_count);
+        let queue = Arc::new(DirectImportTaskQueue::new(active_worker_count));
         let first_error = Arc::new(Mutex::new(None::<String>));
         let service_nodes = Arc::new(Mutex::new(HashMap::<String, SourcemapNode>::new()));
         let pending_tasks = Arc::new(AtomicUsize::new(0));
-        let worker_count = worker_count.max(1);
+        let pending_signal = Arc::new((Mutex::new(()), Condvar::new()));
 
         let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let recv_clone = Arc::clone(&shared_receiver);
-            let sender_clone = sender.clone();
+        for worker_index in 0..worker_count {
+            let queue_clone = Arc::clone(&queue);
             let root_clone = project_root.clone();
             let error_clone = Arc::clone(&first_error);
             let service_nodes_clone = Arc::clone(&service_nodes);
             let pending_tasks_clone = Arc::clone(&pending_tasks);
+            let pending_signal_clone = Arc::clone(&pending_signal);
             let sourcemap_sender_clone = sourcemap_sender.clone();
             let run_started_clone = run_started;
             workers.push(thread::spawn(move || {
-                loop {
-                    let task = {
-                        let guard = match recv_clone.lock() {
-                            Ok(lock) => lock,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        guard.recv()
+                while let Some(task) = queue_clone.receive(worker_index) {
+                    let _pending_guard = PendingTaskGuard {
+                        pending_tasks: &pending_tasks_clone,
+                        pending_signal: &pending_signal_clone,
                     };
-                    let Ok(task) = task else {
-                        break;
-                    };
-                    if matches!(task, DirectImportTask::Shutdown) {
-                        break;
-                    }
-                    let _pending_guard = PendingTaskGuard(&pending_tasks_clone);
                     let panicked =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match task {
                             DirectImportTask::Service { service, parts } => {
@@ -23400,7 +25091,7 @@ impl DirectImportDispatcher {
                                     Ok(state)
                                 })
                                 .and_then(|state| match maybe_enqueue_split_import_tasks(
-                                    &sender_clone,
+                                    queue_clone.as_ref(),
                                     &pending_tasks_clone,
                                     &root_clone,
                                     &src_root,
@@ -23519,7 +25210,6 @@ impl DirectImportDispatcher {
                                 }
                             }
                         }
-                            DirectImportTask::Shutdown => {}
                         }));
                     if let Err(panic) = panicked {
                         let message = panic
@@ -23540,31 +25230,31 @@ impl DirectImportDispatcher {
         }
 
         Self {
-            sender: Some(sender),
+            queue: Some(queue),
             workers,
             first_error,
             service_nodes,
             pending_tasks,
-            worker_count,
+            pending_signal,
         }
     }
 
     fn enqueue_parts(&self, service: &str, parts: ExportedSnapshotParts) -> Result<()> {
         self.check_error()?;
-        let sender = self
-            .sender
+        let queue = self
+            .queue
             .as_ref()
             .with_context(|| "Direct import dispatcher is closed")?;
         self.pending_tasks.fetch_add(1, Ordering::AcqRel);
-        sender
-            .send(DirectImportTask::Service {
-                service: service.to_string(),
-                parts,
-            })
-            .map_err(|err| {
-                self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
-                anyhow::anyhow!("Failed to queue direct import task: {err}")
-            })
+        if queue.enqueue_service(DirectImportTask::Service {
+            service: service.to_string(),
+            parts,
+        }) {
+            Ok(())
+        } else {
+            self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
+            bail!("Failed to queue direct import task: dispatcher is closed")
+        }
     }
 
     fn check_error(&self) -> Result<()> {
@@ -23579,33 +25269,46 @@ impl DirectImportDispatcher {
     }
 
     fn finish(mut self) -> Result<HashMap<String, SourcemapNode>> {
+        if let Some(queue) = self.queue.as_ref() {
+            queue.activate_workers(self.workers.len());
+        }
+        let pending_started = Instant::now();
+        let mut pending_guard = match self.pending_signal.0.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         while self.pending_tasks.load(Ordering::Acquire) > 0 {
             self.check_error()?;
-            thread::sleep(Duration::from_millis(5));
+            pending_guard = match self.pending_signal.1.wait(pending_guard) {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
-        if let Some(sender) = self.sender.take() {
-            for _ in 0..self.worker_count {
-                let _ = sender.send(DirectImportTask::Shutdown);
-            }
+        drop(pending_guard);
+        log_timing("direct import pending wait", pending_started);
+        let join_started = Instant::now();
+        if let Some(queue) = self.queue.take() {
+            queue.close();
         }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+        log_timing("direct import worker join", join_started);
         self.check_error()?;
+        let clone_started = Instant::now();
         let nodes = match self.service_nodes.lock() {
             Ok(lock) => lock.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
+        log_timing("direct import sourcemap clone", clone_started);
         Ok(nodes)
     }
 }
 
 impl Drop for DirectImportDispatcher {
     fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            for _ in 0..self.worker_count {
-                let _ = sender.send(DirectImportTask::Shutdown);
-            }
+        if let Some(queue) = self.queue.take() {
+            queue.close();
         }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
@@ -23776,6 +25479,7 @@ fn is_supported_bridge_codec(value: &str) -> bool {
 
 fn compact_v5_codec_uses_numeric_enum_values(value: &str) -> bool {
     value == BRIDGE_CODEC_VERSION
+        || value == BRIDGE_CODEC_VERSION_SCHEMA8
         || value == BRIDGE_CODEC_VERSION_SCHEMA7
         || value == BRIDGE_CODEC_VERSION_SCHEMA6
         || value == BRIDGE_CODEC_VERSION_SCHEMA5
@@ -24182,16 +25886,9 @@ fn export_snapshots_core(
         && bridge_info.export_all_properties == export_all_properties
         && !bridge_info.pre_serialize_on_prepare
         && !bridge_info.pre_serialize_large_service_warm;
-    let skip_export_options = match mode {
-        ExportBridgeMode::Cold => bridge_options_match,
-        ExportBridgeMode::Warm { prepare_next_run } => bridge_options_match && prepare_next_run,
-    };
-    if skip_export_options {
+    if bridge_options_match {
         println!("[renium] plugin export options already match requested configuration");
     } else {
-        if bridge_options_match {
-            println!("[renium] refreshing plugin export options for warm persistent bridge");
-        }
         bridge
             .call(
                 "setExportOptions",
@@ -24204,6 +25901,12 @@ fn export_snapshots_core(
                 }),
             )
             .context("Failed to apply plugin export options")?;
+        bridge.cache_export_options_for_target(
+            BridgeTarget::Main,
+            performance_mode.as_str(),
+            modified_default_bypass,
+            export_all_properties,
+        );
     }
     let bridge_info_done_ms = elapsed_ms(total_started);
     let property_schema_by_class = load_rbx_dom_property_schema(&project_root)?.unwrap_or_default();
@@ -24305,14 +26008,17 @@ fn export_snapshots_core(
 
     let mut direct_import_dispatcher = if direct_import_mode {
         let resolved_import_workers = resolve_direct_import_workers(import_workers);
+        let drain_import_workers =
+            resolve_direct_import_drain_workers(import_workers, resolved_import_workers);
         println!(
-            "[renium] direct import workers: {}",
-            resolved_import_workers
+            "[renium] direct import workers: {}, drain workers: {}",
+            resolved_import_workers, drain_import_workers
         );
         Some(DirectImportDispatcher::start(
             project_root.clone(),
             compact_meta_json,
             resolved_import_workers,
+            drain_import_workers,
             sourcemap_writer.as_ref().map(SourcemapWriter::sender),
             total_started,
         ))
@@ -24348,114 +26054,40 @@ fn export_snapshots_core(
         Vec::with_capacity(export_services.len());
     let mut service_export_sum_ms = 0.0;
     let mut tune_updates: Vec<(String, AdaptiveTuneEntry)> = Vec::new();
-    let tail_parallel_start =
-        if direct_import_mode && direct_export_workers > 1 && export_services.len() > 2 {
-            1
-        } else if direct_import_mode && direct_export_workers > 1 && export_services.len() > 1 {
-            0
-        } else {
-            export_services.len()
+    let mut native_finish_guard = None;
+    let native_full_export = direct_import_mode;
+    if native_full_export {
+        println!("[renium] native full export enabled");
+        let mut finish_output = |output| {
+            finish_service_export_output(
+                output,
+                direct_import_dispatcher.as_ref(),
+                direct_import_mode,
+                &snapshot_dir,
+                &mut tune_updates,
+                &mut service_export_spans,
+                &mut service_export_sum_ms,
+            )
         };
-    let tail_export_workers = direct_export_workers;
-    let remaining_services = &export_services[tail_parallel_start..];
-
-    for service in &export_services[..tail_parallel_start] {
-        if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
-            dispatcher.check_error()?;
-        }
-        let output = export_service_parts_with_span(
+        native_finish_guard = Some(editor_binary_export_parts(
             bridge,
-            service,
-            effective_chunk,
-            adaptive_instance_batches,
-            performance_mode,
-            !direct_import_mode,
-            source_workers,
-            instance_workers,
-            args.adaptive_seed_batch,
-            adaptive_tune_cache.services.get(service).cloned(),
-            &property_schema_by_class,
+            &export_services,
             total_started,
-        )?;
-        finish_service_export_output(
-            output,
-            direct_import_dispatcher.as_ref(),
-            direct_import_mode,
-            &snapshot_dir,
-            &mut tune_updates,
-            &mut service_export_spans,
-            &mut service_export_sum_ms,
-        )?;
-    }
-
-    if direct_import_mode && tail_export_workers > 1 && remaining_services.len() > 1 {
-        let work_queue: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(remaining_services.iter().cloned().collect()));
-        let (result_tx, result_rx) =
-            mpsc::channel::<std::result::Result<ServiceExportOutput, String>>();
-
-        thread::scope(|scope| -> Result<()> {
-            for _ in 0..tail_export_workers {
-                let queue = Arc::clone(&work_queue);
-                let tx = result_tx.clone();
-                let bridge_ref = bridge;
-                let cache_ref = &adaptive_tune_cache;
-                let property_schema_ref = &property_schema_by_class;
-                scope.spawn(move || {
-                    loop {
-                        let service = {
-                            let mut guard = match queue.lock() {
-                                Ok(lock) => lock,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            guard.pop_front()
-                        };
-                        let Some(service) = service else {
-                            break;
-                        };
-                        let cached_tune = cache_ref.services.get(&service).cloned();
-                        let result = export_service_parts_with_span(
-                            bridge_ref,
-                            &service,
-                            effective_chunk,
-                            adaptive_instance_batches,
-                            performance_mode,
-                            !direct_import_mode,
-                            source_workers,
-                            instance_workers,
-                            args.adaptive_seed_batch,
-                            cached_tune,
-                            property_schema_ref,
-                            total_started,
-                        )
-                        .map_err(|err| format!("{err:#}"));
-                        if tx.send(result).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(result_tx);
-
-            for _ in 0..remaining_services.len() {
-                let output = result_rx
-                    .recv()
-                    .context("Direct export worker result channel closed")?
-                    .map_err(|err| anyhow::anyhow!("{err}"))?;
-                finish_service_export_output(
-                    output,
-                    direct_import_dispatcher.as_ref(),
-                    direct_import_mode,
-                    &snapshot_dir,
-                    &mut tune_updates,
-                    &mut service_export_spans,
-                    &mut service_export_sum_ms,
-                )?;
-            }
-            Ok(())
-        })?;
+            &mut finish_output,
+        )?);
     } else {
-        for service in remaining_services {
+        let tail_parallel_start =
+            if direct_import_mode && direct_export_workers > 1 && export_services.len() > 2 {
+                1
+            } else if direct_import_mode && direct_export_workers > 1 && export_services.len() > 1 {
+                0
+            } else {
+                export_services.len()
+            };
+        let tail_export_workers = direct_export_workers;
+        let remaining_services = &export_services[tail_parallel_start..];
+
+        for service in &export_services[..tail_parallel_start] {
             if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
                 dispatcher.check_error()?;
             }
@@ -24482,6 +26114,103 @@ fn export_snapshots_core(
                 &mut service_export_spans,
                 &mut service_export_sum_ms,
             )?;
+        }
+
+        if direct_import_mode && tail_export_workers > 1 && remaining_services.len() > 1 {
+            let work_queue: Arc<Mutex<VecDeque<String>>> =
+                Arc::new(Mutex::new(remaining_services.iter().cloned().collect()));
+            let (result_tx, result_rx) =
+                mpsc::channel::<std::result::Result<ServiceExportOutput, String>>();
+
+            thread::scope(|scope| -> Result<()> {
+                for _ in 0..tail_export_workers {
+                    let queue = Arc::clone(&work_queue);
+                    let tx = result_tx.clone();
+                    let bridge_ref = bridge;
+                    let cache_ref = &adaptive_tune_cache;
+                    let property_schema_ref = &property_schema_by_class;
+                    scope.spawn(move || {
+                        loop {
+                            let service = {
+                                let mut guard = match queue.lock() {
+                                    Ok(lock) => lock,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.pop_front()
+                            };
+                            let Some(service) = service else {
+                                break;
+                            };
+                            let cached_tune = cache_ref.services.get(&service).cloned();
+                            let result = export_service_parts_with_span(
+                                bridge_ref,
+                                &service,
+                                effective_chunk,
+                                adaptive_instance_batches,
+                                performance_mode,
+                                !direct_import_mode,
+                                source_workers,
+                                instance_workers,
+                                args.adaptive_seed_batch,
+                                cached_tune,
+                                property_schema_ref,
+                                total_started,
+                            )
+                            .map_err(|err| format!("{err:#}"));
+                            if tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                drop(result_tx);
+
+                for _ in 0..remaining_services.len() {
+                    let output = result_rx
+                        .recv()
+                        .context("Direct export worker result channel closed")?
+                        .map_err(|err| anyhow::anyhow!("{err}"))?;
+                    finish_service_export_output(
+                        output,
+                        direct_import_dispatcher.as_ref(),
+                        direct_import_mode,
+                        &snapshot_dir,
+                        &mut tune_updates,
+                        &mut service_export_spans,
+                        &mut service_export_sum_ms,
+                    )?;
+                }
+                Ok(())
+            })?;
+        } else {
+            for service in remaining_services {
+                if let Some(dispatcher) = direct_import_dispatcher.as_ref() {
+                    dispatcher.check_error()?;
+                }
+                let output = export_service_parts_with_span(
+                    bridge,
+                    service,
+                    effective_chunk,
+                    adaptive_instance_batches,
+                    performance_mode,
+                    !direct_import_mode,
+                    source_workers,
+                    instance_workers,
+                    args.adaptive_seed_batch,
+                    adaptive_tune_cache.services.get(service).cloned(),
+                    &property_schema_by_class,
+                    total_started,
+                )?;
+                finish_service_export_output(
+                    output,
+                    direct_import_dispatcher.as_ref(),
+                    direct_import_mode,
+                    &snapshot_dir,
+                    &mut tune_updates,
+                    &mut service_export_spans,
+                    &mut service_export_sum_ms,
+                )?;
+            }
         }
     }
     service_export_spans.sort_by(|a, b| {
@@ -24536,13 +26265,16 @@ fn export_snapshots_core(
                 dispatcher_drain_ms = elapsed_ms(drain_started);
                 log_timing_ms("direct import dispatcher drain", dispatcher_drain_ms);
             }
+            if let Some(writer) = sourcemap_writer.as_ref() {
+                writer.request_finish();
+            }
             let project_started = Instant::now();
             write_generated_project(&project_root, &services, compact_meta_json)?;
             write_generated_project_ms = elapsed_ms(project_started);
             log_timing_ms("write generated project", write_generated_project_ms);
             if let Some(writer) = sourcemap_writer {
                 let sourcemap_started = Instant::now();
-                if let Err(err) = writer.finish() {
+                if let Err(err) = writer.join() {
                     println!("[renium] warning: {err}");
                 }
                 sourcemap_finalize_ms = elapsed_ms(sourcemap_started);
@@ -24570,6 +26302,20 @@ fn export_snapshots_core(
         }
     }
 
+    let sync_completion_started = Instant::now();
+    let mut sync_completion_recorded = false;
+    if let Some(mut finish_guard) = native_finish_guard.take() {
+        match finish_guard.finish(true) {
+            Ok(recorded) => sync_completion_recorded = recorded,
+            Err(err) => {
+                println!("[renium] warning: failed to finish the native export session: {err:#}");
+            }
+        }
+    }
+    if !sync_completion_recorded {
+        record_bridge_sync_completion(bridge);
+    }
+    let sync_completion_ms = elapsed_ms(sync_completion_started);
     let total_run_ms = elapsed_ms(total_started);
     let handshake_ms =
         bridge_listen_to_all_channels_connected_ms + all_channels_connected_to_bridge_info_ms;
@@ -24578,7 +26324,8 @@ fn export_snapshots_core(
     let import_critical_tail_ms = last_service_export_to_dispatcher_drain_start_ms
         + dispatcher_drain_ms
         + write_generated_project_ms
-        + sourcemap_finalize_ms;
+        + sourcemap_finalize_ms
+        + sync_completion_ms;
     let unmeasured_or_scheduler_gap_ms = (total_run_ms
         - cli_start_to_bridge_listen_ms
         - handshake_ms
@@ -24595,7 +26342,7 @@ fn export_snapshots_core(
         }
     }
     println!(
-        "[renium] run timing spans: cli_start_to_bridge_listen_ms={:.1}, bridge_listen_to_all_channels_connected_ms={:.1}, all_channels_connected_to_bridge_info_ms={:.1}, bridge_info_to_property_schema_ready_ms={:.1}, property_schema_ready_to_first_service_export_ms={:.1}, first_service_export_to_last_service_export_ms={:.1}, service_export_sum_ms={:.1}, last_service_export_to_dispatcher_drain_start_ms={:.1}, dispatcher_drain_ms={:.1}, write_generated_project_ms={:.1}, sourcemap_finalize_ms={:.1}, total_run_ms={:.1}",
+        "[renium] run timing spans: cli_start_to_bridge_listen_ms={:.1}, bridge_listen_to_all_channels_connected_ms={:.1}, all_channels_connected_to_bridge_info_ms={:.1}, bridge_info_to_property_schema_ready_ms={:.1}, property_schema_ready_to_first_service_export_ms={:.1}, first_service_export_to_last_service_export_ms={:.1}, service_export_sum_ms={:.1}, last_service_export_to_dispatcher_drain_start_ms={:.1}, dispatcher_drain_ms={:.1}, write_generated_project_ms={:.1}, sourcemap_finalize_ms={:.1}, sync_completion_ms={:.1}, total_run_ms={:.1}",
         cli_start_to_bridge_listen_ms,
         bridge_listen_to_all_channels_connected_ms,
         all_channels_connected_to_bridge_info_ms,
@@ -24607,6 +26354,7 @@ fn export_snapshots_core(
         dispatcher_drain_ms,
         write_generated_project_ms,
         sourcemap_finalize_ms,
+        sync_completion_ms,
         total_run_ms
     );
     println!(
@@ -24620,7 +26368,6 @@ fn export_snapshots_core(
         unmeasured_or_scheduler_gap_ms
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
-    record_bridge_sync_completion(bridge);
     if let ExportBridgeMode::Warm {
         prepare_next_run: true,
     } = mode
@@ -26784,14 +28531,66 @@ fn decode_compact_batch_debug_ids(
             Value::String(text) if text.is_empty() => out.push(None),
             Value::String(text) => out.push(Some(text)),
             Value::Number(number) => {
-                let string_id = number
-                    .as_u64()
-                    .with_context(|| "Compact debug id string id must be a non-negative integer")?
-                    as usize;
+                let numeric = number
+                    .as_f64()
+                    .with_context(|| format!("Compact debug id is not numeric: {number}"))?;
+                if numeric.fract() != 0.0 || numeric.abs() > 9_007_199_254_740_991.0 {
+                    bail!("Compact debug id is not an exact integer: {number}");
+                }
+                if numeric < 0.0 {
+                    let numeric_id = (-numeric - 1.0) as u64;
+                    out.push(Some(format!("0_{numeric_id}")));
+                    continue;
+                }
+                let string_id = numeric as usize;
                 out.push(Some(string_from_table(strings, string_id, "debug id")?));
             }
-            _ => bail!("Compact debug id must be a string, string id, or false"),
+            _ => bail!("Compact debug id must be a string, string id, numeric id, or false"),
         }
+    }
+    Ok(out)
+}
+
+fn decode_native_overlay_debug_ids(
+    encoded: &Value,
+    raw_fallbacks: Vec<Value>,
+    strings: &[String],
+    count: usize,
+) -> Result<Vec<Option<String>>> {
+    let bytes = decode_bridge_buffer(
+        encoded,
+        count.saturating_mul(4),
+        "Native overlay debug id buffer",
+    )?;
+    let mut out = Vec::with_capacity(count);
+    let mut sentinel = Vec::with_capacity(count);
+    for bytes in bytes.chunks_exact(4) {
+        let numeric_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let is_sentinel = numeric_id == u32::MAX;
+        sentinel.push(is_sentinel);
+        out.push((!is_sentinel).then(|| format!("0_{numeric_id}")));
+    }
+    if raw_fallbacks.len() % 2 != 0 {
+        bail!("Native overlay debug id fallbacks must contain offset/value pairs");
+    }
+    let mut seen = HashSet::new();
+    for pair in raw_fallbacks.chunks_exact(2) {
+        let offset = pair[0]
+            .as_u64()
+            .map(|value| value as usize)
+            .filter(|value| *value > 0 && *value <= count)
+            .context("Native overlay debug id fallback offset is out of range")?;
+        if !sentinel[offset - 1] {
+            bail!("Native overlay debug id fallback offset {offset} is not marked as a fallback");
+        }
+        if !seen.insert(offset) {
+            bail!("Native overlay debug id fallback offset {offset} is duplicated");
+        }
+        let value = decode_compact_batch_debug_ids(vec![pair[1].clone()], strings)?
+            .pop()
+            .flatten()
+            .context("Native overlay debug id fallback is empty")?;
+        out[offset - 1] = Some(value);
     }
     Ok(out)
 }
@@ -27293,7 +29092,10 @@ fn decode_compact_v5_ref(raw: Value, strings: &[String]) -> Result<Value> {
 
 fn compact_v5_array(raw: Value, label: &str) -> Result<Vec<Value>> {
     match raw {
-        Value::Array(values) => Ok(values),
+        Value::Array(values) => Ok(values
+            .into_iter()
+            .map(canonicalize_nonfinite_float_json)
+            .collect()),
         _ => bail!("{label} payload must be an array"),
     }
 }
@@ -27317,7 +29119,8 @@ fn decode_compact_v5_value(
     numeric_enum_values: bool,
 ) -> Result<Value> {
     match type_id {
-        TYPE_ID_BOOL | TYPE_ID_NUMBER => Ok(raw),
+        TYPE_ID_BOOL => Ok(raw),
+        TYPE_ID_NUMBER => Ok(canonicalize_nonfinite_float_json(raw)),
         TYPE_ID_STRING | TYPE_ID_CONTENT_ID | TYPE_ID_BINARY_STRING => Ok(Value::String(
             decode_compact_v5_string(raw, strings, "property string")?,
         )),
@@ -28222,6 +30025,71 @@ fn parse_compact_v5_shape_instance_items(
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "native overlay parsing keeps independently versioned payload sections explicit"
+)]
+fn parse_native_overlay_items(
+    raw_items: Value,
+    strings: Vec<String>,
+    batch_start: usize,
+    batch_count: usize,
+    property_schema_by_class: &PropertySchemaMap,
+    enum_value_names_by_type: &EnumValueNameMap,
+    numeric_enum_values: bool,
+    flat_fixed_values: bool,
+    class_names: &[String],
+) -> Result<Vec<NativeOverlayItem>> {
+    let values = match raw_items {
+        Value::Array(values) => values,
+        _ => bail!("Native overlay items must be an array"),
+    };
+    let mut out = Vec::with_capacity(values.len());
+    let mut seen = vec![false; batch_count];
+    for value in values {
+        let fields = match value {
+            Value::Array(fields) => fields,
+            _ => bail!("Native overlay item must be an array"),
+        };
+        if fields.len() != 3 && fields.len() != 5 {
+            bail!(
+                "Native overlay item must contain offset, class, attributes, and optional property fields"
+            );
+        }
+        let offset = fields[0]
+            .as_u64()
+            .map(|value| value as usize)
+            .filter(|value| *value > 0 && *value <= batch_count)
+            .context("Native overlay item offset is out of range")?;
+        if std::mem::replace(&mut seen[offset - 1], true) {
+            bail!("Native overlay item offset {offset} is duplicated");
+        }
+        let class_name = compact_class_name_from_value(fields[1].clone(), class_names)?;
+        let attributes = decode_compact_v5_attributes(fields[2].clone(), &strings)?;
+        let properties = if fields.len() == 5 {
+            compact_properties_mask_take_v5_with_schema(
+                fields[3].clone(),
+                fields[4].clone(),
+                class_name.as_str(),
+                property_schema_by_class.get(class_name.as_str()),
+                &strings,
+                enum_value_names_by_type,
+                numeric_enum_values,
+                flat_fixed_values,
+            )?
+        } else {
+            Map::new()
+        };
+        out.push(NativeOverlayItem {
+            instance_index: batch_start + offset - 1,
+            class_name,
+            properties,
+            attributes,
+        });
+    }
+    Ok(out)
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "compact-v5 instance parsing keeps independently versioned payload sections explicit"
 )]
 fn parse_compact_v5_instance_items(
@@ -29077,16 +30945,27 @@ fn fetch_script_sources(
     Ok(source_map)
 }
 
-fn resolve_direct_import_workers(requested: usize) -> usize {
-    let cpu_cap = std::thread::available_parallelism()
+fn direct_import_cpu_cap() -> usize {
+    std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(4)
         .max(2)
-        .clamp(2, 16);
+        .clamp(2, 16)
+}
+
+fn resolve_direct_import_workers(requested: usize) -> usize {
+    let cpu_cap = direct_import_cpu_cap();
     if requested > 0 {
         return requested.clamp(1, cpu_cap);
     }
     4.min(cpu_cap)
+}
+
+fn resolve_direct_import_drain_workers(requested: usize, active_workers: usize) -> usize {
+    if requested > 0 {
+        return active_workers;
+    }
+    active_workers.max(8.min(direct_import_cpu_cap()))
 }
 
 fn load_service_state(snapshot_dir: &Path, service: &str) -> Result<ServiceState> {
@@ -29201,6 +31080,33 @@ fn build_service_state_from_instances(
     properties_default_elided: bool,
 ) -> Result<ServiceState> {
     let instance_count = instances.len();
+    let can_use_dense_index_topology = properties_default_elided
+        && instances.iter().enumerate().all(|(index, instance)| {
+            instance.instance_index == Some(index + 1)
+                && instance
+                    .parent_index
+                    .is_none_or(|parent_index| parent_index > 0 && parent_index <= instances.len())
+        });
+    if can_use_dense_index_topology {
+        let service_root_index = instances
+            .iter()
+            .position(|instance| instance.instance_index == Some(1))
+            .with_context(|| format!("Snapshot missing root service instance: {service}"))?;
+        let children_by_index = build_children_by_index_from_dense_parent_indices(&instances);
+        let (source_in_subtree, script_count_in_subtree, subtree_sizes) =
+            compute_subtree_metrics(&instances, &children_by_index);
+        return Ok(ServiceState {
+            instances,
+            children_by_index,
+            source_in_subtree,
+            script_count_in_subtree,
+            subtree_sizes,
+            service_root_index,
+            class_defaults_by_class,
+            properties_default_elided,
+            dense_index_topology: true,
+        });
+    }
     let mut children_by_parent_index: HashMap<usize, Vec<usize>> =
         HashMap::with_capacity(instance_count);
     let mut children_by_parent_instance_id: HashMap<String, Vec<usize>> =
@@ -29268,13 +31174,6 @@ fn build_service_state_from_instances(
     })?;
 
     let can_use_index_topology = properties_default_elided && !children_by_parent_index.is_empty();
-    let can_use_dense_index_topology = can_use_index_topology
-        && instances.iter().enumerate().all(|(index, instance)| {
-            instance.instance_index == Some(index + 1)
-                && instance
-                    .parent_index
-                    .is_none_or(|parent_index| parent_index > 0 && parent_index <= instances.len())
-        });
     let needs_path_rebuild = !can_use_index_topology
         && instances
             .iter()
@@ -29291,37 +31190,33 @@ fn build_service_state_from_instances(
         );
     }
 
-    let children_by_index = if can_use_dense_index_topology {
-        build_children_by_index_from_dense_parent_indices(&instances)
-    } else {
-        let mut children_by_parent_path: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut children_by_parent_path: HashMap<String, Vec<usize>> = HashMap::new();
 
-        if !can_use_index_topology {
-            for (index, instance) in instances.iter().enumerate() {
-                let parent_path = instance
-                    .parent_path
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .or_else(|| derive_parent_path(&instance.path));
+    if !can_use_index_topology {
+        for (index, instance) in instances.iter().enumerate() {
+            let parent_path = instance
+                .parent_path
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| derive_parent_path(&instance.path));
 
-                if let Some(parent_path) = parent_path {
-                    children_by_parent_path
-                        .entry(parent_path)
-                        .or_default()
-                        .push(index);
-                }
+            if let Some(parent_path) = parent_path {
+                children_by_parent_path
+                    .entry(parent_path)
+                    .or_default()
+                    .push(index);
             }
         }
+    }
 
-        build_children_by_index(
-            &instances,
-            &children_by_parent_index,
-            &children_by_parent_instance_id,
-            &children_by_parent_path,
-            &children_by_parent_debug,
-        )
-    };
+    let children_by_index = build_children_by_index(
+        &instances,
+        &children_by_parent_index,
+        &children_by_parent_instance_id,
+        &children_by_parent_path,
+        &children_by_parent_debug,
+    );
     let (source_in_subtree, script_count_in_subtree, subtree_sizes) =
         compute_subtree_metrics(&instances, &children_by_index);
 
@@ -29334,7 +31229,7 @@ fn build_service_state_from_instances(
         service_root_index,
         class_defaults_by_class,
         properties_default_elided,
-        dense_index_topology: can_use_dense_index_topology,
+        dense_index_topology: false,
     })
 }
 
@@ -29823,7 +31718,7 @@ fn name_child_indices(state: &ServiceState, child_indices: &[usize]) -> Vec<(usi
 }
 
 fn maybe_enqueue_split_import_tasks(
-    sender: &mpsc::Sender<DirectImportTask>,
+    sender: &DirectImportTaskQueue,
     pending_tasks: &Arc<AtomicUsize>,
     project_root: &Path,
     src_root: &Path,
@@ -29869,9 +31764,9 @@ fn maybe_enqueue_split_import_tasks(
         return Ok(SplitImportDecision::Inline(state));
     }
 
-    let service_dir = src_root.join(sanitize_name(service));
-    fs::create_dir_all(&service_dir)
-        .with_context(|| format!("Failed to create {}", service_dir.display()))?;
+    let final_service_dir = src_root.join(sanitize_name(service));
+    let (service_dir, cleanup_required, fresh_stage) =
+        prepare_split_import_service_dir(&final_service_dir)?;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
     let split_state_setup_started = Instant::now();
@@ -29887,6 +31782,7 @@ fn maybe_enqueue_split_import_tasks(
             &settings_dir,
             compact_meta_json,
             &settings_expected_paths,
+            fresh_stage,
         )
     });
 
@@ -29900,6 +31796,9 @@ fn maybe_enqueue_split_import_tasks(
     let shared = Arc::new(SplitDirectImportState {
         service: service.to_string(),
         service_dir: service_dir.clone(),
+        final_service_dir,
+        fresh_stage,
+        cleanup_required,
         project_root: project_root.to_path_buf(),
         compact_meta_json,
         state: shared_state,
@@ -29970,7 +31869,7 @@ fn child_indices_for_split(state: &ServiceState, index: usize) -> &[usize] {
 
 fn queue_split_subtree_task(
     shared: &Arc<SplitDirectImportState>,
-    sender: &mpsc::Sender<DirectImportTask>,
+    sender: &DirectImportTaskQueue,
     pending_tasks: &Arc<AtomicUsize>,
     items: Vec<DirectImportSubtreeItem>,
 ) -> Result<()> {
@@ -29981,7 +31880,7 @@ fn queue_split_subtree_task(
     shared.queued_tasks.fetch_add(1, Ordering::AcqRel);
     pending_tasks.fetch_add(1, Ordering::AcqRel);
     let queue_send_started = Instant::now();
-    let result = sender.send(DirectImportTask::Subtree(DirectImportSubtreeTask {
+    let queued = sender.enqueue_subtree(DirectImportTask::Subtree(DirectImportSubtreeTask {
         shared: Arc::clone(shared),
         items,
     }));
@@ -29989,11 +31888,13 @@ fn queue_split_subtree_task(
         &format!("{}: split queue send", shared.service),
         queue_send_started,
     );
-    result.map_err(|err| {
+    if queued {
+        Ok(())
+    } else {
         shared.queued_tasks.fetch_sub(1, Ordering::AcqRel);
         pending_tasks.fetch_sub(1, Ordering::AcqRel);
-        anyhow::anyhow!("Failed to queue subtree import task: {err}")
-    })
+        bail!("Failed to queue subtree import task: dispatcher is closed")
+    }
 }
 
 #[expect(
@@ -30002,7 +31903,7 @@ fn queue_split_subtree_task(
 )]
 fn plan_split_import_children(
     shared: &Arc<SplitDirectImportState>,
-    sender: &mpsc::Sender<DirectImportTask>,
+    sender: &DirectImportTaskQueue,
     pending_tasks: &Arc<AtomicUsize>,
     project_root: &Path,
     parent_dir: &Path,
@@ -30106,7 +32007,7 @@ fn plan_split_import_children(
 )]
 fn plan_split_import_node(
     shared: &Arc<SplitDirectImportState>,
-    sender: &mpsc::Sender<DirectImportTask>,
+    sender: &DirectImportTaskQueue,
     pending_tasks: &Arc<AtomicUsize>,
     project_root: &Path,
     parent_dir: &Path,
@@ -30161,6 +32062,7 @@ fn plan_split_import_node(
         parent_dir,
         &fs_stem,
         shared.compact_meta_json,
+        shared.fresh_stage,
         &shared.visited,
         &shared.expected_paths,
     )?
@@ -30225,6 +32127,7 @@ fn emit_split_node_shell(
     parent_dir: &Path,
     fs_stem: &str,
     _compact_meta_json: bool,
+    fresh_stage: bool,
     visited: &Arc<Vec<AtomicBool>>,
     expected_paths: &Arc<ImportPathSets>,
 ) -> Result<Option<SplitNodeShell>> {
@@ -30249,7 +32152,7 @@ fn emit_split_node_shell(
             .and_then(Value::as_str)
             .unwrap_or("");
         let source_path = dir_path.join(source_file_name);
-        write_utf8_file(&source_path, source)?;
+        write_import_source_file(&source_path, source.as_bytes(), fresh_stage)?;
         track_expected_file(expected_paths, &source_path);
 
         return Ok(Some(SplitNodeShell {
@@ -30328,7 +32231,7 @@ fn complete_split_assembly(
             .collect::<Vec<_>>()
     };
 
-    let node = SourcemapNode {
+    let mut node = SourcemapNode {
         name: assembly.name.clone(),
         class_name: assembly.class_name.clone(),
         file_paths: assembly.file_paths.clone(),
@@ -30366,11 +32269,26 @@ fn complete_split_assembly(
             expected_path_tracking_ms(&shared.expected_paths),
         );
 
-        let cleanup_handle = spawn_cleanup_service_dir(
-            shared.service_dir.clone(),
-            Arc::clone(&shared.expected_paths),
-        );
-        join_cleanup_handle(&shared.service, cleanup_handle)?;
+        if shared.fresh_stage {
+            let staged_prefix =
+                path_to_sourcemap_relative(&shared.project_root, &shared.service_dir);
+            let final_prefix =
+                path_to_sourcemap_relative(&shared.project_root, &shared.final_service_dir);
+            rewrite_sourcemap_path_prefix(&mut node, &staged_prefix, &final_prefix);
+            fs::rename(&shared.service_dir, &shared.final_service_dir).with_context(|| {
+                format!(
+                    "Failed to publish staged service {} to {}",
+                    shared.service_dir.display(),
+                    shared.final_service_dir.display()
+                )
+            })?;
+        } else if shared.cleanup_required {
+            let cleanup_handle = spawn_cleanup_service_dir(
+                shared.service_dir.clone(),
+                Arc::clone(&shared.expected_paths),
+            );
+            join_cleanup_handle(&shared.service, cleanup_handle)?;
+        }
 
         if let Some(sender) = sourcemap_sender {
             let _ = sender.send(SourcemapWriterMessage::Service(
@@ -30405,6 +32323,22 @@ fn complete_split_assembly(
     Ok(())
 }
 
+fn rewrite_sourcemap_path_prefix(node: &mut SourcemapNode, from: &str, to: &str) {
+    for path in &mut node.file_paths {
+        if path == from {
+            *path = to.to_string();
+        } else if let Some(suffix) = path
+            .strip_prefix(from)
+            .and_then(|value| value.strip_prefix('/'))
+        {
+            *path = format!("{to}/{suffix}");
+        }
+    }
+    for child in &mut node.children {
+        rewrite_sourcemap_path_prefix(child, from, to);
+    }
+}
+
 fn process_split_subtree_task(
     task: DirectImportSubtreeTask,
     service_nodes: &Arc<Mutex<HashMap<String, SourcemapNode>>>,
@@ -30422,6 +32356,7 @@ fn process_split_subtree_task(
             &item.parent_dir,
             &item.fs_stem,
             shared.compact_meta_json,
+            shared.fresh_stage,
             &shared.visited,
             &shared.expected_paths,
         );
@@ -30474,8 +32409,7 @@ fn import_service_children(
     compact_meta_json: bool,
 ) -> Result<Vec<SourcemapNode>> {
     let service_dir = src_root.join(sanitize_name(service));
-    fs::create_dir_all(&service_dir)
-        .with_context(|| format!("Failed to create {}", service_dir.display()))?;
+    let cleanup_required = ensure_import_service_dir(&service_dir)?;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
     thread::scope(|scope| -> Result<Vec<SourcemapNode>> {
@@ -30486,6 +32420,7 @@ fn import_service_children(
                 &service_dir,
                 compact_meta_json,
                 &expected_paths,
+                false,
             )
         });
 
@@ -30503,6 +32438,7 @@ fn import_service_children(
             project_root,
             &service_dir,
             compact_meta_json,
+            false,
             &visited,
             &expected_paths,
         )?;
@@ -30518,9 +32454,11 @@ fn import_service_children(
             expected_path_tracking_ms(&expected_paths),
         );
 
-        let cleanup_handle =
-            spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
-        join_cleanup_handle(service, cleanup_handle)?;
+        if cleanup_required {
+            let cleanup_handle =
+                spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
+            join_cleanup_handle(service, cleanup_handle)?;
+        }
 
         Ok(child_nodes)
     })
@@ -30586,6 +32524,66 @@ fn expected_path_tracking_ms(expected_paths: &Arc<ImportPathSets>) -> f64 {
 
 fn service_settings_path(service_dir: &Path) -> PathBuf {
     service_dir.join(SERVICE_SETTINGS_FILE_NAME)
+}
+
+fn ensure_import_service_dir(service_dir: &Path) -> Result<bool> {
+    if let Some(parent) = service_dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    match fs::create_dir(service_dir) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && service_dir.is_dir() => {
+            Ok(true)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to create {}", service_dir.display()))
+        }
+    }
+}
+
+fn prepare_split_import_service_dir(final_service_dir: &Path) -> Result<(PathBuf, bool, bool)> {
+    match fs::metadata(final_service_dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Ok((final_service_dir.to_path_buf(), true, false));
+        }
+        Ok(_) => bail!(
+            "Import service path is not a directory: {}",
+            final_service_dir.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to stat {}", final_service_dir.display()));
+        }
+    }
+    let parent = final_service_dir
+        .parent()
+        .with_context(|| "Import service path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let service_name = final_service_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("service");
+    for _ in 0..32 {
+        let sequence = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(
+            ".{service_name}.{}-{sequence}.renium-import",
+            std::process::id()
+        ));
+        match fs::create_dir(&stage) {
+            Ok(()) => return Ok((stage, false, true)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to create {}", stage.display()));
+            }
+        }
+    }
+    bail!(
+        "Failed to allocate a staging directory for {}",
+        final_service_dir.display()
+    )
 }
 
 fn legacy_service_settings_path(service_dir: &Path) -> PathBuf {
@@ -30674,19 +32672,30 @@ fn write_service_settings_file(
     service_dir: &Path,
     _compact_meta_json: bool,
     expected_paths: &Arc<ImportPathSets>,
+    fresh_stage: bool,
 ) -> Result<()> {
-    let settings_path = writable_service_settings_path(service_dir)?;
+    let settings_path = if fresh_stage {
+        service_settings_path(service_dir)
+    } else {
+        writable_service_settings_path(service_dir)?
+    };
     track_expected_file(expected_paths, &settings_path);
-    track_expected_file(
-        expected_paths,
-        &PathBuf::from(format!("{}.lock", settings_path.display())),
-    );
+    if !fresh_stage {
+        track_expected_file(
+            expected_paths,
+            &PathBuf::from(format!("{}.lock", settings_path.display())),
+        );
+    }
     let started = Instant::now();
-    let _lock = acquire_settings_file_lock(&settings_path)?;
-    let preserved_state =
-        state_with_preserved_material_service_settings(service, state, &settings_path)?;
-    let state_to_write = preserved_state.as_ref().unwrap_or(state);
-    write_service_settings_binary_file(&settings_path, state_to_write)?;
+    if fresh_stage {
+        write_fresh_service_settings_binary_file(&settings_path, state)?;
+    } else {
+        let _lock = acquire_settings_file_lock(&settings_path)?;
+        let preserved_state =
+            state_with_preserved_material_service_settings(service, state, &settings_path)?;
+        let state_to_write = preserved_state.as_ref().unwrap_or(state);
+        write_service_settings_binary_file(&settings_path, state_to_write)?;
+    }
     log_timing(&format!("{service}: write settings file"), started);
     Ok(())
 }
@@ -30949,6 +32958,7 @@ fn emit_node_index(
     parent_dir: &Path,
     fs_stem: &str,
     _compact_meta_json: bool,
+    fresh_stage: bool,
     visited: &Arc<Vec<AtomicBool>>,
     expected_paths: &Arc<ImportPathSets>,
 ) -> Result<(Option<SourcemapNode>, ExpectedPathBatch)> {
@@ -30977,7 +32987,7 @@ fn emit_node_index(
                 .with_context(|| format!("Failed to create {}", dir_path.display()))?;
             expected.track_dir(&dir_path);
             let source_path = dir_path.join(source_file_name);
-            write_script_source_file(&source_path, source)?;
+            write_script_source_file(&source_path, source, fresh_stage)?;
             expected.track_file(&source_path);
 
             let (children, child_expected) = emit_children_indices(
@@ -30986,6 +32996,7 @@ fn emit_node_index(
                 project_root,
                 &dir_path,
                 _compact_meta_json,
+                fresh_stage,
                 visited,
                 expected_paths,
             )?;
@@ -31001,7 +33012,7 @@ fn emit_node_index(
             ));
         } else {
             let script_path = parent_dir.join(format!("{fs_stem}{leaf_suffix}"));
-            write_script_source_file(&script_path, source)?;
+            write_script_source_file(&script_path, source, fresh_stage)?;
             expected.track_file(&script_path);
 
             return Ok((
@@ -31031,6 +33042,7 @@ fn emit_node_index(
         project_root,
         &dir_path,
         _compact_meta_json,
+        fresh_stage,
         visited,
         expected_paths,
     )?;
@@ -31057,6 +33069,7 @@ fn emit_children_indices(
     project_root: &Path,
     dir_path: &Path,
     compact_meta_json: bool,
+    fresh_stage: bool,
     visited: &Arc<Vec<AtomicBool>>,
     expected_paths: &Arc<ImportPathSets>,
 ) -> Result<(Vec<SourcemapNode>, ExpectedPathBatch)> {
@@ -31082,6 +33095,7 @@ fn emit_children_indices(
                     dir_path,
                     child_stem,
                     compact_meta_json,
+                    fresh_stage,
                     visited,
                     expected_paths,
                 )
@@ -31107,6 +33121,7 @@ fn emit_children_indices(
                 dir_path,
                 &child_stem,
                 compact_meta_json,
+                fresh_stage,
                 visited,
                 expected_paths,
             )?;
@@ -31134,7 +33149,20 @@ fn child_indices_for_instance(state: &ServiceState, parent_index: usize) -> &[us
         .unwrap_or(&[])
 }
 
-fn write_script_source_file(source_path: &Path, source: &str) -> Result<()> {
+fn write_import_source_file(source_path: &Path, content: &[u8], fresh_stage: bool) -> Result<()> {
+    if !fresh_stage {
+        return write_bytes_if_changed_in_existing_dir(source_path, content);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(source_path)
+        .with_context(|| format!("Failed to create {}", source_path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("Failed to write {}", source_path.display()))
+}
+
+fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool) -> Result<()> {
     if source == "__SOURCE_EXTERNAL__" {
         if source_path.exists() {
             println!(
@@ -31147,9 +33175,9 @@ fn write_script_source_file(source_path: &Path, source: &str) -> Result<()> {
             "[renium] warning: missing fetched Source for {}; writing an empty script",
             source_path.display()
         );
-        return write_utf8_file(source_path, "");
+        return write_import_source_file(source_path, b"", fresh_stage);
     }
-    write_utf8_file(source_path, source)
+    write_import_source_file(source_path, source.as_bytes(), fresh_stage)
 }
 
 fn script_file_names(class_name: &str) -> Option<(&'static str, &'static str)> {
@@ -31871,7 +33899,12 @@ fn write_bytes_if_changed(path: &Path, content: &[u8]) -> Result<()> {
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    if file_contents_match(path, content)? {
+    write_bytes_if_changed_in_existing_dir(path, content)
+}
+
+fn write_bytes_if_changed_in_existing_dir(path: &Path, content: &[u8]) -> Result<()> {
+    let (contents_match, was_readonly) = file_contents_match(path, content)?;
+    if contents_match {
         return Ok(());
     }
 
@@ -31881,13 +33914,21 @@ fn write_bytes_if_changed(path: &Path, content: &[u8]) -> Result<()> {
         return Err(error).with_context(|| format!("Failed to write {}", temp_path.display()));
     }
 
-    publish_sibling_temp(&temp_path, path)
+    publish_sibling_temp_with_permissions(&temp_path, path, was_readonly)
 }
 
 fn publish_sibling_temp(temp_path: &Path, path: &Path) -> Result<()> {
     let was_readonly = fs::metadata(path)
         .map(|meta| meta.permissions().readonly())
         .unwrap_or(false);
+    publish_sibling_temp_with_permissions(temp_path, path, was_readonly)
+}
+
+fn publish_sibling_temp_with_permissions(
+    temp_path: &Path,
+    path: &Path,
+    was_readonly: bool,
+) -> Result<()> {
     if was_readonly {
         set_path_readonly(path, false)?;
     }
@@ -31913,15 +33954,16 @@ fn sibling_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn file_contents_match(path: &Path, content: &[u8]) -> Result<bool> {
+fn file_contents_match(path: &Path, content: &[u8]) -> Result<(bool, bool)> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((false, false)),
         Err(err) => return Err(err).with_context(|| format!("Failed to stat {}", path.display())),
     };
+    let was_readonly = metadata.permissions().readonly();
 
     if metadata.len() != content.len() as u64 {
-        return Ok(false);
+        return Ok((false, was_readonly));
     }
 
     const COMPARE_BUF_SIZE: usize = 1024 * 1024;
@@ -31935,12 +33977,12 @@ fn file_contents_match(path: &Path, content: &[u8]) -> Result<bool> {
             .read_exact(&mut buffer[..want])
             .with_context(|| format!("Failed to read {}", path.display()))?;
         if buffer[..want] != content[offset..offset + want] {
-            return Ok(false);
+            return Ok((false, was_readonly));
         }
         offset += want;
     }
 
-    Ok(true)
+    Ok((true, was_readonly))
 }
 
 fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Result<()> {
