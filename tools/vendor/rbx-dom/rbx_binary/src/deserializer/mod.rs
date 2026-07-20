@@ -2,9 +2,17 @@ mod error;
 mod header;
 mod state;
 
-use std::{io::Read, str};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+    str,
+    sync::Arc,
+};
 
-use rbx_dom_weak::WeakDom;
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    Ustr, WeakDom,
+};
 use rbx_reflection::ReflectionDatabase;
 
 use self::state::DeserializerState;
@@ -13,6 +21,21 @@ use self::state::DeserializerState;
 pub(crate) use self::header::FileHeader;
 
 pub use self::error::Error;
+
+#[allow(missing_docs)]
+pub struct FlatInstance {
+    pub referent: Ref,
+    pub parent_index: Option<usize>,
+    pub name: String,
+    pub class: Ustr,
+    pub properties: Vec<(Ustr, Variant)>,
+}
+
+#[allow(missing_docs)]
+pub struct FlatDom {
+    pub root_indices: Vec<usize>,
+    pub instances: Vec<FlatInstance>,
+}
 
 /// A configurable deserializer for Roblox binary models and places.
 ///
@@ -49,6 +72,8 @@ pub use self::error::Error;
 /// [reflection_database]: Deserializer#method.reflection_database
 pub struct Deserializer<'db> {
     database: &'db ReflectionDatabase<'db>,
+    elide_defaults: bool,
+    flat_property_filter: Option<Arc<HashMap<String, HashSet<String>>>>,
 }
 
 impl<'db> Deserializer<'db> {
@@ -56,13 +81,30 @@ impl<'db> Deserializer<'db> {
     pub fn new() -> Self {
         Self {
             database: rbx_reflection_database::get().unwrap(),
+            elide_defaults: false,
+            flat_property_filter: None,
         }
     }
 
     /// Sets what reflection database for the deserializer to use.
     #[inline]
-    pub fn reflection_database(self, database: &'db ReflectionDatabase<'db>) -> Self {
-        Self { database }
+    pub fn reflection_database(mut self, database: &'db ReflectionDatabase<'db>) -> Self {
+        self.database = database;
+        self
+    }
+
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn elide_defaults(mut self, enabled: bool) -> Self {
+        self.elide_defaults = enabled;
+        self
+    }
+
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn flat_property_filter(mut self, filter: Arc<HashMap<String, HashSet<String>>>) -> Self {
+        self.flat_property_filter = Some(filter);
+        self
     }
 
     /// Deserialize a Roblox binary model or place from the given stream using
@@ -70,7 +112,7 @@ impl<'db> Deserializer<'db> {
     pub fn deserialize<R: Read>(&self, reader: R) -> Result<WeakDom, Error> {
         profiling::scope!("rbx_binary::deserialize");
 
-        let mut deserializer = DeserializerState::new(self, reader)?;
+        let mut deserializer = DeserializerState::new(self, reader, false)?;
 
         loop {
             let chunk = deserializer.next_chunk()?;
@@ -93,6 +135,35 @@ impl<'db> Deserializer<'db> {
         }
 
         Ok(deserializer.finish())
+    }
+
+    #[allow(missing_docs)]
+    pub fn deserialize_flat<R: Read>(&self, reader: R) -> Result<FlatDom, Error> {
+        profiling::scope!("rbx_binary::deserialize_flat");
+
+        let mut deserializer = DeserializerState::new(self, reader, true)?;
+
+        loop {
+            let chunk = deserializer.next_chunk()?;
+
+            match &chunk.name {
+                b"META" => deserializer.decode_meta_chunk(&chunk.data)?,
+                b"SSTR" => deserializer.decode_sstr_chunk(&chunk.data)?,
+                b"INST" => deserializer.decode_inst_chunk(&chunk.data)?,
+                b"PROP" => deserializer.decode_prop_chunk(&chunk.data)?,
+                b"PRNT" => deserializer.decode_prnt_chunk(&chunk.data)?,
+                b"END\0" => {
+                    deserializer.decode_end_chunk(&chunk.data)?;
+                    break;
+                }
+                _ => match str::from_utf8(&chunk.name) {
+                    Ok(name) => log::info!("Unknown binary chunk name {name}"),
+                    Err(_) => log::info!("Unknown binary chunk name {:?}", chunk.name),
+                },
+            }
+        }
+
+        Ok(deserializer.finish_flat())
     }
 }
 

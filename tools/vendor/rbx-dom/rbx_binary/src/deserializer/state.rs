@@ -20,7 +20,7 @@ use crate::{
     types::Type,
 };
 
-use super::{error::InnerError, header::FileHeader, Deserializer};
+use super::{error::InnerError, header::FileHeader, Deserializer, FlatDom, FlatInstance};
 
 pub(super) struct DeserializerState<'db, R> {
     /// The user-provided configuration that we should use.
@@ -47,19 +47,20 @@ pub(super) struct DeserializerState<'db, R> {
 
     /// Key into `instances`.  Contains a Ref to sidestep
     /// mutable + immutable aliasing when reading Content and Ref properties.
-    instance_key_by_ref: HashMap<i32, InstanceKey>,
+    instance_key_by_ref: InstanceKeyLookup,
 
     /// All of the instances known by the deserializer.
     instances: Vec<Instance>,
 
     /// Referents for all of the instances with no parent, in order they appear
     /// in the file.
-    root_instance_refs: Vec<i32>,
+    root_instances: Vec<(i32, usize)>,
 
     /// Contains a set of unknown type IDs that we've encountered so far while
     /// deserializing this file. We use this map in order to ensure we only
     /// print one warning per unknown type ID when deserializing a file.
     unknown_type_ids: HashSet<u8>,
+    flat: bool,
 }
 
 /// Represents a unique instance class. Binary models define all their instance
@@ -78,9 +79,68 @@ struct TypeInfo<'db> {
 
 /// A key into an array of instances which also contains the instance ref
 /// to sidestep mutable + immutable aliasing.
+#[derive(Clone, Copy)]
 struct InstanceKey {
     key: usize,
     referent: Ref,
+}
+
+struct InstanceKeyLookup {
+    dense: Option<Vec<Option<InstanceKey>>>,
+    sparse: HashMap<i32, InstanceKey>,
+}
+
+impl InstanceKeyLookup {
+    fn new(capacity: usize, dense: bool) -> Self {
+        Self {
+            dense: dense.then(|| vec![None; capacity]),
+            sparse: if dense {
+                HashMap::new()
+            } else {
+                HashMap::with_capacity(capacity)
+            },
+        }
+    }
+
+    fn insert(&mut self, referent: i32, key: InstanceKey) -> Option<InstanceKey> {
+        if referent >= 0 {
+            if let Some(slot) = self
+                .dense
+                .as_mut()
+                .and_then(|entries| entries.get_mut(referent as usize))
+            {
+                return slot.replace(key);
+            }
+        }
+        self.sparse.insert(referent, key)
+    }
+
+    fn get(&self, referent: &i32) -> Option<&InstanceKey> {
+        if *referent >= 0 {
+            if let Some(key) = self
+                .dense
+                .as_ref()
+                .and_then(|entries| entries.get(*referent as usize))
+                .and_then(Option::as_ref)
+            {
+                return Some(key);
+            }
+        }
+        self.sparse.get(referent)
+    }
+
+    fn remove(&mut self, referent: &i32) -> Option<InstanceKey> {
+        if *referent >= 0 {
+            if let Some(slot) = self
+                .dense
+                .as_mut()
+                .and_then(|entries| entries.get_mut(*referent as usize))
+            {
+                return slot.take();
+            }
+        }
+        self.sparse.remove(referent)
+    }
 }
 
 /// Contains all the information we need to gather in order to construct an
@@ -91,7 +151,8 @@ struct Instance {
     builder: InstanceBuilder,
 
     /// Document-defined IDs for the children of this instance.
-    children: Vec<i32>,
+    children: Vec<(i32, usize)>,
+    has_name: bool,
 }
 
 /// Properties may be serialized under different names or types than
@@ -104,6 +165,8 @@ struct CanonicalProperty<'db> {
     name: Ustr,
     ty: VariantType,
     migration: Option<&'db PropertySerialization<'db>>,
+    default_value: Option<&'db Variant>,
+    migration_default_values: Vec<(Ustr, &'db Variant)>,
 }
 
 fn find_canonical_property<'de>(
@@ -157,6 +220,8 @@ fn find_canonical_property<'de>(
                 name: canonical_name.into(),
                 ty: canonical_type,
                 migration,
+                default_value: None,
+                migration_default_values: Vec::new(),
             })
         }
         None => {
@@ -174,9 +239,40 @@ fn find_canonical_property<'de>(
                 name: prop_name.into(),
                 ty: canonical_type,
                 migration: None,
+                default_value: None,
+                migration_default_values: Vec::new(),
             })
         }
     }
+}
+
+fn populate_canonical_property_defaults<'db>(
+    database: &'db ReflectionDatabase,
+    class_descriptor: Option<&'db ClassDescriptor<'db>>,
+    property: &mut CanonicalProperty<'db>,
+) {
+    if property.migration.is_none() {
+        property.default_value = class_descriptor
+            .and_then(|class| database.find_default_property(class, property.name.as_str()));
+        return;
+    }
+    property.migration_default_values = property
+        .migration
+        .and_then(|serialization| match serialization {
+            PropertySerialization::Migrate(migration) => Some(
+                migration
+                    .new_property_names()
+                    .iter()
+                    .filter_map(|name| {
+                        class_descriptor
+                            .and_then(|class| database.find_default_property(class, name))
+                            .map(|value| ((*name).into(), value))
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
 }
 
 fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty, value: Variant) {
@@ -185,10 +281,19 @@ fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty,
         match migration.perform(&value) {
             Ok(new_value) => {
                 for &new_property_name in migration.new_property_names() {
+                    if canonical_property
+                        .migration_default_values
+                        .iter()
+                        .any(|(name, value)| {
+                            name.as_str() == new_property_name && *value == &new_value
+                        })
+                    {
+                        continue;
+                    }
                     if !instance.builder.has_property(new_property_name) {
                         log::trace!(
-                                "Attempting to migrate property {old_property_name} to {new_property_name}"
-                            );
+                            "Attempting to migrate property {old_property_name} to {new_property_name}"
+                        );
 
                         instance
                             .builder
@@ -202,6 +307,9 @@ fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty,
             }
         };
     } else {
+        if canonical_property.default_value == Some(&value) {
+            return;
+        }
         instance
             .builder
             .add_property(canonical_property.name, value)
@@ -212,16 +320,19 @@ impl<'db, R: Read> DeserializerState<'db, R> {
     pub(super) fn new(
         deserializer: &'db Deserializer<'db>,
         mut input: R,
+        flat: bool,
     ) -> Result<Self, InnerError> {
         let mut tree = WeakDom::new(InstanceBuilder::new("DataModel"));
 
         let header = FileHeader::decode(&mut input)?;
 
         let type_infos = HashMap::with_capacity(header.num_types as usize);
-        let instance_key_by_ref = HashMap::with_capacity(1 + header.num_instances as usize);
+        let instance_key_by_ref = InstanceKeyLookup::new(1 + header.num_instances as usize, flat);
         let instances = Vec::with_capacity(1 + header.num_instances as usize);
 
-        tree.reserve(header.num_instances as usize);
+        if !flat {
+            tree.reserve(header.num_instances as usize);
+        }
 
         Ok(DeserializerState {
             deserializer,
@@ -232,8 +343,9 @@ impl<'db, R: Read> DeserializerState<'db, R> {
             type_infos,
             instance_key_by_ref,
             instances,
-            root_instance_refs: Vec::new(),
+            root_instances: Vec::new(),
             unknown_type_ids: HashSet::new(),
+            flat,
         })
     }
 
@@ -293,7 +405,14 @@ impl<'db, R: Read> DeserializerState<'db, R> {
 
         let (class_descriptor, prop_capacity) =
             if let Some(class) = self.deserializer.database.classes.get(type_name.as_str()) {
-                (Some(class), class.default_properties.len())
+                (
+                    Some(class),
+                    if self.deserializer.elide_defaults {
+                        0
+                    } else {
+                        class.default_properties.len()
+                    },
+                )
             } else {
                 (None, 0)
             };
@@ -302,8 +421,15 @@ impl<'db, R: Read> DeserializerState<'db, R> {
 
         let start = self.instances.len();
         for (key, referent) in referents.enumerate() {
-            let builder =
-                InstanceBuilder::with_property_capacity(type_name.as_str(), prop_capacity);
+            let builder = if self.flat {
+                InstanceBuilder::with_referent_and_property_capacity(
+                    type_name.as_str(),
+                    Ref::some((start + key + 1) as u128),
+                    prop_capacity,
+                )
+            } else {
+                InstanceBuilder::with_property_capacity(type_name.as_str(), prop_capacity)
+            };
 
             let replaced_referent = self.instance_key_by_ref.insert(
                 referent,
@@ -321,6 +447,7 @@ impl<'db, R: Read> DeserializerState<'db, R> {
             self.instances.push(Instance {
                 builder,
                 children: Vec::new(),
+                has_name: false,
             });
         }
         let end = self.instances.len();
@@ -403,9 +530,9 @@ impl<'db, R: Read> DeserializerState<'db, R> {
 
             for instance in instances {
                 let binary_string = chunk.read_binary_string()?;
-                let value = match std::str::from_utf8(&binary_string) {
-                    Ok(value) => value.to_owned(),
-                    Err(_) => {
+                let value = match String::from_utf8(binary_string) {
+                    Ok(value) => value,
+                    Err(error) => {
                         log::warn!(
                             "Performing lossy string conversion on property {}.{} because it did not contain UTF-8.
 This may cause unexpected or broken behavior in your final results if you rely on this property being non UTF-8.",
@@ -413,16 +540,28 @@ This may cause unexpected or broken behavior in your final results if you rely o
                             prop_name
                         );
 
-                        String::from_utf8_lossy(binary_string.as_ref()).into_owned()
+                        String::from_utf8_lossy(error.as_bytes()).into_owned()
                     }
                 };
                 instance.builder.set_name(value);
+                instance.has_name = true;
             }
 
             return Ok(());
         }
 
-        let property = if let Some(property) = find_canonical_property(
+        if self.flat
+            && self
+                .deserializer
+                .flat_property_filter
+                .as_ref()
+                .and_then(|filter| filter.get(type_name.as_str()))
+                .is_some_and(|allowed| !allowed.contains(prop_name.as_str()))
+        {
+            return Ok(());
+        }
+
+        let mut property = if let Some(property) = find_canonical_property(
             self.deserializer.database,
             binary_type,
             class_descriptor,
@@ -433,6 +572,35 @@ This may cause unexpected or broken behavior in your final results if you rely o
             return Ok(());
         };
 
+        if self.flat
+            && self
+                .deserializer
+                .flat_property_filter
+                .as_ref()
+                .and_then(|filter| filter.get(type_name.as_str()))
+                .is_some_and(|allowed| {
+                    !allowed.contains(property.name.as_str())
+                        && !property.migration.is_some_and(|serialization| {
+                            let PropertySerialization::Migrate(migration) = serialization else {
+                                return false;
+                            };
+                            migration
+                                .new_property_names()
+                                .iter()
+                                .any(|name| allowed.contains(*name))
+                        })
+                })
+        {
+            return Ok(());
+        }
+        if self.deserializer.elide_defaults {
+            populate_canonical_property_defaults(
+                self.deserializer.database,
+                class_descriptor,
+                &mut property,
+            );
+        }
+
         let canonical_type = property.ty;
 
         match binary_type {
@@ -440,9 +608,9 @@ This may cause unexpected or broken behavior in your final results if you rely o
                 VariantType::String => {
                     for instance in instances {
                         let binary_string = chunk.read_binary_string()?;
-                        let value = match std::str::from_utf8(&binary_string) {
-                            Ok(value) => value.to_owned(),
-                            Err(_) => {
+                        let value = match String::from_utf8(binary_string) {
+                            Ok(value) => value,
+                            Err(error) => {
                                 log::warn!(
                             "Performing lossy string conversion on property {}.{} because it did not contain UTF-8.
 This may cause unexpected or broken behavior in your final results if you rely on this property being non UTF-8.",
@@ -450,7 +618,7 @@ This may cause unexpected or broken behavior in your final results if you rely o
                                     property.name
                                 );
 
-                                String::from_utf8_lossy(&binary_string).into_owned()
+                                String::from_utf8_lossy(error.as_bytes()).into_owned()
                             }
                         };
 
@@ -1276,7 +1444,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                         prop_name,
                         valid_type_names: "SharedString",
                         actual_type_name: format!("{invalid_type:?}"),
-                    })
+                    });
                 }
             },
             Type::OptionalCFrame => match canonical_type {
@@ -1488,11 +1656,22 @@ rbx-dom may require changes to fully support this property. Please open an issue
         let parents = chunk.read_referent_array(number_objects as usize)?;
 
         for (id, parent_ref) in subjects.zip(parents) {
+            let child_key = self
+                .instance_key_by_ref
+                .get(&id)
+                .ok_or(InnerError::MissingReferent { referent: id })?
+                .key;
             if parent_ref == -1 {
-                self.root_instance_refs.push(id);
+                self.root_instances.push((id, child_key));
             } else {
-                let instance_key = self.instance_key_by_ref[&parent_ref].key;
-                self.instances[instance_key].children.push(id);
+                let instance_key = self
+                    .instance_key_by_ref
+                    .get(&parent_ref)
+                    .ok_or(InnerError::MissingReferent {
+                        referent: parent_ref,
+                    })?
+                    .key;
+                self.instances[instance_key].children.push((id, child_key));
             }
         }
 
@@ -1525,30 +1704,73 @@ rbx-dom may require changes to fully support this property. Please open an issue
         // tree. Because of the way rbx_dom_weak generally works, we need to
         // start at the top of the tree to begin construction.
         let root_ref = self.tree.root_ref();
-        for &referent in &self.root_instance_refs {
-            instances_to_construct.push_back((referent, root_ref));
+        for &(referent, instance_key) in &self.root_instances {
+            instances_to_construct.push_back((referent, instance_key, root_ref));
         }
 
         // Ensure we hit the global ustr lock array only once
         let empty_ustr = Ustr::default();
 
-        while let Some((referent, parent_ref)) = instances_to_construct.pop_front() {
+        while let Some((referent, instance_key, parent_ref)) = instances_to_construct.pop_front() {
             // We need to drain the instances Vec in a random order without
             // disturbing the indices. Replace each instance with an impostor!
             // We guarantee this is done once by removing the key from `instance_key_by_ref`.
-            let instance_key = self.instance_key_by_ref.remove(&referent).unwrap().key;
             let impostor = Instance {
-                builder: InstanceBuilder::new(empty_ustr),
+                builder: InstanceBuilder::empty_without_referent().with_class(empty_ustr),
                 children: Vec::new(),
+                has_name: false,
             };
             let instance = core::mem::replace(&mut self.instances[instance_key], impostor);
             let id = self.tree.insert(parent_ref, instance.builder);
 
-            for referent in instance.children {
-                instances_to_construct.push_back((referent, id));
+            self.instance_key_by_ref.remove(&referent);
+            for (child_referent, child_key) in instance.children {
+                instances_to_construct.push_back((child_referent, child_key, id));
             }
         }
 
         self.tree
+    }
+
+    pub(super) fn finish_flat(self) -> FlatDom {
+        let mut instances = Vec::with_capacity(self.instances.len());
+        let mut root_indices = Vec::with_capacity(self.root_instances.len());
+        let mut stack = Vec::with_capacity(self.root_instances.len());
+        for (_, instance_key) in self.root_instances.iter().rev() {
+            stack.push((*instance_key, None));
+        }
+        let mut source_instances = self.instances.into_iter().map(Some).collect::<Vec<_>>();
+        while let Some((instance_key, parent_index)) = stack.pop() {
+            let instance = source_instances[instance_key]
+                .take()
+                .unwrap_or_else(|| Instance {
+                    builder: InstanceBuilder::empty_without_referent(),
+                    children: Vec::new(),
+                    has_name: false,
+                });
+            let index = instances.len();
+            if parent_index.is_none() {
+                root_indices.push(index);
+            }
+            for (_, child_key) in instance.children.iter().rev() {
+                stack.push((*child_key, Some(index)));
+            }
+            let mut builder = instance.builder;
+            if !instance.has_name {
+                builder.set_name_to_class();
+            }
+            let (referent, name, class, properties, _) = builder.into_raw_parts();
+            instances.push(FlatInstance {
+                referent,
+                parent_index,
+                name,
+                class,
+                properties,
+            });
+        }
+        FlatDom {
+            root_indices,
+            instances,
+        }
     }
 }

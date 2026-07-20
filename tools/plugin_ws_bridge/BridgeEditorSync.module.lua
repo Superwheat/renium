@@ -2862,11 +2862,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(binaryExports)
 		local exportId = tostring(params.exportId or "")
+		local partitioned = params.partitioned == true
 		if exportId == "" then
 			error("Invalid native export id")
 		end
-		for key in pairs(binaryExports) do
+		for key, previous in pairs(binaryExports) do
 			binaryExports[key] = nil
+			if type(previous) == "table" and type(previous.onExpire) == "function" then
+				local okExpire, expireError = pcall(previous.onExpire)
+				if not okExpire then
+					warn("[Renium] native export cleanup failed: " .. tostring(expireError))
+				end
+			end
 		end
 		local serviceNames = {}
 		for serviceName, allowed in pairs(ctx.allowedServices) do
@@ -2875,9 +2882,32 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		table.sort(serviceNames)
+		if partitioned and type(params.serviceOrder) == "table" then
+			local allowedByName = {}
+			for _, serviceName in ipairs(serviceNames) do
+				allowedByName[serviceName] = true
+			end
+			local orderedNames = {}
+			local included = {}
+			for _, rawServiceName in ipairs(params.serviceOrder) do
+				local serviceName = tostring(rawServiceName)
+				if allowedByName[serviceName] and not included[serviceName] then
+					included[serviceName] = true
+					orderedNames[#orderedNames + 1] = serviceName
+				end
+			end
+			for _, serviceName in ipairs(serviceNames) do
+				if not included[serviceName] then
+					orderedNames[#orderedNames + 1] = serviceName
+				end
+			end
+			serviceNames = orderedNames
+		end
 		local roots = {}
 		local markers = {}
 		local groups = {}
+		local groupByService = {}
+		local rootsByService = {}
 		for _, serviceName in ipairs(serviceNames) do
 			local service = game:GetService(serviceName)
 			local marker = Instance.new("Folder")
@@ -2889,52 +2919,216 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				CollectionService:AddTag(marker, tag)
 			end
 			markers[#markers + 1] = marker
-			roots[#roots + 1] = marker
 			local children = service:GetChildren()
-			local rootProperties = {}
-			if type(ctx.readRootProperties) == "function" then
-				local values = ctx.readRootProperties(serviceName)
-				if type(values) == "table" then
-					rootProperties = values
+			local groupRoots = table.create(#children + 1)
+			groupRoots[1] = marker
+			for _, child in ipairs(children) do
+				groupRoots[#groupRoots + 1] = child
+			end
+			rootsByService[serviceName] = groupRoots
+			if not partitioned then
+				for _, root in ipairs(groupRoots) do
+					roots[#roots + 1] = root
 				end
 			end
-			groups[#groups + 1] = {
+			local group = {
 				service = serviceName,
 				targetPath = { serviceName },
 				count = #children,
-				rootProperties = rootProperties,
+				rootProperties = {},
 			}
-			for _, child in ipairs(children) do
-				roots[#roots + 1] = child
-			end
+			groups[#groups + 1] = group
+			groupByService[serviceName] = group
 		end
-		local ok, payload = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
-		for _, marker in ipairs(markers) do
-			marker:Destroy()
-		end
-		if not ok then
-			error(payload, 0)
-		end
-		local totalBytes = buffer.len(payload)
-		if totalBytes > 536870912 then
-			error("Native export exceeds the supported size")
-		end
-		binaryExports[exportId] = {
-			payload = payload,
+		local session: { [string]: any } = {
 			groups = groups,
-			totalBytes = totalBytes,
+			serviceNames = serviceNames,
+			nativeStates = {},
+			usesDedicatedNativeStates = type(ctx.prepareNativeState) == "function",
+			partitioned = partitioned,
+			status = "pending",
+			structureChanged = false,
+			structureConnections = {},
+			payloads = {},
+			payloadErrors = {},
+			payloadReadyEvent = Instance.new("BindableEvent"),
+			pendingPayloads = if partitioned then #groups else 1,
 			updatedAt = os.clock(),
 		}
-		armSessionExpiry(binaryExports, exportId, binaryExports[exportId])
+		for _, serviceName in ipairs(serviceNames) do
+			local service = game:GetService(serviceName)
+			session.structureConnections[#session.structureConnections + 1] = service.DescendantAdded:Connect(function()
+				session.structureChanged = true
+			end)
+			session.structureConnections[#session.structureConnections + 1] = service.DescendantRemoving:Connect(function()
+				session.structureChanged = true
+			end)
+		end
+		session.onExpire = function()
+			if session.released then
+				return
+			end
+			session.cancelled = true
+			session.released = true
+			for _, connection in ipairs(session.structureConnections) do
+				connection:Disconnect()
+			end
+			table.clear(session.structureConnections)
+			table.clear(session.nativeStates)
+			session.payloadReadyEvent:Destroy()
+			if not session.usesDedicatedNativeStates then
+				for _, serviceName in ipairs(serviceNames) do
+					ctx.releaseService(serviceName)
+				end
+			end
+		end
+		binaryExports[exportId] = session
+		armSessionExpiry(binaryExports, exportId, session)
+		local function completePayload(serviceName: string?, marker: Instance?, ok: boolean, payload: any)
+			if marker then
+				marker:Destroy()
+			end
+			if session.cancelled then
+				return
+			end
+			if not ok then
+				if serviceName then
+					session.payloadErrors[serviceName] = tostring(payload)
+				else
+					session.error = tostring(payload)
+				end
+			else
+				local totalBytes = buffer.len(payload)
+				if totalBytes > 536870912 then
+					local message = "Native export exceeds the supported size"
+					if serviceName then
+						session.payloadErrors[serviceName] = message
+					else
+						session.error = message
+					end
+				elseif serviceName then
+					session.payloads[serviceName] = payload
+				else
+					session.payload = payload
+					session.totalBytes = totalBytes
+				end
+			end
+			session.pendingPayloads -= 1
+			if session.pendingPayloads == 0 then
+				session.status = if session.error or next(session.payloadErrors) then "failed" else "ready"
+			end
+			session.updatedAt = os.clock()
+			session.payloadReadyEvent:Fire()
+		end
+		if partitioned then
+			local serializerWorkerCount =
+				math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
+			local nextSerializationIndex = 0
+			for _ = 1, serializerWorkerCount do
+				task.spawn(function()
+					while not session.cancelled do
+						nextSerializationIndex += 1
+						local group = groups[nextSerializationIndex]
+						if group == nil then
+							break
+						end
+						local ok, payload = pcall(
+							SerializationService.SerializeInstancesAsync,
+							SerializationService,
+							rootsByService[group.service]
+						)
+						completePayload(group.service, rootsByService[group.service][1], ok, payload)
+					end
+				end)
+			end
+		else
+			task.spawn(function()
+				local ok, payload = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
+				for _, marker in ipairs(markers) do
+					marker:Destroy()
+				end
+				completePayload(nil, nil, ok, payload)
+			end)
+		end
+		local propertySchemaByClass = {}
+		local enumValueNamesByType = {}
+		local instanceCount = 0
+		for _, serviceName in ipairs(serviceNames) do
+			local state = if session.usesDedicatedNativeStates
+				then ctx.prepareNativeState(serviceName)
+				else ctx.getState(serviceName)
+			session.nativeStates[serviceName] = state
+			local instances = state.instances or {}
+			local group = groupByService[serviceName]
+			if type(ctx.readRootProperties) == "function" then
+				local values = ctx.readRootProperties(serviceName)
+				if type(values) == "table" then
+					group.rootProperties = values
+				end
+			end
+			group.instanceCount = #instances
+			group.classNames = state.classNames or {}
+			instanceCount += #instances
+			local nonArchivableInstance = if state.nativeExportOnly then state.nonArchivableInstance else nil
+			if not state.nativeExportOnly then
+				for _, instance in ipairs(instances) do
+					if not instance.Archivable then
+						nonArchivableInstance = instance
+						break
+					end
+				end
+			end
+			if nonArchivableInstance then
+				binaryExports[exportId] = nil
+				session.onExpire()
+				return {
+					ok = true,
+					supported = false,
+					reason = "Archivable is disabled on " .. nonArchivableInstance:GetFullName(),
+					instanceCount = instanceCount,
+				}
+			end
+			for _, className in ipairs(state.classNames or {}) do
+				if propertySchemaByClass[className] == nil then
+					local schema = ctx.getPropertySchema(className)
+					propertySchemaByClass[className] = schema
+					for _, entry in ipairs(schema) do
+						local enumType = entry[3]
+						if type(enumType) == "string" and enumValueNamesByType[enumType] == nil then
+							local names = ctx.getEnumValueNames(enumType)
+							if type(names) == "table" then
+								enumValueNamesByType[enumType] = names
+							end
+						end
+					end
+				end
+			end
+		end
 		return {
 			ok = true,
 			exportId = exportId,
-			totalBytes = totalBytes,
 			groups = groups,
+			instanceCount = instanceCount,
+			propertySchemaByClass = propertySchemaByClass,
+			enumValueNamesByType = enumValueNamesByType,
+			pending = session.status == "pending",
+			supported = true,
 		}
 	end
 
-	function api.readBinaryExport(params: { [string]: any }): { [string]: any }
+	function api.getBinaryExportState(exportId: string, serviceName: string): any
+		local session = binaryExports[exportId]
+		if type(session) ~= "table" then
+			error("Native export session was not found")
+		end
+		local state = session.nativeStates and session.nativeStates[serviceName]
+		if state == nil then
+			error("Native export service state was not found")
+		end
+		return state
+	end
+
+	function api.awaitBinaryExport(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(binaryExports)
 		local exportId = tostring(params.exportId or "")
 		local session = binaryExports[exportId]
@@ -2942,31 +3136,190 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Native export session was not found")
 		end
 		armSessionExpiry(binaryExports, exportId, session)
+		if session.structureChanged then
+			error("Studio structure changed during native export")
+		end
+		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 30, 1, 120)
+		local deadline = os.clock() + timeoutSeconds
+		local serviceName = tostring(params.service or "")
+		local partitionedService = session.partitioned and serviceName ~= ""
+		if partitionedService and session.nativeStates[serviceName] == nil then
+			error("Native export service was not found")
+		end
+		local timeoutThread = task.delay(timeoutSeconds, function()
+			if binaryExports[exportId] == session then
+				session.payloadReadyEvent:Fire()
+			end
+		end)
+		if partitionedService then
+			while
+				session.payloads[serviceName] == nil
+				and session.payloadErrors[serviceName] == nil
+				and os.clock() < deadline
+			do
+				session.payloadReadyEvent.Event:Wait()
+			end
+		else
+			while session.status == "pending" and os.clock() < deadline do
+				session.payloadReadyEvent.Event:Wait()
+			end
+		end
+		if coroutine.status(timeoutThread) ~= "dead" then
+			task.cancel(timeoutThread)
+		end
+		if
+			(
+				partitionedService
+				and session.payloads[serviceName] == nil
+				and session.payloadErrors[serviceName] == nil
+			)
+			or (not partitionedService and session.status == "pending")
+		then
+			error("Native export serialization timed out")
+		end
+		if session.structureChanged then
+			error("Studio structure changed during native export")
+		end
+		if partitionedService then
+			local payloadError = session.payloadErrors[serviceName]
+			if payloadError then
+				error(payloadError, 0)
+			end
+			local payload = session.payloads[serviceName]
+			return {
+				ok = true,
+				exportId = exportId,
+				service = serviceName,
+				totalBytes = buffer.len(payload),
+			}
+		end
+		if session.status ~= "ready" then
+			error(session.error or "Native export serialization failed", 0)
+		end
+		return {
+			ok = true,
+			exportId = exportId,
+			totalBytes = session.totalBytes,
+		}
+	end
+
+	function api.getBinaryExportStatus(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryExports)
+		local exportId = tostring(params.exportId or "")
+		local serviceName = tostring(params.service or "")
+		local session = binaryExports[exportId]
+		if type(session) ~= "table" then
+			error("Native export session was not found")
+		end
+		armSessionExpiry(binaryExports, exportId, session)
+		if session.structureChanged then
+			error("Studio structure changed during native export")
+		end
+		if session.partitioned and serviceName ~= "" then
+			local payloadError = session.payloadErrors[serviceName]
+			if payloadError then
+				error(payloadError, 0)
+			end
+			local payload = session.payloads[serviceName]
+			if payload == nil then
+				return {
+					ok = true,
+					exportId = exportId,
+					service = serviceName,
+					pending = true,
+				}
+			end
+			return {
+				ok = true,
+				exportId = exportId,
+				service = serviceName,
+				pending = false,
+				totalBytes = buffer.len(payload),
+			}
+		end
+		if session.status == "pending" then
+			return {
+				ok = true,
+				exportId = exportId,
+				pending = true,
+			}
+		end
+		if session.status ~= "ready" then
+			local _, payloadError = next(session.payloadErrors)
+			error(session.error or payloadError or "Native export serialization failed", 0)
+		end
+		return {
+			ok = true,
+			exportId = exportId,
+			pending = false,
+			totalBytes = session.totalBytes,
+		}
+	end
+
+	function api.readBinaryExport(params: { [string]: any }): { [string]: any }
+		pruneExpiredSessions(binaryExports)
+		local exportId = tostring(params.exportId or "")
+		local serviceName = tostring(params.service or "")
+		local session = binaryExports[exportId]
+		if type(session) ~= "table" then
+			error("Native export session was not found")
+		end
+		armSessionExpiry(binaryExports, exportId, session)
+		if session.structureChanged then
+			error("Studio structure changed during native export")
+		end
+		local payload = session.payload
+		local totalBytes = session.totalBytes
+		if session.partitioned then
+			if serviceName == "" then
+				error("Native export service is required")
+			end
+			local payloadError = session.payloadErrors[serviceName]
+			if payloadError then
+				error(payloadError, 0)
+			end
+			payload = session.payloads[serviceName]
+			totalBytes = if payload then buffer.len(payload) else nil
+		end
+		if payload == nil or totalBytes == nil then
+			error("Native export serialization is not ready")
+		end
 		local offset = tonumber(params.offset)
 		local length = tonumber(params.length)
 		if offset == nil or offset < 0 or offset % 1 ~= 0 then
 			error("Invalid native export offset")
 		end
-		if length == nil or length < 1 or length > 4194304 or length % 1 ~= 0 then
+			if length == nil or length < 1 or length > 8388608 or length % 1 ~= 0 then
 			error("Invalid native export length")
 		end
-		if offset + length > session.totalBytes then
+		if offset + length > totalBytes then
 			error("Native export range exceeds its payload")
 		end
-		local chunk = buffer.create(length)
-		buffer.copy(chunk, 0, session.payload, offset, length)
+		local chunk = if offset == 0 and length == totalBytes then payload else buffer.create(length)
+		if chunk ~= payload then
+			buffer.copy(chunk, 0, payload, offset, length)
+		end
 		return {
 			ok = true,
 			offset = offset,
 			length = length,
-			data = buffer.tostring(EncodingService:Base64Encode(chunk)),
+			data = chunk,
 		}
 	end
 
 	function api.finishBinaryExport(params: { [string]: any }): { [string]: any }
 		local exportId = tostring(params.exportId or "")
-		local found = binaryExports[exportId] ~= nil
+		local session = binaryExports[exportId]
+		local found = session ~= nil
 		binaryExports[exportId] = nil
+		if type(session) == "table" then
+			session.cancelled = true
+			local onExpire = session.onExpire
+			session.onExpire = nil
+			if type(onExpire) == "function" then
+				onExpire()
+			end
+		end
 		return { ok = true, found = found }
 	end
 

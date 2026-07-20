@@ -2,6 +2,10 @@
 
 type ServiceState = {
 	instances: { Instance },
+	nativeExportOnly: boolean,
+	nonArchivableInstance: Instance?,
+	nativeDebugIdBuffer: buffer?,
+	nativeDebugIdFallbackByOffset: { [number]: string | boolean }?,
 	classNames: { string },
 	classIdByName: { [string]: number },
 	generatedAtUnix: number,
@@ -158,7 +162,7 @@ function BridgePluginRuntime.start(context)
 
 	local SETTINGS_PREFIX = "Renium."
 	local DEFAULT_HOST = "127.0.0.1"
-	local DEFAULT_PORTS = { 8781, 8782, 8783 }
+	local DEFAULT_PORTS = { 8781, 8782, 8783, 8784 }
 	local RECONNECT_SECONDS = 0.5
 	local FAST_RECONNECT_SECONDS = 0.25
 	local FAST_RECONNECT_WINDOW_SECONDS = 8.0
@@ -184,7 +188,6 @@ function BridgePluginRuntime.start(context)
 	local PRE_SERIALIZE_WARM_MAX_WORKERS = 4
 	local BRIDGE_VERSION = "0.1.2"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local CODEC_VERSION = "compact-v5-schema-8"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs1"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
@@ -309,6 +312,9 @@ function BridgePluginRuntime.start(context)
 	local ChunkingModule = requireChildModule("BridgeChunking")
 	local ContentModule = requireChildModule("BridgeContent")
 	local ValueCodecModule = requireChildModule("BridgeValueCodec")
+	local CODEC_VERSION = if ValueCodecModule.configureNativeNonFiniteJson(HttpService)
+		then "compact-v5-schema-9"
+		else "compact-v5-schema-8"
 	local TransportModule = requireChildModule("BridgeTransport")
 	local ConnectionModule = requireChildModule("BridgeConnection")
 	local IdentityModule = requireChildModule("BridgeIdentity")
@@ -590,6 +596,12 @@ function BridgePluginRuntime.start(context)
 		end
 	end
 
+	function Config.recordSyncCompletion()
+		editorSyncStats.lastAtUnix = os.time()
+		editorSyncStats.lastOk = true
+		Config.updateStatusText()
+	end
+
 	editorSync = EditorSyncModule.create({
 		stats = editorSyncStats,
 		allowedServices = ALLOWED_SERVICES,
@@ -601,6 +613,22 @@ function BridgePluginRuntime.start(context)
 		identityModule = IdentityModule,
 		getState = function(serviceName: string)
 			return getState(serviceName)
+		end,
+		prepareNativeState = function(serviceName: string)
+			local _, state = prepareService(serviceName, true)
+			return state
+		end,
+		getPropertySchema = function(className: string)
+			return getClassPropertySchema(className) or {}
+		end,
+		getEnumValueNames = function(enumType: string)
+			if Config.getEditorBinaryEnumValueNames then
+				return Config.getEditorBinaryEnumValueNames(enumType)
+			end
+			return nil
+		end,
+		releaseService = function(serviceName: string)
+			stateByService[serviceName] = nil
 		end,
 		invalidateService = function(serviceName: string)
 			stateByService[serviceName] = nil
@@ -1958,6 +1986,8 @@ function BridgePluginRuntime.start(context)
 		return out
 	end
 
+	Config.getEditorBinaryEnumValueNames = getEnumValueNames
+
 	local function getServiceEnumValueNamesByType(state: ServiceState): { [string]: any }
 		local out = {}
 		for _, className in ipairs(state.classNames) do
@@ -2565,7 +2595,7 @@ function BridgePluginRuntime.start(context)
 			end
 		elseif typeId == COMPACT_TYPE_IDS.Number then
 			if type(value) == "number" then
-				return ValueCodecModule.encodeNumber(value)
+				return ValueCodecModule.encodeTransportNumber(value)
 			end
 		elseif typeId == COMPACT_TYPE_IDS.String or typeId == COMPACT_TYPE_IDS.BinaryString then
 			if type(value) == "string" then
@@ -2574,38 +2604,38 @@ function BridgePluginRuntime.start(context)
 		elseif typeId == COMPACT_TYPE_IDS.ContentId then
 			return serializeContentValue(value)
 		elseif typeId == COMPACT_TYPE_IDS.Vector2 and typeof(value) == "Vector2" then
-			return ValueCodecModule.encodeComponents(value.X, value.Y)
+			return ValueCodecModule.encodeTransportComponents(value.X, value.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Vector3 and typeof(value) == "Vector3" then
-			return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
+			return ValueCodecModule.encodeTransportComponents(value.X, value.Y, value.Z)
 		elseif typeId == COMPACT_TYPE_IDS.UDim and typeof(value) == "UDim" then
-			return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
+			return ValueCodecModule.encodeTransportComponents(value.Scale, value.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.UDim2 and typeof(value) == "UDim2" then
-			return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+			return ValueCodecModule.encodeTransportComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.Color3 and typeof(value) == "Color3" then
-			return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
+			return ValueCodecModule.encodeTransportComponents(value.R, value.G, value.B)
 		elseif typeId == COMPACT_TYPE_IDS.BrickColor and typeof(value) == "BrickColor" then
 			return value.Number
 		elseif typeId == COMPACT_TYPE_IDS.NumberRange and typeof(value) == "NumberRange" then
-			return ValueCodecModule.encodeComponents(value.Min, value.Max)
+			return ValueCodecModule.encodeTransportComponents(value.Min, value.Max)
 		elseif typeId == COMPACT_TYPE_IDS.PhysicalProperties then
 			if value == false then
 				return false
 			end
 			local comparable = physicalPropertiesComparable(value)
-			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
+			return if comparable then ValueCodecModule.encodeTransportComponents(table.unpack(comparable, 1, 6)) else nil
 		elseif typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem" then
 			return value.Name
 		elseif typeId == COMPACT_TYPE_IDS.CFrame and typeof(value) == "CFrame" then
-			return ValueCodecModule.encodeComponents(value:GetComponents())
+			return ValueCodecModule.encodeTransportComponents(value:GetComponents())
 		elseif typeId == COMPACT_TYPE_IDS.Rect and typeof(value) == "Rect" then
-			return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+			return ValueCodecModule.encodeTransportComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Font and typeof(value) == "Font" then
 			return { value.Family, tostring(value.Weight), tostring(value.Style) }
 		elseif typeId == COMPACT_TYPE_IDS.ColorSequence and typeof(value) == "ColorSequence" then
 			local out = table.create(#value.Keypoints * 4)
 			local writeIndex = 1
 			for _, keypoint in ipairs(value.Keypoints) do
-				local components = ValueCodecModule.encodeComponents(
+				local components = ValueCodecModule.encodeTransportComponents(
 					keypoint.Time,
 					keypoint.Value.R,
 					keypoint.Value.G,
@@ -2623,7 +2653,7 @@ function BridgePluginRuntime.start(context)
 			local writeIndex = 1
 			for _, keypoint in ipairs(value.Keypoints) do
 				local components =
-					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+					ValueCodecModule.encodeTransportComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
 				out[writeIndex] = components[1]
 				out[writeIndex + 1] = components[2]
 				out[writeIndex + 2] = components[3]
@@ -2635,7 +2665,7 @@ function BridgePluginRuntime.start(context)
 		elseif typeId == COMPACT_TYPE_IDS.Faces and typeof(value) == "Faces" then
 			return facesBitmask(value)
 		elseif typeId == COMPACT_TYPE_IDS.Ray and typeof(value) == "Ray" then
-			return ValueCodecModule.encodeComponents(
+			return ValueCodecModule.encodeTransportComponents(
 				value.Origin.X,
 				value.Origin.Y,
 				value.Origin.Z,
@@ -2788,7 +2818,7 @@ function BridgePluginRuntime.start(context)
 		return false
 	end
 
-	Config.encodeNumberV5 = ValueCodecModule.encodeNumber
+	Config.encodeNumberV5 = ValueCodecModule.encodeTransportNumber
 
 	local function encodeSchemaValueV5(
 		typeId: number,
@@ -2814,31 +2844,31 @@ function BridgePluginRuntime.start(context)
 				return Config.internBatchString(strings, stringIds, serialized)
 			end
 		elseif typeId == COMPACT_TYPE_IDS.Vector2 and typeof(value) == "Vector2" then
-			return ValueCodecModule.encodeComponents(value.X, value.Y)
+			return ValueCodecModule.encodeTransportComponents(value.X, value.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Vector3 and typeof(value) == "Vector3" then
-			return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
+			return ValueCodecModule.encodeTransportComponents(value.X, value.Y, value.Z)
 		elseif typeId == COMPACT_TYPE_IDS.UDim and typeof(value) == "UDim" then
-			return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
+			return ValueCodecModule.encodeTransportComponents(value.Scale, value.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.UDim2 and typeof(value) == "UDim2" then
-			return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+			return ValueCodecModule.encodeTransportComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 		elseif typeId == COMPACT_TYPE_IDS.Color3 and typeof(value) == "Color3" then
-			return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
+			return ValueCodecModule.encodeTransportComponents(value.R, value.G, value.B)
 		elseif typeId == COMPACT_TYPE_IDS.BrickColor and typeof(value) == "BrickColor" then
 			return value.Number
 		elseif typeId == COMPACT_TYPE_IDS.NumberRange and typeof(value) == "NumberRange" then
-			return ValueCodecModule.encodeComponents(value.Min, value.Max)
+			return ValueCodecModule.encodeTransportComponents(value.Min, value.Max)
 		elseif typeId == COMPACT_TYPE_IDS.PhysicalProperties then
 			if value == false then
 				return false
 			end
 			local comparable = physicalPropertiesComparable(value)
-			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
+			return if comparable then ValueCodecModule.encodeTransportComponents(table.unpack(comparable, 1, 6)) else nil
 		elseif typeId == COMPACT_TYPE_IDS.EnumItem and typeof(value) == "EnumItem" then
 			return value.Value
 		elseif typeId == COMPACT_TYPE_IDS.CFrame and typeof(value) == "CFrame" then
-			return ValueCodecModule.encodeComponents(value:GetComponents())
+			return ValueCodecModule.encodeTransportComponents(value:GetComponents())
 		elseif typeId == COMPACT_TYPE_IDS.Rect and typeof(value) == "Rect" then
-			return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+			return ValueCodecModule.encodeTransportComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 		elseif typeId == COMPACT_TYPE_IDS.Font and typeof(value) == "Font" then
 			return {
 				Config.internBatchString(strings, stringIds, value.Family),
@@ -2854,7 +2884,7 @@ function BridgePluginRuntime.start(context)
 		elseif typeId == COMPACT_TYPE_IDS.Faces and typeof(value) == "Faces" then
 			return facesBitmask(value)
 		elseif typeId == COMPACT_TYPE_IDS.Ray and typeof(value) == "Ray" then
-			return ValueCodecModule.encodeComponents(
+			return ValueCodecModule.encodeTransportComponents(
 				value.Origin.X,
 				value.Origin.Y,
 				value.Origin.Z,
@@ -3057,31 +3087,31 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.Vector2] = function(value: any): any
 			if typeof(value) == "Vector2" then
-				return ValueCodecModule.encodeComponents(value.X, value.Y)
+				return ValueCodecModule.encodeTransportComponents(value.X, value.Y)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Vector3] = function(value: any): any
 			if typeof(value) == "Vector3" then
-				return ValueCodecModule.encodeComponents(value.X, value.Y, value.Z)
+				return ValueCodecModule.encodeTransportComponents(value.X, value.Y, value.Z)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.UDim] = function(value: any): any
 			if typeof(value) == "UDim" then
-				return ValueCodecModule.encodeComponents(value.Scale, value.Offset)
+				return ValueCodecModule.encodeTransportComponents(value.Scale, value.Offset)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.UDim2] = function(value: any): any
 			if typeof(value) == "UDim2" then
-				return ValueCodecModule.encodeComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+				return ValueCodecModule.encodeTransportComponents(value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Color3] = function(value: any): any
 			if typeof(value) == "Color3" then
-				return ValueCodecModule.encodeComponents(value.R, value.G, value.B)
+				return ValueCodecModule.encodeTransportComponents(value.R, value.G, value.B)
 			end
 			return nil
 		end,
@@ -3093,7 +3123,7 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.NumberRange] = function(value: any): any
 			if typeof(value) == "NumberRange" then
-				return ValueCodecModule.encodeComponents(value.Min, value.Max)
+				return ValueCodecModule.encodeTransportComponents(value.Min, value.Max)
 			end
 			return nil
 		end,
@@ -3102,7 +3132,7 @@ function BridgePluginRuntime.start(context)
 				return false
 			end
 			local comparable = physicalPropertiesComparable(value)
-			return if comparable then ValueCodecModule.encodeComponents(table.unpack(comparable, 1, 6)) else nil
+			return if comparable then ValueCodecModule.encodeTransportComponents(table.unpack(comparable, 1, 6)) else nil
 		end,
 		[COMPACT_TYPE_IDS.EnumItem] = function(value: any, _state: ServiceState?, strings: { string }, stringIds: { [string]: number }): any
 			if typeof(value) == "EnumItem" then
@@ -3112,13 +3142,13 @@ function BridgePluginRuntime.start(context)
 		end,
 		[COMPACT_TYPE_IDS.CFrame] = function(value: any): any
 			if typeof(value) == "CFrame" then
-				return ValueCodecModule.encodeComponents(value:GetComponents())
+				return ValueCodecModule.encodeTransportComponents(value:GetComponents())
 			end
 			return nil
 		end,
 		[COMPACT_TYPE_IDS.Rect] = function(value: any): any
 			if typeof(value) == "Rect" then
-				return ValueCodecModule.encodeComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
+				return ValueCodecModule.encodeTransportComponents(value.Min.X, value.Min.Y, value.Max.X, value.Max.Y)
 			end
 			return nil
 		end,
@@ -3140,7 +3170,7 @@ function BridgePluginRuntime.start(context)
 			local out = table.create(#keypoints * 4)
 			local writeIndex = 1
 			for _, keypoint in ipairs(keypoints) do
-				local components = ValueCodecModule.encodeComponents(
+				local components = ValueCodecModule.encodeTransportComponents(
 					keypoint.Time,
 					keypoint.Value.R,
 					keypoint.Value.G,
@@ -3163,7 +3193,7 @@ function BridgePluginRuntime.start(context)
 			local writeIndex = 1
 			for _, keypoint in ipairs(keypoints) do
 				local components =
-					ValueCodecModule.encodeComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
+					ValueCodecModule.encodeTransportComponents(keypoint.Time, keypoint.Value, keypoint.Envelope)
 				out[writeIndex] = components[1]
 				out[writeIndex + 1] = components[2]
 				out[writeIndex + 2] = components[3]
@@ -3224,11 +3254,14 @@ function BridgePluginRuntime.start(context)
 				instanceIndex: number,
 				forceSafeReads: boolean,
 				strings: { string },
-				stringIds: { [string]: number }
+				stringIds: { [string]: number },
+				compactOverlay: boolean?
 			)
 				local classValue = state.classValueByIndex[instanceIndex] or IdentityModule.compactClassValue(state, className)
 				local parentIndex = state.parentIndexByIndex[instanceIndex]
-				local attributes = serializeAttributesCompactV5(instance:GetAttributes(), state, strings, stringIds)
+				local attributes = if compactOverlay
+					then false
+					else serializeAttributesCompactV5(instance:GetAttributes(), state, strings, stringIds)
 				local fallbackMap = if shouldUseFallbackMap then getFallbackMap(state, className) else nil
 				local maskWords = nil
 				local maskWordCount = 0
@@ -3239,18 +3272,36 @@ function BridgePluginRuntime.start(context)
 					local propertyName = propertyNames[i]
 					local value = nil
 					local hasValue = false
-					if forceSafeReads or (fallbackMap and fallbackMap[propertyName]) then
-						local got, safeValue = tryRead(instance, propertyName)
-						if got then
-							value = safeValue
+					if
+						not compactOverlay
+						or not hotSchema.nativeRefReadIndices
+						or not hotSchema.nativeRefReadIndices[i]
+						or Config.nativeRefSelectionContains(hotSchema.nativeRefReadIndices[i], instanceIndex)
+					then
+						if forceSafeReads or (fallbackMap and fallbackMap[propertyName]) then
+							local got, safeValue = tryRead(instance, propertyName)
+							if got then
+								value = safeValue
+								hasValue = true
+							end
+						else
+							value = (instance :: any)[propertyName]
 							hasValue = true
 						end
-					else
-						value = (instance :: any)[propertyName]
-						hasValue = true
 					end
 					if propertyName == "CustomPhysicalProperties" then
 						hasValue, value = normalizeSchemaTransportValue(typeIds[i], propertyName, instance, hasValue, value)
+					end
+					if
+						compactOverlay
+						and hotSchema.nativeRefs
+						and hotSchema.nativeRefs[i]
+						and (not hotSchema.nativeRefReadIndices or not hotSchema.nativeRefReadIndices[i])
+						and typeof(value) == "Instance"
+						and value ~= state.instances[1]
+						and value:IsDescendantOf(state.instances[1])
+					then
+						hasValue = false
 					end
 
 					if hasValue and value ~= nil then
@@ -3349,6 +3400,32 @@ function BridgePluginRuntime.start(context)
 
 				local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
 
+				if compactOverlay then
+					if not compactMask and not compactValues then
+						if not attributes then
+							return false, 0, 0, 0, 0, 0, 0, 0
+						end
+						return {
+							classValue,
+							attributes,
+						}, 0, 0, 0, 0, 0, 0, 0
+					end
+					if not attributes then
+						return {
+							classValue,
+							false,
+							compactMask,
+							compactValues,
+						}, 0, 0, 0, 0, 0, 0, 0
+					end
+					return {
+						classValue,
+						attributes,
+						compactMask,
+						compactValues,
+					}, 0, 0, 0, 0, 0, 0, 0
+				end
+
 				local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
 				if not compactMask and not compactValues then
 					if not attributes then
@@ -3393,11 +3470,14 @@ function BridgePluginRuntime.start(context)
 			instanceIndex: number,
 			forceSafeReads: boolean,
 			strings: { string },
-			stringIds: { [string]: number }
+			stringIds: { [string]: number },
+			compactOverlay: boolean?
 		)
 			local classValue = state.classValueByIndex[instanceIndex] or IdentityModule.compactClassValue(state, className)
 			local parentIndex = state.parentIndexByIndex[instanceIndex]
-			local attributes = serializeAttributesCompactV5(instance:GetAttributes(), state, strings, stringIds)
+				local attributes = if compactOverlay
+					then false
+					else serializeAttributesCompactV5(instance:GetAttributes(), state, strings, stringIds)
 			local fallbackMap = if shouldUseFallbackMap then getFallbackMap(state, className) else nil
 			local maskWords = nil
 			local maskWordCount = 0
@@ -3414,8 +3494,11 @@ function BridgePluginRuntime.start(context)
 			for i = 1, propertyCount do
 				local propertyName = propertyNames[i]
 				local defaultComparable = defaults[i]
-				local skipRead = false
-				if modifiedDefaultBypassEnabled then
+				local skipRead = compactOverlay
+					and hotSchema.nativeRefReadIndices
+					and hotSchema.nativeRefReadIndices[i]
+					and not Config.nativeRefSelectionContains(hotSchema.nativeRefReadIndices[i], instanceIndex)
+				if not skipRead and modifiedDefaultBypassEnabled then
 					local bypassKey = bypassKeys[i]
 					if bypassKey and not state.modifiedDefaultRuntimeDenylist[bypassKey] and canModifiedBypass[i] then
 					local shouldUseBypass, sampledHasModified, sampledIsModified, sampledCheck, sampledValidationRead, sampledDenylist =
@@ -3473,11 +3556,22 @@ function BridgePluginRuntime.start(context)
 						value = (instance :: any)[propertyName]
 						hasValue = true
 					end
-					if propertyName == "CustomPhysicalProperties" then
-						hasValue, value = normalizeSchemaTransportValue(typeIds[i], propertyName, instance, hasValue, value)
-					end
+						if propertyName == "CustomPhysicalProperties" then
+							hasValue, value = normalizeSchemaTransportValue(typeIds[i], propertyName, instance, hasValue, value)
+						end
+						if
+							compactOverlay
+							and hotSchema.nativeRefs
+							and hotSchema.nativeRefs[i]
+							and (not hotSchema.nativeRefReadIndices or not hotSchema.nativeRefReadIndices[i])
+							and typeof(value) == "Instance"
+							and value ~= state.instances[1]
+							and value:IsDescendantOf(state.instances[1])
+						then
+							hasValue = false
+						end
 
-					if hasValue and value ~= nil then
+						if hasValue and value ~= nil then
 						local isDefault = false
 						if not exportAllProperties then
 							local compareMode = fastCompareModes[i]
@@ -3575,6 +3669,60 @@ function BridgePluginRuntime.start(context)
 			end
 
 			local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
+
+			if compactOverlay then
+				if not compactMask and not compactValues then
+					if not attributes then
+						return false,
+							modifiedDefaultChecks,
+							modifiedDefaultElided,
+							modifiedDefaultValidationReads,
+							modifiedDefaultRuntimeDenylistCount,
+							propertiesRead,
+							propertiesEncoded,
+							propertiesDefaultSkipped
+					end
+					return {
+						classValue,
+						attributes,
+					},
+						modifiedDefaultChecks,
+						modifiedDefaultElided,
+						modifiedDefaultValidationReads,
+						modifiedDefaultRuntimeDenylistCount,
+						propertiesRead,
+						propertiesEncoded,
+						propertiesDefaultSkipped
+				end
+				if not attributes then
+					return {
+						classValue,
+						false,
+						compactMask,
+						compactValues,
+					},
+						modifiedDefaultChecks,
+						modifiedDefaultElided,
+						modifiedDefaultValidationReads,
+						modifiedDefaultRuntimeDenylistCount,
+						propertiesRead,
+						propertiesEncoded,
+						propertiesDefaultSkipped
+				end
+				return {
+					classValue,
+					attributes,
+					compactMask,
+					compactValues,
+				},
+					modifiedDefaultChecks,
+					modifiedDefaultElided,
+					modifiedDefaultValidationReads,
+					modifiedDefaultRuntimeDenylistCount,
+					propertiesRead,
+					propertiesEncoded,
+					propertiesDefaultSkipped
+			end
 
 			local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
 			if not compactMask and not compactValues then
@@ -3731,8 +3879,9 @@ function BridgePluginRuntime.start(context)
 		hotSchema: { [string]: any },
 		forceSafeReads: boolean,
 		strings: { string },
-		stringIds: { [string]: number }
-	): { any }
+		stringIds: { [string]: number },
+		compactOverlay: boolean?
+	): any
 		local useFallbackMap = forceSafeReads or hotSchema.usesFallbackMap
 		local cacheKey = if useFallbackMap then "exporterWithFallback" else "exporter"
 		local exporter = hotSchema[cacheKey]
@@ -3740,7 +3889,7 @@ function BridgePluginRuntime.start(context)
 			exporter = Config.buildCompactV5Exporter(className, hotSchema, useFallbackMap)
 			hotSchema[cacheKey] = exporter
 		end
-		return exporter(state, instance, instanceIndex, forceSafeReads, strings, stringIds)
+		return exporter(state, instance, instanceIndex, forceSafeReads, strings, stringIds, compactOverlay)
 	end
 
 	local function exportCompactV5InstanceInternal(
@@ -3761,7 +3910,8 @@ function BridgePluginRuntime.start(context)
 			hotSchema,
 			forceSafeReads,
 			strings,
-			stringIds
+			stringIds,
+			false
 		)
 	end
 
@@ -3772,7 +3922,8 @@ function BridgePluginRuntime.start(context)
 		strings: { string },
 		stringIds: { [string]: number },
 		knownClassName: string?,
-		knownHotSchema: any?
+		knownHotSchema: any?,
+		compactOverlay: boolean?
 	)
 		local className = knownClassName or state.classNameByIndex[instanceIndex] or inst.ClassName
 		local hotSchema = knownHotSchema or Config.getHotPropertySchema(state, className)
@@ -3789,7 +3940,8 @@ function BridgePluginRuntime.start(context)
 			hotSchema,
 			false,
 			strings,
-			stringIds
+			stringIds,
+			compactOverlay
 		)
 	end
 
@@ -3939,7 +4091,7 @@ function BridgePluginRuntime.start(context)
 		end)
 	end
 
-	prepareService = function(serviceName: string): { [string]: any }
+	prepareService = function(serviceName: string, nativeExportOnly: boolean?): ({ [string]: any }, ServiceState)
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
 		end
@@ -3950,23 +4102,22 @@ function BridgePluginRuntime.start(context)
 
 		local descendants = service:GetDescendants()
 		local expectedCount = #descendants + 1
+		local nativeExport = nativeExportOnly == true
 		local instances = table.create(expectedCount)
 		instances[1] = service
 		local instanceCount = 1
 
 		local scriptObjects = {}
 		local scriptCount = 0
-		local classSeen = {}
 		local classNames = {}
 		local classIdByName = {}
-		local nameByIndex = table.create(expectedCount)
+		local nameByIndex = if nativeExport then {} else table.create(expectedCount)
 		local classNameByIndex = table.create(expectedCount)
 		local classValueByIndex = table.create(expectedCount)
-		local parentIndexByIndex = table.create(expectedCount)
+		local parentIndexByIndex = if nativeExport then {} else table.create(expectedCount)
 		local unresolvedParentIndices = {}
 		local serviceClassName = service.ClassName
 		local serviceIsLuaSourceContainer = not not Config.LUA_SOURCE_CLASS[serviceClassName]
-		classSeen[serviceClassName] = true
 		classNames[1] = serviceClassName
 		classIdByName[serviceClassName] = 0
 		local pathByInstance = { [service] = service.Name }
@@ -3974,54 +4125,78 @@ function BridgePluginRuntime.start(context)
 		local debugIdByInstance: { [Instance]: string | boolean } = {}
 		local instanceIdByInstance: { [Instance]: string | number | boolean } = {}
 		local scriptKeyByInstance: { [Instance]: string } = {}
+		local nonArchivableInstance = if service.Archivable then nil else service
+		local nativeDebugIdBuffer = if nativeExport then buffer.create(expectedCount * 4) else nil
+		local nativeDebugIdFallbackByOffset = if nativeExport then {} else nil
 		instanceIdByInstance[service] = 1
 		nameByIndex[1] = service.Name
 		classNameByIndex[1] = serviceClassName
 		classValueByIndex[1] = 0
 		parentIndexByIndex[1] = false
+		if nativeDebugIdBuffer and nativeDebugIdFallbackByOffset then
+			Config.writeNativeOverlayDebugId(service, nativeDebugIdBuffer, nativeDebugIdFallbackByOffset, 1)
+		end
 
-		if serviceIsLuaSourceContainer then
+		if serviceIsLuaSourceContainer and not nativeExport then
 			scriptCount += 1
 			scriptObjects[scriptCount] = service
 		end
 
-		local yieldIfNeeded = makeExportBurstYielder()
+		local yieldIfNeeded = if nativeExport then nil else makeExportBurstYielder()
 		for _, inst in ipairs(descendants) do
 			instanceCount += 1
 			instances[instanceCount] = inst
-			instanceIdByInstance[inst] = instanceCount
+			if not nativeExport then
+				instanceIdByInstance[inst] = instanceCount
+			end
+			if nativeDebugIdBuffer and nativeDebugIdFallbackByOffset then
+				Config.writeNativeOverlayDebugId(
+					inst,
+					nativeDebugIdBuffer,
+					nativeDebugIdFallbackByOffset,
+					instanceCount
+				)
+			end
 
 			local className = inst.ClassName
-			local isLuaSourceContainer = not not Config.LUA_SOURCE_CLASS[className]
-			local parent = inst.Parent
-			if not classSeen[className] then
-				classSeen[className] = true
+			if classIdByName[className] == nil then
 				classNames[#classNames + 1] = className
 				classIdByName[className] = #classNames - 1
 			end
-			nameByIndex[instanceCount] = inst.Name
 			classNameByIndex[instanceCount] = className
 			classValueByIndex[instanceCount] = classIdByName[className] or className
-			if parent ~= nil and parent ~= game then
-				local resolvedParentIndex = instanceIdByInstance[parent]
-				if resolvedParentIndex ~= nil then
-					parentIndexByIndex[instanceCount] = resolvedParentIndex
-				else
-					unresolvedParentIndices[#unresolvedParentIndices + 1] = instanceCount
+			if nativeExport then
+				if nonArchivableInstance == nil and not inst.Archivable then
+					nonArchivableInstance = inst
 				end
 			else
-				parentIndexByIndex[instanceCount] = false
-			end
+				local parent = inst.Parent
+				nameByIndex[instanceCount] = inst.Name
+				if parent ~= nil and parent ~= game then
+					local resolvedParentIndex = instanceIdByInstance[parent]
+					if resolvedParentIndex ~= nil then
+						parentIndexByIndex[instanceCount] = resolvedParentIndex
+					else
+						unresolvedParentIndices[#unresolvedParentIndices + 1] = instanceCount
+					end
+				else
+					parentIndexByIndex[instanceCount] = false
+				end
 
-			if isLuaSourceContainer then
-				scriptCount += 1
-				scriptObjects[scriptCount] = inst
+				if Config.LUA_SOURCE_CLASS[className] then
+					scriptCount += 1
+					scriptObjects[scriptCount] = inst
+				end
+				yieldIfNeeded()
 			end
-			yieldIfNeeded()
 		end
 
-		stateByService[serviceName] = {
+		local state: ServiceState = {
 			instances = instances,
+			nativeExportOnly = nativeExport,
+			nonArchivableInstance = nonArchivableInstance,
+			nativeDebugIdBuffer = nativeDebugIdBuffer,
+			nativeDebugIdFallbackByOffset = nativeDebugIdFallbackByOffset,
 			classNames = classNames,
 			classIdByName = classIdByName,
 			generatedAtUnix = os.time(),
@@ -4073,7 +4248,16 @@ function BridgePluginRuntime.start(context)
 			exportMetricsSinceLastRead = Config.newExportMetrics(),
 		}
 
-		local state = stateByService[serviceName]
+		if nativeExport then
+			return {
+				service = serviceName,
+				instanceCount = instanceCount,
+				scriptCount = 0,
+				classNames = classNames,
+			}, state
+		end
+
+		stateByService[serviceName] = state
 		local parentIndexYieldIfNeeded = makeExportBurstYielder()
 		for _, index in ipairs(unresolvedParentIndices) do
 			local parent = instances[index].Parent
@@ -4149,7 +4333,7 @@ function BridgePluginRuntime.start(context)
 			propertyCandidatesByClass = getServicePropertyCandidates(state),
 			propertySchemaByClass = getServicePropertySchema(state),
 			enumValueNamesByType = getServiceEnumValueNamesByType(state),
-		}
+		}, state
 	end
 
 	function Config.getBridgeInfo(): { [string]: any }
@@ -4286,11 +4470,205 @@ function BridgePluginRuntime.start(context)
 		return encoded, encodeMs
 	end
 
+	function Config.nativeRefSelectionContains(selection, instanceIndex: number): boolean
+		if selection.packed == nil then
+			return selection[instanceIndex] == true
+		end
+		local offset = selection.offset
+		local candidate = selection.candidate
+		local packed = selection.packed
+		local length = buffer.len(packed)
+		while candidate and candidate < instanceIndex do
+			offset += 3
+			if offset < length then
+				candidate = buffer.readu8(packed, offset)
+					+ bit32.lshift(buffer.readu8(packed, offset + 1), 8)
+					+ bit32.lshift(buffer.readu8(packed, offset + 2), 16)
+			else
+				candidate = nil
+			end
+		end
+		selection.offset = offset
+		selection.candidate = candidate
+		return candidate == instanceIndex
+	end
+
+	function Config.getNativeOverlayHotSchema(
+		state: ServiceState,
+		className: string,
+		propertyNames: { any }?
+	): { [string]: any }
+		local source = Config.getHotPropertySchema(state, className)
+		local requested = {}
+		local requestedNativeRefIndices = {}
+		if type(propertyNames) == "table" then
+			for _, propertyEntry in ipairs(propertyNames) do
+				if type(propertyEntry) == "string" then
+					requested[propertyEntry] = 1
+				elseif type(propertyEntry) == "table" and type(propertyEntry[1]) == "string" then
+					if propertyEntry[2] == true then
+						requested[propertyEntry[1]] = 2
+					elseif type(propertyEntry[2]) == "table" then
+						local rawSelection = propertyEntry[2]
+						if type(rawSelection.packed) == "string" then
+							local packed =
+								game:GetService("EncodingService"):Base64Decode(buffer.fromstring(rawSelection.packed))
+							local count = tonumber(rawSelection.count)
+							if
+								count == nil
+								or count < 1
+								or count % 1 ~= 0
+								or buffer.len(packed) ~= count * 3
+							then
+								error("Invalid native reference selection")
+							end
+							requested[propertyEntry[1]] = 3
+							local indices = table.create(count)
+							for index = 1, count do
+								local offset = (index - 1) * 3
+								indices[index] = buffer.readu8(packed, offset)
+									+ bit32.lshift(buffer.readu8(packed, offset + 1), 8)
+									+ bit32.lshift(buffer.readu8(packed, offset + 2), 16)
+							end
+							requestedNativeRefIndices[propertyEntry[1]] = {
+								packed = packed,
+								offset = 0,
+								candidate = buffer.readu8(packed, 0)
+									+ bit32.lshift(buffer.readu8(packed, 1), 8)
+									+ bit32.lshift(buffer.readu8(packed, 2), 16),
+								indices = indices,
+							}
+						else
+							local indices = {}
+							local selectedIndices = {}
+							for _, rawIndex in ipairs(rawSelection) do
+								local index = tonumber(rawIndex)
+								if index and index % 1 == 0 and index > 0 and not indices[index] then
+									indices[index] = true
+									selectedIndices[#selectedIndices + 1] = index
+								end
+							end
+							if next(indices) then
+								table.sort(selectedIndices)
+								indices.indices = selectedIndices
+								requested[propertyEntry[1]] = 3
+								requestedNativeRefIndices[propertyEntry[1]] = indices
+							end
+						end
+					else
+						requested[propertyEntry[1]] = 1
+					end
+				end
+			end
+		end
+		local fields = {
+			"typeIds",
+			"enumTypes",
+			"defaults",
+			"fastDefaults",
+			"canModifiedBypass",
+			"bypassKeys",
+			"fastCompareModes",
+			"compareFns",
+			"encodeFns",
+			"skipEncode",
+		}
+		local out = {
+			className = className,
+			count = 0,
+			maxMaskWords = 0,
+			names = {},
+			typeIds = {},
+			enumTypes = {},
+			defaults = {},
+			fastDefaults = {},
+			canModifiedBypass = {},
+			bypassKeys = {},
+			maskWordIndices = {},
+			maskBitValues = {},
+			fastCompareModes = {},
+			compareFns = {},
+			encodeFns = {},
+			skipEncode = {},
+			nativeRefs = {},
+			nativeRefReadIndices = {},
+			nativeRefCandidateIndices = {},
+			nativeRefSelectionOnly = true,
+			exporter = false,
+			exporterWithFallback = false,
+			fallbacksLearned = false,
+			usesFallbackMap = false,
+		}
+		for sourceIndex, propertyName in ipairs(source.names) do
+			local requestedMode = requested[propertyName]
+			if requestedMode then
+				local targetIndex = #out.names + 1
+				out.names[targetIndex] = propertyName
+				for _, field in ipairs(fields) do
+					out[field][targetIndex] = source[field][sourceIndex]
+				end
+				out.maskWordIndices[targetIndex] = math.floor((targetIndex - 1) / 31) + 1
+				out.maskBitValues[targetIndex] = bit32.lshift(1, (targetIndex - 1) % 31)
+				out.nativeRefs[targetIndex] = requestedMode >= 2
+				out.nativeRefReadIndices[targetIndex] = requestedNativeRefIndices[propertyName] or false
+				if requestedMode == 3 then
+					for _, instanceIndex in ipairs(requestedNativeRefIndices[propertyName].indices) do
+						out.nativeRefCandidateIndices[instanceIndex] = true
+					end
+				else
+					out.nativeRefSelectionOnly = false
+				end
+			end
+		end
+		local candidateIndices = {}
+		for instanceIndex in pairs(out.nativeRefCandidateIndices) do
+			candidateIndices[#candidateIndices + 1] = instanceIndex
+		end
+		table.sort(candidateIndices)
+		out.nativeRefCandidateIndices = candidateIndices
+		out.count = #out.names
+		out.maxMaskWords = math.ceil(out.count / 31)
+		return out
+	end
+
+	function Config.writeNativeOverlayDebugId(instance: Instance, packed, fallbackByOffset, offset: number)
+		local raw = instance:GetDebugId(0)
+		local numericId = tonumber(raw)
+		local writeOffset = (offset - 1) * 4
+		if numericId and numericId % 1 == 0 and numericId >= 0 and numericId <= 4294967294 then
+			buffer.writeu32(packed, writeOffset, numericId)
+			return
+		end
+		buffer.writeu32(packed, writeOffset, 4294967295)
+		fallbackByOffset[offset] = IdentityModule.getDebugId(instance) or false
+	end
+
+	function Config.finishNativeOverlayDebugIds(
+		packed,
+		fallbackByOffset,
+		strings: { string },
+		stringIds: { [string]: number }
+	): (buffer?, { any })
+		local fallbacks = {}
+		if packed == nil or fallbackByOffset == nil then
+			return nil, fallbacks
+		end
+		for offset, debugId in pairs(fallbackByOffset) do
+			if debugId then
+				fallbacks[#fallbacks + 1] = offset
+				fallbacks[#fallbacks + 1] = Config.internBatchString(strings, stringIds, debugId)
+			end
+		end
+		return packed, fallbacks
+	end
+
 	local function getCompactInstanceBatchVariantCacheKey(
 		startIndex: number?,
 		maxCount: number?,
 		shapeBatchesEnabled: boolean?,
-		stableIdsEnabled: boolean?
+		stableIdsEnabled: boolean?,
+		overlayId: string?,
+		overlayVariant: string?
 	): string
 		local key = ChunkingModule.getCompactInstanceBatchCacheKey(startIndex, maxCount)
 		if shapeBatchesEnabled then
@@ -4301,6 +4679,12 @@ function BridgePluginRuntime.start(context)
 		if stableIdsEnabled then
 			key ..= ":stable-v1"
 		end
+		if type(overlayId) == "string" and overlayId ~= "" then
+			key ..= ":overlay:" .. overlayId
+		end
+		if type(overlayVariant) == "string" and overlayVariant ~= "" then
+			key ..= ":variant:" .. overlayVariant
+		end
 		return key
 	end
 
@@ -4309,12 +4693,23 @@ function BridgePluginRuntime.start(context)
 		startIndex: number?,
 		maxCount: number?,
 		shapeBatchesEnabled: boolean?,
-		stableIdsEnabled: boolean?
+		stableIdsEnabled: boolean?,
+		overlayPropertiesByClass: { [string]: { any } }?,
+		overlayId: string?,
+		overlayVariant: string?,
+		stateOverride: ServiceState?
 	): (string, number)
-		local state = getState(serviceName)
+		local state = stateOverride or getState(serviceName)
 		local useShapeBatches = not not shapeBatchesEnabled
 		local includeStableIds = not not stableIdsEnabled
-		local key = getCompactInstanceBatchVariantCacheKey(startIndex, maxCount, useShapeBatches, includeStableIds)
+		local key = getCompactInstanceBatchVariantCacheKey(
+			startIndex,
+			maxCount,
+			useShapeBatches,
+			includeStableIds,
+			overlayId,
+			overlayVariant
+		)
 		local cachedPayload = state.batchCacheByKey[key]
 		if cachedPayload then
 			return cachedPayload, 0
@@ -4323,7 +4718,10 @@ function BridgePluginRuntime.start(context)
 		local instances = state.instances
 		local total = #instances
 		local startPos = boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
-		local take = boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
+		local maxBatchItems = if type(overlayPropertiesByClass) == "table"
+			then math.max(total, 1)
+			else MAX_INSTANCE_BATCH_ITEMS
+		local take = boundedPositiveInteger(maxCount, 300, maxBatchItems)
 
 		local function buildPayload(): { [string]: any }
 			if startPos > total then
@@ -4342,11 +4740,91 @@ function BridgePluginRuntime.start(context)
 			local finish = math.min(total, startPos + take - 1)
 			local count = finish - startPos + 1
 			local items = table.create(count)
-			local debugIds = if includeStableIds then table.create(count) else nil
 			local strings = table.create(math.min(count * 2, 65536))
 			local stringIds = {}
 			local workerCount = Config.getCompactDemandWorkerCount(state, count)
-			if MODIFIED_DEFAULT_BYPASS_ENABLED then
+			local overlayHotSchemaByClass = nil
+			local nativeRefCandidateSchemas = nil
+			if type(overlayPropertiesByClass) == "table" then
+				overlayHotSchemaByClass = {}
+				local candidateSchemas = {}
+				local candidateCount = 0
+				local selectionOnly = true
+				for _, className in ipairs(state.classNames) do
+					local hotSchema =
+						Config.getNativeOverlayHotSchema(state, className, overlayPropertiesByClass[className])
+					overlayHotSchemaByClass[className] = hotSchema
+					if hotSchema.count > 0 then
+						if hotSchema.nativeRefSelectionOnly then
+							candidateCount += #hotSchema.nativeRefCandidateIndices
+							candidateSchemas[#candidateSchemas + 1] = {
+								className = className,
+								hotSchema = hotSchema,
+							}
+						else
+							selectionOnly = false
+						end
+					end
+				end
+				if selectionOnly and candidateCount > 0 then
+					nativeRefCandidateSchemas = candidateSchemas
+				end
+			end
+			local precomputedNativeDebugIds = includeStableIds
+				and overlayHotSchemaByClass
+				and startPos == 1
+				and count == total
+				and state.nativeDebugIdBuffer ~= nil
+			local nativeDebugIdBuffer = if precomputedNativeDebugIds
+				then state.nativeDebugIdBuffer
+				elseif includeStableIds and overlayHotSchemaByClass
+				then buffer.create(count * 4)
+				else nil
+			local nativeDebugIdFallbackByOffset = if precomputedNativeDebugIds
+				then state.nativeDebugIdFallbackByOffset
+				elseif nativeDebugIdBuffer
+				then {}
+				else nil
+			local debugIds = if includeStableIds and not nativeDebugIdBuffer then table.create(count) else nil
+			if nativeRefCandidateSchemas then
+				for _, candidateSchema in ipairs(nativeRefCandidateSchemas) do
+					local className = candidateSchema.className
+					local hotSchema = candidateSchema.hotSchema
+					for _, i in ipairs(hotSchema.nativeRefCandidateIndices) do
+						local offset = i - startPos + 1
+						if offset >= 1 and offset <= count then
+							local inst = instances[i]
+							local actualClassName = state.classNameByIndex[i] or inst.ClassName
+							if actualClassName ~= className then
+								error("Native reference candidate class mismatch")
+							end
+							if nativeDebugIdBuffer and not precomputedNativeDebugIds then
+								Config.writeNativeOverlayDebugId(
+									inst,
+									nativeDebugIdBuffer,
+									nativeDebugIdFallbackByOffset,
+									offset
+								)
+							elseif debugIds then
+								local debugId = IdentityModule.getCachedDebugId(state, inst)
+								debugIds[offset] = if debugId
+									then Config.internBatchString(strings, stringIds, debugId)
+									else false
+							end
+							items[offset] = exportCompactV5InstanceIndexed(
+								state,
+								inst,
+								i,
+								strings,
+								stringIds,
+								className,
+								hotSchema,
+								true
+							)
+						end
+					end
+				end
+			elseif MODIFIED_DEFAULT_BYPASS_ENABLED then
 				local workerMetrics = {}
 				ParallelModule.runParallelChunks(count, workerCount, function(startOffset, endOffset)
 					local modifiedDefaultChecks = 0
@@ -4368,31 +4846,48 @@ function BridgePluginRuntime.start(context)
 						local inst = instances[i]
 						local className = state.classNameByIndex[i] or inst.ClassName
 						local hotSchema = lastHotSchema
-						if debugIds then
+						if nativeDebugIdBuffer and not precomputedNativeDebugIds then
+							Config.writeNativeOverlayDebugId(inst, nativeDebugIdBuffer, nativeDebugIdFallbackByOffset, offset)
+						elseif debugIds then
 							local debugId = IdentityModule.getCachedDebugId(state, inst)
-							debugIds[offset] = if debugId ~= nil then Config.internBatchString(strings, stringIds, debugId) else false
+							debugIds[offset] = if debugId
+								then Config.internBatchString(strings, stringIds, debugId)
+								else false
 						end
 						if className ~= lastClassName then
-							hotSchema = Config.getHotPropertySchema(state, className)
+							hotSchema = if overlayHotSchemaByClass
+								then overlayHotSchemaByClass[className]
+								else Config.getHotPropertySchema(state, className)
 							lastClassName = className
 							lastHotSchema = hotSchema
 						end
-						local item,
-							itemModifiedChecks,
-							itemModifiedElided,
-							itemModifiedValidationReads,
-							itemModifiedRuntimeDenylistCount,
-							itemPropertiesRead,
-							itemPropertiesEncoded,
-							itemPropertiesDefaultSkipped = exportCompactV5InstanceIndexed(state, inst, i, strings, stringIds, className, hotSchema)
-						items[offset] = item
-						modifiedDefaultChecks += itemModifiedChecks or 0
-						modifiedDefaultElided += itemModifiedElided or 0
-						modifiedDefaultValidationReads += itemModifiedValidationReads or 0
-						modifiedDefaultRuntimeDenylistCount += itemModifiedRuntimeDenylistCount or 0
-						propertiesRead += itemPropertiesRead or 0
-						propertiesEncoded += itemPropertiesEncoded or 0
-						propertiesDefaultSkipped += itemPropertiesDefaultSkipped or 0
+						if not overlayHotSchemaByClass or hotSchema.count > 0 then
+							local item,
+								itemModifiedChecks,
+								itemModifiedElided,
+								itemModifiedValidationReads,
+								itemModifiedRuntimeDenylistCount,
+								itemPropertiesRead,
+								itemPropertiesEncoded,
+								itemPropertiesDefaultSkipped = exportCompactV5InstanceIndexed(
+									state,
+									inst,
+									i,
+									strings,
+									stringIds,
+									className,
+									hotSchema,
+									overlayHotSchemaByClass ~= nil
+								)
+							items[offset] = item
+							modifiedDefaultChecks += itemModifiedChecks or 0
+							modifiedDefaultElided += itemModifiedElided or 0
+							modifiedDefaultValidationReads += itemModifiedValidationReads or 0
+							modifiedDefaultRuntimeDenylistCount += itemModifiedRuntimeDenylistCount or 0
+							propertiesRead += itemPropertiesRead or 0
+							propertiesEncoded += itemPropertiesEncoded or 0
+							propertiesDefaultSkipped += itemPropertiesDefaultSkipped or 0
+						end
 						if yieldIfNeeded then
 							yieldIfNeeded()
 						end
@@ -4428,21 +4923,67 @@ function BridgePluginRuntime.start(context)
 						local inst = instances[i]
 						local className = state.classNameByIndex[i] or inst.ClassName
 						local hotSchema = lastHotSchema
-						if debugIds then
+						if nativeDebugIdBuffer and not precomputedNativeDebugIds then
+							Config.writeNativeOverlayDebugId(inst, nativeDebugIdBuffer, nativeDebugIdFallbackByOffset, offset)
+						elseif debugIds then
 							local debugId = IdentityModule.getCachedDebugId(state, inst)
-							debugIds[offset] = if debugId ~= nil then Config.internBatchString(strings, stringIds, debugId) else false
+							debugIds[offset] = if debugId
+								then Config.internBatchString(strings, stringIds, debugId)
+								else false
 						end
 						if className ~= lastClassName then
-							hotSchema = Config.getHotPropertySchema(state, className)
+							hotSchema = if overlayHotSchemaByClass
+								then overlayHotSchemaByClass[className]
+								else Config.getHotPropertySchema(state, className)
 							lastClassName = className
 							lastHotSchema = hotSchema
 						end
-						items[offset] = exportCompactV5InstanceIndexed(state, inst, i, strings, stringIds, className, hotSchema)
+						if not overlayHotSchemaByClass or hotSchema.count > 0 then
+							items[offset] = exportCompactV5InstanceIndexed(
+								state,
+								inst,
+								i,
+								strings,
+								stringIds,
+								className,
+								hotSchema,
+								overlayHotSchemaByClass ~= nil
+							)
+						end
 						if yieldIfNeeded then
 							yieldIfNeeded()
 						end
 					end
 				end)
+			end
+			if overlayHotSchemaByClass then
+				local sparseItems = {}
+				for offset = 1, count do
+					local item = items[offset]
+					if item then
+						table.insert(item, 1, offset)
+						sparseItems[#sparseItems + 1] = item
+					end
+				end
+				local debugIdBuffer, debugIdFallbacks = Config.finishNativeOverlayDebugIds(
+					nativeDebugIdBuffer,
+					nativeDebugIdFallbackByOffset,
+					strings,
+					stringIds
+				)
+				return {
+					format = "native-overlay-v2",
+					codecVersion = CODEC_VERSION,
+					start = startPos,
+					nextStart = finish + 1,
+					total = total,
+					defaultElided = true,
+					defaultElisionVersion = 1,
+					strings = strings,
+					debugIdBuffer = debugIdBuffer,
+					debugIdFallbacks = if #debugIdFallbacks > 0 then debugIdFallbacks else nil,
+					items = sparseItems,
+				}
 			end
 			if useShapeBatches then
 				local shapedItems, shapes = Config.tryBuildCompactShapeBatch(items, count)
@@ -4492,10 +5033,10 @@ function BridgePluginRuntime.start(context)
 				state.batchCacheByKey[oldestKey] = nil
 			end
 		end
-		return encoded, encodeMs
-	end
+			return encoded, encodeMs
+		end
 
-	function Config.getClassDefaults(serviceName: string): (string, number)
+		function Config.getClassDefaults(serviceName: string): (string, number)
 		local state = getState(serviceName)
 		if state.classDefaultsEncoded then
 			return state.classDefaultsEncoded, 0
@@ -4704,10 +5245,24 @@ function BridgePluginRuntime.start(context)
 		chunkStart: number?,
 		maxLen: number?,
 		shapeBatchesEnabled: boolean?,
-		stableIdsEnabled: boolean?
+		stableIdsEnabled: boolean?,
+		overlayPropertiesByClass: { [string]: { any } }?,
+		overlayId: string?,
+		overlayVariant: string?,
+		stateOverride: ServiceState?
 	): { [string]: any }
 		local encoded, encodeMs =
-			getInstanceBatchCompact(serviceName, startIndex, maxCount, not not shapeBatchesEnabled, not not stableIdsEnabled)
+			getInstanceBatchCompact(
+				serviceName,
+				startIndex,
+				maxCount,
+				not not shapeBatchesEnabled,
+				not not stableIdsEnabled,
+				overlayPropertiesByClass,
+				overlayId,
+				overlayVariant,
+				stateOverride
+			)
 		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
 	end
 
@@ -4895,9 +5450,20 @@ function BridgePluginRuntime.start(context)
 		return { ok = game:SavePlace(Enum.SaveFilter.SaveAll) }
 	end
 
-	BRIDGE_METHOD_HANDLERS.beginEditorBinaryExport = editorSync.beginBinaryExport
+	BRIDGE_METHOD_HANDLERS.beginEditorBinaryExport = function(p)
+		return editorSync.beginBinaryExport(p)
+	end
+	BRIDGE_METHOD_HANDLERS.awaitEditorBinaryExport = editorSync.awaitBinaryExport
+	BRIDGE_METHOD_HANDLERS.getEditorBinaryExportStatus = editorSync.getBinaryExportStatus
 	BRIDGE_METHOD_HANDLERS.readEditorBinaryExport = editorSync.readBinaryExport
-	BRIDGE_METHOD_HANDLERS.finishEditorBinaryExport = editorSync.finishBinaryExport
+	BRIDGE_METHOD_HANDLERS.finishEditorBinaryExport = function(p)
+		local result = editorSync.finishBinaryExport(p)
+		if p.recordSyncCompletion == true then
+			Config.recordSyncCompletion()
+			result.syncCompletionRecorded = true
+		end
+		return result
+	end
 	BRIDGE_METHOD_HANDLERS.beginEditorBinaryImport = editorSync.beginBinaryImport
 	BRIDGE_METHOD_HANDLERS.appendEditorBinaryImport = editorSync.appendBinaryImport
 	BRIDGE_METHOD_HANDLERS.cancelEditorBinaryImport = editorSync.cancelBinaryImport
@@ -4964,9 +5530,7 @@ function BridgePluginRuntime.start(context)
 	BRIDGE_METHOD_HANDLERS.startStopPlay = RuntimeApi.startStopPlay
 
 	BRIDGE_METHOD_HANDLERS.recordSyncCompletion = function()
-		editorSyncStats.lastAtUnix = os.time()
-		editorSyncStats.lastOk = true
-		Config.updateStatusText()
+		Config.recordSyncCompletion()
 		return { ok = true }
 	end
 
@@ -5007,6 +5571,56 @@ function BridgePluginRuntime.start(context)
 			shapeBatchesEnabled,
 			p.supportsStableInstanceIds == true or p.stableInstanceIds == true
 		)
+	end
+
+	BRIDGE_METHOD_HANDLERS.getEditorBinaryOverlayChunk = function(p)
+		if type(p.overlayPropertiesByClass) ~= "table" then
+			error("Native export overlay properties must be an object")
+		end
+		local overlayId = tostring(p.overlayId or "")
+		if overlayId == "" or #overlayId > 128 then
+			error("Invalid native export overlay id")
+		end
+		local serviceName = tostring(p.service)
+		local state = editorSync.getBinaryExportState(overlayId, serviceName)
+		local started = os.clock()
+		local result = Config.getInstanceBatchCompactChunk(
+			serviceName,
+			p.startIndex,
+			p.maxCount,
+			p.chunkStart,
+			p.maxLen,
+			false,
+			p.supportsStableInstanceIds ~= false,
+			p.overlayPropertiesByClass,
+			overlayId,
+			tostring(p.overlayVariant or ""),
+			state
+		)
+		result.pluginServerMs = math.max(0, (os.clock() - started) * 1000 - (result.pluginEncodeMs or 0))
+		return result
+	end
+
+	BRIDGE_METHOD_HANDLERS.getEditorBinaryDebugIds = function(p)
+		local overlayId = tostring(p.overlayId or "")
+		if overlayId == "" or #overlayId > 128 then
+			error("Invalid native export overlay id")
+		end
+		local serviceName = tostring(p.service)
+		local state = editorSync.getBinaryExportState(overlayId, serviceName)
+		local fallbacks = {}
+		for offset, debugId in pairs(state.nativeDebugIdFallbackByOffset or {}) do
+			if debugId then
+				fallbacks[#fallbacks + 1] = offset
+				fallbacks[#fallbacks + 1] = debugId
+			end
+		end
+		return {
+			ok = true,
+			total = #state.instances,
+			data = state.nativeDebugIdBuffer,
+			fallbacks = fallbacks,
+		}
 	end
 
 	BRIDGE_METHOD_HANDLERS.getClassDefaultsChunk = function(p)

@@ -42,15 +42,51 @@ end
 
 function BridgeValueCodec.encodeComponents(...)
 	local values = table.pack(...)
-	local out = table.create(values.n)
-	for index = 1, values.n do
+	local count = values.n
+	values.n = nil
+	for index = 1, count do
 		local encoded = BridgeValueCodec.encodeNumber(values[index])
 		if not encoded then
 			error("Numeric component encoder received a non-number")
 		end
-		out[index] = encoded
+		values[index] = encoded
 	end
-	return out
+	return values
+end
+
+BridgeValueCodec.encodeTransportNumber = BridgeValueCodec.encodeNumber
+BridgeValueCodec.encodeTransportComponents = BridgeValueCodec.encodeComponents
+
+function BridgeValueCodec.configureNativeNonFiniteJson(HttpService)
+	local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
+		0 / 0,
+		math.huge,
+		-math.huge,
+	})
+	if not encodeOk or type(encoded) ~= "string"
+		or not string.find(encoded, '"t":"numeric"', 1, true)
+		or not string.find(encoded, '"v":"nan"', 1, true)
+		or not string.find(encoded, '"v":"inf"', 1, true)
+		or not string.find(encoded, '"v":"-inf"', 1, true)
+	then
+		return false
+	end
+	local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, encoded)
+	if not decodeOk
+		or type(decoded) ~= "table"
+		or decoded[1] == decoded[1]
+		or decoded[2] ~= math.huge
+		or decoded[3] ~= -math.huge
+	then
+		return false
+	end
+	BridgeValueCodec.encodeTransportNumber = function(value)
+		return if type(value) == "number" then value else nil
+	end
+	BridgeValueCodec.encodeTransportComponents = function(...)
+		return { ... }
+	end
+	return true
 end
 
 return BridgeValueCodec

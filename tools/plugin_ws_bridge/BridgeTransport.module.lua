@@ -7,6 +7,7 @@ local MAX_RAW_CHUNK_BYTES = 8 * 1024 * 1024
 local RAW_CHUNK_METHODS = {
 	getInstanceBatchChunk = true,
 	getInstanceBatchCompactChunk = true,
+	getEditorBinaryOverlayChunk = true,
 	getClassDefaultsChunk = true,
 	getScriptPathsChunk = true,
 	getSourceBatchChunk = true,

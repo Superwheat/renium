@@ -95,6 +95,18 @@ local function normalizePorts(values, maximumCount)
 	return out
 end
 
+local function isDefaultPortSequence(values)
+	if #values < 3 or #values > MAX_BRIDGE_PORTS then
+		return false
+	end
+	for index, port in ipairs(values) do
+		if port ~= 8780 + index then
+			return false
+		end
+	end
+	return true
+end
+
 function BridgeSettings.normalizeLoopbackHost(raw)
 	local host = string.lower(trim(raw))
 	if host == "" or host == "localhost" or host == "127.0.0.1" then
@@ -138,43 +150,9 @@ end
 
 function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 	local configuredPorts = plugin:GetSetting(prefix .. "ports")
-	local valid = normalizePorts(configuredPorts, 8)
+	local valid = normalizePorts(configuredPorts, MAX_BRIDGE_PORTS)
 	if valid then
-		if
-			#valid == 4
-			and valid[1] == 8781
-			and valid[2] == 8782
-			and valid[3] == 8783
-			and valid[4] == 8784
-			and #defaultPorts == 3
-		then
-			return defaultPorts
-		elseif
-			#valid == 3
-			and valid[1] == 8781
-			and valid[2] == 8782
-			and valid[3] == 8783
-			and #defaultPorts == 4
-			and defaultPorts[1] == 8781
-			and defaultPorts[2] == 8782
-			and defaultPorts[3] == 8783
-			and defaultPorts[4] == 8784
-		then
-			return defaultPorts
-		elseif
-			#valid == 8
-			and valid[1] == 8781
-			and valid[2] == 8782
-			and valid[3] == 8783
-			and valid[4] == 8784
-			and valid[5] == 8785
-			and valid[6] == 8786
-			and valid[7] == 8787
-			and valid[8] == 8788
-			and (#defaultPorts == 3 or #defaultPorts == 4)
-		then
-			return defaultPorts
-		elseif #valid > MAX_BRIDGE_PORTS then
+		if isDefaultPortSequence(valid) and isDefaultPortSequence(defaultPorts) then
 			return defaultPorts
 		end
 		return valid
