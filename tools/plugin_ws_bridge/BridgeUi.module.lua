@@ -751,7 +751,7 @@ local function buildSettingsWidget(plugin)
 	local hostHost = makeRow(connection, "Server host", "Loopback address of the Renium sync server.", 1, refs, true, 160)
 	local hostBox = makeInput(hostHost, "127.0.0.1", refs)
 	local portsHost = makeRow(connection, "Server ports", "WebSocket channel ports.", 2, refs, false, 160)
-	local portsBox = makeInput(portsHost, "8781,8782,8783,8784", refs)
+	local portsBox = makeInput(portsHost, "8781,8782", refs)
 	addToggleRow(connection, "Auto connect", "Connect to the local Renium server when this place opens.", 3, false, "autoConnect")
 	addToggleRow(connection, "Auto reconnect", "Retry after an unexpected bridge disconnect. Manual Disconnect always stays disconnected.", 4, false, "autoReconnect")
 

@@ -162,7 +162,7 @@ function BridgePluginRuntime.start(context)
 
 	local SETTINGS_PREFIX = "Renium."
 	local DEFAULT_HOST = "127.0.0.1"
-	local DEFAULT_PORTS = { 8781, 8782, 8783, 8784 }
+	local DEFAULT_PORTS = { 8781, 8782 }
 	local RECONNECT_SECONDS = 0.5
 	local FAST_RECONNECT_SECONDS = 0.25
 	local FAST_RECONNECT_WINDOW_SECONDS = 8.0

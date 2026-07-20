@@ -478,8 +478,8 @@
         },
         "renium.bridgePorts": {
           "type": "string",
-          "default": "8781,8782,8783",
-          "description": "Comma-separated WebSocket bridge ports used by plugin and exporter. Only three ports are supported by default."
+          "default": "8781,8782",
+          "description": "Comma-separated WebSocket bridge ports used by plugin and exporter. Only two ports are supported by default."
         },
         "renium.usePersistentBridge": {
           "type": "boolean",
