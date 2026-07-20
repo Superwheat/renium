@@ -41,12 +41,21 @@ const explorerServiceOrder = new Map<string, number>(
   EXPLORER_SERVICE_ORDER.map((className, index) => [className, index] as const),
 );
 
+const explorerServiceNames = new Map<string, string>(
+  EXPLORER_SERVICE_ORDER.map((className) => [className.toLowerCase(), className] as const),
+);
+
 const explorerClassRank = new Map<string, number>(
   EXPLORER_CLASS_RANK.map((className, index) => [className, index] as const),
 );
 
 function normalizedName(name: string): string {
   return name.toLowerCase();
+}
+
+export function canonicalExplorerServiceName(name: string): string {
+  const trimmed = name.trim();
+  return explorerServiceNames.get(trimmed.toLowerCase()) ?? trimmed;
 }
 
 function compareText(a: string, b: string): number {

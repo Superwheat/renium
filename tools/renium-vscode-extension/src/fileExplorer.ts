@@ -14,7 +14,7 @@ import {
   decodeRbsyncToTree,
 } from "./rbsyncDecode";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
-import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
+import { canonicalExplorerServiceName, DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
 import { isScriptClass, pickWorkspaceRoot } from "./utils";
 
 const SETTINGS_FILE_NAME = "__roblox_sync_settings.renium";
@@ -700,13 +700,50 @@ function getExplorerConfig(): ExplorerConfig {
   const rustCliPath = resolveExplorerRustCliPath(root, configuredRustCliPath);
   const servicesRaw = cfg.get<string[]>("services", [...DEFAULT_SYNC_SERVICES]);
   const services = Array.isArray(servicesRaw)
-    ? servicesRaw.map((value) => String(value).trim()).filter((value) => value.length > 0)
+    ? distinctExplorerServices(servicesRaw.map((value) => canonicalExplorerServiceName(String(value))))
     : [...DEFAULT_SYNC_SERVICES];
   return { projectRoot, rustCliPath, services };
 }
 
 function srcRoot(config: ExplorerConfig): string {
   return path.join(config.projectRoot, "src");
+}
+
+function distinctExplorerServices(services: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const service of services) {
+    const canonical = canonicalExplorerServiceName(service);
+    const key = canonical.toLowerCase();
+    if (!canonical || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(canonical);
+  }
+  return result;
+}
+
+function explorerServiceForPath(config: ExplorerConfig, service: string): string {
+  const trimmed = service.trim();
+  const known = canonicalExplorerServiceName(trimmed);
+  if (!trimmed || known !== trimmed) {
+    return known;
+  }
+  const root = srcRoot(config);
+  if (fs.existsSync(root)) {
+    const diskEntry = fs.readdirSync(root, { withFileTypes: true })
+      .find((entry) => entry.isDirectory() && entry.name.toLowerCase() === trimmed.toLowerCase());
+    if (diskEntry) {
+      return canonicalExplorerServiceName(diskEntry.name);
+    }
+  }
+  const configured = config.services.find((candidate) => candidate.toLowerCase() === trimmed.toLowerCase());
+  return configured ?? known;
+}
+
+function canonicalExplorerServices(config: ExplorerConfig, services: readonly string[]): string[] {
+  return distinctExplorerServices(services.map((service) => explorerServiceForPath(config, String(service))));
 }
 
 function settingsFileForService(config: ExplorerConfig, service: string): string {
@@ -819,7 +856,7 @@ function serviceFromSettingsFile(config: ExplorerConfig, filePath: string): stri
     return undefined;
   }
   const [service] = relativePath.split(/[\\/]/);
-  return service || undefined;
+  return service ? explorerServiceForPath(config, service) : undefined;
 }
 
 function normalizeId(service: string, settingsId: string): string {
@@ -3053,20 +3090,26 @@ export class FileExplorerModel {
   public async refresh(): Promise<void> {
     const config = getExplorerConfig();
     const root = srcRoot(config);
-    const serviceNames = new Set<string>();
+    const serviceNames = new Map<string, string>();
+    const addService = (service: string): void => {
+      const canonical = explorerServiceForPath(config, service);
+      if (canonical) {
+        serviceNames.set(canonical.toLowerCase(), canonical);
+      }
+    };
     this.searchLoadedServices.clear();
     if (fs.existsSync(root)) {
       for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
         if (entry.isDirectory()) {
-          serviceNames.add(entry.name);
+          addService(entry.name);
         }
       }
     }
     for (const service of config.services) {
-      serviceNames.add(service);
+      addService(service);
     }
 
-    const serviceList = Array.from(serviceNames).filter((service) => service.length > 0);
+    const serviceList = Array.from(serviceNames.values());
 
     this.nodesById.clear();
     this.searchOnlyNodeIds.clear();
@@ -3101,7 +3144,7 @@ export class FileExplorerModel {
 
   public async refreshServices(services: string[]): Promise<void> {
     const config = getExplorerConfig();
-    const uniqueServices = Array.from(new Set(services.map((service) => String(service).trim()).filter((service) => service.length > 0)));
+    const uniqueServices = canonicalExplorerServices(config, services);
     let changed = false;
     for (const service of uniqueServices) {
       changed = await this.refreshService(config, service) || changed;
@@ -6058,15 +6101,16 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public async refreshServices(services: string[]): Promise<void> {
     try {
-      await this.backend.reloadServices(services);
+      const canonicalServices = canonicalExplorerServices(getExplorerConfig(), services);
+      await this.backend.reloadServices(canonicalServices);
       if (this.searchBackend.hasInitialized()) {
-        await this.searchBackend.reloadServices(services).catch(() => undefined);
+        await this.searchBackend.reloadServices(canonicalServices).catch(() => undefined);
       }
-      for (const service of services) {
+      for (const service of canonicalServices) {
         this.propertyOnlyStaleServices.delete(service);
       }
       try {
-        await this.propertiesProvider.refreshCurrentForServices(services);
+        await this.propertiesProvider.refreshCurrentForServices(canonicalServices);
       } catch (error) {
         if (!isNoMatchingInstanceError(error)) {
           throw error;

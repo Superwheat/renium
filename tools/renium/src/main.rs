@@ -15770,13 +15770,32 @@ impl ExplorerDaemonState {
     }
 
     fn reload_services(&mut self, services: &[String]) -> Result<()> {
-        let reload_list = if services.is_empty() {
+        let requested = if services.is_empty() {
             explorer_daemon_services(&self.src_root, "")?
         } else {
             services.to_vec()
         };
+        let mut reload_list = Vec::with_capacity(requested.len());
+        for service in requested {
+            let canonical = self
+                .services
+                .iter()
+                .find(|existing| existing.eq_ignore_ascii_case(&service))
+                .cloned()
+                .unwrap_or_else(|| canonical_explorer_service_name(&service));
+            if !reload_list
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&canonical))
+            {
+                reload_list.push(canonical);
+            }
+        }
         for service in &reload_list {
-            if !self.services.contains(service) {
+            if !self
+                .services
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(service))
+            {
                 self.services.push(service.clone());
             }
             match ExplorerServiceState::load(&self.src_root, service) {
@@ -15804,7 +15823,9 @@ impl ExplorerDaemonState {
     fn sort_services(&mut self) {
         self.services
             .sort_by(|a, b| explorer_compare_nodes(a, a, b, b));
-        self.services.dedup();
+        let mut seen = HashSet::new();
+        self.services
+            .retain(|service| seen.insert(service.to_ascii_lowercase()));
     }
 
     fn total_rows(&self, mode: ExplorerViewMode) -> usize {
@@ -16475,7 +16496,7 @@ impl ExplorerServiceState {
 }
 
 fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec<String>> {
-    let mut services = if raw.trim().is_empty() {
+    let requested = if raw.trim().is_empty() {
         DEFAULT_SYNC_SERVICES
             .iter()
             .map(|service| service.to_string())
@@ -16483,14 +16504,16 @@ fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec<String>> {
     } else {
         parse_services(raw)?
     };
+    let mut services = Vec::with_capacity(requested.len());
+    for service in requested {
+        push_explorer_service(&mut services, &service);
+    }
     if src_root.exists() {
         for entry in fs::read_dir(src_root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let service = entry.file_name().to_string_lossy().to_string();
-                if !services.contains(&service) {
-                    services.push(service);
-                }
+                push_explorer_service(&mut services, &service);
             }
         }
     }
@@ -16500,6 +16523,26 @@ fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec<String>> {
     services.sort_by(|a, b| explorer_compare_nodes(a, a, b, b));
     services.dedup();
     Ok(services)
+}
+
+fn canonical_explorer_service_name(service: &str) -> String {
+    DEFAULT_SYNC_SERVICES
+        .iter()
+        .chain(EXTRA_EXPLORER_SERVICES.iter())
+        .find(|candidate| candidate.eq_ignore_ascii_case(service))
+        .copied()
+        .unwrap_or(service)
+        .to_string()
+}
+
+fn push_explorer_service(services: &mut Vec<String>, service: &str) {
+    let canonical = canonical_explorer_service_name(service);
+    if !services
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&canonical))
+    {
+        services.push(canonical);
+    }
 }
 
 fn explorer_compare_nodes(
