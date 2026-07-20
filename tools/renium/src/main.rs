@@ -726,7 +726,7 @@ struct BridgeDaemonArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(long, alias = "ctl-port", default_value_t = DEFAULT_DAEMON_CONTROL_PORT)]
     control_port: u16,
@@ -928,7 +928,7 @@ struct BridgeGetSourceArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'c', long, default_value_t = DEFAULT_EXPORT_CHUNK_SIZE)]
     chunk_size: usize,
@@ -940,7 +940,7 @@ struct PluginConsoleOutputArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'n', long, default_value_t = 200)]
     limit: usize,
@@ -960,7 +960,7 @@ struct ExecuteLuauArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'e', long)]
     code: Option<String>,
@@ -1014,7 +1014,7 @@ struct StudioDeviceArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
 }
 
@@ -1024,7 +1024,7 @@ struct StartStopPlayArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 's', long, action = ArgAction::SetTrue, default_value_t = false)]
     start: bool,
@@ -1040,7 +1040,7 @@ struct ListClientsArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
 }
 
@@ -1054,7 +1054,7 @@ struct EditorReviewDecisionArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
 }
 
@@ -1064,7 +1064,7 @@ struct PressArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "GUI_PATH", required_unless_present = "id")]
     path: Option<String>,
@@ -1086,7 +1086,7 @@ struct ClickArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "X")]
     x: i32,
@@ -1106,7 +1106,7 @@ struct KeyArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "KEY")]
     key: String,
@@ -1122,7 +1122,7 @@ struct UiArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'p', long, value_name = "NAME|N")]
     player: Option<String>,
@@ -1151,7 +1151,7 @@ struct TypeArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "TEXT")]
     text: String,
@@ -1169,7 +1169,7 @@ struct WaitUntilArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "LUAU_CONDITION")]
     condition: String,
@@ -1189,7 +1189,7 @@ struct GotoArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(value_name = "PART_PATH", required_unless_present = "pos")]
     target: Option<String>,
@@ -1209,7 +1209,7 @@ struct ShotArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'o', long, value_name = "PATH", default_value = "shot.png")]
     output: PathBuf,
@@ -1227,7 +1227,7 @@ struct StudioChangeStateArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 's', long, value_name = "SERVICES", default_value = "")]
     services: String,
@@ -1345,7 +1345,7 @@ struct ExportSnapshotsArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'i', long, action = ArgAction::SetTrue, default_value_t = false)]
     run_import: bool,
@@ -1415,7 +1415,7 @@ struct ProfilePluginOpsArgs {
     bridge_wait_seconds: f64,
     #[arg(long, default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(long, default_value = "8781,8782,8783")]
+    #[arg(long, default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(long, default_value_t = 20.0)]
     ws_wait_seconds: f64,
@@ -1473,7 +1473,7 @@ struct PushEditorChangesArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 'p', long = "changed-path", alias = "path", value_name = "PATH", action = ArgAction::Append)]
     changed_paths: Vec<PathBuf>,
@@ -1529,7 +1529,7 @@ struct ApplyEditorPropertyArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 's', long)]
     service: String,
@@ -1561,7 +1561,7 @@ struct ApplyEditorDeleteArgs {
     bridge_wait_seconds: f64,
     #[arg(short = 'H', long, alias = "host", default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782,8783")]
+    #[arg(short = 'P', long, alias = "ports", default_value = "8781,8782")]
     bridge_ports: String,
     #[arg(short = 's', long)]
     service: String,
@@ -1593,7 +1593,7 @@ struct EditorRevertArgs {
     bridge_wait_seconds: f64,
     #[arg(long, default_value = "127.0.0.1")]
     bridge_host: String,
-    #[arg(long, default_value = "8781,8782,8783")]
+    #[arg(long, default_value = "8781,8782")]
     bridge_ports: String,
 }
 
@@ -37068,7 +37068,7 @@ mod tests {
         let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
             bridge_wait_seconds: 1.0,
             bridge_host: "127.0.0.1".to_string(),
-            bridge_ports: "8781,8782,8783".to_string(),
+            bridge_ports: "8781,8782".to_string(),
             service: "Workspace".to_string(),
             settings_id: Some("already-removed".to_string()),
             class_name: "Folder".to_string(),
@@ -37799,7 +37799,7 @@ mod tests {
             src_dir: PathBuf::from("src"),
             bridge_wait_seconds: 1.0,
             bridge_host: "127.0.0.1".to_string(),
-            bridge_ports: "8781,8782,8783".to_string(),
+            bridge_ports: "8781,8782".to_string(),
             changed_paths: vec![PathBuf::from(
                 "src/ReplicatedFirst/LoadingScreen/init.client.luau",
             )],
@@ -37909,7 +37909,7 @@ mod tests {
             src_dir: PathBuf::from("src"),
             bridge_wait_seconds: 1.0,
             bridge_host: "127.0.0.1".to_string(),
-            bridge_ports: "8781,8782,8783".to_string(),
+            bridge_ports: "8781,8782".to_string(),
             changed_paths: vec![PathBuf::from(
                 "src/ReplicatedFirst/LoadingScreen/init.client.luau",
             )],

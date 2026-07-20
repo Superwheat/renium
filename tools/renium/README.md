@@ -58,7 +58,7 @@ not yet live-verified.
 ## Quick start
 
 1. Install the Studio plugin and open your place. The plugin connects to a
-   local bridge daemon on ports 8781–8783.
+   local bridge daemon on ports 8781–8782.
 
    ```powershell
    rbx setup
@@ -95,7 +95,7 @@ The daemon is found automatically by later commands (env vars
 `RENIUM_DAEMON_FILE`, then `.renium-daemon.json` in the project,
 `%LOCALAPPDATA%\Renium\daemon.json`, then the default local endpoint).
 
-`rbx bd` is a standalone long-running process. It keeps ports 8781-8783 open
+`rbx bd` is a standalone long-running process. It keeps ports 8781-8782 open
 until it is stopped. `--editor-stdio` is reserved for the VS Code extension's
 owned child process: it reads daemon requests from stdin and exits when its
 owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.

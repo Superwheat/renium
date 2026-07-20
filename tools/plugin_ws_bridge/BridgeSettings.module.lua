@@ -1,5 +1,5 @@
 local BridgeSettings = {}
-local MAX_BRIDGE_PORTS = 4
+local MAX_BRIDGE_PORTS = 2
 
 local RUNTIME_DEFAULTS = {
 	autoConnect = true,
@@ -96,7 +96,7 @@ local function normalizePorts(values, maximumCount)
 end
 
 local function isDefaultPortSequence(values)
-	if #values < 3 or #values > MAX_BRIDGE_PORTS then
+	if #values < 2 or #values > MAX_BRIDGE_PORTS then
 		return false
 	end
 	for index, port in ipairs(values) do
