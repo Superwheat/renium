@@ -8,6 +8,8 @@ local RAW_CHUNK_METHODS = {
 	getInstanceBatchChunk = true,
 	getInstanceBatchCompactChunk = true,
 	getEditorBinaryOverlayChunk = true,
+	readEditorBinaryExport = true,
+	readEditorBinaryExportBatch = true,
 	getClassDefaultsChunk = true,
 	getScriptPathsChunk = true,
 	getSourceBatchChunk = true,
@@ -44,13 +46,15 @@ local function sendRawChunkResponse(client, id, result, serverMs)
 	local nextStartValue = math.max(startValue, tonumber(result.nextStart) or startValue)
 	local totalValue = math.max(0, tonumber(result.total) or 0)
 	local encodeMs = math.max(0, tonumber(result.pluginEncodeMs) or 0)
-	local header = ("RBS1 %s %d %d %d %.3f %.3f"):format(
+	local serializationComplete = if result.serializationComplete == true then 1 else 0
+	local header = ("RBS2 %s %d %d %d %.3f %.3f %d"):format(
 		tostring(id),
 		startValue,
 		nextStartValue,
 		totalValue,
 		serverMs,
-		encodeMs
+		encodeMs,
+		serializationComplete
 	)
 	local payload = type(result.chunk) == "string" and result.chunk or ""
 	if #payload > MAX_RAW_CHUNK_BYTES then

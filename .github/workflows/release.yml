@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   verify-tag:
@@ -41,9 +44,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +59,7 @@ jobs:
       - name: Test and build
         shell: pwsh
         run: |
+          $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
           cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
           cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
@@ -74,25 +80,42 @@ jobs:
           if ("${{ runner.os }}" -eq "Windows") {
             Copy-Item rbx.cmd $stage
             Copy-Item tools/renium/rbx-run.ps1 $stage
+            Copy-Item install.ps1 $stage
           }
           else {
             Copy-Item rbx $stage
+            Copy-Item install.sh $stage
           }
           $archive = Join-Path $env:RUNNER_TEMP "renium-$version-$platform.zip"
           Compress-Archive -LiteralPath $stage -DestinationPath $archive
+          $rawName = "renium-cli-$("${{ runner.os }}".ToLowerInvariant())-$("${{ runner.arch }}".ToLowerInvariant())"
+          if ("${{ runner.os }}" -eq "Windows") { $rawName += ".exe" }
+          $raw = Join-Path $env:RUNNER_TEMP $rawName
+          Copy-Item "tools/renium/target/release/$binary" $raw
           "RENIUM_ARCHIVE=$archive" >> $env:GITHUB_ENV
+          "RENIUM_RAW_CLI=$raw" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ runner.os }}-${{ runner.arch }}
-          path: ${{ env.RENIUM_ARCHIVE }}
+          path: |
+            ${{ env.RENIUM_ARCHIVE }}
+            ${{ env.RENIUM_RAW_CLI }}
           if-no-files-found: error
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ env.RENIUM_ARCHIVE }}
+            ${{ env.RENIUM_RAW_CLI }}
 
   integration:
     name: Plugin and extension
     needs: verify-tag
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
     defaults:
       run:
         shell: pwsh
@@ -114,30 +137,223 @@ jobs:
       - name: Build release components
         run: |
           $output = Join-Path $env:RUNNER_TEMP "release-output"
-          ./tools/build-release.ps1 -OutputDirectory $output
+          ./tools/build-release.ps1 -OutputDirectory $output -AllowLocalPublisher
           $release = Join-Path $output "renium-${{ needs.verify-tag.outputs.version }}"
           if (-not (Test-Path $release -PathType Container)) { throw "Release directory was not produced" }
-          "RENIUM_RELEASE_DIR=$release" >> $env:GITHUB_ENV
+          $shared = Join-Path $env:RUNNER_TEMP "renium-shared"
+          New-Item -ItemType Directory -Path $shared | Out-Null
+          @(
+            "Renium.rbxm",
+            "Renium.rbxmx",
+            "README.md",
+            "CLI-README.md",
+            "LICENSE",
+            "install.ps1",
+            "install.sh"
+          ) | ForEach-Object {
+            $source = Join-Path $release $_
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Release directory is missing $_"
+            }
+            Copy-Item -LiteralPath $source -Destination $shared
+          }
+          "RENIUM_SHARED_DIR=$shared" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: integration
-          path: ${{ env.RENIUM_RELEASE_DIR }}
+          path: ${{ env.RENIUM_SHARED_DIR }}
+          if-no-files-found: error
+
+  extension:
+    name: Extension (${{ matrix.target }})
+    needs: [verify-tag, cli, integration]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            cliArtifact: cli-Windows-X64
+            target: win32-x64
+            binary: renium.exe
+          - os: windows-11-arm
+            cliArtifact: cli-Windows-ARM64
+            target: win32-arm64
+            binary: renium.exe
+          - os: ubuntu-latest
+            cliArtifact: cli-Linux-X64
+            target: linux-x64
+            binary: renium
+          - os: ubuntu-24.04-arm
+            cliArtifact: cli-Linux-ARM64
+            target: linux-arm64
+            binary: renium
+          - os: macos-latest
+            cliArtifact: cli-macOS-ARM64
+            target: darwin-arm64
+            binary: renium
+          - os: macos-15-intel
+            cliArtifact: cli-macOS-X64
+            target: darwin-x64
+            binary: renium
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: tools/renium-vscode-extension/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: integration
+          path: integration-artifact
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.cliArtifact }}
+          path: cli-artifact
+
+      - name: Prepare matching plugin and CLI
+        shell: pwsh
+        run: |
+          $plugin = Get-ChildItem integration-artifact -Recurse -File -Filter Renium.rbxm | Select-Object -First 1
+          if ($null -eq $plugin) { throw "Integration artifact is missing Renium.rbxm" }
+          Copy-Item -LiteralPath $plugin.FullName -Destination tools/plugin_ws_bridge/Renium.rbxm -Force
+          Copy-Item -LiteralPath $plugin.FullName -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
+          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *.zip | Select-Object -First 1
+          if ($null -eq $archive) { throw "CLI artifact is missing its archive" }
+          $stage = Join-Path $env:RUNNER_TEMP "renium-cli"
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $stage
+          $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
+          if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
+          if ("${{ runner.os }}" -ne "Windows") { chmod +x -- $cli.FullName }
+          "RENIUM_CLI_BUILD=$($cli.FullName)" >> $env:GITHUB_ENV
+
+      - name: Package extension
+        shell: pwsh
+        run: |
+          npm ci --prefix tools/renium-vscode-extension
+          $output = Join-Path $env:RUNNER_TEMP "renium-${{ needs.verify-tag.outputs.version }}-${{ matrix.target }}.vsix"
+          Push-Location tools/renium-vscode-extension
+          try {
+            npx --no-install vsce package --target "${{ matrix.target }}" --out $output
+          }
+          finally {
+            Pop-Location
+          }
+          if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "VSIX was not produced" }
+          "RENIUM_VSIX=$output" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ matrix.target }}
+          path: ${{ env.RENIUM_VSIX }}
+          if-no-files-found: error
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: ${{ env.RENIUM_VSIX }}
+
+  sbom:
+    name: Software bill of materials
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: renium.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: renium.spdx.json
           if-no-files-found: error
 
   publish:
     name: Publish GitHub release
-    needs: [verify-tag, cli, integration]
+    needs: [verify-tag, cli, integration, extension, sbom]
     runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Flatten release assets
+        run: |
+          mkdir release-assets
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            if [ -e "release-assets/$name" ]; then
+              echo "Duplicate release asset name: $name" >&2
+              exit 1
+            fi
+            cp "$file" "release-assets/$name"
+          done < <(find artifacts -type f -print0)
+
+      - name: Generate signed update manifest
+        env:
+          RENIUM_UPDATE_PRIVATE_KEY: ${{ secrets.RENIUM_UPDATE_PRIVATE_KEY }}
+          RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
+        run: |
+          node tools/generate-update-manifest.mjs \
+            release-assets \
+            "${{ needs.verify-tag.outputs.version }}" \
+            "${{ github.repository }}" \
+            release-assets/update-manifest.json
+
+      - name: Generate checksums
+        run: |
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\0' \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: release-assets/*
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: release-assets/*
+          sbom-path: release-assets/renium.spdx.json
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mapfile -d '' files < <(find artifacts -type f -print0)
-          gh release create "${{ github.ref_name }}" "${files[@]}" --verify-tag --generate-notes
+          mapfile -d '' files < <(find release-assets -maxdepth 1 -type f -print0)
+          if gh release view "${{ github.ref_name }}" --json isDraft >/tmp/renium-release.json 2>/dev/null; then
+            if [ "$(jq -r .isDraft /tmp/renium-release.json)" != "true" ]; then
+              echo "Refusing to modify the published release ${{ github.ref_name }}" >&2
+              exit 1
+            fi
+          else
+            gh release create "${{ github.ref_name }}" --verify-tag --generate-notes --draft
+          fi
+          gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/renium-expected-assets
+          gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' | sort > /tmp/renium-uploaded-assets
+          if ! cmp -s /tmp/renium-expected-assets /tmp/renium-uploaded-assets; then
+            echo "Draft release assets do not match the verified release set" >&2
+            diff -u /tmp/renium-expected-assets /tmp/renium-uploaded-assets || true
+            exit 1
+          fi
+          gh release edit "${{ github.ref_name }}" --draft=false

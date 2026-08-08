@@ -1,4 +1,4 @@
-
+import * as path from "path";
 import * as vscode from "vscode";
 import { loadAssetIconNames } from "./fileExplorer";
 import { decodeRbsyncToTree } from "./rbsyncDecode";
@@ -42,16 +42,73 @@ export class RbsyncEditorProvider implements vscode.CustomReadonlyEditorProvider
     webview.html = rbsyncEditorHtml(assetBase, this.iconNames);
 
     let revealedProperties = false;
-    let decodeStarted = false;
-    webview.onDidReceiveMessage((message: unknown) => {
+    let ready = false;
+    let disposed = false;
+    let decodeRunning = false;
+    let decodeDirty = false;
+    let decodeAbort: AbortController | undefined;
+    let decodeTimer: NodeJS.Timeout | undefined;
+    const filePath = path.normalize(document.uri.fsPath);
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(filePath), path.basename(filePath)),
+    );
+    const decode = async (): Promise<void> => {
+      if (!ready || disposed || decodeRunning) {
+        return;
+      }
+      decodeRunning = true;
+      try {
+        while (ready && !disposed && decodeDirty) {
+          decodeDirty = false;
+          const abort = new AbortController();
+          decodeAbort = abort;
+          await this.decodeAndPost(webview, filePath, () => !disposed && !abort.signal.aborted, abort.signal);
+          if (decodeAbort === abort) {
+            decodeAbort = undefined;
+          }
+        }
+      } finally {
+        decodeRunning = false;
+      }
+    };
+    const scheduleDecode = (): void => {
+      decodeDirty = true;
+      if (decodeTimer) {
+        clearTimeout(decodeTimer);
+      }
+      decodeTimer = setTimeout(() => {
+        decodeTimer = undefined;
+        void decode();
+      }, 75);
+    };
+    const sameFile = (uri: vscode.Uri): boolean => path.normalize(uri.fsPath) === filePath;
+    watcher.onDidCreate((uri) => {
+      if (sameFile(uri)) {
+        scheduleDecode();
+      }
+    });
+    watcher.onDidChange((uri) => {
+      if (sameFile(uri)) {
+        scheduleDecode();
+      }
+    });
+    watcher.onDidDelete((uri) => {
+      if (!sameFile(uri)) {
+        return;
+      }
+      decodeDirty = false;
+      decodeAbort?.abort();
+      void webview.postMessage({ type: "error", message: "This file was deleted." });
+    });
+    const messageSubscription = webview.onDidReceiveMessage((message: unknown) => {
       if (!message || typeof message !== "object") {
         return;
       }
       const msg = message as { type?: string; node?: Parameters<RbsyncSelectHandler>[0] };
       if (msg.type === "ready") {
-        if (!decodeStarted) {
-          decodeStarted = true;
-          void this.decodeAndPost(webview, document.uri.fsPath);
+        if (!ready) {
+          ready = true;
+          scheduleDecode();
         }
       } else if (msg.type === "select" && msg.node) {
         if (!revealedProperties) {
@@ -61,18 +118,39 @@ export class RbsyncEditorProvider implements vscode.CustomReadonlyEditorProvider
         this.onSelect(msg.node);
       }
     });
+    panel.onDidDispose(() => {
+      disposed = true;
+      decodeDirty = false;
+      decodeAbort?.abort();
+      if (decodeTimer) {
+        clearTimeout(decodeTimer);
+        decodeTimer = undefined;
+      }
+      watcher.dispose();
+      messageSubscription.dispose();
+    });
   }
 
-  private async decodeAndPost(webview: vscode.Webview, filePath: string): Promise<void> {
+  private async decodeAndPost(
+    webview: vscode.Webview,
+    filePath: string,
+    isCurrent: () => boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
     const cli = this.resolveCli();
     if (!cli) {
-      void webview.postMessage({
+      if (isCurrent()) {
+        void webview.postMessage({
         type: "error",
         message: "Could not locate renium.exe. Set renium.exportCliPath or build the CLI.",
-      });
+        });
+      }
       return;
     }
-    const result = await decodeRbsyncToTree(cli.cliPath, cli.cwd, filePath);
+    const result = await decodeRbsyncToTree(cli.cliPath, cli.cwd, filePath, { signal });
+    if (!isCurrent()) {
+      return;
+    }
     if (result.ok) {
       void webview.postMessage({ type: "tree", result: result.tree });
     } else {

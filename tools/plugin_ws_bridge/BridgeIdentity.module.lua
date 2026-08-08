@@ -20,50 +20,93 @@ function BridgeIdentity.shortenIdentifier(raw)
 	return string.format("%08x%08x", h1, h2)
 end
 
-function BridgeIdentity.getRefPathSegments(instance)
+local function siblingOrdinal(instance)
+	local parent = instance.Parent
+	if parent == nil or parent == game then
+		return 1
+	end
+	local ordinal = 0
+	for _, sibling in ipairs(parent:GetChildren()) do
+		if sibling.Name == instance.Name then
+			ordinal += 1
+		end
+		if sibling == instance then
+			return ordinal
+		end
+	end
+	return 1
+end
+
+function BridgeIdentity.getRefPathParts(instance)
 	if instance == game then
-		return {}
+		return {}, {}
 	end
 	if not instance:IsDescendantOf(game) then
-		return nil
+		return nil, nil
 	end
 
 	local segments = {}
+	local ordinals = {}
 	local current = instance
 	while current ~= nil and current ~= game do
 		table.insert(segments, 1, current.Name)
+		table.insert(ordinals, 1, siblingOrdinal(current))
 		current = current.Parent
 	end
+	return segments, ordinals
+end
+
+function BridgeIdentity.getRefPathSegments(instance)
+	local segments = BridgeIdentity.getRefPathParts(instance)
 	return segments
 end
 
-function BridgeIdentity.getCachedRefPathSegments(state, instance)
+function BridgeIdentity.getRefPathOrdinals(instance)
+	local _, ordinals = BridgeIdentity.getRefPathParts(instance)
+	return ordinals
+end
+
+function BridgeIdentity.getCachedRefPathParts(state, instance)
 	if instance == game then
-		return {}
+		return {}, {}
+	end
+	local cachedSegments = state.pathSegmentsByInstance[instance]
+	local cachedOrdinals = state.pathOrdinalsByInstance[instance]
+	if cachedSegments ~= nil and cachedOrdinals ~= nil then
+		return cachedSegments, cachedOrdinals
 	end
 	if not instance:IsDescendantOf(game) then
-		return nil
-	end
-
-	local cached = state.pathSegmentsByInstance[instance]
-	if cached ~= nil then
-		return cached
+		return nil, nil
 	end
 
 	local parent = instance.Parent
 	local segments = {}
+	local ordinals = {}
 	if parent ~= nil and parent ~= game then
-		local parentSegments = BridgeIdentity.getCachedRefPathSegments(state, parent)
-		if parentSegments == nil then
-			return nil
+		local parentSegments, parentOrdinals = BridgeIdentity.getCachedRefPathParts(state, parent)
+		if parentSegments == nil or parentOrdinals == nil then
+			return nil, nil
 		end
 		for i, segment in ipairs(parentSegments) do
 			segments[i] = segment
+			ordinals[i] = parentOrdinals[i]
 		end
 	end
 	segments[#segments + 1] = instance.Name
+	ordinals[#ordinals + 1] = siblingOrdinal(instance)
 	state.pathSegmentsByInstance[instance] = segments
+	state.pathOrdinalsByInstance[instance] = ordinals
+	return segments, ordinals
+end
+
+function BridgeIdentity.getCachedRefPathSegments(state, instance)
+	local segments = BridgeIdentity.getCachedRefPathParts(state, instance)
 	return segments
+end
+
+function BridgeIdentity.getCachedRefPathOrdinals(state, instance)
+	local _, ordinals = BridgeIdentity.getCachedRefPathParts(state, instance)
+	return ordinals
 end
 
 function BridgeIdentity.serializeRefValue(state, instance)
@@ -80,14 +123,15 @@ function BridgeIdentity.serializeRefValue(state, instance)
 			}
 		end
 
-		local pathSegments = BridgeIdentity.getCachedRefPathSegments(state, instance)
-		if pathSegments == nil or #pathSegments == 0 then
+		local pathSegments, pathOrdinals = BridgeIdentity.getCachedRefPathParts(state, instance)
+		if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 then
 			return nil
 		end
 
 		local out = {
 			_type = "Ref",
 			pathSegments = pathSegments,
+			pathOrdinals = pathOrdinals,
 		}
 		local cachedDebugId = state.debugIdByInstance[instance]
 		if cachedDebugId == nil then
@@ -106,14 +150,15 @@ function BridgeIdentity.serializeRefValue(state, instance)
 		return out
 	end
 
-	local pathSegments = BridgeIdentity.getRefPathSegments(instance)
-	if pathSegments == nil or #pathSegments == 0 then
+	local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+	if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 then
 		return nil
 	end
 
 	local out = {
 		_type = "Ref",
 		pathSegments = pathSegments,
+		pathOrdinals = pathOrdinals,
 	}
 	local debugId = BridgeIdentity.getDebugId(instance)
 	if debugId ~= nil and #debugId > 0 then

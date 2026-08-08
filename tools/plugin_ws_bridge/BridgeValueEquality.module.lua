@@ -27,6 +27,15 @@ local function vectorsEqual(a: any, b: any, fields: { string }): boolean
 	return true
 end
 
+local function contentEqualsString(content: Content, text: string): boolean
+	if content.SourceType == Enum.ContentSourceType.None then
+		return text == ""
+	elseif content.SourceType == Enum.ContentSourceType.Uri then
+		return content.Uri == text
+	end
+	return false
+end
+
 local valuesEqual
 
 local function tablesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: any }): boolean
@@ -79,6 +88,10 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
 			return a == b.Value
 		elseif typeA == "EnumItem" and typeB == "number" then
 			return a.Value == b
+		elseif typeA == "Content" and typeB == "string" then
+			return contentEqualsString(a, b)
+		elseif typeA == "string" and typeB == "Content" then
+			return contentEqualsString(b, a)
 		end
 		return false
 	end

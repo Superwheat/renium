@@ -69,7 +69,8 @@ impl PropertyPredicate {
     }
 }
 
-pub(crate) fn set_property(
+#[cfg(test)]
+fn set_property(
     document: &mut SettingsBytecode,
     selector: InstanceSelector<'_>,
     property_name: &str,
@@ -104,6 +105,13 @@ pub(crate) fn add_instance(
         && parent_index >= document.instances.len()
     {
         bail!("Parent index {parent_index} is out of range");
+    }
+    if document.instances.is_empty() {
+        if spec.parent_index.is_some() {
+            bail!("The first instance in a settings store must be its root");
+        }
+    } else if spec.parent_index.is_none() {
+        bail!("Only an empty settings store can accept an instance without a parent");
     }
 
     let settings_id = match spec.settings_id {
@@ -273,10 +281,20 @@ fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<
             true
         }
         None => {
-            let removed = object.remove("instanceIndex").is_some();
-            object.remove("settingsId");
-            object.remove("instanceId");
-            object.remove("pathSegments");
+            let mut removed = false;
+            for selector in [
+                "instanceIndex",
+                "settingsId",
+                "instanceId",
+                "pathSegments",
+                "pathOrdinals",
+                "debugId",
+                "path",
+                "referent",
+                "ref",
+            ] {
+                removed = object.remove(selector).is_some() || removed;
+            }
             removed
         }
     }
@@ -384,6 +402,13 @@ pub(crate) fn set_instance_property(
         && property_name == "Parent"
     {
         let resolved = resolve_parent_index(document, &value)?;
+        let is_root = document.instances[index].parent_index.is_none();
+        if is_root && resolved.is_some() {
+            bail!("The service root cannot be moved under another instance");
+        }
+        if !is_root && resolved.is_none() {
+            bail!("Only the service root can have no parent");
+        }
         if let Some(parent_index) = resolved {
             ensure_parent_is_not_descendant(document, index, parent_index)?;
         }

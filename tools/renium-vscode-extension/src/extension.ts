@@ -5,9 +5,37 @@ import * as os from "os";
 import * as path from "path";
 import { URLSearchParams } from "url";
 import * as vscode from "vscode";
-import { findExecutableOnPath } from "./cliResolution";
+import {
+  ensureReniumAgentInstructions,
+  isReniumProjectRoot,
+} from "./agentInstructions";
+import {
+  bundledReniumCliPath,
+  reniumCliCandidates,
+} from "./cliResolution";
 import { mergeAndResolve, sameSourceText, withLineEnding, type ConflictPolicy } from "./conflictMerge";
 import { changedEditorLiveSyncPaths } from "./editorLiveSyncCache";
+import {
+  projectProcessOwner,
+  terminateAllProcesses,
+  terminateProcess,
+  terminateProcessesForOwner,
+  trackProcess,
+} from "./processSupervisor";
+import {
+  ExperienceManifest,
+  ExperiencePlace,
+  activeExperienceAlias,
+  experiencePlaceAliasesInOrder,
+  normalizePlaceAlias,
+  normalizePublishedPlaceName,
+  readExperienceManifest,
+  resolveActiveExperiencePlace,
+  resolveExperiencePlaceRoot,
+  setActiveExperiencePlace,
+  uniquePlaceAlias,
+  writeExperienceManifest,
+} from "./experience";
 import {
   FileExplorerController,
   iconAssetNameForClass,
@@ -19,7 +47,6 @@ import {
   GitRunResult,
   GitStatusEntry,
   buildCommitMessage,
-  defaultGitSyncScope,
   nameStatusAffectedPaths,
   parseAheadBehind,
   parseNameStatusZ,
@@ -28,6 +55,7 @@ import {
   remoteUrlToWebUrl,
   renderGitArgs,
   runGit,
+  shouldPullFromStudioBeforePush,
   summarizeStatus,
 } from "./gitSync";
 import { GitViewActions, GitViewState } from "./gitView";
@@ -35,17 +63,57 @@ import { pickWorkspaceRoot } from "./utils";
 import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
 import { RbsyncEditorProvider } from "./rbsyncViewer";
 import { isRobloxModel, reniumPluginReleaseUrl } from "./pluginDistribution";
+import {
+  ProjectSourceGraph,
+  SharedConfig,
+  inferProjectScriptIdentity,
+  invalidateProjectSourceGraph,
+  loadProjectSourceGraph,
+  loadProjectSourceRoot,
+  loadProjectSourceLocations,
+  loadSharedConfig,
+  sharedConfigValue,
+} from "./sharedConfig";
+import { AUTOMATION_OP } from "./automationProtocol.generated";
 
 const RENIUM_PACKAGE_DRAG_MIME = "application/vnd.renium.package";
 const RENIUM_PACKAGE_TEXT_PREFIX = "renium-package:";
 const RENIUM_OPEN_PACKAGE_SCRIPT_TABS_STATE_KEY = "renium.openPackageScriptTabs";
+const RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY = "renium.activeExperiencePlaces";
+const RENIUM_PLACE_PROJECT_FILES = [
+  "renium.project.jsonc",
+  "renium.project.json",
+  "sourcemap.json",
+  "renium-link.json",
+  "wally.toml",
+  "wally.lock",
+  "Packages",
+  "snapshots",
+  ".renium",
+] as const;
+const RENIUM_SINGLE_PLACE_FILES = [
+  "renium.project.jsonc",
+  "renium.project.json",
+  "sourcemap.json",
+  "renium-link.json",
+  ".renium",
+] as const;
+
+function reniumPlaceProjectPaths(root: string): string[] {
+  return [...new Set([loadProjectSourceRoot(root), ...RENIUM_PLACE_PROJECT_FILES])];
+}
+
+function hasSinglePlaceProject(root: string): boolean {
+  return [loadProjectSourceRoot(root), ...RENIUM_SINGLE_PLACE_FILES]
+    .some((name) => fs.existsSync(path.join(root, name)));
+}
 
 type GitSyncConfig = {
   gitPath: string;
   remote: string;
   branch: string;
   autoFetch: boolean;
-  runFullSyncBeforePush: "ask" | "always" | "never";
+  pullFromStudioBeforePush: "ask" | "always" | "never";
   stageMode: "tracked" | "configuredPaths";
   stagePaths: string[];
   includeUntracked: boolean;
@@ -63,6 +131,12 @@ type WallySyncConfig = {
   packagesDir: string;
   targetService: string;
   targetName: string;
+  serverPackagesDir: string;
+  serverTargetService: string;
+  serverTargetName: string;
+  devPackagesDir: string;
+  devTargetService: string;
+  devTargetName: string;
   realms: string;
   runInstall: boolean;
   applyToStudio: "ask" | "always" | "never";
@@ -86,7 +160,12 @@ type DisplayPrompts = "always" | "initial" | "never";
 type SyncConfig = {
   exportCliPath: string;
   rustCliPath: string;
+  experienceRoot: string;
   projectRoot: string;
+  srcDir: string;
+  activePlaceAlias?: string;
+  activePlace?: ExperiencePlace;
+  placeSelector?: string;
   snapshotDir: string;
   transport: "ws" | "mcp";
   server: string;
@@ -131,6 +210,28 @@ type SyncConfig = {
 type CommandRunResult = {
   code: number;
   output: string;
+  result?: unknown;
+  automationError?: AutomationError;
+};
+
+type CapturedLocalScriptState = {
+  content?: string;
+  base?: string;
+};
+
+type BridgeClientInfo = {
+  runtimeId?: string;
+  role?: string;
+  placeId?: number;
+  gameId?: number;
+  placeName?: string;
+};
+
+type ConnectedStudioPlace = {
+  runtimeId?: string;
+  placeId: number;
+  gameId?: number;
+  placeName: string;
 };
 
 type RobloxPlaceFormat = "rbxl" | "rbxlx";
@@ -169,6 +270,7 @@ type CliWallyRealmResult = {
 
 type CliSyncWallyPackagesResult = {
   ok?: boolean;
+  projectRoot?: string;
   settingsFile?: string;
   service?: string;
   targetName?: string;
@@ -252,6 +354,11 @@ type CliLinkStatusResult = {
   targets?: CliLinkStatusTarget[];
 };
 
+type LinkStatusResolution =
+  | { kind: "success"; value: CliLinkStatusResult }
+  | { kind: "missing" }
+  | { kind: "failed"; error: string };
+
 type CliLinkDeletePackageResult = {
   ok?: boolean;
   id?: string;
@@ -303,6 +410,7 @@ type OpenPackageScriptTab = {
 type GitRepoState = {
   view: GitViewState;
   entries: GitStatusEntry[];
+  worktreeEntries: GitStatusEntry[];
   repoRoot?: string;
   branch?: string;
   upstream?: string;
@@ -310,6 +418,11 @@ type GitRepoState = {
   remoteUrl?: string;
   ahead: number;
   behind: number;
+};
+
+type GitProjectToken = {
+  projectRoot: string;
+  generation: number;
 };
 
 type StudioChangeState = {
@@ -321,6 +434,7 @@ type StudioChangeState = {
   dirtyServices?: string[];
   fullSyncServices?: string[];
   propertyChanges?: StudioPropertyChange[];
+  editorActions?: StudioEditorAction[];
   changes?: StudioChangeLog[];
   trackedServices?: number;
   itemChangedAvailable?: boolean;
@@ -329,6 +443,7 @@ type StudioChangeState = {
   waitTimedOut?: boolean;
   twoWaySyncEnabled?: boolean;
   runtimeSettings?: Record<string, unknown>;
+  explicitRuntimeSettings?: Record<string, unknown>;
   conflictResolution?: string;
 };
 
@@ -346,6 +461,7 @@ type StudioPropertyChange = {
 
 type StudioChangeLog = {
   service?: string;
+  settingsId?: string;
   action?: string;
   reason?: string;
   className?: string;
@@ -366,6 +482,9 @@ type StudioSnapshotDiff = {
 
 type EditorPushOptions = {
   force?: boolean;
+  fullSync?: boolean;
+  projectRoot?: string;
+  pendingServices?: string[];
   verifySources?: boolean;
   skipChangeFilter?: boolean;
   taskName?: string;
@@ -376,8 +495,27 @@ type EditorPushOptions = {
   upsertInstancesOnly?: boolean;
 };
 
+type ExperienceChangeSnapshot = {
+  alias?: string;
+  projectRoot?: string;
+  pendingEditorPaths: string[];
+  blockedStudioImportServices: string[];
+  pendingEditorServicesByPath: Array<[string, string[]]>;
+  studioSnapshotFingerprintByService: Array<[string, string]>;
+  pendingLinkPackageSourcePaths: Array<[string, { projectRoot: string; generation: number }]>;
+};
+
+type ProjectRootConfigurationSnapshot = {
+  globalValue?: string;
+  workspaceValue?: string;
+  workspaceFolderValue?: string;
+};
+
+type EditorPushOutcome = "applied" | "skipped";
+
 type EditorPropertyPushRequest = {
   force?: boolean;
+  projectRoot?: string;
   settingsFile?: string;
   service?: string;
   settingsId?: string;
@@ -387,23 +525,35 @@ type EditorPropertyPushRequest = {
   scope?: "metadata" | "property" | "attribute";
   property?: string;
   value?: unknown;
-  allowProtectedMeshIdApply?: boolean;
+  changedPaths?: string[];
+};
+
+type StudioEditorAction = {
+  id?: string;
+  type?: string;
+  service?: string;
+  settingsId?: string;
+  pathSegments?: string[];
+  pathOrdinals?: number[];
 };
 
 type EditorDeletePushRequest = {
   force?: boolean;
+  projectRoot?: string;
   settingsFile?: string;
   service?: string;
   settingsId?: string;
   className?: string;
   pathSegments?: string[];
   pathOrdinals?: number[];
+  changedPaths?: string[];
 };
 
 type ProgrammaticEditorWriteRequest = {
   paths?: string[] | string;
   durationMs?: number;
   refreshCache?: boolean;
+  forcePending?: boolean;
 };
 
 type EditorLiveSyncHashCache = {
@@ -438,6 +588,23 @@ type DaemonPendingRequest = {
   heartbeatTimer: NodeJS.Timeout | undefined;
   timeoutTimer: NodeJS.Timeout | undefined;
   quiet: boolean;
+};
+
+type AutomationError = {
+  c: string;
+  m: string;
+  rt: 0 | 1;
+  n?: string;
+  d?: unknown;
+};
+
+type AutomationResponse = {
+  v: 1;
+  id: number;
+  ok: 0 | 1;
+  ms: number;
+  r?: unknown;
+  e?: AutomationError;
 };
 
 type PluginProfileOperation = {
@@ -520,8 +687,8 @@ function isCanonicalReniumSettingsFileName(fileName: string): boolean {
   return fileName.toLowerCase() === SETTINGS_FILE_NAME;
 }
 
-function existingReniumSettingsFile(projectRoot: string, service: string): string {
-  const serviceDir = path.join(projectRoot, "src", service);
+function existingReniumSettingsFile(projectRoot: string, srcDir: string, service: string): string {
+  const serviceDir = path.join(projectRoot, srcDir, service);
   const canonical = path.join(serviceDir, SETTINGS_FILE_NAME);
   const legacy = path.join(serviceDir, LEGACY_SETTINGS_FILE_NAME);
   return fs.existsSync(canonical) || !fs.existsSync(legacy) ? canonical : legacy;
@@ -554,7 +721,6 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_DAEMON_OUTPUT_BUFFER_BYTES = 1024 * 1024;
 const DAEMON_CHANNEL_WAIT_MAX_MS = 30_000;
-const rustCliHelpCache = new Map<string, { mtimeMs: number; helpText?: string }>();
 
 const TRANSIENT_SNAPSHOT_PROPERTY_NAMES = new Set([
   "absoluteposition",
@@ -673,70 +839,21 @@ function robloxPlaceFormatFromPath(filePath: string): RobloxPlaceFormat | undefi
   return undefined;
 }
 
-function rustCliHelpText(cliPath: string): string | undefined {
-  try {
-    const stat = fs.statSync(cliPath);
-    const cached = rustCliHelpCache.get(cliPath);
-    if (cached && cached.mtimeMs === stat.mtimeMs) {
-      return cached.helpText;
-    }
-    const result = childProcess.spawnSync(cliPath, ["--help"], {
-      cwd: path.dirname(cliPath),
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-    });
-    const helpText = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-    rustCliHelpCache.set(cliPath, { mtimeMs: stat.mtimeMs, helpText });
-    return helpText;
-  } catch {
-    return undefined;
-  }
-}
-
-function rustCliSupportsCommand(cliPath: string, command: string): boolean {
-  if (!fs.existsSync(cliPath)) {
-    return false;
-  }
-  const helpText = rustCliHelpText(cliPath);
-  return helpText !== undefined && helpText.includes(command);
-}
-
-function rustCliVersion(cliPath: string): string | undefined {
-  try {
-    const result = childProcess.spawnSync(cliPath, ["--version"], {
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-    });
-    const match = `${result.stdout ?? ""}`.match(/(\d+\.\d+\.\d+)/);
-    return match ? match[1] : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function resolveExistingRustCliPath(workspaceRoot: string, projectRoot: string, configuredPath: string): string {
+function resolveExistingRustCliPath(
+  workspaceRoot: string,
+  projectRoot: string,
+  configuredPath: string,
+  extensionRoot: string,
+): string {
   const roots = Array.from(new Set([workspaceRoot, projectRoot].map((value) => path.normalize(value))));
-  const pathCandidate = findExecutableOnPath(RUST_CLI_BINARY);
-  const candidates = [
+  const candidates = reniumCliCandidates({
     configuredPath,
-    ...roots.flatMap((root) => RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => path.normalize(path.join(root, relativePath)))),
-    ...(pathCandidate ? [pathCandidate] : []),
-  ];
-  const uniqueCandidates = Array.from(new Set(candidates.map((candidate) => path.normalize(candidate))));
-
-  if (fs.existsSync(configuredPath)) {
-    return configuredPath;
-  }
-
-  const existingCandidates = uniqueCandidates.filter((candidate) => fs.existsSync(candidate));
-  if (existingCandidates.length === 0) {
-    return configuredPath;
-  }
-
-  existingCandidates.sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
-  return existingCandidates[0];
+    extensionRoot,
+    roots,
+    fallbackRelativePaths: RUST_CLI_FALLBACK_RELATIVE_PATHS,
+  });
+  const existing = candidates.find((candidate) => fs.existsSync(candidate));
+  return existing ?? (configuredPath || bundledReniumCliPath(extensionRoot));
 }
 
 class RobloxSyncController {
@@ -744,12 +861,23 @@ class RobloxSyncController {
   private readonly statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 200);
   private queue: Promise<void> = Promise.resolve();
   private liveSyncWatcher: vscode.FileSystemWatcher | undefined;
+  private liveSyncAdditionalWatchers: vscode.FileSystemWatcher[] = [];
   private liveSyncTimer: NodeJS.Timeout | undefined;
   private liveSyncTimerDueAt = 0;
+  private liveSyncGraphRefreshTimer: NodeJS.Timeout | undefined;
+  private liveSyncGraphRefreshPending = false;
+  private liveSyncGraphRefreshRunning = false;
+  private liveSyncProjectRoot: string | undefined;
   private studioLiveSyncTimer: NodeJS.Timeout | undefined;
-  private studioLiveSyncInFlight = false;
+  private readonly studioLiveSyncInFlightGenerations = new Set<number>();
+  private studioLiveSyncGeneration = 0;
+  private readonly studioImportTasks = new Map<number, Set<Promise<unknown>>>();
+  private studioActionPollTimer: NodeJS.Timeout | undefined;
+  private studioActionPollInFlight = false;
   private changePreviewPanel: vscode.WebviewPanel | undefined;
-  private changePreviewResolve: ((decision: "apply" | "full" | "discard") => void) | undefined;
+  private changePreviewResolve: ((decision: "apply" | "full" | "discard" | "pending") => void) | undefined;
+  private pendingStudioReviewKey: string | undefined;
+  private forcedStudioReviewKey: string | undefined;
   private changePreviewIconNames: ReadonlySet<string> | undefined;
   private studioLiveSyncStarted = false;
   private studioLiveSyncNextPollMs = DEFAULT_STUDIO_LIVE_SYNC_POLL_MS;
@@ -759,6 +887,10 @@ class RobloxSyncController {
   private studioSnapshotFingerprintByService = new Map<string, string>();
   private editorLiveSyncRuntimeEnabled = false;
   private pendingEditorPaths = new Set<string>();
+  private blockedStudioImportServices = new Set<string>();
+  private pendingEditorServicesByPath = new Map<string, Set<string>>();
+  private pendingEditorPersistence: Promise<void> = Promise.resolve();
+  private editorLiveSyncCacheWrites: Promise<void> = Promise.resolve();
   private editorPushFailureStreak = 0;
   private forcedEditorLiveSyncPathKeys = new Set<string>();
   private suppressedEditorLiveSyncPathUntilByKey = new Map<string, number>();
@@ -766,10 +898,24 @@ class RobloxSyncController {
   private studioConflictPolicyOverride: ConflictPolicy | undefined;
   private studioRuntimeSettings: Record<string, unknown> | undefined;
   private conflictMarkerWarnedKeys = new Set<string>();
-  private linkStatusCache: { at: number; value: CliLinkStatusResult | undefined } | undefined;
-  private linkStatusInflight: Promise<CliLinkStatusResult | undefined> | undefined;
+  private linkStatusCache: {
+    at: number;
+    projectRoot: string;
+    generation: number;
+    token: number;
+    value: CliLinkStatusResult | undefined;
+  } | undefined;
+  private linkStatusInflight: {
+    projectRoot: string;
+    generation: number;
+    token: number;
+    promise: Promise<CliLinkStatusResult | undefined>;
+  } | undefined;
+  private linkStatusToken = 0;
   private linkPackageSourceApplyTimer: NodeJS.Timeout | undefined;
-  private readonly pendingLinkPackageSourcePaths = new Set<string>();
+  private readonly pendingLinkPackageSourcePaths = new Map<string, { projectRoot: string; generation: number }>();
+  private linkPackageSourceWatchers: vscode.Disposable[] = [];
+  private readonly activeLinkPackageSourceKeys = new Set<string>();
   private readonly linkChangeEmitter = new vscode.EventEmitter<void>();
   public readonly onLinksChanged = this.linkChangeEmitter.event;
   private daemonProcess: childProcess.ChildProcessWithoutNullStreams | undefined;
@@ -780,7 +926,13 @@ class RobloxSyncController {
   private daemonReadyPromise: Promise<void> | undefined;
   private daemonReadyResolve: (() => void) | undefined;
   private daemonReadyReject: ((err: Error) => void) | undefined;
+  private daemonClosePromise: Promise<void> | undefined;
+  private daemonStopPromise: Promise<void> | undefined;
   private daemonPending = new Map<number, DaemonPendingRequest>();
+  private daemonContext: { key: string; id: number } | undefined;
+  private studioEditorActionRuns = new Map<string, { done: boolean; error?: string }>();
+  private publishedPlaceNames = new Map<number, string>();
+  private publishedRootPlaceIds = new Map<number, number>();
   private bridgeServeRequested = false;
   private liveSyncOwnsServe = false;
   private liveSyncStartPromise: Promise<void> | undefined;
@@ -789,8 +941,12 @@ class RobloxSyncController {
   private autoSyncTimer: NodeJS.Timeout | undefined;
   private pendingAutoServices = new Set<string>();
   private activeTaskName: string | undefined;
-  private activeTaskStartedAt = 0;
-  private activeTaskTicker: NodeJS.Timeout | undefined;
+  private gitViewRefreshSuppression = 0;
+  private experienceChangeInProgress = false;
+  private experienceGeneration = 0;
+  private configuredProjectRoot: string | undefined;
+  private projectRootConfigurationSnapshot: ProjectRootConfigurationSnapshot;
+  private configurationChangeQueue: Promise<void> = Promise.resolve();
   private warnedLegacyStartupWaitSeconds = false;
   private warnedMultiRootWorkspace = false;
   private warnedLegacyBridgePorts = false;
@@ -798,7 +954,18 @@ class RobloxSyncController {
   private warnedLegacyChunkSize = false;
   private warnedChunkSizeCap = false;
   private sourcemapCache: SourcemapCache | undefined;
+  private readonly consoleOutput = vscode.window.createOutputChannel("Renium Console");
+  private consoleFollowTimer: NodeJS.Timeout | undefined;
+  private consoleFollowRunning = false;
+  private consoleFollowGeneration = 0;
+  private consoleFollowInFlightGeneration: number | undefined;
+  private consoleFollowSeq = 0;
+  private consoleFollowEpoch: string | undefined;
+  private consoleFollowFromOldest = false;
+  private consoleFollowOwnsServe = false;
   private displayedLiveSyncPrompt = false;
+  private luauSourcemapQueue: Promise<void> = Promise.resolve();
+  private sharedConfig: SharedConfig = {};
 
   public constructor(private readonly context: vscode.ExtensionContext) {
     const output = vscode.window.createOutputChannel("Renium");
@@ -809,17 +976,488 @@ class RobloxSyncController {
       }
     };
     this.output = output;
+    this.restoreActiveExperiencePlace();
+    const initialConfig = this.getConfig();
+    this.configuredProjectRoot = initialConfig.projectRoot;
+    this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
+    this.ensureAgentInstructions(initialConfig.experienceRoot);
+    this.restorePendingEditorPaths();
+    void this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
     this.statusItem.command = "renium.openMenu";
     this.statusItem.show();
     this.updateStatusBar();
   }
 
+  private ensureAgentInstructions(projectRoot: string): void {
+    try {
+      for (const filePath of ensureReniumAgentInstructions(
+        this.context.extensionPath,
+        projectRoot,
+      )) {
+        this.output.appendLine(`[renium] created ${filePath}`);
+      }
+    } catch (error) {
+      this.output.appendLine(
+        `[renium] could not create agent instructions: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private captureProjectRootConfiguration(): ProjectRootConfigurationSnapshot {
+    const root = this.getWorkspaceRoot();
+    const inspected = vscode.workspace
+      .getConfiguration("renium", vscode.Uri.file(root))
+      .inspect<string>("projectRoot");
+    return {
+      globalValue: inspected?.globalValue,
+      workspaceValue: inspected?.workspaceValue,
+      workspaceFolderValue: inspected?.workspaceFolderValue,
+    };
+  }
+
+  private async restoreProjectRootConfiguration(snapshot: ProjectRootConfigurationSnapshot): Promise<void> {
+    const root = this.getWorkspaceRoot();
+    const configuration = vscode.workspace.getConfiguration("renium", vscode.Uri.file(root));
+    const current = this.captureProjectRootConfiguration();
+    const updates: Array<[keyof ProjectRootConfigurationSnapshot, vscode.ConfigurationTarget]> = [
+      ["globalValue", vscode.ConfigurationTarget.Global],
+      ["workspaceValue", vscode.ConfigurationTarget.Workspace],
+      ["workspaceFolderValue", vscode.ConfigurationTarget.WorkspaceFolder],
+    ];
+    for (const [key, target] of updates) {
+      if (current[key] !== snapshot[key]) {
+        await configuration.update("projectRoot", snapshot[key], target);
+      }
+    }
+    this.projectRootConfigurationSnapshot = snapshot;
+  }
+
+  public createAgentInstructions(): void {
+    const cfg = this.getConfig();
+    if (!isReniumProjectRoot(cfg.experienceRoot)) {
+      throw new Error("Open a Renium project before creating agent instructions.");
+    }
+    const before = ["AGENTS.md", "CLAUDE.md"].filter((name) =>
+      fs.existsSync(path.join(cfg.experienceRoot, name))
+    ).length;
+    this.ensureAgentInstructions(cfg.experienceRoot);
+    const after = ["AGENTS.md", "CLAUDE.md"].filter((name) =>
+      fs.existsSync(path.join(cfg.experienceRoot, name))
+    ).length;
+    vscode.window.showInformationMessage(
+      after > before
+        ? "Created Renium agent instructions."
+        : "Renium agent instructions already exist.",
+    );
+  }
+
+  private isManagedLuauSourcemapSetting(
+    value: string,
+    workspaceRoot: string,
+    experienceRoot: string,
+  ): boolean {
+    const absolute = path.resolve(workspaceRoot, value);
+    const relative = path.relative(experienceRoot, absolute).replaceAll(path.sep, "/");
+    return relative === "sourcemap.json" ||
+      /^places\/[^/]+\/sourcemap\.json$/i.test(relative);
+  }
+
+  private async configureLuauSourcemap(
+    cfg: SyncConfig,
+    projectRoot: string,
+  ): Promise<void> {
+    if (
+      !vscode.extensions.getExtension("JohnnyMorganz.luau-lsp") ||
+      !isReniumProjectRoot(cfg.experienceRoot)
+    ) {
+      return;
+    }
+    const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(cfg.experienceRoot));
+    if (!folder) {
+      return;
+    }
+    const relative = path.relative(
+      folder.uri.fsPath,
+      path.join(projectRoot, "sourcemap.json"),
+    );
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      return;
+    }
+    const sourcemapFile = relative.replaceAll(path.sep, "/");
+    const luau = vscode.workspace.getConfiguration("luau-lsp.sourcemap", folder.uri);
+    const sourcemapInspection = luau.inspect<string>("sourcemapFile");
+    const workspaceSourcemap =
+      sourcemapInspection?.workspaceFolderValue ??
+      sourcemapInspection?.workspaceValue;
+    const globalSourcemap = sourcemapInspection?.globalValue;
+    if (
+      (workspaceSourcemap ?? globalSourcemap) &&
+      (workspaceSourcemap ?? globalSourcemap) !== sourcemapFile &&
+      !this.isManagedLuauSourcemapSetting(
+        workspaceSourcemap ?? globalSourcemap ?? "",
+        folder.uri.fsPath,
+        cfg.experienceRoot,
+      )
+    ) {
+      this.output.appendLine(
+        `[renium] keeping custom Luau sourcemap setting ${workspaceSourcemap ?? globalSourcemap}`,
+      );
+      return;
+    }
+    const autogenerateInspection = luau.inspect<boolean>("autogenerate");
+    const workspaceAutogenerate =
+      autogenerateInspection?.workspaceFolderValue ??
+      autogenerateInspection?.workspaceValue;
+    const globalAutogenerate = autogenerateInspection?.globalValue;
+    const generatorInspection = luau.inspect<string>("generatorCommand");
+    const workspaceGenerator =
+      generatorInspection?.workspaceFolderValue ??
+      generatorInspection?.workspaceValue;
+    const globalGenerator = generatorInspection?.globalValue;
+    if (
+      workspaceAutogenerate === true ||
+      globalAutogenerate === true ||
+      workspaceGenerator?.trim() ||
+      globalGenerator?.trim()
+    ) {
+      this.output.appendLine("[renium] keeping custom Luau sourcemap generation settings");
+      return;
+    }
+    try {
+      const enabledInspection = luau.inspect<boolean>("enabled");
+      const workspaceEnabled =
+        enabledInspection?.workspaceFolderValue ??
+        enabledInspection?.workspaceValue;
+      const globalEnabled = enabledInspection?.globalValue;
+      const includeNonScriptsInspection = luau.inspect<boolean>("includeNonScripts");
+      const workspaceIncludeNonScripts =
+        includeNonScriptsInspection?.workspaceFolderValue ??
+        includeNonScriptsInspection?.workspaceValue;
+      const globalIncludeNonScripts = includeNonScriptsInspection?.globalValue;
+      if (workspaceEnabled === undefined && globalEnabled === undefined) {
+        await luau.update(
+          "enabled",
+          true,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+      if (workspaceAutogenerate === undefined && globalAutogenerate === undefined) {
+        await luau.update(
+          "autogenerate",
+          false,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+      if (
+        workspaceIncludeNonScripts === undefined &&
+        globalIncludeNonScripts === undefined
+      ) {
+        await luau.update(
+          "includeNonScripts",
+          true,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+      if (workspaceSourcemap !== sourcemapFile && globalSourcemap === undefined) {
+        await luau.update(
+          "sourcemapFile",
+          sourcemapFile,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+    } catch (error) {
+      this.output.appendLine(
+        `[renium] could not configure Luau sourcemap: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  public configureLuauSourcemapForEditor(
+    editor: vscode.TextEditor | undefined,
+  ): Promise<void> {
+    const update = async (): Promise<void> => {
+      try {
+        const cfg = this.getConfig();
+        let projectRoot = cfg.projectRoot;
+        if (editor?.document.uri.scheme === "file") {
+          const manifest = readExperienceManifest(cfg.experienceRoot);
+          if (manifest) {
+            for (const place of Object.values(manifest.places)) {
+              const placeRoot = resolveExperiencePlaceRoot(cfg.experienceRoot, place.root);
+              if (this.isPathInside(editor.document.uri.fsPath, placeRoot)) {
+                projectRoot = placeRoot;
+                break;
+              }
+            }
+          }
+        }
+        await this.configureLuauSourcemap(cfg, projectRoot);
+      } catch (error) {
+        this.output.appendLine(
+          `[renium] could not select Luau sourcemap: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    const queued = this.luauSourcemapQueue.then(update, update);
+    this.luauSourcemapQueue = queued.catch(() => {});
+    return queued;
+  }
+
+  private configuredExperienceRoot(): string | undefined {
+    const workspaceRoot = pickWorkspaceRoot();
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    const cfg = vscode.workspace.getConfiguration("renium", vscode.Uri.file(workspaceRoot));
+    return this.resolveConfigPath(cfg.get<string>("projectRoot", "${workspaceFolder}"), workspaceRoot);
+  }
+
+  private experienceStateKey(experienceRoot: string): string {
+    const resolved = path.resolve(experienceRoot);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  private restoreActiveExperiencePlace(
+    experienceRoot = this.configuredExperienceRoot(),
+  ): void {
+    if (!experienceRoot) {
+      return;
+    }
+    const stored = this.context.workspaceState.get<Record<string, string>>(
+      RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY,
+      {},
+    );
+    setActiveExperiencePlace(experienceRoot, stored[this.experienceStateKey(experienceRoot)]);
+    try {
+      const active = resolveActiveExperiencePlace(experienceRoot);
+      if (active) {
+        setActiveExperiencePlace(experienceRoot, active.alias);
+      }
+    } catch {
+    }
+  }
+
+  private async persistActiveExperiencePlace(experienceRoot: string, alias: string): Promise<void> {
+    setActiveExperiencePlace(experienceRoot, alias);
+    const stored = {
+      ...this.context.workspaceState.get<Record<string, string>>(
+        RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY,
+        {},
+      ),
+      [this.experienceStateKey(experienceRoot)]: alias,
+    };
+    try {
+      await this.context.workspaceState.update(RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY, stored);
+    } catch (error) {
+      throw new Error(
+        `Could not save the active place selection. ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private experiencePlaceByAlias(experienceRoot: string, alias: string) {
+    const manifest = readExperienceManifest(experienceRoot);
+    const place = manifest?.places[alias];
+    if (!manifest || !place) {
+      throw new Error(`Place alias '${alias}' is not configured.`);
+    }
+    const selector = manifest.gameId > 0 && place.placeId > 0
+      ? `${manifest.gameId}:${place.placeId}`
+      : place.placeId > 0
+        ? String(place.placeId)
+        : place.name;
+    return {
+      alias,
+      manifest,
+      place,
+      projectRoot: resolveExperiencePlaceRoot(experienceRoot, place.root),
+      selector,
+    };
+  }
+
+  private captureExperienceChange(experienceRoot: string): ExperienceChangeSnapshot {
+    return {
+      alias: activeExperienceAlias(experienceRoot),
+      projectRoot: this.configuredProjectRoot,
+      pendingEditorPaths: [...this.pendingEditorPaths],
+      blockedStudioImportServices: [...this.blockedStudioImportServices],
+      pendingEditorServicesByPath: [...this.pendingEditorServicesByPath]
+        .map(([filePath, services]) => [filePath, [...services]]),
+      studioSnapshotFingerprintByService: [...this.studioSnapshotFingerprintByService],
+      pendingLinkPackageSourcePaths: [...this.pendingLinkPackageSourcePaths],
+    };
+  }
+
+  private async rollbackExperienceChange(
+    experienceRoot: string,
+    snapshot: ExperienceChangeSnapshot,
+    resumeLiveSync: boolean,
+  ): Promise<void> {
+    setActiveExperiencePlace(experienceRoot, snapshot.alias);
+    this.configuredProjectRoot = snapshot.projectRoot;
+    this.pendingEditorPaths = new Set(snapshot.pendingEditorPaths);
+    this.blockedStudioImportServices = new Set(snapshot.blockedStudioImportServices);
+    this.pendingEditorServicesByPath = new Map(
+      snapshot.pendingEditorServicesByPath.map(([filePath, services]) => [filePath, new Set(services)]),
+    );
+    this.studioSnapshotFingerprintByService = new Map(snapshot.studioSnapshotFingerprintByService);
+    this.pendingLinkPackageSourcePaths.clear();
+    for (const [filePath, pending] of snapshot.pendingLinkPackageSourcePaths) {
+      this.pendingLinkPackageSourcePaths.set(filePath, {
+        projectRoot: snapshot.projectRoot ?? pending.projectRoot,
+        generation: this.experienceGeneration,
+      });
+    }
+    this.liveSyncProjectRoot = snapshot.projectRoot;
+    this.sourcemapCache = undefined;
+    this.studioRuntimeSettings = undefined;
+    this.studioConflictPolicyOverride = undefined;
+    this.linkStatusCache = undefined;
+    this.linkStatusInflight = undefined;
+    try {
+      await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+      await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
+    } finally {
+      this.experienceChangeInProgress = false;
+    }
+    this.linkChangeEmitter.fire();
+    this.updateStatusBar();
+    if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
+      await this.serve({ silent: true, bestEffort: true });
+    }
+    if (resumeLiveSync) {
+      await this.startLiveSync({ silent: true, bestEffort: true });
+    }
+    if (this.pendingLinkPackageSourcePaths.size > 0 && snapshot.projectRoot) {
+      this.scheduleLinkPackageSourceFlush(snapshot.projectRoot, this.experienceGeneration);
+    }
+  }
+
+  private async prepareExperienceChange(): Promise<boolean> {
+    if (this.experienceChangeInProgress) {
+      throw new Error("Another place change is already in progress.");
+    }
+    if (this.activeTaskName) {
+      throw new Error(`Wait for ${this.activeTaskName} to finish before changing places.`);
+    }
+    const resumeLiveSync = !!(
+      this.liveSyncWatcher ||
+      this.liveSyncStartPromise ||
+      this.editorLiveSyncRuntimeEnabled
+    );
+    const previousProjectRoot = this.configuredProjectRoot;
+    this.experienceGeneration += 1;
+    this.experienceChangeInProgress = true;
+    try {
+      await vscode.commands.executeCommand("renium.fileExplorer.prepareProjectSwitch");
+      if (resumeLiveSync) {
+        await this.stopLiveSync({ silent: true });
+      }
+      await this.persistPendingEditorPaths();
+      this.pendingEditorPaths.clear();
+      this.blockedStudioImportServices.clear();
+      this.pendingEditorServicesByPath.clear();
+      if (this.activeTaskName) {
+        throw new Error(`Wait for ${this.activeTaskName} to finish before changing places.`);
+      }
+      if (this.autoSyncTimer) {
+        clearTimeout(this.autoSyncTimer);
+        this.autoSyncTimer = undefined;
+      }
+      if (this.linkPackageSourceApplyTimer) {
+        clearTimeout(this.linkPackageSourceApplyTimer);
+        this.linkPackageSourceApplyTimer = undefined;
+      }
+      this.pendingAutoServices.clear();
+      await this.stopConsoleFollow();
+      if (previousProjectRoot) {
+        await terminateProcessesForOwner(projectProcessOwner(previousProjectRoot));
+      }
+      await this.stopBridgeDaemon();
+      return resumeLiveSync;
+    } catch (error) {
+      await vscode.commands.executeCommand("renium.fileExplorer.cancelProjectSwitch");
+      this.restorePendingEditorPaths();
+      this.experienceChangeInProgress = false;
+      throw error;
+    }
+  }
+
+  private async finishExperienceChange(experienceRoot: string, alias: string): Promise<void> {
+    const active = this.experiencePlaceByAlias(experienceRoot, alias);
+    setActiveExperiencePlace(experienceRoot, alias);
+    this.configuredProjectRoot = active.projectRoot;
+    fs.mkdirSync(active.projectRoot, { recursive: true });
+    this.restorePendingEditorPaths();
+    this.sourcemapCache = undefined;
+    this.studioRuntimeSettings = undefined;
+    this.studioConflictPolicyOverride = undefined;
+    this.studioSnapshotFingerprintByService.clear();
+    this.conflictMarkerWarnedKeys.clear();
+    this.recentDirectSaveAtByPath.clear();
+    this.editorPushFailureStreak = 0;
+    this.linkStatusCache = undefined;
+    this.linkStatusInflight = undefined;
+    await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+    await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
+    this.ensureAgentInstructions(experienceRoot);
+    this.linkChangeEmitter.fire();
+    this.updateStatusBar();
+    if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
+      await this.serve({ silent: true, bestEffort: true });
+    }
+    await this.persistActiveExperiencePlace(experienceRoot, alias);
+    let pendingPackageSource = false;
+    for (const pending of this.pendingLinkPackageSourcePaths.values()) {
+      if (
+        this.normalizePathForCompare(pending.projectRoot)
+        === this.normalizePathForCompare(active.projectRoot)
+      ) {
+        pending.generation = this.experienceGeneration;
+        pendingPackageSource = true;
+      }
+    }
+    this.experienceChangeInProgress = false;
+    if (pendingPackageSource) {
+      this.scheduleLinkPackageSourceFlush(active.projectRoot, this.experienceGeneration);
+    }
+  }
+
+  private async activateExperiencePlace(experienceRoot: string, alias: string): Promise<void> {
+    this.experiencePlaceByAlias(experienceRoot, alias);
+    const snapshot = this.captureExperienceChange(experienceRoot);
+    const resumeLiveSync = await this.prepareExperienceChange();
+    try {
+      await this.finishExperienceChange(experienceRoot, alias);
+    } catch (error) {
+      await this.rollbackExperienceChange(experienceRoot, snapshot, resumeLiveSync);
+      throw error;
+    }
+    if (resumeLiveSync) {
+      await this.startLiveSync({ silent: true, bestEffort: true });
+    }
+  }
+
+  private async renameWorkspacePath(source: string, target: string): Promise<void> {
+    const edit = new vscode.WorkspaceEdit();
+    edit.renameFile(vscode.Uri.file(source), vscode.Uri.file(target), {
+      overwrite: false,
+      ignoreIfExists: false,
+    });
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      throw new Error(`Could not move ${source} to ${target}.`);
+    }
+  }
+
   private configuredLogLevel(): ReniumLogLevel {
     const runtimeLevel = this.studioRuntimeSettings?.logLevel;
+    const workspaceConfig = vscode.workspace.getConfiguration("renium");
+    const configuredLevel = this.explicitConfigValue<string>(workspaceConfig, "logLevel");
+    const sharedLevel = sharedConfigValue<string>(this.sharedConfig, "logLevel");
     const raw = String(
       typeof runtimeLevel === "string"
         ? runtimeLevel
-        : vscode.workspace.getConfiguration("renium").get<string>("logLevel", "info") ?? "info",
+        : configuredLevel ?? sharedLevel ?? "info",
     ).toLowerCase();
     switch (raw) {
       case "off":
@@ -869,9 +1507,9 @@ class RobloxSyncController {
   public gitViewActions(): GitViewActions {
     return {
       refresh: (options) => this.getGitViewState(options),
-      runAction: (action) => this.runGitViewAction(action),
+      runAction: (action, context) => this.runGitViewAction(action, context.projectRoot),
       openOutput: () => this.output.show(true),
-      openDiff: (filePath) => this.openGitDiff(filePath),
+      openDiff: (filePath, context) => this.openGitDiff(filePath, context.projectRoot),
     };
   }
 
@@ -903,19 +1541,21 @@ class RobloxSyncController {
   }
 
 
-  private async openGitDiff(filePath: string): Promise<void> {
+  private async openGitDiff(filePath: string, expectedProjectRoot: string): Promise<void> {
     const requested = String(filePath ?? "").trim();
     if (!requested) {
       return;
     }
     this.ensureGitHeadProvider();
-    const cfg = this.getConfig();
+    const token = this.captureGitProjectToken(expectedProjectRoot);
+    const cfg = this.gitConfigForToken(token);
     let repoRoot: string;
     try {
       const state = await this.inspectGitRepo(cfg, { fetch: false });
+      this.gitConfigForToken(token);
       repoRoot = this.requireGitRepoRoot(state);
     } catch (err) {
-      vscode.window.showErrorMessage(`Renium: cannot open diff. ${err instanceof Error ? err.message : String(err)}`);
+      vscode.window.showErrorMessage(`Cannot open diff. ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
     const absFile = path.isAbsolute(requested) ? requested : path.join(repoRoot, requested);
@@ -938,28 +1578,22 @@ class RobloxSyncController {
       clearTimeout(this.autoSyncTimer);
       this.autoSyncTimer = undefined;
     }
-    if (this.activeTaskTicker) {
-      clearInterval(this.activeTaskTicker);
-      this.activeTaskTicker = undefined;
+    if (this.linkPackageSourceApplyTimer) {
+      clearTimeout(this.linkPackageSourceApplyTimer);
+      this.linkPackageSourceApplyTimer = undefined;
     }
-
-    if (this.liveSyncTimer) {
-      clearTimeout(this.liveSyncTimer);
-      this.liveSyncTimer = undefined;
-      this.liveSyncTimerDueAt = 0;
+    for (const watcher of this.linkPackageSourceWatchers) {
+      watcher.dispose();
     }
-    if (this.studioLiveSyncTimer) {
-      clearTimeout(this.studioLiveSyncTimer);
-      this.studioLiveSyncTimer = undefined;
-    }
-    if (this.liveSyncWatcher) {
-      this.liveSyncWatcher.dispose();
-      this.liveSyncWatcher = undefined;
-    }
-
-    this.stopBridgeDaemon();
+    this.linkPackageSourceWatchers = [];
+    this.activeLinkPackageSourceKeys.clear();
+    this.disposeLiveSyncRuntime();
+    this.stopStudioActionPolling();
+    void this.stopConsoleFollow({ releaseServe: false });
+    void this.stopBridgeDaemon();
 
     this.statusItem.dispose();
+    this.consoleOutput.dispose();
     this.output.dispose();
   }
 
@@ -989,9 +1623,19 @@ class RobloxSyncController {
     const serving = this.bridgeServeRequested && this.isBridgeDaemonRunning();
     const items: Array<vscode.QuickPickItem & { action: string }> = [
       {
-        label: "$(sync) Full Sync (Studio -> src)",
-        description: "Exports from Studio, updates src, writes generated project JSON",
-        action: "fullSync",
+        label: "$(cloud-download) Pull Studio to files",
+        description: "Replace project files with the connected Studio place",
+        action: "pullFromStudio",
+      },
+      {
+        label: "$(cloud-upload) Push files to Studio",
+        description: "Replace the connected Studio place with project files",
+        action: "pushToStudio",
+      },
+      {
+        label: "$(list-tree) Manage Places",
+        description: "Add, switch, rename, or reorder experience places",
+        action: "managePlaces",
       },
       {
         label: "$(export) Export Snapshots Only",
@@ -1000,7 +1644,7 @@ class RobloxSyncController {
       },
       {
         label: "$(save) Export Game File...",
-        description: "Write a .rbxl/.rbxlx place file from src",
+        description: "Write a .rbxl/.rbxlx place file from the project files",
         action: "exportGameFile",
       },
       {
@@ -1010,7 +1654,7 @@ class RobloxSyncController {
       },
       {
         label: "$(link) Sync Link Mirrors",
-        description: "Rebuild link targets in src from local, git, Wally, or package sources",
+        description: "Rebuild project link targets from local, Git, Wally, or package sources",
         action: "linkApply",
       },
       {
@@ -1027,13 +1671,20 @@ class RobloxSyncController {
       },
       {
         label: liveSyncRunning ? "$(circle-slash) Stop Live Sync" : "$(broadcast) Live Sync",
-        description: liveSyncRunning ? "Stop watching src and Studio changes" : "Two-way sync between src and Studio",
+        description: liveSyncRunning
+          ? "Stop watching project and Studio edits"
+          : "Two-way sync between project files and Studio",
         action: liveSyncRunning ? "stopLive" : "startLive",
       },
       {
         label: "$(git) Git",
         description: "Open the Git tab in the main Renium panel",
         action: "gitSync",
+      },
+      {
+        label: "$(tools) Project Tools",
+        description: "Build, diagnose, configure, update, or open the console",
+        action: "projectTools",
       },
       {
         label: cfg.autoSyncOnSave ? "$(circle-slash) Disable Auto Sync On Save" : "$(history) Enable Auto Sync On Save",
@@ -1062,8 +1713,14 @@ class RobloxSyncController {
     }
 
     switch (picked.action) {
-      case "fullSync":
-        await this.fullSync();
+      case "pullFromStudio":
+        await this.pullFromStudio();
+        return;
+      case "pushToStudio":
+        await this.pushToStudio();
+        return;
+      case "managePlaces":
+        await this.managePlaces();
         return;
       case "exportOnly":
         await this.exportSnapshotsOnly();
@@ -1079,6 +1736,9 @@ class RobloxSyncController {
         return;
       case "gitSync":
         await this.openGitSync();
+        return;
+      case "projectTools":
+        await this.openProjectTools();
         return;
       case "wallyPackages":
         await this.syncWallyPackages();
@@ -1109,31 +1769,665 @@ class RobloxSyncController {
     }
   }
 
+  private async connectedStudioPlaces(attempt = 0): Promise<ConnectedStudioPlace[]> {
+    const cfg = this.getConfig();
+    const result = await this.runAutomationOperation(
+      cfg.exportCliPath,
+      cfg,
+      "current-place",
+      AUTOMATION_OP.studios,
+      { all: true },
+      { timeoutMs: 1_000 },
+    );
+    if (result.code !== 0) {
+      throw new Error("Could not read the connected Studio places.");
+    }
+    const payload = result.result as { studios?: unknown } | undefined;
+    const clients = (Array.isArray(payload?.studios) ? payload.studios : [])
+      .map((value): ConnectedStudioPlace | undefined => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return undefined;
+        }
+        const client = value as BridgeClientInfo;
+        const placeId = Number(client.placeId);
+        const gameId = Number(client.gameId);
+        const placeName = typeof client.placeName === "string" ? client.placeName.trim() : "";
+        if (
+          String(client.role ?? "").toLowerCase() !== "edit" ||
+          !Number.isSafeInteger(placeId) ||
+          placeId < 0 ||
+          !placeName
+        ) {
+          return undefined;
+        }
+        return {
+          runtimeId: typeof client.runtimeId === "string" ? client.runtimeId : undefined,
+          placeId,
+          gameId: Number.isSafeInteger(gameId) && gameId >= 0 ? gameId : undefined,
+          placeName,
+        };
+      })
+      .filter((value): value is ConnectedStudioPlace => value !== undefined);
+    const unique = Array.from(new Map(
+      clients.map((client) => [
+        client.runtimeId || `${client.gameId}:${client.placeId}:${client.placeName}`,
+        client,
+      ]),
+    ).values());
+    if (unique.length === 0 && attempt < 2) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, attempt === 0 ? 200 : 800);
+      });
+      return await this.connectedStudioPlaces(attempt + 1);
+    }
+    return unique;
+  }
+
+  private async currentStudioPlace(
+    connected?: ConnectedStudioPlace[],
+  ): Promise<ConnectedStudioPlace | undefined> {
+    const unique = connected ?? await this.connectedStudioPlaces();
+    if (unique.length === 0) {
+      void vscode.window.showErrorMessage("No edit-mode Studio place is connected.");
+      return undefined;
+    }
+    const resolved = await Promise.all(unique.map(async (client) => ({
+      ...client,
+      placeName: await this.publishedPlaceName(client.placeId) ?? client.placeName,
+    })));
+    if (resolved.length === 1) {
+      return resolved[0];
+    }
+    const picked = await vscode.window.showQuickPick(
+      resolved.map((client) => ({
+        label: client.placeName,
+        description: client.placeId && client.gameId
+          ? `PlaceId ${client.placeId}, GameId ${client.gameId}`
+          : "Unpublished place",
+        client,
+      })),
+      {
+        title: "Choose Studio Place",
+        placeHolder: "Choose the Studio place to use",
+      },
+    );
+    return picked?.client;
+  }
+
+  private async robloxJson(url: string, label: string): Promise<unknown> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1_000);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      return response.ok ? await response.json() : undefined;
+    } catch (error) {
+      this.output.appendLine(
+        `[renium] ${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async publishedPlaceName(placeId: number): Promise<string | undefined> {
+    if (placeId <= 0) {
+      return undefined;
+    }
+    const cached = this.publishedPlaceNames.get(placeId);
+    if (cached) {
+      return cached;
+    }
+    const raw = await this.robloxJson(
+      `https://economy.roblox.com/v2/assets/${placeId}/details`,
+      `Place name lookup for ${placeId}`,
+    );
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return undefined;
+    }
+    const details = raw as { AssetId?: unknown; AssetTypeId?: unknown; Name?: unknown };
+    if (
+      Number(details.AssetId) !== placeId ||
+      Number(details.AssetTypeId) !== 9 ||
+      typeof details.Name !== "string"
+    ) {
+      return undefined;
+    }
+    const name = details.Name.trim();
+    if (!name) {
+      return undefined;
+    }
+    this.publishedPlaceNames.set(placeId, name);
+    return name;
+  }
+
+  private async publishedRootPlaceId(gameId: number): Promise<number | undefined> {
+    if (gameId <= 0) {
+      return undefined;
+    }
+    const cached = this.publishedRootPlaceIds.get(gameId);
+    if (cached) {
+      return cached;
+    }
+    const raw = await this.robloxJson(
+      `https://games.roblox.com/v1/games?universeIds=${gameId}`,
+      `Starting place lookup for ${gameId}`,
+    );
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return undefined;
+    }
+    const data = (raw as { data?: unknown }).data;
+    if (!Array.isArray(data)) {
+      return undefined;
+    }
+    const gameDetails = data.find((value) =>
+      !!value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Number((value as { id?: unknown }).id) === gameId);
+    if (!gameDetails) {
+      return undefined;
+    }
+    const rootPlaceId = Number((gameDetails as { rootPlaceId?: unknown }).rootPlaceId);
+    if (!Number.isSafeInteger(rootPlaceId) || rootPlaceId <= 0) {
+      return undefined;
+    }
+    this.publishedRootPlaceIds.set(gameId, rootPlaceId);
+    return rootPlaceId;
+  }
+
+  public async addCurrentPlace(connectedPlace?: ConnectedStudioPlace): Promise<void> {
+    let shouldSync = false;
+    let resumeLiveSync = false;
+    try {
+      const current = connectedPlace
+        ? {
+          ...connectedPlace,
+          placeName: await this.publishedPlaceName(connectedPlace.placeId) ?? connectedPlace.placeName,
+        }
+        : await this.currentStudioPlace();
+      if (!current) {
+        return;
+      }
+      if (current.gameId === undefined) {
+        void vscode.window.showErrorMessage(
+          "The connected Studio plugin did not report GameId. Install the current plugin and try again.",
+        );
+        return;
+      }
+      const cfg = this.getConfig();
+      const experienceRoot = cfg.experienceRoot;
+      this.ensureAgentInstructions(experienceRoot);
+      let manifest = readExperienceManifest(experienceRoot);
+      const firstPlace = manifest === undefined;
+      if (manifest && manifest.gameId > 0 && current.gameId > 0 && manifest.gameId !== current.gameId) {
+        await vscode.window.showErrorMessage(
+          `This place belongs to GameId ${current.gameId}, but this project belongs to GameId ${manifest.gameId}.`,
+          { modal: true },
+        );
+        return;
+      }
+      const currentPlaceId = current.placeId;
+      const rootPlaceId = await this.publishedRootPlaceId(current.gameId);
+      if (manifest && rootPlaceId) {
+        const rootEntry = Object.entries(manifest.places)
+          .find(([, place]) => place.placeId === rootPlaceId);
+        if (rootEntry && manifest.startPlace !== rootEntry[0]) {
+          manifest = {
+            ...manifest,
+            startPlace: rootEntry[0],
+          };
+          writeExperienceManifest(experienceRoot, manifest);
+        }
+      }
+      const existing = manifest
+        ? Object.entries(manifest.places).find(([, place]) =>
+          currentPlaceId > 0
+            ? place.placeId === currentPlaceId
+            : place.placeId === 0 && place.name === current.placeName)
+        : undefined;
+      if (existing && manifest) {
+        const [existingAlias, existingPlace] = existing;
+        const correctedAlias = normalizePublishedPlaceName(current.placeName, currentPlaceId);
+        const generatedFromOldName =
+          existingAlias === normalizePublishedPlaceName(existingPlace.name, currentPlaceId);
+        if (
+          currentPlaceId > 0 &&
+          generatedFromOldName &&
+          correctedAlias !== existingAlias &&
+          !manifest?.places[correctedAlias] &&
+          !fs.existsSync(path.join(experienceRoot, "places", correctedAlias))
+        ) {
+          await this.renameExperiencePlace(
+            experienceRoot,
+            {
+              alias: existingAlias,
+              manifest,
+              place: existingPlace,
+            },
+            correctedAlias,
+            current.placeName,
+          );
+          void vscode.window.showInformationMessage(
+            `Updated ${existingAlias} to ${correctedAlias} using the published place name.`,
+          );
+          return;
+        }
+        if (existingPlace.name !== current.placeName) {
+          manifest.places[existingAlias] = {
+            ...existingPlace,
+            name: current.placeName,
+          };
+          writeExperienceManifest(experienceRoot, manifest);
+        }
+        await this.activateExperiencePlace(experienceRoot, existingAlias);
+        void vscode.window.showInformationMessage(`Switched to ${existingAlias}.`);
+        return;
+      }
+      const alias = uniquePlaceAlias(
+        experienceRoot,
+        manifest,
+        current.placeName,
+        currentPlaceId,
+      );
+      const originalManifest = manifest
+        ? JSON.parse(JSON.stringify(manifest)) as ExperienceManifest
+        : undefined;
+      manifest = manifest ?? {
+        version: 2,
+        gameId: current.gameId,
+        startPlace: alias,
+        placeOrder: [],
+        places: {},
+      };
+      if (manifest.gameId === 0 && current.gameId > 0) {
+        manifest.gameId = current.gameId;
+      }
+      const placeRoot = path.posix.join("places", alias);
+      manifest.places[alias] = {
+        placeId: currentPlaceId,
+        name: current.placeName,
+        root: placeRoot,
+      };
+      if (currentPlaceId > 0) {
+        manifest.placeOrder.push(currentPlaceId);
+      }
+      if (rootPlaceId === currentPlaceId) {
+        manifest.startPlace = alias;
+      }
+      const absolutePlaceRoot = resolveExperiencePlaceRoot(experienceRoot, placeRoot);
+      const createdPlaceRoot = !fs.existsSync(absolutePlaceRoot);
+      const migratedPaths: Array<{ source: string; target: string }> = [];
+      const experienceSnapshot = this.captureExperienceChange(experienceRoot);
+      resumeLiveSync = await this.prepareExperienceChange();
+      try {
+        fs.mkdirSync(absolutePlaceRoot, { recursive: true });
+        if (firstPlace) {
+          for (const name of reniumPlaceProjectPaths(experienceRoot)) {
+            const source = path.join(experienceRoot, name);
+            const target = path.join(absolutePlaceRoot, name);
+            if (!fs.existsSync(source)) {
+              continue;
+            }
+            await this.renameWorkspacePath(source, target);
+            migratedPaths.push({ source, target });
+          }
+        }
+        writeExperienceManifest(experienceRoot, manifest);
+        await this.finishExperienceChange(experienceRoot, alias);
+      } catch (error) {
+        for (const migrated of migratedPaths.reverse()) {
+          if (!fs.existsSync(migrated.target) || fs.existsSync(migrated.source)) {
+            continue;
+          }
+          try {
+            await this.renameWorkspacePath(migrated.target, migrated.source);
+          } catch (rollbackError) {
+            this.output.appendLine(
+              `[renium] place migration rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+            );
+          }
+        }
+        if (createdPlaceRoot && fs.existsSync(absolutePlaceRoot)) {
+          try {
+            fs.rmdirSync(absolutePlaceRoot);
+          } catch (cleanupError) {
+            this.output.appendLine(
+              `[renium] place folder cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+            );
+          }
+        }
+        if (originalManifest) {
+          writeExperienceManifest(experienceRoot, originalManifest);
+        } else {
+          fs.rmSync(path.join(experienceRoot, "renium.experience.json"), { force: true });
+        }
+        await this.rollbackExperienceChange(experienceRoot, experienceSnapshot, resumeLiveSync);
+        throw error;
+      }
+      void vscode.window.showInformationMessage(
+        `Added ${current.placeName} as ${alias}. Starting its first pull from Studio.`,
+      );
+      shouldSync = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] add current place failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not add the current place. ${message}`);
+      return;
+    }
+    if (shouldSync) {
+      try {
+        await this.syncActivePlace();
+      } finally {
+        if (resumeLiveSync) {
+          await this.startLiveSync({ silent: true, bestEffort: true });
+        }
+      }
+    }
+  }
+
+  public async managePlaces(): Promise<void> {
+    try {
+      const cfg = this.getConfig();
+      const active = resolveActiveExperiencePlace(cfg.experienceRoot);
+      const items: Array<vscode.QuickPickItem & { action: string }> = [
+        {
+          label: "$(add) Add Current Studio Place",
+          description: "Add a connected place to this experience project",
+          action: "addCurrentPlace",
+        },
+      ];
+      if (active) {
+        items.push(
+          {
+            label: "$(arrow-swap) Switch Active Place",
+            description: `Current: ${active.alias}`,
+            action: "switchPlace",
+          },
+          {
+            label: "$(edit) Rename Active Place",
+            description: `Current alias: ${active.alias}`,
+            action: "renamePlace",
+          },
+          {
+            label: "$(list-ordered) Reorder Places",
+            description: "Set the order used when places are displayed",
+            action: "reorderPlaces",
+          },
+        );
+      }
+      const picked = await vscode.window.showQuickPick(items, {
+        title: "Manage Places",
+        placeHolder: "Choose an action",
+      });
+      if (!picked) {
+        return;
+      }
+      switch (picked.action) {
+        case "addCurrentPlace":
+          await this.addCurrentPlace();
+          return;
+        case "switchPlace":
+          await this.switchPlace();
+          return;
+        case "renamePlace":
+          await this.renamePlace();
+          return;
+        case "reorderPlaces":
+          await this.reorderPlaces();
+          return;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] manage places failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not manage places. ${message}`);
+    }
+  }
+
+  public async switchPlace(): Promise<void> {
+    try {
+      const cfg = this.getConfig();
+      const manifest = readExperienceManifest(cfg.experienceRoot);
+      if (!manifest) {
+        void vscode.window.showInformationMessage("Add the current Studio place first.");
+        return;
+      }
+      const rootPlaceId = await this.publishedRootPlaceId(manifest.gameId);
+      const currentAlias = resolveActiveExperiencePlace(cfg.experienceRoot)?.alias;
+      const picked = await vscode.window.showQuickPick(
+        experiencePlaceAliasesInOrder(manifest)
+          .map((alias) => {
+            const place = manifest.places[alias];
+            const startingPlace = rootPlaceId
+              ? place.placeId === rootPlaceId
+              : alias === manifest.startPlace;
+            const status = [
+              startingPlace ? "Starting place" : "",
+              alias === currentAlias ? "Current" : "",
+              place.name,
+            ].filter(Boolean);
+            return {
+              label: alias,
+              description: status.join(" | "),
+              detail: place.placeId > 0 ? `PlaceId ${place.placeId}` : "Unpublished place",
+              alias,
+            };
+          }),
+        {
+          title: "Switch Place",
+          placeHolder: currentAlias ? `Current: ${currentAlias}` : "Choose a place",
+        },
+      );
+      if (!picked || picked.alias === currentAlias) {
+        return;
+      }
+      await this.activateExperiencePlace(cfg.experienceRoot, picked.alias);
+      void vscode.window.showInformationMessage(`Switched to ${picked.alias}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] switch place failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not switch places. ${message}`);
+    }
+  }
+
+  public async reorderPlaces(): Promise<void> {
+    try {
+      const cfg = this.getConfig();
+      const initialManifest = readExperienceManifest(cfg.experienceRoot);
+      if (!initialManifest) {
+        void vscode.window.showInformationMessage("Add the current Studio place first.");
+        return;
+      }
+      let manifest: ExperienceManifest = initialManifest;
+      if (manifest.placeOrder.length < 2) {
+        void vscode.window.showInformationMessage("Add another published place before changing the order.");
+        return;
+      }
+      while (true) {
+        const activeAlias = resolveActiveExperiencePlace(cfg.experienceRoot)?.alias;
+        const orderedAliases = experiencePlaceAliasesInOrder(manifest)
+          .filter((alias) => manifest.places[alias].placeId > 0);
+        const selected = await vscode.window.showQuickPick(
+          orderedAliases.map((alias, index) => {
+            const place = manifest.places[alias];
+            const status = [
+              alias === manifest.startPlace ? "Starting place" : "",
+              alias === activeAlias ? "Current" : "",
+              place.name,
+            ].filter(Boolean);
+            return {
+              label: `${index + 1}. ${alias}`,
+              description: status.join(" | "),
+              detail: place.placeId > 0 ? `PlaceId ${place.placeId}` : "Unpublished place",
+              alias,
+            };
+          }),
+          {
+            title: "Reorder Places",
+            placeHolder: "Choose a place to move; press Escape when finished",
+          },
+        );
+        if (!selected) {
+          return;
+        }
+        const currentIndex = orderedAliases.indexOf(selected.alias);
+        const destination = await vscode.window.showQuickPick(
+          orderedAliases.map((alias, index) => ({
+            label: `Position ${index + 1}`,
+            description: index === currentIndex ? "Current position" : `Currently ${alias}`,
+            index,
+          })),
+          {
+            title: `Move ${selected.alias}`,
+            placeHolder: "Choose its new position",
+          },
+        );
+        if (!destination) {
+          return;
+        }
+        if (destination.index === currentIndex) {
+          continue;
+        }
+        const placeOrder: number[] = [...manifest.placeOrder];
+        placeOrder.splice(currentIndex, 1);
+        placeOrder.splice(destination.index, 0, manifest.places[selected.alias].placeId);
+        manifest = {
+          ...manifest,
+          placeOrder,
+        };
+        writeExperienceManifest(cfg.experienceRoot, manifest);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] reorder places failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not reorder places. ${message}`);
+    }
+  }
+
+  public async renamePlace(): Promise<void> {
+    try {
+      const cfg = this.getConfig();
+      const active = resolveActiveExperiencePlace(cfg.experienceRoot);
+      if (!active) {
+        void vscode.window.showInformationMessage("Add the current Studio place first.");
+        return;
+      }
+      const input = await vscode.window.showInputBox({
+        title: "Rename Current Place Alias",
+        prompt: `Rename ${active.alias}. This does not rename the place in Roblox.`,
+        value: active.alias,
+        validateInput: (value) =>
+          /[a-z0-9]/i.test(value)
+            ? undefined
+            : "Use at least one English letter or number.",
+      });
+      if (input === undefined) {
+        return;
+      }
+      const alias = normalizePlaceAlias(input, active.place.placeId);
+      if (alias === active.alias) {
+        return;
+      }
+      if (active.manifest.places[alias]) {
+        void vscode.window.showErrorMessage(`The alias '${alias}' already exists.`);
+        return;
+      }
+      const nextRoot = path.posix.join("places", alias);
+      const targetRoot = resolveExperiencePlaceRoot(cfg.experienceRoot, nextRoot);
+      if (fs.existsSync(targetRoot)) {
+        void vscode.window.showErrorMessage(`${targetRoot} already exists.`);
+        return;
+      }
+      await this.renameExperiencePlace(cfg.experienceRoot, active, alias, active.place.name);
+      void vscode.window.showInformationMessage(`Renamed ${active.alias} to ${alias}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] rename place failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not rename the place alias. ${message}`);
+    }
+  }
+
+  private async renameExperiencePlace(
+    experienceRoot: string,
+    active: {
+      alias: string;
+      manifest: ExperienceManifest;
+      place: ExperiencePlace;
+    },
+    alias: string,
+    placeName: string,
+  ): Promise<void> {
+    const nextRoot = path.posix.join("places", alias);
+    const sourceRoot = resolveExperiencePlaceRoot(experienceRoot, active.place.root);
+    const targetRoot = resolveExperiencePlaceRoot(experienceRoot, nextRoot);
+    const experienceSnapshot = this.captureExperienceChange(experienceRoot);
+    const resumeLiveSync = await this.prepareExperienceChange();
+    const sourceExists = fs.existsSync(sourceRoot);
+    const places = Object.fromEntries(
+      Object.entries(active.manifest.places).map(([currentAlias, place]): [string, ExperiencePlace] =>
+        currentAlias === active.alias
+          ? [alias, { ...place, name: placeName, root: nextRoot }]
+          : [currentAlias, place]),
+    );
+    const renamed: ExperienceManifest = {
+      ...active.manifest,
+      startPlace: active.manifest.startPlace === active.alias ? alias : active.manifest.startPlace,
+      places,
+    };
+    let sourceMoved = false;
+    let targetCreated = false;
+    try {
+      fs.mkdirSync(path.dirname(targetRoot), { recursive: true });
+      if (sourceExists) {
+        await this.renameWorkspacePath(sourceRoot, targetRoot);
+        sourceMoved = true;
+      } else {
+        fs.mkdirSync(targetRoot);
+        targetCreated = true;
+      }
+      writeExperienceManifest(experienceRoot, renamed);
+      await this.finishExperienceChange(experienceRoot, alias);
+    } catch (error) {
+      try {
+        if (sourceMoved && fs.existsSync(targetRoot) && !fs.existsSync(sourceRoot)) {
+          await this.renameWorkspacePath(targetRoot, sourceRoot);
+        } else if (targetCreated && fs.existsSync(targetRoot)) {
+          fs.rmdirSync(targetRoot);
+        }
+      } catch (rollbackError) {
+        const message = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+        this.output.appendLine(`[renium] place rename rollback failed: ${message}`);
+      }
+      try {
+        writeExperienceManifest(experienceRoot, active.manifest);
+      } catch (rollbackError) {
+        const message = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+        this.output.appendLine(`[renium] place manifest rollback failed: ${message}`);
+      }
+      await this.rollbackExperienceChange(experienceRoot, experienceSnapshot, resumeLiveSync);
+      throw error;
+    }
+    if (resumeLiveSync) {
+      await this.startLiveSync({ silent: true, bestEffort: true });
+    }
+  }
+
   public async installStudioPlugin(): Promise<void> {
     const assetName = "Renium.rbxm";
     const extensionVersion = String(this.context.extension.packageJSON.version ?? "");
     const releaseUrl = reniumPluginReleaseUrl(extensionVersion, assetName);
-    let pluginsDir: string;
-    if (process.platform === "win32") {
-      const localAppData = process.env.LOCALAPPDATA;
-      if (!localAppData) {
-        void vscode.window.showErrorMessage("Renium: LOCALAPPDATA is not set; cannot locate the Roblox Plugins folder.");
-        return;
-      }
-      pluginsDir = path.join(localAppData, "Roblox", "Plugins");
-    } else if (process.platform === "darwin") {
-      pluginsDir = path.join(os.homedir(), "Documents", "Roblox", "Plugins");
-    } else {
-      void vscode.window.showErrorMessage("Renium: Roblox Studio is only available on Windows and macOS.");
+    if (process.platform !== "win32" && process.platform !== "darwin") {
+      void vscode.window.showErrorMessage("Roblox Studio is only available on Windows and macOS.");
       return;
     }
-    const target = path.join(pluginsDir, assetName);
 
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Renium: installing Studio plugin..." },
+      { location: vscode.ProgressLocation.Notification, title: "Installing Studio plugin..." },
       async () => {
         let bytes: Buffer | undefined;
         let source = "";
+        let sourcePath = "";
+        let temporarySource = "";
         const workspaceRoot = pickWorkspaceRoot();
         const localBundles = [
           this.context.asAbsolutePath(path.join("assets", assetName)),
@@ -1147,6 +2441,7 @@ class RobloxSyncController {
           if (isRobloxModel(candidateBytes)) {
             bytes = candidateBytes;
             source = localBundle;
+            sourcePath = localBundle;
             break;
           }
           this.output.appendLine(`[plugin-install] ignored invalid bundled model: ${localBundle}`);
@@ -1161,32 +2456,422 @@ class RobloxSyncController {
             bytes = Buffer.from(await response.arrayBuffer());
           } catch (error) {
             void vscode.window.showErrorMessage(
-              `Renium: downloading the matching Studio plugin failed (${String(error)}). Check your network or download ${assetName} from release v${extensionVersion}.`,
+              `Downloading the matching Studio plugin failed (${String(error)}). Check your network or download ${assetName} from release v${extensionVersion}.`,
             );
             return;
           }
         }
         if (!isRobloxModel(bytes)) {
-          void vscode.window.showErrorMessage("Renium: the Studio plugin file is not a valid Roblox model.");
+          void vscode.window.showErrorMessage("The Studio plugin file is not a valid Roblox model.");
           return;
         }
-        fs.mkdirSync(pluginsDir, { recursive: true });
-        fs.writeFileSync(target, bytes);
-        this.output.appendLine(`[plugin-install] ${source} -> ${target} (${bytes.length} bytes)`);
+        if (!sourcePath) {
+          temporarySource = path.join(os.tmpdir(), `renium-plugin-${process.pid}-${Date.now()}.rbxm`);
+          fs.writeFileSync(temporarySource, bytes);
+          sourcePath = temporarySource;
+        }
+        try {
+          const cfg = this.getConfig();
+          const command = this.resolveRustCliPathForCommand(cfg, "setup");
+          const result = await this.runCommand(
+            command,
+            ["setup", "--file", sourcePath],
+            cfg.projectRoot,
+            "Studio plugin setup",
+            cfg.progressHeartbeatSeconds,
+          );
+          if (result.code !== 0) {
+            void vscode.window.showErrorMessage(
+              `Studio plugin setup failed. ${result.output.trim() || `Exit code ${result.code}`}`,
+            );
+            return;
+          }
+          this.output.appendLine(`[plugin-install] ${source} (${bytes.length} bytes)`);
+        } finally {
+          if (temporarySource) {
+            fs.rmSync(temporarySource, { force: true });
+          }
+        }
         void vscode.window.showInformationMessage(
-          `Renium: Studio plugin installed (${Math.round(bytes.length / 1024)} KB). Restart Roblox Studio to load it.`,
+          process.platform === "darwin"
+            ? `Studio plugin installed (${Math.round(bytes.length / 1024)} KB). Open Renium Studio from Applications.`
+            : `Studio plugin installed (${Math.round(bytes.length / 1024)} KB). Restart Roblox Studio to load it.`,
         );
       },
     );
   }
 
-  public async fullSync(): Promise<void> {
-    await this.enqueue("Full sync", async () => {
+  private async prepareExplicitSync(): Promise<boolean> {
+    const cfg = this.getConfig();
+    this.ensureAgentInstructions(cfg.experienceRoot);
+    await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+    const manifest = readExperienceManifest(cfg.experienceRoot);
+    if (!manifest && !hasSinglePlaceProject(cfg.experienceRoot)) {
+      await this.addCurrentPlace();
+      return false;
+    }
+    if (manifest) {
+      const connected = await this.connectedStudioPlaces();
+      const current = connected.length === 1
+        ? connected[0]
+        : await this.currentStudioPlace(connected);
+      if (!current) {
+        return false;
+      }
+      const matching = Object.entries(manifest.places).find(([, place]) =>
+        current.placeId > 0
+          ? place.placeId === current.placeId
+          : place.placeId === 0 && place.name === current.placeName);
+      if (!matching) {
+        await this.addCurrentPlace(current);
+        return false;
+      }
+      if (matching[0] !== cfg.activePlaceAlias) {
+        await this.activateExperiencePlace(cfg.experienceRoot, matching[0]);
+      }
+    }
+    return true;
+  }
+
+  public async pullFromStudio(): Promise<void> {
+    if (await this.prepareExplicitSync()) {
+      await this.syncActivePlace("studio");
+    }
+  }
+
+  public async pushToStudio(): Promise<void> {
+    if (await this.prepareExplicitSync()) {
+      await this.syncActivePlace("editor");
+    }
+  }
+
+  public async openProjectTools(): Promise<void> {
+    const picked = await vscode.window.showQuickPick([
+      {
+        label: "$(check) Diagnose Project",
+        description: "Check project files, tools, plugin installation, and daemon state",
+        action: "doctor",
+      },
+      {
+        label: "$(package) Build Project",
+        description: "Build the active place using renium.project.jsonc",
+        action: "build",
+      },
+      {
+        label: "$(json) Open Project Configuration",
+        description: "Edit renium.project.jsonc with schema validation",
+        action: "config",
+      },
+      {
+        label: "$(book) Show CLI Documentation",
+        description: "Show the bundled Renium command reference",
+        action: "docs",
+      },
+      {
+        label: "$(terminal) Follow Studio Console",
+        description: "Open or pause the managed Studio console",
+        action: "console",
+      },
+      {
+        label: "$(cloud-download) Check for Updates",
+        description: "Verify the signed release manifest without installing anything",
+        action: "update",
+      },
+      {
+        label: "$(tools) Repair Installation",
+        description: "Reinstall the matching Studio plugin",
+        action: "repair",
+      },
+      {
+        label: "$(trash) Uninstall Studio Plugin",
+        description: "Remove Renium from the Roblox Studio Plugins folder",
+        action: "uninstall",
+      },
+    ], {
+      title: "Renium Project Tools",
+      placeHolder: "Choose an action",
+    });
+    switch (picked?.action) {
+      case "doctor":
+        await this.runProjectDoctor();
+        break;
+      case "build":
+        await this.buildProject();
+        break;
+      case "config":
+        await this.openProjectConfiguration();
+        break;
+      case "docs":
+        await this.openCliDocumentation();
+        break;
+      case "console":
+        this.followStudioConsole();
+        break;
+      case "update":
+        await this.checkForUpdates();
+        break;
+      case "repair":
+        await this.repairInstallation();
+        break;
+      case "uninstall":
+        await this.uninstallStudioPlugin();
+        break;
+    }
+  }
+
+  private projectManifestPath(cfg = this.getConfig()): string {
+    const jsonc = path.join(cfg.projectRoot, "renium.project.jsonc");
+    const json = path.join(cfg.projectRoot, "renium.project.json");
+    return fs.existsSync(json) && !fs.existsSync(jsonc) ? json : jsonc;
+  }
+
+  private requireProjectManifest(cfg = this.getConfig()): string {
+    const manifest = this.projectManifestPath(cfg);
+    if (!fs.existsSync(manifest)) {
+      throw new Error(`Project configuration not found: ${manifest}`);
+    }
+    return manifest;
+  }
+
+  private async runProjectCommand(
+    taskName: string,
+    cliCommand: string,
+    args: string[],
+  ): Promise<CommandRunResult | undefined> {
+    let result: CommandRunResult | undefined;
+    await this.enqueue(taskName, async () => {
+      const cfg = this.getConfig();
+      const command = this.resolveRustCliPathForCommand(cfg, cliCommand);
+      this.ensureFileExists(command);
+      this.output.show(false);
+      this.output.appendLine(`[renium] ${taskName}: ${command} ${this.renderArgs(args)}`);
+      result = await this.runCommand(
+        command,
+        args,
+        cfg.projectRoot,
+        taskName,
+        cfg.progressHeartbeatSeconds,
+      );
+      if (result.code !== 0) {
+        throw new Error(`${cliCommand} exited with code ${result.code}`);
+      }
+    });
+    return result;
+  }
+
+  public async runProjectDoctor(): Promise<void> {
+    const cfg = this.getConfig();
+    await this.runProjectCommand("Project diagnosis", "doctor", [
+      "doctor",
+      "--root",
+      cfg.projectRoot,
+      "--json",
+    ]);
+  }
+
+  public async buildProject(): Promise<void> {
+    const cfg = this.getConfig();
+    const manifest = this.requireProjectManifest(cfg);
+    await this.runProjectCommand("Project build", "build", [
+      "build",
+      "--project",
+      manifest,
+      "--sourcemap",
+    ]);
+  }
+
+  public async openProjectConfiguration(): Promise<void> {
+    const cfg = this.getConfig();
+    const manifest = this.requireProjectManifest(cfg);
+    await vscode.window.showTextDocument(vscode.Uri.file(manifest), { preview: false });
+  }
+
+  public async openCliDocumentation(): Promise<void> {
+    await this.runProjectCommand("CLI documentation", "docs", ["docs"]);
+  }
+
+  public async followStudioConsole(): Promise<void> {
+    if (this.consoleFollowRunning) {
+      await this.stopConsoleFollow();
+      this.consoleOutput.appendLine("[Renium console paused]");
+      this.consoleOutput.show(false);
+      return;
+    }
+    const cfg = this.getConfig();
+    const command = this.resolveRustCliPathForCommand(cfg, "co");
+    this.ensureFileExists(command);
+    const startedServe = !this.bridgeServeRequested;
+    this.bridgeServeRequested = true;
+    this.consoleFollowOwnsServe = startedServe;
+    try {
+      await this.ensureBridgeDaemon(command, cfg, { serve: true });
+    } catch (error) {
+      if (startedServe) {
+        this.bridgeServeRequested = false;
+        this.consoleFollowOwnsServe = false;
+        await this.stopBridgeDaemon();
+      }
+      throw error;
+    }
+    const generation = ++this.consoleFollowGeneration;
+    this.consoleFollowRunning = true;
+    this.consoleOutput.appendLine("[Renium console resumed]");
+    this.consoleOutput.show(false);
+    void this.pollStudioConsole(generation);
+  }
+
+  private async pollStudioConsole(generation: number): Promise<void> {
+    if (
+      !this.consoleFollowRunning ||
+      generation !== this.consoleFollowGeneration ||
+      !this.bridgeServeRequested ||
+      this.consoleFollowInFlightGeneration === generation
+    ) {
+      return;
+    }
+    this.consoleFollowInFlightGeneration = generation;
+    let drainImmediately = false;
+    try {
+      const cfg = this.getConfig();
+      const command = this.resolveRustCliPathForCommand(cfg, "co");
+      const result = await this.runAutomationOperation(
+        command,
+        cfg,
+        "console-follow",
+        AUTOMATION_OP.console,
+        {
+          limit: 200,
+          sinceSeq: this.consoleFollowSeq,
+          fromOldest: this.consoleFollowFromOldest,
+        },
+        { quietWait: true, timeoutMs: 5000 },
+      );
+      if (
+        !this.consoleFollowRunning
+        || generation !== this.consoleFollowGeneration
+        || !this.bridgeServeRequested
+      ) {
+        return;
+      }
+      if (result.code !== 0) {
+        throw new Error(`Console request exited with code ${result.code}`);
+      }
+      const value = result.result && typeof result.result === "object" && !Array.isArray(result.result)
+        ? result.result as Record<string, unknown>
+        : this.parseCliJsonObject<Record<string, unknown>>(result.output);
+      if (value) {
+        const epoch = typeof value.epoch === "string" ? value.epoch : undefined;
+        if (this.consoleFollowEpoch && epoch !== this.consoleFollowEpoch) {
+          this.consoleFollowSeq = 0;
+          this.consoleFollowFromOldest = true;
+          this.consoleOutput.appendLine("[Studio console restarted]");
+          drainImmediately = true;
+        } else {
+          const entries = Array.isArray(value.entries) ? value.entries : [];
+          for (const entry of entries) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+              continue;
+            }
+            const row = entry as Record<string, unknown>;
+            this.consoleOutput.appendLine(`[${String(row.type ?? row.level ?? "output")}] ${String(row.message ?? "")}`);
+          }
+          const nextSeq = Number(value.nextSeq);
+          if (Number.isFinite(nextSeq) && nextSeq >= 0) {
+            this.consoleFollowSeq = Math.floor(nextSeq);
+          }
+          this.consoleFollowFromOldest = false;
+          drainImmediately = value.hasMore === true;
+          if (value.truncated === true) {
+            this.consoleOutput.appendLine("[Studio console output was truncated before Renium could read it]");
+          }
+        }
+        this.consoleFollowEpoch = epoch;
+      }
+    } catch (error) {
+      if (this.consoleFollowRunning && generation === this.consoleFollowGeneration) {
+        this.consoleOutput.appendLine(`[Renium console error] ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      if (this.consoleFollowInFlightGeneration === generation) {
+        this.consoleFollowInFlightGeneration = undefined;
+      }
+      if (
+        this.consoleFollowRunning
+        && generation === this.consoleFollowGeneration
+        && this.bridgeServeRequested
+      ) {
+        this.consoleFollowTimer = setTimeout(() => {
+          this.consoleFollowTimer = undefined;
+          void this.pollStudioConsole(generation);
+        }, drainImmediately ? 0 : 250);
+      }
+    }
+  }
+
+  private async stopConsoleFollow(options: { releaseServe?: boolean } = {}): Promise<void> {
+    this.consoleFollowRunning = false;
+    this.consoleFollowGeneration += 1;
+    if (this.consoleFollowTimer) {
+      clearTimeout(this.consoleFollowTimer);
+      this.consoleFollowTimer = undefined;
+    }
+    const ownedServe = this.consoleFollowOwnsServe;
+    this.consoleFollowOwnsServe = false;
+    if (
+      options.releaseServe !== false
+      && ownedServe
+      && !this.liveSyncWatcher
+      && !this.liveSyncStartPromise
+      && !this.liveSyncStartupInProgress
+    ) {
+      this.bridgeServeRequested = false;
+      this.stopStudioActionPolling();
+      await this.stopBridgeDaemon();
+      this.updateStatusBar();
+    }
+  }
+
+  public async checkForUpdates(): Promise<void> {
+    await this.runProjectCommand("Update check", "update", ["update", "check"]);
+  }
+
+  public async repairInstallation(): Promise<void> {
+    await this.runProjectCommand("Installation repair", "setup", ["setup", "--repair"]);
+  }
+
+  public async uninstallStudioPlugin(): Promise<void> {
+    const choice = await vscode.window.showWarningMessage(
+      "Remove the Renium Studio plugin?",
+      { modal: true },
+      "Uninstall",
+    );
+    if (choice !== "Uninstall") {
+      return;
+    }
+    await this.runProjectCommand("Plugin uninstall", "setup", ["setup", "--uninstall"]);
+  }
+
+  private async syncActivePlace(direction: "studio" | "editor" = "studio"): Promise<void> {
+    await this.enqueue(direction === "editor" ? "Push to Studio" : "Pull from Studio", async () => {
+      if (direction === "editor") {
+        const cfg = this.getConfig();
+        const changedPaths = await this.collectInitialEditorLiveSyncPathsAsync(this.sourceRoot(cfg));
+        if (changedPaths.length === 0) {
+          throw new Error(`No project source files exist under ${this.sourceRoot(cfg)}`);
+        }
+        const outcome = await this.runEditorPush(changedPaths, cfg, { fullSync: true });
+        if (outcome !== "applied") {
+          throw new Error("Studio did not apply the project files");
+        }
+        vscode.window.showInformationMessage("Push to Studio completed.");
+        return;
+      }
       await this.runExport({
         services: this.getConfig().services,
-        runImport: this.getConfig().runImport,
+        runImport: true,
         notifyOnSuccess: true,
-        reason: "Full sync completed",
+        reason: "Pull from Studio completed",
+        destructive: true,
       });
     });
   }
@@ -1248,7 +2933,7 @@ class RobloxSyncController {
         "-r",
         runCfg.projectRoot,
         "-d",
-        "src",
+        runCfg.srcDir,
         "-s",
         selectedServices.join(","),
         "-o",
@@ -1275,7 +2960,7 @@ class RobloxSyncController {
       const instanceSummary = typeof parsed?.instances === "number" && Number.isFinite(parsed.instances)
         ? ` (${parsed.instances} instances)`
         : "";
-      vscode.window.showInformationMessage(`Renium: exported game file to ${finalOutputPath}${instanceSummary}.`);
+      vscode.window.showInformationMessage(`Exported game file to ${finalOutputPath}${instanceSummary}.`);
     });
   }
 
@@ -1285,7 +2970,7 @@ class RobloxSyncController {
       const snapshotPath = this.resolveSnapshotPath(cfg);
       const serviceLabel = cfg.services.length === 1 ? cfg.services[0] : `${cfg.services.length} services`;
       const confirmed = await vscode.window.showWarningMessage(
-        `Import Studio snapshots into src for ${serviceLabel}? Existing generated files may be replaced; stale files are recoverable from .renium/import-backups.`,
+        `Import Studio snapshots into ${cfg.srcDir} for ${serviceLabel}? Existing generated files may be replaced; stale files are recoverable from .renium/import-backups.`,
         { modal: true },
         "Import snapshots",
       );
@@ -1294,42 +2979,42 @@ class RobloxSyncController {
       }
       await this.runRustImport(cfg, snapshotPath, cfg.services);
 
-      vscode.window.showInformationMessage("Renium: snapshot import finished.");
+      vscode.window.showInformationMessage("Snapshot import finished.");
     });
   }
 
   public async syncWallyPackages(): Promise<void> {
     this.output.appendLine(`[renium] Wally packages: requested at ${new Date().toISOString()}`);
-    const manifestReady = await this.ensureWallyManifest(this.getConfig());
-    if (!manifestReady) {
-      return;
-    }
-
-    let syncResult: CliSyncWallyPackagesResult | undefined;
+    const requestedConfig = this.getConfig();
+    const requestedRoot = this.normalizePathForCompare(requestedConfig.projectRoot);
+    const requestedGeneration = this.experienceGeneration;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "Renium: syncing Wally packages",
+        title: "Syncing Wally packages",
         cancellable: false,
       },
       async (progress) => {
         progress.report({ message: "Waiting for Renium task queue..." });
         await this.enqueue("Sync Wally packages", async () => {
           const runCfg = this.getConfig();
+          if (
+            this.experienceGeneration !== requestedGeneration
+            || this.normalizePathForCompare(runCfg.projectRoot) !== requestedRoot
+          ) {
+            throw new Error("The active Renium place changed. Run Wally package sync again.");
+          }
+          if (!(await this.ensureWallyManifest(runCfg))) {
+            return;
+          }
           const command = this.resolveRustCliPathForCommand(runCfg, "sync-wally-packages");
           this.ensureFileExists(command);
-          const targetSettingsFile = existingReniumSettingsFile(runCfg.projectRoot, runCfg.wallySync.targetService);
-          if (!fs.existsSync(targetSettingsFile)) {
-            throw new Error(
-              `No Renium settings file found for ${runCfg.wallySync.targetService}. Run Full Sync once first. Expected ${targetSettingsFile}`,
-            );
-          }
           const args = [
             "sync-wally-packages",
             "-r",
             runCfg.projectRoot,
             "-d",
-            "src",
+            runCfg.srcDir,
             "--wally-path",
             runCfg.wallySync.wallyPath,
             "--packages-dir",
@@ -1338,6 +3023,18 @@ class RobloxSyncController {
             runCfg.wallySync.targetService,
             "--target-name",
             runCfg.wallySync.targetName,
+            "--server-packages-dir",
+            runCfg.wallySync.serverPackagesDir,
+            "--server-target-service",
+            runCfg.wallySync.serverTargetService,
+            "--server-target-name",
+            runCfg.wallySync.serverTargetName,
+            "--dev-packages-dir",
+            runCfg.wallySync.devPackagesDir,
+            "--dev-target-service",
+            runCfg.wallySync.devTargetService,
+            "--dev-target-name",
+            runCfg.wallySync.devTargetName,
             "--realms",
             runCfg.wallySync.realms,
           ];
@@ -1361,20 +3058,23 @@ class RobloxSyncController {
           if (!parsed || parsed.ok === false) {
             throw new Error("Wally package sync didn't finish. Check the Renium output panel for details.");
           }
-          syncResult = parsed;
+          if (
+            typeof parsed.projectRoot !== "string"
+            || this.normalizePathForCompare(parsed.projectRoot) !== requestedRoot
+            || this.experienceGeneration !== requestedGeneration
+            || this.normalizePathForCompare(this.getConfig().projectRoot) !== requestedRoot
+          ) {
+            throw new Error("Wally package sync returned results for a different Renium place.");
+          }
           const importedCount = Array.isArray(parsed.settingsIds) ? parsed.settingsIds.length : 0;
           progress.report({ message: `Imported ${importedCount} package instance(s).` });
           this.output.appendLine(
             `[renium] Wally packages: imported ${importedCount} instance(s) into ${parsed.service ?? runCfg.wallySync.targetService}.${parsed.targetName ?? runCfg.wallySync.targetName}`,
           );
+          await this.applyWallyPackagesToStudio(parsed, runCfg);
         });
       },
     );
-
-    if (!syncResult) {
-      return;
-    }
-    await this.applyWallyPackagesToStudio(syncResult);
   }
 
   private wallySyncFailureMessage(result: CommandRunResult): string {
@@ -1396,7 +3096,7 @@ class RobloxSyncController {
       return "Check that wally.toml exists at renium.projectRoot.";
     }
     if (lower.includes("no renium bytecode settings file") || lower.includes("run full sync once")) {
-      return "Run Full Sync once before syncing packages.";
+      return "Pull from Studio once before syncing packages.";
     }
     if (lower.includes("aftman")) {
       return "If you use Aftman shims, make sure the project has aftman.toml and the tool is trusted/installed.";
@@ -1425,12 +3125,12 @@ class RobloxSyncController {
 
     const create = "Create starter wally.toml";
     const picked = await vscode.window.showWarningMessage(
-      "Renium: no wally.toml was found at the project root.",
+      "No wally.toml was found at the project root.",
       create,
       "Cancel",
     );
     if (picked !== create) {
-      vscode.window.showInformationMessage("Renium: Wally package sync cancelled because no wally.toml was found.");
+      vscode.window.showInformationMessage("Wally package sync cancelled because no wally.toml was found.");
       return false;
     }
 
@@ -1438,7 +3138,7 @@ class RobloxSyncController {
       fs.writeFileSync(manifestPath, this.starterWallyManifest(cfg.projectRoot), "utf8");
       this.output.appendLine(`[renium] Wally packages: created ${manifestPath}`);
     }
-    vscode.window.showInformationMessage("Renium: created starter wally.toml. Add dependencies, then run Sync Wally Packages again.");
+    vscode.window.showInformationMessage("Created starter wally.toml. Add dependencies, then run Sync Wally Packages again.");
     return false;
   }
 
@@ -1464,8 +3164,7 @@ class RobloxSyncController {
     return base || "project";
   }
 
-  private async applyWallyPackagesToStudio(result: CliSyncWallyPackagesResult): Promise<void> {
-    const cfg = this.getConfig();
+  private async applyWallyPackagesToStudio(result: CliSyncWallyPackagesResult, cfg: SyncConfig): Promise<void> {
     const mode = cfg.wallySync.applyToStudio;
 
     const settingsFiles: string[] = [];
@@ -1507,7 +3206,7 @@ class RobloxSyncController {
     const changedPaths = Array.from(new Set([...settingsFiles, ...sourceWritePaths, ...extraChanged]));
 
     if (mode === "never" || (changedPaths.length === 0 && removedTargets.length === 0)) {
-      vscode.window.showInformationMessage(`Renium: synced Wally packages to ${summaryTarget}.`);
+      vscode.window.showInformationMessage(`Synced Wally packages to ${summaryTarget}.`);
       return;
     }
 
@@ -1515,7 +3214,7 @@ class RobloxSyncController {
     if (mode === "ask") {
       const apply = "Apply to Studio";
       const picked = await vscode.window.showInformationMessage(
-        `Renium: synced Wally packages to ${summaryTarget}.`,
+        `Synced Wally packages to ${summaryTarget}.`,
         apply,
         "Not now",
       );
@@ -1526,7 +3225,7 @@ class RobloxSyncController {
     }
     if (!this.canUseStudioPushPipeline()) {
       this.noteStudioPushSkipped("serve/live sync is not active");
-      vscode.window.showInformationMessage(`Renium: synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
+      vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
       return;
     }
 
@@ -1553,16 +3252,16 @@ class RobloxSyncController {
           targetSettingsIds,
         });
         if (!pushed) {
-          vscode.window.showInformationMessage(`Renium: synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
+          vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
           return;
         }
       }
-      vscode.window.showInformationMessage(`Renium: applied Wally packages to Studio (${summaryTarget}).`);
+      vscode.window.showInformationMessage(`Applied Wally packages to Studio (${summaryTarget}).`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] Wally packages Studio apply failed: ${message}`);
       this.output.show(true);
-      vscode.window.showWarningMessage(`Renium: Wally packages synced locally, but Studio apply failed. ${message}`);
+      vscode.window.showWarningMessage(`Wally packages synced locally, but Studio apply failed. ${message}`);
     }
   }
 
@@ -1591,15 +3290,26 @@ class RobloxSyncController {
   }
 
 
-  public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean } = {}): Promise<CliLinkApplyResult | undefined> {
+  public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean; expectedProjectRoot?: string; expectedGeneration?: number } = {}): Promise<CliLinkApplyResult | undefined> {
     let result: CliLinkApplyResult | undefined;
+    let executed = false;
     await this.enqueue("Apply packages", async () => {
       const cfg = this.getConfig();
+      if (
+        (options.expectedGeneration !== undefined && options.expectedGeneration !== this.experienceGeneration)
+        || (
+          options.expectedProjectRoot
+          && this.normalizePathForCompare(options.expectedProjectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
+        )
+      ) {
+        throw new Error("The active project changed before package apply.");
+      }
+      executed = true;
       const manifestPath = this.linkManifestPath(cfg);
       if (!fs.existsSync(manifestPath)) {
         if (!options.silent) {
           vscode.window.showInformationMessage(
-            `Renium: no link manifest found at ${manifestPath}. Use "Renium: Add Link" first.`,
+            `No link manifest found at ${manifestPath}. Use "Add Link" first.`,
           );
         }
         return;
@@ -1611,7 +3321,7 @@ class RobloxSyncController {
         "-r",
         cfg.projectRoot,
         "-d",
-        "src",
+        cfg.srcDir,
         "--manifest",
         cfg.linkSync.manifest,
         "--git-path",
@@ -1653,10 +3363,13 @@ class RobloxSyncController {
       if (!options.silent) {
         const warnCount = Array.isArray(parsed.warnings) ? parsed.warnings.length : 0;
         vscode.window.showInformationMessage(
-          `Renium: applied ${applied} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
+          `Applied ${applied} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
         );
       }
     });
+    if ((options.expectedProjectRoot || options.expectedGeneration !== undefined) && !executed) {
+      throw new Error("Package apply was cancelled before it started.");
+    }
     this.invalidateLinkStatusCache();
     const forceStudioAllowed = options.forceStudio === true && this.canUseStudioPushPipeline();
     if (options.forceStudio === true && !forceStudioAllowed) {
@@ -1723,7 +3436,7 @@ class RobloxSyncController {
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] link Studio push failed: ${message}`);
       if (!options.silent) {
-        vscode.window.showWarningMessage(`Renium: link applied to src/, but the Studio push failed. ${message}`);
+        vscode.window.showWarningMessage(`Link applied to the project files, but the Studio push failed. ${message}`);
       }
     }
   }
@@ -1739,7 +3452,7 @@ class RobloxSyncController {
         "-r",
         cfg.projectRoot,
         "-d",
-        "src",
+        cfg.srcDir,
         "--manifest",
         cfg.linkSync.manifest,
         "--service",
@@ -1765,7 +3478,7 @@ class RobloxSyncController {
       await this.refreshFileExplorerSafe();
     }
     if (!options.silent) {
-      vscode.window.showInformationMessage(`Renium: broke link on ${service}.${pathSegments[pathSegments.length - 1] ?? ""}. It is now editable.`);
+      vscode.window.showInformationMessage(`Broke link on ${service}.${pathSegments[pathSegments.length - 1] ?? ""}. It is now editable.`);
     }
   }
 
@@ -1868,7 +3581,7 @@ class RobloxSyncController {
         throw new Error("Couldn't add the link. Check the Renium output panel for details.");
       }
     });
-    const syncNow = await vscode.window.showInformationMessage("Renium: link added. Apply it now?", "Sync now", "Later");
+    const syncNow = await vscode.window.showInformationMessage("Link added. Apply it now?", "Sync now", "Later");
     if (syncNow === "Sync now") {
       await this.linkApply();
     } else {
@@ -1878,7 +3591,9 @@ class RobloxSyncController {
   }
 
   public invalidateLinkStatusCache(): void {
+    this.linkStatusToken += 1;
     this.linkStatusCache = undefined;
+    this.linkStatusInflight = undefined;
     this.linkChangeEmitter.fire();
   }
 
@@ -1947,38 +3662,96 @@ class RobloxSyncController {
   }
 
   public onLinkPackageSourceChanged(uri: vscode.Uri): void {
-    if (uri.scheme !== "file") {
+    if (this.experienceChangeInProgress || uri.scheme !== "file") {
       return;
     }
     const cfg = this.getConfig();
     const ext = path.extname(uri.fsPath).toLowerCase();
-    if ((ext !== ".rbsync" && ext !== ".renium") || !this.isManagedPackagePath(cfg, uri.fsPath)) {
+    if (
+      (ext !== ".rbsync" && ext !== ".renium")
+      || !this.activeLinkPackageSourceKeys.has(this.normalizePathForCompare(uri.fsPath))
+    ) {
       return;
     }
-    this.pendingLinkPackageSourcePaths.add(path.normalize(uri.fsPath));
+    const generation = this.experienceGeneration;
+    this.pendingLinkPackageSourcePaths.set(path.normalize(uri.fsPath), {
+      projectRoot: cfg.projectRoot,
+      generation,
+    });
+    this.scheduleLinkPackageSourceFlush(cfg.projectRoot, generation);
+  }
+
+  public async refreshLinkPackageSourceWatchers(): Promise<void> {
+    const cfg = this.getConfig();
+    const generation = this.experienceGeneration;
+    const resolution = await this.resolveLinkStatus(cfg);
+    if (resolution.kind === "failed") {
+      throw new Error(resolution.error);
+    }
+    if (generation !== this.experienceGeneration) {
+      return;
+    }
+    const links = resolution.kind === "success" ? resolution.value.links ?? [] : [];
+    const sources = Array.from(new Set(links
+      .map((link) => this.absoluteLinkSourcePath(cfg, link.sourcePath))
+      .filter((sourcePath): sourcePath is string =>
+        typeof sourcePath === "string" && /\.(rbsync|renium)$/i.test(sourcePath))
+      .map(path.normalize)));
+    for (const watcher of this.linkPackageSourceWatchers) {
+      watcher.dispose();
+    }
+    this.linkPackageSourceWatchers = [];
+    this.activeLinkPackageSourceKeys.clear();
+    for (const sourcePath of sources) {
+      this.activeLinkPackageSourceKeys.add(this.normalizePathForCompare(sourcePath));
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(path.dirname(sourcePath), path.basename(sourcePath)),
+      );
+      watcher.onDidCreate((uri) => this.onLinkPackageSourceChanged(uri));
+      watcher.onDidChange((uri) => this.onLinkPackageSourceChanged(uri));
+      watcher.onDidDelete((uri) => this.onLinkPackageSourceChanged(uri));
+      this.linkPackageSourceWatchers.push(watcher);
+    }
+  }
+
+  private scheduleLinkPackageSourceFlush(projectRoot: string, generation: number, delayMs = 500): void {
     if (this.linkPackageSourceApplyTimer) {
       clearTimeout(this.linkPackageSourceApplyTimer);
     }
     this.linkPackageSourceApplyTimer = setTimeout(() => {
       this.linkPackageSourceApplyTimer = undefined;
-      void this.flushLinkPackageSourceChanges().catch((error) => {
+      void this.flushLinkPackageSourceChanges(projectRoot, generation).catch((error) => {
         this.output.appendLine(`[renium] package source auto-apply failed: ${error instanceof Error ? error.message : String(error)}`);
       });
-    }, 500);
+    }, delayMs);
   }
 
-  private async flushLinkPackageSourceChanges(): Promise<void> {
-    const changedPaths = [...this.pendingLinkPackageSourcePaths];
-    this.pendingLinkPackageSourcePaths.clear();
-    if (changedPaths.length === 0) {
+  private async flushLinkPackageSourceChanges(projectRoot: string, generation: number): Promise<void> {
+    if (generation !== this.experienceGeneration || this.experienceChangeInProgress) {
       return;
     }
     const cfg = this.getConfig();
+    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
+      return;
+    }
+    const changedPaths = [...this.pendingLinkPackageSourcePaths]
+      .filter(([, pending]) =>
+        pending.generation === generation
+        && this.normalizePathForCompare(pending.projectRoot) === this.normalizePathForCompare(projectRoot))
+      .map(([filePath]) => filePath);
+    if (changedPaths.length === 0) {
+      return;
+    }
     const changedKeys = new Set(changedPaths.map((filePath) => this.normalizePathForCompare(filePath)));
     this.invalidateLinkStatusCache();
-    const status = await this.getLinkStatus(true);
-    const linkIds = new Set<string>();
-    for (const link of status?.links ?? []) {
+    const resolution = await this.resolveLinkStatus(cfg);
+    if (resolution.kind === "failed") {
+      this.scheduleLinkPackageSourceFlush(projectRoot, generation, 1000);
+      throw new Error(resolution.error);
+    }
+    const links = resolution.kind === "success" ? resolution.value.links ?? [] : [];
+    const linkIdsByPath = new Map<string, Set<string>>();
+    for (const link of links) {
       const id = typeof link.id === "string" ? link.id.trim() : "";
       const sourcePath = this.absoluteLinkSourcePath(cfg, link.sourcePath);
       if (!id || !sourcePath || !changedKeys.has(this.normalizePathForCompare(sourcePath))) {
@@ -1990,21 +3763,43 @@ class RobloxSyncController {
       if (Number(link.targetCount ?? 0) <= 0) {
         continue;
       }
-      linkIds.add(id);
+      const key = this.normalizePathForCompare(sourcePath);
+      const ids = linkIdsByPath.get(key) ?? new Set<string>();
+      ids.add(id);
+      linkIdsByPath.set(key, ids);
     }
-    if (linkIds.size === 0) {
-      return;
-    }
+    let appliedAny = false;
+    let failed = false;
+    const linkIds = new Set(Array.from(linkIdsByPath.values()).flatMap((ids) => [...ids]));
     this.output.appendLine(`[renium] package source changed: applying ${linkIds.size} active link package(s).`);
-    for (const linkId of linkIds) {
-      await this.linkApply({
-        silent: true,
-        refreshExplorer: false,
-        linkId,
-        skipStudio: true,
-      });
+    for (const changedPath of changedPaths) {
+      const ids = linkIdsByPath.get(this.normalizePathForCompare(changedPath)) ?? new Set<string>();
+      try {
+        for (const linkId of ids) {
+          await this.linkApply({
+            silent: true,
+            refreshExplorer: false,
+            linkId,
+            skipStudio: true,
+            expectedProjectRoot: projectRoot,
+            expectedGeneration: generation,
+          });
+          appliedAny = true;
+        }
+        this.pendingLinkPackageSourcePaths.delete(changedPath);
+      } catch (error) {
+        failed = true;
+        this.output.appendLine(
+          `[renium] package source apply retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
-    await this.refreshFileExplorerSafe();
+    if (appliedAny) {
+      await this.refreshFileExplorerSafe();
+    }
+    if (failed) {
+      this.scheduleLinkPackageSourceFlush(projectRoot, generation, 1000);
+    }
   }
 
   public scheduleStartupLinkRefresh(): void {
@@ -2049,20 +3844,9 @@ class RobloxSyncController {
     return index.get(this.normalizeLinkPathKey(uri.fsPath));
   }
 
-  private stripScriptExtension(name: string): string | undefined {
-    const lower = name.toLowerCase();
-    for (const suffix of [".server.luau", ".server.lua", ".client.luau", ".client.lua", ".luau", ".lua"]) {
-      if (lower.endsWith(suffix) && name.length > suffix.length) {
-        return name.slice(0, name.length - suffix.length);
-      }
-    }
-    return undefined;
-  }
-
-
   private linkTargetFromFile(uri: vscode.Uri): { service: string; pathSegments: string[] } | undefined {
     const cfg = this.getConfig();
-    const srcRoot = path.join(cfg.projectRoot, "src");
+    const srcRoot = this.sourceRoot(cfg);
     if (!this.isPathInside(uri.fsPath, srcRoot)) {
       return undefined;
     }
@@ -2072,27 +3856,31 @@ class RobloxSyncController {
     }
     const service = parts[0];
     const fileName = parts[parts.length - 1];
-    if (/^init(\.server|\.client)?\.(luau|lua)$/i.test(fileName)) {
+    const identity = inferProjectScriptIdentity(cfg.projectRoot, fileName);
+    if (!identity) {
+      return undefined;
+    }
+    if (identity.leafName === undefined) {
       const segments = parts.slice(0, parts.length - 1);
       return segments.length >= 2 ? { service, pathSegments: segments } : undefined;
     }
-    const leaf = this.stripScriptExtension(fileName);
-    if (!leaf) {
-      return undefined;
-    }
-    return { service, pathSegments: [...parts.slice(0, parts.length - 1), leaf] };
+    return {
+      service,
+      pathSegments: [...parts.slice(0, parts.length - 1), identity.leafName],
+    };
   }
 
 
   public async addLinkFromFile(uri: vscode.Uri | undefined): Promise<void> {
+    const cfg = this.getConfig();
     const target = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!target) {
-      vscode.window.showInformationMessage("Renium: right-click a script under src/ to link it.");
+      vscode.window.showInformationMessage(`Right-click a script under ${cfg.srcDir}/ to link it.`);
       return;
     }
     const seed = this.linkTargetFromFile(target);
     if (!seed) {
-      vscode.window.showInformationMessage("Renium: that file is not a script under src/.");
+      vscode.window.showInformationMessage(`That file is not a script under ${cfg.srcDir}/.`);
       return;
     }
     await this.addLinkInteractive(seed);
@@ -2107,7 +3895,7 @@ class RobloxSyncController {
     const requestedLinkId = typeof request?.id === "string" ? request.id.trim() : "";
     const resave = request?.resave === true;
     if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Renium: select an instance to link.");
+      vscode.window.showWarningMessage("Select an instance to link.");
       return;
     }
 
@@ -2121,7 +3909,7 @@ class RobloxSyncController {
         "-r",
         cfg.projectRoot,
         "-d",
-        "src",
+        cfg.srcDir,
         "--manifest",
         cfg.linkSync.manifest,
         "--service",
@@ -2146,7 +3934,7 @@ class RobloxSyncController {
     const leaf = pathSegments[pathSegments.length - 1];
     if (!resave && packed?.id && packed?.source) {
       const add = await vscode.window.showInformationMessage(
-        `Renium: packaged ${leaf}. Mirror it to another location (read-only copy)?`,
+        `Packaged ${leaf}. Mirror it to another location (read-only copy)?`,
         "Add mirror",
         "Not now",
       );
@@ -2157,8 +3945,8 @@ class RobloxSyncController {
     await this.linkApply({ silent: true, linkId: packed?.id ?? requestedLinkId, skipStudio: true });
     await this.refreshFileExplorerSafe();
     vscode.window.showInformationMessage(resave
-      ? `Renium: saved new version of ${packed?.id ?? requestedLinkId}.`
-      : `Renium: linked ${leaf}.`);
+      ? `Saved new version of ${packed?.id ?? requestedLinkId}.`
+      : `Linked ${leaf}.`);
   }
 
   public async resavePackageLink(request: { service?: string; pathSegments?: string[] }): Promise<void> {
@@ -2167,7 +3955,7 @@ class RobloxSyncController {
       ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
       : [];
     if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Renium: select a linked package root to resave.");
+      vscode.window.showWarningMessage("Select a linked package root to resave.");
       return;
     }
     const targetPath = this.normalizeLinkTargetSegments(service, pathSegments);
@@ -2183,18 +3971,18 @@ class RobloxSyncController {
     );
     const linkId = typeof target?.linkId === "string" ? target.linkId.trim() : "";
     if (!linkId) {
-      vscode.window.showWarningMessage("Renium: selected instance is not a package link target.");
+      vscode.window.showWarningMessage("Selected instance is not a package link target.");
       return;
     }
     const link = (await this.getLinkPackages(true)).find((candidate) => candidate.id === linkId);
     if (!link || link.sourceKind !== "local" || !link.sourcePath) {
-      vscode.window.showWarningMessage(`Renium: ${linkId} is not a local Renium package, so it cannot be resaved from Explorer.`);
+      vscode.window.showWarningMessage(`${linkId} is not a local Renium package, so it cannot be resaved from Explorer.`);
       return;
     }
     const cfg = this.getConfig();
     const sourcePath = this.absoluteLinkSourcePath(cfg, link.sourcePath);
     if (!sourcePath || !this.isManagedPackagePath(cfg, sourcePath) || !/\.(rbsync|renium)$/i.test(sourcePath)) {
-      vscode.window.showWarningMessage(`Renium: ${linkId} is not stored in a Renium packages folder.`);
+      vscode.window.showWarningMessage(`${linkId} is not stored in a Renium packages folder.`);
       return;
     }
     const label = this.linkTargetDisplay(service, pathSegments);
@@ -2221,7 +4009,7 @@ class RobloxSyncController {
       ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
       : [];
     if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Renium: select a broken package root to relink.");
+      vscode.window.showWarningMessage("Select a broken package root to relink.");
       return;
     }
     const targetPath = this.normalizeLinkTargetSegments(service, pathSegments);
@@ -2235,11 +4023,11 @@ class RobloxSyncController {
     );
     const linkId = typeof target?.linkId === "string" ? target.linkId.trim() : "";
     if (!linkId) {
-      vscode.window.showWarningMessage("Renium: selected instance is not a package link target.");
+      vscode.window.showWarningMessage("Selected instance is not a package link target.");
       return;
     }
     if (target?.broken !== true) {
-      vscode.window.showInformationMessage(`Renium: ${this.linkTargetDisplay(service, pathSegments)} is already linked.`);
+      vscode.window.showInformationMessage(`${this.linkTargetDisplay(service, pathSegments)} is already linked.`);
       return;
     }
     const picked = await vscode.window.showWarningMessage(
@@ -2275,7 +4063,7 @@ class RobloxSyncController {
     this.invalidateLinkStatusCache();
     await this.linkApply({ silent: true, linkId, skipStudio: true });
     await this.refreshFileExplorerSafe();
-    vscode.window.showInformationMessage(`Renium: relinked ${this.linkTargetDisplay(service, pathSegments)}.`);
+    vscode.window.showInformationMessage(`Relinked ${this.linkTargetDisplay(service, pathSegments)}.`);
   }
 
   private async addPackageMirror(linkId: string, source: string): Promise<void> {
@@ -2345,12 +4133,12 @@ class RobloxSyncController {
   public async breakLinkForFile(uri: vscode.Uri | undefined): Promise<void> {
     const target = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!target) {
-      vscode.window.showInformationMessage("Renium: open or select a linked file first.");
+      vscode.window.showInformationMessage("Open or select a linked file first.");
       return;
     }
     const info = await this.linkInfoForFile(target);
     if (!info || info.broken) {
-      vscode.window.showInformationMessage("Renium: that file is not a read-only link target.");
+      vscode.window.showInformationMessage("That file is not a read-only link target.");
       return;
     }
     const confirm = await vscode.window.showWarningMessage(
@@ -2371,21 +4159,21 @@ class RobloxSyncController {
     }
     const info = await this.linkInfoForFile(target);
     if (!info || !info.canonical) {
-      vscode.window.showInformationMessage("Renium: no link source is available for that file.");
+      vscode.window.showInformationMessage("No link source is available for that file.");
       return;
     }
     try {
       const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(info.canonical));
       await vscode.window.showTextDocument(doc, { preview: true });
     } catch (err) {
-      vscode.window.showWarningMessage(`Renium: could not open link source. ${err instanceof Error ? err.message : String(err)}`);
+      vscode.window.showWarningMessage(`Could not open link source. ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   public async showLinkStatus(): Promise<void> {
     const status = await this.getLinkStatus(true);
     if (!status || status.manifestExists === false) {
-      vscode.window.showInformationMessage('Renium: no links exist yet. Use "Renium: Add Link" to create one.');
+      vscode.window.showInformationMessage('No links exist yet. Use "Add Link" to create one.');
       return;
     }
     const targets = Array.isArray(status.targets) ? status.targets : [];
@@ -2527,7 +4315,7 @@ class RobloxSyncController {
     logPackageDragDebug(`packages.insertAtPath: complete link=${linkId} target=${targetLabel}`);
     const normalizedTarget = this.normalizeLinkTargetSegments(service, pathSegments);
     const leaf = normalizedTarget.length > 0 ? normalizedTarget[normalizedTarget.length - 1] : "";
-    vscode.window.showInformationMessage(`Renium: inserted "${name}" at ${service}.${leaf}.`);
+    vscode.window.showInformationMessage(`Inserted "${name}" at ${service}.${leaf}.`);
   }
 
   private tabInputUris(input: unknown): vscode.Uri[] {
@@ -2569,7 +4357,7 @@ class RobloxSyncController {
       ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
       : rawLink;
     if (!link?.id) {
-      vscode.window.showInformationMessage("Renium: select a package to delete.");
+      vscode.window.showInformationMessage("Select a package to delete.");
       return;
     }
     const fresh = (await this.getLinkPackages(true)).find((candidate) => candidate.id === link.id) ?? link;
@@ -2602,7 +4390,7 @@ class RobloxSyncController {
         "-r",
         cfg.projectRoot,
         "-d",
-        "src",
+        cfg.srcDir,
         "--manifest",
         cfg.linkSync.manifest,
         "--id",
@@ -2648,7 +4436,7 @@ class RobloxSyncController {
     const suffix = deleted > 0 ? ` Deleted ${deleted} use${deleted === 1 ? "" : "s"}.`
       : unlinked > 0 ? ` Unlinked ${unlinked} use${unlinked === 1 ? "" : "s"}.`
         : "";
-    vscode.window.showInformationMessage(`Renium: deleted package "${label}".${suffix}`);
+    vscode.window.showInformationMessage(`Deleted package "${label}".${suffix}`);
   }
 
   public async viewPackageUses(rawLink: CliLinkStatusLink | string | undefined): Promise<void> {
@@ -2656,14 +4444,14 @@ class RobloxSyncController {
       ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
       : rawLink;
     if (!link?.id) {
-      vscode.window.showInformationMessage("Renium: select a package to view uses.");
+      vscode.window.showInformationMessage("Select a package to view uses.");
       return;
     }
     const status = await this.getLinkStatus(true);
     const targets = (status?.targets ?? []).filter((target) => target.linkId === link.id);
     const label = (link.rootName && link.rootName.length > 0 ? link.rootName : link.id) ?? link.id;
     if (targets.length === 0) {
-      vscode.window.showInformationMessage(`Renium: package "${label}" has no uses.`);
+      vscode.window.showInformationMessage(`Package "${label}" has no uses.`);
       return;
     }
     const items = targets.map((target) => {
@@ -2693,7 +4481,7 @@ class RobloxSyncController {
       ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
       : rawLink;
     if (!link || typeof link.sourcePath !== "string" || link.sourcePath.length === 0) {
-      vscode.window.showInformationMessage("Renium: this package has no local source to preview.");
+      vscode.window.showInformationMessage("This package has no local source to preview.");
       return;
     }
     if (!/\.(rbsync|renium)$/i.test(link.sourcePath)) {
@@ -2707,7 +4495,7 @@ class RobloxSyncController {
         await vscode.window.showTextDocument(doc, { preview: true });
         return;
       } catch (err) {
-        vscode.window.showWarningMessage(`Renium: could not open link source. ${err instanceof Error ? err.message : String(err)}`);
+        vscode.window.showWarningMessage(`Could not open link source. ${err instanceof Error ? err.message : String(err)}`);
         return;
       }
     }
@@ -2715,7 +4503,7 @@ class RobloxSyncController {
       const preview = await this.loadPackagePreview(link);
       this.showPackagePreview(preview);
     } catch (err) {
-      vscode.window.showWarningMessage(`Renium: could not preview package. ${err instanceof Error ? err.message : String(err)}`);
+      vscode.window.showWarningMessage(`Could not preview package. ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -2768,46 +4556,115 @@ class RobloxSyncController {
     panel.webview.html = packagePreviewHtml(preview);
   }
 
-
-  public async getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
-    const now = Date.now();
-    if (!force && this.linkStatusCache && now - this.linkStatusCache.at < 2000) {
-      return this.linkStatusCache.value;
+  private async resolveLinkStatus(cfg: SyncConfig): Promise<LinkStatusResolution> {
+    const manifestPath = this.linkManifestPath(cfg);
+    if (!fs.existsSync(manifestPath)) {
+      return { kind: "missing" };
     }
-    if (this.linkStatusInflight) {
-      return this.linkStatusInflight;
-    }
-    const inflight = this.fetchLinkStatus(now);
-    this.linkStatusInflight = inflight;
     try {
-      return await inflight;
-    } finally {
-      this.linkStatusInflight = undefined;
+      const command = this.resolveRustCliPathForCommand(cfg, "link-status");
+      if (!fs.existsSync(command)) {
+        return { kind: "failed", error: `Renium CLI not found: ${command}` };
+      }
+      const args = [
+        "link-status",
+        "-r",
+        cfg.projectRoot,
+        "-d",
+        cfg.srcDir,
+        "--manifest",
+        cfg.linkSync.manifest,
+      ];
+      if (cfg.linkSync.cacheDir.length > 0) {
+        args.push("--cache-dir", cfg.linkSync.cacheDir);
+      }
+      const run = await this.runCommand(
+        command,
+        args,
+        cfg.projectRoot,
+        "link-status",
+        cfg.progressHeartbeatSeconds,
+        { quietLog: true },
+      );
+      if (run.code !== 0) {
+        return {
+          kind: "failed",
+          error: `link-status exited with code ${run.code}`,
+        };
+      }
+      const value = this.parseCliJsonObject<CliLinkStatusResult>(run.output);
+      if (!value) {
+        return { kind: "failed", error: "link-status returned invalid JSON" };
+      }
+      return { kind: "success", value };
+    } catch (error) {
+      return {
+        kind: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
-  private async fetchLinkStatus(now: number): Promise<CliLinkStatusResult | undefined> {
-    let value: CliLinkStatusResult | undefined;
-    try {
-      const cfg = this.getConfig();
-      const manifestPath = this.linkManifestPath(cfg);
-      if (fs.existsSync(manifestPath)) {
-        const command = this.resolveRustCliPathForCommand(cfg, "link-status");
-        if (fs.existsSync(command)) {
-          const args = ["link-status", "-r", cfg.projectRoot, "-d", "src", "--manifest", cfg.linkSync.manifest];
-          if (cfg.linkSync.cacheDir.length > 0) {
-            args.push("--cache-dir", cfg.linkSync.cacheDir);
-          }
-          const run = await this.runCommand(command, args, cfg.projectRoot, "link-status", cfg.progressHeartbeatSeconds, { quietLog: true });
-          if (run.code === 0) {
-            value = this.parseCliJsonObject<CliLinkStatusResult>(run.output) ?? undefined;
-          }
-        }
-      }
-    } catch (err) {
-      this.output.appendLine(`[renium] link-status failed: ${err instanceof Error ? err.message : String(err)}`);
+
+  public async getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
+    const now = Date.now();
+    const cfg = this.getConfig();
+    const projectRoot = this.normalizePathForCompare(cfg.projectRoot);
+    const generation = this.experienceGeneration;
+    if (
+      !force
+      && this.linkStatusCache
+      && this.linkStatusCache.projectRoot === projectRoot
+      && this.linkStatusCache.generation === generation
+      && now - this.linkStatusCache.at < 2000
+    ) {
+      return this.linkStatusCache.value;
     }
-    this.linkStatusCache = { at: now, value };
+    if (
+      !force
+      && this.linkStatusInflight
+      && this.linkStatusInflight.projectRoot === projectRoot
+      && this.linkStatusInflight.generation === generation
+    ) {
+      return this.linkStatusInflight.promise;
+    }
+    const token = ++this.linkStatusToken;
+    const promise = this.fetchLinkStatus(now, cfg, projectRoot, generation, token);
+    const inflight = { projectRoot, generation, token, promise };
+    this.linkStatusInflight = inflight;
+    try {
+      return await promise;
+    } finally {
+      if (this.linkStatusInflight === inflight) {
+        this.linkStatusInflight = undefined;
+      }
+    }
+  }
+
+  private async fetchLinkStatus(
+    now: number,
+    cfg: SyncConfig,
+    projectRoot: string,
+    generation: number,
+    token: number,
+  ): Promise<CliLinkStatusResult | undefined> {
+    const resolution = await this.resolveLinkStatus(cfg);
+    const value = resolution.kind === "success" ? resolution.value : undefined;
+    if (resolution.kind === "failed") {
+      this.output.appendLine(`[renium] link-status failed: ${resolution.error}`);
+    }
+    let currentRoot = "";
+    try {
+      currentRoot = this.normalizePathForCompare(this.getConfig().projectRoot);
+    } catch {
+    }
+    if (
+      this.linkStatusToken === token
+      && this.experienceGeneration === generation
+      && currentRoot === projectRoot
+    ) {
+      this.linkStatusCache = { at: now, projectRoot, generation, token, value };
+    }
     return value;
   }
 
@@ -2831,7 +4688,8 @@ class RobloxSyncController {
       const cfg = this.getConfig();
       const activePath = vscode.window.activeTextEditor?.document.uri.fsPath;
 
-      let service = activePath ? this.detectServiceForPath(activePath, cfg.projectRoot, cfg.services) : undefined;
+      const activeServices = activePath ? this.servicesForProjectSourcePath(activePath, cfg) : [];
+      let service = activeServices.length === 1 ? activeServices[0] : undefined;
 
       if (!service) {
         service = await vscode.window.showQuickPick(cfg.services, {
@@ -2858,18 +4716,46 @@ class RobloxSyncController {
     await vscode.commands.executeCommand("renium.fileExplorer.showGit");
   }
 
-  public async gitStatus(): Promise<void> {
+  private captureGitProjectToken(expectedProjectRoot?: string): GitProjectToken {
+    const cfg = this.getConfig();
+    const projectRoot = this.normalizePathForCompare(cfg.projectRoot);
+    if (
+      this.experienceChangeInProgress
+      || (
+        expectedProjectRoot !== undefined
+        && this.normalizePathForCompare(expectedProjectRoot) !== projectRoot
+      )
+    ) {
+      throw new Error("The active Renium place changed. Run the Git action again.");
+    }
+    return { projectRoot, generation: this.experienceGeneration };
+  }
+
+  private gitConfigForToken(token: GitProjectToken): SyncConfig {
+    const cfg = this.getConfig();
+    if (
+      this.experienceChangeInProgress
+      || this.experienceGeneration !== token.generation
+      || this.normalizePathForCompare(cfg.projectRoot) !== token.projectRoot
+    ) {
+      throw new Error("The active Renium place changed. Run the Git action again.");
+    }
+    return cfg;
+  }
+
+  public async gitStatus(token = this.captureGitProjectToken()): Promise<void> {
     await this.enqueue("Git status", async () => {
-      const state = await this.inspectGitRepo(this.getConfig(), { fetch: false });
+      const cfg = this.gitConfigForToken(token);
+      const state = await this.inspectGitRepo(cfg, { fetch: false });
       this.output.show(false);
       this.logGitState(state);
       await this.refreshGitView();
     });
   }
 
-  public async gitFetch(): Promise<void> {
+  public async gitFetch(token = this.captureGitProjectToken()): Promise<void> {
     await this.enqueue("Git fetch", async () => {
-      const cfg = this.getConfig();
+      const cfg = this.gitConfigForToken(token);
       this.ensureWorkspaceTrustedForGitSync();
       const state = await this.inspectGitRepo(cfg, { fetch: false, requireRemote: true });
       const repoRoot = this.requireGitRepoRoot(state);
@@ -2877,20 +4763,18 @@ class RobloxSyncController {
       const result = await this.runGitCommand(cfg, repoRoot, ["fetch", "--prune", remote], "fetch");
       this.ensureGitSuccess(result, "fetch");
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: fetched ${remote}.`);
+      vscode.window.showInformationMessage(`Fetched ${remote}.`);
     });
   }
 
-  public async gitPull(): Promise<void> {
+  public async gitPull(token = this.captureGitProjectToken()): Promise<void> {
     await this.enqueue("Git pull", async () => {
-      const cfg = this.getConfig();
+      const cfg = this.gitConfigForToken(token);
       this.ensureWorkspaceTrustedForGitSync();
-      await this.ensureLiveSyncStoppedForGitPull();
-
       let state = await this.inspectGitRepo(cfg, { fetch: cfg.gitSync.autoFetch, requireRemote: true });
       const repoRoot = this.requireGitRepoRoot(state);
       this.ensureNoGitConflicts(state);
-      if (cfg.gitSync.requireCleanWorktreeBeforePull && state.entries.length > 0) {
+      if (cfg.gitSync.requireCleanWorktreeBeforePull && state.worktreeEntries.length > 0) {
         throw new Error("Pull is blocked because the worktree has local changes. Commit, stash, or discard them before pulling.");
       }
 
@@ -2898,34 +4782,51 @@ class RobloxSyncController {
       const branch = this.resolveGitBranch(cfg, state);
       if (state.upstream && state.behind === 0 && state.ahead === 0) {
         this.output.appendLine(`[git-sync] pull skipped: ${remote}/${branch} is already up to date.`);
-        vscode.window.showInformationMessage("Renium: Git pull is already up to date.");
+        vscode.window.showInformationMessage("Git pull is already up to date.");
         return;
       }
       if (state.upstream && state.ahead > 0 && state.behind > 0) {
         throw new Error("Pull is blocked because the branch has diverged. Resolve with VS Code Source Control or git manually.");
       }
 
-      const oldHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD");
-      const pullResult = await this.runGitCommand(cfg, repoRoot, ["pull", "--ff-only", remote, branch], "pull --ff-only");
-      this.ensureGitSuccess(pullResult, "pull --ff-only");
-      const newHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD after pull");
-      const changedFiles = oldHead !== newHead
-        ? await this.gitChangedFilesBetween(cfg, repoRoot, oldHead, newHead)
-        : [];
-      await this.refreshExplorerForGitPaths(repoRoot, changedFiles, cfg);
-      await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
-      state = await this.inspectGitRepo(cfg, { fetch: false });
-      this.logGitState(state);
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: pulled ${remote}/${branch}.`);
+      const resumeLiveSync = await this.ensureLiveSyncStoppedForGitPull();
+      try {
+        this.gitConfigForToken(token);
+        const oldHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD");
+        const pullResult = await this.runGitCommand(cfg, repoRoot, ["pull", "--ff-only", remote, branch], "pull --ff-only");
+        this.ensureGitSuccess(pullResult, "pull --ff-only");
+        const newHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD after pull");
+        const changedFiles = oldHead !== newHead
+          ? await this.gitChangedFilesBetween(cfg, repoRoot, oldHead, newHead)
+          : [];
+        await this.refreshExplorerForGitPaths(repoRoot, changedFiles, cfg);
+        await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
+        state = await this.inspectGitRepo(cfg, { fetch: false });
+        this.logGitState(state);
+        await this.refreshGitView();
+        vscode.window.showInformationMessage(`Pulled ${remote}/${branch}.`);
+      } catch (error) {
+        if (
+          resumeLiveSync
+          && this.experienceGeneration === token.generation
+          && this.normalizePathForCompare(this.getConfig().projectRoot) === token.projectRoot
+        ) {
+          await this.startLiveSync({ silent: true, bestEffort: true });
+        }
+        throw error;
+      }
     });
   }
 
-  public async gitCommitAndPush(options: { runFullSyncFirst?: boolean } = {}): Promise<void> {
-    await this.enqueue(options.runFullSyncFirst ? "Git full sync + push" : "Git commit & push", async () => {
-      const cfg = this.getConfig();
+  public async gitCommitAndPush(
+    options: { pullFromStudioFirst?: boolean } = {},
+    token = this.captureGitProjectToken(),
+  ): Promise<void> {
+    await this.enqueue(options.pullFromStudioFirst ? "Pull from Studio, commit and push" : "Git commit & push", async () => {
+      const cfg = this.gitConfigForToken(token);
       this.ensureWorkspaceTrustedForGitSync();
-      await this.maybeRunFullSyncBeforeGitPush(cfg, options.runFullSyncFirst === true);
+      await this.maybePullFromStudioBeforeGitPush(cfg, options.pullFromStudioFirst === true);
+      this.gitConfigForToken(token);
 
       let state = await this.inspectGitRepo(cfg, { fetch: cfg.gitSync.autoFetch, requireRemote: true });
       const repoRoot = this.requireGitRepoRoot(state);
@@ -2954,24 +4855,24 @@ class RobloxSyncController {
       }
 
       await this.confirmGitCommitAndPush(plannedChanges, state, cfg);
+      const commitMessage = await this.gitCommitMessage(cfg, branch);
       await this.stageGitSyncChanges(cfg, repoRoot);
       const staged = await this.gitStagedChanges(cfg, repoRoot);
       if (staged.length === 0) {
         throw new Error("No files were staged after applying the configured Git sync path filters.");
       }
-      const commitMessage = await this.gitCommitMessage(cfg, branch);
       const commitResult = await this.runGitCommand(cfg, repoRoot, ["commit", "-m", commitMessage], "commit");
       this.ensureGitSuccess(commitResult, "commit");
       const shortSha = await this.gitOutput(cfg, repoRoot, ["rev-parse", "--short", "HEAD"], "read commit sha");
       await this.pushGitBranch(cfg, repoRoot, remote, branch, state.upstream === undefined);
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: pushed ${shortSha} to ${remote}/${branch}.`);
+      vscode.window.showInformationMessage(`Pushed ${shortSha} to ${remote}/${branch}.`);
     });
   }
 
-  public async gitPublishBranch(): Promise<void> {
+  public async gitPublishBranch(token = this.captureGitProjectToken()): Promise<void> {
     await this.enqueue("Git publish branch", async () => {
-      const cfg = this.getConfig();
+      const cfg = this.gitConfigForToken(token);
       this.ensureWorkspaceTrustedForGitSync();
       const state = await this.inspectGitRepo(cfg, { fetch: false, requireRemote: true });
       const repoRoot = this.requireGitRepoRoot(state);
@@ -2980,11 +4881,11 @@ class RobloxSyncController {
       await this.confirmGitPush(`Publish current branch to ${remote}/${branch}?`, cfg);
       await this.pushGitBranch(cfg, repoRoot, remote, branch, true);
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: published ${remote}/${branch}.`);
+      vscode.window.showInformationMessage(`Published ${remote}/${branch}.`);
     });
   }
 
-  public async gitCreateBranch(): Promise<void> {
+  public async gitCreateBranch(token = this.captureGitProjectToken()): Promise<void> {
     const branchName = await vscode.window.showInputBox({
       title: "Create Git Branch",
       prompt: "New branch name",
@@ -2994,23 +4895,23 @@ class RobloxSyncController {
       return;
     }
     await this.enqueue("Git create branch", async () => {
-      const cfg = this.getConfig();
+      const cfg = this.gitConfigForToken(token);
       this.ensureWorkspaceTrustedForGitSync();
       const state = await this.inspectGitRepo(cfg, { fetch: false });
       const repoRoot = this.requireGitRepoRoot(state);
       const result = await this.runGitCommand(cfg, repoRoot, ["switch", "-c", branchName.trim()], "create branch");
       this.ensureGitSuccess(result, "create branch");
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: created branch ${branchName.trim()}.`);
+      vscode.window.showInformationMessage(`Created branch ${branchName.trim()}.`);
     });
   }
 
-  public async gitCheckoutBranch(): Promise<void> {
-    const cfg = this.getConfig();
+  public async gitCheckoutBranch(token = this.captureGitProjectToken()): Promise<void> {
+    const cfg = this.gitConfigForToken(token);
     const state = await this.inspectGitRepo(cfg, { fetch: false });
     const repoRoot = this.requireGitRepoRoot(state);
-    if (state.entries.length > 0) {
-      vscode.window.showWarningMessage("Renium: checkout is blocked while local changes are present.");
+    if (state.worktreeEntries.length > 0) {
+      vscode.window.showWarningMessage("Checkout is blocked while local changes are present.");
       return;
     }
     const branchesResult = await this.runGitCommand(cfg, repoRoot, ["branch", "--format=%(refname:short)"], "list branches", { quiet: true });
@@ -3021,16 +4922,16 @@ class RobloxSyncController {
       return;
     }
     await this.enqueue("Git checkout branch", async () => {
-      const runCfg = this.getConfig();
+      const runCfg = this.gitConfigForToken(token);
       const result = await this.runGitCommand(runCfg, repoRoot, ["switch", branchName], "checkout branch");
       this.ensureGitSuccess(result, "checkout branch");
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: checked out ${branchName}.`);
+      vscode.window.showInformationMessage(`Checked out ${branchName}.`);
     });
   }
 
-  public async gitConnectRepo(): Promise<void> {
-    const cfg = this.getConfig();
+  public async gitConnectRepo(token = this.captureGitProjectToken()): Promise<void> {
+    const cfg = this.gitConfigForToken(token);
     this.ensureWorkspaceTrustedForGitSync();
     const state = await this.inspectGitRepo(cfg, { fetch: false, allowMissing: true });
     let repoRoot = state.repoRoot;
@@ -3043,6 +4944,7 @@ class RobloxSyncController {
       if (init !== "Initialize Repository") {
         return;
       }
+      this.gitConfigForToken(token);
       repoRoot = cfg.projectRoot;
     }
     const remote = await vscode.window.showInputBox({
@@ -3053,6 +4955,7 @@ class RobloxSyncController {
     if (!remote) {
       return;
     }
+    this.gitConfigForToken(token);
     const remoteUrl = await vscode.window.showInputBox({
       title: "Git Remote URL",
       value: "",
@@ -3065,7 +4968,7 @@ class RobloxSyncController {
     }
 
     await this.enqueue("Git connect repo", async () => {
-      const runCfg = this.getConfig();
+      const runCfg = this.gitConfigForToken(token);
       if (!state.repoRoot) {
         const initResult = await this.runGitCommand(runCfg, runCfg.projectRoot, ["init"], "git init");
         this.ensureGitSuccess(initResult, "git init");
@@ -3078,71 +4981,88 @@ class RobloxSyncController {
       const remoteResult = await this.runGitCommand(runCfg, targetRoot, args, currentRemote.code === 0 ? "set remote" : "add remote");
       this.ensureGitSuccess(remoteResult, currentRemote.code === 0 ? "set remote" : "add remote");
       await this.refreshGitView();
-      vscode.window.showInformationMessage(`Renium: connected ${remote.trim()} to ${redactRemoteUrl(remoteUrl.trim())}.`);
+      vscode.window.showInformationMessage(`Connected ${remote.trim()} to ${redactRemoteUrl(remoteUrl.trim())}.`);
     });
   }
 
-  public async gitOpenRemote(): Promise<void> {
-    const state = await this.inspectGitRepo(this.getConfig(), { fetch: false, allowMissing: true });
+  public async gitOpenRemote(token = this.captureGitProjectToken()): Promise<void> {
+    const cfg = this.gitConfigForToken(token);
+    const state = await this.inspectGitRepo(cfg, { fetch: false, allowMissing: true });
+    this.gitConfigForToken(token);
     const remoteWebUrl = state.view.remoteWebUrl;
     if (!remoteWebUrl) {
-      vscode.window.showWarningMessage("Renium: no Git remote URL is configured.");
+      vscode.window.showWarningMessage("No Git remote URL is configured.");
       return;
     }
     await vscode.env.openExternal(vscode.Uri.parse(remoteWebUrl));
   }
 
-  private async getGitViewState(options: { fetch?: boolean } = {}): Promise<GitViewState> {
-    return (await this.inspectGitRepo(this.getConfig(), { fetch: options.fetch === true, allowMissing: true })).view;
+  private async getGitViewState(options: { fetch?: boolean; projectRoot: string }): Promise<GitViewState> {
+    const token = this.captureGitProjectToken(options.projectRoot);
+    const state = await this.inspectGitRepo(this.gitConfigForToken(token), {
+      fetch: options.fetch === true,
+      allowMissing: true,
+    });
+    this.gitConfigForToken(token);
+    return state.view;
   }
 
   private async refreshGitView(options: { fetch?: boolean } = {}): Promise<void> {
+    if (this.gitViewRefreshSuppression > 0) {
+      return;
+    }
     await vscode.commands.executeCommand("renium.fileExplorer.refreshGit", options);
   }
 
-  private async runGitViewAction(action: string): Promise<void> {
-    switch (action) {
-      case "connect":
-        await this.gitConnectRepo();
-        return;
-      case "fetch":
-        await this.gitFetch();
-        return;
-      case "pull":
-        await this.gitPull();
-        return;
-      case "commitPush":
-        await this.gitCommitAndPush();
-        return;
-      case "syncCommitPush":
-        await this.gitCommitAndPush({ runFullSyncFirst: true });
-        return;
-      case "publishBranch":
-        await this.gitPublishBranch();
-        return;
-      case "createBranch":
-        await this.gitCreateBranch();
-        return;
-      case "checkoutBranch":
-        await this.gitCheckoutBranch();
-        return;
-      case "openRemote":
-        await this.gitOpenRemote();
-        return;
-      case "status":
-        await this.gitStatus();
-        return;
-      default:
-        return;
+  private async runGitViewAction(action: string, expectedProjectRoot: string): Promise<void> {
+    const token = this.captureGitProjectToken(expectedProjectRoot);
+    this.gitViewRefreshSuppression += 1;
+    try {
+      switch (action) {
+        case "connect":
+          await this.gitConnectRepo(token);
+          return;
+        case "fetch":
+          await this.gitFetch(token);
+          return;
+        case "pull":
+          await this.gitPull(token);
+          return;
+        case "commitPush":
+          await this.gitCommitAndPush({}, token);
+          return;
+        case "pullCommitPush":
+          await this.gitCommitAndPush({ pullFromStudioFirst: true }, token);
+          return;
+        case "publishBranch":
+          await this.gitPublishBranch(token);
+          return;
+        case "createBranch":
+          await this.gitCreateBranch(token);
+          return;
+        case "checkoutBranch":
+          await this.gitCheckoutBranch(token);
+          return;
+        case "openRemote":
+          await this.gitOpenRemote(token);
+          return;
+        case "status":
+          await this.gitStatus(token);
+          return;
+        default:
+          return;
+      }
+    } finally {
+      this.gitViewRefreshSuppression -= 1;
     }
   }
 
-  private emptyGitViewState(message?: string): GitViewState {
+  private emptyGitViewState(projectRoot: string, message?: string): GitViewState {
     return {
       ok: false,
       message,
       trusted: vscode.workspace.isTrusted,
-      projectRoot: this.getConfig().projectRoot,
+      projectRoot,
       connected: false,
       ahead: 0,
       behind: 0,
@@ -3157,18 +5077,18 @@ class RobloxSyncController {
     options: { fetch?: boolean; requireRemote?: boolean; allowMissing?: boolean } = {},
   ): Promise<GitRepoState> {
     if (!vscode.workspace.isTrusted) {
-      const view = this.emptyGitViewState("Workspace is not trusted. Trust this workspace before using Git sync.");
+      const view = this.emptyGitViewState(cfg.projectRoot, "Workspace is not trusted. Trust this workspace before using Git sync.");
       if (options.allowMissing) {
-        return { view, entries: [], ahead: 0, behind: 0 };
+        return { view, entries: [], worktreeEntries: [], ahead: 0, behind: 0 };
       }
       throw new Error(view.message);
     }
 
     const repoResult = await this.runGitCommand(cfg, cfg.projectRoot, ["rev-parse", "--show-toplevel"], "repo root", { quiet: true });
     if (repoResult.code !== 0) {
-      const view = this.emptyGitViewState("No Git repository is connected. Use Connect Repo to initialize or configure one.");
+      const view = this.emptyGitViewState(cfg.projectRoot, "No Git repository is connected. Use Connect Repo to initialize or configure one.");
       if (options.allowMissing) {
-        return { view, entries: [], ahead: 0, behind: 0 };
+        return { view, entries: [], worktreeEntries: [], ahead: 0, behind: 0 };
       }
       throw new Error(view.message);
     }
@@ -3192,21 +5112,42 @@ class RobloxSyncController {
       this.ensureGitSuccess(fetchResult, "fetch");
     }
 
-    const upstreamResult = await this.runGitCommand(
-      cfg,
-      repoRoot,
-      ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-      "upstream",
-      { quiet: true },
-    );
-    const upstream = upstreamResult.code === 0 ? upstreamResult.stdout.trim() : undefined;
+    const branchOverride = cfg.gitSync.branch.trim();
+    let upstream: string | undefined;
+    let comparisonRef: string | undefined;
+    if (branchOverride) {
+      const remoteRef = `refs/remotes/${configuredRemote}/${branchOverride}`;
+      const remoteBranchResult = await this.runGitCommand(
+        cfg,
+        repoRoot,
+        ["rev-parse", "--verify", `${remoteRef}^{commit}`],
+        "configured branch",
+        { quiet: true },
+      );
+      if (remoteBranchResult.code === 0) {
+        upstream = `${configuredRemote}/${branchOverride}`;
+        comparisonRef = remoteRef;
+      }
+    } else {
+      const upstreamResult = await this.runGitCommand(
+        cfg,
+        repoRoot,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        "upstream",
+        { quiet: true },
+      );
+      if (upstreamResult.code === 0) {
+        upstream = upstreamResult.stdout.trim();
+        comparisonRef = "@{u}";
+      }
+    }
     let ahead = 0;
     let behind = 0;
-    if (upstream) {
+    if (comparisonRef) {
       const aheadBehindResult = await this.runGitCommand(
         cfg,
         repoRoot,
-        ["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+        ["rev-list", "--left-right", "--count", `HEAD...${comparisonRef}`],
         "ahead/behind",
         { quiet: true },
       );
@@ -3215,22 +5156,37 @@ class RobloxSyncController {
       }
     }
 
-    const statusScope = defaultGitSyncScope(repoRoot, cfg.projectRoot);
-    const statusResult = await this.runGitCommand(cfg, repoRoot, ["status", "--porcelain=v1", "-z", "-uall", "--", statusScope], "status", { quiet: true });
+    const statusResult = await this.runGitCommand(
+      cfg,
+      repoRoot,
+      ["status", "--porcelain=v1", "-z", "-uall"],
+      "status",
+      { quiet: true },
+    );
     this.ensureGitSuccess(statusResult, "status");
-    const entries = parsePorcelainV1Z(statusResult.stdout);
+    const worktreeEntries = parsePorcelainV1Z(statusResult.stdout);
+    const statusScopes = this.defaultGitStageScopes(repoRoot, cfg);
+    const entries = worktreeEntries.filter((entry) =>
+      this.gitEntryMatchesScopes(entry, statusScopes));
     const counts = summarizeStatus(entries);
     const redactedRemoteUrl = remoteUrl ? redactRemoteUrl(remoteUrl) : undefined;
     const remoteWebUrl = remoteUrlToWebUrl(remoteUrl ?? "");
-    const message = !remoteUrl
-      ? `Remote '${configuredRemote}' is not configured.`
-      : counts.conflicted > 0
-        ? `${counts.conflicted} conflicted file(s) need manual resolution.`
-        : behind > 0
-          ? `${behind} remote commit(s) available to pull.`
-          : undefined;
+    const worktreeConflicts = worktreeEntries.filter((entry) => entry.conflicted).length;
+    const messages: string[] = [];
+    if (!remoteUrl) {
+      messages.push(`Remote '${configuredRemote}' is not configured.`);
+    } else if (worktreeConflicts > 0) {
+      messages.push(`${worktreeConflicts} conflicted file(s) need manual resolution.`);
+    } else if (behind > 0) {
+      messages.push(`${behind} remote commit(s) available to pull.`);
+    }
+    const hiddenChanges = worktreeEntries.length - entries.length;
+    if (hiddenChanges > 0) {
+      messages.push(`${hiddenChanges} repository change(s) outside this place's source files are hidden.`);
+    }
+    const message = messages.length > 0 ? messages.join(" ") : undefined;
     const view: GitViewState = {
-      ok: Boolean(remoteUrl) && counts.conflicted === 0,
+      ok: Boolean(remoteUrl) && worktreeConflicts === 0,
       message,
       trusted: true,
       projectRoot: cfg.projectRoot,
@@ -3256,7 +5212,18 @@ class RobloxSyncController {
       })),
       lastUpdated: new Date().toISOString(),
     };
-    return { view, entries, repoRoot, branch, upstream, remote: configuredRemote, remoteUrl, ahead, behind };
+    return {
+      view,
+      entries,
+      worktreeEntries,
+      repoRoot,
+      branch,
+      upstream,
+      remote: configuredRemote,
+      remoteUrl,
+      ahead,
+      behind,
+    };
   }
 
   private ensureWorkspaceTrustedForGitSync(): void {
@@ -3273,7 +5240,7 @@ class RobloxSyncController {
   }
 
   private ensureNoGitConflicts(state: GitRepoState): void {
-    const conflicts = state.entries.filter((entry) => entry.conflicted);
+    const conflicts = state.worktreeEntries.filter((entry) => entry.conflicted);
     if (conflicts.length > 0) {
       throw new Error(`Git sync is blocked by ${conflicts.length} conflicted file(s). Resolve conflicts before continuing.`);
     }
@@ -3305,6 +5272,7 @@ class RobloxSyncController {
       cwd,
       gitPath: cfg.gitSync.gitPath,
       timeoutMs: Math.max(10, cfg.gitSync.timeoutSeconds) * 1000,
+      owner: projectProcessOwner(cfg.projectRoot),
     });
     if (!quiet) {
       const output = redactRemoteUrl(result.output.trim());
@@ -3349,8 +5317,7 @@ class RobloxSyncController {
     const services = new Set<string>();
     for (const affectedPath of nameStatusAffectedPaths(changedFiles)) {
       const absolutePath = path.join(repoRoot, affectedPath);
-      const service = this.detectServiceForPath(absolutePath, cfg.projectRoot, cfg.services);
-      if (service) {
+      for (const service of this.servicesForProjectSourcePath(absolutePath, cfg)) {
         services.add(service);
       }
     }
@@ -3363,14 +5330,14 @@ class RobloxSyncController {
   private async maybeApplyPulledPathsToStudio(repoRoot: string, changedFiles: GitNameStatusEntry[], cfg: SyncConfig): Promise<void> {
     const srcPaths = nameStatusAffectedPaths(changedFiles)
       .map((affectedPath) => path.join(repoRoot, affectedPath))
-      .filter((filePath) => this.isPathInside(filePath, path.join(cfg.projectRoot, "src")));
+      .filter((filePath) => this.isProjectSourcePath(filePath, cfg));
     if (srcPaths.length === 0 || cfg.gitSync.applyPulledChangesToStudio === "never") {
       return;
     }
     let apply = cfg.gitSync.applyPulledChangesToStudio === "always";
     if (!apply) {
       const picked = await vscode.window.showInformationMessage(
-        `Apply ${srcPaths.length} pulled src file(s) to Studio now?`,
+        `Apply ${srcPaths.length} pulled project source file(s) to Studio now?`,
         { modal: true },
         "Apply to Studio",
       );
@@ -3381,58 +5348,60 @@ class RobloxSyncController {
     }
     const pushed = await this.pushEditorPathsNow(srcPaths, { force: true, skipChangeFilter: true, taskName: "Git pull -> Studio sync" });
     if (!pushed) {
-      vscode.window.showInformationMessage("Renium: pulled changes stayed local. Start Serve or live sync before applying to Studio.");
+      vscode.window.showInformationMessage("Pulled changes stayed local. Start Serve or live sync before applying to Studio.");
     }
   }
 
-  private async ensureLiveSyncStoppedForGitPull(): Promise<void> {
+  private async ensureLiveSyncStoppedForGitPull(): Promise<boolean> {
     if (!this.isEditorLiveSyncActive() && !this.liveSyncStartPromise) {
-      return;
+      return false;
     }
     const picked = await vscode.window.showWarningMessage(
-      "Git pull can rewrite src files. Stop Renium live sync before pulling?",
+      "Git pull can rewrite project source files. Stop Renium live sync before pulling?",
       { modal: true },
       "Stop Live Sync",
     );
     if (picked !== "Stop Live Sync") {
       throw new Error("Git pull cancelled because live sync is active.");
     }
-    await this.stopLiveSync();
+    await this.stopLiveSync({ silent: true });
+    return true;
   }
 
-  private async maybeRunFullSyncBeforeGitPush(cfg: SyncConfig, forced: boolean): Promise<void> {
-    let shouldRun = forced || cfg.gitSync.runFullSyncBeforePush === "always";
-    if (!shouldRun && cfg.gitSync.runFullSyncBeforePush === "ask") {
+  private async maybePullFromStudioBeforeGitPush(cfg: SyncConfig, forced: boolean): Promise<void> {
+    let choice: "pull" | "current" | undefined;
+    if (!forced && cfg.gitSync.pullFromStudioBeforePush === "ask") {
       const picked = await vscode.window.showInformationMessage(
-        "Run Renium Full Sync before committing to Git?",
+        "Pull from Studio before committing to Git?",
         { modal: true },
-        "Run Full Sync",
+        "Pull from Studio",
         "Commit Current Files",
       );
       if (!picked) {
-        throw new Error("Git commit cancelled before full-sync choice.");
+        throw new Error("Git commit cancelled before the Studio pull choice.");
       }
-      shouldRun = picked === "Run Full Sync";
+      choice = picked === "Pull from Studio" ? "pull" : "current";
     }
-    if (!shouldRun) {
+    if (!shouldPullFromStudioBeforePush(cfg.gitSync.pullFromStudioBeforePush, forced, choice)) {
       return;
     }
     await this.runExport({
       services: cfg.services,
-      runImport: cfg.runImport,
+      runImport: true,
       notifyOnSuccess: false,
       reason: "",
       quietTimings: false,
+      destructive: true,
     });
   }
 
   private async stageGitSyncChanges(cfg: SyncConfig, repoRoot: string): Promise<void> {
     const configuredPaths = cfg.gitSync.stagePaths.map((value) => value.trim()).filter((value) => value.length > 0);
     const hasConfiguredPaths = cfg.gitSync.stageMode === "configuredPaths" && configuredPaths.length > 0;
-    const defaultScope = this.defaultGitStageScope(repoRoot, cfg.projectRoot);
+    const defaultScopes = this.defaultGitStageScopes(repoRoot, cfg);
     const args = cfg.gitSync.includeUntracked
-      ? ["add", "-A", "--", ...(hasConfiguredPaths ? configuredPaths : [defaultScope])]
-      : ["add", "-u", "--", ...(hasConfiguredPaths ? configuredPaths : [defaultScope])];
+      ? ["add", "-A", "--", ...(hasConfiguredPaths ? configuredPaths : defaultScopes)]
+      : ["add", "-u", "--", ...(hasConfiguredPaths ? configuredPaths : defaultScopes)];
     const result = await this.runGitCommand(cfg, repoRoot, args, "stage changes");
     this.ensureGitSuccess(result, "stage changes");
   }
@@ -3441,7 +5410,7 @@ class RobloxSyncController {
     const configuredPaths = cfg.gitSync.stagePaths.map((value) => value.trim()).filter((value) => value.length > 0);
     const scopes = cfg.gitSync.stageMode === "configuredPaths" && configuredPaths.length > 0
       ? configuredPaths
-      : [this.defaultGitStageScope(repoRoot, cfg.projectRoot)];
+      : this.defaultGitStageScopes(repoRoot, cfg);
     const result = await this.runGitCommand(
       cfg,
       repoRoot,
@@ -3470,8 +5439,35 @@ class RobloxSyncController {
     return status || "M";
   }
 
-  private defaultGitStageScope(repoRoot: string, projectRoot: string): string {
-    return defaultGitSyncScope(repoRoot, projectRoot);
+  private defaultGitStageScopes(repoRoot: string, cfg: SyncConfig): string[] {
+    const scopes = Array.from(new Set(loadProjectSourceGraph(cfg.projectRoot).locations.map((location) => {
+      if (!this.isPathInside(location, repoRoot)) {
+        throw new Error(`Project source path is outside the Git repository: ${location}`);
+      }
+      return path.relative(repoRoot, location).split(path.sep).join("/") || ".";
+    })));
+    scopes.sort((left, right) => left.length - right.length || left.localeCompare(right));
+    return scopes.filter((scope, index) => {
+      const key = process.platform === "win32" ? scope.toLowerCase() : scope;
+      return !scopes.slice(0, index).some((parent) => {
+        const parentKey = process.platform === "win32" ? parent.toLowerCase() : parent;
+        return parentKey === "." || key === parentKey || key.startsWith(`${parentKey}/`);
+      });
+    });
+  }
+
+  private gitEntryMatchesScopes(entry: GitStatusEntry, scopes: string[]): boolean {
+    const matches = (filePath: string | undefined): boolean => {
+      if (!filePath) {
+        return false;
+      }
+      const value = process.platform === "win32" ? filePath.toLowerCase() : filePath;
+      return scopes.some((scope) => {
+        const key = process.platform === "win32" ? scope.toLowerCase() : scope;
+        return key === "." || value === key || value.startsWith(`${key}/`);
+      });
+    };
+    return matches(entry.path) || matches(entry.originalPath);
   }
 
   private async confirmGitCommitAndPush(staged: GitNameStatusEntry[], state: GitRepoState, cfg: SyncConfig): Promise<void> {
@@ -3553,7 +5549,7 @@ class RobloxSyncController {
   public async serve(options: { silent?: boolean; bestEffort?: boolean } = {}): Promise<void> {
     const cfg = this.getConfig();
     if (cfg.transport !== "ws") {
-      const message = "Renium: serve requires WebSocket bridge transport.";
+      const message = "serve requires WebSocket bridge transport.";
       if (options.bestEffort) {
         this.output.appendLine(`[renium] serve skipped: ${message}`);
         return;
@@ -3563,6 +5559,7 @@ class RobloxSyncController {
 
     this.bridgeServeRequested = true;
     this.liveSyncOwnsServe = false;
+    this.consoleFollowOwnsServe = false;
     try {
       await this.ensureBridgeDaemon(cfg.exportCliPath, cfg, { serve: true });
     } catch (err) {
@@ -3576,22 +5573,25 @@ class RobloxSyncController {
     }
 
     this.output.appendLine(`[renium] serve ready: plugin can connect on ${cfg.bridgePorts}`);
+    this.scheduleStudioActionPoll(250);
     this.updateStatusBar();
     if (!options.silent) {
-      vscode.window.showInformationMessage(`Renium: Serve started — Studio can now connect (ports ${cfg.bridgePorts}).`);
+      vscode.window.showInformationMessage(`Serve started — Studio can now connect (ports ${cfg.bridgePorts}).`);
     }
   }
 
   public async stopServe(options: { silent?: boolean } = {}): Promise<void> {
+    await this.stopConsoleFollow({ releaseServe: false });
     if (this.liveSyncWatcher || this.liveSyncStartPromise) {
       await this.stopLiveSync({ silent: true });
     }
     this.bridgeServeRequested = false;
     this.liveSyncOwnsServe = false;
-    this.stopBridgeDaemon();
+    this.stopStudioActionPolling();
+    await this.stopBridgeDaemon();
     this.updateStatusBar();
     if (!options.silent) {
-      vscode.window.showInformationMessage("Renium: serve stopped.");
+      vscode.window.showInformationMessage("Serve stopped.");
     }
   }
 
@@ -3707,7 +5707,7 @@ class RobloxSyncController {
       fs.mkdirSync(path.dirname(benchmarkPath), { recursive: true });
       fs.writeFileSync(benchmarkPath, JSON.stringify(benchmarkPayload, null, 2), "utf8");
       this.output.appendLine(`[renium] benchmark: saved metrics JSON to ${benchmarkPath}`);
-      vscode.window.showInformationMessage(`Renium: benchmark full sync saved to ${benchmarkPath}.`);
+      vscode.window.showInformationMessage(`Benchmark full sync saved to ${benchmarkPath}.`);
     });
   }
 
@@ -3833,7 +5833,7 @@ class RobloxSyncController {
       fs.mkdirSync(path.dirname(benchmarkPath), { recursive: true });
       fs.writeFileSync(benchmarkPath, JSON.stringify(payload, null, 2), "utf8");
       this.output.appendLine(`[renium] benchmark-ab: saved metrics JSON to ${benchmarkPath}`);
-      vscode.window.showInformationMessage(`Renium: modified-default A/B benchmark saved to ${benchmarkPath}.`);
+      vscode.window.showInformationMessage(`Modified-default A/B benchmark saved to ${benchmarkPath}.`);
     });
   }
 
@@ -3887,11 +5887,12 @@ class RobloxSyncController {
         "--flags",
         flags,
       ].filter((value) => value.length > 0);
+      const directArgs = this.withPlaceSelector(cfg, args);
 
       this.output.show(false);
       this.logResolvedConfig(cfg);
-      this.output.appendLine(`[renium] profile command: ${command} ${this.renderArgs(args)}`);
-      const result = await this.runCommand(command, args, cfg.projectRoot, "profile-plugin-ops", cfg.progressHeartbeatSeconds);
+      this.output.appendLine(`[renium] profile command: ${command} ${this.renderArgs(directArgs)}`);
+      const result = await this.runCommand(command, directArgs, cfg.projectRoot, "profile-plugin-ops", cfg.progressHeartbeatSeconds);
       if (result.code !== 0) {
         throw new Error(`Plugin op profile exited with code ${result.code}`);
       }
@@ -3906,11 +5907,13 @@ class RobloxSyncController {
         this.output.appendLine(line);
       }
 
-      vscode.window.showInformationMessage(`Renium: plugin profile saved to ${profilePath}.`);
+      vscode.window.showInformationMessage(`Plugin profile saved to ${profilePath}.`);
     });
   }
 
-  public async startLiveSync(options: { silent?: boolean; bestEffort?: boolean } = {}): Promise<void> {
+  public async startLiveSync(
+    options: { silent?: boolean; bestEffort?: boolean; graphRefresh?: boolean } = {},
+  ): Promise<void> {
     if (this.liveSyncStartPromise) {
       await this.liveSyncStartPromise;
       return;
@@ -3927,14 +5930,17 @@ class RobloxSyncController {
     }
   }
 
-  private async startLiveSyncInternal(options: { silent?: boolean; bestEffort?: boolean } = {}): Promise<void> {
+  private async startLiveSyncInternal(
+    options: { silent?: boolean; bestEffort?: boolean; graphRefresh?: boolean } = {},
+  ): Promise<void> {
+    this.stopStudioActionPolling();
     this.liveSyncStartupInProgress = true;
     try {
       if (this.liveSyncWatcher) {
         await this.setEditorLiveSyncEnabled(true);
         const cfg = this.getConfig();
         if (this.liveSyncStopRequested) {
-          this.disposeLiveSyncRuntime();
+          await this.disposeLiveSyncRuntime();
           await this.setEditorLiveSyncEnabled(false);
           return;
         }
@@ -3943,14 +5949,14 @@ class RobloxSyncController {
             return;
           }
           if (this.liveSyncStopRequested) {
-            this.disposeLiveSyncRuntime();
+            await this.disposeLiveSyncRuntime();
             await this.setEditorLiveSyncEnabled(false);
             return;
           }
           await this.startStudioLiveSyncRuntime(cfg, options);
         }
         if (!options.silent) {
-          vscode.window.showInformationMessage("Renium: live sync is already running.");
+          vscode.window.showInformationMessage("Live sync is already running.");
         }
         return;
       }
@@ -3958,7 +5964,7 @@ class RobloxSyncController {
       const cfg = this.getConfig();
       if (cfg.transport !== "ws") {
         if (!options.silent) {
-          vscode.window.showErrorMessage('Renium: live sync needs the WebSocket transport. Set "renium.transport" to "ws" in Settings.');
+          vscode.window.showErrorMessage('Live sync needs the WebSocket transport. Set "renium.transport" to "ws" in Settings.');
         }
         return;
       }
@@ -3973,9 +5979,12 @@ class RobloxSyncController {
         return;
       }
 
-      const srcRoot = path.join(cfg.projectRoot, "src");
-      if (!fs.existsSync(srcRoot)) {
-        const message = `src directory not found: ${srcRoot}`;
+      this.liveSyncProjectRoot = cfg.projectRoot;
+      invalidateProjectSourceGraph(cfg.projectRoot);
+      const srcRoot = this.sourceRoot(cfg);
+      const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
+      if (sourceGraph.locations.length === 0) {
+        const message = `No project source directory exists for ${cfg.projectRoot}`;
         if (!options.bestEffort) {
           throw new Error(message);
         }
@@ -3990,21 +5999,79 @@ class RobloxSyncController {
         return;
       }
 
-      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(srcRoot, "**/*"));
-      this.liveSyncWatcher = watcher;
-
       const queuePath = (uri: vscode.Uri): void => {
-        if (uri.scheme === "file") {
-          this.queueEditorChange(uri.fsPath);
+        if (uri.scheme !== "file") {
+          return;
+        }
+        const changed = path.resolve(uri.fsPath);
+        if (sourceGraph.manifests.some((manifest) =>
+          this.normalizePathForCompare(manifest) === this.normalizePathForCompare(changed))) {
+          this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
+          return;
+        }
+        if (sourceGraph.locations.some((location) =>
+          this.normalizePathForCompare(location) === this.normalizePathForCompare(changed))) {
+          this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
+        }
+        if (this.isProjectSourcePath(changed, cfg, sourceGraph)) {
+          this.queueEditorChange(changed);
+          return;
+        }
+        if (sourceGraph.locations.some((location) =>
+          this.isPathInside(changed, location) || this.isPathInside(location, changed))) {
+          this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
         }
       };
-      watcher.onDidCreate(queuePath);
-      watcher.onDidChange(queuePath);
-      watcher.onDidDelete(queuePath);
+      const directories = [...sourceGraph.directories];
+      if (fs.existsSync(srcRoot) && fs.statSync(srcRoot).isDirectory()
+        && !directories.some((root) =>
+          this.normalizePathForCompare(root) === this.normalizePathForCompare(srcRoot))) {
+        directories.unshift(srcRoot);
+      }
+      const exactFiles = [...sourceGraph.files, ...sourceGraph.manifests];
+      const patterns = new Map<string, vscode.RelativePattern>();
+      const addPattern = (target: string, recursive: boolean): void => {
+        let base = recursive && fs.existsSync(target) && fs.statSync(target).isDirectory()
+          ? target
+          : path.dirname(target);
+        while (!fs.existsSync(base)) {
+          const parent = path.dirname(base);
+          if (parent === base) {
+            return;
+          }
+          base = parent;
+        }
+        const relative = path.relative(base, target).split(path.sep).join("/");
+        const pattern = recursive
+          ? relative === "" ? "**/*" : `${relative}/**/*`
+          : relative;
+        const key = `${this.normalizePathForCompare(base)}\0${pattern}`;
+        patterns.set(key, new vscode.RelativePattern(base, pattern));
+      };
+      for (const directory of directories) {
+        addPattern(directory, true);
+      }
+      for (const filePath of exactFiles) {
+        addPattern(filePath, false);
+      }
+      for (const location of sourceGraph.locations) {
+        addPattern(location, false);
+        addPattern(location, true);
+      }
+      const watchers = Array.from(patterns.values()).map((pattern) =>
+        vscode.workspace.createFileSystemWatcher(pattern));
+      this.liveSyncWatcher = watchers.shift();
+      this.liveSyncAdditionalWatchers = watchers;
+      for (const watcher of [this.liveSyncWatcher, ...this.liveSyncAdditionalWatchers]) {
+        watcher?.onDidCreate(queuePath);
+        watcher?.onDidChange(queuePath);
+        watcher?.onDidDelete(queuePath);
+      }
+      this.schedulePendingEditorFlushIfNeeded();
 
       await this.setEditorLiveSyncEnabled(true);
       if (this.liveSyncStopRequested) {
-        this.disposeLiveSyncRuntime();
+        await this.disposeLiveSyncRuntime();
         await this.setEditorLiveSyncEnabled(false);
         return;
       }
@@ -4012,32 +6079,61 @@ class RobloxSyncController {
       this.displayedLiveSyncPrompt = false;
       let initialState: StudioChangeState | undefined;
       if (liveCfg.studioLiveSyncEnabled) {
-        initialState = await this.getStudioChangeState(liveCfg, liveCfg.services, { reset: true, start: true });
+        initialState = await this.getStudioChangeState(liveCfg, liveCfg.services, {
+          start: true,
+          replaceServices: true,
+        });
         liveCfg = this.effectiveLiveSyncConfig(liveCfg);
       }
-      if (liveCfg.initialSyncPriority === "editor") {
-        await this.runInitialEditorLiveSyncPass(srcRoot, options);
+      if (liveCfg.initialSyncPriority === "editor" || options.graphRefresh === true) {
+        const outcome = await this.runInitialEditorLiveSyncPass(srcRoot, options);
+        if (outcome === "applied" && initialState) {
+          initialState = await this.getStudioChangeState(
+            liveCfg,
+            liveCfg.services,
+            this.studioChangeAckOptions(
+              this.studioChangeSeq(initialState),
+              initialState.runtimeId,
+            ),
+          );
+        }
       }
       if (this.liveSyncStopRequested) {
-        this.disposeLiveSyncRuntime();
+        await this.disposeLiveSyncRuntime();
         await this.setEditorLiveSyncEnabled(false);
         return;
       }
       await this.startStudioLiveSyncRuntime(liveCfg, {
         ...options,
-        initialSync: liveCfg.initialSyncPriority === "studio",
+        initialSync: options.graphRefresh === true ? false : liveCfg.initialSyncPriority === "studio",
         initialState,
       });
       this.updateStatusBar();
       if (!options.silent) {
-        vscode.window.showInformationMessage("Renium: editor -> Studio live sync started.");
+        vscode.window.showInformationMessage("Editor -> Studio live sync started.");
       }
     } catch (err) {
-      this.disposeLiveSyncRuntime();
+      await this.disposeLiveSyncRuntime();
       await this.setEditorLiveSyncEnabled(false);
       throw err;
     } finally {
       this.liveSyncStartupInProgress = false;
+      if (this.liveSyncGraphRefreshPending) {
+        this.liveSyncGraphRefreshPending = false;
+        let projectRoot = this.liveSyncProjectRoot;
+        if (!projectRoot) {
+          try {
+            projectRoot = this.getConfig().projectRoot;
+          } catch {
+          }
+        }
+        if (projectRoot) {
+          this.scheduleLiveSyncGraphRefresh(projectRoot);
+        }
+      }
+      if (!this.liveSyncWatcher && this.bridgeServeRequested) {
+        this.scheduleStudioActionPoll();
+      }
     }
   }
 
@@ -4050,17 +6146,25 @@ class RobloxSyncController {
     }
     const startedServe = !this.bridgeServeRequested;
     this.bridgeServeRequested = true;
-    if (startedServe) {
+    if (this.consoleFollowOwnsServe) {
+      this.consoleFollowOwnsServe = false;
+      this.liveSyncOwnsServe = true;
+    } else if (startedServe) {
       this.liveSyncOwnsServe = true;
     }
     try {
       await this.ensureBridgeDaemon(cfg.exportCliPath, cfg, { serve: true });
-      const result = await this.runDaemonCommand(
+      const result = await this.runAutomationOperation(
         cfg.exportCliPath,
-        [],
         cfg,
         "live-sync-wait-for-plugin",
-        "wait-for-channels",
+        AUTOMATION_OP.liveStatus,
+        {
+          services: this.normalizeServices(cfg.services, cfg.services).join(","),
+          bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+          bridgePorts: cfg.bridgePorts,
+          contextBound: true,
+        },
         { quietWait: true },
       );
       if (result.code !== 0) {
@@ -4068,7 +6172,7 @@ class RobloxSyncController {
           .replace(/\r\n/g, "\n")
           .split("\n")
           .map((line) => line.trim())
-          .filter((line) => line.length > 0 && !line.startsWith("__ROBLOX_SYNC_DAEMON_RESULT__"))
+          .filter((line) => line.length > 0)
           .slice(-4)
           .join(" ")
           .slice(-700);
@@ -4079,7 +6183,7 @@ class RobloxSyncController {
       if (startedServe) {
         this.bridgeServeRequested = false;
         this.liveSyncOwnsServe = false;
-        this.stopBridgeDaemon();
+        await this.stopBridgeDaemon();
       }
       if (!options.bestEffort) {
         throw err;
@@ -4089,37 +6193,54 @@ class RobloxSyncController {
     }
   }
 
-  private async runInitialEditorLiveSyncPass(srcRoot: string, options: { bestEffort?: boolean } = {}): Promise<void> {
-    const initialPaths = this.collectInitialEditorLiveSyncSettingsPaths(srcRoot);
-    const initialTargets = this.collectInitialEditorLiveSyncTargetIds(srcRoot, initialPaths);
-    if (initialTargets.paths.length === 0 || initialTargets.targetSettingsIds.length === 0) {
-      this.primeEditorLiveSyncCache([], this.getConfig());
-      return;
+  private async runInitialEditorLiveSyncPass(
+    srcRoot: string,
+    options: { bestEffort?: boolean } = {},
+  ): Promise<EditorPushOutcome> {
+    const cfg = this.getConfig();
+    const initialPaths = Array.from(new Set([
+      ...await this.collectInitialEditorLiveSyncSettingsPaths(srcRoot),
+      ...loadProjectSourceLocations(cfg.projectRoot),
+    ]));
+    const initialTargets = await this.collectInitialEditorLiveSyncTargetIds(srcRoot, initialPaths);
+    if (initialTargets.paths.length === 0) {
+      await this.primeEditorLiveSyncCache([], cfg);
+      return "applied";
     }
     try {
-      await this.pushEditorPathsNow(initialTargets.paths, {
+      const applied = await this.pushEditorPathsNow(initialTargets.paths, {
         force: true,
         skipChangeFilter: true,
         targetSettingsIds: initialTargets.targetSettingsIds,
         taskName: "Editor -> Studio initial sync",
       });
+      if (!applied) {
+        this.markEditorPathsPending(initialTargets.paths, cfg, cfg.services);
+      }
+      return applied ? "applied" : "skipped";
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] editor live sync initial pass failed: ${message}`);
+      this.markEditorPathsPending(initialTargets.paths, cfg, cfg.services);
       if (!options.bestEffort) {
         throw err;
       }
+      return "skipped";
     }
   }
 
   public async retryEditorInitialSync(): Promise<void> {
     const cfg = this.getConfig();
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    if (!fs.existsSync(srcRoot)) {
-      throw new Error(`src directory not found: ${srcRoot}`);
+    const srcRoot = this.sourceRoot(cfg);
+    if (!loadProjectSourceLocations(cfg.projectRoot).some((root) => fs.existsSync(root))) {
+      throw new Error(`No project source directory exists for ${cfg.projectRoot}`);
     }
-    await this.runInitialEditorLiveSyncPass(srcRoot);
-    vscode.window.showInformationMessage("Renium: editor -> Studio initial sync finished.");
+    const outcome = await this.runInitialEditorLiveSyncPass(srcRoot);
+    vscode.window.showInformationMessage(
+      outcome === "applied"
+        ? "Editor -> Studio initial sync finished."
+        : "Editor -> Studio initial sync is still pending.",
+    );
   }
 
   private async startStudioLiveSyncRuntime(
@@ -4127,7 +6248,7 @@ class RobloxSyncController {
     options: { bestEffort?: boolean; initialSync?: boolean; initialState?: StudioChangeState } = {},
   ): Promise<void> {
     if (!cfg.studioLiveSyncEnabled) {
-      this.stopStudioLiveSyncRuntime();
+      await this.stopStudioLiveSyncRuntime();
       return;
     }
     try {
@@ -4135,24 +6256,54 @@ class RobloxSyncController {
         this.scheduleStudioLiveSyncPoll(cfg, this.resetStudioLiveSyncPollDelay(cfg));
         return;
       }
-      const initialState = options.initialState ?? await this.getStudioChangeState(cfg, cfg.services, { reset: true, start: true });
+      const generation = ++this.studioLiveSyncGeneration;
+      this.studioLiveSyncStarted = true;
+      let initialState = options.initialState ?? await this.getStudioChangeState(cfg, cfg.services, {
+        start: true,
+        replaceServices: true,
+      });
+      if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+        return;
+      }
       const runtimeCfg = this.effectiveLiveSyncConfig(cfg);
       if (initialState.twoWaySyncEnabled === false) {
         this.output.appendLine("[renium] Studio -> editor live sync is disabled in the Renium Studio plugin settings.");
-        this.stopStudioLiveSyncRuntime();
+        await this.stopStudioLiveSyncRuntime();
         return;
       }
       const shouldRunStudioInitialSync = options.initialSync ?? (runtimeCfg.initialSyncPriority === "studio");
       if (shouldRunStudioInitialSync) {
         await this.enqueue("Studio -> Editor initial sync", async () => {
-          await this.runStudioToEditorSync(runtimeCfg.services, runtimeCfg);
+          if (generation !== this.studioLiveSyncGeneration) {
+            return;
+          }
+          await this.runStudioToEditorSync(runtimeCfg.services, runtimeCfg, {
+            studioAuthoritative: true,
+            generation,
+          });
         });
+        if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+          return;
+        }
+        initialState = await this.getStudioChangeState(
+          runtimeCfg,
+          runtimeCfg.services,
+          this.studioChangeAckOptions(
+            this.studioChangeSeq(initialState),
+            initialState.runtimeId,
+          ),
+        );
+        if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+          return;
+        }
       }
-      await this.getStudioChangeState(runtimeCfg, runtimeCfg.services, { reset: true, start: true });
-      this.studioLiveSyncStarted = true;
-      this.scheduleStudioLiveSyncPoll(runtimeCfg, this.resetStudioLiveSyncPollDelay(runtimeCfg));
+      this.scheduleStudioLiveSyncPoll(
+        runtimeCfg,
+        this.resetStudioLiveSyncPollDelay(runtimeCfg),
+        generation,
+      );
     } catch (err) {
-      this.stopStudioLiveSyncRuntime();
+      await this.stopStudioLiveSyncRuntime();
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] Studio -> editor live sync start failed: ${message}`);
       if (!options.bestEffort) {
@@ -4161,15 +6312,65 @@ class RobloxSyncController {
     }
   }
 
-  private stopStudioLiveSyncRuntime(): void {
+  private stopStudioLiveSyncRuntime(): Promise<void> {
+    const stoppedGeneration = this.studioLiveSyncGeneration;
+    this.studioLiveSyncGeneration += 1;
     if (this.studioLiveSyncTimer) {
       clearTimeout(this.studioLiveSyncTimer);
       this.studioLiveSyncTimer = undefined;
     }
-    this.studioLiveSyncInFlight = false;
     this.studioLiveSyncStarted = false;
     this.studioLiveSyncNextPollMs = DEFAULT_STUDIO_LIVE_SYNC_POLL_MS;
     this.studioToEditorImportInProgress = false;
+    if (this.changePreviewResolve) {
+      this.changePreviewResolve("pending");
+      this.changePreviewResolve = undefined;
+    }
+    this.changePreviewPanel?.dispose();
+    this.changePreviewPanel = undefined;
+    this.pendingStudioReviewKey = undefined;
+    this.forcedStudioReviewKey = undefined;
+    return this.waitForStudioImportTasks(stoppedGeneration);
+  }
+
+  public activeLinkManifest(): { filePath: string; autoApply: boolean; projectRoot: string; generation: number } {
+    const cfg = this.getConfig();
+    return {
+      filePath: path.normalize(this.linkManifestPath(cfg)),
+      autoApply: cfg.linkSync.autoApply,
+      projectRoot: cfg.projectRoot,
+      generation: this.experienceGeneration,
+    };
+  }
+
+  private trackStudioImport<T>(generation: number | undefined, task: Promise<T>): Promise<T> {
+    if (generation === undefined) {
+      return task;
+    }
+    let tracked: Promise<T>;
+    tracked = task.finally(() => {
+      const tasks = this.studioImportTasks.get(generation);
+      tasks?.delete(tracked);
+      if (tasks?.size === 0) {
+        this.studioImportTasks.delete(generation);
+      }
+    });
+    const tasks = this.studioImportTasks.get(generation) ?? new Set<Promise<unknown>>();
+    tasks.add(tracked);
+    this.studioImportTasks.set(generation, tasks);
+    return tracked;
+  }
+
+  private async waitForStudioImportTasks(maxGeneration: number): Promise<void> {
+    for (;;) {
+      const tasks = [...this.studioImportTasks]
+        .filter(([generation]) => generation <= maxGeneration)
+        .flatMap(([, generationTasks]) => [...generationTasks]);
+      if (tasks.length === 0) {
+        return;
+      }
+      await Promise.allSettled(tasks);
+    }
   }
 
   private studioLiveSyncBasePollDelayMs(cfg: SyncConfig): number {
@@ -4206,37 +6407,60 @@ class RobloxSyncController {
     return Math.max(0.05, Math.min(MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS / 1000, delayMs / 1000));
   }
 
-  private scheduleStudioLiveSyncPoll(cfg: SyncConfig, delayMs: number): void {
+  private scheduleStudioLiveSyncPoll(
+    cfg: SyncConfig,
+    delayMs: number,
+    generation = this.studioLiveSyncGeneration,
+  ): void {
     if (this.studioLiveSyncTimer) {
       clearTimeout(this.studioLiveSyncTimer);
       this.studioLiveSyncTimer = undefined;
     }
-    if (!cfg.editorLiveSyncEnabled || !this.liveSyncWatcher || !cfg.studioLiveSyncEnabled) {
+    if (
+      generation !== this.studioLiveSyncGeneration ||
+      !this.studioLiveSyncStarted ||
+      !cfg.editorLiveSyncEnabled ||
+      !this.liveSyncWatcher ||
+      !cfg.studioLiveSyncEnabled
+    ) {
       return;
     }
     this.studioLiveSyncTimer = setTimeout(() => {
       this.studioLiveSyncTimer = undefined;
-      void this.pollStudioLiveSync().catch((err) => {
+      if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+        return;
+      }
+      void this.pollStudioLiveSync(generation).catch((err) => {
+        if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+          return;
+        }
         const latestCfg = this.getConfig();
         const nextDelayMs = this.nextErrorStudioLiveSyncPollDelay(latestCfg);
         const message = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[renium] Studio -> editor live sync failed: ${message}`);
-        this.scheduleStudioLiveSyncPoll(latestCfg, nextDelayMs);
+        this.scheduleStudioLiveSyncPoll(latestCfg, nextDelayMs, generation);
       });
     }, Math.max(MIN_STUDIO_LIVE_SYNC_POLL_MS, delayMs));
   }
 
-  private async pollStudioLiveSync(): Promise<void> {
+  private async pollStudioLiveSync(generation: number): Promise<void> {
     const cfg = this.getConfig();
+    if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+      return;
+    }
     if (!cfg.editorLiveSyncEnabled || !this.liveSyncWatcher || !cfg.studioLiveSyncEnabled) {
-      this.stopStudioLiveSyncRuntime();
+      await this.stopStudioLiveSyncRuntime();
       return;
     }
-    if (this.studioLiveSyncInFlight) {
-      this.scheduleStudioLiveSyncPoll(cfg, this.nextIdleStudioLiveSyncPollDelay(cfg));
+    if (this.studioLiveSyncInFlightGenerations.has(generation)) {
+      this.scheduleStudioLiveSyncPoll(
+        cfg,
+        this.nextIdleStudioLiveSyncPollDelay(cfg),
+        generation,
+      );
       return;
     }
-    this.studioLiveSyncInFlight = true;
+    this.studioLiveSyncInFlightGenerations.add(generation);
     let nextDelayMs = this.studioLiveSyncBasePollDelayMs(cfg);
     try {
       const idleWaitMs = this.nextIdleStudioLiveSyncPollDelay(cfg);
@@ -4244,10 +6468,13 @@ class RobloxSyncController {
         start: true,
         waitSeconds: this.studioLiveSyncWaitSeconds(idleWaitMs),
       });
+      if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+        return;
+      }
       const runtimeCfg = this.effectiveLiveSyncConfig(cfg);
       if (state.twoWaySyncEnabled === false) {
         this.output.appendLine("[renium] Studio -> editor live sync was disabled in the Renium Studio plugin settings.");
-        this.stopStudioLiveSyncRuntime();
+        await this.stopStudioLiveSyncRuntime();
         return;
       }
       this.studioConflictPolicyOverride = typeof state.conflictResolution === "string" && state.conflictResolution.trim().length > 0
@@ -4256,38 +6483,82 @@ class RobloxSyncController {
       const dirtyServices = Array.isArray(state.dirtyServices)
         ? this.normalizeReportedServices(state.dirtyServices, cfg.services)
         : [];
+      const pendingServices = this.pendingStudioImportServiceSet(runtimeCfg);
+      const blockedServices = dirtyServices.filter((service) =>
+        pendingServices.has(service.toLowerCase()));
+      if (blockedServices.length > 0) {
+        this.output.appendLine(
+          `[renium] Studio -> editor sync is waiting for pending editor changes in ${blockedServices.join(", ")}`,
+        );
+      }
+      const importableServices = dirtyServices.filter((service) =>
+        !pendingServices.has(service.toLowerCase()));
       const observedSeq = this.studioChangeSeq(state);
-      if (dirtyServices.length > 0) {
+      const reviewKey = JSON.stringify([
+        state.runtimeId ?? "",
+        observedSeq,
+        (state.editorActions ?? []).map((action) => action.id ?? "").sort(),
+      ]);
+      if (importableServices.length > 0) {
         nextDelayMs = this.resetStudioLiveSyncPollDelay(runtimeCfg);
         const ackObservedDirty = this.studioChangeAckOptions(observedSeq, state.runtimeId);
-        if (this.shouldDropLikelySelfDirtyStudioState(dirtyServices, runtimeCfg)) {
+        if (this.shouldDropLikelySelfDirtyStudioState(importableServices, runtimeCfg)) {
           ackObservedDirty.suppressSeconds = Math.max(1, Math.min(4, runtimeCfg.studioLiveSyncPollMs / 1000 + 1.5));
-          await this.getStudioChangeState(runtimeCfg, dirtyServices, ackObservedDirty);
+          await this.getStudioChangeState(runtimeCfg, importableServices, ackObservedDirty);
           return;
         }
-        let appliedPropertyChanges = false;
+        let propertyImport: "applied" | "fallback" | "pending" = "fallback";
         try {
-          appliedPropertyChanges = await this.tryApplyStudioPropertyChangesToEditor(state, dirtyServices, runtimeCfg);
+          propertyImport = await this.tryApplyStudioPropertyChangesToEditor(
+            state,
+            importableServices,
+            runtimeCfg,
+            generation,
+            reviewKey,
+          );
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.output.appendLine(`[renium] Studio -> editor property fast path failed: ${message}`);
         }
-        if (!appliedPropertyChanges) {
-          await this.enqueueStudioToEditorSyncIfChanged(dirtyServices, runtimeCfg, state);
+        if (propertyImport === "pending") {
+          return;
         }
-        await this.getStudioChangeState(runtimeCfg, dirtyServices, ackObservedDirty);
+        if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+          return;
+        }
+        if (propertyImport === "fallback") {
+          await this.enqueueStudioToEditorSyncIfChanged(
+            importableServices,
+            runtimeCfg,
+            state,
+            generation,
+          );
+        }
+        if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+          return;
+        }
+        await this.getStudioChangeState(runtimeCfg, importableServices, ackObservedDirty);
+      } else if (dirtyServices.length > 0) {
+        nextDelayMs = this.nextIdleStudioLiveSyncPollDelay(runtimeCfg);
       } else {
         nextDelayMs = state.eventDriven === true ? MIN_STUDIO_LIVE_SYNC_POLL_MS : this.nextIdleStudioLiveSyncPollDelay(runtimeCfg);
       }
     } catch (err) {
+      if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
+        return;
+      }
       const latestCfg = this.getConfig();
       nextDelayMs = this.nextErrorStudioLiveSyncPollDelay(latestCfg);
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] Studio -> editor live sync failed: ${message}`);
     } finally {
-      this.studioLiveSyncInFlight = false;
-      if (this.studioLiveSyncStarted) {
-        this.scheduleStudioLiveSyncPoll(this.effectiveLiveSyncConfig(this.getConfig()), nextDelayMs);
+      this.studioLiveSyncInFlightGenerations.delete(generation);
+      if (this.studioLiveSyncStarted && generation === this.studioLiveSyncGeneration) {
+        this.scheduleStudioLiveSyncPoll(
+          this.effectiveLiveSyncConfig(this.getConfig()),
+          nextDelayMs,
+          generation,
+        );
       }
     }
   }
@@ -4297,7 +6568,11 @@ class RobloxSyncController {
     services: string[],
     options: {
       reset?: boolean;
+      replaceServices?: boolean;
+      clearPending?: boolean;
       ackSeq?: number;
+      ackActionIds?: string[];
+      ackActionResults?: Record<string, { ok: boolean; error?: string }>;
       runtimeId?: string;
       start?: boolean;
       stop?: boolean;
@@ -4307,69 +6582,178 @@ class RobloxSyncController {
   ): Promise<StudioChangeState> {
     const command = cfg.exportCliPath;
     this.ensureFileExists(command);
-    const args = [
-      "-w",
-      String(this.editorBridgeWaitSeconds(cfg)),
-      "-P",
-      cfg.bridgePorts,
-      "-s",
-      this.normalizeServices(services, cfg.services).join(","),
-    ];
-    if (options.reset === true) {
-      args.push("--reset");
-    }
-    if (options.start === false) {
-      args.push("--no-start");
-    }
-    if (options.stop === true) {
-      args.push("--stop");
-    }
-    if (typeof options.ackSeq === "number" && Number.isFinite(options.ackSeq)) {
-      args.push("--ack-seq", String(Math.max(0, Math.floor(options.ackSeq))));
+    if (
+      typeof options.ackSeq === "number"
+      || options.ackActionIds?.length
+      || options.ackActionResults
+    ) {
       if (typeof options.runtimeId !== "string" || options.runtimeId.length === 0) {
         throw new Error("Studio change acknowledgment is missing its plugin runtime id.");
       }
-      args.push("--runtime-id", options.runtimeId);
-    }
-    if (typeof options.suppressSeconds === "number" && Number.isFinite(options.suppressSeconds) && options.suppressSeconds > 0) {
-      args.push("--suppress-seconds", String(Math.max(0.05, options.suppressSeconds)));
     }
 
     const useEventWait = typeof options.waitSeconds === "number"
       && Number.isFinite(options.waitSeconds)
       && options.waitSeconds > 0;
-    if (useEventWait) {
-      args.push("--wait-seconds", String(Math.max(0.05, Math.min(25, options.waitSeconds ?? 0))));
-    }
-
-    const result = useEventWait
-      ? await this.runCommand(
-        command,
-        ["st", ...args],
-        cfg.projectRoot,
-        "studio-change-state",
-        cfg.progressHeartbeatSeconds,
-        { quietLog: true },
-      )
-      : await this.runDaemonCommand(
-        command,
-        args,
-        cfg,
-        "studio-change-state",
-        "st",
-        { quietWait: true },
-      );
+    const operation = options.stop === true
+      ? AUTOMATION_OP.liveStop
+      : options.start === false
+        ? AUTOMATION_OP.liveStatus
+        : AUTOMATION_OP.liveStart;
+    const result = await this.runAutomationOperation(
+      command,
+      cfg,
+      "studio-change-state",
+      operation,
+      {
+        bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+        bridgePorts: cfg.bridgePorts,
+        services: this.normalizeServices(services, cfg.services).join(","),
+        reset: options.reset === true,
+        replaceServices: options.replaceServices === true,
+        clearPending: options.clearPending === true,
+        ...(typeof options.ackSeq === "number" && Number.isFinite(options.ackSeq)
+          ? { ackSeq: Math.max(0, Math.floor(options.ackSeq)) }
+          : {}),
+        ...(options.ackActionIds?.length ? { ackActions: options.ackActionIds.join(",") } : {}),
+        ...(options.ackActionResults ? { ackActionResults: options.ackActionResults } : {}),
+        ...(typeof options.runtimeId === "string" && options.runtimeId.length > 0
+          ? { runtimeId: options.runtimeId }
+          : {}),
+        ...(typeof options.suppressSeconds === "number" && Number.isFinite(options.suppressSeconds) && options.suppressSeconds > 0
+          ? { suppressSeconds: Math.max(0.05, options.suppressSeconds) }
+          : {}),
+        ...(useEventWait ? { waitSeconds: Math.max(0.05, Math.min(25, options.waitSeconds ?? 0)) } : {}),
+        contextBound: true,
+      },
+      { quietWait: true },
+    );
     if (result.code !== 0) {
       throw new Error(`Studio change state exited with code ${result.code}`);
     }
-    const state = this.parseStudioChangeState(result.output);
+    const state = result.result && typeof result.result === "object"
+      ? this.parseStudioChangeStatePayload(JSON.stringify(result.result))
+      : this.parseStudioChangeState(result.output);
     if (!state) {
       throw new Error("Studio change state did not return a plugin result.");
     }
-    if (state.runtimeSettings) {
-      this.studioRuntimeSettings = state.runtimeSettings;
+    if (state.explicitRuntimeSettings) {
+      this.studioRuntimeSettings = state.explicitRuntimeSettings;
+    }
+    const acknowledgedActions = await this.handleStudioEditorActions(state.editorActions, state.runtimeId);
+    if (acknowledgedActions.ids.length > 0) {
+      await this.getStudioChangeState(cfg, services, {
+        start: false,
+        ackActionIds: acknowledgedActions.ids,
+        ackActionResults: acknowledgedActions.results,
+        runtimeId: state.runtimeId,
+      });
     }
     return state;
+  }
+
+  private async handleStudioEditorActions(
+    actions: StudioEditorAction[] | undefined,
+    runtimeId: string | undefined,
+  ): Promise<{ ids: string[]; results: Record<string, { ok: boolean; error?: string }> }> {
+    if (!Array.isArray(actions)) {
+      return { ids: [], results: {} };
+    }
+    const acknowledged: string[] = [];
+    const results: Record<string, { ok: boolean; error?: string }> = {};
+    const cfg = this.getConfig();
+    for (const action of actions) {
+      if (action?.type === "revealScript") {
+        if (await this.revealStudioScript(action, cfg) && action.id) {
+          acknowledged.push(action.id);
+        }
+        continue;
+      }
+      if ((action?.type === "pullFromStudio" || action?.type === "pushToStudio") && action.id) {
+        const key = `${runtimeId ?? ""}:${action.id}`;
+        const running = this.studioEditorActionRuns.get(key);
+        if (running?.done) {
+          this.studioEditorActionRuns.delete(key);
+          acknowledged.push(action.id);
+          results[action.id] = running.error
+            ? { ok: false, error: running.error }
+            : { ok: true };
+        } else if (!running) {
+          const state: { done: boolean; error?: string } = { done: false };
+          this.studioEditorActionRuns.set(key, state);
+          const operation = action.type === "pullFromStudio"
+            ? this.pullFromStudio()
+            : this.pushToStudio();
+          void operation
+            .catch((error) => {
+              state.error = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+            })
+            .finally(() => {
+              state.done = true;
+            });
+        }
+      }
+    }
+    return { ids: acknowledged, results };
+  }
+
+  private async revealStudioScript(action: StudioEditorAction, cfg: SyncConfig): Promise<boolean> {
+    const sourcePath = this.resolveStudioSourcePathFromSourcemap(cfg, action);
+    if (!sourcePath || !fs.existsSync(sourcePath)) {
+      this.output.appendLine("[renium] reveal script is waiting for a matching source file.");
+      return false;
+    }
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
+    const editor = await vscode.window.showTextDocument(document, { preview: false });
+    return this.normalizePathForCompare(editor.document.uri.fsPath) ===
+      this.normalizePathForCompare(sourcePath);
+  }
+
+  private scheduleStudioActionPoll(delayMs = 750): void {
+    this.stopStudioActionPolling();
+    if (
+      !this.bridgeServeRequested ||
+      !this.isBridgeDaemonRunning() ||
+      this.liveSyncWatcher ||
+      this.liveSyncStartPromise
+    ) {
+      return;
+    }
+    this.studioActionPollTimer = setTimeout(() => {
+      this.studioActionPollTimer = undefined;
+      void this.pollStudioActions();
+    }, delayMs);
+  }
+
+  private stopStudioActionPolling(): void {
+    if (this.studioActionPollTimer) {
+      clearTimeout(this.studioActionPollTimer);
+      this.studioActionPollTimer = undefined;
+    }
+  }
+
+  private async pollStudioActions(): Promise<void> {
+    if (this.studioActionPollInFlight) {
+      this.scheduleStudioActionPoll();
+      return;
+    }
+    const cfg = this.getConfig();
+    if (
+      !this.bridgeServeRequested ||
+      !this.isBridgeDaemonRunning() ||
+      this.liveSyncWatcher ||
+      this.liveSyncStartPromise
+    ) {
+      return;
+    }
+    this.studioActionPollInFlight = true;
+    try {
+      await this.getStudioChangeState(cfg, cfg.services, { start: false });
+    } catch {
+    } finally {
+      this.studioActionPollInFlight = false;
+      this.scheduleStudioActionPoll();
+    }
   }
 
   private effectiveLiveSyncConfig(cfg: SyncConfig): SyncConfig {
@@ -4428,8 +6812,6 @@ class RobloxSyncController {
     if (observedSeq !== undefined) {
       options.ackSeq = observedSeq;
       options.runtimeId = runtimeId;
-    } else {
-      options.reset = true;
     }
     return options;
   }
@@ -4492,33 +6874,61 @@ class RobloxSyncController {
     }
   }
 
-  private async runStudioToEditorSync(services: string[], cfg: SyncConfig): Promise<void> {
+  private async runStudioToEditorSync(
+    services: string[],
+    cfg: SyncConfig,
+    options: { studioAuthoritative?: boolean; generation?: number } = {},
+  ): Promise<void> {
     const diff = await this.exportStudioLiveSyncSnapshotAndDiff(services, cfg, { quietProbe: true });
     if (diff.changedServices.length === 0) {
       return;
     }
-    await this.importStudioLiveSyncSnapshot(diff.changedServices, cfg, diff.fingerprintsByService, { quietLog: true });
+    await this.importStudioLiveSyncSnapshot(diff.changedServices, cfg, diff.fingerprintsByService, {
+      quietLog: true,
+      studioAuthoritative: options.studioAuthoritative === true,
+      generation: options.generation,
+    });
   }
 
-  private async enqueueStudioToEditorSyncIfChanged(services: string[], cfg: SyncConfig, state?: StudioChangeState): Promise<void> {
+  private async enqueueStudioToEditorSyncIfChanged(
+    services: string[],
+    cfg: SyncConfig,
+    state?: StudioChangeState,
+    generation?: number,
+  ): Promise<void> {
     const run = async (): Promise<void> => {
+      if (
+        generation !== undefined &&
+        (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+      ) {
+        return;
+      }
       let taskStarted = false;
       const taskName = "Studio -> Editor sync";
       try {
         const diff = await this.exportStudioLiveSyncSnapshotAndDiff(services, cfg, { quietProbe: true });
+        if (
+          generation !== undefined &&
+          (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+        ) {
+          return;
+        }
         if (diff.changedServices.length === 0) {
           return;
         }
         taskStarted = true;
         this.setActiveTask(taskName);
         this.logStudioChanges(state, "full", diff.changedServices);
-        await this.importStudioLiveSyncSnapshot(diff.changedServices, cfg, diff.fingerprintsByService, { quietLog: true });
+        await this.importStudioLiveSyncSnapshot(diff.changedServices, cfg, diff.fingerprintsByService, {
+          quietLog: true,
+          generation,
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (taskStarted) {
           this.output.appendLine(`[renium] task failed: ${taskName}: ${message}`);
           this.output.show(true);
-          vscode.window.showErrorMessage(`Renium: ${taskName} failed. ${message}`);
+          vscode.window.showErrorMessage(`${taskName} failed. ${message}`);
         } else {
           this.output.appendLine(`[renium] Studio -> editor dirty check failed: ${message}`);
         }
@@ -4549,33 +6959,78 @@ class RobloxSyncController {
       reason: "",
       quietLog: options.quietProbe === true,
     });
-    return this.diffServicesBySnapshotFingerprint(selectedServices, cfg);
+    return await this.diffServicesBySnapshotFingerprint(selectedServices, cfg);
   }
 
-  private async importStudioLiveSyncSnapshot(
+  private importStudioLiveSyncSnapshot(
     services: string[],
     cfg: SyncConfig,
     fingerprintsByService?: Map<string, string>,
-    options: { quietLog?: boolean } = {},
+    options: { quietLog?: boolean; studioAuthoritative?: boolean; generation?: number } = {},
   ): Promise<void> {
+    return this.trackStudioImport(
+      options.generation,
+      this.importStudioLiveSyncSnapshotInner(services, cfg, fingerprintsByService, options),
+    );
+  }
+
+  private async importStudioLiveSyncSnapshotInner(
+    services: string[],
+    cfg: SyncConfig,
+    fingerprintsByService?: Map<string, string>,
+    options: { quietLog?: boolean; studioAuthoritative?: boolean; generation?: number } = {},
+  ): Promise<void> {
+    if (
+      options.generation !== undefined &&
+      (options.generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+    ) {
+      return;
+    }
     const selectedServices = this.normalizeServices(services, cfg.services);
     this.studioToEditorImportInProgress = true;
-    const capturedLocalEdits = this.captureLocalScriptEditsForServices(selectedServices, cfg);
+    const capturedLocalEdits = await this.captureLocalScriptEditsForServices(
+      selectedServices,
+      cfg,
+      options.studioAuthoritative !== true,
+    );
     try {
-      await this.runRustImport(cfg, this.resolveSnapshotPath(cfg), selectedServices, { quietLog: options.quietLog === true });
-      const survivingLocalEdits = this.reconcileLocalEditsAfterFullImport(selectedServices, cfg, capturedLocalEdits);
+      const changedPaths = await this.runRustImport(
+        cfg,
+        this.resolveSnapshotPath(cfg),
+        selectedServices,
+        { quietLog: options.quietLog === true },
+      );
+      const stillCurrent = options.generation === undefined
+        || (options.generation === this.studioLiveSyncGeneration && this.studioLiveSyncStarted);
+      const affectedKeys = new Set(
+        changedPaths.map((filePath) => this.normalizePathForCompare(filePath)),
+      );
+      const affectedLocalEdits = new Map(
+        [...capturedLocalEdits].filter(([filePath]) =>
+          affectedKeys.has(this.normalizePathForCompare(filePath))),
+      );
+      const survivingLocalEdits = this.reconcileLocalEditsAfterFullImport(
+        changedPaths,
+        cfg,
+        affectedLocalEdits,
+      );
       this.commitStudioSnapshotFingerprints(selectedServices, fingerprintsByService);
-      this.replaceEditorLiveSyncCacheForServices(selectedServices, cfg);
+      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
       if (survivingLocalEdits.length > 0) {
         this.invalidateEditorLiveSyncCacheEntries(survivingLocalEdits, cfg);
         for (const filePath of survivingLocalEdits) {
           this.pendingEditorPaths.add(filePath);
         }
-        this.scheduleEditorLiveSyncFlush(0);
+        void this.persistPendingEditorPaths(cfg.projectRoot);
+        if (stillCurrent) {
+          this.scheduleEditorLiveSyncFlush(0);
+        }
       }
-      try {
-        await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
-      } catch {
+      if (stillCurrent) {
+        try {
+          await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
+        } catch {
+        }
       }
     } finally {
       this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
@@ -4590,7 +7045,26 @@ class RobloxSyncController {
     changeCount: number,
     cfg: SyncConfig,
     mode: "property" | "structural",
-  ): Promise<"apply" | "full" | "discard"> {
+    generation?: number,
+    reviewKey?: string,
+  ): Promise<"apply" | "full" | "discard" | "pending"> {
+    if (
+      generation !== undefined
+      && (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+    ) {
+      return "pending";
+    }
+    if (
+      reviewKey &&
+      this.pendingStudioReviewKey === reviewKey &&
+      this.forcedStudioReviewKey !== reviewKey
+    ) {
+      return "pending";
+    }
+    if (reviewKey && this.forcedStudioReviewKey === reviewKey) {
+      this.forcedStudioReviewKey = undefined;
+      this.pendingStudioReviewKey = undefined;
+    }
     let oldValues: unknown[] = [];
     try {
       const requests = propertyChanges.map((change) => ({
@@ -4617,6 +7091,9 @@ class RobloxSyncController {
     const rows: Array<{
       service: string;
       path: string;
+      pathSegments: string[];
+      pathOrdinals: number[];
+      identity: string;
       leaf: string;
       className: string;
       icon: string;
@@ -4630,9 +7107,17 @@ class RobloxSyncController {
         ? change.pathSegments.map((segment) => String(segment))
         : [];
       const className = String(change.className ?? "");
+      const ordinals = Array.isArray(change.pathOrdinals)
+        ? change.pathOrdinals.map((ordinal) => Math.max(1, Math.floor(Number(ordinal) || 1)))
+        : [];
+      const service = String(change.service ?? "");
+      const settingsId = String(change.settingsId ?? "");
       return {
-        service: String(change.service ?? ""),
+        service,
         path: segments.join("."),
+        pathSegments: segments,
+        pathOrdinals: ordinals,
+        identity: settingsId || JSON.stringify([service, segments, ordinals]),
         leaf: segments.length > 0 ? segments[segments.length - 1] : String(change.settingsId ?? "instance"),
         className,
         icon: iconAssetNameForClass(className || "Folder", iconNames),
@@ -4654,16 +7139,25 @@ class RobloxSyncController {
       if (segments.length === 0) {
         continue;
       }
+      const ordinals = Array.isArray(change.pathOrdinals)
+        ? change.pathOrdinals.map((ordinal) => Math.max(1, Math.floor(Number(ordinal) || 1)))
+        : [];
+      const service = String(change.service ?? segments[0] ?? "");
+      const settingsId = String(change.settingsId ?? "");
       const path = segments.join(".");
-      const statusKey = `${action} ${path}`;
+      const identity = settingsId || JSON.stringify([service, segments, ordinals]);
+      const statusKey = `${action}\0${service}\0${identity}`;
       if (seenStatus.has(statusKey)) {
         continue;
       }
       seenStatus.add(statusKey);
       const className = String(change.className ?? "");
       rows.push({
-        service: String(change.service ?? segments[0] ?? ""),
+        service,
         path,
+        pathSegments: segments,
+        pathOrdinals: ordinals,
+        identity,
         leaf: segments[segments.length - 1],
         className,
         icon: iconAssetNameForClass(className || "Folder", iconNames),
@@ -4673,13 +7167,24 @@ class RobloxSyncController {
       });
     }
 
-    return await this.showChangeReviewPanel(rows, changeCount, cfg.changesThreshold, mode, `review ${changeCount} Studio changes`);
+    return await this.showChangeReviewPanel(
+      rows,
+      changeCount,
+      cfg.changesThreshold,
+      mode,
+      `review ${changeCount} Studio changes`,
+      generation,
+      reviewKey,
+    );
   }
 
   private async showChangeReviewPanel(
     rows: Array<{
       service: string;
       path: string;
+      pathSegments: string[];
+      pathOrdinals: number[];
+      identity: string;
       leaf: string;
       className: string;
       icon: string;
@@ -4693,8 +7198,16 @@ class RobloxSyncController {
     threshold: number,
     mode: "property" | "structural",
     title: string,
-  ): Promise<"apply" | "full" | "discard"> {
-    const defaultDecision = "full";
+    generation?: number,
+    reviewKey?: string,
+  ): Promise<"apply" | "full" | "discard" | "pending"> {
+    if (
+      generation !== undefined &&
+      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+    ) {
+      return "pending";
+    }
+    const defaultDecision = "pending";
     if (this.changePreviewResolve) {
       this.changePreviewResolve(defaultDecision);
       this.changePreviewResolve = undefined;
@@ -4704,7 +7217,7 @@ class RobloxSyncController {
     const assetsUri = vscode.Uri.joinPath(this.context.extensionUri, "assets");
     const panel = vscode.window.createWebviewPanel(
       "reniumChangePreview",
-      `Renium: ${title}`,
+      `${title}`,
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetsUri] },
     );
@@ -4712,15 +7225,38 @@ class RobloxSyncController {
     const assetBase = panel.webview.asWebviewUri(assetsUri).toString();
     panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, threshold, assetBase, mode);
 
-    return await new Promise<"apply" | "full" | "discard">((resolve) => {
+    return await new Promise<"apply" | "full" | "discard" | "pending">((resolve) => {
       let settled = false;
-      const finish = (decision: "apply" | "full" | "discard"): void => {
+      const finish = (decision: "apply" | "full" | "discard" | "pending"): void => {
         if (settled) {
           return;
         }
         settled = true;
         this.changePreviewResolve = undefined;
         this.changePreviewPanel = undefined;
+        if (decision === "pending" && reviewKey) {
+          const firstDeferral = this.pendingStudioReviewKey !== reviewKey;
+          this.pendingStudioReviewKey = reviewKey;
+          if (firstDeferral) {
+            void vscode.window.showInformationMessage(
+              "Studio changes are waiting for review.",
+              "Review changes",
+            ).then((choice) => {
+              if (choice !== "Review changes" || this.pendingStudioReviewKey !== reviewKey) {
+                return;
+              }
+              this.forcedStudioReviewKey = reviewKey;
+              try {
+                const cfg = this.effectiveLiveSyncConfig(this.getConfig());
+                this.scheduleStudioLiveSyncPoll(cfg, MIN_STUDIO_LIVE_SYNC_POLL_MS);
+              } catch {
+              }
+            });
+          }
+        } else if (reviewKey && this.pendingStudioReviewKey === reviewKey) {
+          this.pendingStudioReviewKey = undefined;
+          this.forcedStudioReviewKey = undefined;
+        }
         resolve(decision);
         panel.dispose();
       };
@@ -4739,6 +7275,9 @@ class RobloxSyncController {
     rows: Array<{
       service: string;
       path: string;
+      pathSegments: string[];
+      pathOrdinals: number[];
+      identity: string;
       leaf: string;
       className: string;
       icon: string;
@@ -4754,7 +7293,7 @@ class RobloxSyncController {
     mode: "property" | "structural",
   ): string {
     const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
-    const instanceCount = new Set(rows.map((row) => `${row.service}.${row.path}`)).size;
+    const instanceCount = new Set(rows.map((row) => `${row.service}\0${row.identity}`)).size;
     const services = [...new Set(rows.map((row) => row.service).filter((service) => service.length > 0))];
     const iconNames = this.changePreviewIconNames ?? new Set<string>();
     const folderIcon = iconAssetNameForClass("Folder", iconNames);
@@ -5002,13 +7541,27 @@ class RobloxSyncController {
 
   const root = { children: new Map(), changes: null, icon: null, className: "", status: null };
   for (const row of DATA) {
-    const segments = row.path.length > 0 ? row.path.split(".") : [row.leaf];
+    const segments = Array.isArray(row.pathSegments) && row.pathSegments.length > 0
+      ? row.pathSegments
+      : [row.leaf];
+    const ordinals = Array.isArray(row.pathOrdinals) ? row.pathOrdinals : [];
     let node = root;
-    for (const segment of segments) {
-      if (!node.children.has(segment)) {
-        node.children.set(segment, { name: segment, children: new Map(), changes: null, icon: null, className: "", status: null });
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      const ordinal = Math.max(1, Number(ordinals[index]) || 1);
+      const segmentKey = JSON.stringify([segment, ordinal]);
+      if (!node.children.has(segmentKey)) {
+        node.children.set(segmentKey, {
+          name: segment,
+          ordinal,
+          children: new Map(),
+          changes: null,
+          icon: null,
+          className: "",
+          status: null,
+        });
       }
-      node = node.children.get(segment);
+      node = node.children.get(segmentKey);
     }
     if (row.scope === "__status") {
       node.status = row.status;
@@ -5043,6 +7596,9 @@ class RobloxSyncController {
   let lastCount = -1;
 
   const matchCache = new Map();
+  function childKey(child) {
+    return JSON.stringify([child.name, Math.max(1, Number(child.ordinal) || 1)]);
+  }
   function nodeMatches(node, pathKey) {
     if (!filterText) return true;
     const cached = matchCache.get(pathKey);
@@ -5052,7 +7608,7 @@ class RobloxSyncController {
       || (node.changes && node.changes.some((c) => c.property.toLowerCase().includes(filterText)));
     if (!out) {
       for (const child of node.children.values()) {
-        if (nodeMatches(child, pathKey + "." + child.name)) { out = true; break; }
+        if (nodeMatches(child, pathKey + "/" + childKey(child))) { out = true; break; }
       }
     }
     matchCache.set(pathKey, out);
@@ -5067,7 +7623,7 @@ class RobloxSyncController {
     while (!current.changes && current.children.size === 1 && !filterText) {
       const child = current.children.values().next().value;
       chain.push(child.name);
-      key = key + "." + child.name;
+      key = key + "/" + childKey(child);
       current = child;
     }
     const isFolder = !current.changes;
@@ -5086,7 +7642,7 @@ class RobloxSyncController {
     }
     const children = [...current.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     for (const child of children) {
-      flattenNode(child, key + "." + child.name, depth + 1);
+      flattenNode(child, key + "/" + childKey(child), depth + 1);
     }
   }
 
@@ -5094,7 +7650,7 @@ class RobloxSyncController {
     flat = [];
     matchCache.clear();
     for (const service of root.children.values()) {
-      flattenNode(service, service.name, 0);
+      flattenNode(service, childKey(service), 0);
     }
     sizer.style.height = (flat.length * ROW_HEIGHT) + "px";
     hintEl.textContent = filterText && flat.length === 0 ? "No changes match" : "";
@@ -5200,32 +7756,77 @@ class RobloxSyncController {
 </html>`;
   }
 
-  private async tryApplyStudioPropertyChangesToEditor(
+  private tryApplyStudioPropertyChangesToEditor(
     state: StudioChangeState,
     dirtyServices: string[],
     cfg: SyncConfig,
-  ): Promise<boolean> {
+    generation?: number,
+    reviewKey?: string,
+  ): Promise<"applied" | "fallback" | "pending"> {
+    return this.trackStudioImport(
+      generation,
+      this.tryApplyStudioPropertyChangesToEditorInner(
+        state,
+        dirtyServices,
+        cfg,
+        generation,
+        reviewKey,
+      ),
+    );
+  }
+
+  private async tryApplyStudioPropertyChangesToEditorInner(
+    state: StudioChangeState,
+    dirtyServices: string[],
+    cfg: SyncConfig,
+    generation?: number,
+    reviewKey?: string,
+  ): Promise<"applied" | "fallback" | "pending"> {
+    if (
+      generation !== undefined &&
+      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+    ) {
+      return "pending";
+    }
     const fullSyncServices = Array.isArray(state.fullSyncServices)
       ? state.fullSyncServices.map((service) => service.trim()).filter((service) => service.length > 0)
       : [];
     const propertyChanges = Array.isArray(state.propertyChanges) ? state.propertyChanges : [];
     const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
     const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
-    const reviewStudioBatches = cfg.initialSyncPriority !== "studio" && cfg.displayPrompts !== "never";
+    const reviewStudioBatches = this.canDisplayLiveSyncPrompt(cfg);
     if (propertyChanges.length === 0 || fullSyncServices.length > 0) {
       if (changeCount > cfg.changesThreshold && trackedChanges.length > 0 && reviewStudioBatches) {
-        const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, "structural");
+        const decision = await this.showStudioChangePreview(
+          propertyChanges,
+          trackedChanges,
+          changeCount,
+          cfg,
+          "structural",
+          generation,
+          reviewKey,
+        );
+        if (
+          generation !== undefined &&
+          (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+        ) {
+          return "pending";
+        }
+        if (decision === "pending") {
+          return "pending";
+        }
+        this.displayedLiveSyncPrompt = true;
         if (decision === "discard") {
           this.output.appendLine(
             `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
           );
-          return true;
+          return "applied";
         }
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
         );
       }
-      return false;
+      return "fallback";
     }
 
     if (changeCount > cfg.changesThreshold) {
@@ -5233,20 +7834,38 @@ class RobloxSyncController {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes exceed liveSync.changesThreshold=${cfg.changesThreshold}; using protected full import.`,
         );
-        return false;
+        return "fallback";
       }
-      const decision = await this.showStudioChangePreview(propertyChanges, trackedChanges, changeCount, cfg, "property");
+      const decision = await this.showStudioChangePreview(
+        propertyChanges,
+        trackedChanges,
+        changeCount,
+        cfg,
+        "property",
+        generation,
+        reviewKey,
+      );
+      if (
+        generation !== undefined &&
+        (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+      ) {
+        return "pending";
+      }
+      if (decision === "pending") {
+        return "pending";
+      }
+      this.displayedLiveSyncPrompt = true;
       if (decision === "full") {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
         );
-        return false;
+        return "fallback";
       }
       if (decision === "discard") {
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
         );
-        return true;
+        return "applied";
       }
       this.output.appendLine(`[renium] Studio -> editor: applying ${changeCount} reviewed changes.`);
     }
@@ -5261,79 +7880,144 @@ class RobloxSyncController {
     }
     for (const service of dirtySet) {
       if (!changeServices.has(service)) {
-        return false;
+        return "fallback";
       }
     }
 
     this.ensureFileExists(cfg.rustCliPath);
-    const changedFiles = new Set<string>();
-    const changedSettingsFiles = new Set<string>();
+    const batchEntries: Array<{
+      service: string;
+      settingsId?: string;
+      className: string;
+      pathSegments: string[];
+      pathOrdinals: number[];
+      scope: string;
+      property: string;
+      value: unknown;
+    }> = [];
+    const sourceValues = new Map<number, string>();
+    const pathsToSuppress = new Set<string>();
     for (const change of propertyChanges) {
       const service = String(change.service ?? "").trim();
       const property = String(change.property ?? "").trim();
       if (!dirtySet.has(service) || property.length === 0) {
-        return false;
+        return "fallback";
       }
 
-      const settingsFile = existingReniumSettingsFile(cfg.projectRoot, service);
-      if (!fs.existsSync(settingsFile)) {
-        return false;
+      const settingsFile = existingReniumSettingsFile(cfg.projectRoot, cfg.srcDir, service);
+      if (!fs.existsSync(settingsFile) && !fs.existsSync(this.projectManifestPath(cfg))) {
+        return "fallback";
       }
 
-      const pathSegments = Array.isArray(change.pathSegments) ? change.pathSegments : [];
+      const settingsId = String(change.settingsId ?? "").trim();
+      const pathSegments = Array.isArray(change.pathSegments)
+        ? change.pathSegments.map((segment) => String(segment))
+        : [];
+      if (settingsId.length === 0 && (pathSegments.length < 1 || pathSegments[0] !== service)) {
+        return "fallback";
+      }
+      let value = change.value ?? null;
       if (property === "Source" && (change.scope ?? "property") === "property") {
         if (typeof change.value !== "string") {
-          return false;
+          return "fallback";
         }
-        this.noteProgrammaticEditorWrite({ paths: [settingsFile], durationMs: 5000 });
-        const sourcePath = await this.applyStudioSourceChangeToEditor(cfg, settingsFile, service, change);
-        this.noteProgrammaticEditorWrite({ paths: [settingsFile, sourcePath], durationMs: 5000, refreshCache: true });
-        changedFiles.add(sourcePath);
-        continue;
+        const sourcePath = this.resolveStudioSourcePathFromSourcemap(cfg, change);
+        if (!sourcePath) {
+          return "fallback";
+        }
+        const finalSource = this.reconcileStudioSourceWithLocalEdits(cfg, sourcePath, change.value);
+        value = finalSource;
+        sourceValues.set(batchEntries.length, finalSource);
+        pathsToSuppress.add(sourcePath);
       }
-
-      const args = [
-        "bytecode-set-property",
-        "-f",
-        settingsFile,
-        "-p",
+      pathsToSuppress.add(settingsFile);
+      batchEntries.push({
+        service,
+        settingsId: settingsId.length > 0 ? settingsId : undefined,
+        className: String(change.className ?? ""),
+        pathSegments,
+        pathOrdinals: Array.isArray(change.pathOrdinals)
+          ? change.pathOrdinals.map((ordinal) => Number(ordinal))
+          : [],
+        scope: change.scope ?? "property",
         property,
-        "-S",
-        change.scope ?? "property",
-        `--value-json=${JSON.stringify(change.value ?? null)}`,
-      ];
-      const settingsId = String(change.settingsId ?? "").trim();
-      if (settingsId.length > 0) {
-        args.push("-i", settingsId);
-      } else if (pathSegments.length >= 1 && pathSegments[0] === service) {
-        args.push("--path-segments-json", JSON.stringify(pathSegments));
-        args.push("--path-ordinals-json", JSON.stringify(Array.isArray(change.pathOrdinals) ? change.pathOrdinals : []));
-      } else {
-        return false;
-      }
+        value,
+      });
+    }
 
-      this.noteProgrammaticEditorWrite({ paths: [settingsFile], durationMs: 5000 });
-      const result = await this.runCommand(
+    const batchFile = path.join(
+      os.tmpdir(),
+      `renium-property-batch-${process.pid}-${crypto.randomUUID()}.json`,
+    );
+    fs.writeFileSync(batchFile, JSON.stringify(batchEntries), "utf8");
+    if (
+      generation !== undefined &&
+      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
+    ) {
+      fs.rmSync(batchFile, { force: true });
+      return "pending";
+    }
+    this.noteProgrammaticEditorWrite({ paths: Array.from(pathsToSuppress), durationMs: 5000 });
+    let result: CommandRunResult;
+    try {
+      result = await this.runCommand(
         cfg.rustCliPath,
-        args,
+        [
+          "bytecode-apply-property-batch",
+          "--project-root",
+          cfg.projectRoot,
+          "--input",
+          batchFile,
+        ],
         cfg.projectRoot,
         "studio-property-import",
         cfg.progressHeartbeatSeconds,
         { quietLog: true },
       );
-      if (result.code !== 0) {
-        throw new Error(`Rust property import exited with code ${result.code}`);
+    } finally {
+      try {
+        fs.rmSync(batchFile, { force: true });
+      } catch {
       }
-      this.noteProgrammaticEditorWrite({ paths: [settingsFile], durationMs: 5000, refreshCache: true });
-      changedFiles.add(settingsFile);
-      changedSettingsFiles.add(settingsFile);
     }
+    if (result.code !== 0) {
+      throw new Error(`Rust property import exited with code ${result.code}`);
+    }
+    const stillCurrent = generation === undefined
+      || (generation === this.studioLiveSyncGeneration && this.studioLiveSyncStarted);
+    let batchResult: {
+      changedPaths?: unknown[];
+      sourcePaths?: Array<{ entryIndex?: unknown; path?: unknown }>;
+    };
+    try {
+      batchResult = JSON.parse(result.output.trim()) as typeof batchResult;
+    } catch {
+      throw new Error("Rust property import returned invalid JSON");
+    }
+    const changedFiles = new Set(
+      (Array.isArray(batchResult.changedPaths) ? batchResult.changedPaths : [])
+        .map((filePath) => path.resolve(String(filePath))),
+    );
+    const changedSettingsFiles = new Set(
+      Array.from(changedFiles).filter((filePath) => isReniumSettingsFileName(path.basename(filePath))),
+    );
+    for (const sourceResult of Array.isArray(batchResult.sourcePaths) ? batchResult.sourcePaths : []) {
+      const entryIndex = Number(sourceResult.entryIndex);
+      const sourcePath = path.resolve(String(sourceResult.path ?? ""));
+      const finalContent = sourceValues.get(entryIndex);
+      if (Number.isInteger(entryIndex) && sourcePath.length > 0 && finalContent !== undefined) {
+        this.writeSyncBase(cfg, sourcePath, finalContent);
+      }
+    }
+    this.noteProgrammaticEditorWrite({
+      paths: Array.from(new Set([...pathsToSuppress, ...changedFiles])),
+      durationMs: 5000,
+      refreshCache: true,
+    });
 
     const changedServices = Array.from(dirtySet);
-    for (const filePath of changedFiles) {
-      this.updateEditorLiveSyncCacheAfterPush([filePath], cfg);
-    }
-    if (changedSettingsFiles.size > 0) {
+    await this.updateEditorLiveSyncCacheAfterPush(Array.from(changedFiles), cfg);
+    if (stillCurrent && changedSettingsFiles.size > 0) {
       try {
         await vscode.commands.executeCommand("renium.fileExplorer.refreshPropertyChanges", Array.from(changedSettingsFiles));
       } catch {
@@ -5342,45 +8026,7 @@ class RobloxSyncController {
     this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
     this.studioToEditorLastSyncEndedAt = Date.now();
     this.logStudioChanges(state, "property", changedServices);
-    return true;
-  }
-
-  private async applyStudioSourceChangeToEditor(
-    cfg: SyncConfig,
-    settingsFile: string,
-    service: string,
-    change: StudioPropertyChange,
-  ): Promise<string> {
-    const directSourcePath = this.tryApplyStudioSourceChangeToEditorFromSourcemap(cfg, change);
-    if (directSourcePath) {
-      return directSourcePath;
-    }
-
-    void settingsFile;
-    void service;
-    throw new Error("Studio source change could not be mapped via sourcemap; deferring to protected full import.");
-  }
-
-  private tryApplyStudioSourceChangeToEditorFromSourcemap(
-    cfg: SyncConfig,
-    change: StudioPropertyChange,
-  ): string | undefined {
-    if (typeof change.value !== "string") {
-      return undefined;
-    }
-
-    const sourcePath = this.resolveStudioSourcePathFromSourcemap(cfg, change);
-    if (!sourcePath) {
-      return undefined;
-    }
-
-    const finalContent = this.reconcileStudioSourceWithLocalEdits(cfg, sourcePath, change.value);
-
-    this.noteProgrammaticEditorWrite({ paths: [sourcePath], durationMs: 5000 });
-    this.writeUtf8FileIfChanged(sourcePath, finalContent);
-    this.writeSyncBase(cfg, sourcePath, finalContent);
-    this.noteProgrammaticEditorWrite({ paths: [sourcePath], durationMs: 5000, refreshCache: true });
-    return sourcePath;
+    return stillCurrent ? "applied" : "pending";
   }
 
 
@@ -5463,6 +8109,11 @@ class RobloxSyncController {
 
 
 
+  private canDisplayLiveSyncPrompt(cfg: SyncConfig): boolean {
+    return cfg.displayPrompts === "always" ||
+      (cfg.displayPrompts === "initial" && !this.displayedLiveSyncPrompt);
+  }
+
   private surfaceConflictChoice(
     cfg: SyncConfig,
     sourcePath: string,
@@ -5471,7 +8122,7 @@ class RobloxSyncController {
   ): void {
     const label = path.basename(sourcePath);
     this.output.appendLine(`[renium] conflict on ${sourcePath}: kept your local version; Studio's copy is in .renium/conflicts.`);
-    if (cfg.displayPrompts === "never" || (cfg.displayPrompts === "initial" && this.displayedLiveSyncPrompt)) {
+    if (!this.canDisplayLiveSyncPrompt(cfg)) {
       return;
     }
     this.displayedLiveSyncPrompt = true;
@@ -5484,7 +8135,7 @@ class RobloxSyncController {
     }
     void vscode.window
       .showWarningMessage(
-        `Renium: ${label} was edited in both Studio and your editor. Kept your version; Studio's copy is saved in .renium/conflicts.`,
+        `${label} was edited in both Studio and your editor. Kept your version; Studio's copy is saved in .renium/conflicts.`,
         ...actions,
       )
       .then((choice) => {
@@ -5532,11 +8183,44 @@ class RobloxSyncController {
   }
 
   private syncBasePathForSource(cfg: SyncConfig, sourcePath: string): string | undefined {
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    if (!this.isPathInside(sourcePath, srcRoot)) {
+    const srcRoot = this.sourceRoot(cfg);
+    if (this.isPathInside(sourcePath, srcRoot)) {
+      return path.join(cfg.projectRoot, ".renium", "sync-base", path.relative(srcRoot, sourcePath));
+    }
+    const owner = loadProjectSourceLocations(cfg.projectRoot)
+      .filter((location) => {
+        try {
+          return fs.statSync(location).isFile()
+            ? this.normalizePathForCompare(sourcePath) === this.normalizePathForCompare(location)
+            : this.isPathInside(sourcePath, location);
+        } catch {
+          return path.extname(location) !== ""
+            ? this.normalizePathForCompare(sourcePath) === this.normalizePathForCompare(location)
+            : this.isPathInside(sourcePath, location);
+        }
+      })
+      .sort((left, right) => right.length - left.length)[0];
+    if (!owner) {
       return undefined;
     }
-    return path.join(cfg.projectRoot, ".renium", "sync-base", path.relative(srcRoot, sourcePath));
+    const ownerKey = crypto
+      .createHash("sha256")
+      .update(this.normalizePathForCompare(owner))
+      .digest("hex")
+      .slice(0, 20);
+    const relative = path.extname(owner) !== "" && !fs.existsSync(owner)
+      ? path.basename(sourcePath)
+      : fs.existsSync(owner) && fs.statSync(owner).isFile()
+        ? path.basename(sourcePath)
+        : path.relative(owner, sourcePath);
+    return path.join(
+      cfg.projectRoot,
+      ".renium",
+      "sync-base",
+      "external",
+      ownerKey,
+      relative,
+    );
   }
 
   private readSyncBase(cfg: SyncConfig, sourcePath: string): string | undefined {
@@ -5589,31 +8273,28 @@ class RobloxSyncController {
 
 
 
-  private captureLocalScriptEditsForServices(services: string[], cfg: SyncConfig): Map<string, string> {
-    const captured = new Map<string, string>();
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    for (const service of this.normalizeServices(services, cfg.services)) {
-      const serviceDir = path.join(srcRoot, service);
-      if (!fs.existsSync(serviceDir)) {
+  private async captureLocalScriptEditsForServices(
+    services: string[],
+    cfg: SyncConfig,
+    captureUnbased: boolean = true,
+  ): Promise<Map<string, CapturedLocalScriptState>> {
+    const captured = new Map<string, CapturedLocalScriptState>();
+    const candidates = new Set(await this.liveSyncLuaSourceFiles(services, cfg));
+    for (const filePath of await this.liveSyncBaseSourceFiles(services, cfg)) {
+      candidates.add(filePath);
+    }
+    for (const filePath of candidates) {
+      const base = this.readSyncBase(cfg, filePath);
+      let content: string | undefined;
+      try {
+        content = fs.readFileSync(filePath, "utf8");
+      } catch {
+      }
+      if (base === undefined && !captureUnbased) {
         continue;
       }
-      for (const filePath of this.collectInitialEditorLiveSyncPaths(serviceDir)) {
-        if (!this.isLuaSourcePath(filePath)) {
-          continue;
-        }
-        const base = this.readSyncBase(cfg, filePath);
-        if (base === undefined) {
-          continue;
-        }
-        let content: string;
-        try {
-          content = fs.readFileSync(filePath, "utf8");
-        } catch {
-          continue;
-        }
-        if (content !== base) {
-          captured.set(filePath, content);
-        }
+      if (content === undefined ? base !== undefined : base === undefined || content !== base) {
+        captured.set(filePath, { content, base });
       }
     }
     return captured;
@@ -5625,24 +8306,77 @@ class RobloxSyncController {
 
 
   private reconcileLocalEditsAfterFullImport(
-    services: string[],
+    affectedPaths: string[],
     cfg: SyncConfig,
-    captured: Map<string, string>,
+    captured: Map<string, CapturedLocalScriptState>,
   ): string[] {
     const surviving: string[] = [];
-    for (const [filePath, localContent] of captured) {
-      let newDisk: string;
+    for (const [filePath, local] of captured) {
+      let newDisk: string | undefined;
       try {
         newDisk = fs.readFileSync(filePath, "utf8");
       } catch {
-        continue;
       }
-      if (localContent === newDisk) {
+      if (local.content === newDisk) {
+        if (newDisk === undefined) {
+          const basePath = this.syncBasePathForSource(cfg, filePath);
+          if (basePath) {
+            try {
+              fs.rmSync(basePath, { force: true });
+            } catch {
+            }
+          }
+          continue;
+        }
         this.writeSyncBase(cfg, filePath, newDisk);
         continue;
       }
-      const base = this.readSyncBase(cfg, filePath);
-      const resolved = this.mergeSourceAgainstBase(cfg, filePath, localContent, newDisk, base);
+      if (local.content === undefined) {
+        if (newDisk === local.base) {
+          fs.rmSync(filePath, { force: true });
+          surviving.push(filePath);
+          continue;
+        }
+        const studioBackup = newDisk === undefined
+          ? undefined
+          : this.backupConflictCopy(cfg, filePath, newDisk, "studio");
+        const policy = this.resolveConflictPolicy(cfg);
+        if (policy === "studio") {
+          if (newDisk !== undefined) {
+            this.writeSyncBase(cfg, filePath, newDisk);
+          }
+        } else {
+          fs.rmSync(filePath, { force: true });
+          surviving.push(filePath);
+        }
+        this.surfacePresenceConflict(cfg, filePath, "local deletion", studioBackup);
+        continue;
+      }
+      if (newDisk === undefined) {
+        const localBackup = this.backupConflictCopy(cfg, filePath, local.content, "local");
+        const policy = this.resolveConflictPolicy(cfg);
+        if (policy !== "studio") {
+          this.writeUtf8FileIfChanged(filePath, local.content);
+          surviving.push(filePath);
+        } else {
+          const basePath = this.syncBasePathForSource(cfg, filePath);
+          if (basePath) {
+            try {
+              fs.rmSync(basePath, { force: true });
+            } catch {
+            }
+          }
+        }
+        this.surfacePresenceConflict(cfg, filePath, "Studio deletion", localBackup);
+        continue;
+      }
+      const resolved = this.mergeSourceAgainstBase(
+        cfg,
+        filePath,
+        local.content,
+        newDisk,
+        local.base,
+      );
       if (resolved === newDisk) {
         this.writeSyncBase(cfg, filePath, newDisk);
         continue;
@@ -5651,23 +8385,209 @@ class RobloxSyncController {
       surviving.push(filePath);
     }
 
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    for (const service of this.normalizeServices(services, cfg.services)) {
-      const serviceDir = path.join(srcRoot, service);
-      if (!fs.existsSync(serviceDir)) {
+    for (const filePath of affectedPaths.filter((filePath) => this.isLuaSourcePath(filePath))) {
+      if (captured.has(filePath) || this.syncBaseExists(cfg, filePath)) {
         continue;
       }
-      for (const filePath of this.collectInitialEditorLiveSyncPaths(serviceDir)) {
-        if (!this.isLuaSourcePath(filePath) || captured.has(filePath) || this.syncBaseExists(cfg, filePath)) {
-          continue;
-        }
-        try {
-          this.writeSyncBase(cfg, filePath, fs.readFileSync(filePath, "utf8"));
-        } catch {
-        }
+      try {
+        this.writeSyncBase(cfg, filePath, fs.readFileSync(filePath, "utf8"));
+      } catch {
       }
     }
     return surviving;
+  }
+
+  private async liveSyncBaseSourceFiles(services: string[], cfg: SyncConfig): Promise<string[]> {
+    const baseRoot = path.join(cfg.projectRoot, ".renium", "sync-base");
+    if (!fs.existsSync(baseRoot)) {
+      return [];
+    }
+    const selectedServices = this.normalizeServices(services, cfg.services);
+    const selected = new Set(selectedServices.map((service) => service.toLowerCase()));
+    const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
+    const locations = sourceGraph.locations;
+    const externalByKey = new Map<string, string>();
+    for (const location of locations) {
+      const ownerKey = crypto
+        .createHash("sha256")
+        .update(this.normalizePathForCompare(location))
+        .digest("hex")
+        .slice(0, 20);
+      externalByKey.set(ownerKey, location);
+    }
+    const paths = new Set<string>();
+    for (const entry of await this.collectInitialEditorLiveSyncPathsAsync(baseRoot)) {
+      const relative = path.relative(baseRoot, entry);
+      const parts = relative.split(path.sep);
+      let sourcePath: string | undefined;
+      if (parts[0] === "external" && parts.length >= 3) {
+        const owner = externalByKey.get(parts[1]);
+        if (owner) {
+          const ownerIsFile = fs.existsSync(owner)
+            ? fs.statSync(owner).isFile()
+            : path.extname(owner) !== "";
+          sourcePath = ownerIsFile ? owner : path.join(owner, ...parts.slice(2));
+        }
+      } else if (parts.length > 0 && selected.has(parts[0].toLowerCase())) {
+        sourcePath = path.join(this.sourceRoot(cfg), relative);
+      }
+      if (
+        sourcePath
+        && this.isLuaSourcePath(sourcePath)
+        && this.projectSourcePathMatchesServices(sourcePath, selected, sourceGraph)
+      ) {
+        paths.add(path.resolve(sourcePath));
+      }
+    }
+    return Array.from(paths).sort((left, right) => this.comparePathsForStableOrder(left, right));
+  }
+
+  private surfacePresenceConflict(
+    cfg: SyncConfig,
+    sourcePath: string,
+    detail: string,
+    backupPath: string | undefined,
+  ): void {
+    const policy = this.resolveConflictPolicy(cfg);
+    this.output.appendLine(
+      `[renium] conflict on ${sourcePath}: ${detail} conflicted with the other side; policy=${policy}.`,
+    );
+    if (!this.canDisplayLiveSyncPrompt(cfg)) {
+      return;
+    }
+    this.displayedLiveSyncPrompt = true;
+    const action = backupPath ? "Open Backup" : undefined;
+    void vscode.window
+      .showWarningMessage(
+        `${path.basename(sourcePath)} was deleted on one side and edited on the other. Applied the ${policy} conflict policy.`,
+        ...(action ? [action] : []),
+      )
+      .then((choice) => {
+        if (choice === action && backupPath) {
+          void vscode.window.showTextDocument(vscode.Uri.file(backupPath));
+        }
+      });
+  }
+
+  private async liveSyncLuaSourceFiles(services: string[], cfg: SyncConfig): Promise<string[]> {
+    const paths = new Set<string>();
+    const srcRoot = this.sourceRoot(cfg);
+    const selectedServices = this.normalizeServices(services, cfg.services);
+    const selected = new Set(selectedServices.map((service) => service.toLowerCase()));
+    for (const service of selectedServices) {
+      const serviceDir = path.join(srcRoot, service);
+      if (fs.existsSync(serviceDir)) {
+        for (const filePath of await this.collectInitialEditorLiveSyncPathsAsync(serviceDir)) {
+          if (this.isLuaSourcePath(filePath)) {
+            paths.add(path.resolve(filePath));
+          }
+        }
+      }
+    }
+    const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
+    for (const location of this.projectSourceScanLocations(selectedServices, sourceGraph)) {
+      if (this.isPathInside(location, srcRoot)) {
+        continue;
+      }
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(location);
+      } catch {
+        continue;
+      }
+      if (stat.isFile()) {
+        if (this.isLuaSourcePath(location)) {
+          paths.add(path.resolve(location));
+        }
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        continue;
+      }
+      for (const filePath of await this.collectInitialEditorLiveSyncPathsAsync(location)) {
+        if (this.isLuaSourcePath(filePath)) {
+          paths.add(path.resolve(filePath));
+        }
+      }
+    }
+    return Array.from(paths).sort((left, right) => this.comparePathsForStableOrder(left, right));
+  }
+
+  private projectSourceScanLocations(
+    services: string[],
+    sourceGraph: ProjectSourceGraph,
+  ): string[] {
+    const selected = new Set(services.map((service) => service.toLowerCase()));
+    const locations = new Set<string>();
+    for (const location of sourceGraph.locations) {
+      const normalized = this.normalizePathForCompare(location);
+      const owners = sourceGraph.owners.filter((owner) =>
+        this.normalizePathForCompare(owner.location) === normalized);
+      if (owners.some((owner) => owner.target[0] && selected.has(owner.target[0].toLowerCase()))) {
+        locations.add(location);
+      }
+      if (!owners.some((owner) => owner.target.length === 0)) {
+        continue;
+      }
+      let directory = false;
+      try {
+        directory = fs.statSync(location).isDirectory();
+      } catch {
+        directory = path.extname(location) === "";
+      }
+      if (!directory) {
+        locations.add(location);
+        continue;
+      }
+      for (const service of services) {
+        locations.add(path.join(location, service));
+      }
+    }
+    return Array.from(locations).sort((left, right) => this.comparePathsForStableOrder(left, right));
+  }
+
+  private projectSourcePathMatchesServices(
+    filePath: string,
+    selected: Set<string>,
+    sourceGraph: ProjectSourceGraph,
+  ): boolean {
+    const matches = sourceGraph.owners
+      .filter((owner) => {
+        let isFile = false;
+        try {
+          isFile = fs.statSync(owner.location).isFile();
+        } catch {
+          isFile = path.extname(owner.location) !== "";
+        }
+        return isFile
+          ? this.normalizePathForCompare(filePath) === this.normalizePathForCompare(owner.location)
+          : this.isPathInside(filePath, owner.location);
+      })
+      .sort((left, right) =>
+        path.resolve(right.location).split(path.sep).length
+        - path.resolve(left.location).split(path.sep).length);
+    if (matches.length === 0) {
+      return false;
+    }
+    const specificity = path.resolve(matches[0].location).split(path.sep).length;
+    for (const owner of matches) {
+      if (path.resolve(owner.location).split(path.sep).length !== specificity) {
+        break;
+      }
+      const fixedService = owner.target[0];
+      if (fixedService) {
+        if (selected.has(fixedService.toLowerCase())) {
+          return true;
+        }
+        continue;
+      }
+      const relative = path.relative(owner.location, filePath);
+      const service = relative.split(path.sep)[0];
+      if (!service || service === "." || selected.has(service.toLowerCase())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private invalidateEditorLiveSyncCacheEntries(paths: string[], cfg: SyncConfig): void {
@@ -5687,8 +8607,22 @@ class RobloxSyncController {
 
   private backupConflictCopy(cfg: SyncConfig, sourcePath: string, content: string, side: "local" | "studio"): string | undefined {
     try {
-      const srcRoot = path.join(cfg.projectRoot, "src");
-      const rel = this.isPathInside(sourcePath, srcRoot) ? path.relative(srcRoot, sourcePath) : path.basename(sourcePath);
+      const srcRoot = this.sourceRoot(cfg);
+      let rel = this.isPathInside(sourcePath, srcRoot) ? path.relative(srcRoot, sourcePath) : undefined;
+      if (rel === undefined) {
+        const syncBase = this.syncBasePathForSource(cfg, sourcePath);
+        if (syncBase) {
+          rel = path.relative(path.join(cfg.projectRoot, ".renium", "sync-base"), syncBase);
+        }
+      }
+      if (rel === undefined) {
+        const ownerKey = crypto
+          .createHash("sha256")
+          .update(this.normalizePathForCompare(sourcePath))
+          .digest("hex")
+          .slice(0, 20);
+        rel = path.join("external", ownerKey, path.basename(sourcePath));
+      }
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const dest = path.join(cfg.projectRoot, ".renium", "conflicts", stamp, `${rel}.${side}`);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -5706,7 +8640,7 @@ class RobloxSyncController {
     if (policy === "prompt" || manual) {
       void vscode.window
         .showWarningMessage(
-          `Renium: concurrent edits to ${label} — ${manual ? "conflict markers written; resolve manually" : detail}. Backups in .renium/conflicts.`,
+          `Concurrent edits to ${label} — ${manual ? "conflict markers written; resolve manually" : detail}. Backups in .renium/conflicts.`,
           "Open File",
         )
         .then((choice) => {
@@ -5829,8 +8763,7 @@ class RobloxSyncController {
     }
 
     const sourcePath = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(cfg.projectRoot, rawPath);
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    if (!this.isPathInside(sourcePath, srcRoot)) {
+    if (!this.isProjectSourcePath(sourcePath, cfg)) {
       return undefined;
     }
     return sourcePath;
@@ -5857,11 +8790,14 @@ class RobloxSyncController {
     return false;
   }
 
-  private diffServicesBySnapshotFingerprint(services: string[], cfg: SyncConfig): StudioSnapshotDiff {
+  private async diffServicesBySnapshotFingerprint(
+    services: string[],
+    cfg: SyncConfig,
+  ): Promise<StudioSnapshotDiff> {
     const changedServices: string[] = [];
     const fingerprintsByService = new Map<string, string>();
     for (const service of services) {
-      const fingerprint = this.snapshotFingerprintForService(service, cfg);
+      const fingerprint = await this.snapshotFingerprintForService(service, cfg);
       if (!fingerprint) {
         changedServices.push(service);
         continue;
@@ -5890,9 +8826,12 @@ class RobloxSyncController {
     }
   }
 
-  private snapshotFingerprintForService(service: string, cfg: SyncConfig): string | undefined {
+  private async snapshotFingerprintForService(
+    service: string,
+    cfg: SyncConfig,
+  ): Promise<string | undefined> {
     const snapshotRoot = this.resolveSnapshotPath(cfg);
-    const paths = this.collectSnapshotFingerprintPaths(snapshotRoot, service);
+    const paths = await this.collectSnapshotFingerprintPaths(snapshotRoot, service);
     if (paths.length === 0) {
       return undefined;
     }
@@ -5903,7 +8842,7 @@ class RobloxSyncController {
     for (const filePath of paths) {
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(filePath);
+        stat = await fs.promises.stat(filePath);
       } catch {
         continue;
       }
@@ -5911,7 +8850,7 @@ class RobloxSyncController {
         continue;
       }
       const relPath = this.normalizePathForCompare(path.relative(snapshotRoot, filePath));
-      const content = fs.readFileSync(filePath);
+      const content = await fs.promises.readFile(filePath);
       const fingerprintContent = path.resolve(filePath) === path.resolve(rootFile)
         ? this.normalizeSnapshotRootForFingerprint(content, service)
         : content;
@@ -6054,7 +8993,10 @@ class RobloxSyncController {
     return primitive === undefined ? "null" : primitive;
   }
 
-  private collectSnapshotFingerprintPaths(snapshotRoot: string, service: string): string[] {
+  private async collectSnapshotFingerprintPaths(
+    snapshotRoot: string,
+    service: string,
+  ): Promise<string[]> {
     const paths: string[] = [];
     const rootFile = path.join(snapshotRoot, `${service}.json`);
     if (fs.existsSync(rootFile)) {
@@ -6071,7 +9013,7 @@ class RobloxSyncController {
         }
         let entries: fs.Dirent[];
         try {
-          entries = fs.readdirSync(dir, { withFileTypes: true });
+          entries = await fs.promises.readdir(dir, { withFileTypes: true });
         } catch {
           continue;
         }
@@ -6089,7 +9031,7 @@ class RobloxSyncController {
     return paths.sort((a, b) => this.comparePathsForStableOrder(a, b));
   }
 
-  private collectInitialEditorLiveSyncPaths(srcRoot: string): string[] {
+  private async collectInitialEditorLiveSyncPathsAsync(srcRoot: string): Promise<string[]> {
     const settingsPathsByDirectory = new Map<string, string>();
     const otherPaths: string[] = [];
     const stack = [srcRoot];
@@ -6100,7 +9042,7 @@ class RobloxSyncController {
       }
       let entries: fs.Dirent[];
       try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
+        entries = await fs.promises.readdir(dir, { withFileTypes: true });
       } catch {
         continue;
       }
@@ -6108,19 +9050,16 @@ class RobloxSyncController {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           stack.push(fullPath);
-          continue;
-        }
-        if (!entry.isFile()) {
-          continue;
-        }
-        if (isReniumSettingsFileName(entry.name)) {
-          const directory = path.resolve(path.dirname(fullPath));
-          const previous = settingsPathsByDirectory.get(directory);
-          if (!previous || isCanonicalReniumSettingsFileName(entry.name)) {
-            settingsPathsByDirectory.set(directory, fullPath);
+        } else if (entry.isFile()) {
+          if (isReniumSettingsFileName(entry.name)) {
+            const directory = path.resolve(path.dirname(fullPath));
+            const previous = settingsPathsByDirectory.get(directory);
+            if (!previous || isCanonicalReniumSettingsFileName(entry.name)) {
+              settingsPathsByDirectory.set(directory, fullPath);
+            }
+          } else {
+            otherPaths.push(fullPath);
           }
-        } else {
-          otherPaths.push(fullPath);
         }
       }
     }
@@ -6130,28 +9069,17 @@ class RobloxSyncController {
     ];
   }
 
-  private collectInitialEditorLiveSyncSettingsPaths(srcRoot: string): string[] {
-    return this.collectInitialEditorLiveSyncPaths(srcRoot)
+  private async collectInitialEditorLiveSyncSettingsPaths(srcRoot: string): Promise<string[]> {
+    return (await this.collectInitialEditorLiveSyncPathsAsync(srcRoot))
       .filter((filePath) => isReniumSettingsFileName(path.basename(filePath)));
   }
 
-  private collectEditorLiveSyncPathsForServices(services: string[], cfg: SyncConfig): string[] {
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    const selectedServices = this.normalizeServices(services, cfg.services);
-    const paths: string[] = [];
-    for (const service of selectedServices) {
-      const serviceDir = path.join(srcRoot, service);
-      if (!fs.existsSync(serviceDir)) {
-        continue;
-      }
-      paths.push(...this.collectInitialEditorLiveSyncPaths(serviceDir));
-    }
-    return [...new Set(paths.map((filePath) => path.resolve(filePath)))].sort((a, b) => this.comparePathsForStableOrder(a, b));
-  }
-
-  private collectInitialEditorLiveSyncTargetIds(srcRoot: string, settingsPaths: string[]): { paths: string[]; targetSettingsIds: string[] } {
+  private async collectInitialEditorLiveSyncTargetIds(
+    srcRoot: string,
+    settingsPaths: string[],
+  ): Promise<{ paths: string[]; targetSettingsIds: string[] }> {
     const cfg = this.getConfig();
-    const result = childProcess.spawnSync(
+    const result = await this.runCommand(
       cfg.exportCliPath,
       [
         "bt",
@@ -6160,37 +9088,34 @@ class RobloxSyncController {
         "-s",
         cfg.services.join(","),
       ],
-      {
-        cwd: cfg.projectRoot,
-        encoding: "utf8",
-        maxBuffer: 16 * 1024 * 1024,
-        windowsHide: true,
-      },
+      cfg.projectRoot,
+      "editor-live-sync-target-scan",
+      cfg.progressHeartbeatSeconds,
+      { quietLog: true, timeoutMs: 10_000 },
     );
-    if (result.status !== 0) {
-      const message = (result.stderr || result.stdout || "").trim();
-      this.output.appendLine(`[renium] editor live sync initial target scan failed: ${message || `exit ${result.status}`}`);
-      return { paths: [], targetSettingsIds: [] };
+    if (result.code !== 0) {
+      const message = result.output.trim();
+      this.output.appendLine(`[renium] editor live sync initial target scan failed: ${message || `exit ${result.code}`}`);
+      return { paths: settingsPaths, targetSettingsIds: [] };
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(result.stdout);
-    } catch (err) {
-      this.output.appendLine(`[renium] editor live sync initial target scan failed: ${err instanceof Error ? err.message : String(err)}`);
-      return { paths: [], targetSettingsIds: [] };
+    const parsed = this.parseCliJsonObject<{ paths?: unknown; targetSettingsIds?: unknown }>(result.output);
+    if (!parsed) {
+      this.output.appendLine("[renium] editor live sync initial target scan returned invalid JSON");
+      return { paths: settingsPaths, targetSettingsIds: [] };
     }
-    const rawPaths = Array.isArray((parsed as { paths?: unknown }).paths)
-      ? (parsed as { paths: unknown[] }).paths
+    const rawPaths = Array.isArray(parsed.paths)
+      ? parsed.paths
       : [];
-    const rawIds = Array.isArray((parsed as { targetSettingsIds?: unknown }).targetSettingsIds)
-      ? (parsed as { targetSettingsIds: unknown[] }).targetSettingsIds
+    const rawIds = Array.isArray(parsed.targetSettingsIds)
+      ? parsed.targetSettingsIds
       : [];
     const validSettingsPaths = new Set(settingsPaths.map((settingsPath) => this.normalizePathForCompare(settingsPath)));
     const paths = rawPaths
       .map((value) => String(value))
       .filter((value) => validSettingsPaths.has(this.normalizePathForCompare(value)));
+    paths.push(...settingsPaths.filter((value) => !isReniumSettingsFileName(path.basename(value))));
     return {
-      paths,
+      paths: [...new Set(paths)],
       targetSettingsIds: [...new Set(rawIds.map((value) => String(value)).filter((value) => value.startsWith("editor:")))],
     };
   }
@@ -6255,24 +9180,24 @@ class RobloxSyncController {
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   }
 
-  private editorLiveSyncFileHash(filePath: string): string | undefined {
+  private async editorLiveSyncFileHash(filePath: string): Promise<string | undefined> {
     try {
-      const stat = fs.statSync(filePath);
+      const stat = await fs.promises.stat(filePath);
       if (!stat.isFile()) {
         return undefined;
       }
       const hash = crypto.createHash("sha256");
-      hash.update(fs.readFileSync(filePath));
+      hash.update(await fs.promises.readFile(filePath));
       return `sha256:${stat.size}:${hash.digest("hex")}`;
     } catch {
       return undefined;
     }
   }
 
-  private primeEditorLiveSyncCache(paths: string[], cfg: SyncConfig): void {
+  private async primeEditorLiveSyncCache(paths: string[], cfg: SyncConfig): Promise<void> {
     const cache = this.emptyEditorLiveSyncCache(cfg.projectRoot);
     for (const filePath of paths) {
-      const hash = this.editorLiveSyncFileHash(filePath);
+      const hash = await this.editorLiveSyncFileHash(filePath);
       if (hash) {
         cache.files[this.editorLiveSyncCacheKey(filePath, cfg.projectRoot)] = hash;
       }
@@ -6280,7 +9205,10 @@ class RobloxSyncController {
     this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
   }
 
-  private filterEditorLiveSyncChangedPaths(paths: string[], cfg: SyncConfig): string[] {
+  private async classifyEditorLiveSyncPaths(
+    paths: string[],
+    cfg: SyncConfig,
+  ): Promise<{ pushable: string[]; unchanged: string[]; blocked: string[] }> {
     const { cache, existed } = this.loadEditorLiveSyncCache(cfg.projectRoot);
     const seen = new Set<string>();
     const observations: { path: string; key: string; hash: string | undefined }[] = [];
@@ -6290,32 +9218,34 @@ class RobloxSyncController {
       if (!seen.add(key)) {
         continue;
       }
-      const hash = this.editorLiveSyncFileHash(filePath);
+      const hash = await this.editorLiveSyncFileHash(filePath);
       observations.push({ path: filePath, key, hash });
     }
 
     const changed = changedEditorLiveSyncPaths(observations, existed, cache.files);
-    return this.excludeUnresolvedConflictMarkerPaths(changed);
+    const changedKeys = new Set(changed.map((filePath) => this.normalizePathForCompare(filePath)));
+    const unchanged = observations
+      .filter((observation) => !changedKeys.has(this.normalizePathForCompare(observation.path)))
+      .map((observation) => observation.path);
+    const { pushable, blocked } = await this.partitionUnresolvedConflictMarkerPaths(changed);
+    return { pushable, unchanged, blocked };
   }
 
-
-
-
-
-
-
-  private excludeUnresolvedConflictMarkerPaths(paths: string[]): string[] {
+  private async partitionUnresolvedConflictMarkerPaths(
+    paths: string[],
+  ): Promise<{ pushable: string[]; blocked: string[] }> {
     const pushable: string[] = [];
+    const blocked: string[] = [];
     for (const filePath of paths) {
       const key = this.normalizePathForCompare(filePath);
-      if (this.isLuaSourcePath(filePath) && this.fileHasConflictMarkers(filePath)) {
+      if (this.isLuaSourcePath(filePath) && await this.fileHasConflictMarkers(filePath)) {
         this.output.appendLine(
           `[renium] live-sync: holding back ${filePath} — unresolved conflict markers present; resolve them to resume syncing this file.`,
         );
         if (!this.conflictMarkerWarnedKeys.has(key)) {
           this.conflictMarkerWarnedKeys.add(key);
           void vscode.window.showWarningMessage(
-            `Renium: ${path.basename(filePath)} has unresolved merge conflict markers and won't sync to Studio until resolved.`,
+            `${path.basename(filePath)} has unresolved merge conflict markers and won't sync to Studio until resolved.`,
             "Open File",
           ).then((choice) => {
             if (choice === "Open File") {
@@ -6323,6 +9253,7 @@ class RobloxSyncController {
             }
           });
         }
+        blocked.push(filePath);
         continue;
       }
       if (this.conflictMarkerWarnedKeys.delete(key)) {
@@ -6330,13 +9261,13 @@ class RobloxSyncController {
       }
       pushable.push(filePath);
     }
-    return pushable;
+    return { pushable, blocked };
   }
 
-  private fileHasConflictMarkers(filePath: string): boolean {
+  private async fileHasConflictMarkers(filePath: string): Promise<boolean> {
     let content: string;
     try {
-      content = fs.readFileSync(filePath, "utf8");
+      content = await fs.promises.readFile(filePath, "utf8");
     } catch {
       return false;
     }
@@ -6366,6 +9297,7 @@ class RobloxSyncController {
   }
 
   private scheduleEditorLiveSyncFlush(delayMs: number): void {
+    this.persistPendingEditorPaths();
     const normalizedDelayMs = Math.max(0, Math.ceil(delayMs));
     const dueAt = Date.now() + normalizedDelayMs;
     if (this.liveSyncTimer && this.liveSyncTimerDueAt > 0 && this.liveSyncTimerDueAt <= dueAt) {
@@ -6410,7 +9342,6 @@ class RobloxSyncController {
 
   public noteProgrammaticEditorWrite(request: ProgrammaticEditorWriteRequest): void {
     const cfg = this.getConfig();
-    const srcRoot = path.join(cfg.projectRoot, "src");
     const rawPaths = Array.isArray(request.paths)
       ? request.paths
       : request.paths !== undefined
@@ -6420,7 +9351,7 @@ class RobloxSyncController {
       .map((value) => String(value ?? "").trim())
       .filter((value) => value.length > 0)
       .map((value) => path.isAbsolute(value) ? path.resolve(value) : path.resolve(cfg.projectRoot, value))
-      .filter((value) => this.isPathInside(value, srcRoot)))];
+      .filter((value) => this.isProjectSourcePath(value, cfg)))];
     if (paths.length === 0) {
       return;
     }
@@ -6439,21 +9370,47 @@ class RobloxSyncController {
     }
 
     if (cachePaths.length > 0) {
-      this.updateEditorLiveSyncCacheAfterPush(cachePaths, cfg);
+      void this.updateEditorLiveSyncCacheAfterPush(cachePaths, cfg);
+    }
+    if (request.forcePending === true) {
+      this.invalidateEditorLiveSyncCacheEntries(paths, cfg);
+      this.markEditorPathsPending(paths, cfg);
+      this.scheduleEditorLiveSyncFlush(0);
     }
     this.schedulePendingEditorFlushIfNeeded(now);
   }
 
-  private updateEditorLiveSyncCacheAfterPush(paths: string[], cfg: SyncConfig): void {
+  private async updateEditorLiveSyncCacheAfterPush(paths: string[], cfg: SyncConfig): Promise<void> {
+    const write = this.editorLiveSyncCacheWrites
+      .catch(() => undefined)
+      .then(async () => {
+        const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
+        for (const filePath of paths) {
+          const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+          const hash = await this.editorLiveSyncFileHash(filePath);
+          if (hash) {
+            cache.files[key] = hash;
+          } else {
+            delete cache.files[key];
+          }
+        }
+        this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
+      });
+    this.editorLiveSyncCacheWrites = write.catch((error) => {
+      this.output.appendLine(
+        `[renium] editor live sync cache update failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+    await write;
+  }
+
+  private invalidateEditorLiveSyncCachePaths(paths: string[], cfg: SyncConfig): void {
+    if (paths.length === 0) {
+      return;
+    }
     const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
     for (const filePath of paths) {
-      const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
-      const hash = this.editorLiveSyncFileHash(filePath);
-      if (hash) {
-        cache.files[key] = hash;
-      } else {
-        delete cache.files[key];
-      }
+      delete cache.files[this.editorLiveSyncCacheKey(filePath, cfg.projectRoot)];
     }
     this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
   }
@@ -6464,47 +9421,13 @@ class RobloxSyncController {
     }
 
     const services = [...new Set(
-      paths
-        .map((filePath) => this.detectServiceForPath(filePath, cfg.projectRoot, cfg.services))
-        .filter((service): service is string => typeof service === "string" && service.length > 0),
+      paths.flatMap((filePath) => this.servicesForProjectSourcePath(filePath, cfg)),
     )];
     if (services.length === 0) {
       return;
     }
 
     this.scheduleStudioLiveSyncPoll(cfg, this.resetStudioLiveSyncPollDelay(cfg));
-  }
-
-  private replaceEditorLiveSyncCacheForServices(services: string[], cfg: SyncConfig): void {
-    const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    const selectedServices = this.normalizeServices(services, cfg.services);
-    const serviceDirs = selectedServices.map((service) => path.join(srcRoot, service));
-    const currentHashes: Record<string, string> = {};
-
-    for (const serviceDir of serviceDirs) {
-      if (!fs.existsSync(serviceDir)) {
-        continue;
-      }
-      for (const filePath of this.collectInitialEditorLiveSyncPaths(serviceDir)) {
-        const hash = this.editorLiveSyncFileHash(filePath);
-        if (hash) {
-          currentHashes[this.editorLiveSyncCacheKey(filePath, cfg.projectRoot)] = hash;
-        }
-      }
-    }
-
-    for (const cachedKey of Object.keys(cache.files)) {
-      const absolutePath = path.join(cfg.projectRoot, cachedKey);
-      if (serviceDirs.some((serviceDir) => this.isPathInside(absolutePath, serviceDir))) {
-        delete cache.files[cachedKey];
-      }
-    }
-
-    for (const [key, hash] of Object.entries(currentHashes)) {
-      cache.files[key] = hash;
-    }
-    this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
   }
 
   public async stopLiveSync(options: { silent?: boolean } = {}): Promise<void> {
@@ -6521,28 +9444,35 @@ class RobloxSyncController {
         );
       }
     }
-    this.disposeLiveSyncRuntime();
+    await this.disposeLiveSyncRuntime();
     await this.setEditorLiveSyncEnabled(false);
     if (startup) {
       try {
         await startup;
       } catch {
       }
-      this.disposeLiveSyncRuntime();
+      await this.disposeLiveSyncRuntime();
       await this.setEditorLiveSyncEnabled(false);
     }
     if (this.liveSyncOwnsServe) {
-      this.bridgeServeRequested = false;
       this.liveSyncOwnsServe = false;
-      this.stopBridgeDaemon();
+      if (this.consoleFollowRunning) {
+        this.consoleFollowOwnsServe = true;
+        this.scheduleStudioActionPoll();
+      } else {
+        this.bridgeServeRequested = false;
+        await this.stopBridgeDaemon();
+      }
     } else if (!this.bridgeServeRequested) {
-      this.stopBridgeDaemon();
+      await this.stopBridgeDaemon();
+    } else {
+      this.scheduleStudioActionPoll();
     }
     this.updateStatusBar();
     if (!options.silent) {
       vscode.window.showInformationMessage(wasRunning
-        ? "Renium: editor -> Studio live sync stopped."
-        : "Renium: live sync is not running.");
+        ? "Editor -> Studio live sync stopped."
+        : "Live sync is not running.");
     }
   }
 
@@ -6555,56 +9485,134 @@ class RobloxSyncController {
     }
 
     const cfg = this.getConfig();
+    const projectRoot = typeof options.projectRoot === "string" && options.projectRoot.length > 0
+      ? options.projectRoot
+      : cfg.projectRoot;
+    const retain = (): void => {
+      this.markEditorPathsPendingAtRoot(changedPaths, cfg, projectRoot, options.pendingServices);
+    };
+    if (this.experienceChangeInProgress) {
+      retain();
+      void vscode.window.showWarningMessage("Wait for the place change to finish.");
+      return false;
+    }
+    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
+      retain();
+      return false;
+    }
     if (!options.force && !this.isEditorLiveSyncActive()) {
       this.disposeLiveSyncRuntime();
+      retain();
       this.updateStatusBar();
       return false;
     }
     if (options.force === true && !this.canUseStudioPushPipeline()) {
       this.noteStudioPushSkipped("serve/live sync is not active");
+      retain();
       return false;
     }
 
     let pushed = false;
-    await this.enqueue(options.taskName ?? "Editor -> Studio sync", async () => {
-      const runCfg = this.getConfig();
-      if (!options.force && !this.isEditorLiveSyncActive()) {
-        this.output.appendLine("[renium] editor direct sync cancelled: editor -> Studio live sync is off");
-        return;
-      }
-      if (options.force === true && !this.canUseStudioPushPipeline()) {
-        this.noteStudioPushSkipped("serve/live sync is not active");
-        return;
-      }
-      const pathsToPush = options.skipChangeFilter === true
-        ? changedPaths
-        : this.filterEditorLiveSyncChangedPaths(changedPaths, runCfg);
-      if (pathsToPush.length === 0) {
-        return;
-      }
-      this.logEditorChangedPaths("Editor -> Studio", pathsToPush, runCfg);
-      await this.runEditorPush(pathsToPush, runCfg, options);
-      pushed = true;
-    });
+    let completed = false;
+    try {
+      await this.enqueue(options.taskName ?? "Editor -> Studio sync", async () => {
+        const runCfg = this.getConfig();
+        if (
+          this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(runCfg.projectRoot)
+          || (!options.force && !this.isEditorLiveSyncActive())
+        ) {
+          this.output.appendLine("[renium] editor direct sync cancelled before apply");
+          return;
+        }
+        if (options.force === true && !this.canUseStudioPushPipeline()) {
+          this.noteStudioPushSkipped("serve/live sync is not active");
+          return;
+        }
+        const classified = options.skipChangeFilter === true
+          ? {
+            ...await this.partitionUnresolvedConflictMarkerPaths(changedPaths),
+            unchanged: [] as string[],
+          }
+          : await this.classifyEditorLiveSyncPaths(changedPaths, runCfg);
+        const pathsToPush = classified.pushable;
+        if (classified.unchanged.length > 0) {
+          this.clearAppliedEditorPaths(classified.unchanged);
+        }
+        if (classified.blocked.length > 0) {
+          this.markEditorPathsPendingAtRoot(
+            classified.blocked,
+            runCfg,
+            projectRoot,
+            options.pendingServices,
+          );
+        }
+        if (pathsToPush.length === 0) {
+          completed = true;
+          pushed = classified.blocked.length === 0;
+          return;
+        }
+        this.logEditorChangedPaths("Editor -> Studio", pathsToPush, runCfg);
+        const outcome = await this.runEditorPush(pathsToPush, runCfg, options);
+        if (outcome === "skipped") {
+          this.markEditorPathsPendingAtRoot(pathsToPush, runCfg, projectRoot, options.pendingServices);
+        } else {
+          this.clearAppliedEditorPaths(pathsToPush);
+        }
+        completed = true;
+        pushed = outcome === "applied" && classified.blocked.length === 0;
+      });
+    } catch (error) {
+      retain();
+      throw error;
+    }
+    if (!completed) {
+      retain();
+    }
     return pushed;
   }
 
-  public async pushEditorPropertyNow(request: EditorPropertyPushRequest): Promise<void> {
+  public async pushEditorPropertyNow(request: EditorPropertyPushRequest): Promise<EditorPushOutcome> {
+    const cfg = this.getConfig();
+    const service = String(request.service ?? "").trim();
+    const projectRoot = typeof request.projectRoot === "string" && request.projectRoot.length > 0
+      ? request.projectRoot
+      : cfg.projectRoot;
+    const settingsFile = String(request.settingsFile ?? "").trim();
+    const changedPaths = Array.from(new Set([
+      ...(Array.isArray(request.changedPaths) ? request.changedPaths : []),
+      ...(settingsFile.length > 0 ? [settingsFile] : []),
+    ].map((filePath) => String(filePath).trim()).filter((filePath) => filePath.length > 0)));
+    const retain = (): void => {
+      this.markEditorPathsPendingAtRoot(changedPaths, cfg, projectRoot, service ? [service] : undefined);
+    };
+    if (this.experienceChangeInProgress) {
+      retain();
+      void vscode.window.showWarningMessage("Wait for the place change to finish.");
+      return "skipped";
+    }
     if (!request.force && !this.isEditorLiveSyncActive()) {
-      return;
+      retain();
+      return "skipped";
     }
     if (request.force === true && !this.canUseStudioPushPipeline()) {
       this.noteStudioPushSkipped("serve/live sync is not active");
-      return;
+      retain();
+      return "skipped";
     }
-    const cfg = this.getConfig();
+    if (
+      request.projectRoot
+      && this.normalizePathForCompare(request.projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
+    ) {
+      retain();
+      return "skipped";
+    }
 
-    const service = String(request.service ?? "").trim();
     const property = String(request.property ?? "").trim();
     const pathSegments = Array.isArray(request.pathSegments)
       ? request.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
       : [];
     if (!service || !property || pathSegments.length === 0) {
+      retain();
       throw new Error("Editor property push requires service, property, and path segments.");
     }
 
@@ -6613,6 +9621,10 @@ class RobloxSyncController {
     const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
     const args = [
       "prop",
+      "-r",
+      projectRoot,
+      "-d",
+      cfg.srcDir,
       "-w",
       String(bridgeWaitSeconds),
       "-P",
@@ -6631,31 +9643,53 @@ class RobloxSyncController {
       property,
       `--value-json=${JSON.stringify(request.value ?? null)}`,
     ];
-    const allowProtectedMeshIdApply = request.allowProtectedMeshIdApply === true
-      || (property === "MeshId" && request.className === "MeshPart");
-    if (allowProtectedMeshIdApply) {
-      args.push("-m");
-    }
     const settingsId = String(request.settingsId ?? "").trim();
     if (settingsId.length > 0) {
       args.push("-i", settingsId);
     }
 
     const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
+    const automationParameters = {
+      editor: true,
+      bridgeWaitSeconds,
+      bridgePorts: cfg.bridgePorts,
+      service,
+      className: String(request.className ?? ""),
+      pathSegments,
+      pathOrdinals: Array.isArray(request.pathOrdinals) ? request.pathOrdinals : [],
+      scope: request.scope ?? "property",
+      property,
+      value: request.value ?? null,
+      ...(settingsId.length > 0 ? { settingsId } : {}),
+      overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
+    };
     let result: CommandRunResult;
     if (usePersistentBridge) {
-      result = await this.runDaemonCommand(
+      result = await this.runAutomationOperation(
         command,
-        args.slice(1),
         cfg,
         "editor-property",
-        "prop",
+        AUTOMATION_OP.setProperty,
+        automationParameters,
         { quietWait: true },
       );
+      if (
+        result.automationError?.c === "rejected"
+        && result.automationError.n === "review-prepare"
+      ) {
+        result = await this.runReviewedAutomationOperation(
+          command,
+          cfg,
+          "editor-property",
+          AUTOMATION_OP.setProperty,
+          automationParameters,
+          { quietWait: true },
+        );
+      }
     } else {
       result = await this.runCommand(
         command,
-        args,
+        this.withPlaceSelector(cfg, args),
         cfg.projectRoot,
         "editor-property",
         cfg.progressHeartbeatSeconds,
@@ -6663,39 +9697,73 @@ class RobloxSyncController {
       );
     }
     if (result.code !== 0) {
+      retain();
       throw new Error(`Editor property push exited with code ${result.code}`);
     }
-    const summary = this.parseEditorPushSummary(result.output);
+    const summary = this.parseEditorPushSummary(result.output, result.result);
     if (!summary) {
+      retain();
       throw new Error("Editor property push did not return a Studio apply result.");
+    }
+    if (summary.skippedByReview === true) {
+      retain();
+      return "skipped";
     }
     const errors = this.summaryNumber(summary, "errors");
     if (summary.ok === false || errors > 0) {
+      retain();
       throw new Error("Studio rejected or failed editor property apply.");
     }
 
-    const settingsFile = String(request.settingsFile ?? "").trim();
-    if (settingsFile.length > 0 && fs.existsSync(settingsFile)) {
-      this.updateEditorLiveSyncCacheAfterPush([settingsFile], cfg);
-      await this.suppressStudioLiveSyncAfterEditorPush([settingsFile], cfg);
+    if (changedPaths.length > 0) {
+      this.clearAppliedEditorPaths(changedPaths);
+      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
+      await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
     }
+    return "applied";
   }
 
-  public async pushEditorDeleteNow(request: EditorDeletePushRequest): Promise<void> {
+  public async pushEditorDeleteNow(request: EditorDeletePushRequest): Promise<EditorPushOutcome> {
+    const cfg = this.getConfig();
+    const service = String(request.service ?? "").trim();
+    const projectRoot = typeof request.projectRoot === "string" && request.projectRoot.length > 0
+      ? request.projectRoot
+      : cfg.projectRoot;
+    const settingsFile = String(request.settingsFile ?? "").trim();
+    const changedPaths = Array.from(new Set([
+      ...(Array.isArray(request.changedPaths) ? request.changedPaths : []),
+      ...(settingsFile.length > 0 ? [settingsFile] : []),
+    ].map((filePath) => String(filePath).trim()).filter((filePath) => filePath.length > 0)));
+    const retain = (): void => {
+      this.markEditorPathsPendingAtRoot(changedPaths, cfg, projectRoot, service ? [service] : undefined);
+    };
+    if (this.experienceChangeInProgress) {
+      retain();
+      void vscode.window.showWarningMessage("Wait for the place change to finish.");
+      return "skipped";
+    }
     if (!request.force && !this.isEditorLiveSyncActive()) {
-      return;
+      retain();
+      return "skipped";
     }
     if (request.force === true && !this.canUseStudioPushPipeline()) {
       this.noteStudioPushSkipped("serve/live sync is not active");
-      return;
+      retain();
+      return "skipped";
     }
-    const cfg = this.getConfig();
+    if (
+      request.projectRoot
+      && this.normalizePathForCompare(request.projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
+    ) {
+      retain();
+      return "skipped";
+    }
 
-    const service = String(request.service ?? "").trim();
     const pathSegments = Array.isArray(request.pathSegments)
       ? request.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
       : [];
     if (!service || pathSegments.length <= 1) {
+      retain();
       throw new Error("Editor delete push requires service and a non-root path.");
     }
 
@@ -6704,6 +9772,10 @@ class RobloxSyncController {
     const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
     const args = [
       "del",
+      "-r",
+      projectRoot,
+      "-d",
+      cfg.srcDir,
       "-w",
       String(bridgeWaitSeconds),
       "-P",
@@ -6724,43 +9796,61 @@ class RobloxSyncController {
 
     const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
     const result = usePersistentBridge
-      ? await this.runDaemonCommand(
+      ? await this.runAutomationOperation(
         command,
-        args.slice(1),
         cfg,
         "editor-delete",
-        "del",
+        AUTOMATION_OP.remove,
+        {
+          editor: true,
+          bridgeWaitSeconds,
+          bridgePorts: cfg.bridgePorts,
+          service,
+          className: String(request.className ?? ""),
+          pathSegments,
+          pathOrdinals: Array.isArray(request.pathOrdinals) ? request.pathOrdinals : [],
+          ...(settingsId.length > 0 ? { settingsId } : {}),
+          overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
+        },
         { quietWait: true },
       )
       : await this.runCommand(
         command,
-        args,
+        this.withPlaceSelector(cfg, args),
         cfg.projectRoot,
         "editor-delete",
         cfg.progressHeartbeatSeconds,
         { quietLog: true },
       );
     if (result.code !== 0) {
+      retain();
       throw new Error(`Editor delete push exited with code ${result.code}`);
     }
-    const summary = this.parseEditorPushSummary(result.output);
+    const summary = this.parseEditorPushSummary(result.output, result.result);
     if (!summary) {
+      retain();
       throw new Error("Editor delete push did not return a Studio apply result.");
+    }
+    if (summary.skippedByReview === true) {
+      retain();
+      return "skipped";
     }
     const errors = this.summaryNumber(summary, "errors");
     if (summary.ok === false || errors > 0) {
+      retain();
       throw new Error("Studio rejected or failed editor delete apply.");
     }
 
-    const settingsFile = String(request.settingsFile ?? "").trim();
-    if (settingsFile.length > 0 && fs.existsSync(settingsFile)) {
-      this.updateEditorLiveSyncCacheAfterPush([settingsFile], cfg);
-      await this.suppressStudioLiveSyncAfterEditorPush([settingsFile], cfg);
+    if (changedPaths.length > 0) {
+      this.clearAppliedEditorPaths(changedPaths);
+      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
+      await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
     }
+    return "applied";
   }
 
   public async onDocumentSaved(doc: vscode.TextDocument): Promise<void> {
-    if (doc.isUntitled || doc.uri.scheme !== "file") {
+    if (this.experienceChangeInProgress || doc.isUntitled || doc.uri.scheme !== "file") {
       return;
     }
 
@@ -6770,7 +9860,11 @@ class RobloxSyncController {
       this.updateStatusBar();
     }
 
-    if (cfg.editorLiveSyncEnabled && this.liveSyncWatcher && this.isPathInside(doc.uri.fsPath, path.join(cfg.projectRoot, "src"))) {
+    if (
+      cfg.editorLiveSyncEnabled &&
+      this.liveSyncWatcher &&
+      this.isProjectSourcePath(doc.uri.fsPath, cfg)
+    ) {
       const fileKey = this.normalizePathForCompare(doc.uri.fsPath);
       this.recentDirectSaveAtByPath.set(fileKey, Date.now());
       this.forcedEditorLiveSyncPathKeys.add(fileKey);
@@ -6790,11 +9884,12 @@ class RobloxSyncController {
       return;
     }
 
-    const service = this.detectServiceForPath(doc.uri.fsPath, cfg.projectRoot, cfg.services);
-    if (service) {
+    const services = this.servicesForProjectSourcePath(doc.uri.fsPath, cfg);
+    if (services.length === 0) {
+      return;
+    }
+    for (const service of services) {
       this.pendingAutoServices.add(service);
-    } else {
-      cfg.services.forEach((s) => this.pendingAutoServices.add(s));
     }
 
     if (this.autoSyncTimer) {
@@ -6824,8 +9919,7 @@ class RobloxSyncController {
       return;
     }
 
-    const srcRoot = path.join(cfg.projectRoot, "src");
-    if (!this.isPathInside(filePath, srcRoot)) {
+    if (!this.isProjectSourcePath(filePath, cfg)) {
       return;
     }
     const now = Date.now();
@@ -6857,20 +9951,19 @@ class RobloxSyncController {
     this.output.appendLine(`[renium] editor live sync failed: ${message}`);
     if (this.editorPushFailureStreak <= 1) {
       this.output.show(true);
-      vscode.window.showErrorMessage(`Renium: editor live sync failed. ${message}`);
+      vscode.window.showErrorMessage(`Editor live sync failed. ${message}`);
     }
   }
 
   private async flushEditorChanges(): Promise<void> {
     const cfg = this.getConfig();
     if (!cfg.editorLiveSyncEnabled) {
-      this.pendingEditorPaths.clear();
+      this.persistPendingEditorPaths();
       return;
     }
 
     const now = Date.now();
     const queuedPaths: string[] = [];
-    const queuedPathKeys: string[] = [];
     let earliestSuppressedUntil: number | undefined;
     for (const filePath of this.pendingEditorPaths) {
       const fileKey = this.normalizePathForCompare(filePath);
@@ -6883,29 +9976,83 @@ class RobloxSyncController {
         continue;
       }
       queuedPaths.push(filePath);
-      queuedPathKeys.push(fileKey);
-      this.pendingEditorPaths.delete(filePath);
     }
+    this.persistPendingEditorPaths();
     if (earliestSuppressedUntil !== undefined) {
       this.scheduleEditorLiveSyncFlush(earliestSuppressedUntil - now);
     }
     if (queuedPaths.length === 0) {
       return;
     }
-    const changedPaths = this.filterEditorLiveSyncChangedPaths(queuedPaths, cfg);
+    const classified = await this.classifyEditorLiveSyncPaths(queuedPaths, cfg);
+    const changedPaths = classified.pushable;
+    for (const filePath of classified.unchanged) {
+      const key = this.normalizePathForCompare(filePath);
+      this.pendingEditorPaths.delete(filePath);
+      this.pendingEditorServicesByPath.delete(key);
+      this.forcedEditorLiveSyncPathKeys.delete(key);
+    }
     if (changedPaths.length === 0) {
-      for (const fileKey of queuedPathKeys) {
-        this.forcedEditorLiveSyncPathKeys.delete(fileKey);
-      }
+      this.recomputeBlockedStudioImportServices(cfg);
+      this.persistPendingEditorPaths();
       return;
     }
 
+    const pushedHashes = new Map(
+      await Promise.all(changedPaths.map(async (filePath) => [
+        this.normalizePathForCompare(filePath),
+        await this.editorLiveSyncFileHash(filePath),
+      ] as const)),
+    );
+    const previousCache = this.loadEditorLiveSyncCache(cfg.projectRoot).cache.files;
+    const structuralServices = new Set<string>();
+    for (const filePath of changedPaths) {
+      const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+      const existedBefore = previousCache[key] !== undefined;
+      const existsNow = pushedHashes.get(this.normalizePathForCompare(filePath)) !== undefined;
+      if (
+        existedBefore === existsNow &&
+        !isReniumSettingsFileName(path.basename(filePath))
+      ) {
+        continue;
+      }
+      for (const service of this.servicesForProjectSourcePath(filePath, cfg)) {
+        structuralServices.add(service);
+      }
+    }
+    let applied = false;
     try {
       await this.enqueue("Editor -> Studio sync", async () => {
         this.logEditorChangedPaths("Editor -> Studio", changedPaths, cfg);
-        await this.runEditorPush(changedPaths, cfg);
-        this.refreshSyncBasesForPaths(changedPaths, cfg);
+        const outcome = await this.runEditorPush(changedPaths, cfg);
+        if (outcome === "applied") {
+          this.refreshSyncBasesForPaths(changedPaths, cfg);
+          applied = true;
+        }
       });
+      if (!applied) {
+        this.persistPendingEditorPaths();
+        return;
+      }
+      const changedDuringPush: string[] = [];
+      for (const filePath of changedPaths) {
+        const key = this.normalizePathForCompare(filePath);
+        if (pushedHashes.get(key) === await this.editorLiveSyncFileHash(filePath)) {
+          this.pendingEditorPaths.delete(filePath);
+          this.pendingEditorServicesByPath.delete(key);
+        } else {
+          changedDuringPush.push(filePath);
+        }
+      }
+      this.recomputeBlockedStudioImportServices(cfg);
+      this.invalidateEditorLiveSyncCachePaths(changedDuringPush, cfg);
+      this.persistPendingEditorPaths();
+      if (structuralServices.size > 0) {
+        await vscode.commands.executeCommand(
+          "renium.fileExplorer.refreshServices",
+          [...structuralServices],
+        );
+      }
       if (this.editorPushFailureStreak > 0) {
         this.output.appendLine(
           `[renium] editor live sync recovered after ${this.editorPushFailureStreak} failed attempt(s).`,
@@ -6921,16 +10068,23 @@ class RobloxSyncController {
       for (const filePath of changedPaths) {
         this.pendingEditorPaths.add(filePath);
       }
+      this.persistPendingEditorPaths();
       this.scheduleEditorLiveSyncFlush(retryDelayMs);
       throw err;
     } finally {
-      for (const fileKey of queuedPathKeys) {
-        this.forcedEditorLiveSyncPathKeys.delete(fileKey);
+      if (applied) {
+        for (const filePath of changedPaths) {
+          this.forcedEditorLiveSyncPathKeys.delete(this.normalizePathForCompare(filePath));
+        }
       }
     }
   }
 
-  private async runEditorPush(changedPaths: string[], cfg: SyncConfig, options: EditorPushOptions = {}): Promise<void> {
+  private async runEditorPush(
+    changedPaths: string[],
+    cfg: SyncConfig,
+    options: EditorPushOptions = {},
+  ): Promise<EditorPushOutcome> {
     const command = cfg.exportCliPath;
     this.ensureFileExists(command);
     const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
@@ -6939,13 +10093,14 @@ class RobloxSyncController {
       "-r",
       cfg.projectRoot,
       "-d",
-      "src",
+      cfg.srcDir,
       "-w",
       String(bridgeWaitSeconds),
       "-P",
       cfg.bridgePorts,
     ];
-    const verifySources = options.verifySources === true || cfg.verifyEditorPushSources;
+    const verifySources = options.fullSync !== true
+      && (options.verifySources === true || cfg.verifyEditorPushSources);
     if (verifySources) {
       args.push("-v");
     }
@@ -6955,9 +10110,15 @@ class RobloxSyncController {
     if (this.effectiveLiveSyncConfig(cfg).overridePackages) {
       args.push("--override-packages");
     }
+    if (options.fullSync === true) {
+      args.push("--no-review", "--yes");
+    }
+    const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
     let changedPathsFile: string | undefined;
-    const changedPathArgs = changedPaths.map((changedPath) => this.editorChangedPathArg(changedPath, cfg.projectRoot));
-    if (changedPathArgs.length > 32) {
+    const changedPathArgs = options.fullSync === true
+      ? []
+      : changedPaths.map((changedPath) => this.editorChangedPathArg(changedPath, cfg.projectRoot));
+    if (!usePersistentBridge && changedPathArgs.length > 32) {
       const listDir = path.join(cfg.projectRoot, ".renium", "editor-push-paths");
       fs.mkdirSync(listDir, { recursive: true });
       changedPathsFile = path.join(
@@ -6980,7 +10141,7 @@ class RobloxSyncController {
       .map((value) => String(value).trim())
       .filter((value) => value.length > 0);
     const uniqueTargetSettingsIds = [...new Set(targetSettingsIds)];
-    if (uniqueTargetSettingsIds.length > 128) {
+    if (!usePersistentBridge && uniqueTargetSettingsIds.length > 128) {
       const listDir = path.join(cfg.projectRoot, ".renium", "editor-push-paths");
       fs.mkdirSync(listDir, { recursive: true });
       targetIdsFile = path.join(
@@ -7007,46 +10168,56 @@ class RobloxSyncController {
       args.push("-u");
     }
 
-    const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
-
     try {
-      const maxAttempts = 2;
-      let result: CommandRunResult | undefined;
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        if (usePersistentBridge) {
-          result = await this.runDaemonCommand(
+      const parameters = {
+        bridgeWaitSeconds,
+        bridgePorts: cfg.bridgePorts,
+        changedPaths: changedPathArgs,
+        targetSettingsIds: uniqueTargetSettingsIds,
+        targetProperties: [...new Set(targetProperties)],
+        verifySources,
+        upsertInstancesOnly: options.upsertInstancesOnly === true,
+        overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
+        ...(cfg.linkSync.cacheDir.length > 0 ? { linkCacheDir: cfg.linkSync.cacheDir } : {}),
+        destructive: options.fullSync === true,
+      };
+      const result = usePersistentBridge
+        ? options.fullSync === true
+          ? await this.runReviewedAutomationOperation(
             command,
-            args.slice(1),
             cfg,
-            attempt === 1 ? "editor-push" : `editor-push-retry-${attempt}`,
-            "push",
+            "editor-push",
+            AUTOMATION_OP.push,
+            parameters,
             { quietWait: true },
-          );
-        } else {
-          result = await this.runCommand(
+          )
+          : await this.runAutomationOperation(
             command,
-            args,
-            cfg.projectRoot,
-            attempt === 1 ? "editor-push" : `editor-push-retry-${attempt}`,
-            cfg.progressHeartbeatSeconds,
-            { quietLog: true },
-          );
-        }
-        if (result.code === 0) {
-          break;
-        }
-        if (attempt >= maxAttempts || !isTransientBridgeFailure(result.output)) {
-          break;
-        }
-        await sleep(250);
-      }
+            cfg,
+            "editor-push",
+            AUTOMATION_OP.push,
+            parameters,
+            { quietWait: true },
+          )
+        : await this.runCommand(
+          command,
+          this.withPlaceSelector(cfg, args),
+          cfg.projectRoot,
+          "editor-push",
+          cfg.progressHeartbeatSeconds,
+          { quietLog: true },
+        );
 
-      if (!result || result.code !== 0) {
-        throw new Error(`Editor push exited with code ${result?.code ?? "unknown"}`);
+      if (result.code !== 0) {
+        throw new Error(result.automationError?.m ?? `Editor push exited with code ${result.code}`);
       }
-      const summary = this.parseEditorPushSummary(result.output);
+      const summary = this.parseEditorPushSummary(result.output, result.result);
       if (!summary) {
         throw new Error("Editor push did not return a Studio apply result.");
+      }
+      if (summary.skippedByReview === true) {
+        this.output.appendLine("[renium] editor push was skipped in Studio and remains pending");
+        return "skipped";
       }
       const sourceVerified = this.summaryNumber(summary, "sourceVerified");
       const sourceVerifyFailed = this.summaryNumber(summary, "sourceVerifyFailed");
@@ -7063,10 +10234,10 @@ class RobloxSyncController {
       }
       if (summary.ok === false || sourceVerifyFailed > 0) {
         const detail = Array.isArray(summary.sourceVerifyErrors) ? ` ${summary.sourceVerifyErrors.join("; ")}` : "";
-        this.output.appendLine(`[renium] editor push verification warning:${detail || " Studio reported a source verification mismatch after apply."}`);
+        throw new Error(`Studio reported a failed editor push.${detail}`);
       }
       if (summary.ok !== false && errors === 0 && sourceVerifyFailed === 0) {
-        this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
+        await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
         await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
       }
 
@@ -7076,6 +10247,7 @@ class RobloxSyncController {
           `[renium] editor push verification warning: verified ${sourceVerified}/${existingSourceSaves} saved Lua source file(s).`,
         );
       }
+      return "applied";
     } finally {
       if (changedPathsFile) {
         try {
@@ -7092,7 +10264,10 @@ class RobloxSyncController {
     }
   }
 
-  private parseEditorPushSummary(output: string): Record<string, unknown> | undefined {
+  private parseEditorPushSummary(output: string, daemonResult?: unknown): Record<string, unknown> | undefined {
+    if (daemonResult && typeof daemonResult === "object" && !Array.isArray(daemonResult)) {
+      return daemonResult as Record<string, unknown>;
+    }
     const prefix = "__ROBLOX_SYNC_EDITOR_PUSH_RESULT__ ";
     let found: Record<string, unknown> | undefined;
     for (const rawLine of output.replace(/\r\n/g, "\n").split("\n")) {
@@ -7157,17 +10332,11 @@ class RobloxSyncController {
 
   private parseStudioChangeState(output: string): StudioChangeState | undefined {
     const prefix = "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ ";
-    const daemonResultPrefix = "__ROBLOX_SYNC_DAEMON_RESULT__ ";
     let found: StudioChangeState | undefined;
     for (const rawLine of output.replace(/\r\n/g, "\n").split("\n")) {
       const line = rawLine.trim();
       const index = line.indexOf(prefix);
-      const daemonIndex = line.indexOf(daemonResultPrefix);
-      const payload = index >= 0
-        ? line.slice(index + prefix.length)
-        : daemonIndex >= 0
-          ? line.slice(daemonIndex + daemonResultPrefix.length)
-          : undefined;
+      const payload = index >= 0 ? line.slice(index + prefix.length) : undefined;
       if (!payload) {
         continue;
       }
@@ -7210,6 +10379,7 @@ class RobloxSyncController {
       || Array.isArray(record.fullSyncServices)
       || Array.isArray(record.propertyChanges)
       || Array.isArray(record.changes)
+      || Array.isArray(record.editorActions)
       || typeof record.tracking === "boolean"
       || typeof record.seq === "number"
       || typeof record.trackedServices === "number"
@@ -7250,11 +10420,26 @@ class RobloxSyncController {
             seq: typeof value.seq === "number" ? value.seq : undefined,
           }))
         : undefined,
+      editorActions: Array.isArray(record.editorActions)
+        ? record.editorActions
+          .filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
+          .map((value) => ({
+            id: typeof value.id === "string" ? value.id : undefined,
+            type: typeof value.type === "string" ? value.type : undefined,
+            service: typeof value.service === "string" ? value.service : undefined,
+            settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
+            pathSegments: Array.isArray(value.pathSegments) ? value.pathSegments.map(String) : undefined,
+            pathOrdinals: Array.isArray(value.pathOrdinals)
+              ? value.pathOrdinals.map((entry) => Number(entry))
+              : undefined,
+          }))
+        : undefined,
       changes: Array.isArray(record.changes)
         ? record.changes
           .filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
           .map((value) => ({
             service: typeof value.service === "string" ? value.service : undefined,
+            settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
             action: typeof value.action === "string" ? value.action : undefined,
             reason: typeof value.reason === "string" ? value.reason : undefined,
             className: typeof value.className === "string" ? value.className : undefined,
@@ -7280,6 +10465,9 @@ class RobloxSyncController {
       twoWaySyncEnabled: typeof record.twoWaySyncEnabled === "boolean" ? record.twoWaySyncEnabled : undefined,
       runtimeSettings: record.runtimeSettings && typeof record.runtimeSettings === "object" && !Array.isArray(record.runtimeSettings)
         ? record.runtimeSettings as Record<string, unknown>
+        : undefined,
+      explicitRuntimeSettings: record.explicitRuntimeSettings && typeof record.explicitRuntimeSettings === "object" && !Array.isArray(record.explicitRuntimeSettings)
+        ? record.explicitRuntimeSettings as Record<string, unknown>
         : undefined,
     };
   }
@@ -7312,8 +10500,149 @@ class RobloxSyncController {
   }
 
   public onConfigurationChanged(event?: vscode.ConfigurationChangeEvent): void {
+    const apply = this.configurationChangeQueue.then(() => this.applyConfigurationChanged(event));
+    this.configurationChangeQueue = apply.catch(() => undefined);
+    void apply.catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[renium] configuration reload failed: ${message}`);
+      void vscode.window.showErrorMessage(`Could not reload Renium configuration. ${message}`);
+    });
+  }
+
+  private async applyConfigurationChanged(event?: vscode.ConfigurationChangeEvent): Promise<void> {
     const cfg = this.getConfig();
     const editorLiveSyncChanged = event?.affectsConfiguration("renium.editorLiveSyncEnabled") === true;
+    const projectRootChanged = event?.affectsConfiguration("renium.projectRoot") === true;
+    if (projectRootChanged) {
+      const previousRoot = this.configuredProjectRoot;
+      if (
+        previousRoot !== undefined
+        && this.normalizePathForCompare(previousRoot) === this.normalizePathForCompare(cfg.projectRoot)
+      ) {
+        this.configuredProjectRoot = cfg.projectRoot;
+        this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
+      } else {
+        const previousConfiguration = this.projectRootConfigurationSnapshot;
+        const previousState: ExperienceChangeSnapshot = {
+          projectRoot: previousRoot,
+          pendingEditorPaths: [...this.pendingEditorPaths],
+          blockedStudioImportServices: [...this.blockedStudioImportServices],
+          pendingEditorServicesByPath: [...this.pendingEditorServicesByPath]
+            .map(([filePath, services]) => [filePath, [...services]]),
+          studioSnapshotFingerprintByService: [...this.studioSnapshotFingerprintByService],
+          pendingLinkPackageSourcePaths: [...this.pendingLinkPackageSourcePaths],
+        };
+        const resumeLiveSync = !!(
+          this.liveSyncWatcher
+          || this.liveSyncStartPromise
+          || this.editorLiveSyncRuntimeEnabled
+        );
+        this.experienceChangeInProgress = true;
+        let explorerPrepared = false;
+        try {
+          await this.queue.catch(() => undefined);
+          this.experienceGeneration += 1;
+          await this.stopConsoleFollow();
+          await vscode.commands.executeCommand("renium.fileExplorer.prepareProjectSwitch");
+          explorerPrepared = true;
+          if (previousRoot) {
+            await terminateProcessesForOwner(projectProcessOwner(previousRoot));
+          }
+          await this.persistPendingEditorPaths(previousRoot);
+          if (this.liveSyncProjectRoot !== undefined) {
+            await this.disposeLiveSyncRuntime();
+          }
+          this.pendingEditorPaths.clear();
+          this.blockedStudioImportServices.clear();
+          this.pendingEditorServicesByPath.clear();
+          if (previousRoot) {
+            invalidateProjectSourceGraph(previousRoot);
+          }
+          invalidateProjectSourceGraph(cfg.projectRoot);
+          this.restorePendingEditorPaths(cfg.projectRoot);
+          this.configuredProjectRoot = cfg.projectRoot;
+          this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
+          this.sourcemapCache = undefined;
+          this.studioRuntimeSettings = undefined;
+          this.studioConflictPolicyOverride = undefined;
+          this.studioSnapshotFingerprintByService.clear();
+          this.conflictMarkerWarnedKeys.clear();
+          this.recentDirectSaveAtByPath.clear();
+          this.editorPushFailureStreak = 0;
+          this.linkStatusCache = undefined;
+          this.linkStatusInflight = undefined;
+          await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+          await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
+          explorerPrepared = false;
+          this.ensureAgentInstructions(cfg.experienceRoot);
+          let pendingPackageSource = false;
+          for (const pending of this.pendingLinkPackageSourcePaths.values()) {
+            if (
+              this.normalizePathForCompare(pending.projectRoot)
+              === this.normalizePathForCompare(cfg.projectRoot)
+            ) {
+              pending.generation = this.experienceGeneration;
+              pendingPackageSource = true;
+            }
+          }
+          if (pendingPackageSource) {
+            this.scheduleLinkPackageSourceFlush(
+              cfg.projectRoot,
+              this.experienceGeneration,
+              1000,
+            );
+          }
+        } catch (error) {
+          await this.restoreProjectRootConfiguration(previousConfiguration);
+          this.configuredProjectRoot = previousRoot;
+          this.pendingEditorPaths = new Set(previousState.pendingEditorPaths);
+          this.blockedStudioImportServices = new Set(previousState.blockedStudioImportServices);
+          this.pendingEditorServicesByPath = new Map(
+            previousState.pendingEditorServicesByPath
+              .map(([filePath, services]) => [filePath, new Set(services)]),
+          );
+          this.studioSnapshotFingerprintByService = new Map(previousState.studioSnapshotFingerprintByService);
+          this.pendingLinkPackageSourcePaths.clear();
+          for (const [filePath, pending] of previousState.pendingLinkPackageSourcePaths) {
+            this.pendingLinkPackageSourcePaths.set(filePath, {
+              projectRoot: previousRoot ?? pending.projectRoot,
+              generation: this.experienceGeneration,
+            });
+          }
+          this.liveSyncProjectRoot = previousRoot;
+          this.sourcemapCache = undefined;
+          this.studioRuntimeSettings = undefined;
+          this.studioConflictPolicyOverride = undefined;
+          this.linkStatusCache = undefined;
+          this.linkStatusInflight = undefined;
+          if (previousRoot) {
+            invalidateProjectSourceGraph(previousRoot);
+          }
+          if (explorerPrepared) {
+            await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
+            explorerPrepared = false;
+          } else {
+            await vscode.commands.executeCommand("renium.fileExplorer.cancelProjectSwitch");
+          }
+          await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+          if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
+            await this.serve({ silent: true, bestEffort: true });
+          }
+          if (resumeLiveSync) {
+            await this.startLiveSync({ silent: true, bestEffort: true });
+          }
+          if (this.pendingLinkPackageSourcePaths.size > 0 && previousRoot) {
+            this.scheduleLinkPackageSourceFlush(previousRoot, this.experienceGeneration);
+          }
+          throw error;
+        } finally {
+          if (explorerPrepared) {
+            await vscode.commands.executeCommand("renium.fileExplorer.cancelProjectSwitch");
+          }
+          this.experienceChangeInProgress = false;
+        }
+      }
+    }
     const bridgeConfigChanged = !event || [
       "renium.exportCliPath",
       "renium.projectRoot",
@@ -7323,8 +10652,11 @@ class RobloxSyncController {
     ].some((key) => event.affectsConfiguration(key));
     const persistentBridgeChanged = event?.affectsConfiguration("renium.usePersistentBridge") === true;
 
+    if (bridgeConfigChanged) {
+      await this.stopConsoleFollow();
+    }
     if (bridgeConfigChanged || (persistentBridgeChanged && !this.bridgeServeRequested)) {
-      this.stopBridgeDaemon();
+      await this.stopBridgeDaemon();
       if (this.bridgeServeRequested) {
         void this.serve({ silent: true, bestEffort: true });
       } else if (cfg.editorLiveSyncEnabled && this.liveSyncWatcher && this.shouldUsePersistentBridge(cfg)) {
@@ -7332,23 +10664,35 @@ class RobloxSyncController {
       }
     }
     if (!cfg.editorLiveSyncEnabled && this.liveSyncWatcher) {
-      this.disposeLiveSyncRuntime();
+      await this.disposeLiveSyncRuntime();
       if (!this.bridgeServeRequested) {
-        this.stopBridgeDaemon();
+        await this.stopBridgeDaemon();
       }
     }
-    if (editorLiveSyncChanged && cfg.editorLiveSyncEnabled && !this.liveSyncWatcher && !this.liveSyncStartPromise) {
+    if (
+      (editorLiveSyncChanged || projectRootChanged) &&
+      cfg.editorLiveSyncEnabled &&
+      !this.liveSyncWatcher &&
+      !this.liveSyncStartPromise
+    ) {
       void this.startLiveSync({ silent: true, bestEffort: true });
     }
     if (cfg.editorLiveSyncEnabled && this.liveSyncWatcher && !this.liveSyncStartupInProgress) {
       if (cfg.studioLiveSyncEnabled) {
         void this.startStudioLiveSyncRuntime(cfg, { bestEffort: true });
       } else {
-        this.stopStudioLiveSyncRuntime();
+        await this.stopStudioLiveSyncRuntime();
       }
     }
     if (!event || event.affectsConfiguration("renium.gitSync") || event.affectsConfiguration("renium.projectRoot")) {
       void this.refreshGitView();
+    }
+    if (
+      !event
+      || event.affectsConfiguration("renium.link")
+      || event.affectsConfiguration("renium.projectRoot")
+    ) {
+      this.invalidateLinkStatusCache();
     }
     this.updateStatusBar();
   }
@@ -7383,11 +10727,19 @@ class RobloxSyncController {
     await cfg.update("autoSyncOnSave", !enabled, vscode.ConfigurationTarget.Workspace);
 
     this.updateStatusBar();
-    vscode.window.showInformationMessage(`Renium: auto sync on save ${!enabled ? "enabled" : "disabled"}.`);
+    vscode.window.showInformationMessage(`Auto sync on save ${!enabled ? "enabled" : "disabled"}.`);
   }
 
   private async enqueue(taskName: string, task: () => Promise<void>): Promise<void> {
+    if (this.experienceChangeInProgress) {
+      void vscode.window.showWarningMessage("Wait for the place change to finish.");
+      return;
+    }
+    const generation = this.experienceGeneration;
     const run = async (): Promise<void> => {
+      if (generation !== this.experienceGeneration || this.experienceChangeInProgress) {
+        return;
+      }
       try {
         this.setActiveTask(taskName);
         await task();
@@ -7395,7 +10747,7 @@ class RobloxSyncController {
         const message = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[renium] task failed: ${taskName}: ${message}`);
         this.output.show(true);
-        vscode.window.showErrorMessage(`Renium: ${taskName} failed. ${message}`);
+        vscode.window.showErrorMessage(`${taskName} failed. ${message}`);
         throw err;
       } finally {
         this.setActiveTask(undefined);
@@ -7414,6 +10766,7 @@ class RobloxSyncController {
     reason: string;
     quietTimings?: boolean;
     quietLog?: boolean;
+    destructive?: boolean;
     configOverrides?: Partial<Pick<SyncConfig, "modifiedDefaultBypass">>;
   }): Promise<CommandRunResult> {
     const cfg = {
@@ -7430,6 +10783,7 @@ class RobloxSyncController {
       options.quietTimings !== false,
     );
     const usePersistentBridge = this.shouldUsePersistentBridge(cfg);
+    const directArgs = this.withPlaceSelector(cfg, args);
 
     const quietLog = options.quietLog === true;
     if (!quietLog) {
@@ -7439,49 +10793,56 @@ class RobloxSyncController {
         this.output.appendLine(
           `[renium] export daemon command: ${command} bd -w ${Math.max(1, cfg.bridgeWaitSeconds)} -P ${cfg.bridgePorts}`,
         );
-        this.output.appendLine(`[renium] export daemon request: x ${this.renderArgs(args.slice(1))}`);
+        this.output.appendLine(`[renium] automation operation: ${options.runImport ? "pull" : "export-snapshots"}`);
       } else {
-        this.output.appendLine(`[renium] export command: ${command} ${this.renderArgs(args)}`);
+        this.output.appendLine(`[renium] export command: ${command} ${this.renderArgs(directArgs)}`);
       }
     }
 
-    const maxAttempts = 3;
-    let result: CommandRunResult | undefined;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      if (usePersistentBridge) {
-        result = await this.runDaemonExport(
+    const operation = options.runImport ? AUTOMATION_OP.pull : AUTOMATION_OP.exportSnapshots;
+    const parameters = {
+      services: selectedServices,
+      snapshotDir: cfg.snapshotDir,
+      bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+      bridgePorts: cfg.bridgePorts,
+      performanceMode: cfg.performanceMode,
+      modifiedDefaultBypass: cfg.modifiedDefaultBypass,
+      chunkSize: Math.max(512, cfg.chunkSize),
+      sourceWorkers: Math.max(0, cfg.sourceWorkers),
+      instanceWorkers: Math.max(0, cfg.instanceWorkers),
+      importWorkers: Math.max(0, cfg.importWorkers),
+      adaptiveThrottle: cfg.adaptiveThrottle,
+      noUpdateEditorIcons: cfg.noUpdateEditorIcons,
+      destructive: options.destructive === true,
+    };
+    const result = usePersistentBridge
+      ? options.destructive === true
+        ? await this.runReviewedAutomationOperation(
           command,
-          args.slice(1),
           cfg,
-          attempt === 1 ? "export" : `export-retry-${attempt}`,
+          "pull",
+          operation,
+          parameters,
           { quietWait: quietLog },
-        );
-      } else {
-        result = await this.runCommand(
+        )
+        : await this.runAutomationOperation(
           command,
-          args,
-          cfg.projectRoot,
-          attempt === 1 ? "export" : `export-retry-${attempt}`,
-          cfg.progressHeartbeatSeconds,
-          { quietLog },
-        );
-      }
-      if (result.code === 0) {
-        break;
-      }
-      if (attempt >= maxAttempts || !isTransientBridgeFailure(result.output)) {
-        break;
-      }
-      const retryDelayMs = attempt === 1 ? 250 : 500;
-      if (!quietLog) {
-        this.output.appendLine(
-          `[renium] export: transient bridge failure; retrying attempt ${attempt + 1}/${maxAttempts} after ${retryDelayMs}ms`,
-        );
-      }
-      await sleep(retryDelayMs);
-    }
-    if (!result || result.code !== 0) {
-      throw new Error(`Export exited with code ${result?.code ?? "unknown"}`);
+          cfg,
+          "export",
+          operation,
+          parameters,
+          { quietWait: quietLog },
+        )
+      : await this.runCommand(
+        command,
+        directArgs,
+        cfg.projectRoot,
+        "export",
+        cfg.progressHeartbeatSeconds,
+        { quietLog },
+      );
+    if (result.code !== 0) {
+      throw new Error(result.automationError?.m ?? `Export exited with code ${result.code}`);
     }
 
     if (options.runImport && options.notifyOnSuccess) {
@@ -7492,7 +10853,7 @@ class RobloxSyncController {
     }
 
     if (options.notifyOnSuccess && options.reason) {
-      vscode.window.showInformationMessage(`Renium: ${options.reason}.`);
+      vscode.window.showInformationMessage(`${options.reason}.`);
     }
     return result;
   }
@@ -7515,25 +10876,95 @@ class RobloxSyncController {
     });
   }
 
-  private async runDaemonExport(
+  private async runAutomationOperation(
     command: string,
-    args: string[],
     cfg: SyncConfig,
     label: string,
-    options: { quietWait?: boolean } = {},
-  ): Promise<CommandRunResult> {
-    return await this.runDaemonCommand(command, args, cfg, label, "x", options);
-  }
-
-  private async runDaemonCommand(
-    command: string,
-    args: string[],
-    cfg: SyncConfig,
-    label: string,
-    daemonCommand: string,
+    op: number,
+    parameters: Record<string, unknown>,
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensureBridgeDaemon(command, cfg, { serve: this.bridgeServeRequested });
+    const contextId = await this.ensureDaemonContext(command, cfg);
+    return await this.sendAutomationRequest(cfg, label, op, contextId, parameters, options);
+  }
+
+  private async runReviewedAutomationOperation(
+    command: string,
+    cfg: SyncConfig,
+    label: string,
+    op: number,
+    parameters: Record<string, unknown>,
+    options: { quietWait?: boolean; timeoutMs?: number } = {},
+  ): Promise<CommandRunResult> {
+    await this.ensureBridgeDaemon(command, cfg, { serve: this.bridgeServeRequested });
+    const contextId = await this.ensureDaemonContext(command, cfg);
+    const prepared = await this.sendAutomationRequest(
+      cfg,
+      `${label}-review`,
+      AUTOMATION_OP.reviewPrepare,
+      contextId,
+      { op, p: parameters },
+      { ...options, quietWait: true },
+    );
+    if (prepared.code !== 0) {
+      return prepared;
+    }
+    const result = prepared.result as Record<string, unknown> | undefined;
+    const reviewId = typeof result?.reviewId === "string" ? result.reviewId : undefined;
+    if (!reviewId) {
+      return { code: 1, output: "Review preparation did not return reviewId." };
+    }
+    return await this.sendAutomationRequest(
+      cfg,
+      label,
+      AUTOMATION_OP.reviewApply,
+      contextId,
+      { reviewId },
+      options,
+    );
+  }
+
+  private async ensureDaemonContext(command: string, cfg: SyncConfig): Promise<number> {
+    const key = JSON.stringify({
+      projectRoot: path.resolve(cfg.projectRoot),
+      place: cfg.placeSelector ?? "",
+      daemon: this.daemonKeyValue ?? "",
+    });
+    if (this.daemonContext?.key === key) {
+      return this.daemonContext.id;
+    }
+    const bound = await this.sendAutomationRequest(
+      cfg,
+      "bind",
+      AUTOMATION_OP.bind,
+      undefined,
+      { root: cfg.projectRoot, place: cfg.placeSelector },
+      { quietWait: true, timeoutMs: 2_000 },
+    );
+    if (bound.code !== 0) {
+      throw new Error(bound.automationError?.m ?? "Renium could not bind this project.");
+    }
+    const result = bound.result as Record<string, unknown> | undefined;
+    const id = Number(result?.id);
+    if (!Number.isSafeInteger(id) || id < 1) {
+      throw new Error("Renium bind response omitted the context ID.");
+    }
+    if (typeof result?.runtimeId === "string" && result.runtimeId.length > 0) {
+      this.daemonContext = { key, id };
+    }
+    void command;
+    return id;
+  }
+
+  private async sendAutomationRequest(
+    cfg: SyncConfig,
+    label: string,
+    op: number,
+    contextId: number | undefined,
+    parameters: Record<string, unknown>,
+    options: { quietWait?: boolean; timeoutMs?: number } = {},
+  ): Promise<CommandRunResult> {
 
     return await new Promise<CommandRunResult>((resolve, reject) => {
       const proc = this.daemonProcess;
@@ -7572,7 +11003,7 @@ class RobloxSyncController {
         }, heartbeatMs);
       }
 
-      const timeoutMs = this.daemonRequestTimeoutMs(cfg, daemonCommand, options.timeoutMs);
+      const timeoutMs = this.daemonRequestTimeoutMs(cfg, op, options.timeoutMs);
       pending.timeoutTimer = setTimeout(() => {
         if (!this.daemonPending.has(id)) {
           return;
@@ -7580,45 +11011,53 @@ class RobloxSyncController {
         const timeoutMessage = `[renium] ${label}: daemon request timed out after ${Math.round(timeoutMs / 1000)}s; restarting the bridge daemon.\n`;
         this.output.appendLine(timeoutMessage.trim());
         this.finishDaemonRequest(id, { code: 124, output: pending.output + `\n${timeoutMessage}` });
-        this.stopBridgeDaemon(new Error(`Persistent bridge daemon request timed out (${label}).`));
+        void this.stopBridgeDaemon(new Error(`Persistent bridge daemon request timed out (${label}).`));
       }, timeoutMs);
 
       this.daemonPending.set(id, pending);
       const request = JSON.stringify({
+        v: 1,
         id,
-        command: daemonCommand,
-        args,
+        op,
+        ...(contextId === undefined ? {} : { cx: contextId }),
+        p: parameters,
       }) + "\n";
 
-      proc.stdin.write(request, "utf8", (err) => {
-        if (err) {
+      const writeFailed = (): void => {
+        if (this.daemonPending.has(id)) {
           this.finishDaemonRequest(id, {
             code: 1,
-            output: pending.output + `\n[renium] daemon request write failed: ${err.message}`,
+            output: pending.output + "\nThe daemon transport closed before the request was written.",
           });
         }
-      });
+        void this.stopBridgeDaemon(new Error("Persistent bridge daemon transport closed."));
+      };
+      try {
+        proc.stdin.write(request, "utf8", (error) => {
+          if (error) {
+            writeFailed();
+          }
+        });
+      } catch {
+        writeFailed();
+      }
     });
   }
 
   private shouldUsePersistentBridge(cfg: SyncConfig): boolean {
-    return cfg.transport === "ws" && (cfg.usePersistentBridge || this.bridgeServeRequested);
+    return cfg.transport === "ws";
   }
 
   private shouldUsePersistentBridgeForEditorPush(cfg: SyncConfig): boolean {
-    return cfg.transport === "ws" && (
-      this.bridgeServeRequested ||
-      (cfg.editorLiveSyncEnabled && this.liveSyncWatcher !== undefined) ||
-      (cfg.usePersistentBridge && this.isBridgeDaemonRunning())
-    );
+    return cfg.transport === "ws";
   }
 
   private editorBridgeWaitSeconds(cfg: SyncConfig): number {
     return Math.max(1, Math.min(2, Number(cfg.bridgeWaitSeconds) || 2));
   }
 
-  private daemonRequestTimeoutMs(cfg: SyncConfig, daemonCommand: string, requestedTimeoutMs?: number): number {
-    if (daemonCommand === "wait-for-channels") {
+  private daemonRequestTimeoutMs(cfg: SyncConfig, op: number, requestedTimeoutMs?: number): number {
+    if (op === AUTOMATION_OP.liveStatus) {
       const bridgeWaitMs = (Math.max(1, Number(cfg.bridgeWaitSeconds) || 1) + 3) * 1000;
       return Math.max(5_000, Math.min(DAEMON_CHANNEL_WAIT_MAX_MS, bridgeWaitMs));
     }
@@ -7629,18 +11068,21 @@ class RobloxSyncController {
   }
 
   private isBridgeDaemonRunning(): boolean {
-    return !!this.daemonProcess && !this.daemonProcess.killed;
+    return !!this.daemonProcess
+      && !this.daemonProcess.killed
+      && this.daemonProcess.exitCode === null
+      && this.daemonProcess.signalCode === null;
   }
 
   private async ensureBridgeDaemon(command: string, cfg: SyncConfig, options: { serve?: boolean } = {}): Promise<void> {
     this.ensureFileExists(command);
     const key = this.daemonKey(command, cfg, options.serve === true);
-    if (this.daemonProcess && !this.daemonProcess.killed && this.daemonKeyValue === key) {
+    if (this.isBridgeDaemonRunning() && this.daemonKeyValue === key) {
       await this.awaitBridgeDaemonReady(cfg);
       return;
     }
 
-    this.stopBridgeDaemon();
+    await this.stopBridgeDaemon();
 
     const args = [
       "bd",
@@ -7650,16 +11092,18 @@ class RobloxSyncController {
       cfg.bridgePorts,
       "--parent-pid",
       String(process.pid),
-	  options.serve ? "" : "--editor-stdio",
-    ].filter((value) => value.length > 0);
+      "--editor-stdio",
+    ];
 
     const child = childProcess.spawn(command, args, {
       cwd: cfg.projectRoot,
       env: process.env,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: "pipe",
       windowsHide: true,
     });
+    this.daemonClosePromise = trackProcess(child, projectProcessOwner(cfg.projectRoot));
 
     this.daemonProcess = child;
     this.daemonKeyValue = key;
@@ -7668,6 +11112,12 @@ class RobloxSyncController {
     this.daemonReadyPromise = new Promise<void>((resolve, reject) => {
       this.daemonReadyResolve = resolve;
       this.daemonReadyReject = reject;
+    });
+    child.once("spawn", () => {
+      this.daemonReady = true;
+      this.daemonReadyResolve?.();
+      this.daemonReadyResolve = undefined;
+      this.daemonReadyReject = undefined;
     });
     child.stdout.on("data", (data: Buffer | string) => {
       this.handleDaemonOutput(command, data, false);
@@ -7687,16 +11137,8 @@ class RobloxSyncController {
       }
       this.daemonReadyReject?.(exitError);
       this.rejectDaemonPending(exitError);
-      if (this.daemonProcess === child) {
-        this.daemonProcess = undefined;
-        this.daemonKeyValue = undefined;
-        this.daemonOutputBuffer = "";
-        this.daemonReady = false;
-        this.daemonReadyPromise = undefined;
-        this.daemonReadyResolve = undefined;
-        this.daemonReadyReject = undefined;
-      }
     });
+    child.on("close", () => this.clearBridgeDaemonProcess(child));
 
     await this.awaitBridgeDaemonReady(cfg);
   }
@@ -7726,7 +11168,7 @@ class RobloxSyncController {
       ]);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      this.stopBridgeDaemon(error);
+      await this.stopBridgeDaemon(error);
       throw error;
     } finally {
       if (timeoutHandle) {
@@ -7738,7 +11180,7 @@ class RobloxSyncController {
   private handleDaemonOutput(prefix: string, data: Buffer | string, isStderr: boolean): void {
     const text = data.toString();
     const hasQuietPending = Array.from(this.daemonPending.values()).some((pending) => pending.quiet);
-    if (!hasQuietPending) {
+    if (isStderr && !hasQuietPending) {
       this.output.append(this.prefixOutput(prefix, data));
     }
 
@@ -7751,7 +11193,7 @@ class RobloxSyncController {
     if (this.daemonOutputBuffer.length > MAX_DAEMON_OUTPUT_BUFFER_BYTES) {
       const error = new Error("Persistent bridge daemon emitted more than 1 MiB without a complete protocol line.");
       this.output.appendLine(`[renium] bridge daemon protocol error: ${error.message}`);
-      this.stopBridgeDaemon(error);
+      void this.stopBridgeDaemon(error);
       return;
     }
     let newlineIndex = this.daemonOutputBuffer.indexOf("\n");
@@ -7759,8 +11201,8 @@ class RobloxSyncController {
       const rawLine = this.daemonOutputBuffer.slice(0, newlineIndex + 1);
       const line = this.daemonOutputBuffer.slice(0, newlineIndex).replace(/\r$/, "");
       this.daemonOutputBuffer = this.daemonOutputBuffer.slice(newlineIndex + 1);
-      this.appendDaemonOutputToActiveRequest(rawLine);
       this.processDaemonLine(line);
+      void rawLine;
       newlineIndex = this.daemonOutputBuffer.indexOf("\n");
     }
   }
@@ -7779,43 +11221,39 @@ class RobloxSyncController {
   }
 
   private processDaemonLine(line: string): void {
-    const readyPrefix = "__ROBLOX_SYNC_DAEMON_READY__ ";
-    if (line.startsWith(readyPrefix)) {
-      this.daemonReady = true;
-      this.daemonReadyResolve?.();
-      this.daemonReadyResolve = undefined;
-      this.daemonReadyReject = undefined;
-      return;
-    }
-
-    const resultPrefix = "__ROBLOX_SYNC_DAEMON_RESULT__ ";
-    if (!line.startsWith(resultPrefix)) {
-      return;
-    }
-
-    let payload: unknown;
+    let payload: AutomationResponse;
     try {
-      payload = JSON.parse(line.slice(resultPrefix.length));
+      payload = JSON.parse(line) as AutomationResponse;
     } catch (err) {
       this.output.appendLine(
-        `[renium] bridge daemon: invalid result sentinel: ${err instanceof Error ? err.message : String(err)}`,
+        `[renium] bridge daemon returned invalid protocol JSON: ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
-
-    const record = payload as Record<string, unknown>;
-    const id = Number(record.id ?? 0);
-    const code = Number(record.code ?? (record.ok ? 0 : 1));
+    if (payload.v !== 1 || (payload.ok !== 0 && payload.ok !== 1)) {
+      this.output.appendLine("[renium] bridge daemon returned an incompatible protocol response.");
+      return;
+    }
+    const id = Number(payload.id ?? 0);
+    const code = payload.ok === 1 ? 0 : 1;
     const pending = this.daemonPending.get(id);
     if (!pending) {
       return;
     }
+    if (payload.e?.c === "stale_cx") {
+      this.daemonContext = undefined;
+    }
 
     let output = pending.output;
-    if (code !== 0 && record.error) {
-      output += `\n[renium] daemon request error: ${String(record.error)}\n`;
+    if (payload.e?.m) {
+      output += `\n${payload.e.m}\n`;
     }
-    this.finishDaemonRequest(id, { code, output });
+    this.finishDaemonRequest(id, {
+      code,
+      output,
+      result: payload.r,
+      automationError: payload.e,
+    });
   }
 
   private finishDaemonRequest(id: number, result: CommandRunResult): void {
@@ -7858,13 +11296,42 @@ class RobloxSyncController {
     }
 
     try {
-      const id = this.daemonRequestId++;
-      proc.stdin.write(JSON.stringify({ id, command: "shutdown", args: [] }) + "\n", "utf8");
+      proc.stdin.end();
     } catch {
     }
   }
 
-  private stopBridgeDaemon(reason = new Error("Persistent bridge daemon was stopped.")): void {
+  private clearBridgeDaemonProcess(proc: childProcess.ChildProcess): void {
+    if (this.daemonProcess !== proc) {
+      return;
+    }
+    this.daemonProcess = undefined;
+    this.daemonKeyValue = undefined;
+    this.daemonOutputBuffer = "";
+    this.daemonReady = false;
+    this.daemonReadyPromise = undefined;
+    this.daemonReadyResolve = undefined;
+    this.daemonReadyReject = undefined;
+    this.daemonClosePromise = undefined;
+    this.daemonContext = undefined;
+    this.studioEditorActionRuns.clear();
+  }
+
+  private stopBridgeDaemon(reason = new Error("Persistent bridge daemon was stopped.")): Promise<void> {
+    if (this.daemonStopPromise) {
+      return this.daemonStopPromise;
+    }
+    const stop = this.stopBridgeDaemonProcess(reason);
+    const tracked = stop.finally(() => {
+      if (this.daemonStopPromise === tracked) {
+        this.daemonStopPromise = undefined;
+      }
+    });
+    this.daemonStopPromise = tracked;
+    return tracked;
+  }
+
+  private async stopBridgeDaemonProcess(reason: Error): Promise<void> {
     const proc = this.daemonProcess;
     if (!proc) {
       this.rejectDaemonPending(reason);
@@ -7877,18 +11344,23 @@ class RobloxSyncController {
     }
 
     this.sendDaemonShutdown();
-    if (!proc.killed) {
-      proc.kill();
-    }
     this.daemonReadyReject?.(reason);
     this.rejectDaemonPending(reason);
-    this.daemonProcess = undefined;
-    this.daemonKeyValue = undefined;
-    this.daemonOutputBuffer = "";
-    this.daemonReady = false;
-    this.daemonReadyPromise = undefined;
-    this.daemonReadyResolve = undefined;
-    this.daemonReadyReject = undefined;
+    const closed = this.daemonClosePromise ?? trackProcess(
+      proc,
+      projectProcessOwner(this.configuredProjectRoot ?? this.context.extensionPath),
+    );
+    let closedGracefully = false;
+    await Promise.race([
+      closed.then(() => {
+        closedGracefully = true;
+      }),
+      sleep(500),
+    ]);
+    if (!closedGracefully) {
+      await terminateProcess(proc);
+    }
+    this.clearBridgeDaemonProcess(proc);
   }
 
   private resolveExportCommand(
@@ -7901,7 +11373,12 @@ class RobloxSyncController {
     const runImportFlag = requestedRunImport ? "-i" : "--no-import";
     const extraImportArgs: string[] = [];
     if (useRustImportInExporter) {
-      const importCliPath = resolveExistingRustCliPath(this.getWorkspaceRoot(), cfg.projectRoot, cfg.rustCliPath);
+      const importCliPath = resolveExistingRustCliPath(
+        this.getWorkspaceRoot(),
+        cfg.projectRoot,
+        cfg.rustCliPath,
+        this.context.extensionPath,
+      );
       this.ensureFileExists(importCliPath);
       extraImportArgs.push("--import-cli", importCliPath);
     }
@@ -7912,6 +11389,8 @@ class RobloxSyncController {
         "x",
         "-r",
         cfg.projectRoot,
+        "--src-dir",
+        cfg.srcDir,
         "-d",
         cfg.snapshotDir,
         "-t",
@@ -7955,35 +11434,35 @@ class RobloxSyncController {
   private resolveRustCliPathForCommand(cfg: SyncConfig, command: string): string {
     const workspaceRoot = this.getWorkspaceRoot();
     const roots = Array.from(new Set([workspaceRoot, cfg.projectRoot].map((value) => path.normalize(value))));
-    const pathCandidate = findExecutableOnPath(RUST_CLI_BINARY);
-    const fallbackCandidates = roots.flatMap((root) =>
-      RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => path.normalize(path.join(root, relativePath))),
-    );
-    const uniqueCandidates = Array.from(
-      new Set([
-        cfg.rustCliPath,
-        ...fallbackCandidates,
-        ...(pathCandidate ? [pathCandidate] : []),
-      ].map((candidate) => path.normalize(candidate))),
-    );
-    const configuredPath = path.normalize(cfg.rustCliPath);
-    const configuredIsDefaultCandidate = fallbackCandidates.includes(configuredPath);
-
-    if (!configuredIsDefaultCandidate && rustCliSupportsCommand(configuredPath, command)) {
-      return configuredPath;
-    }
-
-    const supportedCandidates = uniqueCandidates.filter((candidate) => rustCliSupportsCommand(candidate, command));
-    if (supportedCandidates.length === 0) {
-      return configuredPath;
-    }
-
-    supportedCandidates.sort((left, right) => {
-      const leftMtime = fs.existsSync(left) ? fs.statSync(left).mtimeMs : 0;
-      const rightMtime = fs.existsSync(right) ? fs.statSync(right).mtimeMs : 0;
-      return rightMtime - leftMtime;
+    const candidates = reniumCliCandidates({
+      configuredPath: cfg.rustCliPath,
+      extensionRoot: this.context.extensionPath,
+      roots,
+      fallbackRelativePaths: RUST_CLI_FALLBACK_RELATIVE_PATHS,
     });
-    return supportedCandidates[0];
+    void command;
+    return candidates.find((candidate) => fs.existsSync(candidate)) ?? cfg.rustCliPath;
+  }
+
+  public async detectedCliVersion(cliPath: string): Promise<string | undefined> {
+    const result = await this.runCommand(
+      cliPath,
+      ["--version"],
+      path.dirname(cliPath),
+      "CLI version check",
+      10,
+      { quietLog: true, timeoutMs: 5_000 },
+    );
+    if (result.code !== 0) {
+      return undefined;
+    }
+    return result.output.match(/(\d+\.\d+\.\d+)/)?.[1];
+  }
+
+  private withPlaceSelector(cfg: SyncConfig, args: string[]): string[] {
+    return cfg.placeSelector
+      ? ["--place", cfg.placeSelector, ...args]
+      : args;
   }
 
   private async runRustImport(
@@ -7991,16 +11470,25 @@ class RobloxSyncController {
     snapshotPath: string,
     services: string[],
     options: { quietLog?: boolean } = {},
-  ): Promise<void> {
-    const rustCliPath = resolveExistingRustCliPath(this.getWorkspaceRoot(), cfg.projectRoot, cfg.rustCliPath);
+  ): Promise<string[]> {
+    const rustCliPath = resolveExistingRustCliPath(
+      this.getWorkspaceRoot(),
+      cfg.projectRoot,
+      cfg.rustCliPath,
+      this.context.extensionPath,
+    );
     this.ensureFileExists(rustCliPath);
     const selectedServices = this.normalizeServices(services, cfg.services);
     const args = [
+      "--output-mode",
+      "json",
       "import-snapshots",
       "--snapshot-dir",
       snapshotPath,
       "--project-root",
       cfg.projectRoot,
+      "--src-dir",
+      cfg.srcDir,
       "--services",
       selectedServices.join(","),
       "--compact-meta-json",
@@ -8025,6 +11513,16 @@ class RobloxSyncController {
     if (result.code !== 0) {
       throw new Error(`Rust import exited with code ${result.code}`);
     }
+    const parsed = this.parseCliJsonObject<{ changedPaths?: unknown }>(result.output);
+    if (!parsed || !Array.isArray(parsed.changedPaths)) {
+      throw new Error("Rust import returned invalid structured output.");
+    }
+    return parsed.changedPaths.map((filePath) => {
+      if (typeof filePath !== "string") {
+        throw new Error("Rust import returned a non-string changed path.");
+      }
+      return path.resolve(cfg.projectRoot, filePath);
+    });
   }
 
   private resolveSnapshotPath(cfg: SyncConfig): string {
@@ -8050,6 +11548,7 @@ class RobloxSyncController {
       let sawOutput = false;
       let capturedOutput = "";
       let settled = false;
+      let timedOut = false;
       let heartbeatTimer: NodeJS.Timeout | undefined;
       let timeoutTimer: NodeJS.Timeout | undefined;
       let child: childProcess.ChildProcess;
@@ -8095,10 +11594,12 @@ class RobloxSyncController {
         child = childProcess.spawn(command, args, {
           cwd,
           env: process.env,
+          detached: process.platform !== "win32",
           shell: false,
           stdio: "pipe",
           windowsHide: true,
         });
+        trackProcess(child, projectProcessOwner(cwd));
       } catch (err) {
         fail(err instanceof Error ? err : new Error(String(err)));
         return;
@@ -8124,12 +11625,9 @@ class RobloxSyncController {
         }, heartbeatMs);
 
       timeoutTimer = setTimeout(() => {
+        timedOut = true;
         appendOutput(`\n[renium] ${label}: timed out after ${Math.round(timeoutMs / 1000)}s; terminating the process.\n`);
-        try {
-          child.kill();
-        } catch {
-        }
-        finish(124);
+        void terminateProcess(child).finally(() => finish(124));
       }, timeoutMs);
 
       this.bindProcessOutput(child, command, () => {
@@ -8143,7 +11641,7 @@ class RobloxSyncController {
         fail(err);
       });
       child.on("close", (code) => {
-        finish(code ?? 0);
+        finish(timedOut ? 124 : code ?? 130);
       });
     });
   }
@@ -8220,196 +11718,246 @@ class RobloxSyncController {
     return { cliPath: cfg.exportCliPath, cwd: cfg.projectRoot };
   }
 
+  private explicitConfigValue<T>(cfg: vscode.WorkspaceConfiguration, key: string): T | undefined {
+    const inspected = cfg.inspect<T>(key);
+    return inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
+  }
+
+  private mergedConfigValue<T>(
+    cfg: vscode.WorkspaceConfiguration,
+    shared: SharedConfig,
+    key: string,
+    defaultValue: T,
+  ): T {
+    return this.explicitConfigValue<T>(cfg, key) ?? sharedConfigValue<T>(shared, key) ?? defaultValue;
+  }
+
   private getConfig(): SyncConfig {
     const root = this.getWorkspaceRoot();
-    const cfg = vscode.workspace.getConfiguration("renium");
+    const cfg = vscode.workspace.getConfiguration("renium", vscode.Uri.file(root));
 
-    const projectRoot = this.resolveConfigPath(cfg.get<string>("projectRoot", "${workspaceFolder}"), root);
+    const preliminaryShared = loadSharedConfig(root, root);
+    const projectRootSetting = this.mergedConfigValue(
+      cfg,
+      preliminaryShared,
+      "projectRoot",
+      "${workspaceFolder}",
+    );
+    const experienceRoot = this.resolveConfigPath(projectRootSetting, root);
+    if (!activeExperienceAlias(experienceRoot)) {
+      this.restoreActiveExperiencePlace(experienceRoot);
+    }
+    const activePlace = resolveActiveExperiencePlace(experienceRoot);
+    if (activePlace && activeExperienceAlias(experienceRoot) !== activePlace.alias) {
+      setActiveExperiencePlace(experienceRoot, activePlace.alias);
+    }
+    const projectRoot = activePlace?.projectRoot ?? experienceRoot;
+    const shared = loadSharedConfig(root, projectRoot);
+    const srcDir = loadProjectSourceRoot(projectRoot);
+    this.sharedConfig = shared;
+    const read = <T>(key: string, defaultValue: T): T =>
+      this.mergedConfigValue(cfg, shared, key, defaultValue);
     const configTomlPath = this.resolveConfigPath(
-      cfg.get<string>("configTomlPath", "${userHome}/.codex/config.toml"),
+      read("configTomlPath", "${userHome}/.codex/config.toml"),
       root,
     );
-    const configuredExportCliPath = this.resolveConfigPath(
-      cfg.get<string>("exportCliPath", "${workspaceFolder}/renium.exe"),
+    const configuredExportCliPathRaw = read("exportCliPath", "").trim();
+    const configuredExportCliPath = configuredExportCliPathRaw.length > 0
+      ? this.resolveConfigPath(configuredExportCliPathRaw, root)
+      : "";
+    const exportCliPath = resolveExistingRustCliPath(
       root,
+      projectRoot,
+      configuredExportCliPath,
+      this.context.extensionPath,
     );
-    const exportCliPath = resolveExistingRustCliPath(root, projectRoot, configuredExportCliPath);
 
-    const servicesRaw = cfg.get<string[]>("services", DEFAULT_SERVICES);
+    const servicesRaw = read<string[]>("services", DEFAULT_SERVICES);
     const services = (Array.isArray(servicesRaw) ? servicesRaw : DEFAULT_SERVICES)
       .map((s) => String(s).trim())
       .filter((s) => s.length > 0);
 
-    const transportRaw = cfg.get<string>("transport", "ws");
+    const transportRaw = read<string>("transport", "ws");
     const transport = transportRaw === "mcp" ? "mcp" : "ws";
 
-    const importModeRaw = cfg.get<string>("importMode", "direct");
+    const importModeRaw = read<string>("importMode", "direct");
     const importMode = importModeRaw === "snapshot" ? "snapshot" : "direct";
-    const performanceModeRaw = cfg.get<string>("performanceMode", "throughput");
+    const performanceModeRaw = read<string>("performanceMode", "throughput");
     const performanceMode =
       performanceModeRaw === "smooth"
         ? "smooth"
         : performanceModeRaw === "balanced"
           ? "balanced"
           : "throughput";
-    const modifiedDefaultBypass = cfg.get<boolean>("modifiedDefaultBypass", false) === true;
-    const wsWaitSeconds = this.getWsWaitSeconds(cfg);
-    const chunkSize = this.normalizeChunkSize(cfg);
-    const configuredRustCliPath = this.resolveConfigPath(
-      cfg.get<string>("rustCliPath", "${workspaceFolder}/renium.exe"),
+    const modifiedDefaultBypass = read<boolean>("modifiedDefaultBypass", false) === true;
+    const wsWaitSeconds = this.getWsWaitSeconds(cfg, shared);
+    const chunkSize = this.normalizeChunkSize(read("chunkSize", DEFAULT_CHUNK_SIZE));
+    const configuredRustCliPathRaw = read("rustCliPath", "").trim();
+    const configuredRustCliPath = configuredRustCliPathRaw.length > 0
+      ? this.resolveConfigPath(configuredRustCliPathRaw, root)
+      : "";
+    const rustCliPath = resolveExistingRustCliPath(
       root,
+      projectRoot,
+      configuredRustCliPath,
+      this.context.extensionPath,
     );
-    const rustCliPath = resolveExistingRustCliPath(root, projectRoot, configuredRustCliPath);
 
-    const gitStagePathsRaw = cfg.get<string[]>("gitSync.stagePaths", []);
+    const gitStagePathsRaw = read<string[]>("gitSync.stagePaths", []);
     const gitStagePaths = (Array.isArray(gitStagePathsRaw) ? gitStagePathsRaw : [])
       .map((value) => String(value).trim())
       .filter((value) => value.length > 0);
-    const gitRunFullSyncBeforePushRaw = cfg.get<string>("gitSync.runFullSyncBeforePush", "ask");
-    const gitRunFullSyncBeforePush = gitRunFullSyncBeforePushRaw === "always"
+    const gitPullFromStudioBeforePushRaw = read<string>("gitSync.pullFromStudioBeforePush", "ask");
+    const gitPullFromStudioBeforePush = gitPullFromStudioBeforePushRaw === "always"
       ? "always"
-      : gitRunFullSyncBeforePushRaw === "never"
+      : gitPullFromStudioBeforePushRaw === "never"
         ? "never"
         : "ask";
-    const gitStageModeRaw = cfg.get<string>("gitSync.stageMode", "tracked");
+    const gitStageModeRaw = read<string>("gitSync.stageMode", "tracked");
     const gitStageMode = gitStageModeRaw === "configuredPaths" ? "configuredPaths" : "tracked";
-    const gitApplyPulledChangesRaw = cfg.get<string>("gitSync.applyPulledChangesToStudio", "ask");
+    const gitApplyPulledChangesRaw = read<string>("gitSync.applyPulledChangesToStudio", "ask");
     const gitApplyPulledChangesToStudio = gitApplyPulledChangesRaw === "always"
       ? "always"
       : gitApplyPulledChangesRaw === "never"
         ? "never"
         : "ask";
-    const gitOutputBehaviorRaw = cfg.get<string>("gitSync.outputBehavior", "onStart");
+    const gitOutputBehaviorRaw = read<string>("gitSync.outputBehavior", "onStart");
     const gitOutputBehavior = gitOutputBehaviorRaw === "silent"
       ? "silent"
       : gitOutputBehaviorRaw === "onError"
         ? "onError"
         : "onStart";
-    const wallyApplyToStudioRaw = cfg.get<string>("wallySync.applyToStudio", "ask");
+    const wallyApplyToStudioRaw = read<string>("wallySync.applyToStudio", "ask");
     const wallyApplyToStudio = wallyApplyToStudioRaw === "always"
       ? "always"
       : wallyApplyToStudioRaw === "never"
         ? "never"
         : "ask";
-    const linkApplyToStudioRaw = cfg.get<string>("link.applyToStudio", "ask");
+    const linkApplyToStudioRaw = read<string>("link.applyToStudio", "ask");
     const linkApplyToStudio = linkApplyToStudioRaw === "always"
       ? "always"
       : linkApplyToStudioRaw === "never"
         ? "never"
         : "ask";
-    const initialSyncPriorityRaw = cfg.get<string>("liveSync.initialSyncPriority", "studio");
+    const initialSyncPriorityRaw = read<string>("liveSync.initialSyncPriority", "studio");
     const initialSyncPriority: InitialSyncPriority = initialSyncPriorityRaw === "editor"
       ? "editor"
       : initialSyncPriorityRaw === "none"
         ? "none"
         : "studio";
-    const displayPromptsRaw = cfg.get<string>("liveSync.displayPrompts", "always");
+    const displayPromptsRaw = read<string>("liveSync.displayPrompts", "always");
     const displayPrompts: DisplayPrompts = displayPromptsRaw === "initial"
       ? "initial"
       : displayPromptsRaw === "never"
         ? "never"
         : "always";
     const logLevel = this.configuredLogLevel();
+    const number = (
+      key: string,
+      defaultValue: number,
+      options: { min?: number; integer?: boolean } = {},
+    ): number => this.normalizeConfigNumber(read<unknown>(key, defaultValue), defaultValue, options);
 
     return {
       exportCliPath,
       rustCliPath,
+      experienceRoot,
       projectRoot,
-      snapshotDir: cfg.get<string>("snapshotDir", "snapshots"),
+      srcDir,
+      activePlaceAlias: activePlace?.alias,
+      activePlace: activePlace?.place,
+      placeSelector: activePlace?.selector,
+      snapshotDir: read("snapshotDir", "snapshots"),
       transport,
-      server: cfg.get<string>("server", "Roblox_Studio"),
+      server: read("server", "Roblox_Studio"),
       configTomlPath,
       services: services.length > 0 ? services : [...DEFAULT_SERVICES],
-      sourceWorkers: this.configNumber(cfg, "sourceWorkers", 0, { min: 0, integer: true }),
-      instanceWorkers: this.configNumber(cfg, "instanceWorkers", 0, { min: 0, integer: true }),
-      importWorkers: this.configNumber(cfg, "importWorkers", 0, { min: 0, integer: true }),
+      sourceWorkers: number("sourceWorkers", 0, { min: 0, integer: true }),
+      instanceWorkers: number("instanceWorkers", 0, { min: 0, integer: true }),
+      importWorkers: number("importWorkers", 0, { min: 0, integer: true }),
       chunkSize,
-      snapshotInstanceChunkSize: this.configNumber(cfg, "snapshotInstanceChunkSize", 5000, { min: 0, integer: true }),
-      bridgeWaitSeconds: this.configNumber(cfg, "bridgeWaitSeconds", 8, { min: 1 }),
+      snapshotInstanceChunkSize: number("snapshotInstanceChunkSize", 5000, { min: 0, integer: true }),
+      bridgeWaitSeconds: number("bridgeWaitSeconds", 8, { min: 1 }),
       bridgePorts: this.normalizeBridgePorts(
         String(
-          cfg.get<string>(
-            "bridgePorts",
-            DEFAULT_BRIDGE_PORTS.join(","),
-          ) ?? DEFAULT_BRIDGE_PORTS.join(","),
+          read("bridgePorts", DEFAULT_BRIDGE_PORTS.join(",")),
         ),
       ),
-      usePersistentBridge: cfg.get<boolean>("usePersistentBridge", true) !== false,
-      verifyEditorPushSources: cfg.get<boolean>("verifyEditorPushSources", false) === true,
-      adaptiveThrottle: cfg.get<boolean>("adaptiveThrottle", true),
-      noUpdateEditorIcons: cfg.get<boolean>("noUpdateEditorIcons", true),
-      autoSyncOnSave: cfg.get<boolean>("autoSyncOnSave", false),
-      autoSyncDebounceMs: this.configNumber(cfg, "autoSyncDebounceMs", 800, { min: 100, integer: true }),
-      editorLiveSyncEnabled: cfg.get<boolean>("editorLiveSyncEnabled", false) === true,
-      editorLiveSyncOnStartup: cfg.get<boolean>("editorLiveSyncOnStartup", false) === true,
-      studioLiveSyncEnabled: cfg.get<boolean>("studioLiveSyncEnabled", true) !== false,
-      studioLiveSyncPollMs: this.configNumber(
-        cfg,
+      usePersistentBridge: read<boolean>("usePersistentBridge", true) !== false,
+      verifyEditorPushSources: read<boolean>("verifyEditorPushSources", false) === true,
+      adaptiveThrottle: read<boolean>("adaptiveThrottle", true),
+      noUpdateEditorIcons: read<boolean>("noUpdateEditorIcons", true),
+      autoSyncOnSave: read<boolean>("autoSyncOnSave", false),
+      autoSyncDebounceMs: number("autoSyncDebounceMs", 800, { min: 100, integer: true }),
+      editorLiveSyncEnabled: read<boolean>("editorLiveSyncEnabled", false) === true,
+      editorLiveSyncOnStartup: read<boolean>("editorLiveSyncOnStartup", false) === true,
+      studioLiveSyncEnabled: read<boolean>("studioLiveSyncEnabled", true) !== false,
+      studioLiveSyncPollMs: number(
         "studioLiveSyncPollMs",
         DEFAULT_STUDIO_LIVE_SYNC_POLL_MS,
         { min: MIN_STUDIO_LIVE_SYNC_POLL_MS, integer: true },
       ),
       initialSyncPriority,
-      changesThreshold: this.configNumber(cfg, "liveSync.changesThreshold", 5, { min: 0, integer: true }),
-      diffLinesLimit: this.configNumber(cfg, "liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
+      changesThreshold: number("liveSync.changesThreshold", 5, { min: 0, integer: true }),
+      diffLinesLimit: number("liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
       displayPrompts,
       logLevel,
-      overridePackages: cfg.get<boolean>("liveSync.overridePackages", false) === true,
-      conflictResolution: this.normalizeConflictPolicy(cfg.get<string>("liveSync.conflictResolution", "prompt")),
-      runImport: cfg.get<boolean>("runImport", true),
+      overridePackages: read<boolean>("liveSync.overridePackages", false) === true,
+      conflictResolution: this.normalizeConflictPolicy(read("liveSync.conflictResolution", "prompt")),
+      runImport: read<boolean>("runImport", true),
       importMode,
       performanceMode,
       modifiedDefaultBypass,
       wsWaitSeconds,
-      progressHeartbeatSeconds: this.configNumber(cfg, "progressHeartbeatSeconds", 2, { min: 2 }),
-      benchmarkRuns: this.configNumber(cfg, "benchmarkRuns", 5, { min: 1, integer: true }),
+      progressHeartbeatSeconds: number("progressHeartbeatSeconds", 2, { min: 2 }),
+      benchmarkRuns: number("benchmarkRuns", 5, { min: 1, integer: true }),
       gitSync: {
-        gitPath: cfg.get<string>("gitSync.gitPath", "git"),
-        remote: cfg.get<string>("gitSync.remote", "origin"),
-        branch: cfg.get<string>("gitSync.branch", ""),
-        autoFetch: cfg.get<boolean>("gitSync.autoFetch", true) !== false,
-        runFullSyncBeforePush: gitRunFullSyncBeforePush,
+        gitPath: read("gitSync.gitPath", "git"),
+        remote: read("gitSync.remote", "origin"),
+        branch: read("gitSync.branch", ""),
+        autoFetch: read<boolean>("gitSync.autoFetch", true) !== false,
+        pullFromStudioBeforePush: gitPullFromStudioBeforePush,
         stageMode: gitStageMode,
-        stagePaths: gitStagePaths.length > 0 ? gitStagePaths : ["src"],
-        includeUntracked: cfg.get<boolean>("gitSync.includeUntracked", false) === true,
-        commitMessageTemplate: cfg.get<string>("gitSync.commitMessageTemplate", "Renium sync: ${date}"),
-        confirmBeforePush: cfg.get<boolean>("gitSync.confirmBeforePush", true) !== false,
-        requireCleanWorktreeBeforePull: cfg.get<boolean>("gitSync.requireCleanWorktreeBeforePull", true) !== false,
+        stagePaths: gitStagePaths.length > 0 ? gitStagePaths : [srcDir],
+        includeUntracked: read<boolean>("gitSync.includeUntracked", false) === true,
+        commitMessageTemplate: read("gitSync.commitMessageTemplate", "Renium sync: ${date}"),
+        confirmBeforePush: read<boolean>("gitSync.confirmBeforePush", true) !== false,
+        requireCleanWorktreeBeforePull: read<boolean>("gitSync.requireCleanWorktreeBeforePull", true) !== false,
         applyPulledChangesToStudio: gitApplyPulledChangesToStudio,
-        timeoutSeconds: this.configNumber(cfg, "gitSync.timeoutSeconds", 120, { min: 10 }),
+        timeoutSeconds: number("gitSync.timeoutSeconds", 120, { min: 10 }),
         outputBehavior: gitOutputBehavior,
       },
       wallySync: {
-        wallyPath: cfg.get<string>("wallySync.wallyPath", "wally"),
-        rojoPath: cfg.get<string>("wallySync.rojoPath", "rojo"),
-        packagesDir: cfg.get<string>("wallySync.packagesDir", "Packages"),
-        targetService: cfg.get<string>("wallySync.targetService", "ReplicatedStorage"),
-        targetName: cfg.get<string>("wallySync.targetName", "Packages"),
-        realms: cfg.get<string>("wallySync.realms", "shared,server,dev"),
-        runInstall: cfg.get<boolean>("wallySync.runInstall", true) !== false,
+        wallyPath: read("wallySync.wallyPath", "wally"),
+        rojoPath: read("wallySync.rojoPath", "rojo"),
+        packagesDir: read("wallySync.packagesDir", "Packages"),
+        targetService: read("wallySync.targetService", "ReplicatedStorage"),
+        targetName: read("wallySync.targetName", "Packages"),
+        serverPackagesDir: read("wallySync.serverPackagesDir", "ServerPackages"),
+        serverTargetService: read("wallySync.serverTargetService", "ServerStorage"),
+        serverTargetName: read("wallySync.serverTargetName", "ServerPackages"),
+        devPackagesDir: read("wallySync.devPackagesDir", "DevPackages"),
+        devTargetService: read("wallySync.devTargetService", "ReplicatedStorage"),
+        devTargetName: read("wallySync.devTargetName", "DevPackages"),
+        realms: read("wallySync.realms", "shared,server,dev"),
+        runInstall: read<boolean>("wallySync.runInstall", true) !== false,
         applyToStudio: wallyApplyToStudio,
       },
       linkSync: {
-        manifest: cfg.get<string>("link.manifest", "renium-link.json"),
-        folder: (cfg.get<string>("link.folder", "") ?? "").trim(),
-        cacheDir: (cfg.get<string>("link.cacheDir", "") ?? "").trim(),
-        gitPath: cfg.get<string>("link.gitPath", "git"),
-        wallyPath: cfg.get<string>("wallySync.wallyPath", "wally"),
-        offline: cfg.get<boolean>("link.offline", false) === true,
-        autoApply: cfg.get<boolean>("link.autoApplyOnManifestChange", false) === true,
+        manifest: read("link.manifest", "renium-link.json"),
+        folder: read("link.folder", "").trim(),
+        cacheDir: read("link.cacheDir", "").trim(),
+        gitPath: read("link.gitPath", "git"),
+        wallyPath: read("wallySync.wallyPath", "wally"),
+        offline: read<boolean>("link.offline", false) === true,
+        autoApply: read<boolean>("link.autoApplyOnManifestChange", false) === true,
         applyToStudio: linkApplyToStudio,
       },
     };
   }
 
-  private normalizeChunkSize(cfg: vscode.WorkspaceConfiguration): number {
-    const inspected = cfg.inspect<number>("chunkSize");
-    const configuredValue =
-      inspected?.workspaceFolderValue ??
-      inspected?.workspaceValue ??
-      inspected?.globalValue ??
-      inspected?.defaultValue;
-    const rawValue = Number(configuredValue ?? DEFAULT_CHUNK_SIZE);
+  private normalizeChunkSize(value: unknown): number {
+    const rawValue = Number(value ?? DEFAULT_CHUNK_SIZE);
 
     if (!Number.isFinite(rawValue) || rawValue < 512) {
       return DEFAULT_CHUNK_SIZE;
@@ -8435,15 +11983,6 @@ class RobloxSyncController {
     }
 
     return normalized;
-  }
-
-  private configNumber(
-    cfg: vscode.WorkspaceConfiguration,
-    key: string,
-    defaultValue: number,
-    options: { min?: number; integer?: boolean } = {},
-  ): number {
-    return this.normalizeConfigNumber(cfg.get<number>(key, defaultValue), defaultValue, options);
   }
 
   private normalizeConfigNumber(
@@ -8479,6 +12018,9 @@ class RobloxSyncController {
     if (inspected?.globalValue !== undefined) {
       return "user";
     }
+    if (sharedConfigValue(this.sharedConfig, key) !== undefined) {
+      return "shared";
+    }
     if (inspected?.defaultValue !== undefined) {
       return "default";
     }
@@ -8491,6 +12033,7 @@ class RobloxSyncController {
       inspected?.workspaceFolderValue ??
       inspected?.workspaceValue ??
       inspected?.globalValue ??
+      sharedConfigValue(this.sharedConfig, key) ??
       inspected?.defaultValue
     );
   }
@@ -8541,7 +12084,7 @@ class RobloxSyncController {
   private normalizeBridgePorts(raw: string): string {
     const parsed = raw
       .split(",")
-      .map((token) => Number.parseInt(token.trim(), 10))
+      .map((token) => Number(token.trim()))
       .filter((value) => Number.isInteger(value) && value > 0 && value <= 65535)
       .filter((value, index, all) => all.indexOf(value) === index);
 
@@ -8562,32 +12105,30 @@ class RobloxSyncController {
       normalized = [...DEFAULT_BRIDGE_PORTS];
     }
 
-    if (normalized.length === 0) {
-      normalized = [...DEFAULT_BRIDGE_PORTS];
-    }
-
-    if (normalized.length > DEFAULT_BRIDGE_PORTS.length) {
+    if (normalized.length !== DEFAULT_BRIDGE_PORTS.length) {
       if (!this.warnedBridgePortLimit) {
         this.warnedBridgePortLimit = true;
-        this.output.appendLine(
-          `[renium] config: only ${DEFAULT_BRIDGE_PORTS.length} bridge ports are supported; using ${normalized
-            .slice(0, DEFAULT_BRIDGE_PORTS.length)
-            .join(",")}.`,
+      this.output.appendLine(
+          `[renium] config: exactly ${DEFAULT_BRIDGE_PORTS.length} bridge ports are required; using ${DEFAULT_BRIDGE_PORTS.join(",")}.`,
         );
       }
-      normalized = normalized.slice(0, DEFAULT_BRIDGE_PORTS.length);
+      normalized = [...DEFAULT_BRIDGE_PORTS];
     }
 
     return normalized.join(",");
   }
 
-  private getWsWaitSeconds(cfg: vscode.WorkspaceConfiguration): number {
-    const configuredWsWaitSeconds = this.getConfiguredNumber(cfg, "wsWaitSeconds");
+  private getWsWaitSeconds(cfg: vscode.WorkspaceConfiguration, shared: SharedConfig): number {
+    const configuredWsWaitSeconds =
+      this.explicitConfigValue<unknown>(cfg, "wsWaitSeconds") ??
+      sharedConfigValue<unknown>(shared, "wsWaitSeconds");
     if (configuredWsWaitSeconds !== undefined) {
       return this.normalizeConfigNumber(configuredWsWaitSeconds, 20, { min: 1 });
     }
 
-    const legacyStartupWaitSeconds = this.getConfiguredNumber(cfg, "startupWaitSeconds");
+    const legacyStartupWaitSeconds =
+      this.explicitConfigValue<unknown>(cfg, "startupWaitSeconds") ??
+      sharedConfigValue<unknown>(shared, "startupWaitSeconds");
     if (legacyStartupWaitSeconds !== undefined) {
       if (!this.warnedLegacyStartupWaitSeconds) {
         this.warnedLegacyStartupWaitSeconds = true;
@@ -8598,20 +12139,7 @@ class RobloxSyncController {
       return this.normalizeConfigNumber(legacyStartupWaitSeconds, 20, { min: 1 });
     }
 
-    return this.configNumber(cfg, "wsWaitSeconds", 20, { min: 1 });
-  }
-
-  private getConfiguredNumber(
-    cfg: vscode.WorkspaceConfiguration,
-    key: string,
-  ): number | undefined {
-    const inspected = cfg.inspect<number>(key);
-    const configuredValue =
-      inspected?.workspaceFolderValue ??
-      inspected?.workspaceValue ??
-      inspected?.globalValue;
-    const value = Number(configuredValue);
-    return Number.isFinite(value) ? value : undefined;
+    return 20;
   }
 
   private resolveConfigPath(raw: string, workspaceRoot: string): string {
@@ -8630,7 +12158,7 @@ class RobloxSyncController {
     if (folders && folders.length > 1 && root === folders[0].uri.fsPath && !this.warnedMultiRootWorkspace) {
       this.warnedMultiRootWorkspace = true;
       this.output.appendLine(
-        `[renium] multi-root workspace: no folder contains renium.exe; using the first folder (${root}). Set renium.projectRoot or renium.exportCliPath if this is wrong.`,
+        `[renium] multi-root workspace: using ${root}. Open a file in another workspace folder or set renium.projectRoot to switch projects.`,
       );
     }
     return root;
@@ -8639,6 +12167,87 @@ class RobloxSyncController {
   private isPathInside(filePath: string, rootPath: string): boolean {
     const relative = path.relative(this.normalizePathForCompare(rootPath), this.normalizePathForCompare(filePath));
     return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+  }
+
+  private sourceRoot(cfg: SyncConfig): string {
+    return path.join(cfg.projectRoot, cfg.srcDir);
+  }
+
+  private isProjectSourcePath(
+    filePath: string,
+    cfg: SyncConfig,
+    sourceGraph = loadProjectSourceGraph(cfg.projectRoot),
+  ): boolean {
+    if (sourceGraph.ignored.some((ignored) => this.isPathInside(filePath, ignored))) {
+      return false;
+    }
+    return sourceGraph.files.some((location) =>
+      this.normalizePathForCompare(filePath) === this.normalizePathForCompare(location))
+      || sourceGraph.directories.some((location) => this.isPathInside(filePath, location));
+  }
+
+  private servicesForProjectSourcePath(
+    filePath: string,
+    cfg: SyncConfig,
+    sourceGraph = loadProjectSourceGraph(cfg.projectRoot),
+  ): string[] {
+    if (!this.isProjectSourcePath(filePath, cfg, sourceGraph)) {
+      return [];
+    }
+    const matches = sourceGraph.owners
+      .filter((owner) => {
+        let isFile = false;
+        try {
+          isFile = fs.statSync(owner.location).isFile();
+        } catch {
+          isFile = path.extname(owner.location) !== "";
+        }
+        return isFile
+          ? this.normalizePathForCompare(filePath) === this.normalizePathForCompare(owner.location)
+          : this.isPathInside(filePath, owner.location);
+      })
+      .sort((left, right) =>
+        path.resolve(right.location).split(path.sep).length
+        - path.resolve(left.location).split(path.sep).length);
+    if (matches.length === 0) {
+      return [];
+    }
+    const specificity = path.resolve(matches[0].location).split(path.sep).length;
+    const byLower = new Map(cfg.services.map((service) => [service.toLowerCase(), service]));
+    const services = new Set<string>();
+    let ambiguous = false;
+    for (const owner of matches) {
+      if (path.resolve(owner.location).split(path.sep).length !== specificity) {
+        break;
+      }
+      const fixed = owner.target[0];
+      if (fixed) {
+        const service = byLower.get(fixed.toLowerCase());
+        if (service) {
+          services.add(service);
+        }
+        continue;
+      }
+      let isFile = false;
+      try {
+        isFile = fs.statSync(owner.location).isFile();
+      } catch {
+        isFile = path.extname(owner.location) !== "";
+      }
+      if (isFile) {
+        ambiguous = true;
+        continue;
+      }
+      const relative = path.relative(owner.location, filePath);
+      const first = relative.split(path.sep)[0];
+      const service = first && first !== "." ? byLower.get(first.toLowerCase()) : undefined;
+      if (service) {
+        services.add(service);
+      } else {
+        ambiguous = true;
+      }
+    }
+    return ambiguous && services.size === 0 ? [...cfg.services] : [...services];
   }
 
   private normalizePathForCompare(filePath: string): string {
@@ -8657,22 +12266,6 @@ class RobloxSyncController {
       return filePath;
     }
     return path.relative(projectRoot, filePath);
-  }
-
-  private detectServiceForPath(filePath: string, projectRoot: string, services: string[]): string | undefined {
-    const srcRoot = path.join(projectRoot, "src");
-    if (!this.isPathInside(filePath, srcRoot)) {
-      return undefined;
-    }
-
-    const relative = path.relative(srcRoot, filePath);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      return undefined;
-    }
-
-    const firstSegment = relative.split(path.sep)[0];
-    const byLower = new Map(services.map((s) => [s.toLowerCase(), s]));
-    return byLower.get(firstSegment.toLowerCase());
   }
 
   private parseBenchmarkMetrics(output: string): BenchmarkRunMetrics {
@@ -9090,10 +12683,18 @@ class RobloxSyncController {
   }
 
   private updateStatusBar(): void {
+    const experienceRoot = this.configuredExperienceRoot();
+    const placeAlias = experienceRoot ? activeExperienceAlias(experienceRoot) : undefined;
+    const statusText = placeAlias ? `Renium - ${placeAlias}` : "Renium";
+    const placeTooltip = placeAlias ? ` for ${placeAlias}` : "";
+    const pendingCount = this.pendingEditorPaths.size;
+    const pendingText = pendingCount > 0 ? ` (${pendingCount})` : "";
+    const pendingTooltip = pendingCount > 0
+      ? `; ${pendingCount} editor change${pendingCount === 1 ? "" : "s"} waiting`
+      : "";
     if (this.activeTaskName) {
-      const elapsedSeconds = Math.max(0, Math.floor((Date.now() - this.activeTaskStartedAt) / 1000));
-      this.statusItem.text = `$(sync~spin) Renium ${elapsedSeconds}s`;
-      this.statusItem.tooltip = `${this.activeTaskName} in progress`;
+      this.statusItem.text = `$(sync~spin) ${statusText}${pendingText}`;
+      this.statusItem.tooltip = `${this.activeTaskName} in progress${placeTooltip}${pendingTooltip}`;
       return;
     }
 
@@ -9102,60 +12703,389 @@ class RobloxSyncController {
     const liveSyncEnabled = this.editorLiveSyncRuntimeEnabled;
 
     if (this.bridgeServeRequested && this.isBridgeDaemonRunning()) {
-      this.statusItem.text = "$(radio-tower) Renium Serve";
-      this.statusItem.tooltip = "Bridge server is running; Studio plugin can connect";
+      this.statusItem.text = `$(radio-tower) ${placeAlias ? `Serving - ${placeAlias}` : "Serving"}${pendingText}`;
+      this.statusItem.tooltip = `Bridge server is running${placeTooltip}; Studio plugin can connect${pendingTooltip}`;
       return;
     }
 
     if (liveSyncEnabled && this.liveSyncWatcher) {
-      this.statusItem.text = "$(sync~spin) Renium Live";
-      this.statusItem.tooltip = "Live sync running";
+      this.statusItem.text = `$(sync~spin) ${statusText}${pendingText}`;
+      this.statusItem.tooltip = `Live sync running${placeTooltip}${pendingTooltip}`;
       return;
     }
 
     if (autoEnabled) {
-      this.statusItem.text = "$(sync) Renium Auto";
-      this.statusItem.tooltip = "Auto sync on save is enabled";
+      this.statusItem.text = `$(sync) ${statusText}${pendingText}`;
+      this.statusItem.tooltip = `Auto sync on save is enabled${placeTooltip}${pendingTooltip}`;
       return;
     }
 
-    this.statusItem.text = "$(sync) Renium";
-    this.statusItem.tooltip = "Open Renium menu";
+    this.statusItem.text = `$(sync) ${statusText}${pendingText}`;
+    this.statusItem.tooltip = `${placeAlias ? `Open Renium menu for ${placeAlias}` : "Open Renium menu"}${pendingTooltip}`;
   }
 
   private setActiveTask(taskName: string | undefined): void {
     this.activeTaskName = taskName;
-    this.activeTaskStartedAt = taskName ? Date.now() : 0;
-
-    if (this.activeTaskTicker) {
-      clearInterval(this.activeTaskTicker);
-      this.activeTaskTicker = undefined;
-    }
-
-    if (taskName) {
-      this.activeTaskTicker = setInterval(() => {
-        this.updateStatusBar();
-      }, 1000);
-    }
-
     this.updateStatusBar();
   }
 
-  private disposeLiveSyncRuntime(): void {
-    this.stopStudioLiveSyncRuntime();
+  private disposeLiveSyncRuntime(): Promise<void> {
+    const importDrain = this.stopStudioLiveSyncRuntime();
+    if (this.liveSyncGraphRefreshTimer) {
+      clearTimeout(this.liveSyncGraphRefreshTimer);
+      this.liveSyncGraphRefreshTimer = undefined;
+    }
     if (this.liveSyncWatcher) {
       this.liveSyncWatcher.dispose();
       this.liveSyncWatcher = undefined;
     }
+    for (const watcher of this.liveSyncAdditionalWatchers) {
+      watcher.dispose();
+    }
+    this.liveSyncAdditionalWatchers = [];
     if (this.liveSyncTimer) {
       clearTimeout(this.liveSyncTimer);
       this.liveSyncTimer = undefined;
       this.liveSyncTimerDueAt = 0;
     }
-    this.pendingEditorPaths.clear();
     this.forcedEditorLiveSyncPathKeys.clear();
     this.suppressedEditorLiveSyncPathUntilByKey.clear();
     this.recentDirectSaveAtByPath.clear();
+    this.persistPendingEditorPaths(this.liveSyncProjectRoot);
+    return importDrain;
+  }
+
+  private scheduleLiveSyncGraphRefresh(projectRoot: string): void {
+    if (this.liveSyncGraphRefreshTimer) {
+      clearTimeout(this.liveSyncGraphRefreshTimer);
+    }
+    this.liveSyncGraphRefreshTimer = setTimeout(() => {
+      this.liveSyncGraphRefreshTimer = undefined;
+      void this.restartLiveSyncAfterGraphChange(projectRoot);
+    }, 100);
+  }
+
+  private async restartLiveSyncAfterGraphChange(projectRoot: string): Promise<void> {
+    if (this.liveSyncGraphRefreshRunning) {
+      this.liveSyncGraphRefreshPending = true;
+      return;
+    }
+    this.liveSyncGraphRefreshRunning = true;
+    try {
+    let cfg: SyncConfig;
+    try {
+      cfg = this.getConfig();
+    } catch {
+      return;
+    }
+    if (this.normalizePathForCompare(cfg.projectRoot) !== this.normalizePathForCompare(projectRoot)) {
+      return;
+    }
+    invalidateProjectSourceGraph(projectRoot);
+    await vscode.commands.executeCommand("renium.fileExplorer.refreshProjectGraph");
+    if (this.liveSyncStartupInProgress) {
+      this.liveSyncGraphRefreshPending = true;
+      return;
+    }
+    if (!this.liveSyncWatcher) {
+      return;
+    }
+    await this.disposeLiveSyncRuntime();
+    if (this.normalizePathForCompare(this.getConfig().projectRoot) !== this.normalizePathForCompare(projectRoot)) {
+      return;
+    }
+    await this.startLiveSync({ silent: true, bestEffort: true, graphRefresh: true });
+    } finally {
+      this.liveSyncGraphRefreshRunning = false;
+      if (this.liveSyncGraphRefreshPending && !this.liveSyncStartupInProgress) {
+        this.liveSyncGraphRefreshPending = false;
+        this.scheduleLiveSyncGraphRefresh(projectRoot);
+      }
+    }
+  }
+
+  private pendingEditorPathsStorageKey(projectRoot?: string): string {
+    let resolvedRoot = projectRoot ?? "";
+    if (!resolvedRoot) {
+      try {
+        resolvedRoot = this.getConfig().projectRoot;
+      } catch {
+      }
+    }
+    return `renium.pendingEditorPaths:${this.normalizePathForCompare(resolvedRoot || this.context.extensionPath)}`;
+  }
+
+  private restorePendingEditorPaths(projectRoot?: string): void {
+    let resolvedRoot = projectRoot;
+    if (!resolvedRoot) {
+      try {
+        resolvedRoot = this.getConfig().projectRoot;
+      } catch {
+      }
+    }
+    this.liveSyncProjectRoot = resolvedRoot;
+    this.pendingEditorPaths.clear();
+    this.blockedStudioImportServices.clear();
+    this.pendingEditorServicesByPath.clear();
+    const stored = this.context.workspaceState.get<unknown>(
+      this.pendingEditorPathsStorageKey(resolvedRoot),
+    );
+    const paths = Array.isArray(stored)
+      ? stored
+      : stored && typeof stored === "object" && !Array.isArray(stored)
+        ? (stored as { paths?: unknown }).paths
+        : undefined;
+    if (!Array.isArray(paths)) {
+      return;
+    }
+    for (const value of paths) {
+      if (typeof value === "string" && value.length > 0) {
+        this.pendingEditorPaths.add(value);
+      }
+    }
+    const pathServices = stored && typeof stored === "object" && !Array.isArray(stored)
+      ? (stored as { pathServices?: unknown }).pathServices
+      : undefined;
+    if (pathServices && typeof pathServices === "object" && !Array.isArray(pathServices)) {
+      for (const [filePath, rawServices] of Object.entries(pathServices)) {
+        if (!Array.isArray(rawServices)) {
+          continue;
+        }
+        const services = rawServices
+          .filter((service): service is string => typeof service === "string" && service.length > 0)
+          .map((service) => service.toLowerCase());
+        if (services.length > 0) {
+          this.pendingEditorServicesByPath.set(
+            this.normalizePathForCompare(filePath),
+            new Set(services),
+          );
+        }
+      }
+    }
+    const blockedServices = stored && typeof stored === "object" && !Array.isArray(stored)
+      ? (stored as { blockedServices?: unknown }).blockedServices
+      : undefined;
+    let cfg: SyncConfig | undefined;
+    try {
+      cfg = this.getConfig();
+    } catch {
+    }
+    for (const filePath of this.pendingEditorPaths) {
+      const key = this.normalizePathForCompare(filePath);
+      if (this.pendingEditorServicesByPath.has(key)) {
+        continue;
+      }
+      const detected = cfg
+        ? this.servicesForProjectSourcePath(filePath, cfg)
+        : [];
+      const services = detected.length > 0
+        ? detected.map((service) => service.toLowerCase())
+        : Array.isArray(blockedServices)
+          ? blockedServices.filter((service): service is string => typeof service === "string")
+            .map((service) => service.toLowerCase())
+          : cfg?.services.map((service) => service.toLowerCase()) ?? [];
+      if (services.length > 0) {
+        this.pendingEditorServicesByPath.set(key, new Set(services));
+      }
+    }
+    if (cfg) {
+      this.recomputeBlockedStudioImportServices(cfg);
+    }
+  }
+
+  private rememberPendingEditorPath(filePath: string, cfg: SyncConfig, services?: string[]): void {
+    this.pendingEditorPaths.add(filePath);
+    const detected = services ?? this.servicesForProjectSourcePath(filePath, cfg);
+    this.pendingEditorServicesByPath.set(
+      this.normalizePathForCompare(filePath),
+      new Set((detected.length > 0 ? detected : cfg.services).map((service) => service.toLowerCase())),
+    );
+  }
+
+  private recomputeBlockedStudioImportServices(cfg: SyncConfig): void {
+    this.blockedStudioImportServices.clear();
+    const pendingKeys = new Set<string>();
+    for (const filePath of this.pendingEditorPaths) {
+      const key = this.normalizePathForCompare(filePath);
+      pendingKeys.add(key);
+      let services = this.pendingEditorServicesByPath.get(key);
+      if (!services) {
+        const detected = this.servicesForProjectSourcePath(filePath, cfg);
+        services = new Set(
+          (detected.length > 0 ? detected : cfg.services).map((service) => service.toLowerCase()),
+        );
+        this.pendingEditorServicesByPath.set(key, services);
+      }
+      for (const service of services) {
+        this.blockedStudioImportServices.add(service);
+      }
+    }
+    for (const key of this.pendingEditorServicesByPath.keys()) {
+      if (!pendingKeys.has(key)) {
+        this.pendingEditorServicesByPath.delete(key);
+      }
+    }
+  }
+
+  public onProjectGraphChanged(projectRoot: string): void {
+    const cfg = this.getConfig();
+    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
+      return;
+    }
+    invalidateProjectSourceGraph(projectRoot);
+    this.pendingEditorServicesByPath.clear();
+    for (const filePath of this.pendingEditorPaths) {
+      const services = this.servicesForProjectSourcePath(filePath, cfg);
+      this.pendingEditorServicesByPath.set(
+        this.normalizePathForCompare(filePath),
+        new Set((services.length > 0 ? services : cfg.services).map((service) => service.toLowerCase())),
+      );
+    }
+    this.recomputeBlockedStudioImportServices(cfg);
+    void this.persistPendingEditorPaths(projectRoot);
+    this.invalidateLinkStatusCache();
+    if (this.liveSyncWatcher && !this.liveSyncGraphRefreshRunning) {
+      this.scheduleLiveSyncGraphRefresh(projectRoot);
+    }
+  }
+
+  private markEditorPathsPending(paths: string[], cfg: SyncConfig, services?: string[]): void {
+    for (const filePath of paths) {
+      this.rememberPendingEditorPath(filePath, cfg, services);
+    }
+    this.recomputeBlockedStudioImportServices(cfg);
+    this.persistPendingEditorPaths();
+  }
+
+  private markEditorPathsPendingAtRoot(
+    paths: string[],
+    cfg: SyncConfig,
+    projectRoot = cfg.projectRoot,
+    services?: string[],
+  ): void {
+    const uniquePaths = Array.from(new Set(paths
+      .map((filePath) => String(filePath).trim())
+      .filter((filePath) => filePath.length > 0)));
+    if (uniquePaths.length === 0) {
+      return;
+    }
+    if (this.normalizePathForCompare(projectRoot) === this.normalizePathForCompare(cfg.projectRoot)) {
+      this.markEditorPathsPending(uniquePaths, cfg, services);
+      return;
+    }
+    const key = this.pendingEditorPathsStorageKey(projectRoot);
+    const normalizedServices = (services ?? [])
+      .map((service) => String(service).trim().toLowerCase())
+      .filter((service) => service.length > 0);
+    const update = async (): Promise<void> => {
+      const stored = this.context.workspaceState.get<unknown>(key);
+      const storedRecord = stored && typeof stored === "object" && !Array.isArray(stored)
+        ? stored as { paths?: unknown; blockedServices?: unknown; pathServices?: unknown }
+        : {};
+      const storedPaths = Array.isArray(storedRecord.paths)
+        ? storedRecord.paths.filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [];
+      const mergedPaths = Array.from(new Set([...storedPaths, ...uniquePaths]));
+      const pathServices = storedRecord.pathServices
+        && typeof storedRecord.pathServices === "object"
+        && !Array.isArray(storedRecord.pathServices)
+        ? { ...storedRecord.pathServices as Record<string, unknown> }
+        : {};
+      for (const filePath of uniquePaths) {
+        const existing = Array.isArray(pathServices[filePath])
+          ? (pathServices[filePath] as unknown[])
+            .filter((service): service is string => typeof service === "string" && service.length > 0)
+            .map((service) => service.toLowerCase())
+          : [];
+        pathServices[filePath] = Array.from(new Set([...existing, ...normalizedServices]));
+      }
+      const blockedServices = Array.from(new Set([
+        ...(Array.isArray(storedRecord.blockedServices)
+          ? storedRecord.blockedServices.filter((service): service is string => typeof service === "string")
+          : []),
+        ...normalizedServices,
+      ]));
+      await this.context.workspaceState.update(key, {
+        paths: mergedPaths,
+        blockedServices,
+        pathServices,
+      });
+    };
+    this.pendingEditorPersistence = this.pendingEditorPersistence.then(update, update);
+  }
+
+  private pendingStudioImportServiceSet(cfg: SyncConfig): Set<string> {
+    this.recomputeBlockedStudioImportServices(cfg);
+    return new Set(this.blockedStudioImportServices);
+  }
+
+  private clearAppliedEditorPaths(paths: string[]): void {
+    const applied = new Set(paths.map((filePath) => this.normalizePathForCompare(filePath)));
+    for (const filePath of this.pendingEditorPaths) {
+      if (applied.has(this.normalizePathForCompare(filePath))) {
+        this.pendingEditorPaths.delete(filePath);
+        this.pendingEditorServicesByPath.delete(this.normalizePathForCompare(filePath));
+      }
+    }
+    try {
+      this.recomputeBlockedStudioImportServices(this.getConfig());
+    } catch {
+    }
+    this.persistPendingEditorPaths();
+  }
+
+  private persistPendingEditorPaths(projectRoot = this.liveSyncProjectRoot): Promise<void> {
+    const key = this.pendingEditorPathsStorageKey(projectRoot);
+    const value = {
+      paths: [...this.pendingEditorPaths],
+      blockedServices: [...this.blockedStudioImportServices],
+      pathServices: Object.fromEntries(
+        [...this.pendingEditorPaths].map((filePath) => [
+          filePath,
+          [...(this.pendingEditorServicesByPath.get(this.normalizePathForCompare(filePath)) ?? [])],
+        ]),
+      ),
+    };
+    const update = async (): Promise<void> => {
+      await this.context.workspaceState.update(key, value);
+    };
+    this.pendingEditorPersistence = this.pendingEditorPersistence.then(update, update);
+    this.updateStatusBar();
+    return this.pendingEditorPersistence;
+  }
+
+  public async shutdown(): Promise<void> {
+    await this.persistPendingEditorPaths();
+    await this.pendingEditorPersistence;
+    await this.disposeLiveSyncRuntime();
+    await this.stopConsoleFollow({ releaseServe: false });
+    await this.stopBridgeDaemon();
+    await terminateAllProcesses();
+    this.dispose();
+  }
+
+  public discardPendingEditorChanges(): void {
+    const count = this.pendingEditorPaths.size;
+    this.pendingEditorPaths.clear();
+    this.blockedStudioImportServices.clear();
+    this.pendingEditorServicesByPath.clear();
+    this.persistPendingEditorPaths();
+    vscode.window.showInformationMessage(
+      count === 1
+        ? "Discarded one pending editor change."
+        : `Discarded ${count} pending editor changes.`,
+    );
+  }
+
+  public async retryPendingEditorChanges(): Promise<void> {
+    if (this.pendingEditorPaths.size === 0) {
+      vscode.window.showInformationMessage("No editor changes are pending.");
+      return;
+    }
+    if (!this.liveSyncWatcher) {
+      await this.startLiveSync({ silent: true });
+    }
+    await this.flushEditorChanges();
   }
 
   private async setEditorLiveSyncEnabled(enabled: boolean): Promise<void> {
@@ -9176,15 +13106,22 @@ class LinkDecorationProvider implements vscode.FileDecorationProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri[] | undefined>();
   public readonly onDidChangeFileDecorations = this.emitter.event;
   private index = new Map<string, LinkFileInfo>();
+  private refreshGeneration = 0;
 
   public constructor(private readonly controller: RobloxSyncController) {}
 
   public async refresh(): Promise<void> {
+    const generation = ++this.refreshGeneration;
+    let index: Map<string, LinkFileInfo>;
     try {
-      this.index = await this.controller.getLinkFileIndex(true);
+      index = await this.controller.getLinkFileIndex(true);
     } catch {
-      this.index = new Map();
+      index = new Map();
     }
+    if (generation !== this.refreshGeneration) {
+      return;
+    }
+    this.index = index;
     this.emitter.fire(undefined);
   }
 
@@ -9350,8 +13287,10 @@ type PackageNodeElement = {
 type PackageTreeElement = PackageLinkElement | PackageNodeElement;
 
 type PackagePreviewTree = {
+  generation: number;
   preview: PackagePreviewData;
   nodesByKey: Map<string, PackagePreviewNode>;
+  elementsByKey: Map<string, PackageNodeElement>;
   childrenByParent: Map<string, PackageNodeElement[]>;
   roots: PackageNodeElement[];
 };
@@ -9471,6 +13410,7 @@ class PackageScriptContentProvider implements vscode.TextDocumentContentProvider
   private readonly contents = new Map<string, string>();
   private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
   public readonly onDidChange = this.changeEmitter.event;
+  private generation = 0;
 
   public constructor(private readonly resolveContent?: (linkId: string, nodeKey: string) => Promise<string | undefined>) {}
 
@@ -9484,10 +13424,13 @@ class PackageScriptContentProvider implements vscode.TextDocumentContentProvider
     if (!info || !this.resolveContent) {
       return "";
     }
+    const generation = this.generation;
     return this.resolveContent(info.linkId, info.nodeKey).then(
       (source) => {
         const text = source ?? "";
-        this.contents.set(key, text);
+        if (generation === this.generation) {
+          this.contents.set(key, text);
+        }
         return text;
       },
       () => "",
@@ -9515,7 +13458,19 @@ class PackageScriptContentProvider implements vscode.TextDocumentContentProvider
     return uri;
   }
 
+  public refresh(): void {
+    this.generation += 1;
+    for (const document of vscode.workspace.textDocuments) {
+      if (document.uri.scheme !== "renium-package") {
+        continue;
+      }
+      this.contents.delete(document.uri.toString());
+      this.changeEmitter.fire(document.uri);
+    }
+  }
+
   public dispose(): void {
+    this.generation += 1;
     this.contents.clear();
     this.changeEmitter.dispose();
   }
@@ -9550,6 +13505,7 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
   private propertiesPanel: vscode.WebviewPanel | undefined;
   private selectionGeneration = 0;
   private suppressExpansionTracking = false;
+  private propertiesUpdateChain: Promise<void> = Promise.resolve();
 
   public constructor(
     private readonly controller: RobloxSyncController,
@@ -9570,13 +13526,22 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
   }
 
   public refresh(): void {
+    if (this.clearDragTimer) {
+      clearTimeout(this.clearDragTimer);
+      this.clearDragTimer = undefined;
+    }
+    this.setPackageDrag(undefined);
+    this.selectionGeneration += 1;
     this.previewCache.clear();
+    this.scriptContentProvider.refresh();
+    this.queuePackagePropertiesClear();
     this.changeEmitter.fire();
   }
 
   public clearSelection(_element: PackageTreeElement | undefined): void {
     this.selectionGeneration += 1;
     this.suppressExpansionTracking = true;
+    this.queuePackagePropertiesClear();
     this.changeEmitter.fire();
   }
 
@@ -9753,10 +13718,16 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
   public async getChildren(element?: PackageTreeElement): Promise<PackageTreeElement[]> {
     if (element?.kind === "node") {
       const tree = await this.previewTree(element.link);
+      if (tree.generation !== this.selectionGeneration) {
+        return [];
+      }
       return (tree.childrenByParent.get(element.nodeKey) ?? []).map((child) => this.currentPackageElement(child) as PackageNodeElement);
     }
     if (element?.kind === "link") {
       const tree = await this.previewTree(element.link);
+      if (tree.generation !== this.selectionGeneration) {
+        return [];
+      }
       if (tree.roots.length === 1) {
         return (tree.childrenByParent.get(tree.roots[0].nodeKey) ?? [])
           .map((child) => this.currentPackageElement(child) as PackageNodeElement);
@@ -9777,10 +13748,13 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       return this.linkElement(element.link);
     }
     const tree = await this.previewTree(element.link);
+    if (tree.generation !== this.selectionGeneration) {
+      return undefined;
+    }
     if (tree.roots.length === 1 && element.parentKey === tree.roots[0].nodeKey) {
       return this.linkElement(element.link);
     }
-    return this.elementForKey(element.link, tree.preview, tree.nodesByKey, tree.childrenByParent, element.parentKey);
+    return tree.elementsByKey.get(element.parentKey);
   }
 
   private linkElement(link: CliLinkStatusLink): PackageLinkElement {
@@ -9806,7 +13780,10 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       return undefined;
     }
     const tree = await this.previewTree(linkElement.link);
-    return this.elementForKey(linkElement.link, tree.preview, tree.nodesByKey, tree.childrenByParent, nodeKey);
+    if (tree.generation !== this.selectionGeneration) {
+      return undefined;
+    }
+    return tree.elementsByKey.get(nodeKey);
   }
 
   public async packageScriptSourceFor(linkId: string, nodeKey: string): Promise<string | undefined> {
@@ -9815,6 +13792,9 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       return undefined;
     }
     const tree = await this.previewTree(linkElement.link);
+    if (tree.generation !== this.selectionGeneration) {
+      return undefined;
+    }
     const node = tree.nodesByKey.get(nodeKey);
     if (!node || !isPackageScriptClass(node.className)) {
       return undefined;
@@ -9832,6 +13812,9 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       return false;
     }
     const tree = await this.previewTree(linkElement.link);
+    if (tree.generation !== this.selectionGeneration) {
+      return false;
+    }
     const node = tree.nodesByKey.get(nodeKey);
     if (!node) {
       return false;
@@ -9841,14 +13824,18 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
 
   private previewTree(link: CliLinkStatusLink): Promise<PackagePreviewTree> {
     const id = String(link.id ?? "");
-    const existing = this.previewCache.get(id);
+    const generation = this.selectionGeneration;
+    const cacheKey = `${generation}\0${id}`;
+    const existing = this.previewCache.get(cacheKey);
     if (existing) {
       return existing;
     }
     const loading = this.controller.loadPackagePreview(link).then((preview) => {
       const nodesByKey = new Map<string, PackagePreviewNode>();
+      const elementsByKey = new Map<string, PackageNodeElement>();
       const childrenByParent = new Map<string, PackageNodeElement[]>();
       const keyByRawId = new Map<string, string>();
+      const childCounts = new Map<string, number>();
       preview.nodes.forEach((node, index) => {
         const key = packageNodeKey(node, index);
         nodesByKey.set(key, node);
@@ -9859,7 +13846,7 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       preview.nodes.forEach((node, index) => {
         const key = packageNodeKey(node, index);
         const parentKey = node.parentId ? (keyByRawId.get(node.parentId) ?? node.parentId) : "";
-        const childCount = preview.nodes.filter((candidate) => candidate.parentId === node.settingsId).length;
+        childCounts.set(parentKey, (childCounts.get(parentKey) ?? 0) + 1);
         const element: PackageNodeElement = {
           kind: "node",
           link,
@@ -9867,50 +13854,26 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
           node,
           nodeKey: key,
           parentKey,
-          childCount,
+          childCount: 0,
           selectionVersion: this.nodeSelectionVersion(link, key),
         };
-        const bucket = childrenByParent.get(parentKey) ?? [];
-        bucket.push(element);
-        childrenByParent.set(parentKey, bucket);
+        elementsByKey.set(key, element);
       });
+      for (const element of elementsByKey.values()) {
+        element.childCount = childCounts.get(element.nodeKey) ?? 0;
+        const bucket = childrenByParent.get(element.parentKey) ?? [];
+        bucket.push(element);
+        childrenByParent.set(element.parentKey, bucket);
+      }
       const roots = (preview.rootIds.length > 0
         ? preview.rootIds.map((rootId) => keyByRawId.get(rootId) ?? rootId)
         : Array.from(childrenByParent.get("") ?? []).map((root) => root.nodeKey))
-        .map((key) => (childrenByParent.get("") ?? []).find((candidate) => candidate.nodeKey === key)
-          ?? this.elementForKey(link, preview, nodesByKey, childrenByParent, key))
+        .map((key) => elementsByKey.get(key))
         .filter((element): element is PackageNodeElement => !!element);
-      return { preview, nodesByKey, childrenByParent, roots };
+      return { generation, preview, nodesByKey, elementsByKey, childrenByParent, roots };
     });
-    this.previewCache.set(id, loading);
+    this.previewCache.set(cacheKey, loading);
     return loading;
-  }
-
-  private elementForKey(
-    link: CliLinkStatusLink,
-    preview: PackagePreviewData,
-    nodesByKey: Map<string, PackagePreviewNode>,
-    childrenByParent: Map<string, PackageNodeElement[]>,
-    key: string,
-  ): PackageNodeElement | undefined {
-    const node = nodesByKey.get(key);
-    if (!node) {
-      return undefined;
-    }
-    const childCount = childrenByParent.get(key)?.length ?? 0;
-    const parentKey = node.parentId
-      ? (Array.from(nodesByKey.entries()).find(([, candidate]) => candidate.settingsId === node.parentId)?.[0] ?? node.parentId)
-      : "";
-    return {
-      kind: "node",
-      link,
-      preview,
-      node,
-      nodeKey: key,
-      parentKey,
-      childCount,
-      selectionVersion: this.nodeSelectionVersion(link, key),
-    };
   }
 
   public async openItem(element: PackageTreeElement | undefined): Promise<void> {
@@ -9919,18 +13882,20 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
     }
     if (element.kind === "link") {
       const tree = await this.previewTree(element.link);
-      if (!this.isCurrentElement(element)) {
+      if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
         return;
       }
       const root = tree.roots[0];
-      await this.showPackageProperties(tree.preview, root?.node);
-      if (root && tree.roots.length === 1 && await this.openPackageScript(tree.preview, root.node)) {
+      const generation = this.selectionGeneration;
+      await this.showPackageProperties(tree.preview, root?.node, generation);
+      if (root && tree.roots.length === 1 && await this.openPackageScript(tree.preview, root.node, {}, generation)) {
         return;
       }
       return;
     }
-    await this.showPackageProperties(element.preview, element.node);
-    if (await this.openPackageScript(element.preview, element.node)) {
+    const generation = this.selectionGeneration;
+    await this.showPackageProperties(element.preview, element.node, generation);
+    if (await this.openPackageScript(element.preview, element.node, {}, generation)) {
       return;
     }
   }
@@ -9981,6 +13946,7 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
   }
 
   public async openLinkedScriptPreview(request: LinkedPackageScriptPreviewRequest | undefined): Promise<boolean> {
+    const generation = this.selectionGeneration;
     const service = typeof request?.service === "string" ? request.service.trim() : "";
     const pathSegments = Array.isArray(request?.pathSegments)
       ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
@@ -9990,6 +13956,9 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
     }
     const normalizedPath = pathSegments[0] === service ? pathSegments : [service, ...pathSegments];
     const status = await this.controller.getLinkStatus(false);
+    if (generation !== this.selectionGeneration) {
+      return false;
+    }
     const targets = (status?.targets ?? [])
       .filter((target) =>
         target.broken !== true
@@ -10006,6 +13975,9 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       return false;
     }
     const packages = await this.controller.getLinkPackages(false);
+    if (generation !== this.selectionGeneration) {
+      return false;
+    }
     for (const { target, targetPath } of targets) {
       const link = packages.find((candidate) => candidate.id === target.linkId);
       if (!link) {
@@ -10013,10 +13985,13 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       }
       const relativePath = normalizedPath.slice(targetPath.length);
       const tree = await this.previewTree(link);
+      if (generation !== this.selectionGeneration || tree.generation !== generation) {
+        return false;
+      }
       const node = Array.from(tree.nodesByKey.values()).find((candidate) =>
         this.packageNodeMatchesExplorerRequest(candidate, relativePath, request ?? {}),
       );
-      if (node && await this.openPackageScript(tree.preview, node)) {
+      if (node && await this.openPackageScript(tree.preview, node, {}, generation)) {
         return true;
       }
     }
@@ -10029,17 +14004,21 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
     }
     if (element.kind === "link") {
       const tree = await this.previewTree(element.link);
-      if (!this.isCurrentElement(element)) {
+      if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
         return;
       }
-      await this.showPackageProperties(tree.preview, tree.roots[0]?.node);
+      await this.showPackageProperties(tree.preview, tree.roots[0]?.node, this.selectionGeneration);
       return;
     }
-    await this.showPackageProperties(element.preview, element.node);
+    await this.showPackageProperties(element.preview, element.node, this.selectionGeneration);
   }
 
-  private async showPackageProperties(preview: PackagePreviewData, node: PackagePreviewNode | undefined): Promise<void> {
-    await vscode.commands.executeCommand("renium.properties.showPackageNode", {
+  private async showPackageProperties(
+    preview: PackagePreviewData,
+    node: PackagePreviewNode | undefined,
+    generation: number,
+  ): Promise<void> {
+    const payload = {
       packageId: preview.id,
       packageName: preview.name,
       source: preview.source,
@@ -10047,14 +14026,32 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       rootClass: preview.rootClass,
       rootName: preview.rootName,
       node,
+    };
+    const update = this.propertiesUpdateChain.then(async () => {
+      if (generation === this.selectionGeneration) {
+        await vscode.commands.executeCommand("renium.properties.showPackageNode", payload);
+      }
     });
+    this.propertiesUpdateChain = update.catch(() => undefined);
+    await update;
+  }
+
+  private queuePackagePropertiesClear(): void {
+    const update = this.propertiesUpdateChain.then(async () => {
+      await vscode.commands.executeCommand("renium.properties.clearPackageNode");
+    });
+    this.propertiesUpdateChain = update.catch(() => undefined);
   }
 
   private async openPackageScript(
     preview: PackagePreviewData,
     node: PackagePreviewNode,
     options: { preview?: boolean; preserveFocus?: boolean } = {},
+    generation = this.selectionGeneration,
   ): Promise<boolean> {
+    if (generation !== this.selectionGeneration) {
+      return false;
+    }
     if (!isPackageScriptClass(node.className)) {
       return false;
     }
@@ -10064,6 +14061,9 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
     }
     const uri = this.scriptContentProvider.uriFor(preview, node);
     const doc = await vscode.workspace.openTextDocument(uri);
+    if (generation !== this.selectionGeneration) {
+      return false;
+    }
     await vscode.window.showTextDocument(doc, {
       preview: options.preview ?? false,
       preserveFocus: options.preserveFocus,
@@ -10072,28 +14072,41 @@ class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement
       await vscode.languages.setTextDocumentLanguage(doc, "luau");
     } catch {
     }
-    return true;
+    return generation === this.selectionGeneration;
   }
 }
 
+let activeController: RobloxSyncController | undefined;
+let activeFileExplorerController: FileExplorerController | undefined;
+
 export function activate(context: vscode.ExtensionContext): void {
+  const bundledCliPath = bundledReniumCliPath(context.extensionPath);
+  if (fs.existsSync(bundledCliPath)) {
+    context.environmentVariableCollection.prepend("PATH", `${path.dirname(bundledCliPath)}${path.delimiter}`);
+  } else {
+    context.environmentVariableCollection.delete("PATH");
+  }
   const controller = new RobloxSyncController(context);
+  activeController = controller;
   setTimeout(() => {
+    void (async () => {
     try {
       const cli = controller.rbsyncViewerCli();
       const extensionVersion = String(context.extension.packageJSON.version ?? "");
       if (cli && extensionVersion && fs.existsSync(cli.cliPath)) {
-        const cliVersion = rustCliVersion(cli.cliPath);
+        const cliVersion = await controller.detectedCliVersion(cli.cliPath);
         if (cliVersion && cliVersion !== extensionVersion) {
           void vscode.window.showWarningMessage(
-            `Renium: this extension is v${extensionVersion} but ${RUST_CLI_BINARY} is v${cliVersion}. Update whichever is older so they match — syncing may misbehave until then.`,
+            `This extension is v${extensionVersion} but ${RUST_CLI_BINARY} is v${cliVersion}. Update whichever is older so they match — syncing may misbehave until then.`,
           );
         }
       }
     } catch {
     }
+    })();
   }, 0);
   const fileExplorerController = new FileExplorerController(context, controller.gitViewActions());
+  activeFileExplorerController = fileExplorerController;
   const linkDecorationProvider = new LinkDecorationProvider(controller);
   let packagesProvider: PackagesTreeProvider;
   const packageScriptProvider = new PackageScriptContentProvider((linkId, nodeKey) =>
@@ -10122,7 +14135,8 @@ export function activate(context: vscode.ExtensionContext): void {
       } catch {
       }
       setTimeout(() => {
-        if (packagesTreeView.selection.length === 0) {
+        const currentSelection = packagesTreeView.selection[0];
+        if (currentSelection && currentSelection !== selectedPackage) {
           return;
         }
         packagesProvider.clearSelection(selectedPackage);
@@ -10190,6 +14204,9 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     controller,
     fileExplorerController,
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      void controller.configureLuauSourcemapForEditor(editor);
+    }),
     vscode.window.registerCustomEditorProvider(
       RbsyncEditorProvider.viewType,
       new RbsyncEditorProvider(
@@ -10201,19 +14218,39 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("renium.openMenu", () => controller.openMenu()),
     vscode.commands.registerCommand("renium.installStudioPlugin", () => controller.installStudioPlugin()),
+    vscode.commands.registerCommand("renium.projectTools", () => controller.openProjectTools()),
+    vscode.commands.registerCommand("renium.projectDoctor", () => controller.runProjectDoctor()),
+    vscode.commands.registerCommand("renium.projectBuild", () => controller.buildProject()),
+    vscode.commands.registerCommand("renium.projectConfig", () => controller.openProjectConfiguration()),
+    vscode.commands.registerCommand("renium.projectDocs", () => controller.openCliDocumentation()),
+    vscode.commands.registerCommand("renium.createAgentInstructions", () => controller.createAgentInstructions()),
+    vscode.commands.registerCommand("renium.followConsole", () => controller.followStudioConsole()),
+    vscode.commands.registerCommand("renium.checkUpdates", () => controller.checkForUpdates()),
+    vscode.commands.registerCommand("renium.repairInstallation", () => controller.repairInstallation()),
+    vscode.commands.registerCommand("renium.uninstallStudioPlugin", () => controller.uninstallStudioPlugin()),
     vscode.commands.registerCommand("renium.openExplorer", () => vscode.commands.executeCommand("workbench.view.extension.reniumContainer")),
+    vscode.commands.registerCommand("renium.projectGraphChanged", (projectRoot?: string) => {
+      if (typeof projectRoot === "string" && projectRoot.length > 0) {
+        controller.onProjectGraphChanged(projectRoot);
+      }
+    }),
+    vscode.commands.registerCommand("renium.managePlaces", () => controller.managePlaces()),
+    vscode.commands.registerCommand("renium.addCurrentPlace", () => controller.addCurrentPlace()),
+    vscode.commands.registerCommand("renium.switchPlace", () => controller.switchPlace()),
+    vscode.commands.registerCommand("renium.renamePlace", () => controller.renamePlace()),
     vscode.commands.registerCommand("renium.gitSync", () => controller.openGitSync()),
     vscode.commands.registerCommand("renium.gitSync.status", () => controller.gitStatus()),
     vscode.commands.registerCommand("renium.gitSync.fetch", () => controller.gitFetch()),
     vscode.commands.registerCommand("renium.gitSync.pull", () => controller.gitPull()),
     vscode.commands.registerCommand("renium.gitSync.commitAndPush", () => controller.gitCommitAndPush()),
-    vscode.commands.registerCommand("renium.gitSync.fullSyncAndPush", () => controller.gitCommitAndPush({ runFullSyncFirst: true })),
+    vscode.commands.registerCommand("renium.gitSync.pullFromStudioAndPush", () => controller.gitCommitAndPush({ pullFromStudioFirst: true })),
     vscode.commands.registerCommand("renium.gitSync.connectRepo", () => controller.gitConnectRepo()),
     vscode.commands.registerCommand("renium.gitSync.publishBranch", () => controller.gitPublishBranch()),
     vscode.commands.registerCommand("renium.gitSync.createBranch", () => controller.gitCreateBranch()),
     vscode.commands.registerCommand("renium.gitSync.checkoutBranch", () => controller.gitCheckoutBranch()),
     vscode.commands.registerCommand("renium.gitSync.openRemote", () => controller.gitOpenRemote()),
-    vscode.commands.registerCommand("renium.fullSync", () => controller.fullSync()),
+    vscode.commands.registerCommand("renium.pullFromStudio", () => controller.pullFromStudio()),
+    vscode.commands.registerCommand("renium.pushToStudio", () => controller.pushToStudio()),
     vscode.commands.registerCommand("renium.exportSnapshots", () => controller.exportSnapshotsOnly()),
     vscode.commands.registerCommand("renium.exportGameFile", () => controller.exportGameFile()),
     vscode.commands.registerCommand("renium.syncWallyPackages", () => controller.syncWallyPackages()),
@@ -10289,6 +14326,8 @@ export function activate(context: vscode.ExtensionContext): void {
       persistOpenPackageScriptTabs();
     }),
     controller.onLinksChanged(() => {
+      refreshLinkManifestWatcher();
+      void controller.refreshLinkPackageSourceWatchers().catch(() => undefined);
       void linkDecorationProvider.refresh();
       void controller.pushLinkStateToExplorer();
       packagesProvider.refresh();
@@ -10296,6 +14335,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("renium.startLiveSync", () => controller.startLiveSync()),
     vscode.commands.registerCommand("renium.stopLiveSync", () => controller.stopLiveSync()),
     vscode.commands.registerCommand("renium.retryEditorInitialSync", () => controller.retryEditorInitialSync()),
+    vscode.commands.registerCommand("renium.retryPendingEditorChanges", () => controller.retryPendingEditorChanges()),
+    vscode.commands.registerCommand("renium.discardPendingEditorChanges", () => controller.discardPendingEditorChanges()),
     vscode.commands.registerCommand("renium.serve", () => controller.serve()),
     vscode.commands.registerCommand("renium.stopServe", () => controller.stopServe()),
     vscode.commands.registerCommand("renium.pushEditorPathsNow", (paths: string[] | string, options?: EditorPushOptions) =>
@@ -10320,41 +14361,93 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  const linkManifestWatcher = vscode.workspace.createFileSystemWatcher("**/renium-link.json");
+  let linkManifestWatcherPath = "";
+  let linkManifestWatcherGeneration = -1;
+  let linkManifestDisposables: vscode.Disposable[] = [];
   let linkApplyTimer: NodeJS.Timeout | undefined;
-  const onLinkManifestChanged = (): void => {
+  const sameLinkManifestPath = (left: string, right: string): boolean => {
+    const normalize = (value: string): string => {
+      const normalized = path.resolve(value);
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    return normalize(left) === normalize(right);
+  };
+  const onLinkManifestChanged = (uri: vscode.Uri): void => {
+    let active: { filePath: string; autoApply: boolean; projectRoot: string; generation: number };
+    try {
+      active = controller.activeLinkManifest();
+    } catch {
+      return;
+    }
+    if (uri.scheme !== "file" || !sameLinkManifestPath(uri.fsPath, active.filePath)) {
+      return;
+    }
     controller.invalidateLinkStatusCache();
-    const linkCfg = vscode.workspace.getConfiguration("renium");
-    if (linkCfg.get<boolean>("link.autoApplyOnManifestChange", false) === true) {
+    if (active.autoApply) {
       if (linkApplyTimer) {
         clearTimeout(linkApplyTimer);
       }
+      const captured = active;
       linkApplyTimer = setTimeout(() => {
-        void controller.linkApply({ silent: true }).catch(() => undefined);
+        linkApplyTimer = undefined;
+        void controller.linkApply({
+          silent: true,
+          expectedProjectRoot: captured.projectRoot,
+          expectedGeneration: captured.generation,
+        }).catch(() => undefined);
       }, 1500);
     }
   };
-  context.subscriptions.push(
-    linkManifestWatcher,
-    linkManifestWatcher.onDidChange(onLinkManifestChanged),
-    linkManifestWatcher.onDidCreate(onLinkManifestChanged),
-  );
-
-  const linkPackageWatchers = [
-    vscode.workspace.createFileSystemWatcher("**/*.rbsync"),
-    vscode.workspace.createFileSystemWatcher("**/*.renium"),
-  ];
-  for (const watcher of linkPackageWatchers) {
-    context.subscriptions.push(
-      watcher,
-      watcher.onDidChange((uri) => controller.onLinkPackageSourceChanged(uri)),
-      watcher.onDidCreate((uri) => controller.onLinkPackageSourceChanged(uri)),
-      watcher.onDidDelete((uri) => controller.onLinkPackageSourceChanged(uri)),
+  const refreshLinkManifestWatcher = (): void => {
+    let active: { filePath: string; autoApply: boolean; projectRoot: string; generation: number };
+    try {
+      active = controller.activeLinkManifest();
+    } catch {
+      return;
+    }
+    if (
+      linkManifestDisposables.length > 0
+      && sameLinkManifestPath(active.filePath, linkManifestWatcherPath)
+      && active.generation === linkManifestWatcherGeneration
+    ) {
+      return;
+    }
+    for (const disposable of linkManifestDisposables) {
+      disposable.dispose();
+    }
+    if (linkApplyTimer) {
+      clearTimeout(linkApplyTimer);
+      linkApplyTimer = undefined;
+    }
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(active.filePath), path.basename(active.filePath)),
     );
-  }
+    linkManifestWatcherPath = active.filePath;
+    linkManifestWatcherGeneration = active.generation;
+    linkManifestDisposables = [
+      watcher,
+      watcher.onDidChange(onLinkManifestChanged),
+      watcher.onDidCreate(onLinkManifestChanged),
+      watcher.onDidDelete(onLinkManifestChanged),
+    ];
+  };
+  refreshLinkManifestWatcher();
+  context.subscriptions.push(
+    new vscode.Disposable(() => {
+      for (const disposable of linkManifestDisposables) {
+        disposable.dispose();
+      }
+      linkManifestDisposables = [];
+      if (linkApplyTimer) {
+        clearTimeout(linkApplyTimer);
+        linkApplyTimer = undefined;
+      }
+    }),
+  );
 
   void linkDecorationProvider.refresh();
   void controller.pushLinkStateToExplorer();
+  void controller.refreshLinkPackageSourceWatchers().catch(() => undefined);
   controller.scheduleStartupLinkRefresh();
   setTimeout(() => {
     void restoreOpenPackageScriptTabs().catch(() => undefined);
@@ -10366,5 +14459,22 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 }
 
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
+  const controller = activeController;
+  const fileExplorerController = activeFileExplorerController;
+  activeController = undefined;
+  activeFileExplorerController = undefined;
+  const results = await Promise.allSettled([
+    fileExplorerController?.prepareShutdown(),
+    controller?.shutdown(),
+  ]);
+  const failures = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  if (failures.length === 1) {
+    throw failures[0];
+  }
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Renium shutdown failed.");
+  }
 }

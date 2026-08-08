@@ -1,5 +1,10 @@
 import * as childProcess from "child_process";
 import * as path from "path";
+import {
+  projectProcessOwner,
+  terminateProcess,
+  trackProcess,
+} from "./processSupervisor";
 
 export type GitRunResult = {
   code: number;
@@ -15,6 +20,7 @@ export type GitRunOptions = {
   cwd: string;
   gitPath?: string;
   timeoutMs?: number;
+  owner?: string;
   onOutput?: (stream: "stdout" | "stderr", text: string) => void;
 };
 
@@ -88,11 +94,14 @@ const UNMERGED_STATUS_PAIRS = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]
 export async function runGit(args: string[], options: GitRunOptions): Promise<GitRunResult> {
   const gitPath = options.gitPath?.trim() || "git";
   const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 120_000));
+  const outputLimit = 16 * 1024 * 1024;
 
   return await new Promise<GitRunResult>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let outputLimitExceeded = false;
+    let outputBytes = 0;
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
 
@@ -102,7 +111,9 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
       shell: false,
       stdio: "pipe",
       windowsHide: true,
+      detached: true,
     });
+    const processClosed = trackProcess(child, options.owner ?? projectProcessOwner(options.cwd));
 
     const finish = (code: number): void => {
       if (settled) {
@@ -125,22 +136,33 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
 
     timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill();
-      } catch {
-      }
+      void terminateProcess(child).then(() => finish(124));
     }, timeoutMs);
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
-      const text = chunk.toString();
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, outputLimit - outputBytes);
+      const text = buffer.subarray(0, remaining).toString();
+      outputBytes += buffer.length;
       stdout += text;
       options.onOutput?.("stdout", text);
+      if (buffer.length > remaining && !outputLimitExceeded) {
+        outputLimitExceeded = true;
+        void terminateProcess(child).then(() => finish(125));
+      }
     });
 
     child.stderr?.on("data", (chunk: Buffer | string) => {
-      const text = chunk.toString();
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, outputLimit - outputBytes);
+      const text = buffer.subarray(0, remaining).toString();
+      outputBytes += buffer.length;
       stderr += text;
       options.onOutput?.("stderr", text);
+      if (buffer.length > remaining && !outputLimitExceeded) {
+        outputLimitExceeded = true;
+        void terminateProcess(child).then(() => finish(125));
+      }
     });
 
     child.on("error", (err) => {
@@ -154,8 +176,20 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
       reject(err);
     });
 
+    child.on("close", (code) => {
+      finish(outputLimitExceeded ? 125 : code ?? (timedOut ? 124 : 130));
+    });
     child.on("exit", (code) => {
-      finish(code ?? (timedOut ? 124 : 0));
+      const resultCode = outputLimitExceeded ? 125 : code ?? (timedOut ? 124 : 130);
+      void Promise.race([
+        processClosed.then(() => true),
+        new Promise<boolean>((resolveClose) => setTimeout(() => resolveClose(false), 100)),
+      ]).then(async (closed) => {
+        if (!closed) {
+          await terminateProcess(child, 250);
+        }
+        finish(resultCode);
+      });
     });
   });
 }
@@ -330,10 +364,18 @@ export function buildCommitMessage(template: string, branch: string): string {
     .replaceAll("${branch}", branch || "HEAD");
 }
 
-export function defaultGitSyncScope(repoRoot: string, projectRoot: string): string {
-  const srcRoot = path.join(projectRoot, "src");
+export function defaultGitSyncScope(repoRoot: string, projectRoot: string, srcDir = "src"): string {
+  const srcRoot = path.join(projectRoot, srcDir);
   const relative = path.relative(repoRoot, srcRoot).replaceAll("\\", "/");
-  return relative && relative !== "." ? relative : "src";
+  return relative && relative !== "." ? relative : srcDir.replaceAll("\\", "/");
+}
+
+export function shouldPullFromStudioBeforePush(
+  policy: "ask" | "always" | "never",
+  forced: boolean,
+  choice?: "pull" | "current",
+): boolean {
+  return forced || policy === "always" || (policy === "ask" && choice === "pull");
 }
 
 function classifyStatus(

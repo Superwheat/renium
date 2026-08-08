@@ -37,9 +37,13 @@ export type GitViewState = {
   lastUpdated: string;
 };
 
+export type GitViewContext = {
+  projectRoot: string;
+};
+
 export type GitViewActions = {
-  refresh: (options?: { fetch?: boolean }) => Promise<GitViewState>;
-  runAction: (action: string) => Promise<void>;
+  refresh: (context: GitViewContext & { fetch?: boolean }) => Promise<GitViewState>;
+  runAction: (action: string, context: GitViewContext) => Promise<void>;
   openOutput: () => void;
-  openDiff: (path: string) => Promise<void>;
+  openDiff: (path: string, context: GitViewContext) => Promise<void>;
 };

@@ -4,16 +4,89 @@ use rbx_dom_weak::types::{Content, ContentId, ContentType};
 
 use crate::{
     core::XmlType,
+    deserializer::ParseState,
     deserializer_core::{XmlEventReader, XmlReadEvent},
     error::{DecodeError, DecodeErrorKind, EncodeError},
+    serializer::EmitState,
     serializer_core::{XmlEventWriter, XmlWriteEvent},
 };
+
+pub const XML_TAG_NAME: &str = "Content";
+
+pub fn write_content<W: Write>(
+    writer: &mut XmlEventWriter<W>,
+    xml_property_name: &str,
+    value: &Content,
+    state: &mut EmitState,
+) -> Result<(), EncodeError> {
+    writer.write(XmlWriteEvent::start_element(XML_TAG_NAME).attr("name", xml_property_name))?;
+    match value.value() {
+        ContentType::Object(referent) => {
+            writer.write(XmlWriteEvent::start_element("Ref"))?;
+            if referent.is_none() {
+                writer.write(XmlWriteEvent::characters("null"))?;
+            } else {
+                writer.write_characters(state.map_id(*referent))?;
+            }
+            writer.write(XmlWriteEvent::end_element())?;
+        }
+        _ => value.write_xml(writer)?,
+    }
+    writer.write(XmlWriteEvent::end_element())?;
+    Ok(())
+}
+
+pub fn read_content<R: Read>(
+    reader: &mut XmlEventReader<R>,
+    instance_id: rbx_dom_weak::types::Ref,
+    property_name: &str,
+    state: &mut ParseState,
+) -> Result<Content, DecodeError> {
+    reader.expect_start_with_name(XML_TAG_NAME)?;
+    let value = match reader.expect_next()? {
+        XmlReadEvent::StartElement {
+            name,
+            attributes,
+            namespace,
+        } => match name.local_name.as_str() {
+            "null" => {
+                reader.expect_end_with_name("null")?;
+                Content::none()
+            }
+            "url" | "uri" => {
+                let tag = name.local_name;
+                let value = reader.read_characters()?;
+                reader.expect_end_with_name(&tag)?;
+                Content::from_uri(value)
+            }
+            "Ref" => {
+                let referent = reader.read_characters()?;
+                reader.expect_end_with_name("Ref")?;
+                if referent != "null" {
+                    state.add_content_referent_rewrite(instance_id, property_name.into(), referent);
+                }
+                Content::none()
+            }
+            _ => {
+                let event = XmlReadEvent::StartElement {
+                    name,
+                    attributes,
+                    namespace,
+                };
+                return Err(reader.error(DecodeErrorKind::UnexpectedXmlEvent(event)));
+            }
+        },
+        unexpected => return Err(reader.error(DecodeErrorKind::UnexpectedXmlEvent(unexpected))),
+    };
+    reader.expect_end_with_name(XML_TAG_NAME)?;
+    Ok(value)
+}
 
 // A ContentId type is serialized as either:
 // <null></null>, which indicates an empty content value
 // <url>something</url>, where 'something' is a URL to use for content.
 impl XmlType for Content {
-    const XML_TAG_NAME: &'static str = "Content";
+    const XML_TAG_NAME: &'static str = XML_TAG_NAME;
 
     fn write_xml<W: Write>(&self, writer: &mut XmlEventWriter<W>) -> Result<(), EncodeError> {
         match self.value() {
@@ -24,7 +97,13 @@ impl XmlType for Content {
                 writer.write(XmlWriteEvent::start_element("url"))?;
                 writer.write_string(uri)?;
             }
-            ty => todo!("ContentType {:?} is not yet supported", ty),
+            _ => {
+                return Err(
+                    writer.error(crate::error::EncodeErrorKind::UnsupportedPropertyType(
+                        rbx_dom_weak::types::VariantType::Content,
+                    )),
+                );
+            }
         }
 
         writer.write(XmlWriteEvent::end_element())?;

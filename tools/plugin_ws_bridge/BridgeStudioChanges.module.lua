@@ -35,7 +35,24 @@ type StudioChangeDetails = {
 	attribute: string?,
 	direct: boolean?,
 	fullSync: boolean?,
+	valueCaptured: boolean?,
+	value: any,
+	instance: Instance?,
+	journalValueCaptured: boolean?,
+	journalValue: any,
 }
+type ExpectedValue = {
+	value: any,
+}
+type ExpectedValueQueue = { ExpectedValue }
+type ExpectedInstanceEvent = {
+	active: boolean,
+	fingerprint: string?,
+	matchParent: boolean?,
+	parent: Instance?,
+}
+type ExpectedInstanceEventQueue = { ExpectedInstanceEvent }
+type ExpectedInstanceEvents = { [Instance]: { [string]: ExpectedInstanceEventQueue } }
 type StudioChangeLog = {
 	service: string,
 	action: string,
@@ -105,11 +122,13 @@ type State = {
 	started: boolean,
 	seq: number,
 	dirtySeqByService: DirtySeqMap,
+	mutationSeqByService: DirtySeqMap,
 	fullSyncSeqByService: DirtySeqMap,
 	propertyChangesByKey: { [string]: DirectPropertyChange },
 	changeLogByKey: { [string]: StudioChangeLog },
 	propertyFingerprintByInstance: PropertyFingerprintMap,
 	ordinalCacheByParent: { [Instance]: { [Instance]: number } },
+	lastParentByInstance: { [Instance]: Instance? },
 	watchedServices: { [string]: boolean },
 	serviceRoots: { [string]: Instance },
 	rootConnections: { [string]: { RBXScriptConnection } },
@@ -133,6 +152,15 @@ type State = {
 	directPropertyBytes: number,
 	directPropertyCount: number,
 	tagPollToken: number,
+	expectedProperties: { [string]: ExpectedValueQueue },
+	expectedAttributes: { [string]: ExpectedValueQueue },
+	expectedStructuralByInstance: ExpectedInstanceEvents,
+	expectedInstanceProperties: ExpectedInstanceEvents,
+	expectedInstanceAttributes: ExpectedInstanceEvents,
+	expectedTags: ExpectedInstanceEvents,
+	expectedGeneration: number,
+	luaSourceDescendantCounts: { [Instance]: number },
+	changeJournal: any?,
 }
 
 local function trim(value: string): string
@@ -205,11 +233,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		started = false,
 		seq = 0,
 		dirtySeqByService = {},
+		mutationSeqByService = {},
 		fullSyncSeqByService = {},
 		propertyChangesByKey = {},
 		changeLogByKey = {},
 		propertyFingerprintByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		ordinalCacheByParent = setmetatable({}, { __mode = "k" }) :: any,
+		lastParentByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		watchedServices = {},
 		serviceRoots = {},
 		rootConnections = {},
@@ -233,12 +263,301 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		directPropertyBytes = 0,
 		directPropertyCount = 0,
 		tagPollToken = 0,
+		expectedProperties = {},
+		expectedAttributes = {},
+		expectedStructuralByInstance = setmetatable({}, { __mode = "k" }) :: any,
+		expectedInstanceProperties = setmetatable({}, { __mode = "k" }) :: any,
+		expectedInstanceAttributes = setmetatable({}, { __mode = "k" }) :: any,
+		expectedTags = setmetatable({}, { __mode = "k" }) :: any,
+		expectedGeneration = 0,
+		luaSourceDescendantCounts = setmetatable({}, { __mode = "k" }) :: any,
+		changeJournal = nil,
 	}
 
 	local api = {}
 
+	local function persistPendingServices()
+		if type(config.savePendingStudioChanges) ~= "function" then
+			return
+		end
+		local services = {}
+		for serviceName in pairs(state.dirtySeqByService) do
+			services[#services + 1] = serviceName
+		end
+		table.sort(services)
+		config.savePendingStudioChanges(services)
+	end
+
+	if type(config.loadPendingStudioChanges) == "function" then
+		local pending = config.loadPendingStudioChanges()
+		if type(pending) == "table" then
+			for _, serviceName in pending do
+				if type(serviceName) == "string" and allowedServices[serviceName] then
+					state.seq += 1
+					state.dirtySeqByService[serviceName] = state.seq
+					state.mutationSeqByService[serviceName] = state.seq
+					state.fullSyncSeqByService[serviceName] = state.seq
+				end
+			end
+		end
+	end
+
 	local function isSuppressed(): boolean
 		return state.suppressDepth > 0 or os.clock() < state.suppressUntil
+	end
+
+	local function expectedPathKey(
+		serviceName: string,
+		pathSegments: { string }?,
+		pathOrdinals: { number }?,
+		name: string?
+	): string
+		return serviceName
+			.. "\0"
+			.. structuredPathKey(pathSegments, pathOrdinals)
+			.. "\0"
+			.. tostring(name or "")
+	end
+
+	local function expectedValuesEqual(left: any, right: any): boolean
+		if type(left) == "number" or type(right) == "number" then
+			return BridgeValueCodec.numbersEqual(left, right)
+		end
+		if type(left) ~= type(right) then
+			return false
+		end
+		if type(left) ~= "table" then
+			return left == right
+		end
+		for key, value in pairs(left) do
+			if not expectedValuesEqual(value, right[key]) then
+				return false
+			end
+		end
+		for key in pairs(right) do
+			if left[key] == nil then
+				return false
+			end
+		end
+		return true
+	end
+
+	local function isExpectedChange(serviceName: string, details: StudioChangeDetails?): boolean
+		if not isSuppressed() or type(details) ~= "table" then
+			return false
+		end
+		local action = tostring(details.action or "")
+		local keyName = if action == "attribute" then details.attribute else details.property
+		local key = expectedPathKey(serviceName, details.pathSegments, details.pathOrdinals, keyName)
+		if details.valueCaptured ~= true then
+			return false
+		end
+		local expectedValues = if action == "attribute"
+			then state.expectedAttributes
+			else if action == "property" then state.expectedProperties else nil
+		if expectedValues == nil then
+			return false
+		end
+		local queue = expectedValues[key]
+		if queue == nil then
+			return false
+		end
+		for index, expected in ipairs(queue) do
+			if expectedValuesEqual(expected.value, details.value) then
+				table.remove(queue, index)
+				if #queue == 0 then
+					expectedValues[key] = nil
+				end
+				return true
+			end
+		end
+		return false
+	end
+
+	local stableValueString: (any, number?) -> string
+	local expectedPropertyFingerprint: (Instance, string, any) -> string?
+
+	local function consumeExpectedInstanceEvent(
+		target: ExpectedInstanceEvents,
+		instance: Instance,
+		action: string,
+		fingerprint: string?,
+		parent: Instance?
+	): boolean
+		if not isSuppressed() then
+			return false
+		end
+		local expected = target[instance]
+		local queue = if expected ~= nil then expected[action] else nil
+		if queue == nil then
+			return false
+		end
+		local index = 1
+		while index <= #queue do
+			local event = queue[index]
+			if not event.active then
+				table.remove(queue, index)
+			elseif
+				(event.fingerprint == nil or event.fingerprint == fingerprint)
+				and (not event.matchParent or event.parent == parent)
+			then
+				event.active = false
+				table.remove(queue, index)
+				if #queue == 0 then
+					expected[action] = nil
+					if next(expected) == nil then
+						target[instance] = nil
+					end
+				end
+				return true
+			else
+				index += 1
+			end
+		end
+		if #queue == 0 then
+			expected[action] = nil
+			if next(expected) == nil then
+				target[instance] = nil
+			end
+		end
+		return false
+	end
+
+	local function expectInstanceEvent(
+		target: ExpectedInstanceEvents,
+		instance: Instance,
+		action: string,
+		fingerprint: string?,
+		matchParent: boolean?,
+		parent: Instance?
+	): ExpectedInstanceEvent
+		local expected = target[instance]
+		if expected == nil then
+			expected = {}
+			target[instance] = expected
+		end
+		local queue = expected[action]
+		if queue == nil then
+			queue = {}
+			expected[action] = queue
+		end
+		local event = {
+			active = true,
+			fingerprint = fingerprint,
+			matchParent = matchParent,
+			parent = parent,
+		}
+		queue[#queue + 1] = event
+		return event
+	end
+
+	function api.expectParentChange(instance: Instance, nextParent: Instance?)
+		local instances = { instance }
+		local tokens = {}
+		for _, descendant in ipairs(instance:GetDescendants()) do
+			instances[#instances + 1] = descendant
+		end
+		for _, target in ipairs(instances) do
+			if instance.Parent ~= nil then
+				tokens[#tokens + 1] =
+					expectInstanceEvent(state.expectedStructuralByInstance, target, "removed", nil, true, target.Parent)
+			end
+			if nextParent ~= nil then
+				local expectedParent = if target == instance then nextParent else target.Parent
+				tokens[#tokens + 1] =
+					expectInstanceEvent(state.expectedStructuralByInstance, target, "added", nil, true, expectedParent)
+			end
+		end
+		if state.instanceConnections[instance] ~= nil then
+			tokens[#tokens + 1] =
+				expectInstanceEvent(state.expectedInstanceProperties, instance, "parent", nil, false, nil)
+		end
+		return { tokens = tokens }
+	end
+
+	function api.expectPropertyEvent(instance: Instance, propertyName: string, value: any)
+		return expectInstanceEvent(
+			state.expectedInstanceProperties,
+			instance,
+			string.lower(propertyName),
+			expectedPropertyFingerprint(instance, propertyName, value),
+			false,
+			nil
+		)
+	end
+
+	function api.expectAttributeEvent(instance: Instance, attributeName: string, value: any)
+		return expectInstanceEvent(
+			state.expectedInstanceAttributes,
+			instance,
+			attributeName,
+			stableValueString(value),
+			false,
+			nil
+		)
+	end
+
+	function api.expectTagChange(instance: Instance, tag: string, added: boolean)
+		local action = (if added then "added:" else "removed:") .. tag
+		return {
+			tokens = {
+				expectInstanceEvent(state.expectedTags, instance, action, nil, false, nil),
+				expectInstanceEvent(state.expectedTags, instance, "property", nil, false, nil),
+			},
+		}
+	end
+
+	function api.cancelExpectedEvent(token: any)
+		if type(token) ~= "table" then
+			return
+		end
+		if type(token.tokens) == "table" then
+			for _, child in ipairs(token.tokens) do
+				api.cancelExpectedEvent(child)
+			end
+			return
+		end
+		token.active = false
+	end
+
+	function api.serviceGeneration(serviceName: string): number
+		return state.mutationSeqByService[serviceName] or 0
+	end
+
+	function api.beginChangeJournal(transactionId: string, services: { string })
+		if state.changeJournal ~= nil then
+			error("Another Studio change journal is already active")
+		end
+		local included = {}
+		for _, serviceName in ipairs(services) do
+			included[serviceName] = true
+		end
+		state.changeJournal = {
+			id = transactionId,
+			services = included,
+			records = {},
+			recordsByInstance = {},
+		}
+	end
+
+	function api.drainChangeJournal(transactionId: string): { any }
+		local journal = state.changeJournal
+		if journal == nil then
+			return {}
+		end
+		if journal.id ~= transactionId then
+			error("Studio change journal does not match the active transaction")
+		end
+		local records = journal.records
+		journal.records = {}
+		journal.recordsByInstance = {}
+		return records
+	end
+
+	function api.finishChangeJournal(transactionId: string): { any }
+		local records = api.drainChangeJournal(transactionId)
+		state.changeJournal = nil
+		return records
 	end
 
 	local function clearPropertyChangesForService(serviceName: string)
@@ -370,26 +689,143 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeLogByKey[key] = entry
 	end
 
+	local function recordJournalChange(serviceName: string, details: StudioChangeDetails?)
+		local journal = state.changeJournal
+		local instance = if details ~= nil then details.instance else nil
+		if
+			journal == nil
+			or not journal.services[serviceName]
+			or instance == nil
+			or typeof(instance) ~= "Instance"
+		then
+			return
+		end
+		local record = journal.recordsByInstance[instance]
+		if record == nil then
+			record = {
+				instance = instance,
+				service = serviceName,
+				properties = {},
+				attributes = {},
+			}
+			journal.recordsByInstance[instance] = record
+			journal.records[#journal.records + 1] = record
+		end
+		if details.pathSegments ~= nil and #details.pathSegments > 0 then
+			record.pathSegments = table.clone(details.pathSegments)
+			record.pathOrdinals = table.clone(details.pathOrdinals or {})
+		end
+		local action = tostring(details.action or "")
+		if action == "property" and details.property ~= nil then
+			record.properties[details.property] = {
+				captured = details.journalValueCaptured == true,
+				value = details.journalValue,
+			}
+		elseif action == "attribute" and details.attribute ~= nil then
+			record.attributes[details.attribute] = {
+				captured = details.journalValueCaptured == true,
+				value = details.journalValue,
+			}
+		elseif action == "tag" then
+			record.tagsChanged = true
+		elseif action == "added" or action == "removed" then
+			record.structural = true
+		end
+	end
+
 	local function markDirty(serviceName: string?, requiresFullSync: boolean?, details: StudioChangeDetails?)
 		if serviceName == nil or not allowedServices[serviceName] then
 			return
 		end
-		if isSuppressed() then
+		if isExpectedChange(serviceName, details) then
 			return
 		end
+		recordJournalChange(serviceName, details)
+		local wasDirty = state.dirtySeqByService[serviceName] ~= nil
 		state.seq += 1
 		state.dirtySeqByService[serviceName] = state.seq
+		state.mutationSeqByService[serviceName] = state.seq
 		local isFullSync = requiresFullSync ~= false
 		if isFullSync then
 			state.fullSyncSeqByService[serviceName] = state.seq
 			clearPropertyChangesForService(serviceName)
 		end
 		recordChange(serviceName, state.seq, isFullSync, details)
+		if not wasDirty then
+			persistPendingServices()
+		end
 		signalChange()
 	end
 
-	local function directPropertyKey(serviceName: string, pathSegments: { string }, pathOrdinals: { number }, propertyName: string): string
-		return serviceName .. "\0" .. structuredPathKey(pathSegments, pathOrdinals) .. "\0" .. propertyName
+	local function directPropertyKey(
+		serviceName: string,
+		pathSegments: { string },
+		pathOrdinals: { number },
+		scope: string,
+		propertyName: string
+	): string
+		return serviceName
+			.. "\0"
+			.. structuredPathKey(pathSegments, pathOrdinals)
+			.. "\0"
+			.. scope
+			.. "\0"
+			.. propertyName
+	end
+
+	local function directChangeLogKey(
+		serviceName: string,
+		pathSegments: { string },
+		pathOrdinals: { number },
+		action: string,
+		name: string
+	): string
+		return serviceName
+			.. "\0"
+			.. action
+			.. "\0"
+			.. structuredPathKey(pathSegments, pathOrdinals)
+			.. "\0"
+			.. name
+	end
+
+	local function removeQueuedDirectChange(
+		serviceName: string,
+		pathSegments: { string },
+		pathOrdinals: { number },
+		scope: string,
+		name: string
+	)
+		local key = directPropertyKey(serviceName, pathSegments, pathOrdinals, scope, name)
+		local previous = state.propertyChangesByKey[key]
+		if previous ~= nil then
+			state.directPropertyBytes = math.max(0, state.directPropertyBytes - (previous.estimatedBytes or 0))
+			state.directPropertyCount = math.max(0, state.directPropertyCount - 1)
+			state.propertyChangesByKey[key] = nil
+		end
+		local logKey = directChangeLogKey(serviceName, pathSegments, pathOrdinals, scope, name)
+		if state.changeLogByKey[logKey] ~= nil then
+			state.changeLogByKey[logKey] = nil
+			state.changeLogCountByService[serviceName] =
+				math.max(0, (state.changeLogCountByService[serviceName] or 0) - 1)
+		end
+		if state.fullSyncSeqByService[serviceName] ~= nil then
+			return
+		end
+		for _, change in pairs(state.propertyChangesByKey) do
+			if change.service == serviceName then
+				return
+			end
+		end
+		for _, change in pairs(state.changeLogByKey) do
+			if change.service == serviceName then
+				return
+			end
+		end
+		if state.dirtySeqByService[serviceName] ~= nil then
+			state.dirtySeqByService[serviceName] = nil
+			persistPendingServices()
+		end
 	end
 
 	local function canTrackDirectProperty(propertyName: string): boolean
@@ -398,7 +834,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	local function encodeDirectValue(value: any): (boolean, any)
 		local valueType = type(value)
-		if valueType == "boolean" or valueType == "string" then
+		if value == nil then
+			return true, nil
+		elseif valueType == "boolean" or valueType == "string" then
 			return true, value
 		elseif valueType == "number" then
 			return true, BridgeValueCodec.encodeNumber(value)
@@ -518,6 +956,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	): StudioChangeDetails
 		local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 		return {
+			instance = instance,
 			action = action,
 			reason = reason,
 			className = instance.ClassName,
@@ -529,28 +968,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		}
 	end
 
-	local function markDirectProperty(
+	local function markDirectValue(
 		instance: Instance,
 		serviceName: string,
-		propertyName: string,
+		scope: string,
+		name: string,
 		capturedOk: boolean?,
-		capturedValue: any
+		capturedValue: any,
+		journalValueCaptured: boolean?,
+		journalValue: any
 	): boolean
-		if isSuppressed() then
-			return true
-		end
-		if not canTrackDirectProperty(propertyName) then
-			return false
-		end
-		if state.fullSyncSeqByService[serviceName] ~= nil then
-			markDirty(
-				serviceName,
-				true,
-				changeDetailsForInstance(instance, "property", propertyName, nil, "property changed while full sync was pending")
-			)
-			return true
-		end
-
 		local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 		if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 or pathSegments[1] ~= serviceName then
 			return false
@@ -560,17 +987,66 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			okValue = capturedOk
 			value = capturedValue
 		else
-			okValue, value = encodeDirectPropertyValue(instance, propertyName)
+			if scope == "attribute" then
+				okValue, value = encodeDirectValue(instance:GetAttribute(name))
+			else
+				okValue, value = encodeDirectPropertyValue(instance, name)
+			end
+		end
+		if
+			isExpectedChange(serviceName, {
+				action = scope,
+				property = if scope == "property" then name else nil,
+				attribute = if scope == "attribute" then name else nil,
+				pathSegments = pathSegments,
+				pathOrdinals = pathOrdinals,
+				valueCaptured = okValue,
+				value = value,
+			})
+		then
+			removeQueuedDirectChange(serviceName, pathSegments, pathOrdinals, scope, name)
+			return true
+		end
+		if state.fullSyncSeqByService[serviceName] ~= nil then
+			local details = changeDetailsForInstance(
+				instance,
+				scope,
+				if scope == "property" then name else nil,
+				if scope == "attribute" then name else nil,
+				scope .. " changed while a Studio pull was pending"
+			)
+			details.journalValueCaptured = journalValueCaptured
+			details.journalValue = journalValue
+			markDirty(
+				serviceName,
+				true,
+				details
+			)
+			return true
+		end
+		if scope == "property" and not canTrackDirectProperty(name) then
+			return false
 		end
 		if not okValue then
 			return false
 		end
-		local key = directPropertyKey(serviceName, pathSegments, pathOrdinals, propertyName)
+		local key = directPropertyKey(serviceName, pathSegments, pathOrdinals, scope, name)
 		local previous = state.propertyChangesByKey[key]
 		local previousBytes = if previous ~= nil then previous.estimatedBytes else 0
 		local estimatedBytes = #key + estimatedValueBytes(value) + 128
 		local nextCount = state.directPropertyCount + (if previous == nil then 1 else 0)
 		local nextBytes = state.directPropertyBytes - previousBytes + estimatedBytes
+		recordJournalChange(serviceName, {
+			instance = instance,
+			action = scope,
+			property = if scope == "property" then name else nil,
+			attribute = if scope == "attribute" then name else nil,
+			pathSegments = pathSegments,
+			pathOrdinals = pathOrdinals,
+			journalValueCaptured = journalValueCaptured,
+			journalValue = journalValue,
+			value = nil,
+		})
 		if nextCount > MAX_DIRECT_PROPERTY_CHANGES or nextBytes > MAX_DIRECT_PROPERTY_BYTES then
 			markDirty(serviceName, true, {
 				action = "fullSync",
@@ -581,16 +1057,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			return true
 		end
 
+		local wasDirty = state.dirtySeqByService[serviceName] ~= nil
 		state.seq += 1
 		state.dirtySeqByService[serviceName] = state.seq
+		state.mutationSeqByService[serviceName] = state.seq
 		recordChange(serviceName, state.seq, false, {
-			action = "property",
-			reason = "property changed",
+			action = scope,
+			reason = scope .. " changed",
 			className = instance.ClassName,
 			pathSegments = pathSegments,
 			pathOrdinals = pathOrdinals,
 			path = pathToString(pathSegments),
-			property = propertyName,
+			property = if scope == "property" then name else nil,
+			attribute = if scope == "attribute" then name else nil,
 			direct = true,
 			fullSync = false,
 		})
@@ -599,19 +1078,46 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			className = instance.ClassName,
 			pathSegments = pathSegments,
 			pathOrdinals = pathOrdinals,
-			scope = "property",
-			property = propertyName,
+			scope = scope,
+			property = name,
 			value = value,
 			seq = state.seq,
 			estimatedBytes = estimatedBytes,
 		}
 		state.directPropertyCount = nextCount
 		state.directPropertyBytes = nextBytes
+		if not wasDirty then
+			persistPendingServices()
+		end
 		signalChange()
 		return true
 	end
 
+	local function markDirectProperty(
+		instance: Instance,
+		serviceName: string,
+		propertyName: string,
+		capturedOk: boolean?,
+		capturedValue: any,
+		journalValueCaptured: boolean?,
+		journalValue: any
+	): boolean
+		return markDirectValue(
+			instance,
+			serviceName,
+			"property",
+			propertyName,
+			capturedOk,
+			capturedValue,
+			journalValueCaptured,
+			journalValue
+		)
+	end
+
 	local function shouldIgnoreInstance(instance: Instance): boolean
+		if type(config.shouldIgnoreInstance) == "function" and config.shouldIgnoreInstance(instance) then
+			return true
+		end
 		local workspace = game:GetService("Workspace")
 		local currentCamera = workspace.CurrentCamera
 		if currentCamera == nil then
@@ -629,10 +1135,44 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	local function hasLuaSourceDescendant(instance: Instance): boolean
-		if isLuaSourceInstance(instance) then
-			return true
+		local count = state.luaSourceDescendantCounts[instance]
+		if count ~= nil then
+			return count > 0
 		end
-		return instance:FindFirstChildWhichIsA("LuaSourceContainer", true) ~= nil
+		count = if isLuaSourceInstance(instance) then 1 else 0
+		for _, child in ipairs(instance:GetChildren()) do
+			if hasLuaSourceDescendant(child) then
+				count += state.luaSourceDescendantCounts[child] or 0
+			end
+		end
+		state.luaSourceDescendantCounts[instance] = count
+		return count > 0
+	end
+
+	local function adjustLuaSourceAncestors(instance: Instance, delta: number)
+		local current = instance
+		while current ~= nil do
+			state.luaSourceDescendantCounts[current] =
+				math.max(0, (state.luaSourceDescendantCounts[current] or 0) + delta)
+			current = current.Parent
+		end
+	end
+
+	local function rebuildLuaSourceCounts(root: Instance)
+		local descendants = root:GetDescendants()
+		for index = #descendants, 1, -1 do
+			local instance = descendants[index]
+			local count = if isLuaSourceInstance(instance) then 1 else 0
+			for _, child in ipairs(instance:GetChildren()) do
+				count += state.luaSourceDescendantCounts[child] or 0
+			end
+			state.luaSourceDescendantCounts[instance] = count
+		end
+		local rootCount = if isLuaSourceInstance(root) then 1 else 0
+		for _, child in ipairs(root:GetChildren()) do
+			rootCount += state.luaSourceDescendantCounts[child] or 0
+		end
+		state.luaSourceDescendantCounts[root] = rootCount
 	end
 
 	local function exportPropertyNameForEvent(instance: Instance, loweredPropertyName: string): string
@@ -709,6 +1249,18 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	local function markTagChange(instance: Instance, tag: string, added: boolean)
+		if isSuppressed() then
+			if tag == "Tags" then
+				if consumeExpectedInstanceEvent(state.expectedTags, instance, "property", nil, nil) then
+					return
+				end
+			else
+				local action = (if added then "added:" else "removed:") .. tag
+				if consumeExpectedInstanceEvent(state.expectedTags, instance, action, nil, nil) then
+					return
+				end
+			end
+		end
 		local serviceName = serviceNameForTrackedInstance(instance)
 		if serviceName == nil or not tagChangeRelevant(instance) then
 			return
@@ -796,7 +1348,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return string.format("%d:%08x%08x", #value, first, second)
 	end
 
-	local function stableValueString(value: any, depth: number?): string
+	stableValueString = function(value: any, depth: number?): string
 		local currentDepth = depth or 0
 		if currentDepth > 8 then
 			return "<max-depth>"
@@ -887,18 +1439,28 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return propertyName
 	end
 
-	local function readPropertyFingerprint(instance: Instance, propertyName: string): (string?, boolean, any)
+	expectedPropertyFingerprint = function(instance: Instance, propertyName: string, value: any): string?
+		if string.lower(propertyReadNameForEvent(instance, propertyName)) ~= string.lower(propertyName) then
+			return nil
+		end
+		return stableValueString(value)
+	end
+
+	local function readPropertyFingerprint(
+		instance: Instance,
+		propertyName: string
+	): (string?, boolean, any, boolean, any)
 		local lowered = string.lower(propertyName)
 		if lowered == "attributes" or lowered == "attributereplicate" or lowered == "attributesreplicate" or lowered == "attributesserialize" then
 			local attributes = instance:GetAttributes()
-			return stableValueString(attributes), false, nil
+			return stableValueString(attributes), false, nil, true, attributes
 		end
 		if lowered == "parent" then
 			local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 			return stableValueString({
 				pathSegments = pathSegments or {},
 				pathOrdinals = pathOrdinals or {},
-			}), false, nil
+			}), false, nil, true, instance.Parent
 		end
 
 		local readName = propertyReadNameForEvent(instance, propertyName)
@@ -911,16 +1473,20 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end)
 		end
 		if not okValue then
-			return nil, false, nil
+			return nil, false, nil, false, nil
 		end
 		local directOk, directValue = encodeDirectValue(value)
-		return stableValueString(value), directOk, directValue
+		return stableValueString(value), directOk, directValue, true, value
 	end
 
-	local function shouldRecordPropertyDirty(instance: Instance, propertyName: string): (boolean, boolean, any)
-		local fingerprint, directOk, directValue = readPropertyFingerprint(instance, propertyName)
+	local function shouldRecordPropertyDirty(
+		instance: Instance,
+		propertyName: string
+	): (boolean, boolean, any, string?, boolean, any)
+		local fingerprint, directOk, directValue, valueCaptured, value =
+			readPropertyFingerprint(instance, propertyName)
 		if fingerprint == nil then
-			return true, false, nil
+			return true, false, nil, nil, valueCaptured, value
 		end
 
 		local cache = state.propertyFingerprintByInstance[instance]
@@ -931,10 +1497,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local key = propertyCacheKey(instance, propertyName)
 		local previous = cache[key]
 		cache[key] = fingerprint
-		return previous == nil or previous ~= fingerprint, directOk, directValue
+		return previous == nil or previous ~= fingerprint, directOk, directValue, fingerprint, valueCaptured, value
 	end
 
-	local function shouldRecordAttributeDirty(instance: Instance, attributeName: string): boolean
+	local function shouldRecordAttributeDirty(
+		instance: Instance,
+		attributeName: string
+	): (boolean, boolean, any, string, boolean, any)
 		local value = instance:GetAttribute(attributeName)
 		local cache = state.propertyFingerprintByInstance[instance]
 		if cache == nil then
@@ -945,7 +1514,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local fingerprint = stableValueString(value)
 		local previous = cache[key]
 		cache[key] = fingerprint
-		return previous == nil or previous ~= fingerprint
+		local directOk, directValue = encodeDirectValue(value)
+		return previous == nil or previous ~= fingerprint, directOk, directValue, fingerprint, true, value
 	end
 
 	local function connectAttributeChanged(instance: Instance, serviceName: string): RBXScriptConnection?
@@ -957,12 +1527,40 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					return
 				end
 				local attribute = tostring(attributeName)
-				if shouldRecordAttributeDirty(instance, attribute) then
-					markDirty(
-						serviceName,
-						true,
-						changeDetailsForInstance(instance, "attribute", nil, attribute, "attribute changed")
-					)
+				local shouldRecord, directOk, directValue, fingerprint, valueCaptured, value =
+					shouldRecordAttributeDirty(instance, attribute)
+				if shouldRecord then
+					if
+						consumeExpectedInstanceEvent(
+							state.expectedInstanceAttributes,
+							instance,
+							attribute,
+							fingerprint,
+							nil
+						)
+					then
+						return
+					end
+					if
+						not markDirectValue(
+							instance,
+							serviceName,
+							"attribute",
+							attribute,
+							directOk,
+							directValue,
+							valueCaptured,
+							value
+						)
+					then
+						local details =
+							changeDetailsForInstance(instance, "attribute", nil, attribute, "attribute changed")
+						details.valueCaptured = directOk
+						details.value = directValue
+						details.journalValueCaptured = valueCaptured
+						details.journalValue = value
+						markDirty(serviceName, true, details)
+					end
 				end
 			end)
 	end
@@ -974,6 +1572,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		state.instanceConnections[instance] = nil
 		state.propertyFingerprintByInstance[instance] = nil
+		state.lastParentByInstance[instance] = nil
 		state.connectedInstanceCount = math.max(0, state.connectedInstanceCount - 1)
 		for _, connection in ipairs(connections) do
 			connection:Disconnect()
@@ -993,28 +1592,57 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 
 		local connections: { RBXScriptConnection } = {}
+		state.lastParentByInstance[instance] = instance.Parent
 		local changedConnection = instance.Changed:Connect(function(propertyName: any)
 				local dirtyPropertyName = if instance:IsA("ValueBase") then "Value" else propertyName
 				if isRelevantInstanceProperty(instance, dirtyPropertyName) then
 					local property = tostring(dirtyPropertyName)
 					local lowered = string.lower(property)
-					if lowered == "name" or lowered == "parent" then
+					if lowered == "name" then
 						invalidateSiblingOrdinals(instance.Parent)
 					end
-					local shouldRecord, directOk, directValue = shouldRecordPropertyDirty(instance, property)
+					local shouldRecord, directOk, directValue, fingerprint, valueCaptured, value =
+						shouldRecordPropertyDirty(instance, property)
 					if not shouldRecord then
 						return
 					end
-					if not markDirectProperty(instance, serviceName, property, directOk, directValue) then
-						markDirty(
-							serviceName,
-							true,
-							changeDetailsForInstance(instance, "property", property, nil, "property changed")
+					if
+						consumeExpectedInstanceEvent(
+							state.expectedInstanceProperties,
+							instance,
+							lowered,
+							fingerprint,
+							nil
 						)
+					then
+						return
+					end
+					if
+						not markDirectProperty(
+							instance,
+							serviceName,
+							property,
+							directOk,
+							directValue,
+							valueCaptured,
+							value
+						)
+					then
+						local details =
+							changeDetailsForInstance(instance, "property", property, nil, "property changed")
+						details.journalValueCaptured = valueCaptured
+						details.journalValue = value
+						markDirty(serviceName, true, details)
 					end
 				end
 			end)
 		table.insert(connections, changedConnection)
+		table.insert(connections, instance.AncestryChanged:Connect(function(_, parent: Instance?)
+			local previousParent = state.lastParentByInstance[instance]
+			invalidateSiblingOrdinals(previousParent)
+			invalidateSiblingOrdinals(parent)
+			state.lastParentByInstance[instance] = parent
+		end))
 
 		local attributeConnection = connectAttributeChanged(instance, serviceName)
 		if attributeConnection ~= nil then
@@ -1074,37 +1702,80 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local service = game:GetService(serviceName)
 		state.watchedServices[serviceName] = true
 		state.serviceRoots[serviceName] = service
+		rebuildLuaSourceCounts(service)
 
 		local connections: { RBXScriptConnection } = {
 			service.Changed:Connect(function(propertyName: string)
 				local property = tostring(propertyName)
 				if not shouldIgnoreRootProperty(service, serviceName, property) then
-					local shouldRecord, directOk, directValue = shouldRecordPropertyDirty(service, property)
+					local shouldRecord, directOk, directValue, fingerprint, valueCaptured, value =
+						shouldRecordPropertyDirty(service, property)
 					if not shouldRecord then
 						return
 					end
-					if not markDirectProperty(service, serviceName, property, directOk, directValue) then
-						markDirty(
-							serviceName,
-							true,
-							changeDetailsForInstance(service, "property", property, nil, "service property changed")
+					if
+						consumeExpectedInstanceEvent(
+							state.expectedInstanceProperties,
+							service,
+							string.lower(property),
+							fingerprint,
+							nil
 						)
+					then
+						return
+					end
+					if
+						not markDirectProperty(
+							service,
+							serviceName,
+							property,
+							directOk,
+							directValue,
+							valueCaptured,
+							value
+						)
+					then
+						local details =
+							changeDetailsForInstance(service, "property", property, nil, "service property changed")
+						details.journalValueCaptured = valueCaptured
+						details.journalValue = value
+						markDirty(serviceName, true, details)
 					end
 				end
 			end),
 			service.DescendantAdded:Connect(function(instance: Instance)
+				local expected =
+					consumeExpectedInstanceEvent(state.expectedStructuralByInstance, instance, "added", nil, instance.Parent)
+				if isLuaSourceInstance(instance) then
+					adjustLuaSourceAncestors(instance, 1)
+				elseif state.luaSourceDescendantCounts[instance] == nil then
+					state.luaSourceDescendantCounts[instance] = 0
+				end
 				invalidateSiblingOrdinals(instance.Parent)
 				if not shouldIgnoreInstance(instance) and (not state.onlyCodeMode or hasLuaSourceDescendant(instance)) then
 					connectInstance(instance, serviceName)
 					reconcileAncestorConnections(instance, service, serviceName)
-					markDirty(
-						serviceName,
-						true,
-						changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
-					)
+					if not expected then
+						markDirty(
+							serviceName,
+							true,
+							changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
+						)
+					end
 				end
 			end),
 			service.DescendantRemoving:Connect(function(instance: Instance)
+				local expected = consumeExpectedInstanceEvent(
+					state.expectedStructuralByInstance,
+					instance,
+					"removed",
+					nil,
+					instance.Parent
+				)
+				local wasCodeRelevant = not state.onlyCodeMode or hasLuaSourceDescendant(instance)
+				if isLuaSourceInstance(instance) then
+					adjustLuaSourceAncestors(instance, -1)
+				end
 				if state.instanceConnections[instance] == nil then
 					return
 				end
@@ -1115,7 +1786,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					current = current.Parent
 				end
 				invalidateSiblingOrdinals(instance.Parent)
-				if not shouldIgnoreInstance(instance) and (not state.onlyCodeMode or hasLuaSourceDescendant(instance)) then
+				if not expected and not shouldIgnoreInstance(instance) and wasCodeRelevant then
 					markDirty(
 						serviceName,
 						true,
@@ -1143,7 +1814,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		connectExistingDescendants(service, serviceName)
 	end
 
-	local function unwatchService(serviceName: string)
+	local function unwatchService(serviceName: string, preservePending: boolean?)
 		local service = state.serviceRoots[serviceName]
 		if service == nil then
 			return
@@ -1163,10 +1834,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		state.watchedServices[serviceName] = nil
 		state.serviceRoots[serviceName] = nil
-		state.dirtySeqByService[serviceName] = nil
-		state.fullSyncSeqByService[serviceName] = nil
-		clearPropertyChangesForService(serviceName)
-		clearChangeLogsForService(serviceName)
+		if not preservePending then
+			state.dirtySeqByService[serviceName] = nil
+			state.fullSyncSeqByService[serviceName] = nil
+			clearPropertyChangesForService(serviceName)
+			clearChangeLogsForService(serviceName)
+			persistPendingServices()
+		end
 	end
 
 	local function stopTracking()
@@ -1177,7 +1851,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			table.insert(watched, serviceName)
 		end
 		for _, serviceName in ipairs(watched) do
-			unwatchService(serviceName)
+			unwatchService(serviceName, true)
 		end
 		for _, connection in ipairs(state.globalConnections) do
 			connection:Disconnect()
@@ -1299,8 +1973,87 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.suppressUntil = math.max(state.suppressUntil, os.clock() + duration)
 	end
 
-	function api.beginSuppress(seconds: number?)
+	local function addExpectedMutation(raw: any)
+		if type(raw) ~= "table" then
+			return
+		end
+		local function addExpected(
+			target: { [string]: ExpectedValueQueue },
+			key: string,
+			value: any
+		)
+			local queue = target[key]
+			if queue == nil then
+				queue = {}
+				target[key] = queue
+			end
+			queue[#queue + 1] = { value = value }
+		end
+		for _, change in ipairs(raw.sourceChanges or {}) do
+			local serviceName = tostring(change.service or "")
+			if allowedServices[serviceName] then
+				addExpected(
+					state.expectedProperties,
+					expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, "Source"),
+					change.source
+				)
+			end
+		end
+		for _, change in ipairs(raw.propertyChanges or {}) do
+			local serviceName = tostring(change.service or "")
+			if allowedServices[serviceName] then
+				for propertyName, value in pairs(change.properties or {}) do
+					addExpected(
+						state.expectedProperties,
+						expectedPathKey(
+							serviceName,
+							change.pathSegments,
+							change.pathOrdinals,
+							tostring(propertyName)
+						),
+						value
+					)
+				end
+				for attributeName, value in pairs(change.attributes or {}) do
+					addExpected(
+						state.expectedAttributes,
+						expectedPathKey(
+							serviceName,
+							change.pathSegments,
+							change.pathOrdinals,
+							tostring(attributeName)
+						),
+						value
+					)
+				end
+				for _, attributeName in ipairs(change.deletedAttributes or {}) do
+					addExpected(
+						state.expectedAttributes,
+						expectedPathKey(
+							serviceName,
+							change.pathSegments,
+							change.pathOrdinals,
+							tostring(attributeName)
+						),
+						nil
+					)
+				end
+			end
+		end
+	end
+
+	function api.beginSuppress(seconds: number?, expectation: any)
+		if state.suppressDepth == 0 then
+			state.expectedGeneration += 1
+			table.clear(state.expectedProperties)
+			table.clear(state.expectedAttributes)
+			table.clear(state.expectedStructuralByInstance)
+			table.clear(state.expectedInstanceProperties)
+			table.clear(state.expectedInstanceAttributes)
+			table.clear(state.expectedTags)
+		end
 		state.suppressDepth += 1
+		addExpectedMutation(expectation)
 		local duration = tonumber(seconds)
 		if duration ~= nil and duration > 0 then
 			api.suppress(duration)
@@ -1313,9 +2066,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		else
 			state.suppressDepth = 0
 		end
-		local duration = tonumber(settleSeconds)
-		if duration ~= nil and duration > 0 then
-			api.suppress(duration)
+		if state.suppressDepth == 0 then
+			local duration = tonumber(settleSeconds) or 0.2
+			if duration > 0 then
+				api.suppress(duration)
+			end
+			local generation = state.expectedGeneration
+			task.delay(math.max(0, duration), function()
+				if state.suppressDepth == 0 and state.expectedGeneration == generation then
+					table.clear(state.expectedProperties)
+					table.clear(state.expectedAttributes)
+					table.clear(state.expectedStructuralByInstance)
+					table.clear(state.expectedInstanceProperties)
+					table.clear(state.expectedInstanceAttributes)
+					table.clear(state.expectedTags)
+				end
+			end)
 		end
 	end
 
@@ -1355,14 +2121,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					end
 				end
 			end
+			persistPendingServices()
 		end
-		if params.reset == true then
+		if params.clearPending == true or params.reset == true then
 			for _, serviceName in ipairs(services) do
 				state.dirtySeqByService[serviceName] = nil
 				state.fullSyncSeqByService[serviceName] = nil
 				clearPropertyChangesForService(serviceName)
 				clearChangeLogsForService(serviceName)
 			end
+			persistPendingServices()
 		end
 	end
 
@@ -1447,7 +2215,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if params.stop == true then
 			stopTracking()
 		elseif params.start ~= false then
-			if params.reset == true then
+			if params.replaceServices == true or params.reset == true then
 				local requested = {}
 				for _, serviceName in ipairs(services) do
 					requested[serviceName] = true
@@ -1469,7 +2237,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local waitSeconds = tonumber(params.waitSeconds)
 		local waitedForChange = false
 		local waitTimedOut = false
-		if waitSeconds ~= nil and waitSeconds > 0 and params.reset ~= true and params.ackSeq == nil then
+		if
+			waitSeconds ~= nil
+			and waitSeconds > 0
+			and params.clearPending ~= true
+			and params.reset ~= true
+			and params.ackSeq == nil
+		then
 			waitedForChange = true
 			waitTimedOut = not waitForDirtyServices(services, waitSeconds)
 		end
@@ -1483,8 +2257,40 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return response
 	end
 
+	function api.hasPendingChanges(): boolean
+		for serviceName in pairs(allowedServices) do
+			if state.dirtySeqByService[serviceName] ~= nil then
+				return true
+			end
+		end
+		return false
+	end
+
+	function api.pendingChangeCount(): number
+		local count = 0
+		for _, change in pairs(state.changeLogByKey) do
+			if state.dirtySeqByService[change.service] ~= nil then
+				count += 1
+			end
+		end
+		if count > 0 then
+			return count
+		end
+		for serviceName in pairs(allowedServices) do
+			if state.dirtySeqByService[serviceName] ~= nil then
+				count += 1
+			end
+		end
+		return count
+	end
+
+	function api.onChanged(callback): RBXScriptConnection
+		return state.changeEvent.Event:Connect(callback)
+	end
+
 	function api.stop()
 		stopTracking()
+		state.changeJournal = nil
 		state.changeEvent:Destroy()
 	end
 

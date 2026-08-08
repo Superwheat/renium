@@ -4,8 +4,7 @@
     [int]$ProgressEvery = 250,
     [switch]$CompactMetaJson,
     [switch]$SkipDefaultFiltering,
-    [string[]]$Services = @(),
-    [switch]$NoProjectWrite
+    [string[]]$Services = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,15 +55,6 @@ if (-not (Test-Path -LiteralPath $SnapshotDir)) {
 
 $srcRoot = Join-Path $ProjectRoot "src"
 New-Item -ItemType Directory -Force -Path $srcRoot | Out-Null
-$projectRootFullPath = [System.IO.Path]::GetFullPath($ProjectRoot)
-$trimmedProjectRoot = $projectRootFullPath.TrimEnd([char[]]@(
-    [System.IO.Path]::DirectorySeparatorChar,
-    [System.IO.Path]::AltDirectorySeparatorChar
-))
-$projectName = [System.IO.Path]::GetFileName($trimmedProjectRoot)
-if ([string]::IsNullOrWhiteSpace($projectName)) {
-    $projectName = "ReniumProject"
-}
 
 function Sanitize-Name {
     param([string]$Name)
@@ -1022,22 +1012,4 @@ foreach ($service in $TargetServices) {
     }
 }
 
-if (-not $NoProjectWrite) {
-    $tree = [ordered]@{ '$className' = 'DataModel' }
-    foreach ($service in $TargetServices) {
-        $tree[$service] = [ordered]@{ '$path' = "src/$service" }
-    }
-
-    $project = [ordered]@{
-        name = $projectName
-        tree = $tree
-    }
-
-    $projectPath = Join-Path $ProjectRoot "default.project.generated.json"
-    $projectJson = $project | ConvertTo-Json -Depth 20
-    Write-Utf8File -Path $projectPath -Content $projectJson
-
-    Write-Output "Imported snapshots into src tree and wrote default.project.generated.json"
-} else {
-    Write-Output "Imported snapshots into src tree"
-}
+Write-Output "Imported snapshots into src tree"

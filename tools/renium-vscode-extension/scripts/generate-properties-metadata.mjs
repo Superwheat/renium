@@ -566,6 +566,11 @@ function isWritablePropertyForClass(classes, className, declaringClass, property
     return false;
   }
   const defaultBacked = isDefaultBackedProperty(classes, className, declaringClass, propertyName);
+  const materialServiceOverride = className === "MaterialService" &&
+    declaringClass === "MaterialService" &&
+    property.Category === "Material Overrides" &&
+    propertyDataType(property) === "String" &&
+    isSerializedProperty(property);
   if (property.MemberType && property.MemberType !== "Property") {
     return false;
   }
@@ -574,14 +579,14 @@ function isWritablePropertyForClass(classes, className, declaringClass, property
     (writeSecurity === undefined || ALLOWED_WRITE_SECURITY.has(writeSecurity));
   if (hasBlockedTag(property, {
     allowHidden: defaultBacked && allowsHiddenDefaultBackedProperty(propertyName, property),
-    allowNotScriptable: defaultBacked || apiDumpStudioWritable,
+    allowNotScriptable: defaultBacked || apiDumpStudioWritable || materialServiceOverride,
   })) {
     return false;
   }
-  if (!defaultBacked && writeSecurity !== undefined && !ALLOWED_WRITE_SECURITY.has(writeSecurity)) {
+  if (!defaultBacked && !materialServiceOverride && writeSecurity !== undefined && !ALLOWED_WRITE_SECURITY.has(writeSecurity)) {
     return false;
   }
-  if (!defaultBacked && property.Scriptability && property.Scriptability !== "ReadWrite") {
+  if (!defaultBacked && !materialServiceOverride && property.Scriptability && property.Scriptability !== "ReadWrite") {
     return false;
   }
   if (!isSerializedProperty(property) && !allowsNonSerializedPropertyForClass(className, propertyName)) {
@@ -1110,7 +1115,9 @@ export function generateRobloxPropertiesMetadata(options = {}) {
   };
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  const studioApiSchemaPath = writeStudioApiSchemaModule(repoRoot, generatedClasses);
+  const studioApiSchemaPath = process.env.RENIUM_SKIP_PLUGIN_SCHEMA_WRITE === "1"
+    ? undefined
+    : writeStudioApiSchemaModule(repoRoot, generatedClasses);
   const classList = writeRobloxClassListModule(extensionRoot, classes);
   return {
     outputPath,

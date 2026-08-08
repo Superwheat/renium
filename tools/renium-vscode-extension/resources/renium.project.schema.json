@@ -1,0 +1,369 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json",
+  "title": "Renium project",
+  "type": "object",
+  "required": [
+    "schemaVersion"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sourceRoot": {
+      "type": "string",
+      "default": "src"
+    },
+    "buildTarget": {
+      "$ref": "#/$defs/target"
+    },
+    "root": {
+      "$ref": "#/$defs/node"
+    },
+    "tree": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "mounts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mount"
+      }
+    },
+    "adapters": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/adapter"
+      }
+    },
+    "syncRules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/syncRule"
+      }
+    },
+    "globIgnorePaths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "filters": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/filter"
+      }
+    },
+    "scriptExtension": {
+      "enum": [
+        "preserve",
+        "luau",
+        "lua"
+      ],
+      "default": "preserve"
+    },
+    "exportNaming": {
+      "type": "object",
+      "properties": {
+        "serverSuffix": {
+          "type": "string",
+          "default": ".server"
+        },
+        "clientSuffix": {
+          "type": "string",
+          "default": ".client"
+        },
+        "moduleSuffix": {
+          "type": "string",
+          "default": ""
+        },
+        "pluginSuffix": {
+          "type": "string",
+          "default": ".plugin"
+        },
+        "clientRunContextSuffix": {
+          "type": "string",
+          "default": ".run-client"
+        }
+      },
+      "additionalProperties": false
+    },
+    "settings": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "target": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "required": [
+            "segments"
+          ],
+          "properties": {
+            "segments": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "ordinals": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "$id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "$path": {
+          "type": "string"
+        },
+        "$className": {
+          "type": "string"
+        },
+        "$properties": {
+          "type": "object"
+        },
+        "$attributes": {
+          "type": "object"
+        },
+        "$tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "$ignoreUnknownInstances": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "mount": {
+      "type": "object",
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "ownership": {
+          "enum": [
+            "exclusive",
+            "overlay",
+            "read-only"
+          ],
+          "default": "exclusive"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "adapter": {
+      "type": "object",
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "output": {
+          "type": "string"
+        },
+        "format": {
+          "enum": [
+            "txt",
+            "csv",
+            "json",
+            "jsonc",
+            "toml",
+            "yaml",
+            "msgpack",
+            "markdown",
+            "model-json",
+            "rbxm",
+            "rbxmx",
+            "nested-project"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "to-project",
+            "from-project",
+            "two-way"
+          ],
+          "default": "to-project"
+        },
+        "generated": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "syncRule": {
+      "type": "object",
+      "required": [
+        "pattern",
+        "use"
+      ],
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exclude": {
+          "type": "string",
+          "minLength": 1
+        },
+        "use": {
+          "enum": [
+            "ignore",
+            "moduleScript",
+            "serverScript",
+            "clientScript",
+            "pluginScript",
+            "txt",
+            "csv",
+            "json",
+            "jsonc",
+            "toml",
+            "yaml",
+            "msgpack",
+            "markdown",
+            "model-json",
+            "rbxm",
+            "rbxmx",
+            "nested-project"
+          ]
+        },
+        "suffix": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "filter": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "enum": [
+            "include",
+            "ignore"
+          ],
+          "default": "ignore"
+        },
+        "direction": {
+          "enum": [
+            "both",
+            "studio-to-files",
+            "files-to-studio"
+          ],
+          "default": "both"
+        },
+        "glob": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "class": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "attribute": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "glob"
+          ]
+        },
+        {
+          "required": [
+            "name"
+          ]
+        },
+        {
+          "required": [
+            "class"
+          ]
+        },
+        {
+          "required": [
+            "tag"
+          ]
+        },
+        {
+          "required": [
+            "attribute"
+          ]
+        },
+        {
+          "required": [
+            "property"
+          ]
+        },
+        {
+          "required": [
+            "id"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

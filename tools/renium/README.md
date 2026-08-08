@@ -32,13 +32,13 @@ src/
     SomeScript.server.luau            properties, attributes
   ServerScriptService/
     ...
-default.project.generated.json
+sourcemap.json
 ```
 
 Script sources live as normal `.luau` files you edit directly. The `.renium`
-store holds the instance tree and every other property. Both are the sync
-source of truth; Studio is updated from them and dirty Studio changes are
-imported back.
+store holds the instance tree and every other property. Together they contain
+the saved project state. Studio is updated from them, and Studio edits are
+written back.
 
 ## Installation
 
@@ -51,9 +51,9 @@ rbx       renium            (macOS; chmod +x both)
 
 `rbx` is the short launcher used in every example below. It finds the CLI in
 this order: `RENIUM_CLI` env var → `PATH` → next to the launcher → `bin\` next
-to the launcher → source-repo build folder. macOS support is implemented
-(Quartz input/capture, needs Accessibility + Screen Recording permissions) but
-not yet live-verified.
+to the launcher → source-repo build folder. macOS support is implemented but
+not yet live-verified. Input and capture use Quartz and need Accessibility and
+Screen Recording permissions.
 
 ## Quick start
 
@@ -66,9 +66,12 @@ not yet live-verified.
 
    `setup` installs `Renium.rbxm` into your Roblox Plugins folder — from
    a copy next to the exe if present, otherwise downloading the latest GitHub
-   release (`--file <path>` and `--dir <plugins dir>` override both). The VS
-   Code extension has the same thing as **Renium: Install Studio Plugin** in
-   the command palette and the Renium status-bar menu.
+   release (`--file <path>` and `--dir <plugins dir>` override both). On macOS,
+   it also prepares `~/Applications/Renium Studio.app`. Open that app instead
+   of the original Studio app so Renium can serialize protected properties
+   directly to a local file without showing a file picker. The original Studio
+   app is not changed. The VS Code extension provides the same setup through
+   **Renium: Install Studio Plugin** in the command palette and status-bar menu.
 2. Start the daemon and leave it running:
 
    ```powershell
@@ -82,7 +85,8 @@ not yet live-verified.
    ```
 
    This writes service snapshots and imports them into `src/`. From the
-   extension, this is **Renium: Full Sync**.
+   extension, use **Renium: Pull Studio to Files**. Use **Renium: Push Files to
+   Studio** for the opposite direction.
 
 4. Check the connection any time:
 
@@ -92,8 +96,8 @@ not yet live-verified.
 
 The daemon is found automatically by later commands (env vars
 `RENIUM_DAEMON`, `RENIUM_DAEMON_HOST`/`RENIUM_DAEMON_CONTROL_PORT`,
-`RENIUM_DAEMON_FILE`, then `.renium-daemon.json` in the project,
-`%LOCALAPPDATA%\Renium\daemon.json`, then the default local endpoint).
+`RENIUM_DAEMON_FILE`, then `%LOCALAPPDATA%\Renium\daemon.json`, then the
+default local endpoint).
 
 `rbx bd` is a standalone long-running process. It keeps ports 8781-8782 open
 until it is stopped. `--editor-stdio` is reserved for the VS Code extension's
@@ -101,6 +105,91 @@ owned child process: it reads daemon requests from stdin and exits when its
 owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.
 The older `-s`/`--serve` spelling is accepted for compatibility but is no
 longer required.
+
+## Projects, adapters, and builds
+
+`renium.project.jsonc` is optional. It controls the source directory, projected
+tree, mounts, adapters, filters, and script naming without replacing the
+full-fidelity `.renium` stores.
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json",
+  "schemaVersion": 1,
+  "name": "my-place",
+  "sourceRoot": "game"
+}
+```
+
+Service folders directly under `sourceRoot` are mapped automatically. Use `tree`
+only for sources that need a different target. The extension Pull and Push
+commands honor `sourceRoot`; it does not have to be `src`.
+Renium discovers the nearest project file, or you can pin one globally:
+
+```powershell
+rbx --project .\renium.project.jsonc build -o .\build\place.rbxl
+rbx fmt-project --project .\renium.project.jsonc
+rbx explain-path .\game\ReplicatedStorage\Config.luau --project .\renium.project.jsonc
+rbx generate-sourcemap --project .\renium.project.jsonc --stdout --filter "**/*.luau"
+```
+
+Create a project without replacing files that already exist:
+
+```powershell
+rbx init .\my-place --with git,wally,selene,docs
+rbx init .\empty-project --preview
+```
+
+Adapters explicitly map non-Luau files into Roblox instances. TXT maps to
+`StringValue`, CSV maps to `LocalizationTable`, model JSON maps to an instance
+subtree, and JSON/JSONC/TOML/YAML/MessagePack/Markdown generate deterministic
+ModuleScripts. Markdown is converted to escaped Roblox RichText before it is
+returned. Roblox models and nested Renium or Rojo projects can be mounted.
+Generated or one-way formats must be marked as such in the project file. Mounts
+can be `exclusive`, `overlay`, or `read-only`, and can be `optional`.
+
+```powershell
+rbx adapters validate
+rbx adapters build
+rbx adapters build --check
+rbx adapters watch
+rbx adapters syncback
+rbx adapters syncback --preview
+rbx import-rojo --project .\default.project.json --preview
+rbx import-rojo --project .\default.project.json --apply
+```
+
+Two-way TXT, CSV, and model-JSON adapters update their canonical instances
+during `adapters build` or `adapters watch`. Studio imports update their source
+files after pulling from Studio.
+
+For a controlled Studio-to-files import, preview the included and ignored
+instances plus every planned file write, deletion, and adapter update first:
+
+```powershell
+rbx syncback --input .\snapshots --list
+rbx syncback --input .\snapshots --dry-run
+rbx syncback --input .\snapshots -y
+rbx import-path .\Shared.luau --path-json '["ReplicatedStorage","Shared"]' --dry-run
+```
+
+Filters are ordered and last-match wins. They can match path glob, name, class,
+tag, attribute, or property and can apply to either sync direction. Ignored
+Studio instances and ignored script sources remain unchanged, including during
+a structural reconcile.
+
+Shared settings merge in this order: user, workspace, experience, place, then
+the project file's `settings` object. Explicit editor settings and CLI flags
+override the merged value.
+
+```powershell
+rbx config list --origins
+rbx config get liveSync.changesThreshold
+rbx config set liveSync.changesThreshold 10 --scope place
+rbx config unset liveSync.changesThreshold --scope place
+rbx config edit --scope user
+rbx config export -o effective-renium-config.json
+```
 
 ## Everyday commands
 
@@ -171,10 +260,11 @@ rbx press "Workspace.Button" --world  # click a part or model's on-screen positi
 ```
 
 Multiple games open at once: every bridge reports its place (`rbx clients` shows
-`placeName`/`placeId`), and when connected bridges span more than one place,
+`placeName`, `placeId`, and `gameId`), and when connected bridges span more than one place,
 commands refuse with the list instead of guessing. Pin commands to one game with
-the `RENIUM_PLACE` env var or the global `--place <name|id>` flag (id, exact
-name, or substring). With a single game open no filter is needed.
+the `RENIUM_PLACE` env var or the global `--place <name|id|gameId:placeId>`
+flag. The pair form is exact; names can be exact or substring matches. With a
+single game open no filter is needed.
 
 Multiple Studio windows can also have the same place open. `rbx clients` exposes
 their distinct `runtimeId` values. Renium chooses the most recently focused
@@ -205,6 +295,8 @@ Read Studio console output:
 ```powershell
 rbx c           # latest message
 rbx cl 10       # last 10 messages
+rbx co --follow --level error
+rbx test --mode play --players 2 --timeout 30 --fail-on-error
 ```
 
 Push editor changes to Studio:
@@ -244,7 +336,72 @@ Export Studio to files:
 ```powershell
 rbx x -r . -d snapshots --no-run-import    # snapshots only
 rbx x -r . -d snapshots --run-import       # snapshots + import into src/
+rbx x -r . --src-dir game -d snapshots --run-import
 ```
+
+Friendly structural commands edit the canonical store by stable id:
+
+```powershell
+rbx create Workspace --class Folder --name NewFolder
+rbx rename Workspace --id editor:id "New name"
+rbx move Workspace --id editor:id --parent-id editor:parent
+```
+
+## Lifecycle, diagnostics, and publishing
+
+Install scripts place `renium` and `rbx` on the user PATH and install the Studio
+plugin:
+
+```powershell
+.\install.ps1
+.\install.ps1 -Uninstall
+```
+
+```sh
+./install.sh
+./install.sh --uninstall
+```
+
+The CLI can inspect, repair, or remove the Studio plugin and can update matched
+release components from a signed manifest:
+
+```powershell
+rbx setup --status
+rbx setup --repair
+rbx setup --uninstall
+rbx update check
+rbx update apply --component all --dry-run
+rbx doctor --json
+rbx doctor --bundle .\.renium\diagnostics\release-check
+```
+
+Named daemons are selected with the global `--daemon` flag:
+
+```powershell
+rbx --daemon playtest bd
+rbx daemon list
+rbx daemon status playtest
+rbx daemon stop playtest
+rbx daemon clean
+```
+
+Resolve or launch the exact Studio file without choosing an ambiguous project:
+
+```powershell
+rbx studio .\place.rbxl --check
+rbx --project .\renium.project.jsonc studio
+```
+
+Publish a place through Open Cloud. Renium validates the universe and place
+against `renium.experience.json` when that file exists:
+
+```powershell
+$env:ROBLOX_API_KEY = "..."
+rbx --project .\renium.project.jsonc upload-place --universe-id 123 --place-id 456
+```
+
+`rbx docs [topic]` prints the bundled reference. `rbx docs --serve` exposes the
+same text on a read-only loopback page.
 
 ## Exploring and editing the store
 
@@ -513,3 +670,66 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
   stops with an error instead of replacing them with empty content.
 - Infinity, negative Infinity, and NaN use Renium's tagged float transport and
   round-trip without being converted to finite JSON numbers.
+
+## Automation opcode registry
+
+<!-- automation-opcodes:start -->
+Protocol version: `1`
+
+| ID | Operation | Aliases | Review |
+|---:|---|---|:---:|
+| 0 | `cap` | - | no |
+| 1 | `bind` | - | no |
+| 2 | `context` | - | no |
+| 3 | `unbind` | - | no |
+| 10 | `pull` | - | yes |
+| 11 | `push` | - | yes |
+| 12 | `live-start` | - | no |
+| 13 | `live-stop` | - | no |
+| 14 | `live-status` | - | no |
+| 15 | `retry-pending` | - | no |
+| 16 | `discard-pending` | - | no |
+| 20 | `find` | - | no |
+| 21 | `tree` | - | no |
+| 22 | `inspect` | - | no |
+| 23 | `batch` | bb | no |
+| 30 | `get-property` | - | no |
+| 31 | `set-property` | - | yes |
+| 32 | `set-source` | - | no |
+| 33 | `add` | - | no |
+| 34 | `clone` | - | no |
+| 35 | `move` | - | no |
+| 36 | `remove` | - | no |
+| 37 | `revert` | - | no |
+| 40 | `import-model` | - | no |
+| 41 | `export-model` | - | no |
+| 42 | `export-place` | - | no |
+| 43 | `import-snapshots` | - | no |
+| 44 | `export-snapshots` | - | no |
+| 45 | `sourcemap` | - | no |
+| 50 | `studios` | - | no |
+| 51 | `studio-status` | - | no |
+| 52 | `studio-open` | - | yes |
+| 53 | `studio-close` | - | yes |
+| 54 | `luau` | - | no |
+| 55 | `console` | - | no |
+| 56 | `play-start` | - | no |
+| 57 | `play-stop` | - | no |
+| 58 | `shot` | - | no |
+| 59 | `device` | - | no |
+| 60 | `ui` | - | no |
+| 61 | `press` | - | no |
+| 62 | `click` | - | no |
+| 63 | `key` | - | no |
+| 64 | `type` | - | no |
+| 65 | `wait` | - | no |
+| 66 | `goto` | - | no |
+| 70 | `project-init` | - | no |
+| 71 | `project-validate` | - | no |
+| 72 | `place-add` | - | no |
+| 73 | `place-rename` | - | no |
+| 74 | `place-reorder` | - | no |
+| 80 | `review-prepare` | - | no |
+| 81 | `review-apply` | - | no |
+| 82 | `review-reject` | - | no |
+<!-- automation-opcodes:end -->

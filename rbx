@@ -7,14 +7,14 @@ CLI=""
 if [ -n "${RENIUM_CLI:-}" ] && [ -x "${RENIUM_CLI}" ]; then
   CLI=$RENIUM_CLI
 fi
-if [ -z "$CLI" ]; then
-  CLI=$(command -v renium 2>/dev/null || true)
-fi
-for candidate in "$script_dir/renium" "$script_dir/bin/renium" "$script_dir/tools/renium/target/release/renium"; do
+for candidate in "$script_dir/renium" "$script_dir/bin/renium" "${XDG_DATA_HOME:-$HOME/.local/share}/renium/renium" "$script_dir/tools/renium/target/release/renium"; do
   if [ -z "$CLI" ] && [ -x "$candidate" ]; then
     CLI=$candidate
   fi
 done
+if [ -z "$CLI" ]; then
+  CLI=$(command -v renium 2>/dev/null || true)
+fi
 if [ -z "$CLI" ]; then
   echo "Renium CLI not found. Install renium on PATH or set RENIUM_CLI to its full path." >&2
   exit 127
@@ -26,9 +26,21 @@ usage_exit() {
 }
 
 ensure_daemon() {
-  if ! pgrep -x renium >/dev/null 2>&1; then
-    "$CLI" bd >/dev/null 2>&1 &
-    sleep 1
+  if "$CLI" daemon status >/dev/null 2>&1; then
+    return
+  fi
+  "$CLI" bd >/dev/null 2>&1 &
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    if "$CLI" daemon status >/dev/null 2>&1; then
+      return
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  if ! "$CLI" daemon status >/dev/null 2>&1; then
+    echo "Renium daemon did not become ready." >&2
+    exit 1
   fi
 }
 
@@ -37,15 +49,78 @@ run_with_console() {
   code=$2
   wait_seconds=${3:-2}
   ensure_daemon
-  since=$("$CLI" co -n 1 2>/dev/null | sed -n 's/.*"nextSeq": *\([0-9]*\).*/\1/p')
-  since=${since:-0}
+  if [ "$client_flag" = "client" ]; then
+    if ! "$CLI" clients 2>/dev/null | grep -Eq '"role"[[:space:]]*:[[:space:]]*"play-client"'; then
+      "$CLI" play -s || exit $?
+      attempts=0
+      while [ "$attempts" -lt 60 ]; do
+        if "$CLI" clients 2>/dev/null | grep -Eq '"role"[[:space:]]*:[[:space:]]*"play-client"'; then
+          break
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.1
+      done
+      if [ "$attempts" -ge 60 ]; then
+        echo "A Studio play client did not connect." >&2
+        exit 1
+      fi
+    fi
+    if ! seed=$("$CLI" co --client -n 1 2>/dev/null); then
+      echo "Could not read the Studio console baseline." >&2
+      exit 1
+    fi
+  else
+    if ! seed=$("$CLI" co -n 1 2>/dev/null); then
+      echo "Could not read the Studio console baseline." >&2
+      exit 1
+    fi
+  fi
+  since=$(printf '%s\n' "$seed" | sed -n 's/.*"nextSeq": *\([0-9]*\).*/\1/p')
+  epoch=$(printf '%s\n' "$seed" | sed -n 's/.*"epoch": *"\([^"]*\)".*/\1/p')
+  if [ -z "$since" ] || [ -z "$epoch" ]; then
+    echo "Studio console baseline was malformed." >&2
+    exit 1
+  fi
   if [ "$client_flag" = "client" ]; then
     "$CLI" lx -c -e "$code" || exit $?
   else
     "$CLI" lx -e "$code" || exit $?
   fi
   sleep "$wait_seconds"
-  "$CLI" co -n 20 -s "$since"
+  while :; do
+    if [ "$client_flag" = "client" ]; then
+      page=$("$CLI" co --client -n 200 -s "$since") || exit $?
+    else
+      page=$("$CLI" co -n 200 -s "$since") || exit $?
+    fi
+    page_epoch=$(printf '%s\n' "$page" | sed -n 's/.*"epoch": *"\([^"]*\)".*/\1/p')
+    if [ -z "$page_epoch" ]; then
+      echo "Studio console page was malformed." >&2
+      exit 1
+    fi
+    if [ "$page_epoch" != "$epoch" ]; then
+      echo "Studio console restarted while output was being collected." >&2
+      epoch=$page_epoch
+      since=0
+      continue
+    fi
+    truncated=$(printf '%s\n' "$page" | sed -n 's/.*"truncated": *\(true\|false\).*/\1/p')
+    if [ "$truncated" = "true" ]; then
+      echo "Studio console output was truncated before it could be read." >&2
+      exit 1
+    fi
+    printf '%s\n' "$page"
+    next=$(printf '%s\n' "$page" | sed -n 's/.*"nextSeq": *\([0-9]*\).*/\1/p')
+    has_more=$(printf '%s\n' "$page" | sed -n 's/.*"hasMore": *\(true\|false\).*/\1/p')
+    if [ "$has_more" != "true" ]; then
+      break
+    fi
+    if [ -z "$next" ] || [ "$next" -le "$since" ]; then
+      echo "Renium console cursor did not advance." >&2
+      exit 1
+    fi
+    since=$next
+  done
 }
 
 cmd=${1:-}

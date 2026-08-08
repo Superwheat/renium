@@ -1,7 +1,7 @@
 # Renium Studio plugin
 
-`Renium.project.json` is the source of truth for the Studio plugin. The two
-generated convenience artifacts are:
+`Renium.project.json` defines the Studio plugin bundle. The two generated
+artifacts are:
 
 - `Renium.rbxm` — binary model for normal Studio installation.
 - `Renium.rbxmx` — XML model for inspection and source-control review.

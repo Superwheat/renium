@@ -390,6 +390,7 @@ local function makeInput(controlHost, placeholder, refs)
 	textBox.Size = UDim2.fromScale(1, 1)
 	textBox.BackgroundTransparency = 1
 	textBox.ClearTextOnFocus = false
+	textBox.FontFace = FONT_REGULAR
 	textBox.PlaceholderText = placeholder
 	textBox.Text = ""
 	textBox.FontFace = FONT_MONO
@@ -411,6 +412,26 @@ local function makeInput(controlHost, placeholder, refs)
 	table.insert(refs.fields, box)
 	table.insert(refs.fieldStrokes, stroke)
 	table.insert(refs.fieldTexts, textBox)
+	return textBox
+end
+
+local function makeSelectableText(parent, name, refs)
+	local textBox = Instance.new("TextBox")
+	textBox.Name = name
+	textBox.AutomaticSize = Enum.AutomaticSize.Y
+	textBox.Size = UDim2.new(1, 0, 0, 0)
+	textBox.BackgroundTransparency = 1
+	textBox.ClearTextOnFocus = false
+	textBox.MultiLine = true
+	textBox.Text = ""
+	textBox.TextEditable = false
+	textBox.FontFace = FONT_REGULAR
+	textBox.TextSize = TEXT_XS
+	textBox.TextWrapped = true
+	textBox.TextXAlignment = Enum.TextXAlignment.Left
+	textBox.TextYAlignment = Enum.TextYAlignment.Top
+	textBox.Parent = parent
+	table.insert(refs.dimmed, textBox)
 	return textBox
 end
 
@@ -798,7 +819,8 @@ local function buildSettingsWidget(plugin)
 	local changesHost = makeRow(advanced, "Changes threshold", "Maximum Studio changes to take through the granular fast path before Renium uses a protected full import.", 1, refs, true, 96)
 	local changesThresholdBox = makeInput(changesHost, "5", refs)
 	settingInputs.changesThreshold = changesThresholdBox
-	addDropdownRow(advanced, "Log level", "Amount of bridge diagnostic output shown in Studio.", 2, false, "logLevel", {
+	addToggleRow(advanced, "Notifications", "Show notices for waiting changes, reviews, and component problems.", 2, false, "notifications")
+	addDropdownRow(advanced, "Log level", "Amount of bridge diagnostic output shown in Studio.", 3, false, "logLevel", {
 		{ value = "off", label = "Off" },
 		{ value = "error", label = "Error" },
 		{ value = "warn", label = "Warn" },
@@ -938,24 +960,94 @@ local function buildStatusWidget(plugin, versionText)
 	statusTitle.Size = UDim2.new(1, -20, 1, 0)
 	table.insert(refs.text, statusTitle)
 
-	local statusSubtitle = makeText(card, "StatusSubtitle", "Start the sync server, then connect.", {
-		size = TEXT_XS,
-		autoHeight = true,
-		wrap = true,
-	})
+	local statusSubtitle = makeSelectableText(card, "StatusSubtitle", refs)
+	statusSubtitle.Text = "Start the sync server, then connect."
 	statusSubtitle.LayoutOrder = 2
-	table.insert(refs.dimmed, statusSubtitle)
 
 	local syncLine = makeText(card, "SyncedAt", "Not connected", { size = TEXT_XS })
 	syncLine.Size = UDim2.new(1, 0, 0, 18)
 	syncLine.LayoutOrder = 3
 	table.insert(refs.dimmed, syncLine)
 
+	local notificationCard = makeCard(content, "Notification", refs)
+	notificationCard.LayoutOrder = 3
+	notificationCard.Visible = false
+	addPadding(notificationCard, 14, 14, 12, 12)
+	addVerticalList(notificationCard, 6)
+
+	local notificationTitle = makeText(notificationCard, "NotificationTitle", "", {
+		font = FONT_MEDIUM,
+		size = TEXT_SM,
+		autoHeight = true,
+		wrap = true,
+	})
+	notificationTitle.LayoutOrder = 1
+	table.insert(refs.text, notificationTitle)
+
+	local notificationBody = makeSelectableText(notificationCard, "NotificationBody", refs)
+	notificationBody.LayoutOrder = 2
+
+	local notificationActions = Instance.new("Frame")
+	notificationActions.Name = "NotificationActions"
+	notificationActions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
+	notificationActions.BackgroundTransparency = 1
+	notificationActions.LayoutOrder = 3
+	notificationActions.Parent = notificationCard
+
+	local notificationActionButton = Instance.new("TextButton")
+	notificationActionButton.Name = "Action"
+	notificationActionButton.Size = UDim2.new(0.4, -4, 1, 0)
+	notificationActionButton.Text = "Open"
+	notificationActionButton.Parent = notificationActions
+	styleButton(notificationActionButton, refs, true)
+
+	local notificationSnoozeButton = Instance.new("TextButton")
+	notificationSnoozeButton.Name = "Snooze"
+	notificationSnoozeButton.Position = UDim2.new(0.4, 4, 0, 0)
+	notificationSnoozeButton.Size = UDim2.new(0.3, -4, 1, 0)
+	notificationSnoozeButton.Text = "Snooze"
+	notificationSnoozeButton.Parent = notificationActions
+	styleButton(notificationSnoozeButton, refs, false)
+
+	local notificationDismissButton = Instance.new("TextButton")
+	notificationDismissButton.Name = "Dismiss"
+	notificationDismissButton.AnchorPoint = Vector2.new(1, 0)
+	notificationDismissButton.Position = UDim2.new(1, 0, 0, 0)
+	notificationDismissButton.Size = UDim2.new(0.3, -4, 1, 0)
+	notificationDismissButton.Text = "Dismiss"
+	notificationDismissButton.Parent = notificationActions
+	styleButton(notificationDismissButton, refs, false)
+
+	local syncActions = Instance.new("Frame")
+	syncActions.Name = "SyncActions"
+	syncActions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
+	syncActions.BackgroundTransparency = 1
+	syncActions.LayoutOrder = 4
+	syncActions.Parent = content
+
+	local pullButton = Instance.new("TextButton")
+	pullButton.Name = "PullFromStudio"
+	pullButton.Size = UDim2.new(0.5, -4, 1, 0)
+	pullButton.Text = "Pull Studio to files"
+	pullButton.Parent = syncActions
+	styleButton(pullButton, refs, false)
+	setButtonEnabled(pullButton, false)
+
+	local pushButton = Instance.new("TextButton")
+	pushButton.Name = "PushToStudio"
+	pushButton.AnchorPoint = Vector2.new(1, 0)
+	pushButton.Position = UDim2.new(1, 0, 0, 0)
+	pushButton.Size = UDim2.new(0.5, -4, 1, 0)
+	pushButton.Text = "Push files to Studio"
+	pushButton.Parent = syncActions
+	styleButton(pushButton, refs, false)
+	setButtonEnabled(pushButton, false)
+
 	local actions = Instance.new("Frame")
 	actions.Name = "Actions"
 	actions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
 	actions.BackgroundTransparency = 1
-	actions.LayoutOrder = 3
+	actions.LayoutOrder = 5
 	actions.Parent = content
 
 	local primarySlot = Instance.new("Frame")
@@ -995,6 +1087,14 @@ local function buildStatusWidget(plugin, versionText)
 		statusTitle = statusTitle,
 		statusSubtitle = statusSubtitle,
 		syncLine = syncLine,
+		notificationCard = notificationCard,
+		notificationTitle = notificationTitle,
+		notificationBody = notificationBody,
+		notificationActionButton = notificationActionButton,
+		notificationSnoozeButton = notificationSnoozeButton,
+		notificationDismissButton = notificationDismissButton,
+		pullButton = pullButton,
+		pushButton = pushButton,
 		settingsButton = settingsButton,
 		disconnectButton = disconnectButton,
 		connectButton = connectButton,
@@ -1699,6 +1799,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 			if resolvedInstance.Name ~= desiredName then
 				table.insert(node.props, {
 					name = "Name",
+					typeName = "string",
 					oldText = resolvedInstance.Name,
 					newText = desiredName,
 				})
@@ -1707,6 +1808,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 			if desiredParent ~= nil and resolvedInstance.Parent ~= desiredParent then
 				table.insert(node.props, {
 					name = "Parent",
+					typeName = "Instance",
 					oldText = resolvedInstance.Parent ~= nil and formatInstancePath(resolvedInstance.Parent) or "Not set",
 					newText = formatInstancePath(desiredParent),
 				})
@@ -1716,6 +1818,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				if currentParentPath ~= desiredParentPath then
 					table.insert(node.props, {
 						name = "Parent",
+						typeName = "Instance",
 						oldText = currentParentPath,
 						newText = desiredParentPath,
 					})
@@ -1732,6 +1835,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				elseif node.instance.ClassName ~= className then
 					table.insert(node.props, {
 						name = "ClassName",
+						typeName = "string",
 						oldText = node.instance.ClassName,
 						newText = className,
 					})
@@ -1749,6 +1853,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				elseif newClass ~= "" and node.instance.ClassName ~= newClass then
 					table.insert(node.props, {
 						name = "ClassName",
+						typeName = "string",
 						oldText = node.instance.ClassName,
 						newText = newClass,
 					})
@@ -1835,8 +1940,14 @@ local function buildReviewTree(summaryRows, groups, helpers)
 					local componentOldValue = haveOld and not oldValueMissing and oldValue or nil
 					local componentNewValue = if deleting then nil elseif haveNew then newValue else entry.value
 					local components = reviewValueComponents(componentOldValue, componentNewValue)
+					local typeName = tostring(entry.dataType or entry.valueType or "")
+					if typeName == "" then
+						local typedValue = if haveNew then newValue elseif haveOld then oldValue else entry.value
+						typeName = typeof(typedValue)
+					end
 					table.insert(node.props, {
 						name = name,
+						typeName = typeName,
 						oldText = oldText,
 						newText = newText,
 						components = components,
@@ -2065,11 +2176,14 @@ local function bindReviewRow(reviewUi, row, item)
 			bar.BackgroundColor3 = p.Dimmed
 		end
 		row.icon.Visible = false
+		local propertyName = if prop.typeName and prop.typeName ~= ""
+			then `{escapeRich(prop.name)} <font color="{dimHex}">[{escapeRich(prop.typeName)}]</font>`
+			else escapeRich(prop.name)
 		local html = if prop.oldText and not item.node.status
 			then string.format(
 				'<font color="%s">%s</font>  <s><font color="%s">%s</font></s> <font color="%s">→</font> <font color="%s">%s</font>',
 				dimHex,
-				escapeRich(prop.name),
+				propertyName,
 				redHex,
 				escapeRich(prop.oldText),
 				dimHex,
@@ -2079,7 +2193,7 @@ local function bindReviewRow(reviewUi, row, item)
 			else string.format(
 				'<font color="%s">%s</font>  <font color="%s">%s</font>',
 				dimHex,
-				escapeRich(prop.name),
+				propertyName,
 				textHex,
 				escapeRich(prop.newText)
 			)
@@ -2144,6 +2258,13 @@ local function buildReviewWidget(plugin)
 	subtitle.Position = UDim2.fromOffset(0, 28)
 	table.insert(refs.dimmed, subtitle)
 
+	local searchHost = Instance.new("Frame")
+	searchHost.Name = "Search"
+	searchHost.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
+	searchHost.BackgroundTransparency = 1
+	searchHost.Parent = root
+	local searchBox = makeInput(searchHost, "Search changes", refs)
+
 	local listCard = Instance.new("Frame")
 	listCard.Name = "List"
 	listCard.BorderSizePixel = 0
@@ -2154,7 +2275,9 @@ local function buildReviewWidget(plugin)
 	table.insert(refs.cardStrokes, listStroke)
 
 	local function layoutListCard()
-		local top = 28 + math.max(subtitle.AbsoluteSize.Y, DESCRIPTION_TEXT + 3) + 12
+		local searchTop = 28 + math.max(subtitle.AbsoluteSize.Y, DESCRIPTION_TEXT + 3) + 10
+		searchHost.Position = UDim2.fromOffset(0, searchTop)
+		local top = searchTop + CONTROL_HEIGHT + 10
 		listCard.Position = UDim2.fromOffset(0, top)
 		listCard.Size = UDim2.new(1, 0, 1, -(top + 58))
 	end
@@ -2252,6 +2375,7 @@ local function buildReviewWidget(plugin)
 		countdownLabel = countdownLabel,
 		skipButton = skipButton,
 		applyButton = applyButton,
+		searchBox = searchBox,
 		rowPool = {},
 		visibleItems = {},
 		treeRoots = {},
@@ -2280,7 +2404,35 @@ local function buildReviewWidget(plugin)
 
 	function reviewUi.refreshList()
 		local items = flattenReviewTree(reviewUi.treeRoots)
-		reviewUi.visibleItems = items
+		local query = string.lower(searchBox.Text)
+		if query == "" then
+			reviewUi.visibleItems = items
+		else
+			local visible = {}
+			for _, item in ipairs(items) do
+				local text = ""
+				if item.kind == "node" then
+					text = table.concat(item.chain or {}, " ")
+						.. " "
+						.. tostring(item.node.className or "")
+						.. " "
+						.. tostring(item.node.note or "")
+				else
+					local prop = item.prop or {}
+					text = tostring(prop.name or "")
+						.. " "
+						.. tostring(prop.typeName or "")
+						.. " "
+						.. tostring(prop.oldText or "")
+						.. " "
+						.. tostring(prop.newText or "")
+				end
+				if string.find(string.lower(text), query, 1, true) ~= nil then
+					visible[#visible + 1] = item
+				end
+			end
+			reviewUi.visibleItems = visible
+		end
 		renderWindow()
 	end
 
@@ -2297,6 +2449,7 @@ local function buildReviewWidget(plugin)
 	end
 	scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(scheduleRender)
 	scroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleRender)
+	searchBox:GetPropertyChangedSignal("Text"):Connect(reviewUi.refreshList)
 
 	return reviewUi
 end
@@ -2312,6 +2465,14 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 
 	local toolbar = plugin:CreateToolbar("Renium")
 	local openButton = toolbar:CreateButton("Renium", "Open or close Renium" .. tooltipVersion, TOOLBAR_ICON)
+	local actions = {
+		connect = plugin:CreatePluginAction("ReniumConnect", "Connect Renium", "Connect Renium to the local sync server", TOOLBAR_ICON, true),
+		disconnect = plugin:CreatePluginAction("ReniumDisconnect", "Disconnect Renium", "Disconnect Renium from the local sync server", TOOLBAR_ICON, true),
+		status = plugin:CreatePluginAction("ReniumStatus", "Show Renium Status", "Open the Renium status panel", TOOLBAR_ICON, true),
+		review = plugin:CreatePluginAction("ReniumReview", "Open Renium Review", "Open the pending Renium change review", TOOLBAR_ICON, true),
+		reveal = plugin:CreatePluginAction("ReniumRevealScript", "Reveal Script in Editor", "Reveal the selected Studio script in the connected editor", TOOLBAR_ICON, true),
+		lock = plugin:CreatePluginAction("ReniumSessionLock", "Inspect Renium Session", "Inspect or take over the active Renium session", TOOLBAR_ICON, true),
+	}
 
 	local settingsUi = buildSettingsWidget(plugin)
 	local statusUi = buildStatusWidget(plugin, versionText)
@@ -2326,6 +2487,8 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		openSettings = settingsUi.open,
 		panelConnectButton = statusUi.connectButton,
 		panelDisconnectButton = statusUi.disconnectButton,
+		panelPullButton = statusUi.pullButton,
+		panelPushButton = statusUi.pushButton,
 		hostBox = settingsUi.hostBox,
 		portsBox = settingsUi.portsBox,
 		statusLabel = statusUi.statusSubtitle,
@@ -2333,10 +2496,163 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		settingOptionButtons = settingsUi.settingOptionButtons,
 		settingInputs = settingsUi.settingInputs,
 		settingToggles = settingsUi.settingToggles,
+		actions = actions,
 		_lastView = nil,
 		_playModeHidden = false,
+		_connected = false,
+		_projectSyncAvailable = false,
+		_projectSyncPending = nil,
 		_conflictValue = nil,
 	}
+
+	local function refreshProjectSyncButtons()
+		local enabled = ui._connected and ui._projectSyncAvailable and ui._projectSyncPending == nil
+		statusUi.pullButton.Text = if ui._projectSyncPending == "pull"
+			then "Pulling..."
+			else "Pull Studio to files"
+		statusUi.pushButton.Text = if ui._projectSyncPending == "push"
+			then "Pushing..."
+			else "Push files to Studio"
+		setButtonEnabled(statusUi.pullButton, enabled)
+		setButtonEnabled(statusUi.pushButton, enabled)
+	end
+
+	function ui.setProjectSyncAvailable(available)
+		ui._projectSyncAvailable = available == true
+		refreshProjectSyncButtons()
+	end
+
+	function ui.setProjectSyncPending(direction)
+		ui._projectSyncPending = direction
+		refreshProjectSyncButtons()
+	end
+
+	local notificationKey = nil
+	local notificationAction = nil
+	local storedSnoozes = plugin:GetSetting("Renium.NotificationSnoozeUntil")
+	local notificationSnoozeUntil = if type(storedSnoozes) == "table" then storedSnoozes else {}
+	local notificationPayloads = {}
+	local scheduledSnoozes = {}
+
+	local function hideNotification()
+		notificationKey = nil
+		notificationAction = nil
+		statusUi.notificationCard.Visible = false
+	end
+
+	local function clearNotification(key)
+		local normalizedKey = tostring(key or "")
+		notificationPayloads[normalizedKey] = nil
+		notificationSnoozeUntil[normalizedKey] = nil
+		scheduledSnoozes[normalizedKey] = nil
+		plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+		if notificationKey == normalizedKey then
+			hideNotification()
+		end
+	end
+
+	statusUi.notificationActionButton.MouseButton1Click:Connect(function()
+		local action = notificationAction
+		hideNotification()
+		if action then
+			action()
+		end
+	end)
+	statusUi.notificationSnoozeButton.MouseButton1Click:Connect(function()
+		if notificationKey then
+			local key = notificationKey
+			local payload = notificationPayloads[key]
+			notificationSnoozeUntil[key] = os.time() + 300
+			plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+			hideNotification()
+			if payload ~= nil then
+				task.defer(function()
+					ui.notify(
+						key,
+						payload.title,
+						payload.body,
+						payload.actionLabel,
+						payload.action,
+						payload.allowSnooze
+					)
+				end)
+			end
+			return
+		end
+		hideNotification()
+	end)
+	statusUi.notificationDismissButton.MouseButton1Click:Connect(function()
+		if notificationKey ~= nil then
+			clearNotification(notificationKey)
+		else
+			hideNotification()
+		end
+	end)
+
+	function ui.notify(key, title, body, actionLabel, action, allowSnooze)
+		local normalizedKey = tostring(key or "")
+		local snoozeUntil = tonumber(notificationSnoozeUntil[normalizedKey]) or 0
+		if snoozeUntil > os.time() then
+			notificationPayloads[normalizedKey] = {
+				title = title,
+				body = body,
+				actionLabel = actionLabel,
+				action = action,
+				allowSnooze = allowSnooze,
+			}
+			if scheduledSnoozes[normalizedKey] ~= snoozeUntil then
+				scheduledSnoozes[normalizedKey] = snoozeUntil
+				task.delay(math.max(0, snoozeUntil - os.time()), function()
+					if scheduledSnoozes[normalizedKey] ~= snoozeUntil then
+						return
+					end
+					scheduledSnoozes[normalizedKey] = nil
+					if (tonumber(notificationSnoozeUntil[normalizedKey]) or 0) <= os.time() then
+						notificationSnoozeUntil[normalizedKey] = nil
+						plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+						local payload = notificationPayloads[normalizedKey]
+						notificationPayloads[normalizedKey] = nil
+						if payload ~= nil then
+							ui.notify(
+								normalizedKey,
+								payload.title,
+								payload.body,
+								payload.actionLabel,
+								payload.action,
+								payload.allowSnooze
+							)
+						end
+					end
+				end)
+			end
+			return false
+		end
+		notificationSnoozeUntil[normalizedKey] = nil
+		notificationPayloads[normalizedKey] = {
+			title = title,
+			body = body,
+			actionLabel = actionLabel,
+			action = action,
+			allowSnooze = allowSnooze,
+		}
+		notificationKey = normalizedKey
+		notificationAction = action
+		statusUi.notificationTitle.Text = tostring(title or "")
+		statusUi.notificationBody.Text = tostring(body or "")
+		statusUi.notificationActionButton.Text = tostring(actionLabel or "Open")
+		statusUi.notificationActionButton.Visible = action ~= nil
+		statusUi.notificationSnoozeButton.Visible = allowSnooze == true
+		statusUi.notificationCard.Visible = true
+		return true
+	end
+
+	function ui.dismissNotification(key)
+		if key == nil then
+			hideNotification()
+		else
+			clearNotification(key)
+		end
+	end
 
 	ui.setConflictResolutionActive = function(value)
 		ui._conflictValue = value
@@ -2444,6 +2760,7 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		if reviewUi and reviewUi.widget.Enabled then
 			reviewUi.widget.Enabled = false
 		end
+		ui.dismissNotification("pending-review")
 	end
 
 	local function ensureReviewUi()
@@ -2457,11 +2774,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		end)
 		reviewUi.skipButton.MouseButton1Click:Connect(function()
 			decideReview("skip")
-		end)
-		reviewUi.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
-			if not reviewUi.widget.Enabled then
-				decideReview("skip")
-			end
 		end)
 		return reviewUi
 	end
@@ -2509,7 +2821,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		local threshold = tonumber(runtimeSettings.changesThreshold) or 5
 		if
 			tostring(runtimeSettings.displayPrompts or "") == "never"
-			or tostring(runtimeSettings.initialSyncPriority or "") == "editor"
 			or changeCount <= threshold
 			or ui._playModeHidden
 		then
@@ -2565,10 +2876,11 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		if tree.effectiveCount <= threshold then
 			return { required = false }
 		end
-		if reviewState then
-			rememberFinishedReview(reviewState.id, reviewState.decision or "skip")
+		if reviewState and not reviewState.decision then
+			error("Another editor review is already pending")
+		elseif reviewState then
+			rememberFinishedReview(reviewState.id, reviewState.decision)
 			reviewState = nil
-			stopReviewCountdown()
 		end
 		reviewCounter = reviewCounter + 1
 		local reviewId = string.format("review-%d-%d", os.time(), reviewCounter)
@@ -2603,6 +2915,7 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 				threshold
 			)
 		panel.treeRoots = tree.roots
+		panel.searchBox.Text = ""
 		panel.scroll.CanvasPosition = Vector2.zero
 		panel.refreshList()
 		panel.widget.Enabled = true
@@ -2610,6 +2923,19 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 			panel.widget:RequestRaise()
 		end)
 		startReviewCountdown("skip", "Skips")
+		if runtimeSettings.notifications ~= false then
+			ui.notify(
+				"pending-review",
+				"Changes are waiting for review",
+				subtitleText,
+				"Review",
+				function()
+					panel.widget.Enabled = true
+					panel.widget:RequestRaise()
+				end,
+				true
+			)
+		end
 		return { required = true, reviewId = reviewId, effectiveCount = tree.effectiveCount }
 	end
 
@@ -2677,7 +3003,11 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 			finishedReviewDecisions[reviewId] = nil
 			return { decided = true, decision = finished.decision }
 		end
-		return { decided = true, decision = "apply" }
+		return { decided = true, decision = "skip", error = "Review id was not found" }
+	end
+
+	function ui.pendingReviewCount()
+		return if reviewState ~= nil and reviewState.decision == nil then 1 else 0
 	end
 
 	statusUi.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
@@ -2687,6 +3017,16 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 
 	openButton.Click:Connect(function()
 		ui.toggleWidget()
+	end)
+	actions.status.Triggered:Connect(ui.showWidget)
+	actions.review.Triggered:Connect(function()
+		if reviewUi and reviewState and not reviewState.decision then
+			reviewUi.widget.Enabled = true
+			reviewUi.widget:RequestRaise()
+		else
+			ui.showWidget()
+			ui.notify("no-review", "No review is waiting", "Renium has no pending changes to review.", nil, nil, false)
+		end
 	end)
 
 	function ui.updateStatus(view)
@@ -2702,8 +3042,16 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 
 		statusUi.dot.BackgroundColor3 = color
 		statusUi.statusTitle.Text = tostring(view.title or "Disconnected")
-		statusUi.statusSubtitle.Text = tostring(view.subtitle or "")
-		statusUi.syncLine.Text = tostring(view.syncText or "")
+		local subtitle = tostring(view.subtitle or "")
+		statusUi.statusSubtitle.Text = if subtitle == "" then " " else subtitle
+		local syncText = tostring(view.syncText or "")
+		statusUi.syncLine.Text = syncText
+		ui._connected = mode == "connected"
+		if not ui._connected then
+			ui._projectSyncAvailable = false
+			ui._projectSyncPending = nil
+		end
+		refreshProjectSyncButtons()
 
 		if mode == "connected" then
 			statusUi.connectButton.Visible = false

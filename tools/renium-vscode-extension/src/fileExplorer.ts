@@ -1,12 +1,23 @@
 import * as childProcess from "child_process";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 
+import {
+  bundledReniumCliPath,
+  reniumCliCandidates,
+} from "./cliResolution";
+import { resolveActiveExperiencePlace } from "./experience";
 import { GitViewActions, GitViewState } from "./gitView";
 import { InstanceSorter } from "./instanceSorter";
 import { getPropertiesHtml } from "./propertiesHtml";
+import {
+  projectProcessOwner,
+  terminateProcess,
+  trackProcess,
+} from "./processSupervisor";
 import {
   DecodeResult,
   MAX_RBSYNC_DROPPED_BYTES,
@@ -15,6 +26,15 @@ import {
 } from "./rbsyncDecode";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
 import { canonicalExplorerServiceName, DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
+import {
+  SharedConfig,
+  invalidateProjectSourceGraph,
+  loadProjectSourceGraph,
+  loadProjectSourceLocations,
+  loadProjectSourceRoot,
+  loadSharedConfig,
+  sharedConfigValue,
+} from "./sharedConfig";
 import { isScriptClass, pickWorkspaceRoot } from "./utils";
 
 const SETTINGS_FILE_NAME = "__roblox_sync_settings.renium";
@@ -37,22 +57,12 @@ const EXPLORER_RUST_CLI_FALLBACK_RELATIVE_PATHS = [
   `tools/renium/target-rename-release/debug/${RUST_CLI_BINARY}`,
   `tools/renium/target-resave-release/debug/${RUST_CLI_BINARY}`,
 ];
-const EXPLORER_REQUIRED_CLI_COMMANDS = [
-  "bytecode-explorer-batch",
-  "bytecode-set-property",
-  "bytecode-add-instance",
-  "bytecode-clone-instance",
-  "bytecode-move-instance",
-  "bytecode-remove-instance",
-  "bytecode-export-model",
-  "bytecode-import-model",
-];
-const explorerCliHelpCache = new Map<string, { mtimeMs: number; helpText?: string }>();
+let explorerExtensionRoot = "";
 let packageDragDebugOutput: vscode.OutputChannel | undefined;
-const PACKAGE_DRAG_DEBUG_ENABLED = process.env.RENIUM_PACKAGE_DRAG_DEBUG === "1";
 
 export function logPackageDragDebug(message: string): void {
-  if (!PACKAGE_DRAG_DEBUG_ENABLED) {
+  const level = vscode.workspace.getConfiguration("renium").get<string>("logLevel", "info");
+  if (level !== "debug" && level !== "trace") {
     return;
   }
   if (!packageDragDebugOutput) {
@@ -85,6 +95,7 @@ const WORKSPACE_SERVER_AUTHORITY_PROPERTIES = new Set([
 
 type ExplorerConfig = {
   projectRoot: string;
+  srcDir: string;
   rustCliPath: string;
   services: string[];
 };
@@ -95,6 +106,8 @@ type CliServiceNode = {
   id?: string;
   index: number;
   settingsId: string;
+  canonicalSettingsId?: string;
+  settingsFile?: string;
   name: string;
   className: string;
   parentId?: string | null;
@@ -148,6 +161,7 @@ type CliCloneInstanceResult = {
   rootSettingsId?: string;
   settingsIds?: string[];
   sourceCopies?: Array<{ from?: string; to?: string }>;
+  changedPaths?: string[];
 };
 
 type CliMoveInstanceResult = CliCloneInstanceResult & {
@@ -169,16 +183,19 @@ type CliImportModelResult = {
   rootSettingsIds?: string[];
   settingsIds?: string[];
   sourceWrites?: Array<{ settingsId?: string; path?: string }>;
+  changedPaths?: string[];
 };
 
 type CliRemoveInstanceResult = {
   ok?: boolean;
   removedIndexes?: number[];
   removedSourcePaths?: string[];
+  changedPaths?: string[];
 };
 
 type CliDesyncPackageLinkResult = {
   ok?: boolean;
+  settingsFile?: string;
   removedPackageLinks?: Array<{
     settingsId?: string;
     name?: string;
@@ -199,6 +216,7 @@ export type FileExplorerNode = {
   name: string;
   className: string;
   settingsId?: string;
+  projectionSettingsId?: string;
   index?: number;
   parentTreeId: string | null;
   children: string[];
@@ -239,6 +257,11 @@ function readonlyScriptFileName(node: FileExplorerNode): string {
 class ReadonlyExplorerScriptContentProvider implements vscode.TextDocumentContentProvider, vscode.Disposable {
   private readonly contents = new Map<string, string>();
   private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
+  private readonly closeSubscription = vscode.workspace.onDidCloseTextDocument((document) => {
+    if (document.uri.scheme === "renium-readonly-script") {
+      this.contents.delete(document.uri.toString());
+    }
+  });
   public readonly onDidChange = this.changeEmitter.event;
 
   public provideTextDocumentContent(uri: vscode.Uri): string {
@@ -252,7 +275,7 @@ class ReadonlyExplorerScriptContentProvider implements vscode.TextDocumentConten
       scheme: "renium-readonly-script",
       authority: "preview",
       path: `/${encodeURIComponent(packageName)}/${encodeURIComponent(fileName)}`,
-      query: `v=${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`,
+      query: `id=${crypto.createHash("sha256").update(`${node.treeId}\0${sourcePath}`).digest("hex").slice(0, 24)}`,
     });
     this.contents.set(uri.toString(), content);
     this.changeEmitter.fire(uri);
@@ -261,6 +284,7 @@ class ReadonlyExplorerScriptContentProvider implements vscode.TextDocumentConten
 
   public dispose(): void {
     this.contents.clear();
+    this.closeSubscription.dispose();
     this.changeEmitter.dispose();
   }
 }
@@ -432,6 +456,7 @@ type EditorHistoryManifest = {
   className?: string;
   propertyName?: string;
   propertyLabel?: string;
+  settingsFile?: string;
   settingsBackup?: string;
   sourceBackup?: string;
 };
@@ -442,6 +467,7 @@ type ExplorerHistoryEntry = {
   className: string;
   settingsId?: string;
   sourcePath?: string;
+  settingsFile?: string;
   pathSegments: string[];
   propertyName?: string;
   propertyLabel?: string;
@@ -598,115 +624,60 @@ function resolveConfigPath(raw: string, root: string): string {
   return path.isAbsolute(replaced) ? path.normalize(replaced) : path.normalize(path.join(root, replaced));
 }
 
-function explorerCliHelpText(cliPath: string): string | undefined {
-  try {
-    const stat = fs.statSync(cliPath);
-    const cached = explorerCliHelpCache.get(cliPath);
-    if (cached && cached.mtimeMs === stat.mtimeMs) {
-      return cached.helpText;
-    }
-    const result = childProcess.spawnSync(cliPath, ["--help"], {
-      cwd: path.dirname(cliPath),
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-    });
-    const helpText = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-    explorerCliHelpCache.set(cliPath, { mtimeMs: stat.mtimeMs, helpText });
-    return helpText;
-  } catch {
-    return undefined;
-  }
-}
-
-function explorerCliSupportsRequiredCommands(cliPath: string): boolean {
-  if (!fs.existsSync(cliPath)) {
-    return false;
-  }
-  const helpText = explorerCliHelpText(cliPath);
-  return helpText !== undefined && EXPLORER_REQUIRED_CLI_COMMANDS.every((command) => helpText.includes(command));
-}
-
-function explorerCliSupportsCommand(cliPath: string, command: string): boolean {
-  if (!fs.existsSync(cliPath)) {
-    return false;
-  }
-  try {
-    const result = childProcess.spawnSync(cliPath, [command, "--help"], {
-      cwd: path.dirname(cliPath),
-      encoding: "utf8",
-      shell: false,
-      timeout: 2000,
-      windowsHide: true,
-    });
-    return !result.error && result.status === 0;
-  } catch {
-    return false;
-  }
-}
-
 function resolveExplorerRustCliPath(root: string, configuredPath: string): string {
-  const candidates = [
+  const candidates = reniumCliCandidates({
     configuredPath,
-    ...EXPLORER_RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => resolveConfigPath(relativePath, root)),
-  ].map((candidate) => path.normalize(candidate));
-  const uniqueCandidates = Array.from(new Set(candidates));
-
-  if (explorerCliSupportsRequiredCommands(configuredPath)) {
-    return configuredPath;
-  }
-
-  const supportedCandidates = uniqueCandidates.filter((candidate) => explorerCliSupportsRequiredCommands(candidate));
-  if (supportedCandidates.length === 0) {
-    return configuredPath;
-  }
-
-  supportedCandidates.sort((left, right) => {
-    const leftMtime = fs.statSync(left).mtimeMs;
-    const rightMtime = fs.statSync(right).mtimeMs;
-    return rightMtime - leftMtime;
+    extensionRoot: explorerExtensionRoot,
+    roots: [root],
+    fallbackRelativePaths: EXPLORER_RUST_CLI_FALLBACK_RELATIVE_PATHS,
   });
-  return supportedCandidates[0];
+  return candidates.find((candidate) => fs.existsSync(candidate))
+    ?? configuredPath
+    ?? bundledReniumCliPath(explorerExtensionRoot);
 }
 
 function resolveExplorerRustCliPathForCommand(root: string, configuredPath: string, command: string): string {
-  const candidates = [
+  const candidates = reniumCliCandidates({
     configuredPath,
-    ...EXPLORER_RUST_CLI_FALLBACK_RELATIVE_PATHS.map((relativePath) => resolveConfigPath(relativePath, root)),
-  ].map((candidate) => path.normalize(candidate));
-  const uniqueCandidates = Array.from(new Set(candidates));
-  const supportedCandidates = uniqueCandidates.filter(
-    (candidate) => explorerCliSupportsRequiredCommands(candidate) && explorerCliSupportsCommand(candidate, command),
-  );
-  if (supportedCandidates.length === 0) {
-    return resolveExplorerRustCliPath(root, configuredPath);
-  }
-  supportedCandidates.sort((left, right) => {
-    const leftMtime = fs.statSync(left).mtimeMs;
-    const rightMtime = fs.statSync(right).mtimeMs;
-    return rightMtime - leftMtime;
+    extensionRoot: explorerExtensionRoot,
+    roots: [root],
+    fallbackRelativePaths: EXPLORER_RUST_CLI_FALLBACK_RELATIVE_PATHS,
   });
-  return supportedCandidates[0];
+  void command;
+  return candidates.find((candidate) => fs.existsSync(candidate))
+    ?? resolveExplorerRustCliPath(root, configuredPath);
 }
 
 function getExplorerConfig(): ExplorerConfig {
   const root = workspaceRoot();
-  const cfg = vscode.workspace.getConfiguration("renium");
-  const projectRoot = resolveConfigPath(cfg.get<string>("projectRoot", "${workspaceFolder}"), root);
-  const configuredRustCliPath = resolveConfigPath(
-    cfg.get<string>("rustCliPath", "${workspaceFolder}/" + DEFAULT_RUST_CLI_RELATIVE_PATH),
-    root,
-  );
+  const cfg = vscode.workspace.getConfiguration("renium", vscode.Uri.file(root));
+  const read = <T>(shared: SharedConfig, key: string, defaultValue: T): T => {
+    const inspected = cfg.inspect<T>(key);
+    return inspected?.workspaceFolderValue
+      ?? inspected?.workspaceValue
+      ?? inspected?.globalValue
+      ?? sharedConfigValue<T>(shared, key)
+      ?? defaultValue;
+  };
+  const preliminaryShared = loadSharedConfig(root, root);
+  const experienceRoot = resolveConfigPath(read(preliminaryShared, "projectRoot", "${workspaceFolder}"), root);
+  const projectRoot = resolveActiveExperiencePlace(experienceRoot)?.projectRoot ?? experienceRoot;
+  const shared = loadSharedConfig(root, projectRoot);
+  const srcDir = loadProjectSourceRoot(projectRoot);
+  const configuredRustCliPathRaw = read(shared, "rustCliPath", "").trim();
+  const configuredRustCliPath = configuredRustCliPathRaw.length > 0
+    ? resolveConfigPath(configuredRustCliPathRaw, root)
+    : "";
   const rustCliPath = resolveExplorerRustCliPath(root, configuredRustCliPath);
-  const servicesRaw = cfg.get<string[]>("services", [...DEFAULT_SYNC_SERVICES]);
+  const servicesRaw = read<string[]>(shared, "services", [...DEFAULT_SYNC_SERVICES]);
   const services = Array.isArray(servicesRaw)
     ? distinctExplorerServices(servicesRaw.map((value) => canonicalExplorerServiceName(String(value))))
     : [...DEFAULT_SYNC_SERVICES];
-  return { projectRoot, rustCliPath, services };
+  return { projectRoot, srcDir, rustCliPath, services };
 }
 
 function srcRoot(config: ExplorerConfig): string {
-  return path.join(config.projectRoot, "src");
+  return path.join(config.projectRoot, config.srcDir);
 }
 
 function distinctExplorerServices(services: readonly string[]): string[] {
@@ -915,6 +886,14 @@ function jsonValuesEqual(a: unknown, b: unknown): boolean {
 function pathInsideRoot(root: string, candidate: string): boolean {
   const relativePath = path.relative(normalizeFilesystemPathKey(root), normalizeFilesystemPathKey(candidate));
   return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function projectGraphOwnsPath(config: ExplorerConfig, candidate: string): boolean {
+  if (pathInsideRoot(config.projectRoot, candidate)) {
+    return true;
+  }
+  return loadProjectSourceLocations(config.projectRoot)
+    .some((location) => pathInsideRoot(location, candidate) || pathInsideRoot(candidate, location));
 }
 
 function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined {
@@ -1762,7 +1741,7 @@ function propertyRowsForNode(node: FileExplorerNode): PropertyRow[] {
   const config = getExplorerConfig();
   const database = loadRbxDomDatabase(config) ?? {};
   const generatedMetadata = loadGeneratedRobloxProperties(config);
-  const classes = database.Classes;
+  const classes = database.Classes ?? {};
   const rows = new Map<string, PropertyRow>();
   let nextOrder = 0;
   const setRow = (name: string, row: Omit<PropertyRow, "name">): void => {
@@ -1806,62 +1785,6 @@ function propertyRowsForNode(node: FileExplorerNode): PropertyRow[] {
     rows.set(name, { name, ...row });
   };
   const finalizeRows = (): PropertyRow[] => withStudioDuplicatePropertyRows(sortPropertyRows(Array.from(rows.values())), node);
-  if (!classes) {
-    const generatedValueInfo = generatedPropertyInfo(generatedMetadata, node.className, "Value");
-    const generatedValueProperty = propertyFromGeneratedInfo(generatedValueInfo);
-    const fallbackValueProperty = fallbackValueInstanceProperty(node.className, "Value");
-    const valueProperty = generatedValueProperty ?? fallbackValueProperty;
-    if (valueProperty) {
-      rows.set("Value", {
-        name: "Value",
-        displayName: propertyDisplayName(generatedMetadata, node.className, "Value"),
-        value: defaultValueForDataType(
-          generatedValueInfo?.type ?? propertyDataType(valueProperty),
-          database,
-          enumItemsForGeneratedInfo(generatedValueInfo, valueProperty, database),
-        ),
-        readonly: false,
-        defaulted: true,
-        category: propertyCategory(node.className, "Value", valueProperty, generatedMetadata),
-        order: nextOrder++,
-        dataType: generatedValueInfo?.type ?? propertyDataType(valueProperty),
-        uiMinimum: generatedValueInfo?.uiMinimum,
-        uiMaximum: generatedValueInfo?.uiMaximum,
-        uiNumTicks: generatedValueInfo?.uiNumTicks,
-        sliderScaling: generatedValueInfo?.sliderScaling,
-      });
-    }
-    for (const name of Object.keys(node.properties).filter((name) => !isMetadataPropertyName(name) && name !== "Tags" && name !== "Attributes")) {
-      if (hasGeneratedPropertyList(generatedMetadata, node.className) && !isGeneratedPropertyVisible(generatedMetadata, node.className, name)) {
-        continue;
-      }
-      const generated = generatedPropertyInfo(generatedMetadata, node.className, name);
-      const property = propertyFromGeneratedInfo(generated) ?? fallbackValueInstanceProperty(node.className, name);
-      const row: PropertyRow = {
-        name,
-        displayName: propertyDisplayName(generatedMetadata, node.className, name),
-        value: node.properties[name],
-        readonly: false,
-        defaulted: false,
-        category: propertyCategory(node.className, name, property, generatedMetadata),
-        order: nextOrder++,
-        dataType: generated?.type ?? propertyDataType(property),
-        enumItems: generated?.enumItems,
-        uiMinimum: generated?.uiMinimum,
-        uiMaximum: generated?.uiMaximum,
-        uiNumTicks: generated?.uiNumTicks,
-        sliderScaling: generated?.sliderScaling,
-      };
-      if (usesDisabledProperty(node.className) && name === "Disabled") {
-        const disabledValue = row.value === true || String(row.value).toLowerCase() === "true";
-        rows.set("Enabled", { ...row, name: "Enabled", value: !disabledValue, dataType: "Bool" });
-      } else {
-        rows.set(name, row);
-      }
-    }
-    ensureModelPivotRows(node, rows, classes, nextOrder);
-    return finalizeRows();
-  }
   const templates = propertyTemplatesForClass(node.className, database, classes, generatedMetadata);
   for (const template of templates) {
     setRow(template.name, {
@@ -2397,7 +2320,16 @@ function verdePropertyRowsForNode(node: FileExplorerNode, parentName: string, re
   const properties: VerdePropertyInfo[] = [
     { name: "Name", type: "string", value: node.name, category: "Data", layoutOrder: -3, isReadOnly: metadataLocked },
     { name: "ClassName", type: "string", value: node.className, category: "Data", layoutOrder: -2, isReadOnly: true },
-    { name: "Parent", type: "string", value: parentName || "game", category: "Data", layoutOrder: -1, isReadOnly: true },
+    {
+      name: "Parent",
+      type: "Ref",
+      value: parentName || "game",
+      category: "Data",
+      layoutOrder: -1,
+      isInstanceReference: true,
+      referencedInstanceId: node.parentTreeId ?? undefined,
+      referencedInstanceName: parentName || "game",
+    },
   ];
   for (const row of propertyRowsForNode(node)) {
     const type = verdeTypeForValue(row.value, row.dataType);
@@ -2910,21 +2842,46 @@ function runCli(command: string, args: string[], cwd: string): Promise<CommandRu
     const child = childProcess.spawn(command, args, {
       cwd,
       env: process.env,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: "pipe",
       windowsHide: true,
     });
+    trackProcess(child, projectProcessOwner(cwd));
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const appendBounded = (current: string, chunk: string): string => {
+      const combined = current + chunk;
+      return combined.length > 8_000_000 ? combined.slice(-8_000_000) : combined;
+    };
+    const timer = setTimeout(() => {
+      void terminateProcess(child).finally(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Renium Explorer command timed out."));
+        }
+      });
+    }, 60_000);
     child.stdout.on("data", (data: Buffer | string) => {
-      stdout += data.toString();
+      stdout = appendBounded(stdout, data.toString());
     });
     child.stderr.on("data", (data: Buffer | string) => {
-      stderr += data.toString();
+      stderr = appendBounded(stderr, data.toString());
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
     child.on("close", (code) => {
-      resolve({ code: code ?? 0, stdout, stderr });
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code: code ?? 130, stdout, stderr });
+      }
     });
   });
 }
@@ -2946,10 +2903,13 @@ async function runBytecodeBatchOne<T extends object>(
   service: string,
   op: CliBatchOp,
 ): Promise<T & { service: string; settingsFile: string }> {
+  const inputArgs = fs.existsSync(path.join(config.projectRoot, "renium.project.jsonc"))
+    || fs.existsSync(path.join(config.projectRoot, "renium.project.json"))
+    ? ["--project-root", config.projectRoot]
+    : ["-f", settingsFile];
   const dump = await runJsonCli<CliBatchDump<T>>(config, [
     "bytecode-explorer-batch",
-    "-f",
-    settingsFile,
+    ...inputArgs,
     "-s",
     service,
     "-o",
@@ -2976,6 +2936,34 @@ export class FileExplorerModel {
   private rootIds: string[] = [];
   private readonly onChangeCallbacks: Array<() => void> = [];
   private studioMutationChain: Promise<void> = Promise.resolve();
+  private projectGeneration = 0;
+
+  public resetProjectState(): void {
+    this.projectGeneration += 1;
+    this.studioMutationChain = Promise.resolve();
+    this.nodesById.clear();
+    this.searchOnlyNodeIds.clear();
+    this.searchLoadedServices.clear();
+    this.rootIds = [];
+  }
+
+  public currentProjectGeneration(): number {
+    return this.projectGeneration;
+  }
+
+  public isProjectGenerationCurrent(generation: number): boolean {
+    return generation === this.projectGeneration;
+  }
+
+  public async prepareProjectSwitch(): Promise<void> {
+    await this.studioMutationChain.catch(() => undefined);
+  }
+
+  private requireProjectGeneration(generation: number): void {
+    if (!this.isProjectGenerationCurrent(generation)) {
+      throw new Error("The active Renium project changed while the operation was running.");
+    }
+  }
 
   public onChange(callback: () => void): void {
     this.onChangeCallbacks.push(callback);
@@ -2983,6 +2971,27 @@ export class FileExplorerModel {
 
   public getNode(treeId: string): FileExplorerNode | undefined {
     return this.nodesById.get(treeId);
+  }
+
+  public getKnownNodes(): FileExplorerNode[] {
+    return Array.from(this.nodesById.values());
+  }
+
+  public findNodeByPath(service: string, pathSegments: string[], pathOrdinals: number[]): FileExplorerNode | undefined {
+    return this.getKnownNodes().find((candidate) => {
+      if (candidate.service !== service || candidate.pathSegments.length !== pathSegments.length) {
+        return false;
+      }
+      for (let index = 0; index < pathSegments.length; index += 1) {
+        if (
+          candidate.pathSegments[index] !== pathSegments[index]
+          || (candidate.pathOrdinals[index] ?? 1) !== (pathOrdinals[index] ?? 1)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    });
   }
 
   public findNodeForReference(value: unknown, service?: string): FileExplorerNode | undefined {
@@ -3015,14 +3024,14 @@ export class FileExplorerModel {
     const byServiceSettingsId = new Map<string, FileExplorerNode>();
     for (const node of this.nodesById.values()) {
       if (node.settingsId) {
-        byServiceSettingsId.set(`${node.service} ${node.settingsId}`, node);
+        byServiceSettingsId.set(`${node.service}\0${node.settingsId}`, node);
       }
     }
     return requests.map((request) => {
       if (!request || !request.settingsId || !request.property) {
         return undefined;
       }
-      const node = byServiceSettingsId.get(`${request.service ?? ""} ${request.settingsId}`);
+      const node = byServiceSettingsId.get(`${request.service ?? ""}\0${request.settingsId}`);
       if (!node) {
         return undefined;
       }
@@ -3039,7 +3048,7 @@ export class FileExplorerModel {
     });
   }
 
-  public rememberNode(node: FileExplorerNode): FileExplorerNode {
+  public rememberNode(node: FileExplorerNode, authoritative = false): FileExplorerNode {
     const existing = this.nodesById.get(node.treeId);
     if (existing) {
       existing.id = node.id;
@@ -3048,17 +3057,20 @@ export class FileExplorerModel {
       existing.name = node.name;
       existing.className = node.className;
       existing.settingsId = node.settingsId;
+      existing.projectionSettingsId = node.projectionSettingsId;
       existing.index = node.index;
       existing.parentTreeId = node.parentTreeId;
       existing.hasChildren = node.hasChildren;
       existing.hasPackageLink = node.hasPackageLink;
       existing.settingsFile = node.settingsFile;
-      existing.sourcePath = node.sourcePath ?? existing.sourcePath;
+      existing.sourcePath = authoritative ? node.sourcePath : node.sourcePath ?? existing.sourcePath;
       existing.pathSegments = node.pathSegments.length > 0 ? node.pathSegments : existing.pathSegments;
-      if (Object.keys(node.properties).length > 0) {
+      existing.pathOrdinals = node.pathOrdinals.length > 0 ? node.pathOrdinals : existing.pathOrdinals;
+      existing.detailsLoaded = authoritative ? node.detailsLoaded : existing.detailsLoaded || node.detailsLoaded;
+      if (authoritative || Object.keys(node.properties).length > 0) {
         existing.properties = node.properties;
       }
-      if (Object.keys(node.attributes).length > 0) {
+      if (authoritative || Object.keys(node.attributes).length > 0) {
         existing.attributes = node.attributes;
       }
       return existing;
@@ -3077,10 +3089,64 @@ export class FileExplorerModel {
       .filter((node): node is FileExplorerNode => node !== undefined);
   }
 
+  public invalidateServices(services: string[]): void {
+    const targets = new Set(services);
+    for (const [treeId, node] of this.nodesById) {
+      if (!targets.has(node.service)) {
+        continue;
+      }
+      if (node.kind === "service") {
+        node.children = [];
+        node.loaded = false;
+        node.detailsLoaded = false;
+        node.properties = {};
+        node.attributes = {};
+        continue;
+      }
+      this.nodesById.delete(treeId);
+      this.searchOnlyNodeIds.delete(treeId);
+    }
+    for (const service of targets) {
+      this.searchLoadedServices.delete(service);
+    }
+  }
+
   public getChildren(node: FileExplorerNode): FileExplorerNode[] {
     return node.children
       .map((id) => this.nodesById.get(id))
       .filter((child): child is FileExplorerNode => child !== undefined);
+  }
+
+  public async sourcePathsForSubtree(node: FileExplorerNode): Promise<string[]> {
+    const generation = this.projectGeneration;
+    const root = await this.ensureLoaded(node);
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return [];
+    }
+    const paths = new Set<string>();
+    const visited = new Set<string>();
+    const visit = async (current: FileExplorerNode): Promise<void> => {
+      if (!this.isProjectGenerationCurrent(generation)) {
+        return;
+      }
+      if (!visited.add(current.treeId)) {
+        return;
+      }
+      if (current.sourcePath) {
+        paths.add(current.sourcePath);
+      }
+      if (current.hasChildren || current.children.length > 0) {
+        await this.loadChildren(current, false);
+        if (!this.isProjectGenerationCurrent(generation)) {
+          return;
+        }
+        for (const child of this.getChildren(current)) {
+          await visit(child);
+        }
+      }
+    };
+    await visit(root);
+    return [...paths];
   }
 
   public sort(nodes: FileExplorerNode[]): FileExplorerNode[] {
@@ -3116,7 +3182,6 @@ export class FileExplorerModel {
     this.rootIds = serviceList
       .map((service) => {
         const settingsFile = settingsFileForService(config, service);
-        const hasSettingsFile = fs.existsSync(settingsFile);
         const node: FileExplorerNode = {
           id: serviceTreeId(service),
           treeId: serviceTreeId(service),
@@ -3128,7 +3193,7 @@ export class FileExplorerModel {
           children: [],
           loaded: false,
           detailsLoaded: false,
-          hasChildren: hasSettingsFile,
+          hasChildren: true,
           settingsFile,
           pathSegments: [service],
           pathOrdinals: [1],
@@ -3143,11 +3208,15 @@ export class FileExplorerModel {
   }
 
   public async refreshServices(services: string[]): Promise<void> {
+    const generation = this.projectGeneration;
     const config = getExplorerConfig();
     const uniqueServices = canonicalExplorerServices(config, services);
     let changed = false;
     for (const service of uniqueServices) {
       changed = await this.refreshService(config, service) || changed;
+      if (!this.isProjectGenerationCurrent(generation)) {
+        return;
+      }
     }
     if (changed) {
       this.fireChange();
@@ -3156,22 +3225,31 @@ export class FileExplorerModel {
 
   public servicesFromSettingsFiles(settingsFiles: string[]): string[] {
     const config = getExplorerConfig();
-    return Array.from(new Set(settingsFiles
-      .map((settingsFile) => serviceFromSettingsFile(config, settingsFile))
-      .filter((service): service is string => service !== undefined)));
+    const services: string[] = [];
+    for (const settingsFile of settingsFiles) {
+      const key = normalizeFilesystemPathKey(settingsFile);
+      const owner = Array.from(this.nodesById.values())
+        .find((node) => normalizeFilesystemPathKey(node.settingsFile) === key);
+      const service = owner?.service ?? serviceFromSettingsFile(config, settingsFile);
+      if (service) {
+        services.push(service);
+      }
+    }
+    return Array.from(new Set(services));
   }
 
   private async refreshService(config: ExplorerConfig, service: string): Promise<boolean> {
+    const generation = this.projectGeneration;
     const serviceNode = this.nodesById.get(serviceTreeId(service));
     const settingsFile = settingsFileForService(config, service);
-    if (!serviceNode || !fs.existsSync(settingsFile)) {
+    if (!serviceNode) {
       await this.refresh();
       return false;
     }
 
     if (this.searchLoadedServices.has(service)) {
       await this.loadServiceDump(config, service, false);
-      return true;
+      return this.isProjectGenerationCurrent(generation);
     }
 
     const loadedNodeIds = Array.from(this.nodesById.values())
@@ -3182,8 +3260,11 @@ export class FileExplorerModel {
     if (loadedNodeIds.length === 0) {
       try {
         const counts = await runBytecodeBatchOne<CliExplorerCounts>(config, settingsFile, service, { type: "counts" });
+        if (!this.isProjectGenerationCurrent(generation)) {
+          return false;
+        }
         serviceNode.hasChildren = (counts.rootChildren ?? 0) > 0;
-        serviceNode.settingsFile = settingsFile;
+        serviceNode.settingsFile = counts.settingsFile;
         return true;
       } catch {
         return false;
@@ -3194,6 +3275,9 @@ export class FileExplorerModel {
       const node = this.nodesById.get(treeId);
       if (node) {
         await this.loadChildren(node, false);
+        if (!this.isProjectGenerationCurrent(generation)) {
+          return false;
+        }
       }
     }
     return true;
@@ -3202,9 +3286,6 @@ export class FileExplorerModel {
   private async readRootChildCounts(config: ExplorerConfig, services: string[]): Promise<Map<string, number>> {
     const entries = await Promise.all(services.map(async (service): Promise<[string, number]> => {
       const settingsFile = settingsFileForService(config, service);
-      if (!fs.existsSync(settingsFile)) {
-        return [service, 0];
-      }
       try {
         const counts = await runBytecodeBatchOne<CliExplorerCounts>(config, settingsFile, service, { type: "counts" });
         return [service, counts.rootChildren ?? 0];
@@ -3216,16 +3297,27 @@ export class FileExplorerModel {
   }
 
   public async ensureLoaded(node: FileExplorerNode): Promise<FileExplorerNode> {
-    const current = this.nodesById.get(node.treeId) ?? node;
+    const current = this.nodesById.get(node.treeId);
+    if (!current) {
+      throw new Error("The selected instance no longer belongs to the active Renium project.");
+    }
     if (current.loaded) {
       return current;
     }
     await this.loadChildren(current);
-    return this.nodesById.get(current.treeId) ?? current;
+    const reloaded = this.nodesById.get(current.treeId);
+    if (!reloaded) {
+      throw new Error("The selected instance disappeared while it was loading.");
+    }
+    return reloaded;
   }
 
   public async loadDetails(node: FileExplorerNode): Promise<FileExplorerNode> {
-    const loaded = this.nodesById.get(node.treeId) ?? node;
+    const generation = this.projectGeneration;
+    const loaded = this.nodesById.get(node.treeId);
+    if (!loaded) {
+      throw new Error("The selected instance no longer belongs to the active Renium project.");
+    }
     if (loaded.detailsLoaded) {
       return loaded;
     }
@@ -3240,8 +3332,11 @@ export class FileExplorerModel {
     const raw = await runBytecodeBatchOne<CliServiceNode>(config, loaded.settingsFile, loaded.service, {
       type: "instance",
       output: "full",
-      id: loaded.settingsId,
+      id: loaded.projectionSettingsId ?? loaded.settingsId,
     });
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return this.nodesById.get(node.treeId) ?? node;
+    }
     loaded.name = raw.name;
     loaded.className = raw.className;
     loaded.index = raw.index;
@@ -3269,6 +3364,7 @@ export class FileExplorerModel {
   }
 
   public async loadSearchCorpus(onProgress?: (progress: SearchLoadProgress) => void): Promise<void> {
+    const generation = this.projectGeneration;
     const config = getExplorerConfig();
     const roots = this.getRoots();
     const pending = roots.filter((root) => !this.searchLoadedServices.has(root.service));
@@ -3286,15 +3382,22 @@ export class FileExplorerModel {
           return;
         }
         await this.loadServiceDump(config, root.service, false);
+        if (!this.isProjectGenerationCurrent(generation)) {
+          return;
+        }
         loaded += 1;
         onProgress?.({ loaded, total: roots.length, service: root.service });
       }
     });
     await Promise.all(workers);
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return;
+    }
     this.fireChange();
   }
 
   public async searchDescendants(query: string, onProgress?: (progress: SearchLoadProgress) => void): Promise<void> {
+    const generation = this.projectGeneration;
     const config = getExplorerConfig();
     const roots = this.getRoots();
     this.clearSearchOnlyNodes();
@@ -3313,11 +3416,17 @@ export class FileExplorerModel {
           return;
         }
         await this.loadSearchDump(config, root.service, query);
+        if (!this.isProjectGenerationCurrent(generation)) {
+          return;
+        }
         loaded += 1;
         onProgress?.({ loaded, total: roots.length, service: root.service });
       }
     });
     await Promise.all(workers);
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return;
+    }
     this.fireChange();
   }
 
@@ -3343,19 +3452,25 @@ export class FileExplorerModel {
   }
 
   private async loadSearchDump(config: ExplorerConfig, service: string, query: string): Promise<void> {
+    const generation = this.projectGeneration;
     const settingsFile = settingsFileForService(config, service);
     const serviceNode = this.nodesById.get(serviceTreeId(service));
-    if (!serviceNode || !fs.existsSync(settingsFile)) {
+    if (!serviceNode) {
       return;
     }
     const dump = await runBytecodeBatchOne<CliSearchDump>(config, settingsFile, service, {
       type: "search",
       q: query,
     });
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return;
+    }
     const matchedTreeIds = new Set((dump.matchIds ?? []).map((settingsId) => normalizeId(service, settingsId)));
     const rootRaw = dump.nodes.find((raw) => !raw.parentId) ?? dump.nodes.find((raw) => raw.settingsId === dump.rootIds[0]);
     if (rootRaw) {
-      serviceNode.settingsId = rootRaw.settingsId;
+      serviceNode.settingsId = rootRaw.canonicalSettingsId ?? rootRaw.settingsId;
+      serviceNode.projectionSettingsId = rootRaw.settingsId;
+      serviceNode.settingsFile = rootRaw.settingsFile ?? dump.settingsFile;
       serviceNode.index = rootRaw.index;
       serviceNode.name = rootRaw.name;
       serviceNode.className = rootRaw.className;
@@ -3381,7 +3496,8 @@ export class FileExplorerModel {
         treeId,
         kind: "instance",
         service,
-        settingsId: raw.settingsId,
+        settingsId: raw.canonicalSettingsId ?? raw.settingsId,
+        projectionSettingsId: raw.settingsId,
         index: raw.index,
         name: raw.name,
         className: raw.className,
@@ -3395,7 +3511,7 @@ export class FileExplorerModel {
         detailsLoaded: false,
         hasChildren: (raw.childCount ?? raw.children?.length ?? 0) > 0,
         hasPackageLink: raw.hasPackageLink === true,
-        settingsFile: dump.settingsFile,
+        settingsFile: raw.settingsFile ?? dump.settingsFile,
         sourcePath: raw.sourcePath,
         pathSegments: raw.pathSegments ?? [],
         pathOrdinals: raw.pathOrdinals ?? [],
@@ -3406,6 +3522,7 @@ export class FileExplorerModel {
       const existing = this.nodesById.get(treeId);
       if (existing && !this.searchOnlyNodeIds.has(treeId)) {
         existing.settingsId = childNode.settingsId;
+        existing.projectionSettingsId = childNode.projectionSettingsId;
         existing.index = childNode.index;
         existing.name = childNode.name;
         existing.className = childNode.className;
@@ -3414,6 +3531,7 @@ export class FileExplorerModel {
         existing.detailsLoaded = existing.detailsLoaded && Object.keys(existing.properties).length > 0;
         existing.hasChildren = childNode.hasChildren;
         existing.hasPackageLink = childNode.hasPackageLink;
+        existing.settingsFile = childNode.settingsFile;
         existing.sourcePath = childNode.sourcePath;
         existing.pathSegments = childNode.pathSegments;
         existing.pathOrdinals = childNode.pathOrdinals;
@@ -3451,13 +3569,17 @@ export class FileExplorerModel {
   }
 
   private async loadServiceDump(config: ExplorerConfig, service: string, notify = true): Promise<void> {
+    const generation = this.projectGeneration;
     const settingsFile = settingsFileForService(config, service);
     const serviceNode = this.nodesById.get(serviceTreeId(service));
-    if (!serviceNode || !fs.existsSync(settingsFile)) {
+    if (!serviceNode) {
       this.searchLoadedServices.add(service);
       return;
     }
     const dump = await runBytecodeBatchOne<CliServiceDump>(config, settingsFile, service, { type: "service" });
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return;
+    }
     const rootId = dump.rootIds[0];
     const rootRaw = dump.nodes.find((raw) => raw.settingsId === rootId) ?? dump.nodes.find((raw) => !raw.parentId);
     if (!rootRaw) {
@@ -3470,7 +3592,9 @@ export class FileExplorerModel {
     }
 
     this.removeKnownChildren(serviceNode);
-    serviceNode.settingsId = rootRaw.settingsId;
+    serviceNode.settingsId = rootRaw.canonicalSettingsId ?? rootRaw.settingsId;
+    serviceNode.projectionSettingsId = rootRaw.settingsId;
+    serviceNode.settingsFile = rootRaw.settingsFile ?? dump.settingsFile;
     serviceNode.index = rootRaw.index;
     serviceNode.name = rootRaw.name;
     serviceNode.className = rootRaw.className;
@@ -3495,7 +3619,8 @@ export class FileExplorerModel {
         treeId,
         kind: "instance",
         service,
-        settingsId: raw.settingsId,
+        settingsId: raw.canonicalSettingsId ?? raw.settingsId,
+        projectionSettingsId: raw.settingsId,
         index: raw.index,
         name: raw.name,
         className: raw.className,
@@ -3509,7 +3634,7 @@ export class FileExplorerModel {
         detailsLoaded: true,
         hasChildren: (raw.childCount ?? raw.children?.length ?? 0) > 0,
         hasPackageLink: raw.hasPackageLink === true,
-        settingsFile: dump.settingsFile,
+        settingsFile: raw.settingsFile ?? dump.settingsFile,
         sourcePath: raw.sourcePath,
         pathSegments: raw.pathSegments ?? [],
         pathOrdinals: raw.pathOrdinals ?? [],
@@ -3525,23 +3650,14 @@ export class FileExplorerModel {
   }
 
   public async loadChildren(node: FileExplorerNode, notify = true): Promise<void> {
+    const generation = this.projectGeneration;
     const config = getExplorerConfig();
     const settingsFile = settingsFileForService(config, node.service);
-    if (!fs.existsSync(settingsFile)) {
-      node.loaded = true;
-      node.detailsLoaded = true;
-      node.hasChildren = false;
-      node.children = [];
-      if (notify) {
-        this.fireChange();
-      }
-      return;
-    }
 
     const op: CliBatchOp = { type: "children" };
     if (node.kind !== "service") {
-      if (node.settingsId) {
-        op.id = node.settingsId;
+      if (node.projectionSettingsId ?? node.settingsId) {
+        op.id = node.projectionSettingsId ?? node.settingsId;
       } else if (node.index !== undefined) {
         op.x = node.index;
       } else {
@@ -3550,8 +3666,13 @@ export class FileExplorerModel {
     }
 
     const dump = await runBytecodeBatchOne<CliChildrenDump>(config, settingsFile, node.service, op);
+    if (!this.isProjectGenerationCurrent(generation)) {
+      return;
+    }
     const parentRaw = dump.parent;
-    node.settingsId = parentRaw.settingsId;
+    node.settingsId = parentRaw.canonicalSettingsId ?? parentRaw.settingsId;
+    node.projectionSettingsId = parentRaw.settingsId;
+    node.settingsFile = parentRaw.settingsFile ?? dump.settingsFile;
     node.index = parentRaw.index;
     node.name = parentRaw.name;
     node.className = parentRaw.className;
@@ -3574,7 +3695,8 @@ export class FileExplorerModel {
         treeId,
         kind: "instance",
         service: dump.service,
-        settingsId: raw.settingsId,
+        settingsId: raw.canonicalSettingsId ?? raw.settingsId,
+        projectionSettingsId: raw.settingsId,
         index: raw.index,
         name: raw.name,
         className: raw.className,
@@ -3588,7 +3710,7 @@ export class FileExplorerModel {
         detailsLoaded: true,
         hasChildren: (raw.childCount ?? raw.children?.length ?? 0) > 0,
         hasPackageLink: raw.hasPackageLink === true,
-        settingsFile: dump.settingsFile,
+        settingsFile: raw.settingsFile ?? dump.settingsFile,
         sourcePath: raw.sourcePath,
         pathSegments: raw.pathSegments ?? [],
         pathOrdinals: raw.pathOrdinals ?? [],
@@ -3620,8 +3742,12 @@ export class FileExplorerModel {
     this.nodesById.delete(treeId);
   }
 
-  public async setValue(node: FileExplorerNode, scope: "metadata" | "property" | "attribute", name: string, valueText: string, options: { skipStudioPush?: boolean } = {}): Promise<void> {
+  public async setValue(node: FileExplorerNode, scope: "metadata" | "property" | "attribute", name: string, valueText: string, options: { skipStudioPush?: boolean } = {}): Promise<string[]> {
+    const generation = this.projectGeneration;
     const loaded = await this.ensureDetails(node);
+    if (generation !== this.projectGeneration) {
+      throw new Error("The active Renium project changed before the edit could be applied.");
+    }
     if (loaded.index === undefined && !loaded.settingsId) {
       throw new Error("Selected instance has no bytecode id.");
     }
@@ -3636,41 +3762,94 @@ export class FileExplorerModel {
     let parsedValue = scope === "metadata" && name === "Parent"
       ? this.resolveParentValue(loaded, parseJsonValue(valueText))
       : parseJsonValue(valueText);
+    const oldParentTreeId = loaded.parentTreeId;
+    const newParentSettingsId =
+      scope === "metadata" && name === "Parent" && typeof parsedValue === "string" ? parsedValue : undefined;
     if (scope === "property" && usesDisabledProperty(loaded.className) && name === "Enabled") {
       propertyName = "Disabled";
       parsedValue = !(parsedValue === true);
     }
     if (options.skipStudioPush) {
       await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths: [loaded.settingsFile],
+        paths: loaded.settingsFile ? [loaded.settingsFile] : [],
         durationMs: 5000,
       });
     }
-    const args = [
-      "bytecode-set-property",
-      "-f",
-      loaded.settingsFile,
-      "-p",
-      propertyName,
-      `--value-json=${JSON.stringify(parsedValue)}`,
-      "-S",
+    const batchDir = path.join(config.projectRoot, ".renium", "editor-property-batches");
+    fs.mkdirSync(batchDir, { recursive: true });
+    const batchPath = path.join(
+      batchDir,
+      `explorer-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+    );
+    fs.writeFileSync(batchPath, JSON.stringify([{
+      service: loaded.service,
+      settingsId: loaded.settingsId,
+      className: loaded.className,
+      pathSegments: loaded.pathSegments,
+      pathOrdinals: loaded.pathOrdinals,
       scope,
-    ];
-    if (loaded.settingsId) {
-      args.push("-i", loaded.settingsId);
-    } else {
-      args.push("-x", String(loaded.index));
+      property: propertyName,
+      value: parsedValue,
+    }]), "utf8");
+    let batchResult: {
+      applied?: number;
+      filtered?: number;
+      changedPaths?: string[];
+      sourcePaths?: Array<{ path?: string }>;
+    };
+    try {
+      batchResult = await runJsonCli(config, [
+        "bytecode-apply-property-batch",
+        "--project-root",
+        config.projectRoot,
+        "--input",
+        batchPath,
+        "--direction",
+        "files-to-studio",
+      ]);
+    } finally {
+      try {
+        fs.unlinkSync(batchPath);
+      } catch {
+      }
     }
-    await runJsonCli(config, args);
+    if (generation !== this.projectGeneration) {
+      throw new Error("The active Renium project changed while the edit was being applied.");
+    }
+    if (batchResult.applied !== 1) {
+      throw new Error(batchResult.filtered === 1
+        ? "This field is excluded by the project filters."
+        : "The project did not apply this property edit.");
+    }
+    const changedPaths = Array.from(new Set([
+      ...(batchResult.changedPaths ?? []),
+      ...(batchResult.sourcePaths ?? [])
+        .map((entry) => entry.path)
+        .filter((value): value is string => typeof value === "string" && value.length > 0),
+    ]));
     if (options.skipStudioPush) {
       await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths: [loaded.settingsFile],
+        paths: changedPaths,
         durationMs: 5000,
-        refreshCache: true,
       });
     }
     if (scope === "metadata") {
-      await this.reloadParentChildren(loaded);
+      if (name === "Parent") {
+        const oldParent = oldParentTreeId ? this.nodesById.get(oldParentTreeId) : undefined;
+        if (oldParent) {
+          await this.loadChildren(oldParent);
+        }
+        const newParent = newParentSettingsId
+          ? this.nodesById.get(normalizeId(loaded.service, newParentSettingsId))
+          : undefined;
+        if (newParent) {
+          await this.loadChildren(newParent);
+        } else {
+          await this.loadService(loaded.service);
+        }
+      } else {
+        await this.reloadParentChildren(loaded);
+      }
     } else {
       if (scope === "property") {
         loaded.properties[propertyName] = parsedValue;
@@ -3681,8 +3860,16 @@ export class FileExplorerModel {
       this.fireChange();
     }
     if (!options.skipStudioPush) {
-      await this.pushSettingsToStudio(loaded.settingsFile);
+      await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
+        projectRoot: config.projectRoot,
+        pendingServices: [loaded.service],
+        skipChangeFilter: true,
+        taskName: "Explorer -> Studio sync",
+        targetSettingsId: loaded.settingsId,
+        targetProperty: propertyName,
+      });
     }
+    return changedPaths;
   }
 
   private async reloadParentChildren(node: FileExplorerNode): Promise<void> {
@@ -3714,18 +3901,40 @@ export class FileExplorerModel {
         return serviceRoot.settingsId;
       }
     }
-    for (const candidate of this.nodesById.values()) {
-      if (candidate.service !== node.service || candidate.treeId === node.treeId || !candidate.settingsId) {
-        continue;
-      }
-      if (
-        candidate.settingsId === text ||
-        candidate.treeId === text ||
-        candidate.name === text ||
-        candidate.pathSegments.join(".") === text
-      ) {
-        return candidate.settingsId;
-      }
+    const candidates = Array.from(this.nodesById.values()).filter((candidate) => (
+      candidate.service === node.service &&
+      candidate.treeId !== node.treeId &&
+      Boolean(candidate.settingsId)
+    ));
+    const idMatch = candidates.find((candidate) => (
+      candidate.settingsId === text || candidate.treeId === text
+    ));
+    if (idMatch?.settingsId) {
+      return idMatch.settingsId;
+    }
+    const qualifiedPath = (candidate: FileExplorerNode): string => candidate.pathSegments
+      .map((segment, index) => {
+        const ordinal = candidate.pathOrdinals[index] ?? 1;
+        return ordinal > 1 ? `${segment}[${ordinal}]` : segment;
+      })
+      .join(".");
+    const exactPathMatches = candidates.filter((candidate) => qualifiedPath(candidate) === text);
+    if (exactPathMatches.length === 1) {
+      return exactPathMatches[0].settingsId;
+    }
+    const looseMatches = candidates.filter((candidate) => (
+      candidate.name === text || candidate.pathSegments.join(".") === text
+    ));
+    const matches = exactPathMatches.length > 0 ? exactPathMatches : looseMatches;
+    if (matches.length === 1) {
+      return matches[0].settingsId;
+    }
+    if (matches.length > 1) {
+      const choices = matches
+        .slice(0, 6)
+        .map((candidate) => `${qualifiedPath(candidate)} (${candidate.settingsId})`)
+        .join(", ");
+      throw new Error(`Parent ${JSON.stringify(text)} is ambiguous. Use a bytecode id or ordinal-qualified path: ${choices}`);
     }
     return value;
   }
@@ -3754,37 +3963,7 @@ export class FileExplorerModel {
       throw new Error("Cannot move an instance into itself or one of its descendants.");
     }
     if (loaded.service !== loadedParent.service) {
-      const config = getExplorerConfig();
-      const args = [
-        "bytecode-move-instance",
-        "-f",
-        loaded.settingsFile,
-        "-s",
-        loaded.service,
-        "-i",
-        loaded.settingsId,
-        "--target-file",
-        loadedParent.settingsFile,
-        "--target-service",
-        loadedParent.service,
-      ];
-      if (loadedParent.settingsId) {
-        args.push("-I", loadedParent.settingsId);
-      } else if (loadedParent.index !== undefined) {
-        args.push("-X", String(loadedParent.index));
-      }
-      const result = await runJsonCli<CliMoveInstanceResult>(config, args);
-      const copiedSourcePaths: string[] = [];
-      for (const copy of result.sourceCopies ?? []) {
-        if (copy.to) {
-          copiedSourcePaths.push(copy.to);
-        }
-      }
-      await this.loadService(loaded.service);
-      await this.loadService(loadedParent.service);
-      await this.pushSettingsToStudio(loadedParent.settingsFile, result.settingsIds, copiedSourcePaths);
-      await this.pushSettingsToStudio(loaded.settingsFile);
-      return result.rootSettingsId ? this.nodesById.get(normalizeId(loadedParent.service, result.rootSettingsId)) : undefined;
+      throw new Error("Cross-service moves are not available because Studio cannot apply them atomically.");
     }
     await this.setValue(loaded, "metadata", "Parent", loadedParent.settingsId);
     return this.nodesById.get(normalizeId(loaded.service, loaded.settingsId));
@@ -3798,17 +3977,20 @@ export class FileExplorerModel {
     attributes: Record<string, unknown> = {},
     pushToStudio = true,
   ): Promise<FileExplorerNode | undefined> {
+    const generation = this.projectGeneration;
     const loadedParent = await this.ensureLoaded(parent);
-    if (loadedParent.index === undefined) {
-      throw new Error("Parent instance has no bytecode index.");
+    this.requireProjectGeneration(generation);
+    if (!loadedParent.settingsId) {
+      throw new Error("Parent instance has no bytecode id.");
     }
     const config = getExplorerConfig();
     const args = [
-      "bytecode-add-instance",
-      "-f",
-      loadedParent.settingsFile,
-      "-x",
-      String(loadedParent.index),
+      "create",
+      loadedParent.service,
+      "-r",
+      config.projectRoot,
+      "-I",
+      loadedParent.settingsId ?? "",
       "-c",
       className,
       "-n",
@@ -3816,119 +3998,114 @@ export class FileExplorerModel {
     ];
     appendRecordAssignments(args, "-p", properties);
     appendRecordAssignments(args, "-a", attributes);
-    const result = await runJsonCli<{ settingsId?: string }>(config, args);
+    const result = await runJsonCli<{ settingsId?: string; changedPaths?: string[]; sourceWrites?: string[] }>(config, args);
+    this.requireProjectGeneration(generation);
     await this.loadChildren(loadedParent);
+    this.requireProjectGeneration(generation);
     if (pushToStudio) {
-      await this.pushSettingsToStudio(
-        loadedParent.settingsFile,
+      await this.pushChangedPathsToStudio(
+        result.changedPaths ?? result.sourceWrites ?? [],
         result.settingsId ? [result.settingsId] : undefined,
       );
+      this.requireProjectGeneration(generation);
     }
     return result.settingsId ? this.nodesById.get(normalizeId(loadedParent.service, result.settingsId)) : undefined;
   }
 
   public async cloneInstance(source: FileExplorerNode, parent: FileExplorerNode): Promise<FileExplorerNode | undefined> {
+    const generation = this.projectGeneration;
     if (source.kind === "service") {
       throw new Error("Service roots cannot be copied.");
     }
     const loadedSource = await this.ensureDetails(await this.ensureLoaded(source));
     const loadedParent = await this.ensureLoaded(parent);
+    this.requireProjectGeneration(generation);
     if (loadedSource.service !== loadedParent.service) {
       throw new Error("Cross-service copies need a subtree copy path before they can be full fidelity.");
     }
     if (!loadedSource.settingsId) {
       throw new Error("Selected instance has no bytecode id.");
     }
-    if (!loadedParent.settingsId && loadedParent.index === undefined) {
+    if (!loadedParent.settingsId) {
       throw new Error("Target parent has no bytecode id.");
     }
     const config = getExplorerConfig();
     const args = [
-      "bytecode-clone-instance",
-      "-f",
-      loadedParent.settingsFile,
-      "-s",
+      "clone",
       loadedParent.service,
+      "-r",
+      config.projectRoot,
       "-i",
       loadedSource.settingsId,
+      "-I",
+      loadedParent.settingsId ?? "",
     ];
-    if (loadedParent.settingsId) {
-      args.push("-I", loadedParent.settingsId);
-    } else if (loadedParent.index !== undefined) {
-      args.push("-X", String(loadedParent.index));
-    }
     const result = await runJsonCli<CliCloneInstanceResult>(config, args);
-    const copiedSourcePaths: string[] = [];
-    for (const copy of result.sourceCopies ?? []) {
-      if (!copy.from || !copy.to || !fs.existsSync(copy.from)) {
-        continue;
-      }
-      fs.mkdirSync(path.dirname(copy.to), { recursive: true });
-      fs.copyFileSync(copy.from, copy.to);
-      copiedSourcePaths.push(copy.to);
-    }
+    this.requireProjectGeneration(generation);
     await this.loadChildren(loadedParent);
+    this.requireProjectGeneration(generation);
     const current = result.rootSettingsId
       ? this.nodesById.get(normalizeId(loadedParent.service, result.rootSettingsId))
       : undefined;
-    await this.pushSettingsToStudio(loadedParent.settingsFile, result.settingsIds, copiedSourcePaths);
+    await this.pushChangedPathsToStudio(result.changedPaths ?? [], result.settingsIds);
+    this.requireProjectGeneration(generation);
     return current;
   }
 
   public async exportModel(node: FileExplorerNode, outputPath: string, format: RobloxModelFormat): Promise<CliExportModelResult> {
+    const generation = this.projectGeneration;
     const loaded = await this.ensureLoaded(node);
-    if (!loaded.settingsId && loaded.index === undefined) {
+    this.requireProjectGeneration(generation);
+    if (!loaded.settingsId) {
       throw new Error("Selected instance has no bytecode id.");
     }
     const config = getExplorerConfig();
     const args = [
-      "bytecode-export-model",
-      "-f",
-      loaded.settingsFile,
-      "-s",
+      "export-model",
       loaded.service,
+      "-r",
+      config.projectRoot,
       "-o",
       outputPath,
       "--format",
       format,
     ];
-    if (loaded.settingsId) {
-      args.push("-i", loaded.settingsId);
-    } else if (loaded.index !== undefined) {
-      args.push("-x", String(loaded.index));
-    }
+    args.push("-i", loaded.settingsId ?? "");
     return runJsonCli<CliExportModelResult>(config, args);
   }
 
   public async importModel(parent: FileExplorerNode, modelPath: string): Promise<FileExplorerNode | undefined> {
+    const generation = this.projectGeneration;
     const loadedParent = await this.ensureLoaded(parent);
-    if (!loadedParent.settingsId && loadedParent.index === undefined) {
+    this.requireProjectGeneration(generation);
+    if (!loadedParent.settingsId) {
       throw new Error("Target parent has no bytecode id.");
     }
     const config = getExplorerConfig();
     const args = [
-      "bytecode-import-model",
-      "-f",
-      loadedParent.settingsFile,
-      "-s",
+      "import-model",
       loadedParent.service,
+      "-r",
+      config.projectRoot,
       "-m",
       modelPath,
+      "-I",
+      loadedParent.settingsId ?? "",
     ];
-    if (loadedParent.settingsId) {
-      args.push("-I", loadedParent.settingsId);
-    } else if (loadedParent.index !== undefined) {
-      args.push("-x", String(loadedParent.index));
-    }
     const result = await runJsonCli<CliImportModelResult>(config, args);
+    this.requireProjectGeneration(generation);
     await this.loadChildren(loadedParent);
+    this.requireProjectGeneration(generation);
     const created = result.rootSettingsIds?.[0]
       ? this.nodesById.get(normalizeId(loadedParent.service, result.rootSettingsIds[0]))
       : undefined;
-    const sourceWritePaths = (result.sourceWrites ?? [])
-      .map((write) => write.path)
-      .filter((writePath): writePath is string => typeof writePath === "string" && writePath.length > 0);
-    await this.pushSettingsToStudio(loadedParent.settingsFile, result.settingsIds, sourceWritePaths);
+    await this.pushChangedPathsToStudio(
+      result.changedPaths ?? (result.sourceWrites ?? [])
+        .map((write) => write.path)
+        .filter((writePath): writePath is string => typeof writePath === "string" && writePath.length > 0),
+      result.settingsIds,
+    );
+    this.requireProjectGeneration(generation);
     return created;
   }
 
@@ -4021,7 +4198,9 @@ export class FileExplorerModel {
   }
 
   public async removeInstance(node: FileExplorerNode): Promise<CliRemoveInstanceResult> {
+    const generation = this.projectGeneration;
     const loaded = await this.ensureLoaded(node);
+    this.requireProjectGeneration(generation);
     if (loaded.kind === "service") {
       throw new Error("Refusing to remove a service root.");
     }
@@ -4045,12 +4224,14 @@ export class FileExplorerModel {
     for (let attempt = 0; ; attempt++) {
       try {
         result = await runJsonCli<CliRemoveInstanceResult>(config, [
-          "bytecode-remove-instance",
-          "-f",
-          loaded.settingsFile,
+          "remove",
+          loaded.service,
+          "-r",
+          config.projectRoot,
           "-i",
           loaded.settingsId,
         ]);
+        this.requireProjectGeneration(generation);
         break;
       } catch (error) {
         if (attempt >= 2 || !isSettingsLockTimeout(error)) {
@@ -4067,16 +4248,18 @@ export class FileExplorerModel {
     this.fireChange();
     this.queueStudioMutation(async () => {
       try {
-        await this.pushDeleteToStudio(studioDeleteTarget);
+        await this.pushDeleteToStudio(studioDeleteTarget, result?.changedPaths ?? []);
       } catch {
-        await this.pushSettingsToStudio(loaded.settingsFile);
+        await this.pushChangedPathsToStudio(result?.changedPaths ?? []);
       }
     }, "delete instance");
     return result ?? {};
   }
 
   public async desyncPackageLink(node: FileExplorerNode): Promise<CliDesyncPackageLinkResult> {
+    const generation = this.projectGeneration;
     const loaded = await this.ensureLoaded(node);
+    this.requireProjectGeneration(generation);
     if (loaded.kind === "service") {
       throw new Error("Select a package root or PackageLink instance.");
     }
@@ -4085,12 +4268,14 @@ export class FileExplorerModel {
     }
     const config = getExplorerConfig();
     const result = await runJsonCli<CliDesyncPackageLinkResult>(config, [
-      "bytecode-desync-package-link",
-      "-f",
-      loaded.settingsFile,
+      "desync-package-link",
+      loaded.service,
+      "-r",
+      config.projectRoot,
       "-i",
       loaded.settingsId,
     ]);
+    this.requireProjectGeneration(generation);
     const removedLinks = Array.isArray(result.removedPackageLinks) ? result.removedPackageLinks : [];
     const studioDeleteTargets = removedLinks.map((link, offset) => {
       const treeId = link.settingsId ? normalizeId(loaded.service, link.settingsId) : `${loaded.treeId}:PackageLink:${offset}`;
@@ -4148,10 +4333,13 @@ export class FileExplorerModel {
     this.fireChange();
     try {
       for (const target of studioDeleteTargets) {
-        await this.pushDeleteToStudio(target);
+        await this.pushDeleteToStudio(target, [result.settingsFile ?? loaded.settingsFile]);
+        this.requireProjectGeneration(generation);
       }
     } catch {
-      await this.pushSettingsToStudio(loaded.settingsFile);
+      this.requireProjectGeneration(generation);
+      await this.pushSettingsToStudio(result.settingsFile ?? loaded.settingsFile);
+      this.requireProjectGeneration(generation);
     }
     if (loaded.className === "PackageLink") {
       if (parent) {
@@ -4201,6 +4389,20 @@ export class FileExplorerModel {
       }
     }
     await vscode.commands.executeCommand("renium.pushEditorPathsNow", paths, {
+      projectRoot: getExplorerConfig().projectRoot,
+      skipChangeFilter: true,
+      taskName: "Explorer -> Studio sync",
+      targetSettingsIds,
+    });
+  }
+
+  private async pushChangedPathsToStudio(paths: string[], targetSettingsIds?: string[]): Promise<void> {
+    const changedPaths = Array.from(new Set(paths.filter((value) => typeof value === "string" && value.length > 0)));
+    if (changedPaths.length === 0) {
+      throw new Error("The project mutation returned no changed source paths.");
+    }
+    await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
+      projectRoot: getExplorerConfig().projectRoot,
       skipChangeFilter: true,
       taskName: "Explorer -> Studio sync",
       targetSettingsIds,
@@ -4216,6 +4418,8 @@ export class FileExplorerModel {
       return;
     }
     await vscode.commands.executeCommand("renium.pushEditorPathsNow", [settingsFile], {
+      projectRoot: getExplorerConfig().projectRoot,
+      pendingServices: [node.service],
       skipChangeFilter: true,
       taskName: "Explorer -> Studio sync",
       targetSettingsId: node.settingsId,
@@ -4228,49 +4432,82 @@ export class FileExplorerModel {
     scope: "metadata" | "property" | "attribute",
     propertyName: string,
     value: unknown,
-  ): Promise<void> {
+    changedPaths: string[] = [node.settingsFile],
+  ): Promise<"applied" | "skipped"> {
+    const config = getExplorerConfig();
     const targetProperty = String(propertyName).trim();
     if (targetProperty.length === 0) {
-      return;
+      return "skipped";
     }
     const pathSegments = node.pathSegments.length > 0
       ? node.pathSegments.slice()
       : [node.service, node.name].filter((segment) => segment.length > 0);
-    await vscode.commands.executeCommand("renium.pushEditorPropertyNow", {
-      settingsFile: node.settingsFile,
-      service: node.service,
-      settingsId: node.settingsId,
-      className: node.className,
-      pathSegments,
-      pathOrdinals: node.pathOrdinals.slice(),
-      scope,
-      property: targetProperty,
-      value,
-      allowProtectedMeshIdApply: node.className === "MeshPart" && targetProperty === "MeshId",
-    });
+    try {
+      const outcome = await vscode.commands.executeCommand<"applied" | "skipped">(
+        "renium.pushEditorPropertyNow",
+        {
+          projectRoot: config.projectRoot,
+          settingsFile: node.settingsFile,
+          service: node.service,
+          settingsId: node.settingsId,
+          className: node.className,
+          pathSegments,
+          pathOrdinals: node.pathOrdinals.slice(),
+          scope,
+          property: targetProperty,
+          value,
+          changedPaths,
+          allowProtectedMeshIdApply: node.className === "MeshPart" && targetProperty === "MeshId",
+        },
+      );
+      if (outcome !== "applied") {
+        await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+          paths: changedPaths,
+          durationMs: 5000,
+          forcePending: true,
+        });
+        return "skipped";
+      }
+      return "applied";
+    } catch (error) {
+      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+        paths: changedPaths,
+        durationMs: 5000,
+        forcePending: true,
+      });
+      throw error;
+    }
   }
 
-  public async pushDeleteToStudio(node: FileExplorerNode): Promise<void> {
+  public async pushDeleteToStudio(node: FileExplorerNode, changedPaths: string[] = [node.settingsFile]): Promise<void> {
+    const config = getExplorerConfig();
     const pathSegments = node.pathSegments.length > 0
       ? node.pathSegments.slice()
       : [node.service, node.name].filter((segment) => segment.length > 0);
     await vscode.commands.executeCommand("renium.pushEditorDeleteNow", {
+      projectRoot: config.projectRoot,
       settingsFile: node.settingsFile,
       service: node.service,
       settingsId: node.settingsId,
       className: node.className,
       pathSegments,
       pathOrdinals: node.pathOrdinals.slice(),
+      changedPaths,
     });
   }
 
   private queueStudioMutation(task: () => Promise<void>, label: string): void {
+    const generation = this.projectGeneration;
     this.studioMutationChain = this.studioMutationChain
       .catch(() => undefined)
-      .then(task)
+      .then(async () => {
+        if (generation === this.projectGeneration) {
+          await task();
+        }
+      })
       .catch((error) => {
         vscode.window.showErrorMessage(
-          `Renium: failed to ${label} in Studio. ${error instanceof Error ? error.message : String(error)}`,
+          `Failed to ${label} in Studio. ${error instanceof Error ? error.message : String(error)}`,
         );
       });
   }
@@ -4288,21 +4525,31 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   private currentNode: FileExplorerNode | undefined;
   private currentPackageMessage: PropertiesUpdateMessage | undefined;
   private webviewReady = false;
-  private readonly pendingPropertyFinalSets = new Map<string, { node: FileExplorerNode; name: string; value: unknown }>();
+  private readonly pendingPropertyFinalSets = new Map<string, {
+    node: FileExplorerNode;
+    name: string;
+    value: unknown;
+    generation: number;
+  }>();
   private readonly pendingPropertyHistory = new Map<string, PropertyEditHistoryItem>();
   private readonly propertyUndoStack: PropertyEditHistoryItem[] = [];
   private readonly propertyRedoStack: PropertyEditHistoryItem[] = [];
   private propertyHistorySequence = 0;
-  private propertyFinalSetActive = false;
+  private propertyFinalSetGeneration: number | undefined;
   private readonly pendingLiveStudioPushes = new Map<string, {
     node: FileExplorerNode;
     scope: "metadata" | "property";
     propertyName: string;
     value: unknown;
+    generation: number;
   }>();
   private liveStudioPushTimer: NodeJS.Timeout | undefined;
+  private liveStudioFlushChain: Promise<void> = Promise.resolve();
   private studioPropertyPushChain: Promise<void> = Promise.resolve();
+  private readonly activeMessageTasks = new Set<Promise<void>>();
+  private mutationAdmissionOpen = true;
   private referenceRevealHandler: ((nodeId: string) => Promise<void> | void) | undefined;
+  private projectGeneration = 0;
 
   public constructor(
     private readonly model: FileExplorerModel,
@@ -4312,6 +4559,26 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
 
   public setReferenceRevealHandler(handler: (nodeId: string) => Promise<void> | void): void {
     this.referenceRevealHandler = handler;
+  }
+
+  public resetProjectState(): void {
+    this.projectGeneration += 1;
+    this.mutationAdmissionOpen = true;
+    if (this.liveStudioPushTimer) {
+      clearTimeout(this.liveStudioPushTimer);
+      this.liveStudioPushTimer = undefined;
+    }
+    this.currentNode = undefined;
+    this.currentPackageMessage = undefined;
+    this.pendingPropertyFinalSets.clear();
+    this.pendingPropertyHistory.clear();
+    this.pendingLiveStudioPushes.clear();
+    this.propertyUndoStack.length = 0;
+    this.propertyRedoStack.length = 0;
+    this.propertyFinalSetGeneration = undefined;
+    this.liveStudioFlushChain = Promise.resolve();
+    this.studioPropertyPushChain = Promise.resolve();
+    this.webviewView?.webview.postMessage({ type: "clear" });
   }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -4325,7 +4592,13 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       ],
     };
     webviewView.webview.onDidReceiveMessage((message) => {
-      void this.onMessage(message);
+      const task = this.onMessage(message).catch((error) => {
+        const text = error instanceof Error ? error.message : String(error);
+        this.webviewView?.webview.postMessage({ type: "error", message: text });
+        vscode.window.showErrorMessage(`Property action failed. ${text}`);
+      });
+      this.activeMessageTasks.add(task);
+      void task.finally(() => this.activeMessageTasks.delete(task));
     });
     this.onVisibilityChanged?.(FilePropertiesViewProvider.viewType, webviewView.visible);
     webviewView.onDidChangeVisibility(() => {
@@ -4334,9 +4607,27 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = getPropertiesHtml(this.extensionUri, { showFilterInput: true });
   }
 
+  public async prepareProjectSwitch(): Promise<void> {
+    this.mutationAdmissionOpen = false;
+    await Promise.allSettled(Array.from(this.activeMessageTasks));
+    await this.finalizePendingPropertyHistory();
+    await this.flushLiveStudioPushes().catch(() => undefined);
+    await this.studioPropertyPushChain.catch(() => undefined);
+    await this.liveStudioFlushChain.catch(() => undefined);
+  }
+
+  public cancelProjectSwitch(): void {
+    this.mutationAdmissionOpen = true;
+  }
+
   public async show(node: FileExplorerNode): Promise<void> {
+    const generation = this.projectGeneration;
     this.currentPackageMessage = undefined;
-    this.currentNode = await this.model.loadDetails(node);
+    const loaded = await this.model.loadDetails(node);
+    if (generation !== this.projectGeneration) {
+      return;
+    }
+    this.currentNode = loaded;
     this.pushCurrent();
   }
 
@@ -4390,6 +4681,14 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       readOnly: true,
     };
     this.pushCurrent();
+  }
+
+  public clearReadonlyPackage(): void {
+    if (!this.currentPackageMessage) {
+      return;
+    }
+    this.currentPackageMessage = undefined;
+    this.webviewView?.webview.postMessage({ type: "clear" });
   }
 
 
@@ -4464,11 +4763,16 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!this.currentNode) {
       return;
     }
+    const generation = this.projectGeneration;
     const updated = (this.currentNode.settingsId
       ? this.model.getNode(normalizeId(this.currentNode.service, this.currentNode.settingsId))
       : this.model.getNode(serviceTreeId(this.currentNode.service))) ?? this.currentNode;
     updated.detailsLoaded = false;
-    this.currentNode = await this.model.loadDetails(updated);
+    const loaded = await this.model.loadDetails(updated);
+    if (generation !== this.projectGeneration) {
+      return;
+    }
+    this.currentNode = loaded;
     this.pushCurrent();
   }
 
@@ -4532,7 +4836,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
         try {
           await this.referenceRevealHandler(instanceId);
         } catch (error) {
-          vscode.window.showErrorMessage(`Renium: failed to reveal referenced instance. ${error instanceof Error ? error.message : String(error)}`);
+          vscode.window.showErrorMessage(`Failed to reveal referenced instance. ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       return;
@@ -4540,12 +4844,16 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!this.currentNode || !message.type) {
       return;
     }
+    const mutationTypes = new Set([
+      "setProperty", "undo", "redo", "addTag", "removeTag", "addAttribute", "setAttribute", "removeAttribute",
+      "renameAttribute",
+    ]);
+    if (!this.mutationAdmissionOpen && mutationTypes.has(message.type)) {
+      return;
+    }
     const messageNode = typeof message.nodeTreeId === "string" && message.nodeTreeId.length > 0
       ? this.model.getNode(message.nodeTreeId)
       : this.currentNode;
-    const mutationTypes = new Set([
-      "setProperty", "addTag", "removeTag", "addAttribute", "setAttribute", "removeAttribute", "renameAttribute",
-    ]);
     if (mutationTypes.has(message.type)) {
       if (!messageNode) {
         return;
@@ -4606,7 +4914,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       ) {
         this.webviewView?.webview.postMessage({ type: "propertyCommitDone", propertyName: message.propertyName });
       }
-      vscode.window.showErrorMessage(`Renium: failed to update property. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to update property. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -4614,26 +4922,32 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!node || !name) {
       return;
     }
+    const generation = this.projectGeneration;
     if (live) {
       await this.setPropertyFromWebview(node, name, value, true);
       return;
     }
-    this.pendingPropertyFinalSets.set(`${node.treeId}:${name}`, { node, name, value });
-    if (this.propertyFinalSetActive) {
+    this.pendingPropertyFinalSets.set(`${node.treeId}:${name}`, { node, name, value, generation });
+    if (this.propertyFinalSetGeneration === generation) {
       return;
     }
-    this.propertyFinalSetActive = true;
+    this.propertyFinalSetGeneration = generation;
     try {
-      while (this.pendingPropertyFinalSets.size > 0) {
+      while (generation === this.projectGeneration && this.pendingPropertyFinalSets.size > 0) {
         const next = this.pendingPropertyFinalSets.values().next().value;
         if (!next) {
           break;
         }
         this.pendingPropertyFinalSets.delete(`${next.node.treeId}:${next.name}`);
+        if (next.generation !== generation) {
+          continue;
+        }
         await this.setPropertyFromWebview(next.node, next.name, next.value, false);
       }
     } finally {
-      this.propertyFinalSetActive = false;
+      if (this.propertyFinalSetGeneration === generation) {
+        this.propertyFinalSetGeneration = undefined;
+      }
     }
   }
 
@@ -4707,28 +5021,50 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       }
       return;
     }
-    const settingsBackup = this.capturePropertyHistoryBackup(historyItem);
+    const settingsBackup = await this.capturePropertyHistoryBackup(historyItem);
     this.applyLocalPropertyValue(node, scope, name, rawValue);
-    await this.model.setValue(node, scope, writePropertyName, JSON.stringify(rawValue), { skipStudioPush: true });
-    this.rememberPropertyHistory(historyItem, settingsBackup);
+    const changedPaths = await this.model.setValue(
+      node,
+      scope,
+      writePropertyName,
+      JSON.stringify(rawValue),
+      { skipStudioPush: true },
+    );
+    await this.rememberPropertyHistory(historyItem, settingsBackup);
     this.pushCurrent();
-    this.queueFinalStudioPropertyPush(pushTarget, scope, studioPropertyName, studioRawValue);
+    this.queueFinalStudioPropertyPush(pushTarget, scope, studioPropertyName, studioRawValue, changedPaths);
   }
 
-  private capturePropertyHistoryBackup(item: PropertyEditHistoryItem): Buffer | undefined {
+  private async finalizePendingPropertyHistory(): Promise<void> {
+    for (const item of Array.from(this.pendingPropertyHistory.values())) {
+      const currentMatches = !!this.currentNode && (
+        this.currentNode.treeId === item.treeId
+        || (!!item.settingsId && this.currentNode.settingsId === item.settingsId)
+      );
+      const node = this.model.getNode(item.treeId)
+        ?? (item.settingsId ? this.model.getNode(normalizeId(item.service, item.settingsId)) : undefined)
+        ?? (currentMatches ? this.currentNode : undefined);
+      if (!node || node.service !== item.service) {
+        throw new Error(`Could not finish the pending ${item.propertyLabel} edit before changing projects.`);
+      }
+      await this.setPropertyFromWebview(node, item.name, cloneHistoryValue(item.afterRawValue), false);
+    }
+  }
+
+  private async capturePropertyHistoryBackup(item: PropertyEditHistoryItem): Promise<Buffer | undefined> {
     const settingsFile = path.normalize(item.settingsFile);
     if (!settingsFile || !fs.existsSync(settingsFile)) {
       return undefined;
     }
     try {
-      return fs.readFileSync(settingsFile);
+      return await fs.promises.readFile(settingsFile);
     } catch {
       return undefined;
     }
   }
 
-  private rememberPropertyHistory(item: PropertyEditHistoryItem, settingsBackup: Buffer | undefined): void {
-    const historyId = this.writePropertyHistory(item, settingsBackup);
+  private async rememberPropertyHistory(item: PropertyEditHistoryItem, settingsBackup: Buffer | undefined): Promise<void> {
+    const historyId = await this.writePropertyHistory(item, settingsBackup);
     const stored: PropertyEditHistoryItem = {
       ...item,
       pathSegments: item.pathSegments.slice(),
@@ -4744,7 +5080,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private writePropertyHistory(item: PropertyEditHistoryItem, settingsBackup: Buffer | undefined): string | undefined {
+  private async writePropertyHistory(item: PropertyEditHistoryItem, settingsBackup: Buffer | undefined): Promise<string | undefined> {
     if (!settingsBackup || settingsBackup.length === 0) {
       return undefined;
     }
@@ -4756,13 +5092,15 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     const safeProperty = safeHistoryComponent(item.propertyLabel ?? item.name);
     const id = `${createdUnixMs}-${sequence}-${safeService}-${safeProperty}`;
     const entryDir = path.join(historyRoot, id);
+    const stagedEntryDir = path.join(historyRoot, `.${id}.tmp`);
     const manifestPath = path.join(entryDir, "manifest.json");
-    if (!pathInsideRoot(historyRoot, manifestPath)) {
+    if (!pathInsideRoot(historyRoot, manifestPath) || !pathInsideRoot(historyRoot, stagedEntryDir)) {
       return undefined;
     }
     try {
-      fs.mkdirSync(entryDir, { recursive: true });
-      fs.writeFileSync(path.join(entryDir, "settings.renium"), settingsBackup);
+      await fs.promises.mkdir(historyRoot, { recursive: true });
+      await fs.promises.mkdir(stagedEntryDir);
+      await fs.promises.writeFile(path.join(stagedEntryDir, "settings.renium"), settingsBackup);
       const manifest: EditorHistoryManifest = {
         version: 1,
         createdUnixMs,
@@ -4773,11 +5111,25 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
         className: item.className,
         propertyName: item.name,
         propertyLabel: item.propertyLabel ?? item.name,
+        settingsFile: item.settingsFile,
         settingsBackup: "settings.renium",
       };
-      fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+      await fs.promises.writeFile(
+        path.join(stagedEntryDir, "manifest.json"),
+        `${JSON.stringify(manifest, null, 2)}\n`,
+        "utf8",
+      );
+      await fs.promises.rename(stagedEntryDir, entryDir);
+      const entries = (await fs.promises.readdir(historyRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name)
+        .sort();
+      await Promise.all(entries.slice(0, Math.max(0, entries.length - 100)).map((entry) =>
+        fs.promises.rm(path.join(historyRoot, entry), { recursive: true, force: true })
+      ));
       return id;
     } catch {
+      await fs.promises.rm(stagedEntryDir, { recursive: true, force: true }).catch(() => undefined);
       return undefined;
     }
   }
@@ -4830,12 +5182,24 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     const pushTarget = this.snapshotStudioPushNode(node);
     const clonedValue = cloneHistoryValue(rawValue);
     this.applyLocalPropertyValue(node, item.scope, item.name, clonedValue);
-    await this.model.setValue(node, item.scope, item.writePropertyName, JSON.stringify(clonedValue), { skipStudioPush: true });
+    const changedPaths = await this.model.setValue(
+      node,
+      item.scope,
+      item.writePropertyName,
+      JSON.stringify(clonedValue),
+      { skipStudioPush: true },
+    );
     if (this.currentNode && (this.currentNode.treeId === node.treeId || (item.settingsId && this.currentNode.settingsId === item.settingsId))) {
       this.applyLocalPropertyValue(this.currentNode, item.scope, item.name, clonedValue);
       this.pushCurrent();
     }
-    this.queueFinalStudioPropertyPush(pushTarget, item.scope, item.studioPropertyName, this.studioRawValueForHistory(item, clonedValue));
+    this.queueFinalStudioPropertyPush(
+      pushTarget,
+      item.scope,
+      item.studioPropertyName,
+      this.studioRawValueForHistory(item, clonedValue),
+      changedPaths,
+    );
   }
 
   private studioRawValueForHistory(item: PropertyEditHistoryItem, rawValue: unknown): unknown {
@@ -4880,6 +5244,7 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       scope,
       propertyName,
       value,
+      generation: this.projectGeneration,
     });
     if (this.liveStudioPushTimer) {
       clearTimeout(this.liveStudioPushTimer);
@@ -4891,15 +5256,23 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async flushLiveStudioPushes(): Promise<void> {
-    if (this.liveStudioPushTimer) {
-      clearTimeout(this.liveStudioPushTimer);
-      this.liveStudioPushTimer = undefined;
-    }
-    const pushes = Array.from(this.pendingLiveStudioPushes.values());
-    this.pendingLiveStudioPushes.clear();
-    await Promise.all(pushes.map((push) =>
-      this.model.pushPropertyToStudio(push.node, push.scope, push.propertyName, push.value),
-    ));
+    const run = this.liveStudioFlushChain
+      .catch(() => undefined)
+      .then(async () => {
+        const generation = this.projectGeneration;
+        if (this.liveStudioPushTimer) {
+          clearTimeout(this.liveStudioPushTimer);
+          this.liveStudioPushTimer = undefined;
+        }
+        const pushes = Array.from(this.pendingLiveStudioPushes.values())
+          .filter((push) => push.generation === generation);
+        this.pendingLiveStudioPushes.clear();
+        await Promise.all(pushes.map((push) =>
+          this.model.pushPropertyToStudio(push.node, push.scope, push.propertyName, push.value),
+        ));
+      });
+    this.liveStudioFlushChain = run.catch(() => undefined);
+    await run;
   }
 
   private queueFinalStudioPropertyPush(
@@ -4907,17 +5280,31 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     scope: "metadata" | "property",
     propertyName: string,
     value: unknown,
+    changedPaths: string[] = [node.settingsFile],
   ): void {
+    const generation = this.projectGeneration;
     this.studioPropertyPushChain = this.studioPropertyPushChain
       .catch(() => undefined)
       .then(async () => {
+        if (generation !== this.projectGeneration) {
+          return;
+        }
         await this.flushLiveStudioPushes();
-        await this.model.pushPropertyToStudio(node, scope, propertyName, value);
+        if (generation !== this.projectGeneration) {
+          return;
+        }
+        await this.model.pushPropertyToStudio(node, scope, propertyName, value, changedPaths);
+        if (generation !== this.projectGeneration) {
+          return;
+        }
         await this.reloadCurrent();
       })
       .catch((error) => {
+        if (generation !== this.projectGeneration) {
+          return;
+        }
         vscode.window.showErrorMessage(
-          `Renium: failed to update property in Studio. ${error instanceof Error ? error.message : String(error)}`,
+          `Failed to update property in Studio. ${error instanceof Error ? error.message : String(error)}`,
         );
       });
   }
@@ -4984,11 +5371,16 @@ class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!this.currentNode) {
       return;
     }
+    const generation = this.projectGeneration;
     const updated = this.currentNode.settingsId
       ? this.model.getNode(normalizeId(this.currentNode.service, this.currentNode.settingsId))
       : this.model.getNode(serviceTreeId(this.currentNode.service));
     if (updated) {
-      this.currentNode = await this.model.loadDetails(updated);
+      const loaded = await this.model.loadDetails(updated);
+      if (generation !== this.projectGeneration) {
+        return;
+      }
+      this.currentNode = loaded;
     }
   }
 
@@ -5291,6 +5683,7 @@ type ExplorerViewMode = "normal" | "search";
 type ExplorerRowSummary = {
   id: string;
   settingsId?: string;
+  settingsFile?: string;
   index?: number;
   kind: FileExplorerNodeKind;
   service: string;
@@ -5331,6 +5724,7 @@ type ExplorerBackendResponse = {
     id?: string;
     parentId?: string | null;
     settingsId?: string;
+    settingsFile?: string;
     pathSegments?: string[];
     pathOrdinals?: number[];
     properties?: Record<string, unknown>;
@@ -5363,6 +5757,7 @@ type ExplorerRowRequest = {
   scrollToSelected: boolean;
   includeMatchIds: boolean;
   revision?: number;
+  generation: number;
 };
 
 class ExplorerBackendClient implements vscode.Disposable {
@@ -5372,6 +5767,7 @@ class ExplorerBackendClient implements vscode.Disposable {
   private readonly pending = new Map<number, ExplorerPendingRequest>();
   private disposed = false;
   private starting: Promise<void> | undefined;
+  private stopping: Promise<void> = Promise.resolve();
   private initialized = false;
   private processInitialized = false;
 
@@ -5384,14 +5780,7 @@ class ExplorerBackendClient implements vscode.Disposable {
       pending.reject(new Error(`Explorer backend request ${id} cancelled.`));
     }
     this.pending.clear();
-    if (this.process && !this.process.killed) {
-      try {
-        this.process.stdin.write(`${JSON.stringify({ t: "quit", id: this.requestId++ })}\n`);
-      } catch {
-      }
-      this.process.kill();
-    }
-    this.process = undefined;
+    this.stopping = this.stopCurrentProcess();
   }
 
   public async initialize(): Promise<ExplorerBackendResponse> {
@@ -5420,10 +5809,7 @@ class ExplorerBackendClient implements vscode.Disposable {
   public restart(): void {
     this.processInitialized = false;
     this.failAll(new Error("Explorer backend restarted."));
-    if (this.process && !this.process.killed) {
-      this.process.kill();
-    }
-    this.process = undefined;
+    this.stopping = this.stopCurrentProcess();
   }
 
   public async getRows(start: number, count: number, mode: ExplorerViewMode, includeMatchIds = false): Promise<ExplorerBackendResponse> {
@@ -5491,12 +5877,11 @@ class ExplorerBackendClient implements vscode.Disposable {
       const timeoutMs = type === "searchStart" || type === "searchRows" ? 10000 : 30000;
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
-        if (this.process && !this.process.killed) {
-          this.process.kill();
-          this.process = undefined;
-          this.processInitialized = false;
-        }
-        reject(new Error(`Explorer backend request timed out: ${type}`));
+        this.processInitialized = false;
+        this.stopping = this.stopCurrentProcess();
+        void this.stopping.finally(() => {
+          reject(new Error(`Explorer backend request timed out: ${type}`));
+        });
       }, timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
       child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
@@ -5551,6 +5936,7 @@ class ExplorerBackendClient implements vscode.Disposable {
   }
 
   private async ensureStarted(): Promise<void> {
+    await this.stopping;
     if (this.process && !this.process.killed) {
       return;
     }
@@ -5578,7 +5964,7 @@ class ExplorerBackendClient implements vscode.Disposable {
       "-r",
       config.projectRoot,
       "-d",
-      "src",
+      config.srcDir,
       "-s",
       config.services.join(","),
       "--parent-pid",
@@ -5586,10 +5972,12 @@ class ExplorerBackendClient implements vscode.Disposable {
     ], {
       cwd: config.projectRoot,
       env: process.env,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: "pipe",
       windowsHide: true,
     });
+    trackProcess(child, projectProcessOwner(config.projectRoot));
     this.process = child;
     this.buffer = "";
     child.stdout.on("data", (data: Buffer | string) => {
@@ -5621,9 +6009,23 @@ class ExplorerBackendClient implements vscode.Disposable {
         return;
       }
       if (!this.disposed) {
-        this.failAll(new Error(`Explorer backend exited with code ${code ?? 0}.`));
+        this.failAll(new Error(`Explorer backend exited with code ${code ?? 130}.`));
       }
     });
+  }
+
+  private async stopCurrentProcess(): Promise<void> {
+    const child = this.process;
+    this.process = undefined;
+    this.processInitialized = false;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+    try {
+      child.stdin.write(`${JSON.stringify({ t: "quit", id: this.requestId++ })}\n`);
+    } catch {
+    }
+    await terminateProcess(child);
   }
 
   private handleStdout(chunk: string): void {
@@ -5685,7 +6087,10 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private rowRequestInFlight = false;
   private queuedRowRequest: ExplorerRowRequest | undefined;
   private mutationQueue: Promise<void> = Promise.resolve();
+  private readonly activeMessageTasks = new Set<Promise<void>>();
+  private mutationAdmissionOpen = true;
   private searchGeneration = 0;
+  private projectGeneration = 0;
   private readonly propertyOnlyStaleServices = new Set<string>();
   private referencePreviewId: string | undefined;
   private referencePreviewScrollPending = false;
@@ -5693,7 +6098,13 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private gitState: GitViewState | undefined;
   private gitLoading = false;
   private revealGitOnReady = false;
-  private externalPackageDrag: { id: string; name?: string; mode?: string } | undefined;
+  private externalPackageDrag: {
+    id: string;
+    name?: string;
+    mode?: string;
+    projectRoot: string;
+    generation: number;
+  } | undefined;
   private packageCursorProcess: childProcess.ChildProcess | undefined;
   private packageCursorBuffer = "";
   private packageCursorLastPost = 0;
@@ -5711,7 +6122,13 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public setExternalPackageDrag(link?: { id: string; name?: string; mode?: string }): void {
-    this.externalPackageDrag = link;
+    this.externalPackageDrag = link
+      ? {
+        ...link,
+        projectRoot: getExplorerConfig().projectRoot,
+        generation: this.projectGeneration,
+      }
+      : undefined;
     logPackageDragDebug(
       `explorer.host.setExternalPackageDrag: ${link ? `armed ${link.id} name=${link.name ?? ""} mode=${link.mode ?? ""}` : "cleared"} webviewReady=${this.webviewReady}`,
     );
@@ -5985,7 +6402,13 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "assets")],
     };
     webviewView.webview.onDidReceiveMessage((message) => {
-      void this.onMessage(message);
+      const task = this.onMessage(message).catch((error) => {
+        const text = error instanceof Error ? error.message : String(error);
+        this.pushError(text);
+        vscode.window.showErrorMessage(`Explorer action failed. ${text}`);
+      });
+      this.activeMessageTasks.add(task);
+      void task.finally(() => this.activeMessageTasks.delete(task));
     });
     this.onVisibilityChanged?.(FileExplorerViewProvider.viewType, webviewView.visible);
     webviewView.onDidChangeVisibility(() => {
@@ -6026,6 +6449,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public async revealReference(nodeId: string): Promise<void> {
+    const generation = this.projectGeneration;
     this.referencePreviewId = nodeId;
     this.referencePreviewScrollPending = true;
     this.currentMode = "normal";
@@ -6034,9 +6458,15 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     this.reveal();
     this.webviewView?.webview.postMessage({ type: "prepareReferencePreview" });
     await this.backend.ensureInitialized();
+    if (generation !== this.projectGeneration) {
+      return;
+    }
     const count = Math.max(this.rowWindow.count, 120);
     let start = this.rowWindow.start;
     const reveal = await this.backend.revealNode(nodeId);
+    if (generation !== this.projectGeneration) {
+      return;
+    }
     if (typeof reveal.rowIndex === "number") {
       start = Math.max(0, reveal.rowIndex - Math.floor(count / 2));
     }
@@ -6045,14 +6475,59 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public async refresh(): Promise<void> {
+    const generation = this.projectGeneration;
     try {
       await this.backend.initialize();
+      if (generation !== this.projectGeneration) {
+        return;
+      }
       await this.requestRows();
-      void this.searchBackend.ensureInitialized().catch(() => undefined);
     } catch (error) {
+      if (generation !== this.projectGeneration) {
+        return;
+      }
       this.pushError(error instanceof Error ? error.message : String(error));
-      vscode.window.showErrorMessage(`Renium: failed to refresh Explorer. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to refresh Explorer. ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  public async switchProject(): Promise<void> {
+    const refreshGit = this.gitState !== undefined || this.gitLoading || this.revealGitOnReady;
+    this.projectGeneration += 1;
+    this.searchGeneration += 1;
+    this.mutationAdmissionOpen = true;
+    this.mutationQueue = Promise.resolve();
+    this.clipboardNodeId = undefined;
+    this.propertyOnlyStaleServices.clear();
+    this.propertiesProvider.resetProjectState();
+    this.backend.restart();
+    this.searchBackend.restart();
+    this.selectedId = undefined;
+    this.currentMode = "normal";
+    this.referencePreviewId = undefined;
+    this.gitState = undefined;
+    this.gitLoading = false;
+    this.postGitState();
+    this.queuedRowRequest = undefined;
+    this.rowRequestSerial += 1;
+    await this.refresh();
+    if (refreshGit) {
+      await this.refreshGit();
+    }
+  }
+
+  public async prepareProjectSwitch(): Promise<void> {
+    this.mutationAdmissionOpen = false;
+    const properties = this.propertiesProvider.prepareProjectSwitch();
+    await Promise.allSettled(Array.from(this.activeMessageTasks));
+    await this.mutationQueue.catch(() => undefined);
+    await properties;
+    await this.model.prepareProjectSwitch();
+  }
+
+  public cancelProjectSwitch(): void {
+    this.mutationAdmissionOpen = true;
+    this.propertiesProvider.cancelProjectSwitch();
   }
 
   public async showGit(): Promise<void> {
@@ -6070,15 +6545,29 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!git || !this.webviewView || !this.webviewReady) {
       return;
     }
+    const generation = this.projectGeneration;
+    const projectRoot = path.resolve(getExplorerConfig().projectRoot);
     this.gitLoading = true;
     this.postGitState();
     try {
-      this.gitState = await git.refresh(options);
+      const state = await git.refresh({ ...options, projectRoot });
+      if (
+        !this.isCurrentGitContext(projectRoot, generation)
+        || !state.projectRoot
+        || !this.isCurrentGitContext(state.projectRoot, generation)
+      ) {
+        return;
+      }
+      this.gitState = state;
     } catch (error) {
+      if (!this.isCurrentGitContext(projectRoot, generation)) {
+        return;
+      }
       this.gitState = {
         ok: false,
         message: error instanceof Error ? error.message : String(error),
         trusted: vscode.workspace.isTrusted,
+        projectRoot,
         connected: false,
         ahead: 0,
         behind: 0,
@@ -6087,8 +6576,10 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         lastUpdated: new Date().toISOString(),
       };
     } finally {
-      this.gitLoading = false;
-      this.postGitState();
+      if (this.isCurrentGitContext(projectRoot, generation)) {
+        this.gitLoading = false;
+        this.postGitState();
+      }
     }
   }
 
@@ -6096,21 +6587,67 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!this.webviewView || !this.webviewReady) {
       return;
     }
-    this.webviewView.webview.postMessage({ type: "gitState", state: this.gitState, loading: this.gitLoading });
+    let projectRoot = "";
+    try {
+      projectRoot = path.resolve(getExplorerConfig().projectRoot);
+    } catch {
+    }
+    this.webviewView.webview.postMessage({
+      type: "gitState",
+      state: this.gitState,
+      loading: this.gitLoading,
+      projectRoot,
+      generation: this.projectGeneration,
+    });
+  }
+
+  private isCurrentGitContext(projectRoot: string | undefined, generation: number | undefined): boolean {
+    if (!projectRoot || generation !== this.projectGeneration) {
+      return false;
+    }
+    try {
+      const currentRoot = path.resolve(getExplorerConfig().projectRoot);
+      const requestedRoot = path.resolve(projectRoot);
+      return process.platform === "win32"
+        ? currentRoot.toLowerCase() === requestedRoot.toLowerCase()
+        : currentRoot === requestedRoot;
+    } catch {
+      return false;
+    }
   }
 
   public async refreshServices(services: string[]): Promise<void> {
+    const generation = this.projectGeneration;
     try {
       const canonicalServices = canonicalExplorerServices(getExplorerConfig(), services);
+      const affected = new Set(canonicalServices);
+      this.model.invalidateServices(canonicalServices);
+      if (this.selectedId && affected.has(this.serviceFromNodeId(this.selectedId) ?? "")) {
+        this.selectedId = undefined;
+        this.referencePreviewId = undefined;
+        this.propertiesProvider.resetProjectState();
+      }
+      if (this.clipboardNodeId && affected.has(this.serviceFromNodeId(this.clipboardNodeId) ?? "")) {
+        this.clipboardNodeId = undefined;
+      }
       await this.backend.reloadServices(canonicalServices);
+      if (generation !== this.projectGeneration) {
+        return;
+      }
       if (this.searchBackend.hasInitialized()) {
         await this.searchBackend.reloadServices(canonicalServices).catch(() => undefined);
+        if (generation !== this.projectGeneration) {
+          return;
+        }
       }
       for (const service of canonicalServices) {
         this.propertyOnlyStaleServices.delete(service);
       }
       try {
         await this.propertiesProvider.refreshCurrentForServices(canonicalServices);
+        if (generation !== this.projectGeneration) {
+          return;
+        }
       } catch (error) {
         if (!isNoMatchingInstanceError(error)) {
           throw error;
@@ -6118,17 +6655,29 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       }
       await this.requestRows();
     } catch (error) {
+      if (generation !== this.projectGeneration) {
+        return;
+      }
       if (isNoMatchingInstanceError(error)) {
         await this.requestRows().catch(() => undefined);
         return;
       }
       this.pushError(error instanceof Error ? error.message : String(error));
-      vscode.window.showErrorMessage(`Renium: failed to refresh Explorer changes. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to refresh Explorer changes. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   private async enqueueMutation(task: () => Promise<void>): Promise<void> {
-    const run = this.mutationQueue.then(task, task);
+    if (!this.mutationAdmissionOpen) {
+      return;
+    }
+    const generation = this.projectGeneration;
+    const runTask = async (): Promise<void> => {
+      if (generation === this.projectGeneration) {
+        await task();
+      }
+    };
+    const run = this.mutationQueue.then(runTask, runTask);
     this.mutationQueue = run.catch(() => undefined);
     await run;
   }
@@ -6163,6 +6712,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       scrollToSelected,
       includeMatchIds,
       revision,
+      generation: this.projectGeneration,
     };
     if (this.rowRequestInFlight) {
       return;
@@ -6172,6 +6722,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       while (this.queuedRowRequest) {
         const request: ExplorerRowRequest = this.queuedRowRequest;
         this.queuedRowRequest = undefined;
+        if (request.generation !== this.projectGeneration) {
+          continue;
+        }
         this.rowWindow = { start: request.start, count: request.count };
         const serial = ++this.rowRequestSerial;
         try {
@@ -6180,7 +6733,12 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
             await backend.ensureInitialized();
           }
           const response = await backend.getRows(request.start, request.count, request.mode, request.includeMatchIds);
-          if (this.queuedRowRequest || serial !== this.rowRequestSerial || request.mode !== this.currentMode) {
+          if (
+            request.generation !== this.projectGeneration
+            || this.queuedRowRequest
+            || serial !== this.rowRequestSerial
+            || request.mode !== this.currentMode
+          ) {
             if (request.mode === this.currentMode) {
               this.postRowsPrefetch(response, request.revision);
             }
@@ -6188,7 +6746,11 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           }
           this.postRowsWindow(response, request.scrollToSelected, request.revision);
         } catch (error) {
-          if (!this.queuedRowRequest && request.mode === this.currentMode) {
+          if (
+            request.generation === this.projectGeneration
+            && !this.queuedRowRequest
+            && request.mode === this.currentMode
+          ) {
             const message = error instanceof Error ? error.message : String(error);
             if (message.includes("Explorer backend exited with code 0")) {
               this.queuedRowRequest = request;
@@ -6200,6 +6762,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       this.rowRequestInFlight = false;
+      if (this.queuedRowRequest) {
+        void this.requestRows();
+      }
     }
   }
 
@@ -6263,13 +6828,20 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!this.webviewView || !this.webviewReady || mode !== this.currentMode) {
       return;
     }
+    const generation = this.projectGeneration;
     try {
       const backend = mode === "search" ? this.searchBackend : this.backend;
       if (mode === "search") {
         await backend.ensureInitialized();
       }
       const response = await backend.getRows(Math.max(0, start), Math.max(1, Math.min(2400, count)), mode);
-      if (!this.webviewView || !this.webviewReady || mode !== this.currentMode || response.type !== "rowsWindow") {
+      if (
+        generation !== this.projectGeneration
+        || !this.webviewView
+        || !this.webviewReady
+        || mode !== this.currentMode
+        || response.type !== "rowsWindow"
+      ) {
         return;
       }
       for (const row of response.rows ?? []) {
@@ -6281,7 +6853,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         revision,
       });
     } catch {
-      this.webviewView?.webview.postMessage({ type: "rowsPrefetchDone", mode, revision });
+      if (generation === this.projectGeneration) {
+        this.webviewView?.webview.postMessage({ type: "rowsPrefetchDone", mode, revision });
+      }
     }
   }
 
@@ -6291,6 +6865,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     const kind = (row?.kind === "service" ? "service" : "instance") as FileExplorerNodeKind;
     const settingsId = typeof row?.settingsId === "string" ? row.settingsId : this.settingsIdFromNodeId(id);
     const config = getExplorerConfig();
+    const hasBackendSettingsFile = !!row && Object.prototype.hasOwnProperty.call(row, "settingsFile");
     return {
       id,
       treeId: id,
@@ -6299,6 +6874,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       name: String(row?.name ?? service),
       className: String(row?.className ?? service),
       settingsId,
+      projectionSettingsId: this.settingsIdFromNodeId(id),
       index: typeof row?.index === "number" ? row.index : undefined,
       parentTreeId: typeof row?.parentId === "string" ? row.parentId : null,
       children: [],
@@ -6306,7 +6882,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       detailsLoaded: !!row?.properties || !!row?.attributes,
       hasChildren: row?.hasChildren === true || Number(row?.childCount ?? 0) > 0,
       hasPackageLink: row?.hasPackageLink === true,
-      settingsFile: settingsFileForService(config, service),
+      settingsFile: hasBackendSettingsFile
+        ? typeof row?.settingsFile === "string" ? path.normalize(row.settingsFile) : ""
+        : settingsFileForService(config, service),
       sourcePath: typeof row?.sourcePath === "string" ? row.sourcePath : undefined,
       pathSegments: Array.isArray(row?.pathSegments) ? row.pathSegments : [service],
       pathOrdinals: Array.isArray(row?.pathOrdinals) ? row.pathOrdinals : [1],
@@ -6450,6 +7028,8 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     fetch?: boolean;
     action?: string;
     path?: string;
+    projectRoot?: string;
+    generation?: number;
     message?: string;
     base64?: string;
     node?: {
@@ -6461,6 +7041,14 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       pathSegments?: string[];
     };
   }): Promise<void> {
+    const mutationTypes = new Set([
+      "restoreHistory", "restoreHistoryGroup", "addInstance", "createInstance", "renameInstance", "moveInstance",
+      "deleteInstance", "desyncPackageLink", "pasteInstance", "duplicateInstance", "importModel", "createLink",
+      "resaveLink", "relinkLink", "insertPackage", "breakLink",
+    ]);
+    if (!this.mutationAdmissionOpen && message.type && mutationTypes.has(message.type)) {
+      return;
+    }
     const node = message.nodeId ? this.model.getNode(message.nodeId) : undefined;
     switch (message.type) {
       case "rbsyncDecode":
@@ -6510,27 +7098,46 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         this.setExternalPackageDrag(undefined);
         return;
       case "gitRefresh":
-        await this.refreshGit({ fetch: message.fetch === true });
+        if (this.isCurrentGitContext(message.projectRoot, message.generation)) {
+          await this.refreshGit({ fetch: message.fetch === true });
+        }
         return;
-      case "gitAction":
-        if (this.actions.git && message.action) {
+      case "gitAction": {
+        const projectRoot = message.projectRoot;
+        if (
+          this.actions.git
+          && message.action
+          && projectRoot
+          && this.isCurrentGitContext(projectRoot, message.generation)
+        ) {
+          const generation = this.projectGeneration;
           this.gitLoading = true;
           this.postGitState();
           try {
-            await this.actions.git.runAction(String(message.action));
+            await this.actions.git.runAction(String(message.action), { projectRoot });
           } finally {
-            await this.refreshGit();
+            if (this.isCurrentGitContext(projectRoot, generation)) {
+              await this.refreshGit();
+            }
           }
         }
         return;
+      }
       case "gitOpenOutput":
         this.actions.git?.openOutput();
         return;
-      case "gitDiff":
-        if (this.actions.git && message.path) {
-          await this.actions.git.openDiff(String(message.path));
+      case "gitDiff": {
+        const projectRoot = message.projectRoot;
+        if (
+          this.actions.git
+          && message.path
+          && projectRoot
+          && this.isCurrentGitContext(projectRoot, message.generation)
+        ) {
+          await this.actions.git.openDiff(String(message.path), { projectRoot });
         }
         return;
+      }
       case "loadHistory":
         await this.postHistoryEntries();
         return;
@@ -6538,14 +7145,14 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         try {
           await this.openHistoryBackup(message.historyId);
         } catch (error) {
-          vscode.window.showErrorMessage(`Renium: failed to open history backup. ${error instanceof Error ? error.message : String(error)}`);
+          vscode.window.showErrorMessage(`Failed to open history backup. ${error instanceof Error ? error.message : String(error)}`);
         }
         return;
       case "compareHistoryBackup":
         try {
           await this.compareHistoryBackup(message.historyId);
         } catch (error) {
-          vscode.window.showErrorMessage(`Renium: failed to compare history backup. ${error instanceof Error ? error.message : String(error)}`);
+          vscode.window.showErrorMessage(`Failed to compare history backup. ${error instanceof Error ? error.message : String(error)}`);
         }
         return;
       case "restoreHistory":
@@ -6553,7 +7160,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           await this.restoreHistoryEntry(message.historyId);
         } catch (error) {
           this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", id: message.historyId });
-          vscode.window.showErrorMessage(`Renium: failed to restore history. ${error instanceof Error ? error.message : String(error)}`);
+          vscode.window.showErrorMessage(`Failed to restore history. ${error instanceof Error ? error.message : String(error)}`);
         }
         return;
       case "restoreHistoryGroup":
@@ -6561,7 +7168,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           await this.restoreHistoryGroup(message.historyIds, message.historyGroupId);
         } catch (error) {
           this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", groupId: message.historyGroupId });
-          vscode.window.showErrorMessage(`Renium: failed to restore history group. ${error instanceof Error ? error.message : String(error)}`);
+          vscode.window.showErrorMessage(`Failed to restore history group. ${error instanceof Error ? error.message : String(error)}`);
         }
         return;
       case "searchLoad":
@@ -6596,7 +7203,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
             await this.requestRows(message.start ?? this.rowWindow.start, message.count ?? this.rowWindow.count, this.currentMode);
           } catch (error) {
             this.webviewView?.webview.postMessage({ type: "loadComplete", nodeId: message.nodeId, ok: false });
-            vscode.window.showErrorMessage(`Renium: failed to expand instance. ${error instanceof Error ? error.message : String(error)}`);
+            vscode.window.showErrorMessage(`Failed to expand instance. ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         return;
@@ -6611,24 +7218,39 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
             await backend.collapse(message.nodeId, this.currentMode);
             await this.requestRows(message.start ?? this.rowWindow.start, message.count ?? this.rowWindow.count, this.currentMode);
           } catch (error) {
-            vscode.window.showErrorMessage(`Renium: failed to collapse instance. ${error instanceof Error ? error.message : String(error)}`);
+            vscode.window.showErrorMessage(`Failed to collapse instance. ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         return;
       case "selectNode":
         if (message.nodeId) {
           this.referencePreviewId = undefined;
-          this.selectedId = message.nodeId;
+          const previousSelectedId = this.selectedId;
           const service = this.serviceFromNodeId(message.nodeId);
-          let loadedNode: FileExplorerNode;
-          if (service && this.propertyOnlyStaleServices.has(service)) {
-            loadedNode = await this.model.loadDetails(this.model.getNode(message.nodeId) ?? this.nodeFromBackend({ id: message.nodeId }));
-          } else {
-            const details = await this.backend.selectDetails(message.nodeId);
-            loadedNode = this.model.rememberNode(this.nodeFromBackend(details.details ?? { id: message.nodeId }));
+          try {
+            let loadedNode: FileExplorerNode;
+            if (service && this.propertyOnlyStaleServices.has(service)) {
+              await this.backend.reloadServices([service]);
+              const details = await this.backend.selectDetails(message.nodeId);
+              loadedNode = this.model.rememberNode(
+                this.nodeFromBackend(details.details ?? { id: message.nodeId }),
+                true,
+              );
+              this.propertyOnlyStaleServices.delete(service);
+            } else {
+              const details = await this.backend.selectDetails(message.nodeId);
+              loadedNode = this.model.rememberNode(
+                this.nodeFromBackend(details.details ?? { id: message.nodeId }),
+                true,
+              );
+            }
+            this.selectedId = message.nodeId;
+            await this.propertiesProvider.show(loadedNode);
+            this.actions.onSelectNode?.();
+          } catch (error) {
+            this.selectedId = previousSelectedId;
+            throw error;
           }
-          await this.propertiesProvider.show(loadedNode);
-          this.actions.onSelectNode?.();
         }
         return;
       case "openScript":
@@ -6707,6 +7329,17 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       case "insertPackage":
         if (message.linkId) {
+          const drag = this.externalPackageDrag;
+          const currentRoot = getExplorerConfig().projectRoot;
+          if (
+            !drag
+            || drag.id !== String(message.linkId)
+            || drag.generation !== this.projectGeneration
+            || normalizeFilesystemPathKey(drag.projectRoot) !== normalizeFilesystemPathKey(currentRoot)
+          ) {
+            this.setExternalPackageDrag(undefined);
+            throw new Error("The package selection belongs to a different Renium project.");
+          }
           logPackageDragDebug(`explorer.host.onMessage insertPackage: link=${message.linkId} node=${message.nodeId ?? ""} name=${message.name ?? ""}`);
           this.setExternalPackageDrag(undefined);
           await this.actions.insertPackage(node, {
@@ -6732,6 +7365,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async loadSearchCorpus(query: string, revision?: number, count?: number): Promise<void> {
+    const projectGeneration = this.projectGeneration;
     const generation = ++this.searchGeneration;
     const searchId = generation;
     const trimmedQuery = query.trim();
@@ -6741,6 +7375,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     try {
       if (!trimmedQuery) {
         await this.backend.clearSearch();
+        if (projectGeneration !== this.projectGeneration) {
+          return;
+        }
         await this.requestRows(0, this.rowWindow.count, "normal");
         return;
       }
@@ -6753,10 +7390,14 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         try {
           await this.searchBackend.ensureInitialized();
           const searchStatus = await this.searchBackend.searchStart(trimmedQuery, searchId);
-          if (generation === this.searchGeneration) {
+          if (projectGeneration === this.projectGeneration && generation === this.searchGeneration) {
             const firstCount = Math.max(700, Math.min(1800, count ?? this.rowWindow.count));
             const searchRows = await this.searchBackend.getRows(0, firstCount, "search");
-            if (generation === this.searchGeneration && this.currentMode === "search") {
+            if (
+              projectGeneration === this.projectGeneration
+              && generation === this.searchGeneration
+              && this.currentMode === "search"
+            ) {
               this.postRowsWindow(searchRows, false, revision);
               this.webviewView?.webview.postMessage({
                 type: "searchStatus",
@@ -6770,7 +7411,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           return;
         } catch (error) {
           lastError = error;
-          if (generation !== this.searchGeneration) {
+          if (projectGeneration !== this.projectGeneration || generation !== this.searchGeneration) {
             return;
           }
           const message = error instanceof Error ? error.message : String(error);
@@ -6783,9 +7424,9 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       }
       throw lastError instanceof Error ? lastError : new Error(String(lastError));
     } catch (error) {
-      if (generation === this.searchGeneration) {
+      if (projectGeneration === this.projectGeneration && generation === this.searchGeneration) {
         this.webviewView?.webview.postMessage({ type: "searchStatus", loading: false });
-        vscode.window.showErrorMessage(`Renium: failed to load search results. ${error instanceof Error ? error.message : String(error)}`);
+        vscode.window.showErrorMessage(`Failed to load search results. ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -6801,7 +7442,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       await this.backend.reloadServices([parent.service]);
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -6813,19 +7454,26 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       const parent = loaded.parentTreeId ? this.model.getNode(loaded.parentTreeId) : undefined;
       if (oldLinkTargetPath && this.siblingNamed(parent, newName, loaded.treeId)) {
         vscode.window.showWarningMessage(
-          `Renium: linked package targets need unique sibling names. ${newName} already exists under ${parent?.name ?? loaded.service}.`,
+          `Linked package targets need unique sibling names. ${newName} already exists under ${parent?.name ?? loaded.service}.`,
         );
         return;
       }
       if (oldLinkTargetPath && newLinkTargetPath && this.hasLinkedTargetCollision(loaded.service, oldLinkTargetPath, newLinkTargetPath)) {
         vscode.window.showWarningMessage(
-          `Renium: ${newName} is already a linked package target under this parent. Rename one of them to a unique name before linking or deleting.`,
+          `${newName} is already a linked package target under this parent. Rename one of them to a unique name before linking or deleting.`,
         );
         return;
       }
       const renamed = await this.model.renameInstance(loaded, newName);
       if (oldLinkTargetPath && newLinkTargetPath) {
-        await this.moveReniumLinkTarget(loaded.service, oldLinkTargetPath, loaded.service, newLinkTargetPath);
+        try {
+          await this.moveReniumLinkTarget(loaded.service, oldLinkTargetPath, loaded.service, newLinkTargetPath);
+        } catch (error) {
+          if (renamed) {
+            await this.model.renameInstance(renamed, loaded.name);
+          }
+          throw error;
+        }
         void vscode.commands.executeCommand("renium.packages.refresh").then(
           () => undefined,
           () => undefined,
@@ -6839,25 +7487,36 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       await this.backend.reloadServices([loaded.service]);
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to rename instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to rename instance. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async moveInstance(node: FileExplorerNode, target: FileExplorerNode): Promise<void> {
+  private async moveInstance(
+    node: FileExplorerNode,
+    target: FileExplorerNode,
+  ): Promise<FileExplorerNode | undefined> {
     try {
       const loaded = await this.model.ensureLoaded(node);
       const loadedTarget = await this.model.ensureLoaded(target);
       const oldLinkTargetPath = this.directReniumLinkTargetPath(loaded);
       if (oldLinkTargetPath && this.siblingNamed(loadedTarget, loaded.name, loaded.treeId)) {
         vscode.window.showWarningMessage(
-          `Renium: linked package targets need unique sibling names. ${loaded.name} already exists under ${loadedTarget.name}.`,
+          `Linked package targets need unique sibling names. ${loaded.name} already exists under ${loadedTarget.name}.`,
         );
         return;
       }
       const newLinkTargetPath = oldLinkTargetPath ? this.childPathUnder(loadedTarget, loaded.name) : undefined;
+      const oldParent = loaded.parentTreeId ? this.model.getNode(loaded.parentTreeId) : undefined;
       const moved = await this.model.moveInstance(loaded, loadedTarget);
       if (oldLinkTargetPath && newLinkTargetPath) {
-        await this.moveReniumLinkTarget(loaded.service, oldLinkTargetPath, loadedTarget.service, newLinkTargetPath);
+        try {
+          await this.moveReniumLinkTarget(loaded.service, oldLinkTargetPath, loadedTarget.service, newLinkTargetPath);
+        } catch (error) {
+          if (moved && oldParent) {
+            await this.model.moveInstance(moved, oldParent);
+          }
+          throw error;
+        }
         void vscode.commands.executeCommand("renium.packages.refresh").then(
           () => undefined,
           () => undefined,
@@ -6870,8 +7529,10 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       }
       await this.backend.reloadServices(Array.from(new Set([loaded.service, loadedTarget.service])));
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      return moved;
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to move instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to move instance. ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
     }
   }
 
@@ -6891,7 +7552,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!source) {
       this.clipboardNodeId = undefined;
       this.postClipboardState();
-      vscode.window.showWarningMessage("Renium: copied instance no longer exists.");
+      vscode.window.showWarningMessage("Copied instance no longer exists.");
       return;
     }
     try {
@@ -6904,7 +7565,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       await this.backend.reloadServices([parent.service]);
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to paste instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to paste instance. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -6926,7 +7587,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       await this.backend.reloadServices([node.service]);
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to duplicate instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to duplicate instance. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -6962,6 +7623,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           ? manifest.pathSegments.map((segment) => String(segment))
           : [];
         const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
+        const settingsFile = typeof manifest.settingsFile === "string" ? manifest.settingsFile : undefined;
         const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
         const className = typeof manifest.className === "string" ? manifest.className : "Instance";
         const propertyName = typeof manifest.propertyName === "string" ? manifest.propertyName : undefined;
@@ -6976,6 +7638,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           className,
           settingsId,
           sourcePath,
+          settingsFile,
           pathSegments,
           propertyName,
           propertyLabel,
@@ -7145,7 +7808,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
     const sourcePath = path.join(data.entryDir, sourceBackup);
     if (!pathInsideRoot(editorHistoryRoot(getExplorerConfig()), sourcePath) || !fs.existsSync(sourcePath)) {
-      vscode.window.showWarningMessage("Renium: history source backup was not found.");
+      vscode.window.showWarningMessage("History source backup was not found.");
       return;
     }
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
@@ -7169,10 +7832,10 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       ? path.normalize(sourcePath)
       : path.normalize(path.join(config.projectRoot, sourcePath));
     if (!pathInsideRoot(editorHistoryRoot(config), backupPath) || !fs.existsSync(backupPath)) {
-      vscode.window.showWarningMessage("Renium: history source backup was not found.");
+      vscode.window.showWarningMessage("History source backup was not found.");
       return;
     }
-    if (!pathInsideRoot(config.projectRoot, currentPath) || !fs.existsSync(currentPath)) {
+    if (!projectGraphOwnsPath(config, currentPath) || !fs.existsSync(currentPath)) {
       await this.openHistoryBackup(id);
       return;
     }
@@ -7190,7 +7853,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private async restoreHistoryEntry(id: string | undefined): Promise<void> {
     const data = this.readHistoryManifest(id);
     if (!data) {
-      vscode.window.showWarningMessage("Renium: history entry was not found.");
+      vscode.window.showWarningMessage("History entry was not found.");
       return;
     }
     const manifest = data.manifest;
@@ -7198,7 +7861,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
     const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
     if (!service || (!sourcePath && !settingsId)) {
-      vscode.window.showWarningMessage("Renium: this history entry can't be restored — it no longer points at a file or instance.");
+      vscode.window.showWarningMessage("This history entry can't be restored — it no longer points at a file or instance.");
       return;
     }
     const targetLabel = sourcePath || (Array.isArray(manifest.pathSegments) ? manifest.pathSegments.join(".") : settingsId) || service;
@@ -7220,7 +7883,7 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       .map((id) => String(id).trim())
       .filter((id) => id.length > 0)));
     if (restoreIds.length === 0) {
-      vscode.window.showWarningMessage("Renium: history group has no restore targets.");
+      vscode.window.showWarningMessage("History group has no restore targets.");
       return;
     }
     const picked = await vscode.window.showWarningMessage(
@@ -7259,7 +7922,15 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       if (typeof manifest.settingsBackup === "string") {
         const from = path.join(data.entryDir, manifest.settingsBackup);
         if (pathInsideRoot(historyRoot, from) && fs.existsSync(from)) {
-          const to = settingsFileForService(config, service);
+          const configuredSettingsFile = typeof manifest.settingsFile === "string"
+            ? manifest.settingsFile
+            : settingsFileForService(config, service);
+          const to = path.isAbsolute(configuredSettingsFile)
+            ? path.normalize(configuredSettingsFile)
+            : path.normalize(path.join(config.projectRoot, configuredSettingsFile));
+          if (!projectGraphOwnsPath(config, to)) {
+            throw new Error(`Refusing to restore history outside project sources: ${to}`);
+          }
           fs.mkdirSync(path.dirname(to), { recursive: true });
           fs.copyFileSync(from, to);
           changedPaths.push(to);
@@ -7272,8 +7943,8 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         if (!pathInsideRoot(historyRoot, from) || !fs.existsSync(from)) {
           continue;
         }
-        if (!pathInsideRoot(config.projectRoot, to)) {
-          throw new Error(`Refusing to restore history outside project root: ${to}`);
+        if (!projectGraphOwnsPath(config, to)) {
+          throw new Error(`Refusing to restore history outside project sources: ${to}`);
         }
         fs.mkdirSync(path.dirname(to), { recursive: true });
         fs.copyFileSync(from, to);
@@ -7294,16 +7965,18 @@ class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
     }
     this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", id: completionId, groupId: isGroup ? completionId : undefined });
-    vscode.window.showInformationMessage(isGroup ? "Renium: history session restored locally." : "Renium: history entry restored locally.");
+    vscode.window.showInformationMessage(isGroup ? "History session restored locally." : "History entry restored locally.");
 
     if (changedPaths.length > 0) {
       const uniqueChangedPaths = Array.from(new Set(changedPaths));
       void vscode.commands.executeCommand("renium.pushEditorPathsNow", uniqueChangedPaths, {
+        projectRoot: config.projectRoot,
+        pendingServices: [...changedServices],
         skipChangeFilter: true,
         taskName: "History restore -> Studio sync",
       }).then(
         undefined,
-        (error) => vscode.window.showErrorMessage(`Renium: failed to push restored history. ${error instanceof Error ? error.message : String(error)}`),
+        (error) => vscode.window.showErrorMessage(`Failed to push restored history. ${error instanceof Error ? error.message : String(error)}`),
       );
     }
   }
@@ -7566,7 +8239,7 @@ var tabs=document.getElementById('tabs'),explorerPane=document.getElementById('e
 var rbsyncPane=document.getElementById('rbsyncPane'),rbsyncTree=document.getElementById('rbsyncTree'),rbsyncSearch=document.getElementById('rbsyncSearch');
 var saved=vscode.getState()||{};
 var activeTab=saved.activeTab==='history'||saved.activeTab==='git'||saved.activeTab==='rbsync'?saved.activeTab:'explorer',historyGroups=[],historyLoading=false,historyLoaded=false,historyRestoring={},historyExpanded=new Set(Array.isArray(saved.historyExpanded)?saved.historyExpanded:[]);
-var gitState=null,gitLoading=false,gitChangesOpen=saved.gitChangesOpen!==false,gitAdvancedOpen=!!saved.gitAdvancedOpen;
+var gitState=null,gitLoading=false,gitProjectRoot='',gitGeneration=0,gitChangesOpen=saved.gitChangesOpen!==false,gitAdvancedOpen=!!saved.gitAdvancedOpen;
 var hasClipboardInstance=false;
 var packageDragDebugLast=0,packageDragDebugLastMessage='';
 function debugPackageDrag(message){
@@ -7849,7 +8522,7 @@ function renderGit(){
   if(gitChangesOpen){
     html+='<div class="ghChanges">';
     if(entries.length===0){
-      html+='<div class="ghEmpty">'+ghCheckIcon()+'<span>No changes in <code>src/</code></span></div>';
+      html+='<div class="ghEmpty">'+ghCheckIcon()+'<span>No changes in project sources</span></div>';
     }else{
       for(var i=0;i<Math.min(entries.length,200);i++){
         var entry=entries[i];
@@ -7867,7 +8540,7 @@ function renderGit(){
   html+='<button class="ghSectionHead '+(gitAdvancedOpen?'open':'')+'" data-gh-group="actions" aria-expanded="'+(gitAdvancedOpen?'true':'false')+'">'+ghTwisty()+'<span class="ghSectionTitle">Repository Actions</span></button>';
   if(gitAdvancedOpen){
     html+='<div class="ghCommands">';
-    html+=gitActionButton('Full Sync, Commit & Push','syncCommitPush',canSync,'Run Renium Full Sync before committing src changes');
+    html+=gitActionButton('Pull from Studio, Commit and Push','pullCommitPush',canSync,'Pull Studio changes before committing project source changes');
     html+=gitActionButton('Fetch','fetch',canRepo,'Fetch remote refs');
     html+=gitActionButton('Connect Remote...','connect',canSetup,'Initialize or configure the Git remote');
     html+=gitActionButton('Open on Git','openRemote',canRepo,'Open the configured remote in a browser');
@@ -8869,7 +9542,7 @@ window.addEventListener('message',function(e){
   if(m.type==='optimisticDelete'){optimisticDelete(m.id);return}
   if(m.type==='clearSelection'){clearSelection();return}
   if(m.type==='setTab'){setActiveTab(m.tab,true);return}
-  if(m.type==='gitState'){gitState=m.state||null;gitLoading=!!m.loading;if(activeTab==='git')renderGit();return}
+  if(m.type==='gitState'){gitState=m.state||null;gitLoading=!!m.loading;gitProjectRoot=String(m.projectRoot||'');gitGeneration=Number(m.generation||0);if(activeTab==='git')renderGit();return}
   if(m.type==='updateTree'){var anchor=captureScrollAnchor();nodes=m.nodes||{};rootIds=m.rootIds||[];if(m.selectedId)lastHostSelectionId=m.selectedId;selectedId=m.selectedId||selectedId;invalidateSearchIndex();Object.keys(loadingIds).forEach(function(id){var n=nodes[id];if(!n||n.loaded||(n.children&&n.children.length>0))delete loadingIds[id]});save();scheduleRender(anchor);syncSelectionToHost()}
   else if(m.type==='rowsWindow'){
     if(m.scrollToReferencePreview)prepareReferencePreview();
@@ -9161,7 +9834,7 @@ function rbsyncSendBytes(file){
 gitApp.addEventListener('click',function(e){
   var refresh=e.target.closest('[data-gh-refresh]');
   if(refresh){
-    vscode.postMessage({type:'gitRefresh'});
+    vscode.postMessage({type:'gitRefresh',projectRoot:gitProjectRoot,generation:gitGeneration});
     return;
   }
   var group=e.target.closest('[data-gh-group]');
@@ -9178,12 +9851,12 @@ gitApp.addEventListener('click',function(e){
   var action=e.target.closest('[data-gh-action]');
   if(action){
     closeGitActions();
-    vscode.postMessage({type:'gitAction',action:action.dataset.ghAction});
+    vscode.postMessage({type:'gitAction',action:action.dataset.ghAction,projectRoot:gitProjectRoot,generation:gitGeneration});
     return;
   }
   var diff=e.target.closest('[data-gh-diff]');
   if(diff){
-    vscode.postMessage({type:'gitDiff',path:diff.dataset.ghDiff});
+    vscode.postMessage({type:'gitDiff',path:diff.dataset.ghDiff,projectRoot:gitProjectRoot,generation:gitGeneration});
     return;
   }
 });
@@ -9192,7 +9865,7 @@ gitApp.addEventListener('keydown',function(e){
   var diff=e.target.closest('[data-gh-diff]');
   if(diff){
     e.preventDefault();
-    vscode.postMessage({type:'gitDiff',path:diff.dataset.ghDiff});
+    vscode.postMessage({type:'gitDiff',path:diff.dataset.ghDiff,projectRoot:gitProjectRoot,generation:gitGeneration});
   }
 });
 refreshHistory.addEventListener('click',function(){historyLoaded=false;loadHistory()});
@@ -9546,14 +10219,23 @@ export class FileExplorerController implements vscode.Disposable {
   private readonly explorerSelectionEmitter = new vscode.EventEmitter<void>();
   public readonly onDidSelectExplorerNode = this.explorerSelectionEmitter.event;
   private readonly disposables: vscode.Disposable[] = [];
+  private settingsWatchers: vscode.Disposable[] = [];
+  private graphWatchers: vscode.Disposable[] = [];
   private readonly pendingSettingsRefreshes = new Set<string>();
   private readonly propertyOnlySettingsRefreshUntil = new Map<string, number>();
   private readonly visibleViewTypes = new Set<string>();
   private linkState: Record<string, string> = {};
   private settingsRefreshTimer: NodeJS.Timeout | undefined;
+  private graphRefreshTimer: NodeJS.Timeout | undefined;
+  private graphRefreshPromise: Promise<void> = Promise.resolve();
+  private projectGraphFingerprint = "";
   private startupRestoreTimer: NodeJS.Timeout | undefined;
-  private settingsRefreshInFlight = false;
-  private settingsRefreshAgain = false;
+  private settingsRefreshInFlightGeneration: number | undefined;
+  private settingsRefreshAgainGeneration: number | undefined;
+  private projectGeneration = 0;
+  private projectSwitchPrepared = false;
+  private mutationAdmissionOpen = true;
+  private readonly activeMutationCommands = new Set<Promise<void>>();
   private reniumActivityVisible = false;
   private observedVisibleViewThisSession = false;
 
@@ -9571,6 +10253,7 @@ export class FileExplorerController implements vscode.Disposable {
   }
 
   public constructor(private readonly context: vscode.ExtensionContext, private readonly git?: GitViewActions) {
+    explorerExtensionRoot = context.extensionPath;
     this.reniumActivityVisible = context.workspaceState.get<boolean>(RENIUM_ACTIVITY_VISIBLE_STATE_KEY, false) === true;
     const onVisibilityChanged: ViewVisibilityHandler = (viewType, visible) => this.onViewVisibilityChanged(viewType, visible);
     this.propertiesProvider = new FilePropertiesViewProvider(this.model, context.extensionUri, onVisibilityChanged);
@@ -9602,16 +10285,29 @@ export class FileExplorerController implements vscode.Disposable {
         webviewOptions: { retainContextWhenHidden: false },
       }),
       vscode.commands.registerCommand("renium.fileExplorer.refresh", () => this.explorerProvider.refresh()),
+      vscode.commands.registerCommand("renium.fileExplorer.prepareProjectSwitch", () => this.prepareProjectSwitch()),
+      vscode.commands.registerCommand("renium.fileExplorer.cancelProjectSwitch", () => this.cancelProjectSwitch()),
+      vscode.commands.registerCommand("renium.fileExplorer.switchProject", () => this.switchProject()),
+      vscode.commands.registerCommand("renium.fileExplorer.refreshProjectGraph", () => this.refreshProjectGraph()),
       vscode.commands.registerCommand("renium.fileExplorer.showGit", () => this.explorerProvider.showGit()),
       vscode.commands.registerCommand("renium.fileExplorer.refreshGit", (options?: { fetch?: boolean }) =>
         this.explorerProvider.refreshGit(options ?? {}),
       ),
       vscode.commands.registerCommand("renium.fileExplorer.openScript", (node?: FileExplorerNode) => this.openScript(node)),
-      vscode.commands.registerCommand("renium.fileExplorer.addInstance", (node?: FileExplorerNode) => this.addInstance(node)),
-      vscode.commands.registerCommand("renium.fileExplorer.deleteInstance", (node?: FileExplorerNode) => this.deleteInstance(node)),
-      vscode.commands.registerCommand("renium.fileExplorer.desyncPackageLink", (node?: FileExplorerNode) => this.desyncPackageLink(node)),
+      vscode.commands.registerCommand(
+        "renium.fileExplorer.revealStudioScript",
+        (action?: { service?: string; settingsId?: string; pathSegments?: string[]; pathOrdinals?: number[] }) =>
+          this.revealStudioScript(action),
+      ),
+      vscode.commands.registerCommand("renium.fileExplorer.addInstance", (node?: FileExplorerNode) =>
+        this.runMutationCommand(() => this.addInstance(node))),
+      vscode.commands.registerCommand("renium.fileExplorer.deleteInstance", (node?: FileExplorerNode) =>
+        this.runMutationCommand(() => this.deleteInstance(node))),
+      vscode.commands.registerCommand("renium.fileExplorer.desyncPackageLink", (node?: FileExplorerNode) =>
+        this.runMutationCommand(() => this.desyncPackageLink(node))),
       vscode.commands.registerCommand("renium.fileExplorer.copyPath", (node?: FileExplorerNode) => this.copyPath(node)),
-      vscode.commands.registerCommand("renium.fileExplorer.importModel", (node?: FileExplorerNode) => this.importModel(node)),
+      vscode.commands.registerCommand("renium.fileExplorer.importModel", (node?: FileExplorerNode) =>
+        this.runMutationCommand(() => this.importModel(node))),
       vscode.commands.registerCommand("renium.fileExplorer.exportModel", (node?: FileExplorerNode) => this.exportModel(node)),
       vscode.commands.registerCommand("renium.fileExplorer.refreshServices", (services?: string[]) =>
         this.explorerProvider.refreshServices(Array.isArray(services) ? services : []),
@@ -9627,12 +10323,16 @@ export class FileExplorerController implements vscode.Disposable {
       vscode.commands.registerCommand("renium.properties.showPackageNode", (payload?: PackagePropertiesPayload) =>
         this.propertiesProvider.showReadonlyPackage(payload),
       ),
+      vscode.commands.registerCommand("renium.properties.clearPackageNode", () =>
+        this.propertiesProvider.clearReadonlyPackage(),
+      ),
       vscode.commands.registerCommand("renium.fileExplorer.setLinkState", (keys?: Record<string, string>) => {
         this.linkState = keys ?? {};
         this.explorerProvider.setLinkState(this.linkState);
       }),
     );
     this.startSettingsWatcher();
+    this.startProjectGraphWatcher();
     this.scheduleStartupActivityRestore();
   }
 
@@ -9645,10 +10345,24 @@ export class FileExplorerController implements vscode.Disposable {
       clearTimeout(this.startupRestoreTimer);
       this.startupRestoreTimer = undefined;
     }
+    if (this.graphRefreshTimer) {
+      clearTimeout(this.graphRefreshTimer);
+      this.graphRefreshTimer = undefined;
+    }
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
+    for (const watcher of this.settingsWatchers) {
+      watcher.dispose();
+    }
+    for (const watcher of this.graphWatchers) {
+      watcher.dispose();
+    }
     this.explorerSelectionEmitter.dispose();
+  }
+
+  public async prepareShutdown(): Promise<void> {
+    await this.prepareProjectSwitch();
   }
 
   public setExternalPackageDrag(link?: { id: string; name?: string; mode?: string }): void {
@@ -9674,7 +10388,7 @@ export class FileExplorerController implements vscode.Disposable {
     return uris;
   }
 
-  private async closeSourceTabs(sourcePaths: string[] | undefined): Promise<void> {
+  private async closeSourceTabs(sourcePaths: string[] | undefined): Promise<boolean> {
     const pathKeys = new Set(
       (sourcePaths ?? [])
         .map((sourcePath) => String(sourcePath || "").trim())
@@ -9682,7 +10396,7 @@ export class FileExplorerController implements vscode.Disposable {
         .map((sourcePath) => this.normalizedFileKey(sourcePath)),
     );
     if (pathKeys.size === 0) {
-      return;
+      return true;
     }
     const tabs: vscode.Tab[] = [];
     for (const group of vscode.window.tabGroups.all) {
@@ -9693,8 +10407,9 @@ export class FileExplorerController implements vscode.Disposable {
       }
     }
     if (tabs.length > 0) {
-      await vscode.window.tabGroups.close(tabs, true);
+      return await vscode.window.tabGroups.close(tabs, true);
     }
+    return true;
   }
 
   private scheduleStartupActivityRestore(): void {
@@ -9729,13 +10444,45 @@ export class FileExplorerController implements vscode.Disposable {
   }
 
   private startSettingsWatcher(): void {
-    const config = getExplorerConfig();
-    const root = srcRoot(config);
-    const watchers = [SETTINGS_FILE_NAME, LEGACY_SETTINGS_FILE_NAME].map((fileName) =>
-      vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, `**/${fileName}`)),
-    );
+    for (const watcher of this.settingsWatchers) {
+      watcher.dispose();
+    }
+    this.settingsWatchers = [];
+    const generation = this.projectGeneration;
+    let config: ExplorerConfig;
+    try {
+      config = getExplorerConfig();
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Could not watch project files. ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+    const graph = loadProjectSourceGraph(config.projectRoot);
+    const directories = Array.from(new Set(graph.directories.map(path.normalize)));
+    const watcherPatterns = directories.flatMap((root) =>
+      [SETTINGS_FILE_NAME, LEGACY_SETTINGS_FILE_NAME].flatMap((fileName) =>
+        [fileName, `**/${fileName}`].map((pattern) => ({ root, pattern })),
+      ));
+    for (const filePath of graph.files) {
+      if (isSettingsFileName(path.basename(filePath))) {
+        watcherPatterns.push({ root: path.dirname(filePath), pattern: path.basename(filePath) });
+      }
+    }
+    const watcherKeys = new Set<string>();
+    const watchers = watcherPatterns
+      .filter(({ root, pattern }) => {
+        const key = `${normalizeFilesystemPathKey(root)}\0${pattern.toLowerCase()}`;
+        if (watcherKeys.has(key)) {
+          return false;
+        }
+        watcherKeys.add(key);
+        return true;
+      })
+      .map(({ root, pattern }) =>
+        vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, pattern)));
     const queue = (uri: vscode.Uri): void => {
-      if (uri.scheme === "file") {
+      if (generation === this.projectGeneration && uri.scheme === "file") {
         this.queueSettingsRefresh(uri.fsPath);
       }
     };
@@ -9743,48 +10490,225 @@ export class FileExplorerController implements vscode.Disposable {
       watcher.onDidCreate(queue);
       watcher.onDidChange(queue);
       watcher.onDidDelete(queue);
-      this.disposables.push(watcher);
+    }
+    this.settingsWatchers = watchers;
+  }
+
+  private graphFingerprint(projectRoot: string): string {
+    const graph = loadProjectSourceGraph(projectRoot);
+    const manifests = Array.from(new Set([
+      ...graph.manifests,
+      path.join(projectRoot, "renium.project.jsonc"),
+      path.join(projectRoot, "renium.project.json"),
+    ])).map(path.normalize).sort();
+    return manifests.map((manifest) => {
+      try {
+        const content = fs.readFileSync(manifest);
+        return `${manifest}\0${content.length}\0${crypto.createHash("sha256").update(content).digest("hex")}`;
+      } catch {
+        return `${manifest}\0-`;
+      }
+    }).join("\n");
+  }
+
+  private startProjectGraphWatcher(): void {
+    for (const watcher of this.graphWatchers) {
+      watcher.dispose();
+    }
+    this.graphWatchers = [];
+    let config: ExplorerConfig;
+    try {
+      config = getExplorerConfig();
+    } catch {
+      this.projectGraphFingerprint = "";
+      return;
+    }
+    const graph = loadProjectSourceGraph(config.projectRoot);
+    const manifests = Array.from(new Set([
+      ...graph.manifests,
+      path.join(config.projectRoot, "renium.project.jsonc"),
+      path.join(config.projectRoot, "renium.project.json"),
+    ].map(path.normalize)));
+    const generation = this.projectGeneration;
+    const queue = (): void => {
+      if (generation !== this.projectGeneration) {
+        return;
+      }
+      if (this.graphRefreshTimer) {
+        clearTimeout(this.graphRefreshTimer);
+      }
+      this.graphRefreshTimer = setTimeout(() => {
+        this.graphRefreshTimer = undefined;
+        void this.refreshProjectGraph();
+      }, 100);
+    };
+    this.graphWatchers = manifests.map((manifest) => {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(path.dirname(manifest), path.basename(manifest)),
+      );
+      watcher.onDidCreate(queue);
+      watcher.onDidChange(queue);
+      watcher.onDidDelete(queue);
+      return watcher;
+    });
+    this.projectGraphFingerprint = this.graphFingerprint(config.projectRoot);
+  }
+
+  private refreshProjectGraph(): Promise<void> {
+    const run = this.graphRefreshPromise.then(async () => {
+      const config = getExplorerConfig();
+      invalidateProjectSourceGraph(config.projectRoot);
+      const fingerprint = this.graphFingerprint(config.projectRoot);
+      if (fingerprint === this.projectGraphFingerprint) {
+        return;
+      }
+      await this.switchProject();
+      await vscode.commands.executeCommand("renium.projectGraphChanged", config.projectRoot);
+    });
+    this.graphRefreshPromise = run.catch(() => undefined);
+    return run;
+  }
+
+  private async runMutationCommand(task: () => Promise<void>): Promise<void> {
+    if (!this.mutationAdmissionOpen) {
+      return;
+    }
+    const generation = this.projectGeneration;
+    const run = (async () => {
+      if (generation !== this.projectGeneration || !this.mutationAdmissionOpen) {
+        return;
+      }
+      await task();
+    })();
+    this.activeMutationCommands.add(run);
+    try {
+      await run;
+    } finally {
+      this.activeMutationCommands.delete(run);
+    }
+  }
+
+  private async prepareProjectSwitch(): Promise<void> {
+    if (this.projectSwitchPrepared) {
+      return;
+    }
+    this.mutationAdmissionOpen = false;
+    await Promise.allSettled(Array.from(this.activeMutationCommands));
+    await this.explorerProvider.prepareProjectSwitch();
+    this.projectSwitchPrepared = true;
+  }
+
+  private cancelProjectSwitch(): void {
+    this.projectSwitchPrepared = false;
+    this.mutationAdmissionOpen = true;
+    this.explorerProvider.cancelProjectSwitch();
+  }
+
+  private async switchProject(): Promise<void> {
+    await this.prepareProjectSwitch();
+    try {
+      const generation = ++this.projectGeneration;
+      if (this.settingsRefreshTimer) {
+        clearTimeout(this.settingsRefreshTimer);
+        this.settingsRefreshTimer = undefined;
+      }
+      this.pendingSettingsRefreshes.clear();
+      this.propertyOnlySettingsRefreshUntil.clear();
+      this.settingsRefreshAgainGeneration = undefined;
+      this.model.resetProjectState();
+      this.propertiesProvider.resetProjectState();
+      this.linkState = {};
+      this.explorerProvider.setExternalPackageDrag(undefined);
+      this.explorerProvider.setLinkState({});
+      this.startSettingsWatcher();
+      this.startProjectGraphWatcher();
+      const explorerSwitch = this.explorerProvider.switchProject();
+      await this.model.refresh();
+      if (generation !== this.projectGeneration) {
+        await explorerSwitch.catch(() => undefined);
+        return;
+      }
+      await explorerSwitch;
+    } finally {
+      this.projectSwitchPrepared = false;
+      this.mutationAdmissionOpen = true;
     }
   }
 
   private queueSettingsRefresh(settingsFile: string): void {
+    const generation = this.projectGeneration;
     const normalizedSettingsFile = this.normalizeSettingsRefreshPath(settingsFile);
     this.clearExpiredPropertyOnlyRefreshes();
     const propertyOnlyUntil = this.propertyOnlySettingsRefreshUntil.get(normalizedSettingsFile);
+    this.pendingSettingsRefreshes.add(normalizedSettingsFile);
     if (propertyOnlyUntil !== undefined && propertyOnlyUntil > Date.now()) {
+      if (this.settingsRefreshTimer) {
+        clearTimeout(this.settingsRefreshTimer);
+      }
+      this.settingsRefreshTimer = setTimeout(() => {
+        this.settingsRefreshTimer = undefined;
+        void this.flushSettingsRefreshes(generation);
+      }, Math.max(1, propertyOnlyUntil - Date.now() + 25));
       return;
     }
-    this.pendingSettingsRefreshes.add(normalizedSettingsFile);
     if (this.settingsRefreshTimer) {
       clearTimeout(this.settingsRefreshTimer);
     }
     this.settingsRefreshTimer = setTimeout(() => {
       this.settingsRefreshTimer = undefined;
-      void this.flushSettingsRefreshes();
+      void this.flushSettingsRefreshes(generation);
     }, 600);
   }
 
-  private async flushSettingsRefreshes(): Promise<void> {
-    if (this.settingsRefreshInFlight) {
-      this.settingsRefreshAgain = true;
+  private async flushSettingsRefreshes(generation = this.projectGeneration): Promise<void> {
+    if (generation !== this.projectGeneration) {
       return;
     }
-    this.settingsRefreshInFlight = true;
+    if (this.settingsRefreshInFlightGeneration === generation) {
+      this.settingsRefreshAgainGeneration = generation;
+      return;
+    }
+    this.settingsRefreshInFlightGeneration = generation;
     try {
       do {
-        this.settingsRefreshAgain = false;
+        if (generation !== this.projectGeneration) {
+          return;
+        }
+        this.settingsRefreshAgainGeneration = undefined;
         this.clearExpiredPropertyOnlyRefreshes();
         const settingsFiles = Array.from(this.pendingSettingsRefreshes).filter((settingsFile) => {
           const propertyOnlyUntil = this.propertyOnlySettingsRefreshUntil.get(settingsFile);
           return propertyOnlyUntil === undefined || propertyOnlyUntil <= Date.now();
         });
-        this.pendingSettingsRefreshes.clear();
+        for (const settingsFile of settingsFiles) {
+          this.pendingSettingsRefreshes.delete(settingsFile);
+        }
         if (settingsFiles.length > 0) {
           await this.explorerProvider.refreshSettingsFiles(settingsFiles);
+          if (generation !== this.projectGeneration) {
+            return;
+          }
         }
-      } while (this.settingsRefreshAgain || this.pendingSettingsRefreshes.size > 0);
+      } while (this.settingsRefreshAgainGeneration === generation);
     } finally {
-      this.settingsRefreshInFlight = false;
+      if (this.settingsRefreshInFlightGeneration === generation) {
+        this.settingsRefreshInFlightGeneration = undefined;
+      }
+    }
+    if (generation !== this.projectGeneration) {
+      return;
+    }
+    if (this.pendingSettingsRefreshes.size > 0) {
+      const now = Date.now();
+      const earliest = Math.min(...Array.from(this.pendingSettingsRefreshes, (settingsFile) =>
+        this.propertyOnlySettingsRefreshUntil.get(settingsFile) ?? now));
+      if (this.settingsRefreshTimer) {
+        clearTimeout(this.settingsRefreshTimer);
+      }
+      this.settingsRefreshTimer = setTimeout(() => {
+        this.settingsRefreshTimer = undefined;
+        void this.flushSettingsRefreshes(generation);
+      }, Math.max(1, earliest - now + 25));
     }
   }
 
@@ -9939,15 +10863,42 @@ export class FileExplorerController implements vscode.Disposable {
         await this.showReadonlyScriptDocument(loaded, loaded.sourcePath, fs.readFileSync(loaded.sourcePath, "utf8"));
         return;
       }
-      vscode.window.showWarningMessage(`Renium: source preview not found for ${loaded.name}.`);
+      vscode.window.showWarningMessage(`Source preview not found for ${loaded.name}.`);
       return;
     }
     if (!loaded.sourcePath || !fs.existsSync(loaded.sourcePath)) {
-      vscode.window.showWarningMessage(`Renium: source file not found for ${loaded.name}.`);
+      vscode.window.showWarningMessage(`Source file not found for ${loaded.name}.`);
       return;
     }
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(loaded.sourcePath));
     await vscode.window.showTextDocument(document, { preview: false });
+  }
+
+  private async revealStudioScript(action?: {
+    service?: string;
+    settingsId?: string;
+    pathSegments?: string[];
+    pathOrdinals?: number[];
+  }): Promise<void> {
+    const service = String(action?.service ?? "").trim();
+    const settingsId = String(action?.settingsId ?? "").trim();
+    const pathSegments = Array.isArray(action?.pathSegments) ? action.pathSegments.map(String) : [];
+    const pathOrdinals = Array.isArray(action?.pathOrdinals)
+      ? action.pathOrdinals.map((value) => Math.max(1, Math.floor(Number(value) || 1)))
+      : [];
+    if (!service) {
+      return;
+    }
+    await this.model.loadSearchCorpus();
+    const node = settingsId
+      ? this.model.getNode(normalizeId(service, settingsId))
+      : this.model.findNodeByPath(service, pathSegments, pathOrdinals);
+    if (!node || !isScriptClass(node.className)) {
+      vscode.window.showWarningMessage("The selected Studio script is not present in the current Renium project.");
+      return;
+    }
+    await this.explorerProvider.revealReference(node.treeId);
+    await this.openScript(node);
   }
 
   private async addInstance(node?: FileExplorerNode): Promise<void> {
@@ -9975,7 +10926,7 @@ export class FileExplorerController implements vscode.Disposable {
         void this.propertiesProvider.show(created);
       }
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -9985,10 +10936,14 @@ export class FileExplorerController implements vscode.Disposable {
     }
     try {
       const loaded = await this.model.ensureLoaded(node);
+      const sourcePaths = await this.model.sourcePathsForSubtree(loaded);
+      if (!await this.closeSourceTabs(sourcePaths)) {
+        return;
+      }
       const manifestTarget = this.reniumManifestTarget(loaded);
       if (manifestTarget && this.hasSiblingPathCollision(manifestTarget.node, manifestTarget.pathSegments)) {
         vscode.window.showWarningMessage(
-          `Renium: cannot safely delete ${loaded.name} because another sibling has the same linked target path (${manifestTarget.pathSegments.join(".")}). Rename one of them first.`,
+          `Cannot safely delete ${loaded.name} because another sibling has the same linked target path (${manifestTarget.pathSegments.join(".")}). Rename one of them first.`,
         );
         return;
       }
@@ -10008,7 +10963,6 @@ export class FileExplorerController implements vscode.Disposable {
         }
       }
       const removeResult = await this.model.removeInstance(loaded);
-      await this.closeSourceTabs(removeResult.removedSourcePaths);
       void vscode.commands.executeCommand("renium.packages.refresh").then(
         () => undefined,
         () => undefined,
@@ -10018,7 +10972,7 @@ export class FileExplorerController implements vscode.Disposable {
       if (/no matched instance|no matching instance|instance not found/i.test(message)) {
         return;
       }
-      vscode.window.showErrorMessage(`Renium: failed to delete instance. ${message}`);
+      vscode.window.showErrorMessage(`Failed to delete instance. ${message}`);
     }
   }
 
@@ -10040,9 +10994,9 @@ export class FileExplorerController implements vscode.Disposable {
     try {
       const result = await this.model.desyncPackageLink(node);
       const removed = Array.isArray(result.removedPackageLinks) ? result.removedPackageLinks.length : 0;
-      vscode.window.showInformationMessage(`Renium: removed ${removed} PackageLink${removed === 1 ? "" : "s"}.`);
+      vscode.window.showInformationMessage(`Removed ${removed} PackageLink${removed === 1 ? "" : "s"}.`);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to desync package. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to desync package. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -10056,7 +11010,7 @@ export class FileExplorerController implements vscode.Disposable {
 
   private async importModel(node?: FileExplorerNode, providedModelPaths?: string[]): Promise<void> {
     if (!node) {
-      vscode.window.showWarningMessage("Renium: select an Explorer node to import into.");
+      vscode.window.showWarningMessage("Select an Explorer node to import into.");
       return;
     }
     const target = await this.model.ensureLoaded(node);
@@ -10079,7 +11033,7 @@ export class FileExplorerController implements vscode.Disposable {
       modelPaths = normalizeRobloxModelPaths(picked.map((uri) => uri.fsPath));
     }
     if (modelPaths.length === 0) {
-      vscode.window.showWarningMessage("Renium: choose one or more .rbxm or .rbxmx files to import.");
+      vscode.window.showWarningMessage("Choose one or more .rbxm or .rbxmx files to import.");
       return;
     }
     try {
@@ -10097,15 +11051,15 @@ export class FileExplorerController implements vscode.Disposable {
       const summary = modelPaths.length === 1
         ? path.basename(modelPaths[0])
         : `${modelPaths.length} model files`;
-      vscode.window.showInformationMessage(`Renium: imported ${summary} into ${target.name}.`);
+      vscode.window.showInformationMessage(`Imported ${summary} into ${target.name}.`);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to import model. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to import model. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   private async exportModel(node?: FileExplorerNode): Promise<void> {
     if (!node || node.kind === "service") {
-      vscode.window.showWarningMessage("Renium: select an Explorer instance to export.");
+      vscode.window.showWarningMessage("Select an Explorer instance to export.");
       return;
     }
     const loaded = await this.model.ensureLoaded(node);
@@ -10149,9 +11103,9 @@ export class FileExplorerController implements vscode.Disposable {
       const finalOutputPath = typeof result.output === "string" && result.output.trim().length > 0
         ? result.output
         : outputPath;
-      vscode.window.showInformationMessage(`Renium: exported ${loaded.name} to ${finalOutputPath}.`);
+      vscode.window.showInformationMessage(`Exported ${loaded.name} to ${finalOutputPath}.`);
     } catch (error) {
-      vscode.window.showErrorMessage(`Renium: failed to export model. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to export model. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -10165,17 +11119,6 @@ export class FileExplorerController implements vscode.Disposable {
       const key = this.nodeLinkPathKey(current);
       if (key && this.linkState[key]) {
         return { node: current, pathSegments: this.nodeTargetPath(current) };
-      }
-      if (current.hasPackageLink === true) {
-        return { node: current, pathSegments: this.nodeTargetPath(current) };
-      }
-      if (current.className === "PackageLink") {
-        const parent = current.parentTreeId ? this.model.getNode(current.parentTreeId) : undefined;
-        if (parent && parent.kind !== "service") {
-          return { node: parent, pathSegments: this.nodeTargetPath(parent) };
-        }
-        const pathSegments = this.nodeTargetPath(current);
-        return pathSegments.length > 1 ? { node: current, pathSegments: pathSegments.slice(0, -1) } : undefined;
       }
       current = current.parentTreeId ? this.model.getNode(current.parentTreeId) : undefined;
     }
@@ -10196,7 +11139,7 @@ export class FileExplorerController implements vscode.Disposable {
 
   private async createLink(node?: FileExplorerNode): Promise<void> {
     if (!node || node.kind === "service") {
-      vscode.window.showWarningMessage("Renium: select an Explorer instance to link.");
+      vscode.window.showWarningMessage("Select an Explorer instance to link.");
       return;
     }
     const loaded = await this.model.ensureLoaded(node);
@@ -10208,13 +11151,13 @@ export class FileExplorerController implements vscode.Disposable {
 
   private async resaveLink(node?: FileExplorerNode): Promise<void> {
     if (!node || node.kind === "service") {
-      vscode.window.showWarningMessage("Renium: select a linked package root to resave.");
+      vscode.window.showWarningMessage("Select a linked package root to resave.");
       return;
     }
     const loaded = await this.model.ensureLoaded(node);
     const target = this.reniumManifestTarget(loaded);
     if (!target) {
-      vscode.window.showWarningMessage("Renium: select a linked package root to resave.");
+      vscode.window.showWarningMessage("Select a linked package root to resave.");
       return;
     }
     await vscode.commands.executeCommand("renium.link.resavePackage", {
@@ -10225,13 +11168,13 @@ export class FileExplorerController implements vscode.Disposable {
 
   private async relinkLink(node?: FileExplorerNode): Promise<void> {
     if (!node || node.kind === "service") {
-      vscode.window.showWarningMessage("Renium: select a broken package root to relink.");
+      vscode.window.showWarningMessage("Select a broken package root to relink.");
       return;
     }
     const loaded = await this.model.ensureLoaded(node);
     const target = this.reniumManifestTarget(loaded);
     if (!target) {
-      vscode.window.showWarningMessage("Renium: select a broken package root to relink.");
+      vscode.window.showWarningMessage("Select a broken package root to relink.");
       return;
     }
     await vscode.commands.executeCommand("renium.link.relinkPackage", {
@@ -10247,7 +11190,7 @@ export class FileExplorerController implements vscode.Disposable {
       return;
     }
     if (!node) {
-      vscode.window.showWarningMessage("Renium: drop the package onto an Explorer service or instance.");
+      vscode.window.showWarningMessage("Drop the package onto an Explorer service or instance.");
       return;
     }
     const loaded = await this.model.ensureLoaded(node);
@@ -10270,7 +11213,7 @@ export class FileExplorerController implements vscode.Disposable {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logPackageDragDebug(`explorer.controller.insertPackage: failed link=${linkId} target=${loaded.service}.${targetPath.join(".")} error=${message}`);
-      vscode.window.showErrorMessage(`Renium: failed to insert package. ${message}`);
+      vscode.window.showErrorMessage(`Failed to insert package. ${message}`);
     }
   }
 
