@@ -4861,6 +4861,7 @@ impl BridgeServer {
         self.wait_for_ready_channels_for_target(required_channels, timeout, BridgeTarget::Main)
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn peer_for_selector(&self, target: BridgeTarget, player: Option<&str>) -> Result<String> {
         let runtime_pin = self.runtime_pin_for_selector(target, player)?;
         for channel in &self.channels {
@@ -8323,10 +8324,15 @@ fn automation_dispatch_operation(
             workflows::launch_studio(file.as_deref(), Some(Path::new(&context.project)))
         }
         53 => {
-            wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
-            let pid = studio_pid_for_bridge(bridge)?;
-            input_inject::terminate_studio_process(pid)?;
-            Ok(json!({ "closed": true, "pid": pid }))
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                wait_for_daemon_bridge_channels(bridge, bridge_wait_seconds, BridgeTarget::Main)?;
+                let pid = studio_pid_for_bridge(bridge)?;
+                input_inject::terminate_studio_process(pid)?;
+                Ok(json!({ "closed": true, "pid": pid }))
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            bail!("Studio close is unsupported on this platform")
         }
         23 => automation_batch(context, parameters),
         50 | 51 => Ok(json!({
@@ -18735,7 +18741,7 @@ fn begin_editor_binary_export(
             .and_then(Value::as_u64)
             .map(|value| value as usize)
             .unwrap_or(0);
-        let mut groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
+        let groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
             begin
                 .get("groups")
                 .cloned()
@@ -18753,28 +18759,32 @@ fn begin_editor_binary_export(
             bail!("Studio returned invalid native export groups");
         }
         #[cfg(any(windows, target_os = "macos"))]
-        if let Some(properties) = material_root_properties {
-            let database =
-                rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-            let material = groups
-                .iter_mut()
-                .find(|group| group.service == MATERIAL_SERVICE_CLASS)
-                .context("Studio native export omitted MaterialService")?;
-            merge_live_service_root_property_values(
-                MATERIAL_SERVICE_CLASS,
-                &mut material.root_properties,
-                &properties,
-                database,
-            );
-            if material
-                .root_properties
-                .get(USE_2022_MATERIALS_PROPERTY)
-                .and_then(Value::as_bool)
-                .is_none()
-            {
-                bail!("Native MaterialService root omitted Use2022Materials");
+        let groups = {
+            let mut groups = groups;
+            if let Some(properties) = material_root_properties {
+                let database = rbx_reflection_database::get()
+                    .context("Failed to load Roblox reflection DB")?;
+                let material = groups
+                    .iter_mut()
+                    .find(|group| group.service == MATERIAL_SERVICE_CLASS)
+                    .context("Studio native export omitted MaterialService")?;
+                merge_live_service_root_property_values(
+                    MATERIAL_SERVICE_CLASS,
+                    &mut material.root_properties,
+                    &properties,
+                    database,
+                );
+                if material
+                    .root_properties
+                    .get(USE_2022_MATERIALS_PROPERTY)
+                    .and_then(Value::as_bool)
+                    .is_none()
+                {
+                    bail!("Native MaterialService root omitted Use2022Materials");
+                }
             }
-        }
+            groups
+        };
         let serialization_batches = serde_json::from_value::<Vec<EditorBinarySerializationBatch>>(
             begin
                 .get("serializationBatches")
@@ -19200,6 +19210,7 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
     }
 }
 
+#[cfg(windows)]
 fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryImport> {
     let mut export = begin_editor_binary_export(bridge, false, None, false)?;
     let _finish_guard = EditorBinaryExportFinishGuard {
@@ -20248,6 +20259,7 @@ fn editor_binary_export_parts<'a>(
     Ok(_finish_guard)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn rbx_dom_import_refs(dom: &RbxWeakDom) -> BytecodeModelImportRefs {
     let mut refs_preorder = Vec::new();
     for referent in rbx_model_top_level_refs(dom) {
@@ -20309,6 +20321,7 @@ fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs {
     }
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn rbx_dom_service_root_property_values(
     dom: &RbxWeakDom,
     service_names: &HashSet<String>,
@@ -20447,6 +20460,7 @@ fn finish_native_service_export(
     })
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn read_place_service_root_property_values(
     path: &Path,
     service_names: &HashSet<String>,
@@ -20508,6 +20522,7 @@ fn read_live_service_root_property_values(
     result
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn merge_live_service_root_property_values(
     service: &str,
     values: &mut Map<String, Value>,
@@ -37873,6 +37888,7 @@ fn rbx_model_property_descriptor<'db>(
     None
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn rbx_canonical_property_descriptor_for_serialized_name<'db>(
     database: &'db ReflectionDatabase<'db>,
     class_name: &str,

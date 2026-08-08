@@ -2886,8 +2886,8 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        return fs::rename(source, target)
-            .with_context(|| format!("Failed to replace {}", target.display()));
+        fs::rename(source, target)
+            .with_context(|| format!("Failed to replace {}", target.display()))
     }
     #[cfg(windows)]
     {

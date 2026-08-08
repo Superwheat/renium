@@ -46,6 +46,15 @@ pub fn terminate_studio_process(pid: u32) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn terminate_studio_process(pid: u32) -> Result<()> {
+    let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn frontmost_studio_pid() -> Option<u32> {
     platform::frontmost_studio_pid()
 }
