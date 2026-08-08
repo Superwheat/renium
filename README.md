@@ -1,6 +1,6 @@
 # About the project
 
-Renium is a Roblox daemon sync tool, written mostly in rust. It was built to solve multiple issues, the inefficiencies of Roblox MCP such as its token hungry nature and slow commands, and long sync time.
+Renium is a Roblox daemon sync tool, written mostly in rust. It was built to solve multiple issues, long sync times in other similar tools like Argon/Rojo and the inefficiencies of Roblox MCP, such as its token hungry nature and slow commands.
 It is still in active development and any suggestions/bug reports are greatly appreciated.
 
 ## Components
