@@ -626,7 +626,7 @@ function BridgeProfiling.install(Config, context)
 		end
 
 		if Config.profileFlagEnabled(flags, "engine") then
-			local serviceInstance = game:FindFirstChild(serviceName)
+			local serviceInstance = game:GetService(serviceName)
 			if serviceInstance then
 				local serializationService = game:GetService("SerializationService")
 				local serializedLen = 0

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added experience projects with separate place roots, exact GameId/PlaceId routing, active-place switching, and renameable aliases.
+- Bundled the matching Renium CLI and `rbx` launcher with the extension so projects no longer need local executable copies.
 - Pinned every multi-channel command to one Studio runtime so two windows on the same place cannot be mixed during chunked or parallel sync.
 - Added Studio undo recordings, Explorer selection preservation, CollectionService tag tracking, and first-error batch stopping for filesystem-to-Studio changes.
 - Hardened imports and uploads with recoverable stale-file backups, bounded/expiring sessions, explicit cancellation, and fail-closed place-guard reloads.

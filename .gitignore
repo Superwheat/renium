@@ -6,10 +6,12 @@
 !/CLAUDE.md
 !/LICENSE
 !/README.md
+!/install.ps1
+!/install.sh
 !/rbx
 !/rbx.cmd
 !/aftman.toml
-!/.nvmrc
+!/.node-version
 !/.github/
 !/.github/**
 !/tools/
@@ -29,6 +31,18 @@ tools/**/out-test/
 dist/
 coverage/
 *.lcov
+tools/**/.cache/
+tools/**/.renium-extension-stage-*/
+
+# Native compiler output
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.dll
+*.exe
+*.dSYM/
 
 # Packaged artifacts
 *.vsix
@@ -48,7 +62,6 @@ snapshots/
 .pi_tmp/
 tools/**/.renium/
 tools/**/.renium-cache/
-tools/**/.renium-daemon.json
 tools/**/.vscode-test/
 
 # OS/editor noise

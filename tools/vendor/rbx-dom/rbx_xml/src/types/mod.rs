@@ -39,10 +39,9 @@ mod vectors;
 use std::io::{Read, Write};
 
 use rbx_dom_weak::types::{
-    Axes, BinaryString, CFrame, Color3, Color3uint8, ColorSequence, Content, ContentId, Enum,
-    Faces, Font, NumberRange, NumberSequence, PhysicalProperties, Ray, Rect, Ref,
-    SecurityCapabilities, UDim, UDim2, UniqueId, Variant, Vector2, Vector2int16, Vector3,
-    Vector3int16,
+    Axes, BinaryString, CFrame, Color3, Color3uint8, ColorSequence, ContentId, Enum, Faces, Font,
+    NumberRange, NumberSequence, PhysicalProperties, Ray, Rect, Ref, SecurityCapabilities, UDim,
+    UDim2, UniqueId, Variant, Vector2, Vector2int16, Vector3, Vector3int16,
 };
 
 use crate::{
@@ -87,6 +86,7 @@ macro_rules! declare_rbx_types {
                     Ok(Some(Variant::String(value.0)))
                 },
 
+                self::content::XML_TAG_NAME => Ok(Some(Variant::Content(self::content::read_content(reader, instance_id, property_name, state)?))),
                 self::referent::XML_TAG_NAME => Ok(Some(Variant::Ref(read_ref(reader, instance_id, property_name, state)?))),
                 self::shared_string::XML_TAG_NAME => read_shared_string(reader, instance_id, property_name, state).map(Some),
                 self::net_asset_ref::XML_TAG_NAME => read_net_asset_ref(reader, instance_id, property_name, state).map(Some),
@@ -116,6 +116,7 @@ macro_rules! declare_rbx_types {
                 Variant::BrickColor(value) =>
                     (*value as i32).write_outer_xml(xml_property_name, writer),
 
+                Variant::Content(value) => self::content::write_content(writer, xml_property_name, value, state),
                 Variant::Ref(value) => write_ref(writer, xml_property_name, *value, state),
                 Variant::SharedString(value) => write_shared_string(writer, xml_property_name, value, state),
                 Variant::Tags(value) => write_tags(writer, xml_property_name, value),
@@ -139,7 +140,6 @@ declare_rbx_types! {
     Color3: Color3,
     Color3uint8: Color3uint8,
     ColorSequence: ColorSequence,
-    Content: Content,
     ContentId: ContentId,
     Enum: Enum,
     Faces: Faces,

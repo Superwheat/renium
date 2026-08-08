@@ -136,6 +136,8 @@ pub struct ParseState<'dom, 'db> {
     /// correct Ref value by using the referents map.
     referent_rewrites: Vec<ReferentRewrite>,
 
+    content_referent_rewrites: Vec<ReferentRewrite>,
+
     /// A map from shared string hashes (currently MD5, decided by Roblox) to
     /// the actual SharedString type.
     known_shared_strings: HashMap<String, SharedString>,
@@ -175,6 +177,7 @@ impl<'dom, 'db> ParseState<'dom, 'db> {
             metadata: HashMap::new(),
             referents_to_ids: HashMap::new(),
             referent_rewrites: Vec::new(),
+            content_referent_rewrites: Vec::new(),
             known_shared_strings: HashMap::new(),
             shared_string_rewrites: Vec::new(),
             net_asset_rewrites: Vec::new(),
@@ -206,6 +209,19 @@ impl<'dom, 'db> ParseState<'dom, 'db> {
     /// This is used to deserialize non-null Ref values correctly.
     pub fn add_referent_rewrite(&mut self, id: Ref, property_name: Ustr, referent_value: String) {
         self.referent_rewrites.push(ReferentRewrite {
+            id,
+            property_name,
+            referent_value,
+        });
+    }
+
+    pub fn add_content_referent_rewrite(
+        &mut self,
+        id: Ref,
+        property_name: Ustr,
+        referent_value: String,
+    ) {
+        self.content_referent_rewrites.push(ReferentRewrite {
             id,
             property_name,
             referent_value,
@@ -252,6 +268,18 @@ fn apply_referent_rewrites(state: &mut ParseState) {
         instance.properties.insert(
             rewrite.property_name.as_str().into(),
             Variant::Ref(new_value),
+        );
+    }
+    for rewrite in &state.content_referent_rewrites {
+        let Some(new_value) = state.referents_to_ids.get(&rewrite.referent_value) else {
+            continue;
+        };
+        let instance = state.tree.get_by_ref_mut(rewrite.id).expect(
+            "rbx_xml bug: had ID in content referent rewrite list that didn't end up in the tree",
+        );
+        instance.properties.insert(
+            rewrite.property_name.as_str().into(),
+            Variant::Content(rbx_dom_weak::types::Content::from_referent(*new_value)),
         );
     }
 }

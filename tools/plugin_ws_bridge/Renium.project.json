@@ -25,6 +25,9 @@
       "BridgeConnection": {
         "$path": "BridgeConnection.module.lua"
       },
+      "BridgeSessionLock": {
+        "$path": "BridgeSessionLock.module.lua"
+      },
       "BridgePluginRuntime": {
         "$path": "BridgePluginRuntime.module.lua"
       },
@@ -33,6 +36,9 @@
       },
       "BridgeContent": {
         "$path": "BridgeContent.module.lua"
+      },
+      "BridgeMaterialService": {
+        "$path": "BridgeMaterialService.module.lua"
       },
       "BridgeCandidateMatch": {
         "$path": "BridgeCandidateMatch.module.lua"

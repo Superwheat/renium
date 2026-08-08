@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.meta.schema.json",
+  "title": "Renium instance metadata",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "$id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "$className": {
+      "type": "string",
+      "minLength": 1
+    },
+    "$properties": {
+      "type": "object"
+    },
+    "$attributes": {
+      "type": "object"
+    },
+    "$tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "$ignoreUnknownInstances": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

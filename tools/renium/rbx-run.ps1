@@ -3,6 +3,7 @@ param(
 	[string]$Code,
 	[string]$File,
 	[switch]$Client,
+	[string]$Player,
 	[switch]$Play,
 	[string]$Place = $env:RENIUM_PLACE,
 	[int]$StudioWaitSeconds = 10,
@@ -20,11 +21,6 @@ function Resolve-ReniumCli {
 		return (Resolve-Path -LiteralPath $Cli).Path
 	}
 
-	$fromPath = Get-Command renium.exe -ErrorAction SilentlyContinue
-	if ($fromPath) {
-		return $fromPath.Source
-	}
-
 	$root = Split-Path -Parent $MyInvocation.ScriptName
 	$candidates = @(
 		(Join-Path $root "renium.exe"),
@@ -39,6 +35,11 @@ function Resolve-ReniumCli {
 		}
 	}
 
+	$fromPath = Get-Command renium.exe -ErrorAction SilentlyContinue
+	if ($fromPath) {
+		return $fromPath.Source
+	}
+
 	throw "Renium CLI not found. Put renium.exe on PATH, next to rbx.cmd, in bin\, or set RENIUM_CLI."
 }
 
@@ -49,26 +50,40 @@ function Test-StudioRunning {
 }
 
 function Start-ReniumDaemon {
-	$existing = Get-Process renium -ErrorAction SilentlyContinue | Select-Object -First 1
-	if ($existing) {
+	$status = Invoke-Renium @("daemon", "status")
+	if ($status.Code -eq 0) {
 		return
 	}
 	Start-Process -FilePath $script:CliPath -ArgumentList @("bd", "-s") -WindowStyle Hidden -WorkingDirectory (Get-Location).Path
-	Start-Sleep -Milliseconds 500
+	$deadline = [DateTime]::UtcNow.AddSeconds(5)
+	do {
+		Start-Sleep -Milliseconds 100
+		$status = Invoke-Renium @("daemon", "status")
+		if ($status.Code -eq 0) {
+			return
+		}
+	} while ([DateTime]::UtcNow -lt $deadline)
+	throw "Renium daemon did not become ready: $($status.Text)"
 }
 
 function Ensure-Studio {
-	if (Test-StudioRunning) {
+	if (-not $Place -and (Test-StudioRunning)) {
 		return
 	}
 	if (-not $Place) {
 		throw "Studio is not running. Start Studio first, pass -Place, or set RENIUM_PLACE."
 	}
+	$ready = Invoke-Renium @("lx", "-e", "return true")
+	if ($ready.Code -eq 0) {
+		return
+	}
 	if (-not (Test-Path -LiteralPath $Place)) {
+		if (Test-StudioRunning) {
+			throw "The requested Studio place is not connected: $Place"
+		}
 		throw "Place file not found: $Place"
 	}
 	Start-Process -FilePath $Place
-	Start-Sleep -Seconds $StudioWaitSeconds
 }
 
 function Invoke-Renium {
@@ -100,35 +115,91 @@ function Wait-ReniumReady {
 }
 
 function Start-PlayIfNeeded {
-	if (-not $Client -and -not $Play) {
+	if (-not $Client -and -not $Player -and -not $Play) {
 		return
 	}
+	if ($Client -or $Player) {
+		$probeArgs = @("lx", "-e", "return true")
+		if ($Player) {
+			$probeArgs += @("--player", $Player)
+		} else {
+			$probeArgs += "-c"
+		}
+		if ((Invoke-Renium $probeArgs).Code -eq 0) {
+			return
+		}
+	}
 	$result = Invoke-Renium @("play", "-s")
-	if ($result.Code -ne 0 -and $result.Text -notmatch "Timed out waiting for Studio test session to start") {
+	if ($result.Code -ne 0) {
 		throw $result.Text
 	}
-	Start-Sleep -Seconds $PlayWaitSeconds
+	$deadline = [DateTime]::UtcNow.AddSeconds($PlayWaitSeconds)
+	do {
+		if ($Client -or $Player) {
+			$probeArgs = @("lx", "-e", "return true")
+			if ($Player) {
+				$probeArgs += @("--player", $Player)
+			} else {
+				$probeArgs += "-c"
+			}
+			if ((Invoke-Renium $probeArgs).Code -eq 0) {
+				return
+			}
+		} else {
+			$clients = Invoke-Renium @("clients")
+			if ($clients.Code -eq 0) {
+				try {
+					$parsed = $clients.Text | ConvertFrom-Json
+					if (@($parsed.clients | Where-Object { $_.role -eq "play-server" }).Count -gt 0) {
+						return
+					}
+				} catch {
+				}
+			}
+		}
+		Start-Sleep -Milliseconds 100
+	} while ([DateTime]::UtcNow -lt $deadline)
+	if ($Client -or $Player) {
+		throw "A Studio play client did not connect."
+	}
+	throw "The Studio play server did not become ready."
 }
 
-function Get-ConsoleSeq {
-	$result = Invoke-Renium @("co", "-n", "1")
+function Get-ConsoleArgs {
+	param([int]$Limit, [uint64]$Since)
+	$args = @("co", "-n", [string]$Limit, "-s", [string]$Since)
+	if ($Player) {
+		$args += @("--player", $Player)
+	} elseif ($Client) {
+		$args += "--client"
+	}
+	return $args
+}
+
+function Get-ConsoleState {
+	$result = Invoke-Renium (Get-ConsoleArgs -Limit 1 -Since 0)
 	if ($result.Code -ne 0 -or -not $result.Text) {
-		return 0
+		throw "Could not read the Studio console baseline: $($result.Text)"
 	}
 	try {
 		$json = $result.Text | ConvertFrom-Json
-		if ($null -ne $json.nextSeq) {
-			return [uint64]$json.nextSeq
+		if ($null -ne $json.nextSeq -and $json.epoch) {
+			return [pscustomobject]@{
+				Seq = [uint64]$json.nextSeq
+				Epoch = [string]$json.epoch
+			}
 		}
 	} catch {
-		return 0
+		throw "Studio console baseline was malformed: $($_.Exception.Message)"
 	}
-	return 0
+	throw "Studio console baseline did not include an epoch and sequence."
 }
 
 function Invoke-Luau {
 	$args = @("lx")
-	if ($Client) {
+	if ($Player) {
+		$args += @("--player", $Player)
+	} elseif ($Client) {
 		$args += "-c"
 	}
 	if ($File) {
@@ -152,17 +223,45 @@ function Write-RecentConsole {
 	}
 	$deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.5, $ConsoleWaitSeconds))
 	$printed = New-Object 'System.Collections.Generic.HashSet[uint64]'
+	$cursor = [uint64]$script:ConsoleSinceSeq
+	$epoch = [string]$script:ConsoleEpoch
 	do {
 		Start-Sleep -Milliseconds 250
-		$jsonText = (Invoke-Renium @("co", "-n", [string]$ConsoleLimit, "-s", [string]$script:ConsoleSinceSeq)).Text
-		if ($jsonText) {
+		while ($true) {
+			$page = Invoke-Renium (Get-ConsoleArgs -Limit $ConsoleLimit -Since $cursor)
+			if ($page.Code -ne 0) {
+				throw "Could not read the Studio console: $($page.Text)"
+			}
+			$jsonText = $page.Text
+			if (-not $jsonText) {
+				break
+			}
 			$json = $jsonText | ConvertFrom-Json
+			if ([string]$json.epoch -ne $epoch) {
+				$epoch = [string]$json.epoch
+				$cursor = 0
+				$printed.Clear()
+				$script:ConsoleEpoch = $epoch
+				continue
+			}
+			if ($json.truncated) {
+				throw "Studio console output was truncated before it could be read."
+			}
 			foreach ($entry in $json.entries) {
 				$seq = [uint64]$entry.seq
 				if ($printed.Add($seq)) {
 					$msg = [string]$entry.message -replace "`r?`n", " | "
 					"{0}: {1}" -f $entry.type, $msg
 				}
+			}
+			$next = [uint64]$json.nextSeq
+			if ($json.hasMore -and $next -le $cursor) {
+				throw "Renium console cursor did not advance."
+			}
+			$cursor = $next
+			$script:ConsoleSinceSeq = $cursor
+			if (-not $json.hasMore) {
+				break
 			}
 		}
 	} while ($ConsoleWaitSeconds -gt 0 -and [DateTime]::UtcNow -lt $deadline)
@@ -173,10 +272,20 @@ if (-not $Code -and -not $File) {
 }
 
 $script:CliPath = Resolve-ReniumCli
+if ($Place) {
+	$placeSelector = if (Test-Path -LiteralPath $Place) {
+		[System.IO.Path]::GetFileNameWithoutExtension((Resolve-Path -LiteralPath $Place).Path)
+	} else {
+		$Place
+	}
+	$env:RENIUM_PLACE = $placeSelector
+}
 Start-ReniumDaemon
 Ensure-Studio
 Wait-ReniumReady
 Start-PlayIfNeeded
-$script:ConsoleSinceSeq = Get-ConsoleSeq
+$consoleState = Get-ConsoleState
+$script:ConsoleSinceSeq = $consoleState.Seq
+$script:ConsoleEpoch = $consoleState.Epoch
 Invoke-Luau
 Write-RecentConsole

@@ -1,6 +1,12 @@
-use std::{collections::VecDeque, convert::TryInto, io::Read};
+use std::{
+    collections::VecDeque,
+    convert::TryInto,
+    io::{self, Read},
+    sync::{Arc, Mutex},
+};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use rayon::prelude::*;
 use rbx_dom_weak::{
     types::{
         Attributes, Axes, BinaryString, BrickColor, CFrame, Color3, Color3uint8, ColorSequence,
@@ -39,7 +45,7 @@ pub(super) struct DeserializerState<'db, R> {
 
     /// The SharedStrings contained in the file, if any, in the order that they
     /// appear in the file.
-    shared_strings: Vec<SharedString>,
+    shared_strings: Arc<Vec<SharedString>>,
 
     /// All of the instance types described by the file so far.
     /// The index is the type_id.
@@ -47,7 +53,7 @@ pub(super) struct DeserializerState<'db, R> {
 
     /// Key into `instances`.  Contains a Ref to sidestep
     /// mutable + immutable aliasing when reading Content and Ref properties.
-    instance_key_by_ref: InstanceKeyLookup,
+    instance_key_by_ref: Arc<InstanceKeyLookup>,
 
     /// All of the instances known by the deserializer.
     instances: Vec<Instance>,
@@ -59,12 +65,13 @@ pub(super) struct DeserializerState<'db, R> {
     /// Contains a set of unknown type IDs that we've encountered so far while
     /// deserializing this file. We use this map in order to ensure we only
     /// print one warning per unknown type ID when deserializing a file.
-    unknown_type_ids: HashSet<u8>,
+    unknown_type_ids: Arc<Mutex<HashSet<u8>>>,
     flat: bool,
 }
 
 /// Represents a unique instance class. Binary models define all their instance
 /// types up front and give them a short u32 identifier.
+#[derive(Clone)]
 struct TypeInfo<'db> {
     /// The common name for this type like `Folder` or `UserInputService`.
     type_name: Ustr,
@@ -153,6 +160,19 @@ struct Instance {
     /// Document-defined IDs for the children of this instance.
     children: Vec<(i32, usize)>,
     has_name: bool,
+}
+
+struct FlatPropChunk {
+    index: usize,
+    data: Vec<u8>,
+}
+
+struct FlatTypeDecodeJob<'db> {
+    type_id: u32,
+    type_info: TypeInfo<'db>,
+    instances: Vec<Instance>,
+    chunks: Vec<FlatPropChunk>,
+    error: Option<(usize, InnerError)>,
 }
 
 /// Properties may be serialized under different names or types than
@@ -339,12 +359,12 @@ impl<'db, R: Read> DeserializerState<'db, R> {
             input,
             tree,
             metadata: HashMap::new(),
-            shared_strings: Vec::new(),
+            shared_strings: Arc::new(Vec::new()),
             type_infos,
-            instance_key_by_ref,
+            instance_key_by_ref: Arc::new(instance_key_by_ref),
             instances,
             root_instances: Vec::new(),
-            unknown_type_ids: HashSet::new(),
+            unknown_type_ids: Arc::new(Mutex::new(HashSet::new())),
             flat,
         })
     }
@@ -384,7 +404,9 @@ impl<'db, R: Read> DeserializerState<'db, R> {
         for _ in 0..num_entries {
             chunk.read_exact(&mut [0; 16])?; // We don't do anything with the hash.
             let data = chunk.read_binary_string()?;
-            self.shared_strings.push(SharedString::new(data));
+            Arc::get_mut(&mut self.shared_strings)
+                .expect("shared strings cannot be modified while property decoding is active")
+                .push(SharedString::new(data));
         }
 
         Ok(())
@@ -431,13 +453,15 @@ impl<'db, R: Read> DeserializerState<'db, R> {
                 InstanceBuilder::with_property_capacity(type_name.as_str(), prop_capacity)
             };
 
-            let replaced_referent = self.instance_key_by_ref.insert(
-                referent,
-                InstanceKey {
-                    key: start + key,
-                    referent: builder.referent(),
-                },
-            );
+            let replaced_referent = Arc::get_mut(&mut self.instance_key_by_ref)
+                .expect("referents cannot be modified while property decoding is active")
+                .insert(
+                    referent,
+                    InstanceKey {
+                        key: start + key,
+                        referent: builder.referent(),
+                    },
+                );
 
             // Every referent should be unique
             if replaced_referent.is_some() {
@@ -498,7 +522,12 @@ impl<'db, R: Read> DeserializerState<'db, R> {
         let binary_type: Type = match binary_type_byte.try_into() {
             Ok(ty) => ty,
             Err(_) => {
-                if self.unknown_type_ids.insert(binary_type_byte) {
+                if self
+                    .unknown_type_ids
+                    .lock()
+                    .expect("unknown property type lock was poisoned")
+                    .insert(binary_type_byte)
+                {
                     log::warn!(
                         "Unknown value type ID {byte:#04x} ({byte}) in Roblox \
                          binary model file. Found in property {class}.{prop}.",
@@ -1599,19 +1628,38 @@ rbx-dom may require changes to fully support this property. Please open an issue
                     let mut objects: VecDeque<i32> =
                         chunk.read_referent_array(object_count)?.collect();
 
-                    let external_count = chunk.read_le_u32().unwrap() as usize;
-                    // We are advised by Roblox to just ignore this, as it's
-                    // meant for internal use. If we want to use it in the
-                    // future, it's a referent array.
-                    let mut bytes = vec![0; external_count * 4];
-                    chunk.read_to_end(&mut bytes)?;
+                    let external_count = chunk.read_le_u32()? as usize;
+                    let external_bytes = external_count.checked_mul(4).ok_or_else(|| {
+                        InnerError::InvalidPropData {
+                            type_name: type_name.to_string(),
+                            prop_name: prop_name.clone(),
+                            valid_value: "a valid Content external referent count",
+                            actual_value: external_count.to_string(),
+                        }
+                    })?;
+                    let mut bytes = vec![0; external_bytes];
+                    chunk.read_exact(&mut bytes)?;
 
                     for (ty, instance) in values.zip(instances) {
                         let value = match ty {
                             0 => Content::none(),
-                            1 => Content::from_uri(uris.pop_back().unwrap()),
+                            1 => Content::from_uri(uris.pop_back().ok_or_else(|| {
+                                InnerError::InvalidPropData {
+                                    type_name: type_name.to_string(),
+                                    prop_name: prop_name.clone(),
+                                    valid_value: "enough Content URI values",
+                                    actual_value: "missing URI value".to_string(),
+                                }
+                            })?),
                             2 => {
-                                let read_value = objects.pop_back().unwrap();
+                                let read_value = objects.pop_front().ok_or_else(|| {
+                                    InnerError::InvalidPropData {
+                                        type_name: type_name.to_string(),
+                                        prop_name: prop_name.clone(),
+                                        valid_value: "enough Content object referents",
+                                        actual_value: "missing object referent".to_string(),
+                                    }
+                                })?;
                                 if let Some(key) = self.instance_key_by_ref.get(&read_value) {
                                     Content::from_referent(key.referent)
                                 } else {
@@ -1621,6 +1669,18 @@ rbx-dom may require changes to fully support this property. Please open an issue
                             n => return Err(InnerError::BadContentType(n)),
                         };
                         add_property(instance, &property, value.into())
+                    }
+                    if !uris.is_empty() || !objects.is_empty() {
+                        return Err(InnerError::InvalidPropData {
+                            type_name: type_name.to_string(),
+                            prop_name,
+                            valid_value: "Content value counts matching their source tags",
+                            actual_value: format!(
+                                "{} unused URI values and {} unused object referents",
+                                uris.len(),
+                                objects.len()
+                            ),
+                        });
                     }
                 }
                 invalid_type => {
@@ -1633,6 +1693,141 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 }
             },
         }
+
+        Ok(())
+    }
+
+    #[profiling::function]
+    pub(super) fn decode_prop_chunks_parallel(
+        &mut self,
+        chunks: Vec<Chunk>,
+    ) -> Result<(), InnerError> {
+        let mut type_ids = Vec::with_capacity(chunks.len());
+        let mut distinct_type_ids = HashSet::new();
+
+        for chunk in &chunks {
+            let type_id = chunk.data.as_slice().read_le_u32()?;
+            if !self.type_infos.contains_key(&type_id) {
+                return Err(InnerError::InvalidTypeId { type_id });
+            }
+            type_ids.push(type_id);
+            distinct_type_ids.insert(type_id);
+        }
+
+        if self.instances.len() < 4096
+            || distinct_type_ids.len() < 2
+            || rayon::current_num_threads() <= 1
+        {
+            for chunk in chunks {
+                self.decode_prop_chunk(&chunk.data)?;
+            }
+            return Ok(());
+        }
+
+        let mut chunks_by_type = HashMap::with_capacity(distinct_type_ids.len());
+        for (index, (chunk, type_id)) in chunks.into_iter().zip(type_ids).enumerate() {
+            chunks_by_type
+                .entry(type_id)
+                .or_insert_with(Vec::new)
+                .push(FlatPropChunk {
+                    index,
+                    data: chunk.data,
+                });
+        }
+
+        let mut type_infos = self
+            .type_infos
+            .iter()
+            .map(|(&type_id, type_info)| (type_id, type_info.clone()))
+            .collect::<Vec<_>>();
+        type_infos.sort_unstable_by_key(|(type_id, type_info)| {
+            (type_info.instances.start, type_info.instances.end, *type_id)
+        });
+
+        let total_instances = self.instances.len();
+        let mut remaining_instances = core::mem::take(&mut self.instances);
+        let mut instances_by_type = HashMap::with_capacity(type_infos.len());
+
+        for (type_id, type_info) in type_infos.iter().rev() {
+            if type_info.instances.is_empty() {
+                continue;
+            }
+            let instances = remaining_instances.split_off(type_info.instances.start);
+            debug_assert_eq!(instances.len(), type_info.instances.len());
+            instances_by_type.insert(*type_id, instances);
+        }
+        debug_assert!(remaining_instances.is_empty());
+
+        let mut jobs = type_infos
+            .into_iter()
+            .map(|(type_id, type_info)| FlatTypeDecodeJob {
+                type_id,
+                type_info,
+                instances: instances_by_type.remove(&type_id).unwrap_or_default(),
+                chunks: chunks_by_type.remove(&type_id).unwrap_or_default(),
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let deserializer = self.deserializer;
+        let shared_strings = Arc::clone(&self.shared_strings);
+        let instance_key_by_ref = Arc::clone(&self.instance_key_by_ref);
+        let unknown_type_ids = Arc::clone(&self.unknown_type_ids);
+
+        jobs.par_iter_mut().for_each(|job| {
+            if job.chunks.is_empty() {
+                return;
+            }
+
+            let mut type_info = job.type_info.clone();
+            type_info.instances = 0..job.instances.len();
+            let mut type_infos = HashMap::with_capacity(1);
+            type_infos.insert(job.type_id, type_info);
+
+            let mut state = DeserializerState {
+                deserializer,
+                input: io::empty(),
+                tree: WeakDom::new(InstanceBuilder::new("DataModel")),
+                metadata: HashMap::new(),
+                shared_strings: Arc::clone(&shared_strings),
+                type_infos,
+                instance_key_by_ref: Arc::clone(&instance_key_by_ref),
+                instances: core::mem::take(&mut job.instances),
+                root_instances: Vec::new(),
+                unknown_type_ids: Arc::clone(&unknown_type_ids),
+                flat: true,
+            };
+
+            for chunk in &job.chunks {
+                if let Err(error) = state.decode_prop_chunk(&chunk.data) {
+                    job.error = Some((chunk.index, error));
+                    break;
+                }
+            }
+            job.instances = state.instances;
+        });
+
+        let mut first_error = None;
+        for job in &mut jobs {
+            if let Some(error) = job.error.take() {
+                if first_error
+                    .as_ref()
+                    .is_none_or(|(first_index, _)| error.0 < *first_index)
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some((_, error)) = first_error {
+            return Err(error);
+        }
+
+        remaining_instances.reserve(total_instances);
+        for job in &mut jobs {
+            remaining_instances.append(&mut job.instances);
+        }
+        debug_assert_eq!(remaining_instances.len(), total_instances);
+        self.instances = remaining_instances;
 
         Ok(())
     }
@@ -1723,7 +1918,9 @@ rbx-dom may require changes to fully support this property. Please open an issue
             let instance = core::mem::replace(&mut self.instances[instance_key], impostor);
             let id = self.tree.insert(parent_ref, instance.builder);
 
-            self.instance_key_by_ref.remove(&referent);
+            Arc::get_mut(&mut self.instance_key_by_ref)
+                .expect("referents cannot be modified while property decoding is active")
+                .remove(&referent);
             for (child_referent, child_key) in instance.children {
                 instances_to_construct.push_back((child_referent, child_key, id));
             }
@@ -1769,6 +1966,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
             });
         }
         FlatDom {
+            metadata: self.metadata.into_iter().collect(),
             root_indices,
             instances,
         }

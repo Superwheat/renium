@@ -3,6 +3,7 @@ local Error = require(script.Error)
 local PropertyDescriptor = require(script.PropertyDescriptor)
 
 local referencePropertiesByClass = {}
+local objectContentPropertiesByClass = {}
 
 local function getReferencePropertyNames(className)
 	local cached = referencePropertiesByClass[className]
@@ -22,7 +23,8 @@ local function getReferencePropertyNames(className)
 				seen[propertyName] = true
 				local scriptability = propertyData.Scriptability
 				if
-					propertyData.Kind.Canonical ~= nil
+					propertyName ~= "Parent"
+					and propertyData.Kind.Canonical ~= nil
 					and propertyData.DataType.Value == "Ref"
 					and (scriptability == "ReadWrite" or scriptability == "Custom")
 				then
@@ -34,6 +36,39 @@ local function getReferencePropertyNames(className)
 	until currentClassName == nil
 	table.sort(names)
 	referencePropertiesByClass[className] = names
+	return names
+end
+
+local function getObjectContentPropertyNames(className)
+	local cached = objectContentPropertiesByClass[className]
+	if cached ~= nil then
+		return cached
+	end
+	local names = {}
+	local seen = {}
+	local currentClassName = className
+	repeat
+		local currentClass = database.Classes[currentClassName]
+		if currentClass == nil then
+			break
+		end
+		for propertyName, propertyData in pairs(currentClass.Properties) do
+			if seen[propertyName] == nil then
+				seen[propertyName] = true
+				local scriptability = propertyData.Scriptability
+				if
+					propertyData.Kind.Canonical ~= nil
+					and propertyData.DataType.Value == "Content"
+					and (scriptability == "ReadWrite" or scriptability == "Custom")
+				then
+					names[#names + 1] = propertyName
+				end
+			end
+		end
+		currentClassName = currentClass.Superclass
+	until currentClassName == nil
+	table.sort(names)
+	objectContentPropertiesByClass[className] = names
 	return names
 end
 
@@ -101,6 +136,7 @@ return {
 	writeProperty = writeProperty,
 	findCanonicalPropertyDescriptor = findCanonicalPropertyDescriptor,
 	getReferencePropertyNames = getReferencePropertyNames,
+	getObjectContentPropertyNames = getObjectContentPropertyNames,
 	Error = Error,
 	EncodedValue = require(script.EncodedValue),
 }

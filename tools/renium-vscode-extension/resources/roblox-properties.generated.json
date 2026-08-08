@@ -3,7 +3,7 @@
   "sources": {
     "propertySource": "tools/API-Dump.json",
     "propertySourceKind": "api-dump",
-    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-ed7d8193e8564b1f/ReflectionMetadata.xml",
+    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-a57f2f633baf4a86/ReflectionMetadata.xml",
     "propertySorter": "tools/renium-vscode-extension/resources/robloxPropertySorters.js"
   },
   "classes": {
@@ -27355,6 +27355,366 @@
         "visible": true,
         "declaringClass": "Instance"
       },
+      "AsphaltName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "AsphaltName",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "BasaltName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "BasaltName",
+        "order": 1,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "BrickName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "BrickName",
+        "order": 2,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CobblestoneName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CobblestoneName",
+        "order": 3,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "ConcreteName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "ConcreteName",
+        "order": 4,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CorrodedMetalName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CorrodedMetalName",
+        "order": 5,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CrackedLavaName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CrackedLavaName",
+        "order": 6,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "DiamondPlateName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "DiamondPlateName",
+        "order": 7,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "FabricName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "FabricName",
+        "order": 8,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "FoilName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "FoilName",
+        "order": 9,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "GlacierName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "GlacierName",
+        "order": 10,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "GraniteName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "GraniteName",
+        "order": 11,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "GrassName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "GrassName",
+        "order": 12,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "MarbleName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "MarbleName",
+        "order": 13,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "PavementName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "PavementName",
+        "order": 14,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "RockName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "RockName",
+        "order": 15,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "GroundName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "GroundName",
+        "order": 16,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "IceName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "IceName",
+        "order": 17,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "LeafyGrassName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "LeafyGrassName",
+        "order": 18,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "LimestoneName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "LimestoneName",
+        "order": 19,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "MetalName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "MetalName",
+        "order": 20,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "MudName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "MudName",
+        "order": 21,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "PebbleName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "PebbleName",
+        "order": 22,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "PlasticName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "PlasticName",
+        "order": 23,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SaltName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SaltName",
+        "order": 24,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SandName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SandName",
+        "order": 25,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SandstoneName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SandstoneName",
+        "order": 26,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SlateName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SlateName",
+        "order": 27,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SmoothPlasticName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SmoothPlasticName",
+        "order": 28,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "SnowName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "SnowName",
+        "order": 29,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "WoodName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "WoodName",
+        "order": 30,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "WoodPlanksName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "WoodPlanksName",
+        "order": 31,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CardboardName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CardboardName",
+        "order": 32,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CarpetName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CarpetName",
+        "order": 33,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "CeramicTilesName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "CeramicTilesName",
+        "order": 34,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "ClayRoofTilesName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "ClayRoofTilesName",
+        "order": 35,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "LeatherName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "LeatherName",
+        "order": 36,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "PlasterName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "PlasterName",
+        "order": 37,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "RoofShinglesName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "RoofShinglesName",
+        "order": 38,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
+      "RubberName": {
+        "type": "String",
+        "category": "Material Overrides",
+        "displayName": "RubberName",
+        "order": 39,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialService"
+      },
       "Use2022Materials": {
         "type": "Bool",
         "category": "Material Pack",
@@ -51245,7 +51605,10 @@
         "order": 0,
         "writable": true,
         "visible": true,
-        "declaringClass": "UIGradient"
+        "declaringClass": "UIGradient",
+        "uiMinimum": 0,
+        "uiMaximum": 10,
+        "uiNumTicks": 100
       },
       "TileMode": {
         "type": "Enum.GradientTileMode",

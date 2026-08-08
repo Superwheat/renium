@@ -11,6 +11,7 @@ import {
   redactRemoteUrl,
   remoteUrlToWebUrl,
   renderGitArgs,
+  shouldPullFromStudioBeforePush,
   summarizeStatus,
 } from "../src/gitSync";
 
@@ -106,7 +107,15 @@ test("buildCommitMessage expands Renium Git sync placeholders", () => {
   assert.doesNotMatch(message, /\$\{/);
 });
 
-test("defaultGitSyncScope always targets src relative to the repo root", () => {
+test("defaultGitSyncScope targets the configured source root", () => {
   assert.equal(defaultGitSyncScope("C:/repo", "C:/repo"), "src");
-  assert.equal(defaultGitSyncScope("C:/repo", "C:/repo/game"), "game/src");
+  assert.equal(defaultGitSyncScope("C:/repo", "C:/repo/place", "game"), "place/game");
+});
+
+test("Git commit and push only pulls Studio when configured or selected", () => {
+  assert.equal(shouldPullFromStudioBeforePush("always", false), true);
+  assert.equal(shouldPullFromStudioBeforePush("never", false), false);
+  assert.equal(shouldPullFromStudioBeforePush("ask", false, "pull"), true);
+  assert.equal(shouldPullFromStudioBeforePush("ask", false, "current"), false);
+  assert.equal(shouldPullFromStudioBeforePush("never", true), true);
 });

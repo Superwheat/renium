@@ -26,6 +26,7 @@ function BridgeStatus.view(state)
 	local editor = state.editorSyncStats or {}
 	local connectionStatus = tostring(state.connectionStatus or "Disconnected")
 	local connectRequested = not not state.connectRequested
+	local pendingEditCount = tonumber(state.pendingEditCount) or 0
 
 	local mode = if openChannels > 0
 		then "connected"
@@ -34,9 +35,10 @@ function BridgeStatus.view(state)
 		else "disconnected"
 
 	local title = if mode == "connected" then "Connected" elseif mode == "connecting" then "Connecting..." else "Disconnected"
-	local subtitle = if mode == "connected"
-		then "Listening for editor and export sync requests."
-		elseif mode == "connecting" then "Connecting to local sync server."
+	local subtitle = if mode == "disconnected" and pendingEditCount > 0
+		then if pendingEditCount == 1 then "One Studio edit is waiting to sync." else `{pendingEditCount} Studio edits are waiting to sync.`
+		elseif mode == "connected" or mode == "connecting" then ""
+		elseif connectionStatus == "Disconnected" or connectionStatus == "Another Renium session is active" then ""
 		else connectionStatus
 
 	local lastSyncUnix = tonumber(editor.lastAtUnix) or 0
@@ -44,7 +46,7 @@ function BridgeStatus.view(state)
 		then if editor.lastOk == false
 			then "Last sync failed at " .. formatClock(lastSyncUnix)
 			else "Synced at " .. formatClock(lastSyncUnix)
-		elseif mode == "disconnected" then "Not connected"
+		elseif mode == "disconnected" then ""
 		else "Waiting for sync"
 
 	local ports = state.ports or {}
@@ -52,8 +54,11 @@ function BridgeStatus.view(state)
 	local channelsText = ("%d/%d channels open, %d connecting"):format(openChannels, #channels, connectingChannels)
 	local detailLines = {
 		("Renium %s build %s"):format(tostring(state.bridgeVersion or "unknown"), tostring(state.bridgeBuildUnix or "unknown")),
+		("Target %s | Runtime %s"):format(tostring(state.target or "unknown"), tostring(state.runtimeId or "unknown")),
 		("Codec %s"):format(tostring(state.codecVersion or "unknown")),
 		channelsText,
+		("Pending Studio edits %d"):format(pendingEditCount),
+		("Pending reviews %d"):format(tonumber(state.pendingReviewCount) or 0),
 	}
 	local statsLines = {
 		("Editor requests %d | Last %.1f ms"):format(tonumber(editor.requests) or 0, tonumber(editor.lastMs) or 0),

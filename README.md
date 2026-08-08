@@ -11,7 +11,7 @@ Renium is a high-fidelity two-way sync tool for Roblox Studio made in Rust, desi
 ## Getting started
 
 1. Build the CLI: `cargo build --release --manifest-path tools/renium/Cargo.toml`
-2. Install the Studio plugin: `renium setup` (or copy `tools/plugin_ws_bridge/Renium.rbxm` into your Roblox `Plugins` folder)
+2. Install the Studio plugin: `renium setup` (or copy `tools/plugin_ws_bridge/Renium.rbxm` into your Roblox `Plugins` folder). On macOS, setup also prepares `~/Applications/Renium Studio.app`; open that app so protected properties can sync without a save dialog.
 3. See [tools/renium/README.md](tools/renium/README.md) for the command reference, and [AGENTS.md](AGENTS.md) if you are pointing an AI agent at it.
 
 ## License

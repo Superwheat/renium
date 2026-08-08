@@ -11,8 +11,24 @@ export function pickWorkspaceRootFolder(): vscode.WorkspaceFolder | undefined {
     if (!folders || folders.length === 0) {
         return undefined;
     }
+    const activeUri = vscode.window.activeTextEditor?.document.uri;
+    if (activeUri?.scheme === "file") {
+        const activeFolder = vscode.workspace.getWorkspaceFolder(activeUri);
+        if (activeFolder) {
+            return activeFolder;
+        }
+    }
     if (folders.length > 1) {
-        const match = folders.find((folder) => fs.existsSync(path.join(folder.uri.fsPath, "renium.exe")));
+        const match = folders.find((folder) => {
+            const root = folder.uri.fsPath;
+            return fs.existsSync(path.join(root, "renium.experience.json"))
+                || fs.existsSync(path.join(root, "renium.project.json"))
+                || fs.existsSync(path.join(root, "renium.project.jsonc"))
+                || fs.existsSync(path.join(root, "src"))
+                || fs.existsSync(path.join(root, "sourcemap.json"))
+                || fs.existsSync(path.join(root, "renium-link.json"))
+                || fs.existsSync(path.join(root, ".renium"));
+        });
         if (match) {
             return match;
         }

@@ -33,6 +33,7 @@ pub struct FlatInstance {
 
 #[allow(missing_docs)]
 pub struct FlatDom {
+    pub metadata: HashMap<String, String>,
     pub root_indices: Vec<usize>,
     pub instances: Vec<FlatInstance>,
 }
@@ -142,15 +143,24 @@ impl<'db> Deserializer<'db> {
         profiling::scope!("rbx_binary::deserialize_flat");
 
         let mut deserializer = DeserializerState::new(self, reader, true)?;
+        let mut prop_chunks = Vec::new();
 
         loop {
             let chunk = deserializer.next_chunk()?;
+
+            if &chunk.name == b"PROP" {
+                prop_chunks.push(chunk);
+                continue;
+            }
+
+            if !prop_chunks.is_empty() {
+                deserializer.decode_prop_chunks_parallel(core::mem::take(&mut prop_chunks))?;
+            }
 
             match &chunk.name {
                 b"META" => deserializer.decode_meta_chunk(&chunk.data)?,
                 b"SSTR" => deserializer.decode_sstr_chunk(&chunk.data)?,
                 b"INST" => deserializer.decode_inst_chunk(&chunk.data)?,
-                b"PROP" => deserializer.decode_prop_chunk(&chunk.data)?,
                 b"PRNT" => deserializer.decode_prnt_chunk(&chunk.data)?,
                 b"END\0" => {
                     deserializer.decode_end_chunk(&chunk.data)?;

@@ -18,6 +18,7 @@ export const DEFAULT_SYNC_SERVICES = [
   "StarterPlayer",
   "Teams",
   "SoundService",
+  "VoiceChatService",
 ] as const;
 
 const EXPLORER_SERVICE_ORDER = [
@@ -25,7 +26,6 @@ const EXPLORER_SERVICE_ORDER = [
   "TextChatService",
   "TestService",
   "LocalizationService",
-  "VoiceChatService",
   "VRService",
 ] as const;
 

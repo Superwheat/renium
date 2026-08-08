@@ -17,6 +17,9 @@ local function equal(actual, expected, label)
 	end
 end
 
+local Runtime = require("../BridgePluginRuntime.module")
+equal(type(Runtime.start), "function", "runtime module compilation")
+
 local chunk = Chunking.chunkEncodedString("abcdefgh", 3, 3, -2)
 equal(chunk.start, 3, "chunk start")
 equal(chunk.nextStart, 6, "chunk next start")
@@ -311,12 +314,13 @@ lockedTarget.Parent = lockedParent
 local lockedSibling = FakeInstance.new("Terrain")
 lockedSibling.RobloxLocked = true
 lockedSibling.Parent = lockedParent
-local lockedReplacement = InstanceSwap.replace(lockedTarget, "StringValue", tagService, function(instance)
+local lockedReplacementOk = pcall(InstanceSwap.replace, lockedTarget, "StringValue", tagService, function(instance)
 	instance.Parent = nil
 end, FakeInstance.new)
 local lockedChildren = lockedParent:GetChildren()
-equal(lockedChildren[1], lockedSibling, "locked sibling retained")
-equal(lockedChildren[2], lockedReplacement, "locked sibling replacement fallback")
+equal(lockedReplacementOk, false, "locked sibling replacement rejected")
+equal(lockedChildren[1], lockedTarget, "locked sibling target retained")
+equal(lockedChildren[2], lockedSibling, "locked sibling retained")
 
 equal(Content.serializeSource("None", nil), "", "empty content")
 equal(Content.serializeSource("Uri", "rbxassetid://123"), "rbxassetid://123", "URI content")

@@ -5,7 +5,8 @@ param(
     [switch]$AllowDirty,
     [switch]$AllowUnlicensed,
     [switch]$AllowLocalPublisher,
-    [switch]$LocalBuild
+    [switch]$LocalBuild,
+    [string]$TargetTriple
 )
 
 Set-StrictMode -Version Latest
@@ -76,6 +77,103 @@ function Get-CargoPackageVersion {
     return $match.Groups["version"].Value
 }
 
+function Get-ReleaseTarget {
+    param([string]$Requested)
+
+    if (-not [string]::IsNullOrWhiteSpace($Requested)) {
+        $triple = $Requested.Trim()
+    }
+    else {
+        $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+        $cpu = switch ($architecture) {
+            "x64" { "x86_64" }
+            "arm64" { "aarch64" }
+            default { throw "Renium does not provide a release build for $architecture" }
+        }
+        $os = if ($env:OS -eq "Windows_NT") {
+            "pc-windows-msvc"
+        }
+        elseif ($IsMacOS) {
+            "apple-darwin"
+        }
+        else {
+            "unknown-linux-gnu"
+        }
+        $triple = "$cpu-$os"
+    }
+
+    $match = [regex]::Match(
+        $triple,
+        '^(?<cpu>x86_64|aarch64)-(?<os>pc-windows-msvc|apple-darwin|unknown-linux-gnu)$'
+    )
+    if (-not $match.Success) {
+        throw "Unsupported Renium release target '$triple'"
+    }
+    $platform = switch ($match.Groups["os"].Value) {
+        "pc-windows-msvc" { "win32" }
+        "apple-darwin" { "darwin" }
+        "unknown-linux-gnu" { "linux" }
+    }
+    $architecture = if ($match.Groups["cpu"].Value -eq "x86_64") { "x64" } else { "arm64" }
+    return [pscustomobject]@{
+        Triple = $triple
+        Platform = $platform
+        Architecture = $architecture
+    }
+}
+
+function Get-BinaryArchitecture {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 20) {
+        throw "Release executable is too small to identify: $Path"
+    }
+    if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
+        $header = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ($header -lt 0 -or $header + 6 -gt $bytes.Length) {
+            throw "Release executable has an invalid PE header: $Path"
+        }
+        $machine = [BitConverter]::ToUInt16($bytes, $header + 4)
+        $architecture = switch ($machine) {
+            0x8664 { "x64" }
+            0xAA64 { "arm64" }
+            default { throw "Unsupported PE machine 0x$($machine.ToString('X4')) in $Path" }
+        }
+        return $architecture
+    }
+    if ($bytes[0] -eq 0x7F -and $bytes[1] -eq 0x45 -and $bytes[2] -eq 0x4C -and $bytes[3] -eq 0x46) {
+        $machine = if ($bytes[5] -eq 1) {
+            [BitConverter]::ToUInt16($bytes, 18)
+        }
+        else {
+            [uint16](($bytes[18] -shl 8) -bor $bytes[19])
+        }
+        $architecture = switch ($machine) {
+            62 { "x64" }
+            183 { "arm64" }
+            default { throw "Unsupported ELF machine $machine in $Path" }
+        }
+        return $architecture
+    }
+    $magic = [BitConverter]::ToUInt32($bytes, 0)
+    if ($magic -in @(0xFEEDFACF, 0xCFFAEDFE)) {
+        $cpu = if ($magic -eq 0xFEEDFACF) {
+            [BitConverter]::ToUInt32($bytes, 4)
+        }
+        else {
+            [uint32](($bytes[4] -shl 24) -bor ($bytes[5] -shl 16) -bor ($bytes[6] -shl 8) -bor $bytes[7])
+        }
+        $architecture = switch ($cpu) {
+            0x01000007 { "x64" }
+            0x0100000C { "arm64" }
+            default { throw "Unsupported Mach-O CPU 0x$($cpu.ToString('X8')) in $Path" }
+        }
+        return $architecture
+    }
+    throw "Unsupported executable format: $Path"
+}
+
 function Get-RepositoryRelativePath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -98,6 +196,21 @@ function Get-ArtifactRecord {
         file = $relative
         bytes = $item.Length
         sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function Copy-ExtensionStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    foreach ($entry in Get-ChildItem -LiteralPath $Source -Force) {
+        if ($entry.Name -in @("node_modules", "out", "out-test", "bin")) {
+            continue
+        }
+        Copy-Item -LiteralPath $entry.FullName -Destination $Destination -Recurse -Force
     }
 }
 
@@ -144,6 +257,21 @@ if (-not $AllowDirty -and -not [string]::IsNullOrWhiteSpace($dirtyStatus)) {
     throw "Refusing a public release from a dirty checkout. Commit or stash the changes first, or use -LocalBuild for a private test artifact."
 }
 $revision = Invoke-CapturedChecked -File "git" -Arguments @("-C", $repositoryRoot, "rev-parse", "HEAD")
+if ([string]::IsNullOrWhiteSpace($env:SOURCE_DATE_EPOCH)) {
+    $env:SOURCE_DATE_EPOCH = Invoke-CapturedChecked -File "git" -Arguments @(
+        "-C",
+        $repositoryRoot,
+        "show",
+        "-s",
+        "--format=%ct",
+        "HEAD"
+    )
+}
+$sourceDateEpoch = 0L
+if (-not [long]::TryParse($env:SOURCE_DATE_EPOCH, [ref]$sourceDateEpoch) -or $sourceDateEpoch -lt 0) {
+    throw "SOURCE_DATE_EPOCH must be a non-negative Unix timestamp"
+}
+$generatedAtUtc = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch).UtcDateTime.ToString("o")
 
 $cliVersion = Get-CargoPackageVersion -ManifestPath $cargoManifest
 $extensionPackage = Get-Content -LiteralPath $extensionPackagePath -Raw | ConvertFrom-Json
@@ -162,7 +290,6 @@ $cliSourcePath = Join-Path $cliDirectory "src\main.rs"
 $cliSource = Get-Content -LiteralPath $cliSourcePath -Raw
 $compatibilityConstants = [ordered]@{
     BRIDGE_PROTOCOL_VERSION = "BRIDGE_PROTOCOL_VERSION"
-    CODEC_VERSION = "BRIDGE_CODEC_VERSION_SCHEMA9"
     CHUNK_FRAME_PROTOCOL_VERSION = "BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION"
     COMPACT_VALUE_PROTOCOL_VERSION = "BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION"
 }
@@ -177,6 +304,27 @@ foreach ($pluginConstant in $compatibilityConstants.Keys) {
         throw "Compatibility metadata mismatch: plugin $pluginConstant=$($pluginMatch.Groups["value"].Value), CLI $cliConstant=$($cliMatch.Groups["value"].Value)"
     }
 }
+$pluginCodecMatch = [regex]::Match(
+    $pluginRuntime,
+    '(?ms)\bCODEC_VERSION\s*=\s*if\b.*?\bthen\s*"(?<primary>[^"]+)"\s*\belse\s*"(?<fallback>[^"]+)"'
+)
+$cliPrimaryCodecMatch = [regex]::Match(
+    $cliSource,
+    '(?m)\bBRIDGE_CODEC_VERSION_SCHEMA9\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'
+)
+$cliFallbackCodecMatch = [regex]::Match(
+    $cliSource,
+    '(?m)\bBRIDGE_CODEC_VERSION_SCHEMA8\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'
+)
+if (-not $pluginCodecMatch.Success -or -not $cliPrimaryCodecMatch.Success -or -not $cliFallbackCodecMatch.Success) {
+    throw "Could not read conditional codec compatibility metadata"
+}
+if (
+    $pluginCodecMatch.Groups["primary"].Value -ne $cliPrimaryCodecMatch.Groups["value"].Value -or
+    $pluginCodecMatch.Groups["fallback"].Value -ne $cliFallbackCodecMatch.Groups["value"].Value
+) {
+    throw "Conditional codec compatibility metadata does not match the CLI"
+}
 if ($cliVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
     throw "Unsafe release version '$cliVersion'"
 }
@@ -187,6 +335,35 @@ if (-not $AllowUnlicensed -and $rootLicenses.Count -eq 0) {
 }
 if (-not $AllowLocalPublisher -and [string]::Equals([string]$extensionPackage.publisher, "local", [StringComparison]::OrdinalIgnoreCase)) {
     throw "The extension publisher is still 'local'. Configure a registered VS Code publisher before publishing, or use -LocalBuild only for an offline/private package."
+}
+if (-not $LocalBuild) {
+    $updatePublicKey = [string]$env:RENIUM_UPDATE_PUBLIC_KEY
+    if ([string]::IsNullOrWhiteSpace($updatePublicKey)) {
+        throw "A public release requires RENIUM_UPDATE_PUBLIC_KEY."
+    }
+    try {
+        $updatePublicKeyBytes = [Convert]::FromBase64String($updatePublicKey.Trim())
+    }
+    catch {
+        throw "RENIUM_UPDATE_PUBLIC_KEY must be valid base64."
+    }
+    if ($updatePublicKeyBytes.Length -ne 32) {
+        throw "RENIUM_UPDATE_PUBLIC_KEY must decode to 32 bytes."
+    }
+    $env:RENIUM_UPDATE_PUBLIC_KEY = $updatePublicKey.Trim()
+}
+$releaseTarget = Get-ReleaseTarget -Requested $TargetTriple
+$hostPlatform = if ($env:OS -eq "Windows_NT") {
+    "win32"
+}
+elseif ($IsMacOS) {
+    "darwin"
+}
+else {
+    "linux"
+}
+if ($releaseTarget.Platform -ne $hostPlatform) {
+    throw "Release target $($releaseTarget.Triple) does not match the current operating system."
 }
 
 $outputRoot = if ([IO.Path]::IsPathRooted($OutputDirectory)) {
@@ -200,26 +377,45 @@ if (Test-Path -LiteralPath $outputRoot -PathType Leaf) {
 }
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-$releaseDirectory = [IO.Path]::GetFullPath((Join-Path $outputRoot ("renium-" + $cliVersion)))
+$finalReleaseDirectory = [IO.Path]::GetFullPath((Join-Path $outputRoot ("renium-" + $cliVersion)))
 $releasePrefix = $outputRoot.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
-if (-not $releaseDirectory.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing unsafe release output path: $releaseDirectory"
+if (-not $finalReleaseDirectory.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing unsafe release output path: $finalReleaseDirectory"
 }
-if (Test-Path -LiteralPath $releaseDirectory) {
-    throw "Release output already exists: $releaseDirectory. Bump the version or choose a new -OutputDirectory; the script never overwrites an existing release."
+if (Test-Path -LiteralPath $finalReleaseDirectory) {
+    throw "Release output already exists: $finalReleaseDirectory. Bump the version or choose a new -OutputDirectory; the script never overwrites an existing release."
 }
+$releaseDirectory = Join-Path $outputRoot (".renium-" + $cliVersion + ".stage-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $releaseDirectory | Out-Null
 
+$previousPluginBundle = $env:RENIUM_PLUGIN_BUNDLE
+$previousCliBuild = $env:RENIUM_CLI_BUILD
+$previousIconPath = $env:RENIUM_INSERTABLE_OBJECTS_ICON_PATH
+$previousSkipPluginSchema = $env:RENIUM_SKIP_PLUGIN_SCHEMA_WRITE
+$previousTargetPlatform = $env:RENIUM_CLI_TARGET_PLATFORM
+$previousTargetArchitecture = $env:RENIUM_CLI_TARGET_ARCH
+$extensionStage = Join-Path (Split-Path -Parent $extensionDirectory) (".renium-extension-stage-" + [guid]::NewGuid().ToString("N"))
+$buildError = $null
+$restoreErrors = @()
+try {
 $binaryName = if ($env:OS -eq "Windows_NT") { "renium.exe" } else { "renium" }
-$cliBinary = Join-Path $cliDirectory ("target\release\" + $binaryName)
+$cliBinary = Join-Path $cliDirectory ("target\" + $releaseTarget.Triple + "\release\" + $binaryName)
 
-Invoke-Checked -File "cargo" -Arguments @("build", "--locked", "--release", "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+Invoke-Checked -File "cargo" -Arguments @("build", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
 if (-not $SkipTests) {
-    Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+    Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
     Invoke-Checked -File "lune" -Arguments @("run", "tools/plugin_ws_bridge/tests/run") -WorkingDirectory $repositoryRoot
+    if ($env:OS -eq "Windows_NT") {
+        Invoke-Checked -File "node" -Arguments @("tools/renium/tests/automation-replay.mjs", $cliBinary) -WorkingDirectory $repositoryRoot
+        Invoke-Checked -File "node" -Arguments @("tools/renium/tests/agent-docs-smoke.mjs", $cliBinary) -WorkingDirectory $repositoryRoot
+        Invoke-Checked -File "node" -Arguments @("tools/renium/tests/launcher-smoke.mjs") -WorkingDirectory $repositoryRoot
+    }
 }
 if (-not (Test-Path -LiteralPath $cliBinary -PathType Leaf)) {
     throw "Cargo reported success but did not create $cliBinary"
+}
+if ((Get-BinaryArchitecture -Path $cliBinary) -ne $releaseTarget.Architecture) {
+    throw "Cargo built a CLI whose architecture does not match $($releaseTarget.Triple)"
 }
 $releaseCliBinary = Join-Path $releaseDirectory $binaryName
 Copy-Item -LiteralPath $cliBinary -Destination $releaseCliBinary
@@ -229,7 +425,17 @@ $releaseLicense = Join-Path $releaseDirectory "LICENSE"
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $releaseReadme
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\README.md") -Destination $releaseCliReadme
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
-$releaseSupportFiles = @($releaseReadme, $releaseCliReadme, $releaseLicense)
+$releaseInstallPowerShell = Join-Path $releaseDirectory "install.ps1"
+$releaseInstallShell = Join-Path $releaseDirectory "install.sh"
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.ps1") -Destination $releaseInstallPowerShell
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.sh") -Destination $releaseInstallShell
+$releaseSupportFiles = @(
+    $releaseReadme,
+    $releaseCliReadme,
+    $releaseLicense,
+    $releaseInstallPowerShell,
+    $releaseInstallShell
+)
 if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
     $releaseRbxRunner = Join-Path $releaseDirectory "rbx-run.ps1"
@@ -255,17 +461,23 @@ if (-not ([IO.File]::ReadAllText($releasePluginXml).Contains("<roblox"))) {
     throw "The .rbxmx plugin artifact is not a Roblox XML model"
 }
 
-Copy-Item -LiteralPath $releasePluginXml -Destination (Join-Path $pluginDirectory "Renium.rbxmx") -Force
-Copy-Item -LiteralPath $releasePluginBinary -Destination (Join-Path $pluginDirectory "Renium.rbxm") -Force
-$extensionPluginBundle = Join-Path $extensionDirectory "assets\Renium.rbxm"
-Copy-Item -LiteralPath $releasePluginBinary -Destination $extensionPluginBundle -Force
+$env:RENIUM_PLUGIN_BUNDLE = $releasePluginBinary
+$env:RENIUM_CLI_BUILD = $cliBinary
+$env:RENIUM_INSERTABLE_OBJECTS_ICON_PATH = Join-Path $releaseDirectory "no-studio-icons"
+$env:RENIUM_SKIP_PLUGIN_SCHEMA_WRITE = "1"
+$env:RENIUM_CLI_TARGET_PLATFORM = $releaseTarget.Platform
+$env:RENIUM_CLI_TARGET_ARCH = $releaseTarget.Architecture
 
-Invoke-Checked -File $npm -Arguments @("ci", "--prefix", $extensionDirectory) -WorkingDirectory $repositoryRoot
+Copy-ExtensionStage -Source $extensionDirectory -Destination $extensionStage
+Invoke-Checked -File $npm -Arguments @("ci", "--prefix", $extensionStage) -WorkingDirectory $repositoryRoot
 if (-not $SkipTests) {
-    Invoke-Checked -File $npm -Arguments @("--prefix", $extensionDirectory, "run", "verify") -WorkingDirectory $repositoryRoot
+    Invoke-Checked -File $npm -Arguments @("--prefix", $extensionStage, "run", "verify") -WorkingDirectory $repositoryRoot
 }
-$releaseVsix = Join-Path $releaseDirectory ("renium-" + $cliVersion + ".vsix")
-Invoke-Checked -File $npx -Arguments @("--no-install", "vsce", "package", "--out", $releaseVsix) -WorkingDirectory $extensionDirectory
+$extensionPlatform = $releaseTarget.Platform
+$extensionArchitecture = $releaseTarget.Architecture
+$extensionTarget = "$extensionPlatform-$extensionArchitecture"
+$releaseVsix = Join-Path $releaseDirectory ("renium-" + $cliVersion + "-" + $extensionTarget + ".vsix")
+Invoke-Checked -File $npx -Arguments @("--no-install", "vsce", "package", "--target", $extensionTarget, "--out", $releaseVsix) -WorkingDirectory $extensionStage
 if (-not (Test-Path -LiteralPath $releaseVsix -PathType Leaf)) {
     throw "VSCE reported success but did not create $releaseVsix"
 }
@@ -288,6 +500,11 @@ try {
     if ($null -eq $pluginEntry) {
         throw "Packaged VSIX is missing extension/assets/Renium.rbxm"
     }
+    $extensionCliEntryPath = "extension/bin/$extensionPlatform-$extensionArchitecture/$binaryName"
+    $extensionCliEntry = $archive.GetEntry($extensionCliEntryPath)
+    if ($null -eq $extensionCliEntry) {
+        throw "Packaged VSIX is missing $extensionCliEntryPath"
+    }
     $pluginStream = $pluginEntry.Open()
     $sha256 = [Security.Cryptography.SHA256]::Create()
     try {
@@ -296,6 +513,15 @@ try {
     finally {
         $sha256.Dispose()
         $pluginStream.Dispose()
+    }
+    $extensionCliStream = $extensionCliEntry.Open()
+    $cliSha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $packagedCliHash = [BitConverter]::ToString($cliSha256.ComputeHash($extensionCliStream)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $cliSha256.Dispose()
+        $extensionCliStream.Dispose()
     }
 }
 finally {
@@ -308,11 +534,15 @@ $releasePluginHash = (Get-FileHash -LiteralPath $releasePluginBinary -Algorithm 
 if ($packagedPluginHash -ne $releasePluginHash) {
     throw "Packaged VSIX plugin does not match the release plugin"
 }
+$releaseCliHash = (Get-FileHash -LiteralPath $releaseCliBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($packagedCliHash -ne $releaseCliHash) {
+    throw "Packaged VSIX CLI does not match the release CLI"
+}
 
 $pluginInputs = @(
     Get-ChildItem -LiteralPath $pluginDirectory -File -Recurse |
         Where-Object {
-            $_.Name -notin @("Renium.rbxm", "Renium.rbxmx", ".renium-daemon.json")
+            $_.Name -notin @("Renium.rbxm", "Renium.rbxmx")
         } |
         Sort-Object FullName |
         ForEach-Object {
@@ -339,12 +569,12 @@ $manifest = [ordered]@{
     version = $cliVersion
     gitRevision = $revision
     dirtyCheckout = -not [string]::IsNullOrWhiteSpace($dirtyStatus)
-    generatedAtUtc = [DateTime]::UtcNow.ToString("o")
+    generatedAtUtc = $generatedAtUtc
     toolchain = [ordered]@{
         cargo = Invoke-CapturedChecked -File "cargo" -Arguments @("--version")
         node = Invoke-CapturedChecked -File "node" -Arguments @("--version")
         rojo = Invoke-CapturedChecked -File $rojo -Arguments @("--version") -WorkingDirectory $repositoryRoot
-        vsce = Invoke-CapturedChecked -File $npx -Arguments @("--no-install", "vsce", "--version") -WorkingDirectory $extensionDirectory
+        vsce = Invoke-CapturedChecked -File $npx -Arguments @("--no-install", "vsce", "--version") -WorkingDirectory $extensionStage
     }
     inputs = [ordered]@{
         cargoLockSha256 = (Get-FileHash -LiteralPath (Join-Path $cliDirectory "Cargo.lock") -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -359,8 +589,43 @@ $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -En
 
 $checksumLines = $artifacts | ForEach-Object { "{0} *{1}" -f $_.sha256, $_.file }
 $checksumLines | Set-Content -LiteralPath (Join-Path $releaseDirectory "SHA256SUMS.txt") -Encoding ascii
+}
+catch {
+    $buildError = $_
+}
+finally {
+    try {
+        if (Test-Path -LiteralPath $extensionStage) {
+            Remove-Item -LiteralPath $extensionStage -Recurse -Force
+        }
+    }
+    catch {
+        $restoreErrors += "$($extensionStage): $($_.Exception.Message)"
+    }
+    $env:RENIUM_PLUGIN_BUNDLE = $previousPluginBundle
+    $env:RENIUM_CLI_BUILD = $previousCliBuild
+    $env:RENIUM_INSERTABLE_OBJECTS_ICON_PATH = $previousIconPath
+    $env:RENIUM_SKIP_PLUGIN_SCHEMA_WRITE = $previousSkipPluginSchema
+    $env:RENIUM_CLI_TARGET_PLATFORM = $previousTargetPlatform
+    $env:RENIUM_CLI_TARGET_ARCH = $previousTargetArchitecture
+}
 
-Write-Host "Release artifacts verified: $releaseDirectory"
+if ($null -ne $buildError -or $restoreErrors.Count -gt 0) {
+    if (Test-Path -LiteralPath $releaseDirectory) {
+        Remove-Item -LiteralPath $releaseDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $buildError) {
+        if ($restoreErrors.Count -gt 0) {
+            throw "$($buildError.Exception.Message)`nTemporary staging cleanup also failed: $($restoreErrors -join '; ')"
+        }
+        throw $buildError
+    }
+    throw "Temporary staging cleanup failed: $($restoreErrors -join '; ')"
+}
+
+Move-Item -LiteralPath $releaseDirectory -Destination $finalReleaseDirectory
+
+Write-Host "Release artifacts verified: $finalReleaseDirectory"
 if ($LocalBuild) {
     Write-Warning "This is a local/private build. It bypassed clean-checkout, license, and publisher guards and must not be published as a public release."
 }

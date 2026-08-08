@@ -7,7 +7,11 @@ local function canReparent(instance: Instance): boolean
 	return okRead and not locked
 end
 
-local function restoreOrder(parent: Instance, desired: { Instance }): boolean
+local function restoreOrder(
+	parent: Instance,
+	desired: { Instance },
+	assignParent: ((Instance, Instance?) -> ())?
+): boolean
 	local desiredSet = {}
 	local order = table.clone(desired)
 	for _, child in ipairs(desired) do
@@ -34,10 +38,18 @@ local function restoreOrder(parent: Instance, desired: { Instance }): boolean
 	end
 
 	for index = prefix + 1, #current do
-		current[index].Parent = nil
+		if assignParent ~= nil then
+			assignParent(current[index], nil)
+		else
+			current[index].Parent = nil
+		end
 	end
 	for index = prefix + 1, #order do
-		order[index].Parent = parent
+		if assignParent ~= nil then
+			assignParent(order[index], parent)
+		else
+			order[index].Parent = parent
+		end
 	end
 	return true
 end
@@ -47,7 +59,8 @@ function BridgeInstanceSwap.replace(
 	className: string,
 	collectionService: any,
 	removeInstance: (Instance) -> (),
-	createInstance: ((string) -> Instance)?
+	createInstance: ((string) -> Instance)?,
+	assignParent: ((Instance, Instance?) -> ())?
 ): Instance
 	local parent = instance.Parent
 	if parent == nil then
@@ -64,6 +77,12 @@ function BridgeInstanceSwap.replace(
 		error(`Cannot create replacement {className} for {instance:GetFullName()}: {tostring(replacement)}`)
 	end
 	replacement.Name = instance.Name
+	for index = siblingIndex + 1, #originalSiblings do
+		if not canReparent(originalSiblings[index]) then
+			replacement:Destroy()
+			error(`Cannot preserve sibling order while replacing {instance:GetFullName()} with {className}`)
+		end
+	end
 
 	for attributeName, attributeValue in pairs(instance:GetAttributes()) do
 		pcall(replacement.SetAttribute, replacement, attributeName, attributeValue)
@@ -75,26 +94,33 @@ function BridgeInstanceSwap.replace(
 	local desiredSiblings = table.clone(originalSiblings)
 	desiredSiblings[siblingIndex] = replacement
 	local movedChildren = {}
+	local function setParent(target: Instance, nextParent: Instance?)
+		if assignParent ~= nil then
+			assignParent(target, nextParent)
+		else
+			target.Parent = nextParent
+		end
+	end
 	local okSwap, swapErr = pcall(function()
 		for _, child in ipairs(instance:GetChildren()) do
-			child.Parent = replacement
+			setParent(child, replacement)
 			movedChildren[#movedChildren + 1] = child
 		end
 		removeInstance(instance)
-		if not restoreOrder(parent, desiredSiblings) then
-			replacement.Parent = parent
+		if not restoreOrder(parent, desiredSiblings, assignParent) then
+			error("Cannot restore sibling order after class replacement")
 		end
 	end)
 	if not okSwap then
 		for index = #movedChildren, 1, -1 do
 			pcall(function()
-				movedChildren[index].Parent = instance
+				setParent(movedChildren[index], instance)
 			end)
 		end
 		pcall(function()
-			replacement.Parent = nil
-			instance.Parent = parent
-			restoreOrder(parent, originalSiblings)
+			setParent(replacement, nil)
+			setParent(instance, parent)
+			restoreOrder(parent, originalSiblings, assignParent)
 		end)
 		replacement:Destroy()
 		error(`Cannot replace {instance:GetFullName()} with {className}: {tostring(swapErr)}`, 0)

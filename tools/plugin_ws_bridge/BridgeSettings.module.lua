@@ -15,6 +15,7 @@ local RUNTIME_DEFAULTS = {
 	changesThreshold = 5,
 	logLevel = "warn",
 	overridePackages = false,
+	notifications = true,
 }
 
 local RUNTIME_BOOLEAN_KEYS = {
@@ -26,6 +27,7 @@ local RUNTIME_BOOLEAN_KEYS = {
 	syncbackProperties = true,
 	onlyCodeMode = true,
 	overridePackages = true,
+	notifications = true,
 }
 
 local RUNTIME_ENUMS = {
@@ -69,7 +71,7 @@ local function normalizePorts(values, maximumCount)
 		end
 		count += 1
 	end
-	if count < 1 or count ~= #values then
+	if count < maximumCount or count ~= #values then
 		return nil
 	end
 	local out = table.create(math.min(count, maximumCount))
@@ -92,11 +94,11 @@ local function normalizePorts(values, maximumCount)
 			out[#out + 1] = port
 		end
 	end
-	return out
+	return if #out == maximumCount then out else nil
 end
 
 local function isDefaultPortSequence(values)
-	if #values < 2 or #values > MAX_BRIDGE_PORTS then
+	if #values ~= MAX_BRIDGE_PORTS then
 		return false
 	end
 	for index, port in ipairs(values) do
@@ -208,16 +210,18 @@ end
 
 function BridgeSettings.loadRuntimeSettings(plugin, prefix)
 	local out = BridgeSettings.runtimeDefaults()
+	local explicit = {}
 	for key in pairs(out) do
 		local stored = plugin:GetSetting(prefix .. key)
 		if stored ~= nil then
 			local normalized = BridgeSettings.normalizeRuntimeSetting(key, stored)
 			if normalized ~= nil then
 				out[key] = normalized
+				explicit[key] = normalized
 			end
 		end
 	end
-	return out
+	return out, explicit
 end
 
 function BridgeSettings.saveRuntimeSetting(plugin, prefix, key, value)

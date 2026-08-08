@@ -2,12 +2,15 @@
 name = "renium"
 version = "0.1.2"
 edition = "2024"
+rust-version = "1.88"
 license-file = "../../LICENSE"
 repository = "https://github.com/Superwheat/renium"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
 mimalloc = "0.1"
+memchr = "2.7"
 clap = { version = "4.5.53", features = ["derive"] }
 full_moon = { version = "2.2.0", features = ["luau"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -18,7 +21,17 @@ url = "2.5.7"
 png = "0.17"
 walkdir = "2.5.0"
 zstd = "0.13.2"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 base64 = "0.13.1"
+ed25519-dalek = "2.2.0"
+globset = "0.4.16"
+rmp-serde = "1.3.0"
+semver = "1.0"
+notify = "8.2.0"
+pulldown-cmark = "0.13.0"
+sha2 = "0.10.9"
+toml = "0.9.8"
+serde_yaml = "0.9.34"
 rbx_binary = { path = "../vendor/rbx-dom/rbx_binary" }
 rbx_xml = { path = "../vendor/rbx-dom/rbx_xml" }
 rbx_dom_weak = { path = "../vendor/rbx-dom/rbx_dom_weak" }
@@ -29,7 +42,10 @@ rbx_reflection_database = { path = "../vendor/rbx-dom/rbx_reflection_database" }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[build-dependencies]
+cc = "1.2"
 
 [profile.release]
 lto = "thin"

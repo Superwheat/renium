@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -44,7 +44,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Run CLI tests
-        run: cargo test --locked --manifest-path tools/renium/Cargo.toml
+        run: |
+          cargo test --locked --manifest-path tools/renium/Cargo.toml
+          node tools/renium/tests/launcher-smoke.mjs
+
+  rust-msrv:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Check the minimum Rust version
+        run: cargo check --locked --manifest-path tools/renium/Cargo.toml
 
   build-and-test:
     name: Windows release build and extension
@@ -72,6 +86,9 @@ jobs:
         run: |
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
+          node tools/renium/tests/automation-replay.mjs tools/renium/target/release/renium.exe
+          node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/release/renium.exe
+          node tools/renium/tests/launcher-smoke.mjs
 
       - name: Build both Studio plugin formats
         run: |
@@ -106,6 +123,8 @@ jobs:
             if ($null -eq $archive.GetEntry("extension/package.json")) { throw "VSIX is missing extension/package.json" }
             $pluginEntry = $archive.GetEntry("extension/assets/Renium.rbxm")
             if ($null -eq $pluginEntry) { throw "VSIX is missing its matching Studio plugin" }
+            $cliEntry = $archive.GetEntry("extension/bin/win32-x64/renium.exe")
+            if ($null -eq $cliEntry) { throw "VSIX is missing its matching Renium CLI" }
             $stream = $pluginEntry.Open()
             $sha256 = [Security.Cryptography.SHA256]::Create()
             try {
@@ -117,6 +136,17 @@ jobs:
             }
             $expectedPluginHash = (Get-FileHash -LiteralPath (Join-Path $env:RUNNER_TEMP "Renium.rbxm") -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($packagedPluginHash -ne $expectedPluginHash) { throw "VSIX plugin does not match the built Studio plugin" }
+            $cliStream = $cliEntry.Open()
+            $cliSha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              $packagedCliHash = [BitConverter]::ToString($cliSha256.ComputeHash($cliStream)).Replace("-", "").ToLowerInvariant()
+            }
+            finally {
+              $cliSha256.Dispose()
+              $cliStream.Dispose()
+            }
+            $expectedCliHash = (Get-FileHash -LiteralPath "tools/renium/target/release/renium.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($packagedCliHash -ne $expectedCliHash) { throw "VSIX CLI does not match the built Renium CLI" }
           }
           finally {
             $archive.Dispose()

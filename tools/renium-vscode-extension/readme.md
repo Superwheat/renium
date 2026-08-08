@@ -6,12 +6,12 @@ This extension gives Rojo/Argon-style control from VS Code/Cursor using native R
 
 ## What it does
 
-- Full sync command: Studio -> snapshots -> `src` + `default.project.generated.json`
+- Separate Pull Studio to Files and Push Files to Studio commands
 - Export-only command: Studio -> snapshots
-- Import-only command: snapshots -> `src` (Rust importer)
-- Two-way live sync between `src` and Studio, including dirty Studio service imports
+- Import-only command: snapshots -> the configured project source folder (Rust importer)
+- Two-way live sync between project files and Studio, including dirty Studio service imports
 - Git tab inside the main Renium panel with repository status plus pull/commit/push actions
-- Optional "Full Sync, then commit & push" flow so Studio/export changes can be published in one workflow
+- Optional "Pull from Studio, Commit and Push" flow so Studio changes can be published in one workflow
 - Wally package sync that runs `wally install` and imports packages directly into the configured package target
 - Reusable link packages; treat third-party `.renium` packages as source code because they can contain Luau scripts, auto-running script classes, properties, and PackageLink instances
 - Optional debounced auto-sync on save
@@ -20,12 +20,47 @@ This extension gives Rojo/Argon-style control from VS Code/Cursor using native R
 ## Commands
 
 - `Renium: Open Menu`
-- `Renium: Full Sync (Studio -> src)`
+- `Renium: Install Studio Plugin`
+- `Renium: Manage Places`
+- `Renium: Pull Studio to Files`
+- `Renium: Push Files to Studio`
 - `Renium: Export Snapshots Only`
 - `Renium: Sync Wally Packages`
 - `Renium: Start Live Sync (Editor -> Studio)`
 - `Renium: Stop Live Sync`
 - `Renium: Git`
+
+## Multi-place experiences
+
+Open `Renium: Manage Places`, then choose **Add Current Studio Place** for each
+published place in an experience.
+Renium verifies that its `GameId` matches the project before creating or
+changing files. Each place gets an independent project root. `src` is the
+default source folder; `sourceRoot` in `renium.project.jsonc` can change it:
+
+```text
+renium.experience.json
+places/
+  main/
+    src/
+    sourcemap.json
+  lobby/
+    src/
+    sourcemap.json
+```
+
+The first alias comes from the published place name. It is lowercased, spaces
+become underscores, and non-ASCII letters and punctuation are removed. Choose
+**Rename Active Place** to use a shorter alias such as `main` or `lobby`.
+Renaming the alias moves that place folder and does not rename the place on
+Roblox.
+
+**Switch Active Place** changes the one place that Pull, Push, live sync,
+Explorer, generated files, and package commands use. **Reorder Places**
+controls how places are listed. Both are under **Manage Places**. The active
+selection is stored per workspace, while the display order is stored in
+`renium.experience.json`. Projects without that file keep the existing
+single-place layout and behavior.
 
 ## .renium viewer
 
@@ -38,11 +73,20 @@ matches exactly what syncs. Legacy `.rbsync` stores remain readable.
 
 ## Requirements
 
-- Roblox MCP bridge/plugin running in Studio
-- Native executables:
-  - `renium.exe` in the workspace root or `bin/renium.exe`; source-repository build folders are also detected
+- Renium Studio plugin running in Studio
+- Renium CLI bundled with the extension, installed on `PATH`, or selected with `renium.rustCliPath`
 - For Wally package sync: `wally` on PATH, or configure `renium.wallySync.wallyPath`
 - `git` available on PATH, or configure `renium.gitSync.gitPath`
+
+The released extension carries its matching Renium CLI and exposes `renium`
+and `rbx` to new integrated terminals. Projects do not need copies of
+`renium.exe`, `rbx.cmd`, or the extension itself. A CLI already on `PATH` and
+the older project-local locations remain supported.
+
+On macOS, **Renium: Install Studio Plugin** also prepares
+`~/Applications/Renium Studio.app`. Open that app for exact protected-property
+sync without save or export dialogs. The original Roblox Studio app remains
+unchanged.
 
 ## Wally package sync
 
@@ -58,7 +102,7 @@ realm = "shared"
 [dependencies]
 ```
 
-Then run `Renium: Sync Wally Packages` from the command palette or Renium menu. Renium runs `wally install`, imports the generated package tree directly, replaces the configured package target, and can apply the package tree to Studio. By default, that target is `src/ReplicatedStorage/Packages`.
+Then run `Renium: Sync Wally Packages` from the command palette or Renium menu. Renium runs `wally install`, imports the generated package tree directly, replaces the configured package target, and can apply the package tree to Studio. By default, that target is `<sourceRoot>/ReplicatedStorage/Packages`.
 
 If `wally.toml` is missing, the VS Code command can create a starter manifest. If you use Aftman shims or a custom tool location, set `renium.wallySync.wallyPath`.
 
@@ -66,15 +110,15 @@ If `wally.toml` is missing, the VS Code command can create a starter manifest. I
 
 The **Git** tab lives inside the main Renium panel alongside the existing Explorer and History tabs.
 
-- Shows current branch, remote, ahead/behind counts, and changed `src/` files
+- Shows current branch, remote, ahead/behind counts, and changed project source files
 - Redacts credentials/tokens before remote URLs are shown in the UI or output
-- Uses `src/` as the default and canonical Git sync scope for staging/status
+- Uses the configured project source folder as the default Git sync scope for staging/status
 - Blocks pull when the worktree is dirty if `renium.gitSync.requireCleanWorktreeBeforePull` is enabled
 - Stops live sync before pull so branch updates do not race with editor/Studio mirroring
 - Uses fast-forward-only pull to avoid creating merge commits silently
 - Blocks commit/push when files are already staged, to avoid publishing unintended index state
 - Excludes untracked files by default unless `renium.gitSync.includeUntracked` is enabled
-- Can optionally push pulled `src` changes back into Studio after a successful pull
+- Can optionally push pulled project-file changes back into Studio after a successful pull
 
 ## Development
 
@@ -137,7 +181,7 @@ before Marketplace publication.
 ## Key settings
 
 - `renium.exportCliPath`
-- `renium.rustCliPath` (path to `renium.exe`)
+- `renium.rustCliPath` (optional CLI override; blank uses the bundled CLI)
 - `renium.projectRoot` (default: `${workspaceFolder}`)
 - `renium.transport` (`ws` or `mcp`)
 - `renium.runImport` (default: `true`)
@@ -153,9 +197,9 @@ before Marketplace publication.
 - `renium.gitSync.remote` (default: `origin`)
 - `renium.gitSync.branch` (blank = current branch)
 - `renium.gitSync.autoFetch` (default: `true`)
-- `renium.gitSync.runFullSyncBeforePush` (`ask`, `always`, `never`)
+- `renium.gitSync.pullFromStudioBeforePush` (`ask`, `always`, `never`)
 - `renium.gitSync.stageMode` (`tracked` or `configuredPaths`)
-- `renium.gitSync.stagePaths` (defaults to `src`; path list used with `configuredPaths`)
+- `renium.gitSync.stagePaths` (defaults to `sourceRoot`; path list used with `configuredPaths`)
 - `renium.gitSync.includeUntracked` (default: `false`)
 - `renium.gitSync.commitMessageTemplate` (supports `${date}`, `${datetime}`, `${branch}`)
 - `renium.gitSync.confirmBeforePush` (default: `true`)
@@ -168,5 +212,11 @@ before Marketplace publication.
 - `renium.wallySync.packagesDir` (default: `Packages`)
 - `renium.wallySync.targetService` (default: `ReplicatedStorage`)
 - `renium.wallySync.targetName` (default: `Packages`)
+- `renium.wallySync.serverPackagesDir` (default: `ServerPackages`)
+- `renium.wallySync.serverTargetService` (default: `ServerStorage`)
+- `renium.wallySync.serverTargetName` (default: `ServerPackages`)
+- `renium.wallySync.devPackagesDir` (default: `DevPackages`)
+- `renium.wallySync.devTargetService` (default: `ReplicatedStorage`)
+- `renium.wallySync.devTargetName` (default: `DevPackages`)
 - `renium.wallySync.runInstall` (default: `true`)
 - `renium.wallySync.applyToStudio` (`ask`, `always`, `never`)

@@ -45,6 +45,11 @@ pub fn terminate_studio_process(pid: u32) -> Result<()> {
     platform::terminate_studio_process(pid)
 }
 
+#[cfg(target_os = "macos")]
+pub fn frontmost_studio_pid() -> Option<u32> {
+    platform::frontmost_studio_pid()
+}
+
 #[cfg(not(windows))]
 pub fn post_mouse_move(window: &StudioWindow, x: i32, y: i32) -> Result<()> {
     platform::post_mouse_move(&window.handle, x, y)
@@ -1124,6 +1129,98 @@ mod platform {
         bytes.push(0);
         unsafe {
             CFStringCreateWithCString(std::ptr::null(), bytes.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+        }
+    }
+
+    pub fn frontmost_studio_pid() -> Option<u32> {
+        unsafe {
+            let list = CGWindowListCopyWindowInfo(
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+                0,
+            );
+            if list.is_null() {
+                return None;
+            }
+            let owner_name_key = cf_string("kCGWindowOwnerName");
+            let owner_pid_key = cf_string("kCGWindowOwnerPID");
+            let bounds_key = cf_string("kCGWindowBounds");
+            let layer_key = cf_string("kCGWindowLayer");
+            let mut result = None;
+            let count = CFArrayGetCount(list);
+            for index in 0..count {
+                let dict = CFArrayGetValueAtIndex(list, index) as CFDictionaryRef;
+                if dict.is_null() {
+                    continue;
+                }
+                let layer_value = CFDictionaryGetValue(dict, layer_key);
+                let mut layer: i32 = -1;
+                if layer_value.is_null()
+                    || !CFNumberGetValue(
+                        layer_value,
+                        K_CF_NUMBER_INT_TYPE,
+                        &mut layer as *mut i32 as *mut c_void,
+                    )
+                    || layer != 0
+                {
+                    continue;
+                }
+                let bounds_value = CFDictionaryGetValue(dict, bounds_key) as CFDictionaryRef;
+                if bounds_value.is_null() {
+                    continue;
+                }
+                let mut rect = CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                };
+                if !CGRectMakeWithDictionaryRepresentation(bounds_value, &mut rect)
+                    || rect.size.width < 160.0
+                    || rect.size.height < 120.0
+                {
+                    continue;
+                }
+                let owner_value = CFDictionaryGetValue(dict, owner_name_key);
+                if owner_value.is_null() {
+                    continue;
+                }
+                let mut owner_buffer = [0u8; 256];
+                if !CFStringGetCString(
+                    owner_value,
+                    owner_buffer.as_mut_ptr(),
+                    owner_buffer.len() as isize,
+                    K_CF_STRING_ENCODING_UTF8,
+                ) {
+                    continue;
+                }
+                let owner_len = owner_buffer
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(owner_buffer.len());
+                let owner = String::from_utf8_lossy(&owner_buffer[..owner_len]);
+                if owner.contains("RobloxStudio") || owner.contains("Roblox Studio") {
+                    let pid_value = CFDictionaryGetValue(dict, owner_pid_key);
+                    let mut pid: i32 = 0;
+                    if !pid_value.is_null()
+                        && CFNumberGetValue(
+                            pid_value,
+                            K_CF_NUMBER_INT_TYPE,
+                            &mut pid as *mut i32 as *mut c_void,
+                        )
+                        && pid > 0
+                    {
+                        result = Some(pid as u32);
+                    }
+                }
+                break;
+            }
+            CFRelease(list);
+            CFRelease(owner_name_key);
+            CFRelease(owner_pid_key);
+            CFRelease(bounds_key);
+            CFRelease(layer_key);
+            result
         }
     }
 

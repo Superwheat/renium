@@ -1,6 +1,18 @@
 import * as fs from "fs";
 import * as path from "path";
 
+export function reniumBinaryName(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "renium.exe" : "renium";
+}
+
+export function bundledReniumCliPath(
+  extensionRoot: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string {
+  return path.join(extensionRoot, "bin", `${platform}-${arch}`, reniumBinaryName(platform));
+}
+
 export function findExecutableOnPath(
   binaryName: string,
   pathValue: string | undefined = process.env.PATH,
@@ -34,4 +46,53 @@ export function findExecutableOnPath(
   }
 
   return undefined;
+}
+
+export function reniumCliCandidates(options: {
+  configuredPath?: string;
+  extensionRoot?: string;
+  roots?: readonly string[];
+  fallbackRelativePaths?: readonly string[];
+  pathValue?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  pathExtValue?: string;
+}): string[] {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const binaryName = reniumBinaryName(platform);
+  const candidates: string[] = [];
+  const configuredPath = options.configuredPath?.trim();
+  if (configuredPath) {
+    candidates.push(configuredPath);
+  }
+  if (options.extensionRoot) {
+    candidates.push(bundledReniumCliPath(options.extensionRoot, platform, arch));
+  }
+  const pathCandidate = findExecutableOnPath(
+    binaryName,
+    options.pathValue,
+    platform,
+    options.pathExtValue,
+  );
+  if (pathCandidate) {
+    candidates.push(pathCandidate);
+  }
+  for (const root of options.roots ?? []) {
+    for (const relativePath of options.fallbackRelativePaths ?? []) {
+      candidates.push(path.join(root, relativePath));
+    }
+  }
+
+  const seen = new Set<string>();
+  return candidates
+    .map((candidate) => path.normalize(candidate))
+    .filter((candidate) => {
+      const key = platform === "win32" ? candidate.toLowerCase() : candidate;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
 }

@@ -3,6 +3,11 @@ import * as childProcess from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import {
+  projectProcessOwner,
+  terminateProcess,
+  trackProcess,
+} from "./processSupervisor";
 
 export type DecodeResult = { ok: true; tree: unknown } | { ok: false; error: string };
 
@@ -24,6 +29,7 @@ type RbsyncDecodeOptions = {
   maxInputBytes?: number;
   maxOutputBytes?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 type RbsyncTreeNode = {
@@ -104,9 +110,11 @@ async function runViewCommand(
   filePath: string,
   maxOutputBytes: number,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<DecodeResult> {
   return await new Promise<DecodeResult>((resolve) => {
     let settled = false;
+    let stopping = false;
     let timeout: NodeJS.Timeout | undefined;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -121,6 +129,7 @@ async function runViewCommand(
       if (timeout) {
         clearTimeout(timeout);
       }
+      signal?.removeEventListener("abort", onAbort);
       resolve(result);
     };
 
@@ -129,6 +138,7 @@ async function runViewCommand(
       child = childProcess.spawn(cliPath, ["view", filePath, "--json"], {
         cwd,
         env: process.env,
+        detached: process.platform !== "win32",
         shell: false,
         stdio: "pipe",
         windowsHide: true,
@@ -137,17 +147,29 @@ async function runViewCommand(
       finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
       return;
     }
+    void trackProcess(child, projectProcessOwner(cwd));
 
-    const stop = (error: string): void => {
-      try {
-        child.kill();
-      } catch {
+    const stop = async (error: string): Promise<void> => {
+      if (settled || stopping) {
+        return;
       }
+      stopping = true;
+      await terminateProcess(child);
       finish({ ok: false, error });
     };
 
+    function onAbort(): void {
+      void stop("Decoding was cancelled.");
+    }
+
+    if (signal?.aborted) {
+      void stop("Decoding was cancelled.");
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     timeout = setTimeout(() => {
-      stop(`Decoding timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+      void stop(`Decoding timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
     }, timeoutMs);
 
     child.stdout?.on("data", (data: Buffer | string) => {
@@ -157,7 +179,7 @@ async function runViewCommand(
       const next = appendLimited(stdout, stdoutLength, data, maxOutputBytes);
       stdoutLength = next.length;
       if (next.exceeded) {
-        stop(`Decoded tree exceeds the ${Math.floor(maxOutputBytes / (1024 * 1024))} MiB viewer limit.`);
+        void stop(`Decoded tree exceeds the ${Math.floor(maxOutputBytes / (1024 * 1024))} MiB viewer limit.`);
       }
     });
     child.stderr?.on("data", (data: Buffer | string) => {
@@ -171,7 +193,7 @@ async function runViewCommand(
       finish({ ok: false, error: err.message });
     });
     child.once("close", (code) => {
-      if (settled) {
+      if (settled || stopping) {
         return;
       }
       if (code !== 0) {
@@ -199,6 +221,9 @@ export async function decodeRbsyncToTree(
   const maxInputBytes = boundedLimit(options.maxInputBytes, MAX_RBSYNC_INPUT_BYTES, MAX_RBSYNC_INPUT_BYTES);
   const maxOutputBytes = boundedLimit(options.maxOutputBytes, MAX_RBSYNC_VIEW_OUTPUT_BYTES, MAX_RBSYNC_VIEW_OUTPUT_BYTES);
   const timeoutMs = boundedLimit(options.timeoutMs, RBSYNC_DECODE_TIMEOUT_MS, RBSYNC_DECODE_TIMEOUT_MS);
+  if (options.signal?.aborted) {
+    return { ok: false, error: "Decoding was cancelled." };
+  }
   try {
     const stat = await fs.promises.stat(filePath);
     if (!stat.isFile()) {
@@ -213,7 +238,7 @@ export async function decodeRbsyncToTree(
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
-  return await runViewCommand(cliPath, cwd, filePath, maxOutputBytes, timeoutMs);
+  return await runViewCommand(cliPath, cwd, filePath, maxOutputBytes, timeoutMs, options.signal);
 }
 
 

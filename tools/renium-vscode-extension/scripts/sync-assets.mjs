@@ -7,6 +7,7 @@ import { generateRobloxPropertiesMetadata } from "./generate-properties-metadata
 const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(extensionRoot, "..", "..");
 const extensionAssets = path.join(extensionRoot, "assets");
+const extensionResources = path.join(extensionRoot, "resources");
 const logoFiles = [
   "logo-white.png",
   "logo-black.png",
@@ -18,12 +19,20 @@ const insertableObjectsIconSize = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SIZ
 const preferredIconScale = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SCALE ?? "@2x";
 
 function syncStudioPluginBundle() {
-  const source = path.join(repoRoot, "tools", "plugin_ws_bridge", "Renium.rbxm");
+  const source = process.env.RENIUM_PLUGIN_BUNDLE?.trim() ||
+    path.join(repoRoot, "tools", "plugin_ws_bridge", "Renium.rbxm");
   const bytes = fs.readFileSync(source);
   if (bytes.length < 16 || bytes.subarray(0, 7).toString("ascii") !== "<roblox") {
     throw new Error(`Invalid Studio plugin bundle: ${source}`);
   }
   fs.copyFileSync(source, path.join(extensionAssets, "Renium.rbxm"));
+}
+
+function syncProjectSchema() {
+  for (const name of ["renium.project.schema.json", "renium.meta.schema.json"]) {
+    const source = path.join(repoRoot, "tools", "renium", "schemas", name);
+    fs.copyFileSync(source, path.join(extensionResources, name));
+  }
 }
 
 function discoverInsertableObjectsIconRoot() {
@@ -137,14 +146,13 @@ function syncInsertableObjectIcons() {
 }
 
 fs.mkdirSync(extensionAssets, { recursive: true });
+fs.mkdirSync(extensionResources, { recursive: true });
 
 for (const fileName of logoFiles) {
-  const source = path.join(repoRoot, fileName);
-  if (!fs.existsSync(source)) {
-    throw new Error(`Missing root logo asset: ${source}`);
+  const asset = path.join(extensionAssets, fileName);
+  if (!fs.existsSync(asset)) {
+    throw new Error(`Missing extension logo asset: ${asset}`);
   }
-
-  fs.copyFileSync(source, path.join(extensionAssets, fileName));
 }
 
 generateRobloxPropertiesMetadata({
@@ -155,4 +163,5 @@ generateRobloxPropertiesMetadata({
     process.env.RENIUM_REFRESH_STUDIO_API === "1",
 });
 syncStudioPluginBundle();
+syncProjectSchema();
 syncInsertableObjectIcons();
