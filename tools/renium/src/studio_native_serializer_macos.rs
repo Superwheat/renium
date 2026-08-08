@@ -916,7 +916,7 @@ fn create_managed_studio_transaction(parent: &Path) -> Result<PathBuf> {
         let transaction = parent.join(format!(
             ".Renium Studio.transaction-{}-{}-{attempt}",
             std::process::id(),
-            unix_millis()
+            now_millis()
         ));
         match fs::create_dir(&transaction) {
             Ok(()) => return Ok(transaction),
