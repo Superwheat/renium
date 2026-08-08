@@ -938,6 +938,9 @@ fn apply_update(
             return Err(error);
         }
     };
+    if let Some(bytes) = plugin_bytes.as_deref() {
+        crate::validate_rbxm_version(bytes, &manifest.payload.version)?;
+    }
     if let Err(error) = crate::workflows::stop_all_daemons_for_update() {
         let _ = fs::remove_dir_all(&stage);
         return Err(error);
@@ -971,9 +974,6 @@ fn apply_update(
     plan.phase = "prepared".to_string();
     #[cfg(windows)]
     {
-        if let Some(bytes) = plugin_bytes.as_deref() {
-            crate::validate_rbxm_version(bytes, &manifest.payload.version)?;
-        }
         schedule_windows_update(&plan, plan.core_stage.as_deref())?;
         crate::emit_global_output(
             &json!({

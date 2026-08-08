@@ -1,3 +1,4 @@
+#define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mutex>
 #include <pthread.h>
 #include <string>
