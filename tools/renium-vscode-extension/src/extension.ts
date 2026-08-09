@@ -930,7 +930,6 @@ class RobloxSyncController {
   private daemonStopPromise: Promise<void> | undefined;
   private daemonPending = new Map<number, DaemonPendingRequest>();
   private daemonContext: { key: string; id: number } | undefined;
-  private studioEditorActionRuns = new Map<string, { done: boolean; error?: string }>();
   private publishedPlaceNames = new Map<number, string>();
   private publishedRootPlaceIds = new Map<number, number>();
   private bridgeServeRequested = false;
@@ -6572,7 +6571,6 @@ class RobloxSyncController {
       clearPending?: boolean;
       ackSeq?: number;
       ackActionIds?: string[];
-      ackActionResults?: Record<string, { ok: boolean; error?: string }>;
       runtimeId?: string;
       start?: boolean;
       stop?: boolean;
@@ -6585,7 +6583,6 @@ class RobloxSyncController {
     if (
       typeof options.ackSeq === "number"
       || options.ackActionIds?.length
-      || options.ackActionResults
     ) {
       if (typeof options.runtimeId !== "string" || options.runtimeId.length === 0) {
         throw new Error("Studio change acknowledgment is missing its plugin runtime id.");
@@ -6616,7 +6613,6 @@ class RobloxSyncController {
           ? { ackSeq: Math.max(0, Math.floor(options.ackSeq)) }
           : {}),
         ...(options.ackActionIds?.length ? { ackActions: options.ackActionIds.join(",") } : {}),
-        ...(options.ackActionResults ? { ackActionResults: options.ackActionResults } : {}),
         ...(typeof options.runtimeId === "string" && options.runtimeId.length > 0
           ? { runtimeId: options.runtimeId }
           : {}),
@@ -6640,12 +6636,11 @@ class RobloxSyncController {
     if (state.explicitRuntimeSettings) {
       this.studioRuntimeSettings = state.explicitRuntimeSettings;
     }
-    const acknowledgedActions = await this.handleStudioEditorActions(state.editorActions, state.runtimeId);
-    if (acknowledgedActions.ids.length > 0) {
+    const acknowledgedActions = await this.handleStudioEditorActions(state.editorActions);
+    if (acknowledgedActions.length > 0) {
       await this.getStudioChangeState(cfg, services, {
         start: false,
-        ackActionIds: acknowledgedActions.ids,
-        ackActionResults: acknowledgedActions.results,
+        ackActionIds: acknowledgedActions,
         runtimeId: state.runtimeId,
       });
     }
@@ -6654,13 +6649,11 @@ class RobloxSyncController {
 
   private async handleStudioEditorActions(
     actions: StudioEditorAction[] | undefined,
-    runtimeId: string | undefined,
-  ): Promise<{ ids: string[]; results: Record<string, { ok: boolean; error?: string }> }> {
+  ): Promise<string[]> {
     if (!Array.isArray(actions)) {
-      return { ids: [], results: {} };
+      return [];
     }
     const acknowledged: string[] = [];
-    const results: Record<string, { ok: boolean; error?: string }> = {};
     const cfg = this.getConfig();
     for (const action of actions) {
       if (action?.type === "revealScript") {
@@ -6669,32 +6662,8 @@ class RobloxSyncController {
         }
         continue;
       }
-      if ((action?.type === "pullFromStudio" || action?.type === "pushToStudio") && action.id) {
-        const key = `${runtimeId ?? ""}:${action.id}`;
-        const running = this.studioEditorActionRuns.get(key);
-        if (running?.done) {
-          this.studioEditorActionRuns.delete(key);
-          acknowledged.push(action.id);
-          results[action.id] = running.error
-            ? { ok: false, error: running.error }
-            : { ok: true };
-        } else if (!running) {
-          const state: { done: boolean; error?: string } = { done: false };
-          this.studioEditorActionRuns.set(key, state);
-          const operation = action.type === "pullFromStudio"
-            ? this.pullFromStudio()
-            : this.pushToStudio();
-          void operation
-            .catch((error) => {
-              state.error = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-            })
-            .finally(() => {
-              state.done = true;
-            });
-        }
-      }
     }
-    return { ids: acknowledged, results };
+    return acknowledged;
   }
 
   private async revealStudioScript(action: StudioEditorAction, cfg: SyncConfig): Promise<boolean> {
@@ -11314,7 +11283,6 @@ class RobloxSyncController {
     this.daemonReadyReject = undefined;
     this.daemonClosePromise = undefined;
     this.daemonContext = undefined;
-    this.studioEditorActionRuns.clear();
   }
 
   private stopBridgeDaemon(reason = new Error("Persistent bridge daemon was stopped.")): Promise<void> {
