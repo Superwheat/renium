@@ -573,15 +573,6 @@ function BridgePluginRuntime.start(context)
 	local editorActions = {}
 	local editorActionCounter = 0
 
-	local function queueProjectSyncAction(actionType: string)
-		editorActionCounter += 1
-		editorActions[#editorActions + 1] = {
-			id = tostring(editorActionCounter),
-			type = actionType,
-		}
-		ui.setProjectSyncPending(if actionType == "pullFromStudio" then "pull" else "push")
-	end
-
 	local function selectedScriptAction()
 		local selected = Selection:Get()
 		local selectedScript = nil
@@ -652,7 +643,7 @@ function BridgePluginRuntime.start(context)
 		}
 	end
 
-	local function pendingEditorActions(acknowledged: any, runtimeId: any, actionResults: any)
+	local function pendingEditorActions(acknowledged: any, runtimeId: any)
 		if type(acknowledged) == "table" and #acknowledged > 0 then
 			if type(runtimeId) ~= "string" or runtimeId ~= Config.bridgeRuntimeId then
 				error("Editor action acknowledgment runtime does not match")
@@ -662,50 +653,17 @@ function BridgePluginRuntime.start(context)
 				acknowledgedIds[tostring(id)] = true
 			end
 			local kept = {}
-			local completedProjectSync = false
 			for _, action in ipairs(editorActions) do
 				if not acknowledgedIds[action.id] then
 					kept[#kept + 1] = action
-				elseif action.type == "pullFromStudio" or action.type == "pushToStudio" then
-					completedProjectSync = true
-					local result = if type(actionResults) == "table" then actionResults[action.id] else nil
-					local pulling = action.type == "pullFromStudio"
-					if type(result) == "table" and result.ok == false then
-						ui.notify(
-							"project-sync-result",
-							if pulling then "Pull failed" else "Push failed",
-							tostring(result.error or "The editor could not complete the sync."),
-							nil,
-							nil,
-							false
-						)
-					elseif type(result) == "table" and result.ok == true then
-						ui.notify(
-							"project-sync-result",
-							if pulling then "Pull complete" else "Push complete",
-							if pulling then "Studio changes were written to files." else "File changes were written to Studio.",
-							nil,
-							nil,
-							false
-						)
-					end
 				end
 			end
 			editorActions = kept
-			if completedProjectSync then
-				ui.setProjectSyncPending(nil)
-			end
 		end
 		return table.clone(editorActions)
 	end
 
 	ui.actions.reveal.Triggered:Connect(selectedScriptAction)
-	ui.panelPullButton.MouseButton1Click:Connect(function()
-		queueProjectSyncAction("pullFromStudio")
-	end)
-	ui.panelPushButton.MouseButton1Click:Connect(function()
-		queueProjectSyncAction("pushToStudio")
-	end)
 
 	Config.bridgeConnectRequested = false
 	Config.bridgeConnectedOnce = false
@@ -6096,7 +6054,6 @@ function BridgePluginRuntime.start(context)
 	end
 
 	Config.bridgeMethodHandlers.getStudioChangeState = function(p)
-		ui.setProjectSyncAvailable(p.contextBound == true)
 		local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
 		local explicitRuntimeSettings = if Config.getExplicitBridgeSettings
 			then Config.getExplicitBridgeSettings()
@@ -6114,14 +6071,14 @@ function BridgePluginRuntime.start(context)
 				runtimeSettings = runtimeSettings,
 				explicitRuntimeSettings = explicitRuntimeSettings,
 				runtimeId = Config.bridgeRuntimeId,
-				editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId, p.ackEditorActionResults),
+				editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId),
 			}
 		end
 		local changeState = Config.studioChanges.getState(p)
 		changeState.twoWaySyncEnabled = true
 		changeState.runtimeSettings = runtimeSettings
 		changeState.explicitRuntimeSettings = explicitRuntimeSettings
-		changeState.editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId, p.ackEditorActionResults)
+		changeState.editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
 		return changeState
 	end
 

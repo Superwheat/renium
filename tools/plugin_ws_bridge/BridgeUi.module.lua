@@ -1018,36 +1018,11 @@ local function buildStatusWidget(plugin, versionText)
 	notificationDismissButton.Parent = notificationActions
 	styleButton(notificationDismissButton, refs, false)
 
-	local syncActions = Instance.new("Frame")
-	syncActions.Name = "SyncActions"
-	syncActions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
-	syncActions.BackgroundTransparency = 1
-	syncActions.LayoutOrder = 4
-	syncActions.Parent = content
-
-	local pullButton = Instance.new("TextButton")
-	pullButton.Name = "PullFromStudio"
-	pullButton.Size = UDim2.new(0.5, -4, 1, 0)
-	pullButton.Text = "Pull Studio to files"
-	pullButton.Parent = syncActions
-	styleButton(pullButton, refs, false)
-	setButtonEnabled(pullButton, false)
-
-	local pushButton = Instance.new("TextButton")
-	pushButton.Name = "PushToStudio"
-	pushButton.AnchorPoint = Vector2.new(1, 0)
-	pushButton.Position = UDim2.new(1, 0, 0, 0)
-	pushButton.Size = UDim2.new(0.5, -4, 1, 0)
-	pushButton.Text = "Push files to Studio"
-	pushButton.Parent = syncActions
-	styleButton(pushButton, refs, false)
-	setButtonEnabled(pushButton, false)
-
 	local actions = Instance.new("Frame")
 	actions.Name = "Actions"
 	actions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
 	actions.BackgroundTransparency = 1
-	actions.LayoutOrder = 5
+	actions.LayoutOrder = 4
 	actions.Parent = content
 
 	local primarySlot = Instance.new("Frame")
@@ -1093,8 +1068,6 @@ local function buildStatusWidget(plugin, versionText)
 		notificationActionButton = notificationActionButton,
 		notificationSnoozeButton = notificationSnoozeButton,
 		notificationDismissButton = notificationDismissButton,
-		pullButton = pullButton,
-		pushButton = pushButton,
 		settingsButton = settingsButton,
 		disconnectButton = disconnectButton,
 		connectButton = connectButton,
@@ -2487,8 +2460,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		openSettings = settingsUi.open,
 		panelConnectButton = statusUi.connectButton,
 		panelDisconnectButton = statusUi.disconnectButton,
-		panelPullButton = statusUi.pullButton,
-		panelPushButton = statusUi.pushButton,
 		hostBox = settingsUi.hostBox,
 		portsBox = settingsUi.portsBox,
 		statusLabel = statusUi.statusSubtitle,
@@ -2499,33 +2470,8 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		actions = actions,
 		_lastView = nil,
 		_playModeHidden = false,
-		_connected = false,
-		_projectSyncAvailable = false,
-		_projectSyncPending = nil,
 		_conflictValue = nil,
 	}
-
-	local function refreshProjectSyncButtons()
-		local enabled = ui._connected and ui._projectSyncAvailable and ui._projectSyncPending == nil
-		statusUi.pullButton.Text = if ui._projectSyncPending == "pull"
-			then "Pulling..."
-			else "Pull Studio to files"
-		statusUi.pushButton.Text = if ui._projectSyncPending == "push"
-			then "Pushing..."
-			else "Push files to Studio"
-		setButtonEnabled(statusUi.pullButton, enabled)
-		setButtonEnabled(statusUi.pushButton, enabled)
-	end
-
-	function ui.setProjectSyncAvailable(available)
-		ui._projectSyncAvailable = available == true
-		refreshProjectSyncButtons()
-	end
-
-	function ui.setProjectSyncPending(direction)
-		ui._projectSyncPending = direction
-		refreshProjectSyncButtons()
-	end
 
 	local notificationKey = nil
 	local notificationAction = nil
@@ -3046,12 +2992,6 @@ function BridgeUi.create(plugin, _themeModule, bridgeInfo)
 		statusUi.statusSubtitle.Text = if subtitle == "" then " " else subtitle
 		local syncText = tostring(view.syncText or "")
 		statusUi.syncLine.Text = syncText
-		ui._connected = mode == "connected"
-		if not ui._connected then
-			ui._projectSyncAvailable = false
-			ui._projectSyncPending = nil
-		end
-		refreshProjectSyncButtons()
 
 		if mode == "connected" then
 			statusUi.connectButton.Visible = false
