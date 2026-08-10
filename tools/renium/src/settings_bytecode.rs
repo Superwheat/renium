@@ -11,19 +11,32 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
-use crate::{
-    NativeSettingsValue, SETTINGS_BINARY_MAGIC, SETTINGS_BINARY_VERSION,
-    SETTINGS_BINARY_VERSION_LEGACY, ServiceState, child_indices_for_instance, instance_settings_id,
-    log_timing, nonfinite_float_from_json, should_skip_binary_property, write_bytes_if_changed,
-};
+use crate::file_io::write_bytes_if_changed;
+use crate::property_schema::MESH_SIZE_TRANSPORT_PROPERTY;
+use crate::rbx_decode::nonfinite_float_from_json;
+use crate::snapshot_types::{NativeSettingsValue, ServiceState, SnapshotInstance};
+use crate::timing::log_timing;
+
+const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
+const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
+pub(crate) const SETTINGS_BINARY_VERSION: u8 = 11;
+pub(crate) const SETTINGS_REFERENCE_SELECTOR_KEYS: [&str; 9] = [
+    "instanceIndex",
+    "settingsId",
+    "instanceId",
+    "pathSegments",
+    "pathOrdinals",
+    "debugId",
+    "path",
+    "referent",
+    "ref",
+];
 
 const MAX_SETTINGS_BYTECODE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SETTINGS_COLLECTION_ITEMS: usize = 500_000;
 const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
-const SETTINGS_BINARY_GROUP_LENGTH_VERSION: u8 = 9;
-const SETTINGS_BINARY_NUMERIC_ID_VERSION: u8 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SettingsBytecode {
@@ -60,6 +73,105 @@ impl SettingsBytecode {
     }
 }
 
+pub(crate) fn settings_reference_index(value: &Value) -> Option<usize> {
+    let one_based = value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_i64()
+                .and_then(|number| (number >= 0).then_some(number as u64))
+        })
+        .or_else(|| {
+            value.as_f64().and_then(|number| {
+                number
+                    .is_finite()
+                    .then_some(number.trunc())
+                    .filter(|truncated| (*truncated - number).abs() < f64::EPSILON)
+                    .and_then(|truncated| (truncated >= 0.0).then_some(truncated as u64))
+            })
+        })?;
+    usize::try_from(one_based).ok()?.checked_sub(1)
+}
+
+pub(crate) fn instance_settings_id(index: usize, instance: &SnapshotInstance) -> String {
+    if instance.instance_index == Some(1) && instance.parent_index.is_none() {
+        return "1".to_string();
+    }
+    if let Some(debug_id) = instance
+        .debug_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return format!("debug:{debug_id}");
+    }
+    if let Some(instance_index) = instance.instance_index.filter(|value| *value > 0) {
+        return format!("{instance_index:x}");
+    }
+    if let Some(instance_id) = instance
+        .instance_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return instance_id.to_string();
+    }
+    format!("index:{index:x}")
+}
+
+pub(crate) fn child_indices_for_instance(state: &ServiceState, parent_index: usize) -> &[usize] {
+    state
+        .children_by_index
+        .get(parent_index)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+pub(crate) fn should_skip_binary_property(
+    state: &ServiceState,
+    instance: &SnapshotInstance,
+    name: &str,
+    raw_value: &Value,
+) -> bool {
+    if name.eq_ignore_ascii_case("source")
+        || name.eq_ignore_ascii_case("classname")
+        || name.eq_ignore_ascii_case("parent")
+        || name.eq_ignore_ascii_case("name")
+        || name.eq_ignore_ascii_case("robloxlocked")
+    {
+        return true;
+    }
+    if name == "RunContext" && instance.class_name != "Script" {
+        return true;
+    }
+    if state.properties_default_elided {
+        return false;
+    }
+    is_default_property_value(state, &instance.class_name, name, raw_value)
+}
+
+pub(crate) fn is_default_property_value(
+    state: &ServiceState,
+    class_name: &str,
+    property_name: &str,
+    property_value: &Value,
+) -> bool {
+    if property_name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY) {
+        return false;
+    }
+    if matches!(
+        (property_name, property_value),
+        ("Archivable", Value::Bool(true))
+            | ("Sandboxed", Value::Bool(false))
+            | ("CharacterAutoLoads", Value::Bool(true))
+    ) {
+        return true;
+    }
+    state
+        .class_defaults_by_class
+        .get(class_name)
+        .and_then(|properties| properties.get(property_name))
+        .is_some_and(|default| default == property_value)
+}
+
 pub(crate) fn read_settings_bytecode_file(path: &Path) -> Result<SettingsBytecode> {
     for attempt in 0..6 {
         let file_len = fs::metadata(path)
@@ -75,8 +187,7 @@ pub(crate) fn read_settings_bytecode_file(path: &Path) -> Result<SettingsBytecod
         let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
         match decode_settings_bytecode(&bytes) {
             Ok(document) => return Ok(document),
-            Err(error) if attempt < 5 => {
-                let _ = error;
+            Err(_) if attempt < 5 => {
                 thread::sleep(Duration::from_millis(15 * (attempt + 1) as u64));
             }
             Err(error) => {
@@ -98,17 +209,14 @@ pub(crate) fn write_settings_bytecode_file(path: &Path, document: &SettingsBytec
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
     if bytes.len() > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!(
-            "Settings bytecode exceeds safe size limit of {} bytes",
-            MAX_SETTINGS_BYTECODE_BYTES
-        );
+        bail!("Settings bytecode exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes");
     }
     let mut reader = BytecodeReader::new(bytes);
     reader.read_magic()?;
     let version = reader
         .read_u8()
         .context("Missing settings bytecode version")?;
-    if !(SETTINGS_BINARY_VERSION_LEGACY..=SETTINGS_BINARY_VERSION).contains(&version) {
+    if !(SETTINGS_BINARY_MIN_VERSION..=SETTINGS_BINARY_VERSION).contains(&version) {
         bail!("Unsupported settings bytecode version {version}");
     }
 
@@ -116,14 +224,12 @@ pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode>
     let encoded_len = reader.read_len("compressed settings bytecode byte length")?;
     if decoded_len > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
-            "Decoded settings bytecode payload exceeds safe size limit of {} bytes",
-            MAX_SETTINGS_BYTECODE_BYTES
+            "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
         );
     }
     if encoded_len > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
-            "Compressed settings bytecode payload exceeds safe size limit of {} bytes",
-            MAX_SETTINGS_BYTECODE_BYTES
+            "Compressed settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
         );
     }
     let encoded = reader.read_bytes(encoded_len)?;
@@ -144,10 +250,7 @@ fn decode_settings_bytecode_payload(
     for _ in 0..string_count {
         let len = reader.read_len("string byte length")?;
         if len > MAX_SETTINGS_STRING_BYTES {
-            bail!(
-                "Settings string exceeds safe size limit of {} bytes",
-                MAX_SETTINGS_STRING_BYTES
-            );
+            bail!("Settings string exceeds safe size limit of {MAX_SETTINGS_STRING_BYTES} bytes");
         }
         let bytes = reader.read_bytes(len)?;
         strings.push(String::from_utf8(bytes.to_vec()).context("Invalid UTF-8 settings string")?);
@@ -172,13 +275,7 @@ fn decode_settings_bytecode_payload(
     let instance_count = reader.read_collection_len("instance count")?;
     let mut instances = Vec::with_capacity(instance_count);
     for instance_index in 0..instance_count {
-        let settings_id = if version >= SETTINGS_BINARY_NUMERIC_ID_VERSION {
-            read_compact_settings_id(reader, &strings)?
-        } else {
-            reader
-                .read_string(&strings, "instance settings id")?
-                .to_string()
-        };
+        let settings_id = read_compact_settings_id(reader, &strings)?;
         let name = reader.read_string(&strings, "instance name")?.to_string();
         let class_id = reader.read_len("instance class id")?;
         let class_name = classes
@@ -199,87 +296,41 @@ fn decode_settings_bytecode_payload(
     validate_settings_hierarchy(&instances)?;
 
     let group_count = reader.read_collection_len("property group count")?;
-    if version >= SETTINGS_BINARY_GROUP_LENGTH_VERSION {
-        let mut specs = Vec::with_capacity(group_count);
-        for _ in 0..group_count {
-            let property_id = reader.read_len("property id")?;
-            let property_name = properties
-                .get(property_id)
-                .with_context(|| format!("Invalid property id {property_id}"))?;
-            let kind = reader.read_u8().context("Missing property kind")?;
-            let value_count = reader.read_collection_len("property value count")?;
-            let body_len = reader.read_len("property group byte length")?;
-            let body = reader.read_bytes(body_len)?;
-            specs.push((property_name, kind, value_count, body));
-        }
-        let decoded_groups = specs
-            .par_iter()
-            .map(|(property_name, kind, value_count, body)| {
-                decode_property_group_body(
-                    body,
-                    property_name.as_str(),
-                    *kind,
-                    *value_count,
-                    &strings,
-                    instance_count,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for ((property_name, ..), entries) in specs.iter().zip(decoded_groups) {
-            for entry in entries {
-                match entry {
-                    DecodedGroupEntry::Property(instance_index, value) => {
-                        instances[instance_index]
-                            .properties
-                            .insert((*property_name).clone(), value);
-                    }
-                    DecodedGroupEntry::Attributes(instance_index, attributes) => {
-                        instances[instance_index].attributes = attributes;
-                    }
+    let mut specs = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let property_id = reader.read_len("property id")?;
+        let property_name = properties
+            .get(property_id)
+            .with_context(|| format!("Invalid property id {property_id}"))?;
+        let kind = reader.read_u8().context("Missing property kind")?;
+        let value_count = reader.read_collection_len("property value count")?;
+        let body_len = reader.read_len("property group byte length")?;
+        let body = reader.read_bytes(body_len)?;
+        specs.push((property_name, kind, value_count, body));
+    }
+    let decoded_groups = specs
+        .par_iter()
+        .map(|(property_name, kind, value_count, body)| {
+            decode_property_group_body(
+                body,
+                property_name.as_str(),
+                *kind,
+                *value_count,
+                &strings,
+                instance_count,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for ((property_name, ..), entries) in specs.iter().zip(decoded_groups) {
+        for entry in entries {
+            match entry {
+                DecodedGroupEntry::Property(instance_index, value) => {
+                    instances[instance_index]
+                        .properties
+                        .insert((*property_name).clone(), value);
                 }
-            }
-        }
-    } else {
-        for _ in 0..group_count {
-            let property_id = reader.read_len("property id")?;
-            let property_name = properties
-                .get(property_id)
-                .with_context(|| format!("Invalid property id {property_id}"))?;
-            let kind = reader.read_u8().context("Missing property kind")?;
-            let value_count = reader.read_collection_len("property value count")?;
-            let cframe_group_decoder = decode_cframe_group_header(kind, reader)?;
-            let mut previous_instance_index = 0_usize;
-            let mut previous_ref_target_index = 0_usize;
-            for _ in 0..value_count {
-                let encoded_index = reader.read_len("property instance index")?;
-                let instance_index = previous_instance_index
-                    .checked_add(encoded_index)
-                    .context("Property instance index delta overflow")?;
-                previous_instance_index = instance_index;
-                let instance = instances
-                    .get_mut(instance_index)
-                    .with_context(|| format!("Invalid property instance index {instance_index}"))?;
-                if property_name == "Attributes" && kind == 8 {
-                    instance.attributes =
-                        decode_attributes_payload(reader, &strings, instance_count)?;
-                } else {
-                    let value = if kind == 17 {
-                        decode_resolved_ref_group_payload(
-                            reader,
-                            instance_count,
-                            &mut previous_ref_target_index,
-                        )?
-                    } else {
-                        match &cframe_group_decoder {
-                            CFrameGroupDecoder::Inline => {
-                                decode_raw_value_payload(reader, kind, &strings, instance_count, 0)?
-                            }
-                            CFrameGroupDecoder::RotationTable(rotations) => {
-                                decode_cframe_rotation_table_payload(reader, rotations)?
-                            }
-                        }
-                    };
-                    instance.properties.insert(property_name.clone(), value);
+                DecodedGroupEntry::Attributes(instance_index, attributes) => {
+                    instances[instance_index].attributes = attributes;
                 }
             }
         }
@@ -413,14 +464,6 @@ fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result
 }
 
 fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
-    encode_settings_bytecode_payload_with_layout(document, true, true)
-}
-
-fn encode_settings_bytecode_payload_with_layout(
-    document: &SettingsBytecode,
-    group_len_prefix: bool,
-    numeric_ids: bool,
-) -> Result<Vec<u8>> {
     let lookup = build_bytecode_instance_lookup(document);
     let mut string_counts: SettingsStringCounts<'_> = HashMap::new();
     let mut class_counts: SettingsStringCounts<'_> = HashMap::new();
@@ -428,7 +471,7 @@ fn encode_settings_bytecode_payload_with_layout(
     let mut property_groups: SettingsPropertyGroups<'_> = HashMap::new();
 
     for (instance_index, instance) in document.instances.iter().enumerate() {
-        if !numeric_ids || parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
+        if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
             add_count(&mut string_counts, instance.settings_id.as_str(), 1);
         }
         add_count(&mut string_counts, instance.name.as_str(), 1);
@@ -506,11 +549,7 @@ fn encode_settings_bytecode_payload_with_layout(
     }
     write_var_u64(&mut writer, document.instances.len() as u64)?;
     for (instance_index, instance) in document.instances.iter().enumerate() {
-        if numeric_ids {
-            write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
-        } else {
-            write_binary_string_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
-        }
+        write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
         write_binary_string_id(&mut writer, &string_ids, instance.name.as_str())?;
         write_lookup_id(
             &mut writer,
@@ -538,9 +577,7 @@ fn encode_settings_bytecode_payload_with_layout(
         write_lookup_id(&mut writer, &property_ids, property_name, "property")?;
         writer.write_all(&[*kind])?;
         write_var_u64(&mut writer, values.len() as u64)?;
-        if group_len_prefix {
-            write_var_u64(&mut writer, group_body.len() as u64)?;
-        }
+        write_var_u64(&mut writer, group_body.len() as u64)?;
         writer.extend_from_slice(&group_body);
     }
 
@@ -550,15 +587,13 @@ fn encode_settings_bytecode_payload_with_layout(
 fn wrap_settings_bytecode_payload(payload: Vec<u8>) -> Result<Vec<u8>> {
     if payload.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
-            "Decoded settings bytecode payload exceeds safe size limit of {} bytes",
-            MAX_SETTINGS_BYTECODE_BYTES
+            "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
         );
     }
     let zstd = zstd::bulk::compress(&payload, 1)?;
     if zstd.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
-            "Compressed settings bytecode payload exceeds safe size limit of {} bytes",
-            MAX_SETTINGS_BYTECODE_BYTES
+            "Compressed settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
         );
     }
     let mut writer = Vec::with_capacity(
@@ -690,7 +725,7 @@ impl<'a> BytecodeReader<'a> {
             .with_context(|| format!("Invalid {label} {id}"))
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn finish(&self) -> Result<()> {
         let position = self.cursor.position() as usize;
         let len = self.cursor.get_ref().len();
         if position != len {
@@ -736,7 +771,7 @@ fn decode_raw_value_payload(
             reader.read_var_u64()?,
         )))),
         4 => Ok(Value::Number(Number::from(reader.read_var_u64()?))),
-        5 => number_from_f64(read_f64(reader)?),
+        5 => Ok(number_from_f64(read_f64(reader)?)),
         6 => Ok(Value::String(
             reader.read_string(strings, "value string id")?.to_string(),
         )),
@@ -758,16 +793,16 @@ fn decode_raw_value_payload(
             let len = reader.read_collection_len("numeric array length")?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(number_from_f64(read_f64(reader)?)?);
+                items.push(number_from_f64(read_f64(reader)?));
             }
             Ok(Value::Array(items))
         }
-        20 => number_from_f64(read_f32(reader)? as f64),
+        20 => Ok(number_from_f64(read_f32(reader)? as f64)),
         21 => {
             let len = reader.read_collection_len("f32 numeric array length")?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(number_from_f64(read_f32(reader)? as f64)?);
+                items.push(number_from_f64(read_f32(reader)? as f64));
             }
             Ok(Value::Array(items))
         }
@@ -952,7 +987,7 @@ fn decode_fixed_numeric_payload(
     for field in fields {
         out.insert(
             (*field).to_string(),
-            number_from_f64(read_fixed_numeric_component(reader)?)?,
+            number_from_f64(read_fixed_numeric_component(reader)?),
         );
     }
     Ok(Value::Object(out))
@@ -961,7 +996,7 @@ fn decode_fixed_numeric_payload(
 fn decode_cframe_payload(reader: &mut BytecodeReader<'_>) -> Result<Value> {
     let mut components = Vec::with_capacity(12);
     for _ in 0..12 {
-        components.push(number_from_f64(read_fixed_numeric_component(reader)?)?);
+        components.push(number_from_f64(read_fixed_numeric_component(reader)?));
     }
     Ok(typed_object(
         "CFrame",
@@ -1007,14 +1042,14 @@ fn decode_cframe_rotation_table_payload(
 ) -> Result<Value> {
     let mut components = Vec::with_capacity(12);
     for _ in 0..3 {
-        components.push(number_from_f64(read_f32(reader)? as f64)?);
+        components.push(number_from_f64(read_f32(reader)? as f64));
     }
     let rotation_index = reader.read_len("CFrame rotation index")?;
     let rotation = rotations
         .get(rotation_index)
         .with_context(|| format!("Invalid CFrame rotation index {rotation_index}"))?;
     for component in rotation {
-        components.push(number_from_f64(*component)?);
+        components.push(number_from_f64(*component));
     }
     Ok(typed_object(
         "CFrame",
@@ -1083,9 +1118,9 @@ fn read_fixed_numeric_component(reader: &mut BytecodeReader<'_>) -> Result<f64> 
     Ok(read_f32(reader)? as f64)
 }
 
-fn number_from_f64(value: f64) -> Result<Value> {
+fn number_from_f64(value: f64) -> Value {
     if let Some(number) = Number::from_f64(value) {
-        return Ok(Value::Number(number));
+        return Value::Number(number);
     }
     let text = if value.is_nan() {
         "nan"
@@ -1097,7 +1132,7 @@ fn number_from_f64(value: f64) -> Result<Value> {
     let mut object = Map::with_capacity(2);
     object.insert("_type".to_string(), Value::String("Float".to_string()));
     object.insert("value".to_string(), Value::String(text.to_string()));
-    Ok(Value::Object(object))
+    Value::Object(object)
 }
 
 fn unzigzag_i64(value: u64) -> i64 {
@@ -1535,7 +1570,7 @@ fn parse_numeric_debug_settings_id(text: &str) -> Option<u64> {
 
 fn settings_binary_id<'a>(
     source_index: usize,
-    instance: &'a crate::SnapshotInstance,
+    instance: &'a SnapshotInstance,
 ) -> SettingsBinaryId<'a> {
     if instance.instance_index == Some(1) && instance.parent_index.is_none() {
         return SettingsBinaryId::Text(Cow::Borrowed("1"));
@@ -1993,9 +2028,10 @@ fn write_resolved_ref_group_payload<W: Write + ?Sized>(
             *previous_target_index = *index;
             return Ok(());
         }
-        SettingsBinaryValueSource::Native(_) => bail!("Expected resolved Ref property group"),
+        SettingsBinaryValueSource::Native(_) | SettingsBinaryValueSource::Attributes(_) => {
+            bail!("Expected resolved Ref property group")
+        }
         SettingsBinaryValueSource::Property(value) => *value,
-        SettingsBinaryValueSource::Attributes(_) => bail!("Expected resolved Ref property group"),
     };
     let ref_value = ref_payload_object(value).context("Expected Ref binary settings value")?;
     let target_index = resolve_ref_index(ref_value, lookup)?
@@ -2034,9 +2070,10 @@ fn build_cframe_rotation_table(
             SettingsBinaryValueSource::Native(NativeSettingsValue::CFrame(value)) => {
                 value.map(f32::to_bits)
             }
-            SettingsBinaryValueSource::Native(_) => bail!("Expected CFrame property group"),
+            SettingsBinaryValueSource::Native(_) | SettingsBinaryValueSource::Attributes(_) => {
+                bail!("Expected CFrame property group")
+            }
             SettingsBinaryValueSource::Property(value) => cframe_component_bits(value)?,
-            SettingsBinaryValueSource::Attributes(_) => bail!("Expected CFrame property group"),
         };
         let position = [components[0], components[1], components[2]];
         let mut rotation = [0_u32; 9];
@@ -2187,13 +2224,10 @@ fn fixed_numeric_kind_from_tag(kind: u8) -> Option<FixedNumericKind> {
 
 fn fixed_numeric_len(kind: FixedNumericKind) -> usize {
     match kind {
-        FixedNumericKind::Vector2 => 2,
-        FixedNumericKind::Vector3 => 3,
-        FixedNumericKind::UDim => 2,
-        FixedNumericKind::UDim2 => 4,
-        FixedNumericKind::Color3 => 3,
+        FixedNumericKind::Vector2 | FixedNumericKind::UDim => 2,
+        FixedNumericKind::Vector3 | FixedNumericKind::Color3 => 3,
+        FixedNumericKind::UDim2 | FixedNumericKind::Rect => 4,
         FixedNumericKind::CFrame => 12,
-        FixedNumericKind::Rect => 4,
     }
 }
 
@@ -2364,10 +2398,8 @@ fn resolve_ref_index(
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .context("Ref instanceIndex must be a positive integer")?;
-        let mut index_candidate = None;
-        if instance_index > 0 && instance_index <= lookup.dense_instance_count {
-            index_candidate = Some(instance_index - 1);
-        }
+        let mut index_candidate =
+            (instance_index <= lookup.dense_instance_count).then_some(instance_index - 1);
         if let Some(index) = lookup.by_instance_index.get(&instance_index) {
             if index_candidate.is_some_and(|candidate| candidate != *index) {
                 bail!("Ref instanceIndex mappings disagree");
@@ -2484,12 +2516,7 @@ fn collect_raw_value_strings<'a>(
 ) -> Result<()> {
     match binary_raw_value_kind(value, lookup)? {
         0 | 1 | 2 | 3 | 4 | 5 | 9 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 20 | 21 => {}
-        19 => {
-            if let Some(text) = raw_string_payload(value) {
-                add_count(out, text, 1);
-            }
-        }
-        6 => {
+        6 | 19 => {
             if let Some(text) = raw_string_payload(value) {
                 add_count(out, text, 1);
             }
@@ -3240,6 +3267,57 @@ fn write_settings_binary_id<W: Write + ?Sized>(
     }
 }
 
+pub(crate) fn reindex_reference_indices(
+    record: &mut Map<String, Value>,
+    indices: &HashMap<String, usize>,
+) {
+    visit_reference_objects_mut(record, |object| {
+        let index = object
+            .get("settingsId")
+            .or_else(|| object.get("instanceId"))
+            .and_then(Value::as_str)
+            .and_then(|id| indices.get(id))
+            .copied();
+        if let Some(index) = index {
+            object.insert("instanceIndex".to_string(), Value::from(index + 1));
+        } else {
+            object.remove("instanceIndex");
+        }
+    });
+}
+
+pub(crate) fn visit_reference_objects_mut(
+    record: &mut Map<String, Value>,
+    mut visitor: impl FnMut(&mut Map<String, Value>),
+) {
+    fn visit(value: &mut Value, visitor: &mut impl FnMut(&mut Map<String, Value>)) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, visitor);
+                }
+            }
+            Value::Object(object) => {
+                let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
+                    || object.contains_key("settingsId")
+                    || object.contains_key("instanceId")
+                    || object.contains_key("instanceIndex");
+                if is_reference {
+                    visitor(object);
+                }
+                for value in object.values_mut() {
+                    visit(value, visitor);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for value in record.values_mut() {
+        visit(value, &mut visitor);
+    }
+}
+
 pub(crate) fn write_var_u64<W: Write + ?Sized>(writer: &mut W, mut value: u64) -> Result<()> {
     let mut buf = [0u8; 10];
     let mut len = 0usize;
@@ -3284,139 +3362,6 @@ mod tests {
             f32::NEG_INFINITY
         );
         assert!(fixed_numeric_component_f32(f64::NAN).is_nan());
-    }
-
-    #[test]
-    #[ignore]
-    fn decode_timing_breakdown() {
-        let path = std::env::var("RENIUM_TIMING_STORE").expect("set RENIUM_TIMING_STORE");
-        let started = std::time::Instant::now();
-        let bytes = std::fs::read(&path).expect("read store");
-        let read_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let mut reader = BytecodeReader::new(&bytes);
-        reader.read_magic().unwrap();
-        let version = reader.read_u8().unwrap();
-        let decoded_len = reader.read_len("len").unwrap();
-        let encoded_len = reader.read_len("len").unwrap();
-        let encoded = reader.read_bytes(encoded_len).unwrap();
-        let started = std::time::Instant::now();
-        let decoded = zstd::bulk::decompress(encoded, decoded_len).unwrap();
-        let zstd_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let mut reader = BytecodeReader::new(&decoded);
-        let started = std::time::Instant::now();
-        let string_count = reader.read_collection_len("string count").unwrap();
-        let mut strings = Vec::with_capacity(string_count);
-        for _ in 0..string_count {
-            let len = reader.read_len("string byte length").unwrap();
-            let raw = reader.read_bytes(len).unwrap();
-            strings.push(String::from_utf8(raw.to_vec()).unwrap());
-        }
-        let strings_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let started = std::time::Instant::now();
-        let class_count = reader.read_collection_len("class count").unwrap();
-        let mut classes = Vec::with_capacity(class_count);
-        for _ in 0..class_count {
-            classes.push(reader.read_string(&strings, "class").unwrap().to_string());
-        }
-        let property_count = reader.read_collection_len("property count").unwrap();
-        let mut properties = Vec::with_capacity(property_count);
-        for _ in 0..property_count {
-            properties.push(reader.read_string(&strings, "prop").unwrap().to_string());
-        }
-        let tables_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let started = std::time::Instant::now();
-        let instance_count = reader.read_collection_len("instance count").unwrap();
-        let mut instances = Vec::with_capacity(instance_count);
-        for instance_index in 0..instance_count {
-            let settings_id = reader.read_string(&strings, "sid").unwrap().to_string();
-            let name = reader.read_string(&strings, "name").unwrap().to_string();
-            let class_id = reader.read_len("class id").unwrap();
-            let class_name = classes.get(class_id).unwrap().clone();
-            let parent_raw = reader.read_len("parent").unwrap();
-            let parent_index =
-                decode_parent_index(parent_raw, instance_index, instance_count).unwrap();
-            instances.push(SettingsBytecodeInstance {
-                settings_id,
-                name,
-                class_name,
-                parent_index,
-                properties: Map::new(),
-                attributes: Map::new(),
-            });
-        }
-        let instances_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let started = std::time::Instant::now();
-        validate_settings_hierarchy(&instances).unwrap();
-        let validate_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let started = std::time::Instant::now();
-        let group_count = reader.read_collection_len("group count").unwrap();
-        let mut value_total = 0_usize;
-        for _ in 0..group_count {
-            let property_id = reader.read_len("property id").unwrap();
-            let property_name = properties.get(property_id).unwrap();
-            let kind = reader.read_u8().unwrap();
-            let value_count = reader.read_collection_len("value count").unwrap();
-            value_total += value_count;
-            if version >= 9 {
-                reader.read_len("group byte length").unwrap();
-            }
-            let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader).unwrap();
-            let mut previous_instance_index = 0_usize;
-            let mut previous_ref_target_index = 0_usize;
-            for _ in 0..value_count {
-                let encoded_index = reader.read_len("instance index").unwrap();
-                let instance_index = previous_instance_index + encoded_index;
-                previous_instance_index = instance_index;
-                let instance = instances.get_mut(instance_index).unwrap();
-                if property_name == "Attributes" && kind == 8 {
-                    instance.attributes =
-                        decode_attributes_payload(&mut reader, &strings, instance_count).unwrap();
-                } else {
-                    let value = if kind == 17 {
-                        decode_resolved_ref_group_payload(
-                            &mut reader,
-                            instance_count,
-                            &mut previous_ref_target_index,
-                        )
-                        .unwrap()
-                    } else {
-                        match &cframe_group_decoder {
-                            CFrameGroupDecoder::Inline => decode_raw_value_payload(
-                                &mut reader,
-                                kind,
-                                &strings,
-                                instance_count,
-                                0,
-                            )
-                            .unwrap(),
-                            CFrameGroupDecoder::RotationTable(rotations) => {
-                                decode_cframe_rotation_table_payload(&mut reader, rotations)
-                                    .unwrap()
-                            }
-                        }
-                    };
-                    instance.properties.insert(property_name.clone(), value);
-                }
-            }
-        }
-        let groups_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        let started = std::time::Instant::now();
-        let full = decode_settings_bytecode(&bytes).unwrap();
-        let full_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-        println!(
-            "store={path} version={version} bytes={} decoded_bytes={}\nread {read_ms:.1}ms | zstd {zstd_ms:.1}ms | strings[{string_count}] {strings_ms:.1}ms | class/prop tables {tables_ms:.1}ms | instances[{instance_count}] {instances_ms:.1}ms | validate {validate_ms:.1}ms | groups[{group_count}, {value_total} values, sequential] {groups_ms:.1}ms\nfull decode_settings_bytecode (v9 = parallel groups): {full_ms:.1}ms for {} instances",
-            bytes.len(),
-            decoded.len(),
-            full.instances.len(),
-        );
     }
 
     #[test]
@@ -3522,60 +3467,6 @@ mod tests {
                 "enumType": "Enum.KeyCode",
                 "name": "ButtonL2",
             }))
-        );
-    }
-
-    #[test]
-    fn settings_bytecode_decodes_legacy_v8_stores() {
-        let document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION_LEGACY,
-            instances: vec![
-                SettingsBytecodeInstance {
-                    settings_id: "root".to_string(),
-                    name: "Workspace".to_string(),
-                    class_name: "Workspace".to_string(),
-                    parent_index: None,
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "child".to_string(),
-                    name: "Target".to_string(),
-                    class_name: "Part".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::from_iter([
-                        ("Anchored".to_string(), json!(true)),
-                        ("Transparency".to_string(), json!(0.25)),
-                    ]),
-                    attributes: Map::from_iter([("Health".to_string(), json!(100))]),
-                },
-            ],
-        };
-
-        let payload =
-            encode_settings_bytecode_payload_with_layout(&document, false, false).unwrap();
-        let zstd = zstd::bulk::compress(&payload, 0).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(SETTINGS_BINARY_MAGIC);
-        bytes.push(SETTINGS_BINARY_VERSION_LEGACY);
-        write_var_u64(&mut bytes, payload.len() as u64).unwrap();
-        write_var_u64(&mut bytes, zstd.len() as u64).unwrap();
-        bytes.extend_from_slice(&zstd);
-
-        let decoded = decode_settings_bytecode(&bytes).unwrap();
-        assert_eq!(decoded.version, SETTINGS_BINARY_VERSION_LEGACY);
-        assert_eq!(decoded.instances.len(), 2);
-        assert_eq!(
-            decoded.instances[1].properties.get("Anchored"),
-            Some(&json!(true))
-        );
-        assert_eq!(
-            decoded.instances[1].properties.get("Transparency"),
-            Some(&json!(0.25))
-        );
-        assert_eq!(
-            decoded.instances[1].attributes.get("Health"),
-            Some(&json!(100))
         );
     }
 

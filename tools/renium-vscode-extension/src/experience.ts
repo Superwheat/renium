@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
+import { filesystemPathKey } from "./utils";
 
-export const EXPERIENCE_FILE_NAME = "renium.experience.json";
+const EXPERIENCE_FILE_NAME = "renium.experience.json";
 
 export type ExperiencePlace = {
   placeId: number;
@@ -17,7 +18,7 @@ export type ExperienceManifest = {
   places: Record<string, ExperiencePlace>;
 };
 
-export type ActiveExperiencePlace = {
+type ActiveExperiencePlace = {
   alias: string;
   manifest: ExperienceManifest;
   place: ExperiencePlace;
@@ -26,11 +27,6 @@ export type ActiveExperiencePlace = {
 };
 
 const activePlaces = new Map<string, string>();
-
-function rootKey(projectRoot: string): string {
-  const resolved = path.resolve(projectRoot);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
 
 function validInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -223,7 +219,7 @@ export function writeExperienceManifest(projectRoot: string, manifest: Experienc
 }
 
 export function setActiveExperiencePlace(projectRoot: string, alias: string | undefined): void {
-  const key = rootKey(projectRoot);
+  const key = filesystemPathKey(projectRoot);
   if (alias) {
     activePlaces.set(key, alias);
   } else {
@@ -232,7 +228,7 @@ export function setActiveExperiencePlace(projectRoot: string, alias: string | un
 }
 
 export function activeExperienceAlias(projectRoot: string): string | undefined {
-  return activePlaces.get(rootKey(projectRoot));
+  return activePlaces.get(filesystemPathKey(projectRoot));
 }
 
 export function resolveActiveExperiencePlace(projectRoot: string): ActiveExperiencePlace | undefined {
@@ -242,6 +238,17 @@ export function resolveActiveExperiencePlace(projectRoot: string): ActiveExperie
   }
   const selected = activeExperienceAlias(projectRoot);
   const alias = selected && manifest.places[selected] ? selected : manifest.startPlace;
+  return resolveExperiencePlaceByAlias(projectRoot, alias, manifest);
+}
+
+export function resolveExperiencePlaceByAlias(
+  projectRoot: string,
+  alias: string,
+  manifest = readExperienceManifest(projectRoot),
+): ActiveExperiencePlace {
+  if (!manifest || !manifest.places[alias]) {
+    throw new Error(`Place alias '${alias}' is not configured.`);
+  }
   const place = manifest.places[alias];
   const selector = manifest.gameId > 0 && place.placeId > 0
     ? `${manifest.gameId}:${place.placeId}`

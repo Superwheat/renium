@@ -3,7 +3,6 @@ import { test } from "node:test";
 
 import {
   buildCommitMessage,
-  defaultGitSyncScope,
   nameStatusAffectedPaths,
   parseAheadBehind,
   parseNameStatusZ,
@@ -105,11 +104,6 @@ test("buildCommitMessage expands Renium Git sync placeholders", () => {
   const message = buildCommitMessage("Sync ${branch} on ${date} at ${datetime}", "feature/git-sync");
   assert.match(message, /^Sync feature\/git-sync on \d{4}-\d{2}-\d{2} at \d{4}-\d{2}-\d{2}T/);
   assert.doesNotMatch(message, /\$\{/);
-});
-
-test("defaultGitSyncScope targets the configured source root", () => {
-  assert.equal(defaultGitSyncScope("C:/repo", "C:/repo"), "src");
-  assert.equal(defaultGitSyncScope("C:/repo", "C:/repo/place", "game"), "place/game");
 });
 
 test("Git commit and push only pulls Studio when configured or selected", () => {

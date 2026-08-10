@@ -5,7 +5,6 @@ local MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 local MAX_RAW_CHUNK_BYTES = 8 * 1024 * 1024
 
 local RAW_CHUNK_METHODS = {
-	getInstanceBatchChunk = true,
 	getInstanceBatchCompactChunk = true,
 	getEditorBinaryOverlayChunk = true,
 	readEditorBinaryExport = true,
@@ -18,18 +17,14 @@ local RAW_CHUNK_METHODS = {
 }
 
 function BridgeTransport.sendEnvelope(client, envelope)
-	local ok, encoded = pcall(function()
-		return HttpService:JSONEncode(envelope)
-	end)
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, envelope)
 	if not ok then
 		return false, "Failed to encode bridge response"
 	end
 	if #encoded > MAX_RESPONSE_BYTES then
 		return false, "Bridge response exceeds safe size limit"
 	end
-	local sent, sendErr = pcall(function()
-		client:Send(encoded)
-	end)
+	local sent, sendErr = pcall(client.Send, client, encoded)
 	return sent, sendErr
 end
 
@@ -60,9 +55,7 @@ local function sendRawChunkResponse(client, id, result, serverMs)
 	if #payload > MAX_RAW_CHUNK_BYTES then
 		return false, ("Bridge chunk exceeds safe size limit (%d bytes; maximum is %d)"):format(#payload, MAX_RAW_CHUNK_BYTES)
 	end
-	local sent, sendErr = pcall(function()
-		client:Send(header .. "\n" .. payload)
-	end)
+	local sent, sendErr = pcall(client.Send, client, header .. "\n" .. payload)
 	return sent, sendErr
 end
 

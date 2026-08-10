@@ -10,6 +10,49 @@ const GENERATED_STUDIO_API_SCHEMA_FILE_NAME = "BridgeStudioApiSchema.module.lua"
 const GENERATED_CLASS_LIST_FILE_NAME = "robloxClasses.ts";
 const BLOCKED_TAGS = new Set(["ReadOnly", "Hidden", "Deprecated", "NotScriptable", "NotBrowsable", "WriteOnly"]);
 const ENGINE_MANAGED_TYPES = new Set(["UniqueId", "SecurityCapabilities"]);
+const STUDIO_SCHEMA_RBX_DOM_TYPES = new Set([
+  "Bool",
+  "Int32",
+  "Int64",
+  "Float32",
+  "Float64",
+  "String",
+  "BinaryString",
+  "ContentId",
+  "Ref",
+  "Vector2",
+  "Vector3",
+  "UDim",
+  "UDim2",
+  "Color3",
+  "Color3uint8",
+  "ColorSequence",
+  "NumberRange",
+  "NumberSequence",
+  "PhysicalProperties",
+  "CFrame",
+  "OptionalCFrame",
+  "Rect",
+  "Font",
+  "BrickColor",
+  "Axes",
+  "Faces",
+  "Ray",
+]);
+const VALUE_INSTANCE_TYPES = new Set([
+  "BinaryStringValue",
+  "BoolValue",
+  "BrickColorValue",
+  "CFrameValue",
+  "Color3Value",
+  "DoubleConstrainedValue",
+  "IntConstrainedValue",
+  "IntValue",
+  "NumberValue",
+  "ObjectValue",
+  "StringValue",
+  "Vector3Value",
+]);
 const ALLOWED_WRITE_SECURITY = new Set(["None", "PluginSecurity"]);
 const MODEL_PIVOT_CLASSES = new Set(["Model", "WorldModel", "Workspace"]);
 const LIGHTING_HIDDEN_STUDIO_PROPERTIES = new Set([
@@ -969,19 +1012,142 @@ function writeRobloxClassListModule(extensionRoot, classes) {
   return { outputPath, classCount: classNames.length };
 }
 
+function hasSerializingAlias(property) {
+  const serialization = property?.Kind?.Canonical?.Serialization;
+  return Boolean(serialization &&
+    typeof serialization === "object" &&
+    !Array.isArray(serialization) &&
+    typeof serialization.SerializesAs === "string" &&
+    serialization.SerializesAs !== "");
+}
+
+function isRbxDomStudioSchemaProperty(classes, className, propertyName, property) {
+  if (propertyName.toLowerCase() === "source" || propertyName.toLowerCase() === "robloxlocked") {
+    return false;
+  }
+  const kind = property?.Kind;
+  if (!kind || typeof kind !== "object" || Array.isArray(kind)) {
+    return false;
+  }
+  if (kind.Alias && typeof kind.Alias === "object" && !Array.isArray(kind.Alias)) {
+    return false;
+  }
+  const canonical = kind.Canonical;
+  if (!canonical || typeof canonical !== "object" || Array.isArray(canonical)) {
+    return false;
+  }
+  const tags = new Set(safeArray(property?.Tags).map(String));
+  if (
+    tags.has("Hidden") ||
+    tags.has("Deprecated") ||
+    tags.has("NotBrowsable") ||
+    tags.has("WriteOnly") ||
+    (tags.has("ReadOnly") && !hasSerializingAlias(property))
+  ) {
+    return false;
+  }
+  if (canonical.Serialization === "DoesNotSerialize") {
+    return false;
+  }
+  const dataType = safeObject(property?.DataType);
+  if (ENGINE_MANAGED_TYPES.has(dataType.Value)) {
+    return false;
+  }
+  if (dataType.Value === "Ref" && classHasTag(classes, className, "Service")) {
+    return false;
+  }
+  return typeof dataType.Enum === "string" || STUDIO_SCHEMA_RBX_DOM_TYPES.has(dataType.Value);
+}
+
+function rbxDomStudioSchemaNames(database) {
+  const classes = safeObject(database?.Classes);
+  const memo = new Map();
+  const visiting = new Set();
+
+  function classIsA(className, ancestorName) {
+    const seen = new Set();
+    let current = className;
+    while (current && !seen.has(current)) {
+      if (current === ancestorName) {
+        return true;
+      }
+      seen.add(current);
+      current = classes[current]?.Superclass;
+    }
+    return false;
+  }
+
+  function inheritedProperty(className, propertyName) {
+    const seen = new Set();
+    let current = className;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const property = safeObject(classes[current]?.Properties)[propertyName];
+      if (property) {
+        return property;
+      }
+      current = classes[current]?.Superclass;
+    }
+    return undefined;
+  }
+
+  function collect(className) {
+    const cached = memo.get(className);
+    if (cached) {
+      return cached;
+    }
+    if (visiting.has(className)) {
+      return new Set();
+    }
+    visiting.add(className);
+    const classInfo = classes[className];
+    const names = classInfo?.Superclass ? new Set(collect(classInfo.Superclass)) : new Set();
+    for (const [propertyName, property] of Object.entries(safeObject(classInfo?.Properties))) {
+      if (isRbxDomStudioSchemaProperty(classes, className, propertyName, property)) {
+        names.add(propertyName.toLowerCase());
+      }
+    }
+    if (classIsA(className, "TriangleMeshPart") && inheritedProperty(className, "MeshSize")?.DataType?.Value === "Vector3") {
+      names.add("meshsize");
+    }
+    if (VALUE_INSTANCE_TYPES.has(className)) {
+      names.add("value");
+    }
+    if (className === "Model" || className === "WorldModel") {
+      names.delete("worldpivotdata");
+      names.add("worldpivot");
+    }
+    visiting.delete(className);
+    memo.set(className, names);
+    return names;
+  }
+
+  for (const className of Object.keys(classes)) {
+    collect(className);
+  }
+  return memo;
+}
+
 function writeStudioApiSchemaModule(repoRoot, generatedClasses) {
   const pluginRoot = path.join(repoRoot, "tools", "plugin_ws_bridge");
   if (!fs.existsSync(pluginRoot)) {
     return undefined;
   }
+  const databasePath = path.join(pluginRoot, "rbx_dom_lua", "database.json");
+  const bundledProperties = rbxDomStudioSchemaNames(JSON.parse(fs.readFileSync(databasePath, "utf8")));
   const outputPath = path.join(pluginRoot, GENERATED_STUDIO_API_SCHEMA_FILE_NAME);
   const lines = [
     "return {",
   ];
   for (const className of Object.keys(generatedClasses).sort((a, b) => a.localeCompare(b))) {
     const properties = generatedClasses[className];
+    const bundledClassProperties = bundledProperties.get(className) ?? new Set();
     const entries = Object.entries(properties)
-      .filter(([, info]) => info.writable !== false && typeof info.type === "string" && info.type !== "unknown")
+      .filter(([propertyName, info]) =>
+        info.writable !== false &&
+        typeof info.type === "string" &&
+        info.type !== "unknown" &&
+        !bundledClassProperties.has(propertyName.toLowerCase()))
       .sort(([aName, aInfo], [bName, bInfo]) => {
         const categorySort = String(aInfo.category).localeCompare(String(bInfo.category));
         return categorySort || Number(aInfo.order ?? 0) - Number(bInfo.order ?? 0) || aName.localeCompare(bName);

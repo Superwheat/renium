@@ -26,11 +26,6 @@ where
 }
 
 #[cfg(windows)]
-pub fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
-    platform::pid_for_local_tcp_port(port)
-}
-
-#[cfg(windows)]
 pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
     platform::process_executable_path(pid)
 }
@@ -91,10 +86,8 @@ pub fn post_key(window: &StudioWindow, key: &KeySpec, hold_ms: u64) -> Result<()
 }
 
 pub struct KeySpec {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub windows_vk: u16,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub mac_keycode: u16,
+    #[cfg(any(windows, target_os = "macos"))]
+    platform_code: u16,
     pub name: &'static str,
 }
 
@@ -126,9 +119,11 @@ pub fn resolve_key(name: &str) -> Result<KeySpec> {
         }
     };
     match entry {
-        Some((vk, mac, canonical)) => Ok(KeySpec {
-            windows_vk: vk,
-            mac_keycode: mac,
+        Some((_windows_vk, _mac_keycode, canonical)) => Ok(KeySpec {
+            #[cfg(windows)]
+            platform_code: _windows_vk,
+            #[cfg(target_os = "macos")]
+            platform_code: _mac_keycode,
             name: canonical,
         }),
         None => bail!(
@@ -164,7 +159,7 @@ fn mac_digit_keycode(ch: u8) -> u16 {
     CODES[(ch - b'0') as usize]
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
     use anyhow::Context;
     let file = std::fs::File::create(path)
@@ -597,51 +592,6 @@ mod platform {
         different * 10_000 <= a.len() / 4
     }
 
-    pub fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
-        use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-            TCP_TABLE_OWNER_PID_ALL,
-        };
-        const AF_INET: u32 = 2;
-        unsafe {
-            let mut size = 0u32;
-            GetExtendedTcpTable(
-                std::ptr::null_mut(),
-                &mut size,
-                0,
-                AF_INET,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            );
-            if size == 0 {
-                bail!("GetExtendedTcpTable returned no table size");
-            }
-            let mut buffer = vec![0u8; size as usize];
-            let status = GetExtendedTcpTable(
-                buffer.as_mut_ptr() as *mut _,
-                &mut size,
-                0,
-                AF_INET,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            );
-            if status != 0 {
-                bail!("GetExtendedTcpTable failed with status {status}");
-            }
-            let table = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
-            let count = (*table).dwNumEntries as usize;
-            let rows = (*table).table.as_ptr();
-            for index in 0..count {
-                let row: &MIB_TCPROW_OWNER_PID = &*rows.add(index);
-                let local_port = u16::from_be((row.dwLocalPort & 0xFFFF) as u16);
-                if local_port == port {
-                    return Ok(row.dwOwningPid);
-                }
-            }
-        }
-        bail!("No TCP connection with local port {port} found")
-    }
-
     fn windows_for_pid(pid: u32) -> Vec<(isize, String)> {
         let mut state = EnumTopState {
             pids: vec![pid],
@@ -977,8 +927,8 @@ mod platform {
     }
 
     pub fn post_key(handle: &WindowHandle, key: &super::KeySpec, hold_ms: u64) -> Result<()> {
-        let vk = key.windows_vk as usize;
-        let scan = unsafe { MapVirtualKeyW(key.windows_vk as u32, MAPVK_VK_TO_VSC) } as usize;
+        let vk = key.platform_code as usize;
+        let scan = unsafe { MapVirtualKeyW(key.platform_code as u32, MAPVK_VK_TO_VSC) } as usize;
         let down_lparam = (1usize | (scan << 16)) as isize as LPARAM;
         let up_lparam = (1usize | (scan << 16) | (1 << 30) | (1 << 31)) as isize as LPARAM;
         post(handle.viewport, WM_KEYDOWN, vk as WPARAM, down_lparam)?;
@@ -1141,99 +1091,71 @@ mod platform {
         }
     }
 
-    pub fn frontmost_studio_pid() -> Option<u32> {
+    struct WindowRecord {
+        owner: String,
+        pid: i32,
+        window_number: u32,
+        rect: CGRect,
+    }
+
+    fn cf_number_i32(value: CFTypeRef) -> Option<i32> {
+        if value.is_null() {
+            return None;
+        }
+        let mut number = 0;
         unsafe {
-            let list = CGWindowListCopyWindowInfo(
-                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
-                0,
-            );
-            if list.is_null() {
-                return None;
-            }
-            let owner_name_key = cf_string("kCGWindowOwnerName");
-            let owner_pid_key = cf_string("kCGWindowOwnerPID");
-            let bounds_key = cf_string("kCGWindowBounds");
-            let layer_key = cf_string("kCGWindowLayer");
-            let mut result = None;
-            let count = CFArrayGetCount(list);
-            for index in 0..count {
-                let dict = CFArrayGetValueAtIndex(list, index) as CFDictionaryRef;
-                if dict.is_null() {
-                    continue;
-                }
-                let layer_value = CFDictionaryGetValue(dict, layer_key);
-                let mut layer: i32 = -1;
-                if layer_value.is_null()
-                    || !CFNumberGetValue(
-                        layer_value,
-                        K_CF_NUMBER_INT_TYPE,
-                        &mut layer as *mut i32 as *mut c_void,
-                    )
-                    || layer != 0
-                {
-                    continue;
-                }
-                let bounds_value = CFDictionaryGetValue(dict, bounds_key) as CFDictionaryRef;
-                if bounds_value.is_null() {
-                    continue;
-                }
-                let mut rect = CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                };
-                if !CGRectMakeWithDictionaryRepresentation(bounds_value, &mut rect)
-                    || rect.size.width < 160.0
-                    || rect.size.height < 120.0
-                {
-                    continue;
-                }
-                let owner_value = CFDictionaryGetValue(dict, owner_name_key);
-                if owner_value.is_null() {
-                    continue;
-                }
-                let mut owner_buffer = [0u8; 256];
-                if !CFStringGetCString(
-                    owner_value,
-                    owner_buffer.as_mut_ptr(),
-                    owner_buffer.len() as isize,
-                    K_CF_STRING_ENCODING_UTF8,
-                ) {
-                    continue;
-                }
-                let owner_len = owner_buffer
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .unwrap_or(owner_buffer.len());
-                let owner = String::from_utf8_lossy(&owner_buffer[..owner_len]);
-                if owner.contains("RobloxStudio") || owner.contains("Roblox Studio") {
-                    let pid_value = CFDictionaryGetValue(dict, owner_pid_key);
-                    let mut pid: i32 = 0;
-                    if !pid_value.is_null()
-                        && CFNumberGetValue(
-                            pid_value,
-                            K_CF_NUMBER_INT_TYPE,
-                            &mut pid as *mut i32 as *mut c_void,
-                        )
-                        && pid > 0
-                    {
-                        result = Some(pid as u32);
-                    }
-                }
-                break;
-            }
-            CFRelease(list);
-            CFRelease(owner_name_key);
-            CFRelease(owner_pid_key);
-            CFRelease(bounds_key);
-            CFRelease(layer_key);
-            result
+            CFNumberGetValue(
+                value,
+                K_CF_NUMBER_INT_TYPE,
+                (&raw mut number).cast::<c_void>(),
+            )
+            .then_some(number)
         }
     }
 
-    pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {
+    fn cf_string_value(value: CFTypeRef) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut bytes = [0u8; 256];
+        unsafe {
+            if !CFStringGetCString(
+                value,
+                bytes.as_mut_ptr(),
+                bytes.len() as isize,
+                K_CF_STRING_ENCODING_UTF8,
+            ) {
+                return None;
+            }
+        }
+        let length = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        Some(String::from_utf8_lossy(&bytes[..length]).into_owned())
+    }
+
+    fn cf_rect(value: CFTypeRef) -> Option<CGRect> {
+        if value.is_null() {
+            return None;
+        }
+        let mut rect = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        unsafe {
+            CGRectMakeWithDictionaryRepresentation(value.cast(), &raw mut rect).then_some(rect)
+        }
+    }
+
+    fn is_studio_owner(owner: &str) -> bool {
+        owner.contains("RobloxStudio") || owner.contains("Roblox Studio")
+    }
+
+    fn studio_window_records() -> Result<Vec<WindowRecord>> {
         unsafe {
             let list = CGWindowListCopyWindowInfo(
                 K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
@@ -1247,93 +1169,31 @@ mod platform {
             let bounds_key = cf_string("kCGWindowBounds");
             let layer_key = cf_string("kCGWindowLayer");
             let number_key = cf_string("kCGWindowNumber");
-
-            let mut windows = Vec::new();
-            let count = CFArrayGetCount(list);
-            for index in 0..count {
+            let mut records = Vec::new();
+            for index in 0..CFArrayGetCount(list) {
                 let dict = CFArrayGetValueAtIndex(list, index) as CFDictionaryRef;
-                if dict.is_null() {
+                if dict.is_null() || cf_number_i32(CFDictionaryGetValue(dict, layer_key)) != Some(0)
+                {
                     continue;
                 }
-                let layer_value = CFDictionaryGetValue(dict, layer_key);
-                let mut layer: i32 = -1;
-                if !layer_value.is_null() {
-                    CFNumberGetValue(
-                        layer_value,
-                        K_CF_NUMBER_INT_TYPE,
-                        &mut layer as *mut i32 as *mut c_void,
-                    );
-                }
-                if layer != 0 {
+                let Some(owner) = cf_string_value(CFDictionaryGetValue(dict, owner_name_key))
+                else {
                     continue;
-                }
-                let name_value = CFDictionaryGetValue(dict, owner_name_key);
-                if name_value.is_null() {
-                    continue;
-                }
-                let mut name_buffer = [0u8; 256];
-                if !CFStringGetCString(
-                    name_value,
-                    name_buffer.as_mut_ptr(),
-                    name_buffer.len() as isize,
-                    K_CF_STRING_ENCODING_UTF8,
-                ) {
-                    continue;
-                }
-                let name_len = name_buffer
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(name_buffer.len());
-                let owner = String::from_utf8_lossy(&name_buffer[..name_len]).to_string();
-                if !owner.contains("RobloxStudio") {
-                    continue;
-                }
-                let pid_value = CFDictionaryGetValue(dict, owner_pid_key);
-                if pid_value.is_null() {
-                    continue;
-                }
-                let mut pid: i32 = 0;
-                if !CFNumberGetValue(
-                    pid_value,
-                    K_CF_NUMBER_INT_TYPE,
-                    &mut pid as *mut i32 as *mut c_void,
-                ) {
-                    continue;
-                }
-                let bounds_value = CFDictionaryGetValue(dict, bounds_key) as CFDictionaryRef;
-                if bounds_value.is_null() {
-                    continue;
-                }
-                let mut rect = CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize {
-                        width: 0.0,
-                        height: 0.0,
-                    },
                 };
-                if !CGRectMakeWithDictionaryRepresentation(bounds_value, &mut rect) {
+                let Some(pid) = cf_number_i32(CFDictionaryGetValue(dict, owner_pid_key)) else {
                     continue;
-                }
-                if rect.size.width < 320.0 || rect.size.height < 240.0 {
+                };
+                let Some(rect) = cf_rect(CFDictionaryGetValue(dict, bounds_key)) else {
                     continue;
-                }
-                let number_value = CFDictionaryGetValue(dict, number_key);
-                let mut window_number: i32 = 0;
-                if !number_value.is_null() {
-                    CFNumberGetValue(
-                        number_value,
-                        K_CF_NUMBER_INT_TYPE,
-                        &mut window_number as *mut i32 as *mut c_void,
-                    );
-                }
-                windows.push(StudioWindow {
-                    label: format!("pid {pid}: {owner}"),
-                    handle: WindowHandle {
-                        pid,
-                        window_number: window_number as u32,
-                        origin_x: rect.origin.x,
-                        origin_y: rect.origin.y,
-                    },
+                };
+                let window_number = cf_number_i32(CFDictionaryGetValue(dict, number_key))
+                    .and_then(|number| u32::try_from(number).ok())
+                    .unwrap_or(0);
+                records.push(WindowRecord {
+                    owner,
+                    pid,
+                    window_number,
+                    rect,
                 });
             }
             CFRelease(list);
@@ -1342,13 +1202,51 @@ mod platform {
             CFRelease(bounds_key);
             CFRelease(layer_key);
             CFRelease(number_key);
-
-            if windows.is_empty() {
-                bail!("No visible Roblox Studio windows found");
-            }
-            windows.sort_by_key(|window| window.handle.pid);
-            Ok(windows)
+            Ok(records)
         }
+    }
+
+    pub fn frontmost_studio_pid() -> Option<u32> {
+        studio_window_records()
+            .ok()?
+            .into_iter()
+            .find_map(|record| {
+                if record.pid > 0
+                    && record.rect.size.width >= 160.0
+                    && record.rect.size.height >= 120.0
+                    && is_studio_owner(&record.owner)
+                {
+                    u32::try_from(record.pid).ok()
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {
+        let mut windows = studio_window_records()?
+            .into_iter()
+            .filter(|record| {
+                record.pid > 0
+                    && record.rect.size.width >= 320.0
+                    && record.rect.size.height >= 240.0
+                    && is_studio_owner(&record.owner)
+            })
+            .map(|record| StudioWindow {
+                label: format!("pid {}: {}", record.pid, record.owner),
+                handle: WindowHandle {
+                    pid: record.pid,
+                    window_number: record.window_number,
+                    origin_x: record.rect.origin.x,
+                    origin_y: record.rect.origin.y,
+                },
+            })
+            .collect::<Vec<_>>();
+        if windows.is_empty() {
+            bail!("No visible Roblox Studio windows found");
+        }
+        windows.sort_by_key(|window| window.handle.pid);
+        Ok(windows)
     }
 
     fn post_mouse_event(handle: &WindowHandle, event_type: u32, button: u32, x: i32, y: i32) {
@@ -1403,7 +1301,7 @@ mod platform {
 
     pub fn post_key(handle: &WindowHandle, key: &super::KeySpec, hold_ms: u64) -> Result<()> {
         unsafe {
-            let down = CGEventCreateKeyboardEvent(std::ptr::null(), key.mac_keycode, true);
+            let down = CGEventCreateKeyboardEvent(std::ptr::null(), key.platform_code, true);
             if down.is_null() {
                 bail!(
                     "CGEventCreateKeyboardEvent failed; grant the Accessibility permission to \
@@ -1413,7 +1311,7 @@ mod platform {
             CGEventPostToPid(handle.pid, down);
             CFRelease(down as CFTypeRef);
             std::thread::sleep(std::time::Duration::from_millis(hold_ms.clamp(10, 2000)));
-            let up = CGEventCreateKeyboardEvent(std::ptr::null(), key.mac_keycode, false);
+            let up = CGEventCreateKeyboardEvent(std::ptr::null(), key.platform_code, false);
             if !up.is_null() {
                 CGEventPostToPid(handle.pid, up);
                 CFRelease(up as CFTypeRef);

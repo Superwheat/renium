@@ -1,5 +1,5 @@
 import * as childProcess from "child_process";
-import * as path from "path";
+
 import {
   projectProcessOwner,
   terminateProcess,
@@ -16,7 +16,7 @@ export type GitRunResult = {
   timedOut: boolean;
 };
 
-export type GitRunOptions = {
+type GitRunOptions = {
   cwd: string;
   gitPath?: string;
   timeoutMs?: number;
@@ -24,7 +24,7 @@ export type GitRunOptions = {
   onOutput?: (stream: "stdout" | "stderr", text: string) => void;
 };
 
-export type GitFileKind =
+type GitFileKind =
   | "added"
   | "copied"
   | "conflicted"
@@ -78,7 +78,7 @@ export function nameStatusAffectedPaths(entries: GitNameStatusEntry[]): string[]
   return paths;
 }
 
-export type GitStatusCounts = {
+type GitStatusCounts = {
   total: number;
   tracked: number;
   staged: number;
@@ -91,12 +91,12 @@ export type GitStatusCounts = {
 
 const UNMERGED_STATUS_PAIRS = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 
-export async function runGit(args: string[], options: GitRunOptions): Promise<GitRunResult> {
+export function runGit(args: string[], options: GitRunOptions): Promise<GitRunResult> {
   const gitPath = options.gitPath?.trim() || "git";
   const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 120_000));
   const outputLimit = 16 * 1024 * 1024;
 
-  return await new Promise<GitRunResult>((resolve, reject) => {
+  return new Promise<GitRunResult>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -202,16 +202,14 @@ export function redactRemoteUrl(value: string): string {
     .replace(/\bx-access-token:[^@\s]+@/gi, "x-access-token:***@");
 }
 
-export function renderGitArgs(args: string[]): string {
+export function renderCommandArgs(args: readonly string[]): string {
   return args
-    .map((arg) => {
-      const redacted = redactRemoteUrl(arg);
-      if (/\s/.test(redacted) || redacted.includes('"')) {
-        return `"${redacted.replaceAll('"', '\\"')}"`;
-      }
-      return redacted;
-    })
+    .map((arg) => /\s|"/.test(arg) ? `"${arg.replaceAll('"', '\\"')}"` : arg)
     .join(" ");
+}
+
+export function renderGitArgs(args: string[]): string {
+  return renderCommandArgs(args.map(redactRemoteUrl));
 }
 
 export function parsePorcelainV1Z(raw: string): GitStatusEntry[] {
@@ -362,12 +360,6 @@ export function buildCommitMessage(template: string, branch: string): string {
     .replaceAll("${date}", date)
     .replaceAll("${datetime}", datetime)
     .replaceAll("${branch}", branch || "HEAD");
-}
-
-export function defaultGitSyncScope(repoRoot: string, projectRoot: string, srcDir = "src"): string {
-  const srcRoot = path.join(projectRoot, srcDir);
-  const relative = path.relative(repoRoot, srcRoot).replaceAll("\\", "/");
-  return relative && relative !== "." ? relative : srcDir.replaceAll("\\", "/");
 }
 
 export function shouldPullFromStudioBeforePush(

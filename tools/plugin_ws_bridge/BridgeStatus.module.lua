@@ -3,7 +3,7 @@ local BridgeStatus = {}
 local function countChannels(channels)
 	local openChannels = 0
 	local connectingChannels = 0
-	for _, channel in ipairs(channels or {}) do
+	for _, channel in ipairs(channels) do
 		if channel.open then
 			openChannels += 1
 		elseif channel.connecting then
@@ -14,19 +14,16 @@ local function countChannels(channels)
 end
 
 local function formatClock(unix)
-	if type(unix) ~= "number" or unix <= 0 then
-		return "--"
-	end
 	return DateTime.fromUnixTimestamp(unix):FormatLocalTime("LTS", "en-us")
 end
 
 function BridgeStatus.view(state)
-	local channels = state.channels or {}
+	local channels = state.channels
 	local openChannels, connectingChannels = countChannels(channels)
-	local editor = state.editorSyncStats or {}
-	local connectionStatus = tostring(state.connectionStatus or "Disconnected")
-	local connectRequested = not not state.connectRequested
-	local pendingEditCount = tonumber(state.pendingEditCount) or 0
+	local editor = state.editorSyncStats
+	local connectionStatus = state.connectionStatus
+	local connectRequested = state.connectRequested
+	local pendingEditCount = state.pendingEditCount
 
 	local mode = if openChannels > 0
 		then "connected"
@@ -41,7 +38,7 @@ function BridgeStatus.view(state)
 		elseif connectionStatus == "Disconnected" or connectionStatus == "Another Renium session is active" then ""
 		else connectionStatus
 
-	local lastSyncUnix = tonumber(editor.lastAtUnix) or 0
+	local lastSyncUnix = editor.lastAtUnix
 	local syncText = if lastSyncUnix > 0
 		then if editor.lastOk == false
 			then "Last sync failed at " .. formatClock(lastSyncUnix)
@@ -49,32 +46,31 @@ function BridgeStatus.view(state)
 		elseif mode == "disconnected" then ""
 		else "Waiting for sync"
 
-	local ports = state.ports or {}
-	local address = tostring(state.host or "127.0.0.1") .. "  " .. table.concat(ports, ", ")
+	local address = state.host .. "  " .. table.concat(state.ports, ", ")
 	local channelsText = ("%d/%d channels open, %d connecting"):format(openChannels, #channels, connectingChannels)
 	local detailLines = {
-		("Renium %s build %s"):format(tostring(state.bridgeVersion or "unknown"), tostring(state.bridgeBuildUnix or "unknown")),
-		("Target %s | Runtime %s"):format(tostring(state.target or "unknown"), tostring(state.runtimeId or "unknown")),
-		("Codec %s"):format(tostring(state.codecVersion or "unknown")),
+		("Renium %s build %s"):format(state.bridgeVersion, state.bridgeBuildUnix),
+		("Target %s | Runtime %s"):format(state.target, state.runtimeId),
+		("Codec %s"):format(state.codecVersion),
 		channelsText,
 		("Pending Studio edits %d"):format(pendingEditCount),
-		("Pending reviews %d"):format(tonumber(state.pendingReviewCount) or 0),
+		("Pending reviews %d"):format(state.pendingReviewCount),
 	}
 	local statsLines = {
-		("Editor requests %d | Last %.1f ms"):format(tonumber(editor.requests) or 0, tonumber(editor.lastMs) or 0),
+		("Editor requests %d | Last %.1f ms"):format(editor.requests, editor.lastMs),
 		("Source +%d ~%d -%d | Instances +%d ~%d -%d"):format(
-			tonumber(editor.sourceCreated) or 0,
-			tonumber(editor.sourceUpdated) or 0,
-			tonumber(editor.sourceDeleted) or 0,
-			tonumber(editor.instanceCreated) or 0,
-			tonumber(editor.instanceReplaced) or 0,
-			tonumber(editor.instanceDeleted) or 0
+			editor.sourceCreated,
+			editor.sourceUpdated,
+			editor.sourceDeleted,
+			editor.instanceCreated,
+			editor.instanceReplaced,
+			editor.instanceDeleted
 		),
 		("Properties %d | Attributes %d | No-op %d | Errors %d"):format(
-			tonumber(editor.propertyUpdated) or 0,
-			tonumber(editor.attributeUpdated) or 0,
-			tonumber(editor.noops) or 0,
-			tonumber(editor.errors) or 0
+			editor.propertyUpdated,
+			editor.attributeUpdated,
+			editor.noops,
+			editor.errors
 		),
 	}
 
@@ -89,20 +85,6 @@ function BridgeStatus.view(state)
 		detailText = table.concat(detailLines, "\n"),
 		statsText = table.concat(statsLines, "\n"),
 	}
-end
-
-function BridgeStatus.render(state)
-	local view = BridgeStatus.view(state)
-	return table.concat({
-		view.title,
-		view.subtitle,
-		view.syncText,
-		view.address,
-		"",
-		view.detailText,
-		"",
-		view.statsText,
-	}, "\n")
 end
 
 return BridgeStatus

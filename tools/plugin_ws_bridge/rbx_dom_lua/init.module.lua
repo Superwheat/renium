@@ -5,42 +5,8 @@ local PropertyDescriptor = require(script.PropertyDescriptor)
 local referencePropertiesByClass = {}
 local objectContentPropertiesByClass = {}
 
-local function getReferencePropertyNames(className)
-	local cached = referencePropertiesByClass[className]
-	if cached ~= nil then
-		return cached
-	end
-	local names = {}
-	local seen = {}
-	local currentClassName = className
-	repeat
-		local currentClass = database.Classes[currentClassName]
-		if currentClass == nil then
-			break
-		end
-		for propertyName, propertyData in pairs(currentClass.Properties) do
-			if seen[propertyName] == nil then
-				seen[propertyName] = true
-				local scriptability = propertyData.Scriptability
-				if
-					propertyName ~= "Parent"
-					and propertyData.Kind.Canonical ~= nil
-					and propertyData.DataType.Value == "Ref"
-					and (scriptability == "ReadWrite" or scriptability == "Custom")
-				then
-					names[#names + 1] = propertyName
-				end
-			end
-		end
-		currentClassName = currentClass.Superclass
-	until currentClassName == nil
-	table.sort(names)
-	referencePropertiesByClass[className] = names
-	return names
-end
-
-local function getObjectContentPropertyNames(className)
-	local cached = objectContentPropertiesByClass[className]
+local function getPropertyNames(className, cache, dataType, skipParent)
+	local cached = cache[className]
 	if cached ~= nil then
 		return cached
 	end
@@ -58,8 +24,9 @@ local function getObjectContentPropertyNames(className)
 				local scriptability = propertyData.Scriptability
 				if
 					propertyData.Kind.Canonical ~= nil
-					and propertyData.DataType.Value == "Content"
+					and propertyData.DataType.Value == dataType
 					and (scriptability == "ReadWrite" or scriptability == "Custom")
+					and (not skipParent or propertyName ~= "Parent")
 				then
 					names[#names + 1] = propertyName
 				end
@@ -68,8 +35,16 @@ local function getObjectContentPropertyNames(className)
 		currentClassName = currentClass.Superclass
 	until currentClassName == nil
 	table.sort(names)
-	objectContentPropertiesByClass[className] = names
+	cache[className] = names
 	return names
+end
+
+local function getReferencePropertyNames(className)
+	return getPropertyNames(className, referencePropertiesByClass, "Ref", true)
+end
+
+local function getObjectContentPropertyNames(className)
+	return getPropertyNames(className, objectContentPropertiesByClass, "Content", false)
 end
 
 local function findCanonicalPropertyDescriptor(className, propertyName)

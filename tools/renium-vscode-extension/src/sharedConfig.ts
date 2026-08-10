@@ -9,6 +9,51 @@ const cache = new Map<string, { fingerprint: string; value: SharedConfig }>();
 const sourceRootCache = new Map<string, { fingerprint: string; value: string }>();
 const scriptNamingCache = new Map<string, { fingerprint: string; value: ProjectScriptNaming }>();
 const projectSourceGraphCache = new Map<string, ProjectSourceGraph>();
+const STRING_CONFIG_KEYS = new Set([
+  "projectRoot", "snapshotDir", "cliPath",
+  "bridgePorts", "place", "daemon", "gitSync.gitPath", "gitSync.remote", "gitSync.branch",
+  "gitSync.commitMessageTemplate", "wallySync.wallyPath",
+  "wallySync.packagesDir", "wallySync.targetService", "wallySync.targetName",
+  "wallySync.serverPackagesDir", "wallySync.serverTargetService", "wallySync.serverTargetName",
+  "wallySync.devPackagesDir", "wallySync.devTargetService", "wallySync.devTargetName",
+  "wallySync.realms",
+  "link.manifest", "link.folder", "link.cacheDir", "link.gitPath",
+]);
+const BOOLEAN_CONFIG_KEYS = new Set([
+  "yes", "backtrace", "verifyEditorPushSources", "adaptiveThrottle", "noUpdateEditorIcons",
+  "autoSyncOnSave", "editorLiveSyncEnabled",
+  "studioLiveSyncEnabled", "liveSync.overridePackages", "runImport", "modifiedDefaultBypass",
+  "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",
+  "gitSync.requireCleanWorktreeBeforePull", "wallySync.runInstall", "link.offline",
+  "link.autoApplyOnManifestChange",
+]);
+const INTEGER_CONFIG_KEYS = new Set([
+  "schemaVersion", "sourceWorkers", "instanceWorkers", "importWorkers", "chunkSize",
+  "snapshotInstanceChunkSize", "autoSyncDebounceMs", "studioLiveSyncPollMs",
+  "liveSync.changesThreshold", "liveSync.diffLinesLimit",
+]);
+const NUMBER_CONFIG_KEYS = new Set([
+  "bridgeWaitSeconds", "wsWaitSeconds", "progressHeartbeatSeconds",
+  "gitSync.timeoutSeconds",
+]);
+const STRING_ARRAY_CONFIG_KEYS = new Set(["services", "gitSync.stagePaths"]);
+const ENUM_CONFIG_KEYS = new Map<string, readonly string[]>([
+  ["importMode", ["direct", "snapshot"]],
+  ["performanceMode", ["throughput", "balanced", "smooth"]],
+  ["logLevel", ["off", "error", "warn", "info", "debug", "trace"]],
+  ["color", ["auto", "always", "never"]],
+  ["outputMode", ["text", "json", "pretty"]],
+  ["liveSync.initialSyncPriority", ["studio", "editor", "none"]],
+  ["liveSync.displayPrompts", ["always", "initial", "never"]],
+  ["liveSync.conflictResolution", ["prompt", "filesystem", "studio"]],
+  ["gitSync.pullFromStudioBeforePush", ["ask", "always", "never"]],
+  ["gitSync.applyPulledChangesToStudio", ["ask", "always", "never"]],
+  ["wallySync.applyToStudio", ["ask", "always", "never"]],
+  ["link.applyToStudio", ["ask", "always", "never"]],
+  ["gitSync.stageMode", ["tracked", "configuredPaths"]],
+  ["gitSync.outputBehavior", ["onStart", "onError", "silent"]],
+]);
+const CONFIG_GROUP_KEYS = new Set(["gitSync", "wallySync", "liveSync", "link"]);
 
 function fileContentFingerprint(filePath: string): string {
   try {
@@ -29,12 +74,27 @@ export type ProjectSourceGraph = {
   owners: ProjectSourceOwner[];
 };
 
+function cloneProjectSourceGraph(graph: ProjectSourceGraph): ProjectSourceGraph {
+  return {
+    roots: [...graph.roots],
+    locations: [...graph.locations],
+    files: [...graph.files],
+    directories: [...graph.directories],
+    manifests: [...graph.manifests],
+    ignored: [...graph.ignored],
+    owners: graph.owners.map((owner) => ({
+      location: owner.location,
+      target: [...owner.target],
+    })),
+  };
+}
+
 export type ProjectSourceOwner = {
   location: string;
   target: string[];
 };
 
-export type ProjectScriptNaming = {
+type ProjectScriptNaming = {
   extension: "preserve" | "luau" | "lua";
   serverSuffix: string;
   clientSuffix: string;
@@ -43,7 +103,7 @@ export type ProjectScriptNaming = {
   clientRunContextSuffix: string;
 };
 
-export type ProjectScriptIdentity = {
+type ProjectScriptIdentity = {
   className: "Script" | "LocalScript" | "ModuleScript";
   leafName?: string;
   runContext?: "Client" | "Plugin" | "Legacy";
@@ -183,10 +243,6 @@ export function loadProjectSourceRoot(projectRoot: string): string {
   return value;
 }
 
-export function loadProjectSourceRoots(projectRoot: string): string[] {
-  return [...loadProjectSourceGraph(projectRoot).roots];
-}
-
 export function loadProjectSourceLocations(projectRoot: string): string[] {
   return [...loadProjectSourceGraph(projectRoot).locations];
 }
@@ -195,18 +251,7 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
   const key = path.resolve(projectRoot);
   const cached = projectSourceGraphCache.get(key);
   if (cached) {
-    return {
-      roots: [...cached.roots],
-      locations: [...cached.locations],
-      files: [...cached.files],
-      directories: [...cached.directories],
-      manifests: [...cached.manifests],
-      ignored: [...cached.ignored],
-      owners: cached.owners.map((owner) => ({
-        location: owner.location,
-        target: [...owner.target],
-      })),
-    };
+    return cloneProjectSourceGraph(cached);
   }
   const roots = new Set<string>();
   const locations = new Set<string>();
@@ -378,18 +423,7 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
       || JSON.stringify(left.target).localeCompare(JSON.stringify(right.target))),
   };
   projectSourceGraphCache.set(key, value);
-  return {
-    roots: [...value.roots],
-    locations: [...value.locations],
-    files: [...value.files],
-    directories: [...value.directories],
-    manifests: [...value.manifests],
-    ignored: [...value.ignored],
-    owners: value.owners.map((owner) => ({
-      location: owner.location,
-      target: [...owner.target],
-    })),
-  };
+  return cloneProjectSourceGraph(value);
 }
 
 export function invalidateProjectSourceGraph(projectRoot?: string): void {
@@ -423,7 +457,7 @@ export function invalidateProjectSourceGraph(projectRoot?: string): void {
   }
 }
 
-export function loadProjectScriptNaming(projectRoot: string): ProjectScriptNaming {
+function loadProjectScriptNaming(projectRoot: string): ProjectScriptNaming {
   const filePath = projectFilePath(projectRoot);
   const fingerprint = fileContentFingerprint(filePath);
   const cached = scriptNamingCache.get(filePath);
@@ -513,78 +547,33 @@ function merge(base: SharedConfig, overlay: SharedConfig): void {
 }
 
 function validateSharedConfig(config: SharedConfig): void {
-  const strings = new Set([
-    "projectRoot", "snapshotDir", "server", "configTomlPath", "exportCliPath", "rustCliPath",
-    "bridgePorts", "place", "daemon", "gitSync.gitPath", "gitSync.remote", "gitSync.branch",
-    "gitSync.commitMessageTemplate", "wallySync.wallyPath", "wallySync.rojoPath",
-    "wallySync.packagesDir", "wallySync.targetService", "wallySync.targetName",
-    "wallySync.serverPackagesDir", "wallySync.serverTargetService", "wallySync.serverTargetName",
-    "wallySync.devPackagesDir", "wallySync.devTargetService", "wallySync.devTargetName",
-    "wallySync.realms",
-    "link.manifest", "link.folder", "link.cacheDir", "link.gitPath",
-  ]);
-  const booleans = new Set([
-    "yes", "backtrace", "usePersistentBridge", "verifyEditorPushSources", "adaptiveThrottle",
-    "noUpdateEditorIcons", "autoSyncOnSave", "editorLiveSyncEnabled", "editorLiveSyncOnStartup",
-    "studioLiveSyncEnabled", "liveSync.overridePackages", "runImport", "modifiedDefaultBypass",
-    "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",
-    "gitSync.requireCleanWorktreeBeforePull", "wallySync.runInstall", "link.offline",
-    "link.autoApplyOnManifestChange",
-  ]);
-  const integers = new Set([
-    "schemaVersion", "sourceWorkers", "instanceWorkers", "importWorkers", "chunkSize",
-    "snapshotInstanceChunkSize", "autoSyncDebounceMs", "studioLiveSyncPollMs",
-    "liveSync.changesThreshold", "liveSync.diffLinesLimit", "benchmarkRuns",
-  ]);
-  const numbers = new Set([
-    "bridgeWaitSeconds", "wsWaitSeconds", "startupWaitSeconds", "progressHeartbeatSeconds",
-    "gitSync.timeoutSeconds",
-  ]);
-  const stringArrays = new Set(["services", "gitSync.stagePaths"]);
-  const enums = new Map<string, readonly string[]>([
-    ["transport", ["ws", "mcp"]],
-    ["importMode", ["direct", "snapshot"]],
-    ["performanceMode", ["throughput", "balanced", "smooth"]],
-    ["logLevel", ["off", "error", "warn", "info", "debug", "trace"]],
-    ["color", ["auto", "always", "never"]],
-    ["outputMode", ["text", "json", "pretty"]],
-    ["liveSync.initialSyncPriority", ["studio", "editor", "none"]],
-    ["liveSync.displayPrompts", ["always", "initial", "never"]],
-    ["liveSync.conflictResolution", ["prompt", "filesystem", "studio"]],
-    ["gitSync.pullFromStudioBeforePush", ["ask", "always", "never"]],
-    ["gitSync.applyPulledChangesToStudio", ["ask", "always", "never"]],
-    ["wallySync.applyToStudio", ["ask", "always", "never"]],
-    ["link.applyToStudio", ["ask", "always", "never"]],
-    ["gitSync.stageMode", ["tracked", "configuredPaths"]],
-    ["gitSync.outputBehavior", ["onStart", "onError", "silent"]],
-  ]);
-  const groups = new Set(["gitSync", "wallySync", "liveSync", "link"]);
   const visit = (value: SharedConfig, prefix: string): void => {
     for (const [key, item] of Object.entries(value)) {
       const dotted = prefix ? `${prefix}.${key}` : key;
-      if (groups.has(dotted)) {
+      const enumValues = ENUM_CONFIG_KEYS.get(dotted);
+      if (CONFIG_GROUP_KEYS.has(dotted)) {
         if (!item || typeof item !== "object" || Array.isArray(item)) {
           throw new Error(`Renium configuration key '${dotted}' must be an object`);
         }
         visit(item as SharedConfig, dotted);
-      } else if (strings.has(dotted)) {
+      } else if (STRING_CONFIG_KEYS.has(dotted)) {
         if (typeof item !== "string") throw new Error(`Renium configuration key '${dotted}' must be a string`);
-      } else if (booleans.has(dotted)) {
+      } else if (BOOLEAN_CONFIG_KEYS.has(dotted)) {
         if (typeof item !== "boolean") throw new Error(`Renium configuration key '${dotted}' must be a boolean`);
-      } else if (integers.has(dotted)) {
+      } else if (INTEGER_CONFIG_KEYS.has(dotted)) {
         if (!Number.isSafeInteger(item) || (dotted === "schemaVersion" && item !== 1)) {
           throw new Error(`Renium configuration key '${dotted}' must be ${dotted === "schemaVersion" ? "the integer 1" : "an integer"}`);
         }
-      } else if (numbers.has(dotted)) {
+      } else if (NUMBER_CONFIG_KEYS.has(dotted)) {
         if (typeof item !== "number" || !Number.isFinite(item)) {
           throw new Error(`Renium configuration key '${dotted}' must be a number`);
         }
-      } else if (stringArrays.has(dotted)) {
+      } else if (STRING_ARRAY_CONFIG_KEYS.has(dotted)) {
         if (!Array.isArray(item) || !item.every((entry) => typeof entry === "string")) {
           throw new Error(`Renium configuration key '${dotted}' must be an array of strings`);
         }
-      } else if (enums.has(dotted)) {
-        if (typeof item !== "string" || !enums.get(dotted)?.includes(item)) {
+      } else if (enumValues) {
+        if (typeof item !== "string" || !enumValues.includes(item)) {
           throw new Error(`Renium configuration key '${dotted}' has an unsupported value`);
         }
       } else {
@@ -595,27 +584,10 @@ function validateSharedConfig(config: SharedConfig): void {
   visit(config, "");
 }
 
-function findAncestor(start: string, marker: string): string | undefined {
+function findAncestor(start: string, markers: readonly string[]): string | undefined {
   let current = path.resolve(start);
   for (;;) {
-    if (fs.existsSync(path.join(current, marker))) {
-      return current;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return undefined;
-    }
-    current = parent;
-  }
-}
-
-function findAncestorWithProject(start: string): string | undefined {
-  let current = path.resolve(start);
-  for (;;) {
-    if (
-      fs.existsSync(path.join(current, "renium.project.jsonc")) ||
-      fs.existsSync(path.join(current, "renium.project.json"))
-    ) {
+    if (markers.some((marker) => fs.existsSync(path.join(current, marker)))) {
       return current;
     }
     const parent = path.dirname(current);
@@ -648,9 +620,10 @@ function userConfigPath(): string {
 }
 
 export function loadSharedConfig(workspaceRoot: string, projectRoot: string): SharedConfig {
-  const workspace = findAncestor(projectRoot, ".git") ?? path.resolve(workspaceRoot);
-  const experience = findAncestor(projectRoot, "renium.experience.json") ?? path.resolve(projectRoot);
-  const place = findAncestorWithProject(projectRoot) ?? path.resolve(projectRoot);
+  const workspace = findAncestor(projectRoot, [".git"]) ?? path.resolve(workspaceRoot);
+  const experience = findAncestor(projectRoot, ["renium.experience.json"]) ?? path.resolve(projectRoot);
+  const place = findAncestor(projectRoot, ["renium.project.jsonc", "renium.project.json"])
+    ?? path.resolve(projectRoot);
   const projectFile = projectFilePath(place);
   const files = [
     userConfigPath(),

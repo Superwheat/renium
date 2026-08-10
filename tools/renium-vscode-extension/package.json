@@ -34,43 +34,11 @@
     "roblox",
     "rojo",
     "argon",
-    "mcp",
     "sync",
     "luau"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:renium.openMenu",
-    "onCommand:renium.installStudioPlugin",
-    "onCommand:renium.createAgentInstructions",
-    "onCommand:renium.openExplorer",
-    "onCommand:renium.managePlaces",
-    "onCommand:renium.pullFromStudio",
-    "onCommand:renium.pushToStudio",
-    "onCommand:renium.exportSnapshots",
-    "onCommand:renium.exportGameFile",
-    "onCommand:renium.syncWallyPackages",
-    "onCommand:renium.startLiveSync",
-    "onCommand:renium.stopLiveSync",
-    "onCommand:renium.retryEditorInitialSync",
-    "onCommand:renium.retryPendingEditorChanges",
-    "onCommand:renium.discardPendingEditorChanges",
-    "onCommand:renium.serve",
-    "onCommand:renium.stopServe",
-    "onCommand:renium.gitSync",
-    "onCommand:renium.fileExplorer.refresh",
-    "onCommand:renium.fileExplorer.openScript",
-    "onCommand:renium.fileExplorer.addInstance",
-    "onCommand:renium.fileExplorer.deleteInstance",
-    "onCommand:renium.fileExplorer.desyncPackageLink",
-    "onCommand:renium.fileExplorer.copyPath",
-    "onCommand:renium.fileExplorer.importModel",
-    "onCommand:renium.fileExplorer.exportModel",
-    "onView:renium.fileExplorer",
-    "onView:renium.properties",
-    "onView:renium.packages",
-    "workspaceContains:tools/renium/Cargo.toml",
-    "onCustomEditor:renium.reniumEditor"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -317,9 +285,6 @@
         "selector": [
           {
             "filenamePattern": "*.renium"
-          },
-          {
-            "filenamePattern": "*.rbsync"
           }
         ],
         "priority": "default"
@@ -474,17 +439,11 @@
     "configuration": {
       "title": "Renium",
       "properties": {
-        "renium.exportCliPath": {
+        "renium.cliPath": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Optional path to the Renium executable used for Studio export and sync. Blank uses the CLI bundled with the extension, then PATH, then legacy project locations."
-        },
-        "renium.rustCliPath": {
-          "type": "string",
-          "default": "",
-          "scope": "resource",
-          "description": "Optional path to the Renium CLI. Blank uses the CLI bundled with the extension, then PATH, then legacy project locations."
+          "description": "Optional path to the Renium CLI. Blank uses the bundled CLI, PATH, or a local project build."
         },
         "renium.projectRoot": {
           "type": "string",
@@ -494,27 +453,8 @@
         },
         "renium.snapshotDir": {
           "type": "string",
-          "default": "snapshots",
+          "default": ".renium/snapshots",
           "description": "Snapshot directory (relative to projectRoot unless absolute)"
-        },
-        "renium.transport": {
-          "type": "string",
-          "enum": [
-            "ws",
-            "mcp"
-          ],
-          "default": "ws",
-          "description": "Transport mode used by the export CLI."
-        },
-        "renium.server": {
-          "type": "string",
-          "default": "Roblox_Studio",
-          "description": "MCP server name from config.toml"
-        },
-        "renium.configTomlPath": {
-          "type": "string",
-          "default": "${userHome}/.codex/config.toml",
-          "description": "Path to config.toml that defines the Roblox MCP server"
         },
         "renium.services": {
           "type": "array",
@@ -534,7 +474,8 @@
             "StarterPack",
             "StarterPlayer",
             "Teams",
-            "SoundService"
+            "SoundService",
+            "VoiceChatService"
           ],
           "description": "Services included when pulling from Studio"
         },
@@ -580,11 +521,6 @@
           "default": "8781,8782",
           "description": "Exactly two distinct WebSocket bridge ports used by the plugin and exporter."
         },
-        "renium.usePersistentBridge": {
-          "type": "boolean",
-          "default": true,
-          "description": "Keep the Rust bridge daemon alive so repeated sync operations reuse the connected Roblox Studio bridge channels."
-        },
         "renium.verifyEditorPushSources": {
           "type": "boolean",
           "default": false,
@@ -615,11 +551,6 @@
           "type": "boolean",
           "default": false,
           "description": "Enable live sync. When false, src changes do not push to Studio and Studio changes do not import into src."
-        },
-        "renium.editorLiveSyncOnStartup": {
-          "type": "boolean",
-          "default": false,
-          "description": "Legacy compatibility setting. Live sync startup is controlled by renium.editorLiveSyncEnabled."
         },
         "renium.studioLiveSyncEnabled": {
           "type": "boolean",
@@ -729,21 +660,10 @@
           "minimum": 2,
           "description": "Heartbeat interval for long-running command progress logs."
         },
-        "renium.benchmarkRuns": {
-          "type": "number",
-          "default": 5,
-          "minimum": 1,
-          "description": "Number of repeated full-sync iterations to run for benchmark mode."
-        },
         "renium.wallySync.wallyPath": {
           "type": "string",
           "default": "wally",
           "description": "Wally executable used by Sync Wally Packages."
-        },
-        "renium.wallySync.rojoPath": {
-          "type": "string",
-          "default": "rojo",
-          "description": "Deprecated: Rojo is no longer required. Renium imports Wally packages directly."
         },
         "renium.wallySync.packagesDir": {
           "type": "string",

@@ -34,33 +34,12 @@ function BridgeChunking.chunkEncodedString(encoded, startIndex, maxLen, encodeMs
 	}
 end
 
-function BridgeChunking.removeCachedPayload(cache, cacheKeys, key)
-	if cache[key] == nil then
-		return
-	end
-	cache[key] = nil
-	for i, existingKey in ipairs(cacheKeys) do
-		if existingKey == key then
-			table.remove(cacheKeys, i)
-			return
-		end
-	end
-end
-
-function BridgeChunking.getInstanceBatchCacheKey(startIndex, maxCount)
-	return tostring(startIndex or 1) .. ":" .. tostring(maxCount or 300)
-end
-
 function BridgeChunking.getCompactInstanceBatchCacheKey(startIndex, maxCount)
 	return "compact:" .. tostring(startIndex or 1) .. ":" .. tostring(maxCount or 300)
 end
 
-function BridgeChunking.getSourceBatchCacheKey(instancePaths)
-	local normalizedPaths = table.create(#instancePaths)
-	for i, value in ipairs(instancePaths) do
-		normalizedPaths[i] = tostring(value)
-	end
-	return "paths:" .. table.concat(normalizedPaths, "\\0")
+function BridgeChunking.getSourceBatchCacheKey(instancePaths: { string })
+	return "paths:" .. table.concat(instancePaths, "\\0")
 end
 
 function BridgeChunking.getSourceRangeBatchCacheKey(startIndex, maxCount)

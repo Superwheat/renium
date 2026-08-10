@@ -85,10 +85,10 @@ fn emit_build_metadata() {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let build_timestamp = env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs().to_string())
-            .unwrap_or_else(|_| "0".to_string())
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+            |_| "0".to_string(),
+            |duration| duration.as_secs().to_string(),
+        )
     });
     let mut enabled_features = env::vars()
         .filter_map(|(key, _)| key.strip_prefix("CARGO_FEATURE_").map(str::to_string))

@@ -286,8 +286,8 @@ $pluginVersion = $pluginVersionMatch.Groups["version"].Value
 if (($cliVersion -ne $extensionVersion) -or ($cliVersion -ne $pluginVersion)) {
     throw "Version mismatch: CLI=$cliVersion, extension=$extensionVersion, plugin=$pluginVersion. All three must match before packaging."
 }
-$cliSourcePath = Join-Path $cliDirectory "src\main.rs"
-$cliSource = Get-Content -LiteralPath $cliSourcePath -Raw
+$cliProtocolSourcePath = Join-Path $cliDirectory "src\snapshot_export.rs"
+$cliProtocolSource = Get-Content -LiteralPath $cliProtocolSourcePath -Raw
 $compatibilityConstants = [ordered]@{
     BRIDGE_PROTOCOL_VERSION = "BRIDGE_PROTOCOL_VERSION"
     CHUNK_FRAME_PROTOCOL_VERSION = "BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION"
@@ -296,7 +296,7 @@ $compatibilityConstants = [ordered]@{
 foreach ($pluginConstant in $compatibilityConstants.Keys) {
     $pluginMatch = [regex]::Match($pluginRuntime, ('(?m)\b' + $pluginConstant + '\s*=\s*"(?<value>[^"]+)"'))
     $cliConstant = $compatibilityConstants[$pluginConstant]
-    $cliMatch = [regex]::Match($cliSource, ('(?m)\b' + $cliConstant + '\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'))
+    $cliMatch = [regex]::Match($cliProtocolSource, ('(?m)\b' + $cliConstant + '\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'))
     if (-not $pluginMatch.Success -or -not $cliMatch.Success) {
         throw "Could not read compatibility metadata $pluginConstant/$cliConstant"
     }
@@ -309,11 +309,11 @@ $pluginCodecMatch = [regex]::Match(
     '(?ms)\bCODEC_VERSION\s*=\s*if\b.*?\bthen\s*"(?<primary>[^"]+)"\s*\belse\s*"(?<fallback>[^"]+)"'
 )
 $cliPrimaryCodecMatch = [regex]::Match(
-    $cliSource,
+    $cliProtocolSource,
     '(?m)\bBRIDGE_CODEC_VERSION_SCHEMA9\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'
 )
 $cliFallbackCodecMatch = [regex]::Match(
-    $cliSource,
+    $cliProtocolSource,
     '(?m)\bBRIDGE_CODEC_VERSION_SCHEMA8\s*:\s*&str\s*=\s*"(?<value>[^"]+)"'
 )
 if (-not $pluginCodecMatch.Success -or -not $cliPrimaryCodecMatch.Success -or -not $cliFallbackCodecMatch.Success) {

@@ -12,7 +12,6 @@ end
 
 local function serializeFloat(value)
 
-
 	if value == math.huge or value == -math.huge then
 		return 999999999 * math.sign(value)
 	end
@@ -24,6 +23,7 @@ local ALL_AXES = { "X", "Y", "Z" }
 local ALL_FACES = { "Right", "Top", "Back", "Left", "Bottom", "Front" }
 
 local EncodedValue = {}
+local encodeNaive
 
 local types
 types = {
@@ -51,7 +51,7 @@ types = {
 			local output = {}
 
 			for key, value in pairs(roblox) do
-				local ok, result = EncodedValue.encodeNaive(value)
+				local ok, result = encodeNaive(value)
 
 				if ok then
 					output[key] = result
@@ -116,7 +116,6 @@ types = {
 		fromPod = function(pod)
 			local pos = pod.position
 			local orient = pod.orientation
-
 
 			return CFrame.new(
 				pos[1], pos[2], pos[3],
@@ -351,8 +350,6 @@ types = {
 
 			for index, keypoint in ipairs(pod.keypoints) do
 
-
-
 				local value = keypoint.value or 0
 				local envelope = keypoint.envelope or 0
 				keypoints[index] = NumberSequenceKeypoint.new(keypoint.time, value, envelope)
@@ -383,7 +380,6 @@ types = {
 			if pod == "Default" then
 				return nil
 			else
-
 
 				if pod.acousticAbsorption then
 					return (PhysicalProperties.new :: any)(
@@ -615,7 +611,7 @@ local propertyTypeRenames = {
 	string = "String",
 }
 
-function EncodedValue.encodeNaive(rbxValue)
+encodeNaive = function(rbxValue)
 	local propertyType = typeof(rbxValue)
 	if propertyTypeRenames[propertyType] ~= nil then
 		propertyType = propertyTypeRenames[propertyType]

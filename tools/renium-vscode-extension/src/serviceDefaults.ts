@@ -1,4 +1,4 @@
-export type ExplorerSortableNode = {
+type ExplorerSortableNode = {
   id: string;
   name: string;
   className: string;

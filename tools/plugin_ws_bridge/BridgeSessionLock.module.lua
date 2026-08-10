@@ -4,13 +4,10 @@ local LOCK_NAME = "__Renium_SessionLock"
 local LOCK_MARKER = "ReniumSessionLock"
 local HEARTBEAT_SECONDS = 5
 local EXPIRY_SECONDS = 15
-local SETTLE_SECONDS = 1.5
-local SETTLE_TIMEOUT_SECONDS = 6
 
-function BridgeSessionLock.create(runtimeId: string, ownershipLost: (() -> ())?)
+function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> ())
 	local ServerStorage = game:GetService("ServerStorage")
 	local StudioService = game:GetService("StudioService")
-	local RunService = game:GetService("RunService")
 	local userId = StudioService:GetUserId()
 	local project = if game.GameId > 0
 		then `{game.GameId}:{game.PlaceId}`
@@ -57,17 +54,6 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: (() -> ())?)
 			end
 		end
 		return winner
-	end
-
-	local function candidateSignature(now: number): string
-		local runtimes = {}
-		for _, lock in locks() do
-			if not expired(lock, now) then
-				runtimes[#runtimes + 1] = tostring(lock:GetAttribute("Runtime") or "")
-			end
-		end
-		table.sort(runtimes)
-		return table.concat(runtimes, "\0")
 	end
 
 	local function owned(): Folder?
@@ -124,9 +110,7 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: (() -> ())?)
 		heartbeatToken += 1
 		ownershipGeneration += 1
 		removeOwnedLocks()
-		if ownershipLost ~= nil then
-			ownershipLost()
-		end
+		ownershipLost()
 	end
 
 	local function verifyOwnership()
@@ -219,32 +203,10 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: (() -> ())?)
 		else
 			write(lock)
 		end
-		local started = os.clock()
-		local stableSince = started
-		local signature = candidateSignature(os.time())
-		while os.clock() - stableSince < SETTLE_SECONDS do
-			RunService.Heartbeat:Wait()
-			local winner = elected(os.time())
-			if winner ~= lock then
-				removeOwnedLocks()
-				return false, describe(winner)
-			end
-			local currentSignature = candidateSignature(os.time())
-			if currentSignature ~= signature then
-				signature = currentSignature
-				stableSince = os.clock()
-			end
-			if os.clock() - started >= SETTLE_TIMEOUT_SECONDS then
-				removeOwnedLocks()
-				return false, describe(winner)
-			end
-		end
-		for _ = 1, 2 do
-			RunService.Heartbeat:Wait()
-			if elected(os.time()) ~= lock or candidateSignature(os.time()) ~= signature then
-				removeOwnedLocks()
-				return false, describe(elected(os.time()))
-			end
+		local winner = elected(os.time())
+		if winner ~= lock then
+			removeOwnedLocks()
+			return false, describe(winner)
 		end
 		active = true
 		ownershipGeneration += 1

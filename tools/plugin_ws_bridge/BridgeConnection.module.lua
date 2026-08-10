@@ -14,14 +14,14 @@ function BridgeConnection.create(context)
 	local runtimeSettings, explicitRuntimeSettings = SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
 	local channels = {}
 	local connectChannel
+	local releaseClient
 	local prepareChannelsForNextRun
 	local pauseWatcherStarted = false
 	local pluginUnloading = false
-	local maxReconnectSeconds =
-		math.max(tonumber(context.maxReconnectSeconds) or 4.0, tonumber(context.reconnectSeconds) or 0.5)
-	local stableConnectionSeconds = math.max(tonumber(context.stableConnectionSeconds) or 1.0, 0)
-	local maxRequestBytes = math.max(1024, tonumber(context.maxRequestBytes) or 16 * 1024 * 1024)
-	local maxQueuedExclusiveRequests = math.max(1, tonumber(context.maxQueuedExclusiveRequests) or 16)
+	local maxConnectionFailures = context.maxConnectionFailures
+	local stableConnectionSeconds = 1
+	local maxRequestBytes = context.maxRequestBytes
+	local maxQueuedExclusiveRequests = context.maxQueuedExclusiveRequests
 	local connectionSessionGeneration = nil
 	local exclusiveRequestBusy = false
 	local exclusiveRequestQueue = {}
@@ -40,7 +40,7 @@ function BridgeConnection.create(context)
 	}
 
 	local function autoReconnectEnabled(): boolean
-		return runtimeSettings.autoReconnect ~= false
+		return runtimeSettings.autoReconnect
 	end
 
 	local function bridgeLogEnabled(level: string): boolean
@@ -55,22 +55,16 @@ function BridgeConnection.create(context)
 	end
 
 	local function applyRuntimeSettingsToUi()
-		if ui.setRuntimeSettingActive ~= nil then
-			for key, value in pairs(runtimeSettings) do
-				ui.setRuntimeSettingActive(key, value)
-			end
+		for key, value in pairs(runtimeSettings) do
+			ui.setRuntimeSettingActive(key, value)
 		end
-		if ui.setRuntimeSettingText ~= nil then
-			ui.setRuntimeSettingText("changesThreshold", runtimeSettings.changesThreshold)
-			ui.setRuntimeSettingText("diffLinesLimit", runtimeSettings.diffLinesLimit)
-		end
+		ui.setRuntimeSettingText("changesThreshold", runtimeSettings.changesThreshold)
+		ui.setRuntimeSettingText("diffLinesLimit", runtimeSettings.diffLinesLimit)
 	end
 
 	local function notifyRuntimeSettingsChanged()
 		Config.bridgeSettings = runtimeSettings
-		if type(context.onRuntimeSettingsChanged) == "function" then
-			context.onRuntimeSettingsChanged(runtimeSettings)
-		end
+		context.onRuntimeSettingsChanged(runtimeSettings)
 	end
 
 	function Config.getBridgeSettings()
@@ -129,7 +123,7 @@ function BridgeConnection.create(context)
 		end
 		local lowered = string.lower(channel.lastError)
 		if
-			runtimeSettings.notifications ~= false
+			runtimeSettings.notifications
 			and (
 				string.find(lowered, "protocol", 1, true)
 				or string.find(lowered, "codec", 1, true)
@@ -179,7 +173,7 @@ function BridgeConnection.create(context)
 	end
 
 	local function isReplayProtectedMethod(method)
-		return type(context.isReplayProtectedMethod) == "function" and context.isReplayProtectedMethod(method)
+		return context.isReplayProtectedMethod(method)
 	end
 
 	local function pruneReplayRequests()
@@ -236,9 +230,7 @@ function BridgeConnection.create(context)
 				},
 			})
 			if not errorSent then
-				pcall(function()
-					client:Close()
-				end)
+				releaseClient(channel, client, true)
 			end
 			return
 		end
@@ -258,25 +250,22 @@ function BridgeConnection.create(context)
 			return
 		end
 		local started = os.clock()
-		local exclusive = type(context.isExclusiveMethod) == "function" and context.isExclusiveMethod(method)
-		local sessionOwned = exclusive
-			or type(context.isSessionOwnedMethod) == "function" and context.isSessionOwnedMethod(method)
+		local exclusive = context.isExclusiveMethod(method)
+		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
 		local ownsSession = true
 		if sessionOwned then
-			ownsSession = if type(context.validateSessionLock) == "function"
-				then context.validateSessionLock(sessionGeneration)
-				else type(context.ownsSessionLock) ~= "function" or context.ownsSessionLock()
+			ownsSession = context.validateSessionLock(sessionGeneration)
 		end
 		local okCall, result
 		if sessionOwned and not ownsSession then
 			okCall = false
 			result = "Renium session ownership was lost"
 		else
-			if exclusive and type(context.setExclusiveSessionGeneration) == "function" then
+			if exclusive then
 				context.setExclusiveSessionGeneration(sessionGeneration)
 			end
 			okCall, result = pcall(context.handleMethod, method, params, sessionGeneration)
-			if exclusive and type(context.setExclusiveSessionGeneration) == "function" then
+			if exclusive then
 				context.setExclusiveSessionGeneration(nil)
 			end
 		end
@@ -365,9 +354,7 @@ function BridgeConnection.create(context)
 			sendRequestError(channelId, client, nil, "Bridge request exceeds safe size limit")
 			return
 		end
-		local okDecode, payload = pcall(function()
-			return HttpService:JSONDecode(message)
-		end)
+		local okDecode, payload = pcall(HttpService.JSONDecode, HttpService, message)
 		if not okDecode or not isJsonObject(payload) then
 			sendRequestError(channelId, client, nil, "Invalid JSON payload")
 			return
@@ -437,20 +424,12 @@ function BridgeConnection.create(context)
 			addReplayRecipient(replayRequest, channel, client)
 			replayRequestsByKey[replayKey] = replayRequest
 		end
-		local exclusive = type(context.isExclusiveMethod) == "function" and context.isExclusiveMethod(method)
-		local sessionOwned = exclusive
-			or type(context.isSessionOwnedMethod) == "function" and context.isSessionOwnedMethod(method)
+		local exclusive = context.isExclusiveMethod(method)
+		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
 		local sessionGeneration = nil
 		if sessionOwned then
-			sessionGeneration = if type(context.captureSessionLock) == "function"
-				then context.captureSessionLock()
-				else true
-		end
-		if sessionOwned then
-			if
-				sessionGeneration == nil
-				or (type(context.ownsSessionLock) == "function" and not context.ownsSessionLock())
-			then
+			sessionGeneration = context.captureSessionLock()
+			if sessionGeneration == nil then
 				if replayRequest then
 					replayRequestsByKey[replayRequest.key] = nil
 				end
@@ -508,27 +487,20 @@ function BridgeConnection.create(context)
 		local now = os.clock()
 		local channelCount = math.max(#channels, 1)
 		local failures = math.max(0, tonumber(channel.reconnectFailureCount) or 0)
+		if failures >= maxConnectionFailures then
+			Config.disconnectAll("Connection failed")
+			return
+		end
 		local period = if failures == 0 and channel.fastReconnectUntil > now
 			then context.fastReconnectSeconds
 			else tonumber(context.reconnectSeconds) or 0.5
-		if failures > 0 then
-			local backoffPower = math.min(failures - 1, 4)
-			local backoff = math.max(tonumber(context.reconnectSeconds) or 0.5, 0.1) * (2 ^ backoffPower)
-			period = math.max(period, math.min(maxReconnectSeconds, backoff))
-		end
 		local target = channel.forcedReconnectAt
 		if target ~= nil and target > 0 then
 			channel.forcedReconnectAt = 0
 		else
 			local phase = ((channel.id - 1) % channelCount) * (period / channelCount)
-			target = channel.nextReconnectAt
-			if target <= 0 or target - now > period then
-				target = now + phase
-			elseif target <= now + 0.005 then
-				target += (math.floor((now - target) / period) + 1) * period
-			end
+			target = now + period + phase
 		end
-		channel.nextReconnectAt = target
 		channel.reconnectScheduled = true
 		task.delay(math.max(0.005, target - now), function()
 			if
@@ -567,6 +539,26 @@ function BridgeConnection.create(context)
 		channel.reconnectFailureCount = 0
 	end
 
+	releaseClient = function(channel, client, closeClient)
+		if channel.client ~= client then
+			return false
+		end
+		channel.client = nil
+		channel.connecting = false
+		channel.open = false
+		local connections = channel.clientConnections
+		channel.clientConnections = nil
+		if connections then
+			for _, connection in ipairs(connections) do
+				connection:Disconnect()
+			end
+		end
+		if closeClient then
+			pcall(client.Close, client)
+		end
+		return true
+	end
+
 	local function closeChannel(channel)
 		local wasOpen = channel.open
 		if channel.client ~= nil then
@@ -579,18 +571,16 @@ function BridgeConnection.create(context)
 				)
 			)
 		end
-		channel.connecting = false
-		channel.open = false
 		channel.reconnectScheduled = false
 		if wasOpen then
 			channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
 		end
 		local client = channel.client
-		channel.client = nil
 		if client then
-			pcall(function()
-				client:Close()
-			end)
+			releaseClient(channel, client, true)
+		else
+			channel.connecting = false
+			channel.open = false
 		end
 		if not pluginUnloading then
 			updateStatusText()
@@ -606,23 +596,8 @@ function BridgeConnection.create(context)
 		return false
 	end
 
-	function Config.hasAllOpenChannels()
-		if #channels == 0 then
-			return false
-		end
-		for _, channel in ipairs(channels) do
-			if not channel.open then
-				return false
-			end
-		end
-		return true
-	end
-
 	local function shutdownRequests(unloading: boolean)
-		local cleanup = nil
-		if type(context.requestShutdown) == "function" then
-			cleanup = context.requestShutdown(unloading)
-		end
+		local cleanup = context.requestShutdown(unloading)
 		for _, request in exclusiveRequestQueue do
 			if request.replayRequest then
 				replayRequestsByKey[request.replayRequest.key] = nil
@@ -630,16 +605,8 @@ function BridgeConnection.create(context)
 		end
 		table.clear(exclusiveRequestQueue)
 		exclusiveIdleCallbacks[#exclusiveIdleCallbacks + 1] = function()
-			local cleanupOk, cleanupError = pcall(function()
-				if type(cleanup) == "function" then
-					cleanup()
-				end
-			end)
-			local releaseOk, releaseError = pcall(function()
-				if type(context.releaseSessionLock) == "function" then
-					context.releaseSessionLock()
-				end
-			end)
+			local cleanupOk, cleanupError = pcall(cleanup)
+			local releaseOk, releaseError = pcall(context.releaseSessionLock)
 			if not cleanupOk then
 				error(cleanupError, 0)
 			end
@@ -653,7 +620,7 @@ function BridgeConnection.create(context)
 	function Config.disconnectAll(reason, unloading)
 		local isUnloading = unloading == true
 		shutdownRequests(isUnloading)
-		if isUnloading and type(context.getFinalConsoleSnapshot) == "function" then
+		if isUnloading then
 			local snapshot = context.getFinalConsoleSnapshot()
 			if snapshot ~= nil then
 				snapshot.event = "finalConsoleSnapshot"
@@ -677,17 +644,9 @@ function BridgeConnection.create(context)
 		updateStatusText()
 	end
 
-	function Config.whenExclusiveIdle(callback)
-		if type(callback) ~= "function" then
-			return
-		end
-		exclusiveIdleCallbacks[#exclusiveIdleCallbacks + 1] = callback
-		drainExclusiveIdleCallbacks()
-	end
-
-	function Config.disconnectIfConnectionInterrupted()
+	local function handleConnectionInterruption()
 		if not autoReconnectEnabled() then
-			return false
+			return
 		end
 		if
 			not Config.bridgePausedForPlay
@@ -706,7 +665,6 @@ function BridgeConnection.create(context)
 			end
 			updateStatusText()
 		end
-		return false
 	end
 
 	local function keepFastReconnectIfNextRunActive(channel)
@@ -725,10 +683,7 @@ function BridgeConnection.create(context)
 		then
 			return
 		end
-		if
-			type(context.validateSessionLock) == "function"
-			and not context.validateSessionLock(connectionSessionGeneration)
-		then
+		if not context.validateSessionLock(connectionSessionGeneration) then
 			Config.disconnectAll("Renium session ownership was lost")
 			return
 		end
@@ -751,23 +706,14 @@ function BridgeConnection.create(context)
 		channel.open = false
 		channel.connectAttempt += 1
 		local attempt = channel.connectAttempt
-		local baseOpenTimeoutSeconds = if channel.nextRunFastUntil > now
-			then context.nextRunConnectTimeoutSeconds
-			elseif channel.fastReconnectUntil > now then context.fastConnectOpenTimeoutSeconds
-			else context.connectOpenTimeoutSeconds
-		local openTimeoutSeconds = if Config.bridgeConnectDeadline > now
-			then math.max(baseOpenTimeoutSeconds, Config.bridgeConnectDeadline - now)
-			else baseOpenTimeoutSeconds
 		if not pluginUnloading then
 			updateStatusText()
 		end
 
 		local url = SettingsModule.formatWebSocketUrl(host, channel.port)
-		local ok, client = pcall(function()
-			return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
-				Url = url,
-			})
-		end)
+		local ok, client = pcall(HttpService.CreateWebStreamClient, HttpService, Enum.WebStreamClientType.WebSocket, {
+			Url = url,
+		})
 
 		if not ok or not client then
 			channel.connecting = false
@@ -783,40 +729,16 @@ function BridgeConnection.create(context)
 		end
 
 		channel.client = client
+		local clientConnections = {}
+		channel.clientConnections = clientConnections
 		channel.open = false
-		task.delay(openTimeoutSeconds, function()
-			if pluginUnloading then
-				return
-			end
-			if channel.client ~= client or channel.open or channel.connectAttempt ~= attempt then
-				return
-			end
-			channel.client = nil
-			channel.connecting = false
-			channel.open = false
-			recordReconnectFailure(channel)
-			markConnectionFailure(channel, "connection timed out")
-			keepFastReconnectIfNextRunActive(channel)
-			if not pluginUnloading then
-				updateStatusText()
-			end
-			pcall(function()
-				client:Close()
-			end)
-			scheduleReconnect(channel)
-		end)
 
-		client.Opened:Connect(function(_statusCode, _headers)
+		clientConnections[#clientConnections + 1] = client.Opened:Connect(function(_statusCode, _headers)
 			if pluginUnloading then
-				pcall(function()
-					client:Close()
-				end)
+				releaseClient(channel, client, true)
 				return
 			end
-			if
-				type(context.validateSessionLock) == "function"
-				and not context.validateSessionLock(connectionSessionGeneration)
-			then
+			if not context.validateSessionLock(connectionSessionGeneration) then
 				Config.disconnectAll("Renium session ownership was lost")
 				return
 			end
@@ -843,7 +765,7 @@ function BridgeConnection.create(context)
 				channel = channel.id,
 				version = context.bridgeVersion,
 				bridgeVersion = context.bridgeVersion,
-				runtimeId = context.runtimeId,
+				runtimeId = Config.bridgeRuntimeId,
 				bridgeRole = Config.bridgeRole,
 				protocolVersion = context.protocolVersion,
 				codecVersion = context.codecVersion,
@@ -856,14 +778,14 @@ function BridgeConnection.create(context)
 			})
 		end)
 
-		client.MessageReceived:Connect(function(message)
+		clientConnections[#clientConnections + 1] = client.MessageReceived:Connect(function(message)
 			if pluginUnloading or channel.client ~= client then
 				return
 			end
 			onMessage(channel, client, message)
 		end)
 
-		client.Error:Connect(function(_statusCode, _errorMessage)
+		clientConnections[#clientConnections + 1] = client.Error:Connect(function(_statusCode, _errorMessage)
 			if pluginUnloading then
 				return
 			end
@@ -879,10 +801,7 @@ function BridgeConnection.create(context)
 					tostring(_errorMessage)
 				)
 			)
-			channel.client = nil
-			channel.connecting = false
-			channel.open = false
-			channel.reconnectScheduled = false
+			releaseClient(channel, client, true)
 			recordReconnectClose(channel, wasOpen)
 			markConnectionFailure(channel, _errorMessage or "WebSocket error")
 			if wasOpen then
@@ -891,15 +810,11 @@ function BridgeConnection.create(context)
 				keepFastReconnectIfNextRunActive(channel)
 			end
 			updateStatusText()
-			if not Config.disconnectIfConnectionInterrupted() then
-				scheduleReconnect(channel)
-			end
-			pcall(function()
-				client:Close()
-			end)
+			handleConnectionInterruption()
+			scheduleReconnect(channel)
 		end)
 
-		client.Closed:Connect(function()
+		clientConnections[#clientConnections + 1] = client.Closed:Connect(function()
 			if channel.client ~= client then
 				return
 			end
@@ -911,9 +826,7 @@ function BridgeConnection.create(context)
 					tostring(channel.shouldReconnect)
 				)
 			)
-			channel.client = nil
-			channel.connecting = false
-			channel.open = false
+			releaseClient(channel, client, false)
 			recordReconnectClose(channel, wasOpen)
 			if not wasOpen and Config.bridgeConnectRequested then
 				markConnectionFailure(channel, "connection closed before opening")
@@ -925,10 +838,21 @@ function BridgeConnection.create(context)
 			end
 			if not pluginUnloading then
 				updateStatusText()
-			end
-			if not pluginUnloading and not Config.disconnectIfConnectionInterrupted() then
+				handleConnectionInterruption()
 				scheduleReconnect(channel)
 			end
+		end)
+
+		task.delay(context.connectSessionTimeoutSeconds, function()
+			if pluginUnloading or channel.client ~= client or channel.open then
+				return
+			end
+			releaseClient(channel, client, true)
+			recordReconnectFailure(channel)
+			markConnectionFailure(channel, "connection timed out")
+			keepFastReconnectIfNextRunActive(channel)
+			updateStatusText()
+			scheduleReconnect(channel)
 		end)
 
 		if not pluginUnloading then
@@ -973,56 +897,53 @@ function BridgeConnection.create(context)
 		local session = Config.bridgeConnectSession
 		Config.bridgeConnectionStatus = "Connecting..."
 		updateStatusText()
-		if type(context.acquireSessionLock) == "function" then
-			local acquired, details = context.acquireSessionLock(takeover == true)
-			if session ~= Config.bridgeConnectSession or not Config.bridgeConnectRequested then
-				return
+		local acquired, details = context.acquireSessionLock(takeover == true)
+		if session ~= Config.bridgeConnectSession or not Config.bridgeConnectRequested then
+			return
+		end
+		if not acquired then
+			Config.bridgeConnectRequested = false
+			Config.bridgeConnectionStatus = "Another Renium session is active"
+			updateStatusText()
+			local retryAfterSeconds = tonumber(details.retryAfterSeconds)
+			if runtimeSettings.autoConnect and retryAfterSeconds then
+				task.delay(retryAfterSeconds, function()
+					if
+						not pluginUnloading
+						and session == Config.bridgeConnectSession
+						and not Config.bridgeConnectRequested
+					then
+						Config.connectAll()
+					end
+				end)
 			end
-			if not acquired then
-				Config.bridgeConnectRequested = false
-				Config.bridgeConnectionStatus = "Another Renium session is active"
-				updateStatusText()
-				local retryAfterSeconds = tonumber(details.retryAfterSeconds)
-				if runtimeSettings.autoConnect ~= false and retryAfterSeconds ~= nil then
-					task.delay(retryAfterSeconds, function()
-						if
-							not pluginUnloading
-							and session == Config.bridgeConnectSession
-							and not Config.bridgeConnectRequested
-						then
-							Config.connectAll()
-						end
-					end)
-				end
-				if runtimeSettings.notifications ~= false then
-					ui.notify(
-						"session-lock",
-						"Another Renium session is active",
-						sessionOwnerText(details),
-						"Take over",
-						function()
-							Config.connectAll(true)
-						end,
-						true
-					)
-				end
-				return
+			if runtimeSettings.notifications then
+				ui.notify(
+					"session-lock",
+					"Another Renium session is active",
+					sessionOwnerText(details),
+					"Take over",
+					function()
+						Config.connectAll(true)
+					end,
+					true
+				)
 			end
-			ui.dismissNotification("session-lock")
-			connectionSessionGeneration = if type(context.captureSessionLock) == "function"
-				then context.captureSessionLock()
-				else true
-			if connectionSessionGeneration == nil then
-				Config.bridgeConnectRequested = false
-				Config.bridgeConnectionStatus = "Renium session ownership was lost"
-				updateStatusText()
-				return
-			end
+			return
+		end
+		ui.dismissNotification("session-lock")
+		connectionSessionGeneration = context.captureSessionLock()
+		if connectionSessionGeneration == nil then
+			Config.bridgeConnectRequested = false
+			Config.bridgeConnectionStatus = "Renium session ownership was lost"
+			updateStatusText()
+			return
 		end
 		Config.bridgeConnectDeadline = os.clock() + context.connectSessionTimeoutSeconds
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = true
 			closeChannel(channel)
+			resetReconnectFailures(channel)
 			connectChannel(channel)
 		end
 		task.delay(context.connectSessionTimeoutSeconds, function()
@@ -1082,7 +1003,6 @@ function BridgeConnection.create(context)
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = Config.bridgeConnectRequested
 			channel.reconnectScheduled = false
-			channel.nextReconnectAt = 0
 		end
 		if Config.bridgeConnectRequested then
 			Config.connectAll()
@@ -1118,20 +1038,18 @@ function BridgeConnection.create(context)
 			closeChannel(channel)
 		end
 		table.clear(channels)
-		local now = os.clock()
-		local channelCount = math.max(#ports, 1)
 		for i, port in ipairs(ports) do
 			channels[i] = {
 				id = i,
 				port = port,
 				client = nil,
+				clientConnections = nil,
 				open = false,
 				connecting = false,
 				reconnectScheduled = false,
 				shouldReconnect = Config.bridgeConnectRequested,
 				connectAttempt = 0,
 				reconnectFailureCount = 0,
-				nextReconnectAt = now + ((i - 1) * (context.reconnectSeconds / channelCount)),
 				fastReconnectUntil = 0,
 				forcedReconnectAt = 0,
 				nextRunFastUntil = 0,
@@ -1139,10 +1057,6 @@ function BridgeConnection.create(context)
 			}
 		end
 		syncConfigState()
-	end
-
-	function Config.parsePortsCsv(raw)
-		return SettingsModule.parsePortsCsv(raw)
 	end
 
 	function Config.applyWidgetSettings(reconnectIfRequested)
@@ -1155,7 +1069,7 @@ function BridgeConnection.create(context)
 			return false
 		end
 
-		local parsedPorts = Config.parsePortsCsv(ui.portsBox.Text or "")
+		local parsedPorts = SettingsModule.parsePortsCsv(ui.portsBox.Text or "")
 		if parsedPorts == nil then
 			bridgeLog("warn", "ports must be exactly 2 unique comma-separated integers from 1 through 65535")
 			ui.portsBox.Text = table.concat(ports, ",")
@@ -1198,21 +1112,18 @@ function BridgeConnection.create(context)
 		end
 		Config.disconnectAll("Disconnected")
 	end)
-	if ui.actions ~= nil then
-		ui.actions.connect.Triggered:Connect(function()
-			if not pluginUnloading and Config.applyWidgetSettings(false) then
-				Config.connectAll()
-			end
-		end)
-		ui.actions.disconnect.Triggered:Connect(function()
-			if not pluginUnloading then
-				Config.disconnectAll("Disconnected")
-			end
-		end)
-		ui.actions.lock.Triggered:Connect(function()
-			if pluginUnloading or type(context.inspectSessionLock) ~= "function" then
-				return
-			end
+	ui.actions.connect.Triggered:Connect(function()
+		if not pluginUnloading and Config.applyWidgetSettings(false) then
+			Config.connectAll()
+		end
+	end)
+	ui.actions.disconnect.Triggered:Connect(function()
+		if not pluginUnloading then
+			Config.disconnectAll("Disconnected")
+		end
+	end)
+	ui.actions.lock.Triggered:Connect(function()
+		if not pluginUnloading then
 			local details = context.inspectSessionLock()
 			if details.owned then
 				ui.notify(
@@ -1245,70 +1156,53 @@ function BridgeConnection.create(context)
 				)
 			end
 			ui.showWidget()
-		end)
-	end
-
-	if ui.settingOptionButtons ~= nil then
-		for setting, buttons in pairs(ui.settingOptionButtons) do
-			for rawValue, optionButton in pairs(buttons) do
-				optionButton.MouseButton1Click:Connect(function()
-					if pluginUnloading then
-						return
-					end
-					local value: any = if rawValue == "true"
-						then true
-						elseif rawValue == "false" then false
-						else rawValue
-					Config.setBridgeSetting(setting, value)
-				end)
-			end
 		end
-	end
+	end)
 
-	if ui.settingToggles ~= nil then
-		for setting, toggle in pairs(ui.settingToggles) do
-			toggle.button.MouseButton1Click:Connect(function()
-				if pluginUnloading then
-					return
-				end
-				Config.setBridgeSetting(setting, not toggle.get())
-			end)
-		end
-	end
-
-	if ui.settingInputs ~= nil then
-		for setting, input in pairs(ui.settingInputs) do
-			input.FocusLost:Connect(function()
-				if pluginUnloading then
-					return
-				end
-				local normalized = Config.setBridgeSetting(setting, input.Text)
-				if normalized == nil then
-					applyRuntimeSettingsToUi()
-				end
-			end)
-		end
-	end
-
-	if ui.conflictOptionButtons ~= nil then
-		for value, optionButton in pairs(ui.conflictOptionButtons) do
+	for setting, buttons in pairs(ui.settingOptionButtons) do
+		for rawValue, optionButton in pairs(buttons) do
 			optionButton.MouseButton1Click:Connect(function()
 				if pluginUnloading then
 					return
 				end
-				if Config.studioChanges ~= nil then
-					Config.studioChanges.setConflictResolution(value)
-				end
-				SettingsModule.saveConflictResolution(plugin, context.settingsPrefix, value)
-				if ui.setConflictResolutionActive ~= nil then
-					ui.setConflictResolutionActive(value)
-				end
+				local value: any = if rawValue == "true" then true elseif rawValue == "false" then false else rawValue
+				Config.setBridgeSetting(setting, value)
 			end)
 		end
-		if ui.setConflictResolutionActive ~= nil then
-			ui.setConflictResolutionActive(SettingsModule.loadConflictResolution(plugin, context.settingsPrefix, nil))
-		end
 	end
+
+	for setting, toggle in pairs(ui.settingToggles) do
+		toggle.button.MouseButton1Click:Connect(function()
+			if pluginUnloading then
+				return
+			end
+			Config.setBridgeSetting(setting, not toggle.get())
+		end)
+	end
+
+	for setting, input in pairs(ui.settingInputs) do
+		input.FocusLost:Connect(function()
+			if pluginUnloading then
+				return
+			end
+			local normalized = Config.setBridgeSetting(setting, input.Text)
+			if normalized == nil then
+				applyRuntimeSettingsToUi()
+			end
+		end)
+	end
+
+	for value, optionButton in pairs(ui.conflictOptionButtons) do
+		optionButton.MouseButton1Click:Connect(function()
+			if pluginUnloading then
+				return
+			end
+			Config.studioChanges.setConflictResolution(value)
+			SettingsModule.saveConflictResolution(plugin, context.settingsPrefix, value)
+			ui.setConflictResolutionActive(value)
+		end)
+	end
+	ui.setConflictResolutionActive(SettingsModule.loadConflictResolution(plugin, context.settingsPrefix, nil))
 
 	function Config.updatePlayModeBridgeState()
 		local playModeActive = Config.isPlayModeActiveForBridge()
@@ -1331,21 +1225,10 @@ function BridgeConnection.create(context)
 
 	Config.resetChannels()
 	updateStatusText()
-	if runtimeSettings.autoConnect ~= false then
+	if runtimeSettings.autoConnect then
 		Config.connectAll()
 	end
 
-	return {
-		getHost = function()
-			return host
-		end,
-		getPorts = function()
-			return ports
-		end,
-		getChannels = function()
-			return channels
-		end,
-	}
 end
 
 return BridgeConnection

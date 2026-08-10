@@ -1,16 +1,13 @@
 
-export type ConflictSide = "ours" | "theirs";
+type ConflictSide = "ours" | "theirs";
 
 export type ConflictPolicy = "prompt" | "filesystem" | "studio";
 
 const MAX_LCS_CELLS = 4_000_000;
 
-export interface MergeRegion {
-
+interface MergeRegion {
   readonly clean: boolean;
-
   readonly lines: string[];
-
   readonly conflict?: {
     readonly base: string[];
     readonly ours: string[];
@@ -18,42 +15,30 @@ export interface MergeRegion {
   };
 }
 
-export interface ThreeWayMergeResult {
-
+interface ThreeWayMergeResult {
   readonly clean: boolean;
-
   readonly regions: MergeRegion[];
-
   readonly conflictCount: number;
 }
 
-
-export function splitLines(text: string): string[] {
+function splitLines(text: string): string[] {
   if (text.length === 0) {
     return [];
   }
   return text.split(/\r\n|\r|\n/);
 }
 
-export function joinLines(lines: string[], eol: "\n" | "\r\n" = "\n"): string {
+function joinLines(lines: string[], eol: "\n" | "\r\n" = "\n"): string {
   return lines.join(eol);
 }
-
 
 export function sameSourceText(left: string, right: string): boolean {
   return left.replace(/\r\n|\r/g, "\n") === right.replace(/\r\n|\r/g, "\n");
 }
 
-
 export function withLineEnding(text: string, eol: "\n" | "\r\n"): string {
   return text.replace(/\r\n|\r|\n/g, "\n").replace(/\n/g, eol);
 }
-
-
-
-
-
-
 
 function lcsMatches(a: string[], b: string[]): Array<[number, number]> {
   const n = a.length;
@@ -110,11 +95,6 @@ interface Anchor {
   readonly o: number;
   readonly t: number;
 }
-
-
-
-
-
 
 export function threeWayMerge(base: string[], ours: string[], theirs: string[]): ThreeWayMergeResult {
   const mbOurs = new Map<number, number>();
@@ -190,19 +170,7 @@ export function threeWayMerge(base: string[], ours: string[], theirs: string[]):
   return { clean: conflictCount === 0, regions, conflictCount };
 }
 
-export interface RenderOptions {
-  readonly oursLabel?: string;
-  readonly theirsLabel?: string;
-}
-
-
-
-
-
-
-
-
-export function renderTakingSide(
+function renderTakingSide(
   result: ThreeWayMergeResult,
   side: ConflictSide,
   eol: "\n" | "\r\n" = "\n",
@@ -219,25 +187,23 @@ export function renderTakingSide(
   return joinLines(lines, eol);
 }
 
-export interface ResolvedMerge {
-
+interface ResolvedMerge {
   readonly text: string;
-
   readonly hadConflicts: boolean;
-
-
   readonly needsManualResolution: boolean;
-
   readonly conflictCount: number;
 }
 
-
-
-
-
-
-
-
+export function normalizeConflictPolicy(raw: string | undefined): ConflictPolicy {
+  switch (String(raw ?? "").trim().toLowerCase()) {
+    case "filesystem":
+      return "filesystem";
+    case "studio":
+      return "studio";
+    default:
+      return "prompt";
+  }
+}
 
 export function mergeAndResolve(
   baseText: string,
@@ -245,7 +211,6 @@ export function mergeAndResolve(
   theirsText: string,
   policy: ConflictPolicy,
   eol: "\n" | "\r\n" = "\n",
-  options: RenderOptions = {},
 ): ResolvedMerge {
   const result = threeWayMerge(splitLines(baseText), splitLines(oursText), splitLines(theirsText));
   if (result.clean) {
@@ -259,7 +224,6 @@ export function mergeAndResolve(
   if (policy === "studio") {
     return { text: renderTakingSide(result, "theirs", eol), hadConflicts: true, needsManualResolution: false, conflictCount: result.conflictCount };
   }
-  void options;
   return {
     text: renderTakingSide(result, "ours", eol),
     hadConflicts: true,

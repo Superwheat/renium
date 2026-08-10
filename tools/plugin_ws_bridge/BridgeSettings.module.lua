@@ -173,12 +173,8 @@ function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
 	return true
 end
 
-function BridgeSettings.runtimeDefaults()
-	local copy = {}
-	for key, value in pairs(RUNTIME_DEFAULTS) do
-		copy[key] = value
-	end
-	return copy
+local function runtimeDefaults()
+	return table.clone(RUNTIME_DEFAULTS)
 end
 
 function BridgeSettings.normalizeRuntimeSetting(key, value)
@@ -209,7 +205,7 @@ function BridgeSettings.normalizeRuntimeSetting(key, value)
 end
 
 function BridgeSettings.loadRuntimeSettings(plugin, prefix)
-	local out = BridgeSettings.runtimeDefaults()
+	local out = runtimeDefaults()
 	local explicit = {}
 	for key in pairs(out) do
 		local stored = plugin:GetSetting(prefix .. key)
