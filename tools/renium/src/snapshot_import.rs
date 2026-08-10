@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};

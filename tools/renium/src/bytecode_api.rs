@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
