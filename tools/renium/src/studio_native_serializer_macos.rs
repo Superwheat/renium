@@ -7,9 +7,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
+
+use crate::native_snapshot::{
+    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
+};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
@@ -51,23 +55,6 @@ struct MachImage<'a> {
     cpu: u32,
     text: MachSection,
     sections: Vec<MachSection>,
-}
-
-#[derive(Debug)]
-pub struct NativeSnapshot {
-    pub instance_count: usize,
-    pub output_size: u64,
-    pub setup_ms: f64,
-    pub trace_ms: f64,
-    pub discover_ms: f64,
-    pub helper_ms: f64,
-    pub invoke_ms: f64,
-    pub validate_ms: f64,
-    pub context_ms: f64,
-    pub collect_ms: f64,
-    pub serialize_ms: f64,
-    pub write_ms: f64,
-    pub elapsed_ms: f64,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -212,7 +199,7 @@ fn arm64_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> 
     let text = image.text_bytes()?;
     let mut hits = Vec::new();
     for offset in (0..text.len().saturating_sub(28)).step_by(4) {
-        let instruction = read_u32(text, offset).unwrap();
+        let instruction = read_u32(text, offset).expect("ARM64 instruction range was bounded");
         if instruction & 0x9f00_0000 != 0x9000_0000 {
             continue;
         }
@@ -226,7 +213,7 @@ fn arm64_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> 
         let address = image.text.address + offset as u64;
         let page = (address & !0xfff).wrapping_add_signed(immediate << 12);
         for next in (offset + 4..=offset + 24).step_by(4) {
-            let add = read_u32(text, next).unwrap();
+            let add = read_u32(text, next).expect("ARM64 lookahead range was bounded");
             if add & 0xff00_0000 != 0x9100_0000 || (add >> 5) & 31 != register {
                 continue;
             }
@@ -256,7 +243,8 @@ fn x86_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> {
         if rex & 0xf0 != 0x40 || opcode != 0x8d || modrm & 0xc7 != 0x05 {
             continue;
         }
-        let displacement = read_i32(text, offset + 3).unwrap() as i64;
+        let displacement =
+            read_i32(text, offset + 3).expect("x86 instruction range was bounded") as i64;
         let address = image.text.address + offset as u64;
         if address.wrapping_add(7).wrapping_add_signed(displacement) == string_address {
             hits.push(address);
@@ -479,64 +467,6 @@ fn process_executable_path(pid: u32) -> Result<PathBuf> {
     ))
 }
 
-pub fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
-    let output = Command::new("lsof")
-        .args([
-            "-nP",
-            "-a",
-            &format!("-iTCP:{port}"),
-            "-sTCP:ESTABLISHED",
-            "-Fpc",
-        ])
-        .output()
-        .context("Failed to run lsof while mapping the Studio bridge")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("lsof failed while mapping the Studio bridge");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut current_pid = None;
-    let mut matches = Vec::new();
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix('p') {
-            current_pid = value.parse::<u32>().ok();
-        } else if let Some(command) = line.strip_prefix('c')
-            && (command.contains("RobloxStudio") || command.contains("ReniumStudio"))
-            && let Some(pid) = current_pid
-        {
-            matches.push(pid);
-        }
-    }
-    matches.sort_unstable();
-    matches.dedup();
-    if matches.len() != 1 {
-        bail!(
-            "Bridge port {port} mapped to {} Studio processes",
-            matches.len()
-        );
-    }
-    Ok(matches[0])
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
-}
-
-fn temporary_output_path(output: &Path, pid: u32) -> Result<PathBuf> {
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("place.rbxl");
-    Ok(parent.join(format!(".{name}.renium-native-{pid}-{}.rbxl", now_millis())))
-}
-
 fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64, f64)> {
     let path = output
         .to_str()
@@ -605,61 +535,12 @@ fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result
         let invoke_started = Instant::now();
         let (reported_size, serialize_ms) = invoke_helper(pid, trace, &temporary)?;
         let invoke_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
-        let metadata = fs::metadata(&temporary)
-            .with_context(|| format!("Studio did not create {}", temporary.display()))?;
-        if reported_size == 0 || reported_size != metadata.len() {
-            bail!(
-                "Studio native serializer reported {reported_size} bytes but wrote {}",
-                metadata.len()
-            );
-        }
-        let validate_started = Instant::now();
-        let file = File::open(&temporary)
-            .with_context(|| format!("Could not read {}", temporary.display()))?;
-        let database =
-            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-        let filter = database
-            .classes
-            .keys()
-            .map(|class| (class.to_string(), std::collections::HashSet::new()))
-            .collect::<HashMap<_, _>>();
-        let flat = rbx_binary::Deserializer::new()
-            .flat_property_filter(std::sync::Arc::new(filter))
-            .deserialize_flat(BufReader::new(file))
-            .context("Studio native serializer returned an invalid RBXL")?;
-        if flat
-            .metadata
-            .get("ExplicitAutoJoints")
-            .is_some_and(|value| value == "true")
-        {
-            bail!("Studio native serializer returned an instance model instead of a place");
-        }
-        let root_classes = flat
-            .root_indices
-            .iter()
-            .filter_map(|index| flat.instances.get(*index))
-            .map(|instance| instance.class.as_str())
-            .collect::<Vec<_>>();
-        if !["Workspace", "Players", "MaterialService"]
-            .iter()
-            .all(|required| root_classes.iter().any(|class| class == required))
-        {
-            bail!("Studio native RBXL omitted required service roots");
-        }
-        if let Some(service) = service
-            && !root_classes.iter().any(|class| class == &service)
-        {
-            bail!("Studio native RBXL omitted the {service} service root");
-        }
-        let instance_count = flat.instances.len();
-        let validate_ms = validate_started.elapsed().as_secs_f64() * 1000.0;
-        fs::rename(&temporary, output).with_context(|| {
-            format!(
-                "Could not move validated native snapshot from {} to {}",
-                temporary.display(),
-                output.display()
-            )
-        })?;
+        let expected_roots = NativeSnapshotRoots {
+            exact_service: None,
+            containing_service: service,
+        };
+        let (instance_count, validate_ms) =
+            finalize_native_snapshot(&temporary, output, reported_size, expected_roots)?;
         Ok(NativeSnapshot {
             instance_count,
             output_size: reported_size,
@@ -920,7 +801,7 @@ fn create_managed_studio_transaction(parent: &Path) -> Result<PathBuf> {
         ));
         match fs::create_dir(&transaction) {
             Ok(()) => return Ok(transaction),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Could not create {}", transaction.display()));

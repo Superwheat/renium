@@ -1,23 +1,105 @@
 local BridgeIdentity = {}
 
+BridgeIdentity.PATH_SEPARATOR = "\0"
+
+function BridgeIdentity.pathKey(pathSegments: any): string
+	if type(pathSegments) ~= "table" then
+		return ""
+	end
+	local out = table.create(#pathSegments)
+	for i = 1, #pathSegments do
+		out[i] = tostring(pathSegments[i])
+	end
+	return table.concat(out, BridgeIdentity.PATH_SEPARATOR)
+end
+
+local function pathOrdinalsKey(pathOrdinals: any): string
+	if type(pathOrdinals) ~= "table" then
+		return ""
+	end
+	local out = table.create(#pathOrdinals)
+	for i = 1, #pathOrdinals do
+		out[i] = tostring(tonumber(pathOrdinals[i]) or 1)
+	end
+	return table.concat(out, ",")
+end
+
+function BridgeIdentity.pathCacheKey(pathSegments: any, pathOrdinals: any): string
+	local base = BridgeIdentity.pathKey(pathSegments)
+	local ordinals = pathOrdinalsKey(pathOrdinals)
+	if ordinals == "" then
+		return base
+	end
+	local separator = BridgeIdentity.PATH_SEPARATOR
+	return base .. separator .. "ord" .. separator .. ordinals
+end
+
+function BridgeIdentity.resolveOrdinalChild(parent: Instance, childName: string, ordinal: number): Instance?
+	if ordinal <= 1 then
+		return parent:FindFirstChild(childName)
+	end
+	local seen = 0
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == childName then
+			seen += 1
+			if seen == ordinal then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+function BridgeIdentity.resolvePathSegments(
+	pathSegments: any,
+	resolveCache: { [string]: any }?,
+	pathOrdinals: any?
+): Instance?
+	if type(pathSegments) ~= "table" or #pathSegments == 0 then
+		return nil
+	end
+
+	local cacheKey = nil
+	if resolveCache ~= nil then
+		cacheKey = BridgeIdentity.pathCacheKey(pathSegments, pathOrdinals)
+		local cached = resolveCache[cacheKey]
+		if cached ~= nil then
+			if cached == false then
+				return nil
+			end
+			if typeof(cached) == "Instance" and cached.Parent ~= nil and cached:IsDescendantOf(game) then
+				return cached
+			end
+		end
+	end
+
+	local current = game:GetService(tostring(pathSegments[1]))
+	for i = 2, #pathSegments do
+		local ordinal = if type(pathOrdinals) == "table" then tonumber(pathOrdinals[i]) or 1 else 1
+		current = BridgeIdentity.resolveOrdinalChild(current, tostring(pathSegments[i]), ordinal)
+		if current == nil then
+			if resolveCache ~= nil and cacheKey ~= nil then
+				resolveCache[cacheKey] = false
+			end
+			return nil
+		end
+	end
+	if resolveCache ~= nil and cacheKey ~= nil then
+		resolveCache[cacheKey] = current
+	end
+	return current
+end
+
+function BridgeIdentity.liveInstance(value: any): Instance?
+	if typeof(value) == "Instance" and value.Parent ~= nil and value:IsDescendantOf(game) then
+		return value
+	end
+	return nil
+end
+
 function BridgeIdentity.getDebugId(instance)
 	local debugId = instance:GetDebugId(32)
 	return if type(debugId) == "string" and #debugId > 0 then debugId else nil
-end
-
-local function hashString32(text, seed)
-	local hash = seed % 4294967296
-	for i = 1, #text do
-		local byte = string.byte(text, i)
-		hash = (hash * 33 + byte) % 4294967296
-	end
-	return hash
-end
-
-function BridgeIdentity.shortenIdentifier(raw)
-	local h1 = hashString32(raw, 5381)
-	local h2 = hashString32(raw, 2166136261)
-	return string.format("%08x%08x", h1, h2)
 end
 
 local function siblingOrdinal(instance)
@@ -49,21 +131,16 @@ function BridgeIdentity.getRefPathParts(instance)
 	local ordinals = {}
 	local current = instance
 	while current ~= nil and current ~= game do
-		table.insert(segments, 1, current.Name)
-		table.insert(ordinals, 1, siblingOrdinal(current))
+		segments[#segments + 1] = current.Name
+		ordinals[#ordinals + 1] = siblingOrdinal(current)
 		current = current.Parent
 	end
+	for left = 1, math.floor(#segments / 2) do
+		local right = #segments - left + 1
+		segments[left], segments[right] = segments[right], segments[left]
+		ordinals[left], ordinals[right] = ordinals[right], ordinals[left]
+	end
 	return segments, ordinals
-end
-
-function BridgeIdentity.getRefPathSegments(instance)
-	local segments = BridgeIdentity.getRefPathParts(instance)
-	return segments
-end
-
-function BridgeIdentity.getRefPathOrdinals(instance)
-	local _, ordinals = BridgeIdentity.getRefPathParts(instance)
-	return ordinals
 end
 
 function BridgeIdentity.getCachedRefPathParts(state, instance)
@@ -97,16 +174,6 @@ function BridgeIdentity.getCachedRefPathParts(state, instance)
 	state.pathSegmentsByInstance[instance] = segments
 	state.pathOrdinalsByInstance[instance] = ordinals
 	return segments, ordinals
-end
-
-function BridgeIdentity.getCachedRefPathSegments(state, instance)
-	local segments = BridgeIdentity.getCachedRefPathParts(state, instance)
-	return segments
-end
-
-function BridgeIdentity.getCachedRefPathOrdinals(state, instance)
-	local _, ordinals = BridgeIdentity.getCachedRefPathParts(state, instance)
-	return ordinals
 end
 
 function BridgeIdentity.serializeRefValue(state, instance)
@@ -180,17 +247,6 @@ function BridgeIdentity.getCachedInstancePath(state, instance)
 	return path
 end
 
-function BridgeIdentity.getCachedParentPath(state, instance)
-	local parent = instance.Parent
-	if parent == nil then
-		return nil
-	end
-	if parent == game then
-		return "game"
-	end
-	return BridgeIdentity.getCachedInstancePath(state, parent)
-end
-
 function BridgeIdentity.getCachedDebugId(state, instance)
 	local cached = state.debugIdByInstance[instance]
 	if cached ~= nil then
@@ -244,22 +300,6 @@ function BridgeIdentity.getCachedInstanceIndex(state, instance)
 		return tonumber(cachedId, 16)
 	end
 	return nil
-end
-
-function BridgeIdentity.getCachedParentDebugId(state, instance)
-	local parent = instance.Parent
-	if parent == nil or parent == game then
-		return nil
-	end
-	return BridgeIdentity.getCachedDebugId(state, parent)
-end
-
-function BridgeIdentity.getCachedParentInstanceId(state, instance)
-	local parent = instance.Parent
-	if parent == nil or parent == game then
-		return nil
-	end
-	return BridgeIdentity.getCachedInstanceId(state, parent)
 end
 
 function BridgeIdentity.getCachedParentInstanceIndex(state, instance)

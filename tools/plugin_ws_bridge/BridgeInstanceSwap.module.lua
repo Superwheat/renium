@@ -14,16 +14,16 @@ local function restoreOrder(
 ): boolean
 	local desiredSet = {}
 	local order = table.clone(desired)
+	local current = parent:GetChildren()
 	for _, child in ipairs(desired) do
 		desiredSet[child] = true
 	end
-	for _, child in ipairs(parent:GetChildren()) do
+	for _, child in ipairs(current) do
 		if not desiredSet[child] then
 			order[#order + 1] = child
 		end
 	end
 
-	local current = parent:GetChildren()
 	local prefix = 0
 	while prefix < #current and prefix < #order and current[prefix + 1] == order[prefix + 1] do
 		prefix += 1
@@ -84,13 +84,6 @@ function BridgeInstanceSwap.replace(
 		end
 	end
 
-	for attributeName, attributeValue in pairs(instance:GetAttributes()) do
-		pcall(replacement.SetAttribute, replacement, attributeName, attributeValue)
-	end
-	for _, tag in ipairs(collectionService:GetTags(instance)) do
-		collectionService:AddTag(replacement, tag)
-	end
-
 	local desiredSiblings = table.clone(originalSiblings)
 	desiredSiblings[siblingIndex] = replacement
 	local movedChildren = {}
@@ -102,6 +95,12 @@ function BridgeInstanceSwap.replace(
 		end
 	end
 	local okSwap, swapErr = pcall(function()
+		for attributeName, attributeValue in pairs(instance:GetAttributes()) do
+			replacement:SetAttribute(attributeName, attributeValue)
+		end
+		for _, tag in ipairs(collectionService:GetTags(instance)) do
+			collectionService:AddTag(replacement, tag)
+		end
 		for _, child in ipairs(instance:GetChildren()) do
 			setParent(child, replacement)
 			movedChildren[#movedChildren + 1] = child
@@ -113,9 +112,7 @@ function BridgeInstanceSwap.replace(
 	end)
 	if not okSwap then
 		for index = #movedChildren, 1, -1 do
-			pcall(function()
-				setParent(movedChildren[index], instance)
-			end)
+			pcall(setParent, movedChildren[index], instance)
 		end
 		pcall(function()
 			setParent(replacement, nil)

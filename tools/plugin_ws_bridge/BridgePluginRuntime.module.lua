@@ -27,10 +27,8 @@ type ServiceState = {
 	classDefaults: { [string]: any }?,
 	classDefaultsEncoded: string?,
 	transportDefaultProperties: { [string]: any }?,
-	serializedInstances: { [number]: any }?,
 	serializedCompactInstances: { [number]: any }?,
 	compactWarmStatus: string,
-	compactDemandCount: number,
 	activeInstanceBatchRequests: number,
 	scriptPathsEncoded: string?,
 	batchCacheByKey: { [string]: string },
@@ -74,6 +72,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	local Config = {}
+	local lifetimeConnections: { RBXScriptConnection } = {}
 	local generatedRuntimeId = HttpService:GenerateGUID(false)
 	if type(generatedRuntimeId) ~= "string" or generatedRuntimeId == "" then
 		error("Renium could not create a bridge runtime identity")
@@ -170,12 +169,10 @@ function BridgePluginRuntime.start(context)
 	local RECONNECT_SECONDS = 0.5
 	local FAST_RECONNECT_SECONDS = 0.25
 	local FAST_RECONNECT_WINDOW_SECONDS = 8.0
-	local CONNECT_OPEN_TIMEOUT_SECONDS = 1.5
-	local FAST_CONNECT_OPEN_TIMEOUT_SECONDS = 0.75
+	local MAX_CONNECTION_FAILURES = 2
 	local CONNECT_SESSION_TIMEOUT_SECONDS = 2.0
 	local NEXT_RUN_CLOSE_DELAY_SECONDS = 0.02
 	local NEXT_RUN_RECONNECT_DELAY_SECONDS = 0.02
-	local NEXT_RUN_CONNECT_TIMEOUT_SECONDS = 1.5
 	local NEXT_RUN_FAST_WINDOW_SECONDS = 5.0
 	local DEBUG_BRIDGE_CONNECTION = false
 	local SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
@@ -185,9 +182,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_PRE_SERIALIZE_MIN_ITEMS = 2048
-	local PARALLEL_INSTANCE_BATCH_MIN_ITEMS = 768
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local PRE_SERIALIZE_MAX_INSTANCES = 5000
 	local PRE_SERIALIZE_WARM_MIN_INSTANCES = 4000
 	local PRE_SERIALIZE_WARM_MAX_WORKERS = 4
 	local BRIDGE_VERSION = "0.1.2"
@@ -268,33 +263,9 @@ function BridgePluginRuntime.start(context)
 		LocalScript = true,
 		ModuleScript = true,
 	}
-	local function requireChildModule(name: string): any
-		local child = rootScript:FindFirstChild(name)
-		if child and child:IsA("ModuleScript") then
-			local result = require(child)
-			if type(result) == "table" then
-				return result
-			end
-			error(`Renium module {name} must return a table`)
-		end
-		error(`Renium is missing child ModuleScript {name}`)
-	end
-
-	local function tryRequireChildModule(name: string): any?
-		local child = rootScript:FindFirstChild(name)
-		if child and child:IsA("ModuleScript") then
-			local result = require(child)
-			if type(result) == "table" then
-				return result
-			end
-			error(`Renium module {name} must return a table`)
-		end
-		return nil
-	end
-
-	local function tryRequireNestedModule(parent: Instance?, name: string): any?
+	local function requireModule(parent: Instance?, name: string): any
 		if parent == nil then
-			return nil
+			error(`Renium is missing the parent of ModuleScript {name}`)
 		end
 		local child = parent:FindFirstChild(name)
 		if child and child:IsA("ModuleScript") then
@@ -302,13 +273,16 @@ function BridgePluginRuntime.start(context)
 			if type(result) == "table" then
 				return result
 			end
-			error(`Renium nested module {name} must return a table`)
+			error(`Renium module {name} must return a table`)
 		end
-		return nil
+		error(`Renium is missing ModuleScript {name}`)
+	end
+
+	local function requireChildModule(name: string): any
+		return requireModule(rootScript, name)
 	end
 
 	local SettingsModule = requireChildModule("BridgeSettings")
-	local ThemeModule = requireChildModule("BridgeTheme")
 	local StatusModule = requireChildModule("BridgeStatus")
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
@@ -324,24 +298,20 @@ function BridgePluginRuntime.start(context)
 	local MaterialServiceModule = requireChildModule("BridgeMaterialService")
 	local UiModule = requireChildModule("BridgeUi")
 	local PropertySchemaModule = requireChildModule("BridgePropertySchema")
-	local StudioApiSchemaModule = tryRequireChildModule("BridgeStudioApiSchema")
+	local StudioApiSchemaModule = requireChildModule("BridgeStudioApiSchema")
 	local EditorSyncModule = requireChildModule("BridgeEditorSync")
-	local ProfilingModule = requireChildModule("BridgeProfiling")
 	local activeExclusiveSessionGeneration = nil
 	local editorSync
 	local sessionLock
 	local transactionExpectations = {}
-	local RbxDomDatabase = tryRequireNestedModule(rootScript:FindFirstChild("RbxDom"), "database")
+	local RbxDomDatabase = requireModule(rootScript:FindFirstChild("RbxDom"), "database")
 	sessionLock = SessionLockModule.create(Config.bridgeRuntimeId, function()
-		if type(Config.disconnectAll) == "function" then
-			Config.disconnectAll("Another Renium session took ownership")
-		end
+		Config.disconnectAll("Another Renium session took ownership")
 	end)
 
-	local ui = UiModule.create(plugin, ThemeModule, {
+	local ui = UiModule.create(plugin, {
 		version = BRIDGE_VERSION,
 		buildUnix = BRIDGE_BUILD_UNIX,
-		codecVersion = CODEC_VERSION,
 	})
 	ui.setPlayModeHidden(Config.isPlayModeActiveForBridge())
 
@@ -388,15 +358,10 @@ function BridgePluginRuntime.start(context)
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 	})
 	function Config.applyBridgeRuntimeSettings(runtimeSettings: { [string]: any })
-		if type(runtimeSettings) ~= "table" then
-			return
-		end
-		if Config.studioChanges and type(Config.studioChanges.setOptions) == "function" then
-			Config.studioChanges.setOptions({
-				syncbackProperties = runtimeSettings.syncbackProperties,
-				onlyCodeMode = runtimeSettings.onlyCodeMode,
-			})
-		end
+		Config.studioChanges.setOptions({
+			syncbackProperties = runtimeSettings.syncbackProperties,
+			onlyCodeMode = runtimeSettings.onlyCodeMode,
+		})
 	end
 	do
 		local storedConflictResolution = SettingsModule.loadConflictResolution(plugin, SETTINGS_PREFIX, nil)
@@ -538,7 +503,7 @@ function BridgePluginRuntime.start(context)
 	local BUNDLED_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
 		PropertySchemaModule.buildSchemasFromRbxDom(RbxDomDatabase, COMPACT_TYPE_IDS, StudioApiSchemaModule)
 	local EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } =
-		PropertySchemaModule.mergeSchemas(BUNDLED_PROPERTY_SCHEMAS_BY_CLASS, {})
+		BUNDLED_PROPERTY_SCHEMAS_BY_CLASS
 	local EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS: { [string]: { string } } =
 		PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
 	do
@@ -553,18 +518,7 @@ function BridgePluginRuntime.start(context)
 		end
 	end
 
-	local function configureStudioChangePropertyCandidates()
-		local studioChanges = Config.studioChanges
-		if type(studioChanges) ~= "table" then
-			return
-		end
-		local configure = studioChanges.configurePropertyCandidates
-		if type(configure) == "function" then
-			configure(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
-		end
-	end
-
-	configureStudioChangePropertyCandidates()
+	Config.studioChanges.configurePropertyCandidates(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 
 	local stateByService: { [string]: ServiceState }
 	local demandSerializerGate = Instance.new("BindableEvent")
@@ -594,28 +548,9 @@ function BridgePluginRuntime.start(context)
 			ui.showWidget()
 			return
 		end
-		local pathSegments = {}
-		local pathOrdinals = {}
-		local current: Instance? = selectedScript
-		while current ~= nil and current ~= game do
-			local ordinal = 1
-			local parent = current.Parent
-			if parent ~= nil then
-				for _, sibling in ipairs(parent:GetChildren()) do
-					if sibling == current then
-						break
-					end
-					if sibling.Name == current.Name then
-						ordinal += 1
-					end
-				end
-			end
-			table.insert(pathSegments, 1, current.Name)
-			table.insert(pathOrdinals, 1, ordinal)
-			current = parent
-		end
-		local serviceName = tostring(pathSegments[1] or "")
-		if not ALLOWED_SERVICES[serviceName] then
+		local pathSegments, pathOrdinals = IdentityModule.getRefPathParts(selectedScript)
+		local serviceName = if pathSegments then tostring(pathSegments[1] or "") else ""
+		if pathSegments == nil or pathOrdinals == nil or not ALLOWED_SERVICES[serviceName] then
 			ui.notify(
 				"reveal-script",
 				"Selected script is outside the synced tree",
@@ -663,7 +598,7 @@ function BridgePluginRuntime.start(context)
 		return table.clone(editorActions)
 	end
 
-	ui.actions.reveal.Triggered:Connect(selectedScriptAction)
+	lifetimeConnections[#lifetimeConnections + 1] = ui.actions.reveal.Triggered:Connect(selectedScriptAction)
 
 	Config.bridgeConnectRequested = false
 	Config.bridgeConnectedOnce = false
@@ -691,7 +626,7 @@ function BridgePluginRuntime.start(context)
 		lastOk = true,
 	}
 	local historyVersion = 0
-	ChangeHistoryService.OnRecordingFinished:Connect(function()
+	lifetimeConnections[#lifetimeConnections + 1] = ChangeHistoryService.OnRecordingFinished:Connect(function()
 		historyVersion += 1
 	end)
 
@@ -721,26 +656,16 @@ function BridgePluginRuntime.start(context)
 			codecVersion = CODEC_VERSION,
 			host = Config.bridgeHost,
 			ports = Config.bridgePorts,
-			exportAllProperties = EXPORT_ALL_PROPERTIES,
-			preSerializeOnPrepare = PRE_SERIALIZE_ON_PREPARE,
 			connectionStatus = Config.bridgeConnectionStatus,
 			connectRequested = Config.bridgeConnectRequested,
 			channels = Config.bridgeChannels,
 			editorSyncStats = editorSyncStats,
-			bridgeRole = Config.bridgeRole,
 			runtimeId = Config.bridgeRuntimeId,
 			target = if game.PlaceId > 0 then `{game.Name} ({game.PlaceId})` else game.Name,
-			pendingReviewCount = if type(ui.pendingReviewCount) == "function" then ui.pendingReviewCount() else 0,
-			pendingEditCount = if Config.studioChanges
-					and type(Config.studioChanges.pendingChangeCount) == "function"
-				then Config.studioChanges.pendingChangeCount()
-				else 0,
+			pendingReviewCount = ui.pendingReviewCount(),
+			pendingEditCount = Config.studioChanges.pendingChangeCount(),
 		}
-		if ui.updateStatus then
-			ui.updateStatus(StatusModule.view(statusState))
-		else
-			ui.statusLabel.Text = StatusModule.render(statusState)
-		end
+		ui.updateStatus(StatusModule.view(statusState))
 	end
 
 	function Config.recordSyncCompletion()
@@ -750,7 +675,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	function Config.showUndoNotification()
-		local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
+		local runtimeSettings = Config.getBridgeSettings()
 		if runtimeSettings.notifications == false then
 			return
 		end
@@ -807,20 +732,14 @@ function BridgePluginRuntime.start(context)
 			return getClassPropertySchema(className) or {}
 		end,
 		getEnumValueNames = function(enumType: string)
-			if Config.getEditorBinaryEnumValueNames then
-				return Config.getEditorBinaryEnumValueNames(enumType)
-			end
-			return nil
-		end,
-		releaseService = function(serviceName: string)
-			stateByService[serviceName] = nil
+			return Config.getEditorBinaryEnumValueNames(enumType)
 		end,
 		invalidateService = function(serviceName: string)
 			stateByService[serviceName] = nil
 		end,
 		updateStatus = Config.updateStatusText,
 		getSyncOptions = function()
-			return Config.getBridgeSettings and Config.getBridgeSettings() or {}
+			return Config.getBridgeSettings()
 		end,
 		readRootProperties = function(serviceName: string, state: ServiceState)
 			return Config.readEditorBinaryRootProperties(serviceName, state)
@@ -985,9 +904,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	function Config.tryIsPropertyModified(instance: Instance, propertyName: string): (boolean, boolean?)
-		local ok, modified = pcall(function()
-			return instance:IsPropertyModified(propertyName)
-		end)
+		local ok, modified = pcall(instance.IsPropertyModified, instance, propertyName)
 		if ok and type(modified) == "boolean" then
 			return true, modified
 		end
@@ -1395,9 +1312,7 @@ function BridgePluginRuntime.start(context)
 			return cached
 		end
 
-		local ok, probe = pcall(function()
-			return Instance.new(className)
-		end)
+		local ok, probe = pcall(Instance.new, className)
 		if not ok or probe == nil then
 			DEFAULT_PROPERTY_CACHE[className] = NO_DEFAULTS
 			CLASS_PROPERTY_CANDIDATES_CACHE[className] = NO_PROPERTIES
@@ -1441,9 +1356,7 @@ function BridgePluginRuntime.start(context)
 			return cached
 		end
 
-		local ok, probe = pcall(function()
-			return Instance.new(className)
-		end)
+		local ok, probe = pcall(Instance.new, className)
 		if not ok or probe == nil then
 			DEFAULT_TRANSPORT_PROPERTY_CACHE[className] = NO_DEFAULTS
 			DEFAULT_TRANSPORT_FAST_COMPARE_CACHE[className] = NO_DEFAULTS
@@ -1594,7 +1507,7 @@ function BridgePluginRuntime.start(context)
 			stateByService[serviceName] = nil
 		end
 
-		configureStudioChangePropertyCandidates()
+		Config.studioChanges.configurePropertyCandidates(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 		local classCount, propertyCount = PropertySchemaModule.countCandidates(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
 
 		return {
@@ -1655,7 +1568,6 @@ function BridgePluginRuntime.start(context)
 				table.clear(CLASS_PROPERTY_CANDIDATES_CACHE)
 				for _, serviceState in pairs(stateByService) do
 					serviceState.hotPropertySchemaByClass = nil
-					serviceState.serializedInstances = nil
 				end
 			end
 		end
@@ -1679,9 +1591,7 @@ function BridgePluginRuntime.start(context)
 		if cached == nil then
 			local external = EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS[className]
 			if external ~= nil and #external > 0 then
-				local ok, probe = pcall(function()
-					return Instance.new(className)
-				end)
+				local ok, probe = pcall(Instance.new, className)
 				if ok and probe ~= nil then
 					local validated = {}
 					for _, schemaEntry in ipairs(external) do
@@ -1885,27 +1795,10 @@ function BridgePluginRuntime.start(context)
 	end
 
 	local function getOrdinalPathSourceKey(state: ServiceState, instance: Instance): string
-		local ordinals = {}
-		local current: Instance? = instance
-		while current ~= nil and current ~= game do
-			local ordinal = 1
-			local parent = current.Parent
-			if parent ~= nil then
-				ordinal = 0
-				for _, child in ipairs(parent:GetChildren()) do
-					if child.Name == current.Name then
-						ordinal += 1
-						if child == current then
-							break
-						end
-					end
-				end
-				if ordinal < 1 then
-					ordinal = 1
-				end
-			end
-			table.insert(ordinals, 1, tostring(ordinal))
-			current = parent
+		local _, pathOrdinals = IdentityModule.getCachedRefPathParts(state, instance)
+		local ordinals = table.create(#pathOrdinals)
+		for index, ordinal in ipairs(pathOrdinals) do
+			ordinals[index] = tostring(ordinal)
 		end
 		return "pathord:" .. table.concat(ordinals, ",") .. ":" .. IdentityModule.getCachedInstancePath(state, instance)
 	end
@@ -1952,152 +1845,6 @@ function BridgePluginRuntime.start(context)
 		state.scriptPaths = scriptPaths
 		state.scriptInstances = scriptInstances
 		state.scriptPathsEncoded = nil
-	end
-
-	local function exportInstanceInternal(
-		state: ServiceState,
-		instance: Instance,
-		forceSafeReads: boolean,
-		path: string,
-		parentPath: string?,
-		debugId: string?,
-		parentDebugId: string?,
-		instanceId: string?,
-		parentInstanceId: string?,
-		includePathData: boolean?
-	): { [string]: any }
-		local entry: { [string]: any } = {
-			name = instance.Name,
-			className = instance.ClassName,
-			parentInstanceId = parentInstanceId,
-			attributes = instance:GetAttributes(),
-		}
-		if includePathData ~= false then
-			entry.path = path
-			entry.pathSegments = IdentityModule.getCachedRefPathSegments(state, instance)
-			entry.parentPath = parentPath
-			entry.parentDebugId = parentDebugId
-		end
-		local properties = {}
-		local defaultProperties = if EXPORT_ALL_PROPERTIES
-			then nil
-			else getDefaultSerializedProperties(instance.ClassName)
-
-		if includePathData ~= false and debugId then
-			entry.debugId = debugId
-		end
-		if instanceId then
-			entry.instanceId = instanceId
-		end
-
-		local fallbackMap = Config.getClassPropertyFallbackMap(state, instance.ClassName)
-		local propertyNames = getClassPropertyCandidates(instance.ClassName) or PROPERTY_CANDIDATES
-		for _, propertyName in ipairs(propertyNames) do
-			if not shouldSkipStructuralTransportProperty(instance.ClassName, propertyName) then
-				local defaultSerialized = defaultProperties and defaultProperties[propertyName] or nil
-				local skipRead = false
-				local hasModifiedState = false
-				if not EXPORT_ALL_PROPERTIES then
-					local hasModified, isModified = Config.tryIsPropertyModified(instance, propertyName)
-					hasModifiedState = hasModified
-					if hasModified and not isModified then
-						skipRead = true
-					end
-				end
-
-				if not skipRead then
-					Config.bumpExportMetric(state, "propertiesRead")
-					local value = nil
-					local hasValue = false
-					if forceSafeReads or fallbackMap[propertyName] then
-						local got, safeValue = tryRead(instance, propertyName)
-						if got then
-							value = safeValue
-							hasValue = true
-						end
-					else
-						value = (instance :: any)[propertyName]
-						hasValue = true
-					end
-					if propertyName == "CustomPhysicalProperties" then
-						hasValue, value = normalizeSchemaTransportValue(
-							COMPACT_TYPE_IDS.PhysicalProperties,
-							propertyName,
-							instance,
-							hasValue,
-							value
-						)
-					end
-
-					if hasValue and value ~= nil then
-						local serialized = serializeValue(value, state)
-						if serialized ~= nil then
-							if instance.ClassName == "Texture" and propertyName == "Rotation" then
-								serialized = nil
-							end
-						end
-						if serialized ~= nil then
-							if
-								not EXPORT_ALL_PROPERTIES
-								and not hasModifiedState
-								and isAlwaysDefaultSerialized(propertyName, serialized)
-							then
-								serialized = nil
-							end
-						end
-						if serialized ~= nil then
-							if
-								EXPORT_ALL_PROPERTIES
-								or defaultSerialized == nil
-								or not deepEqual(serialized, defaultSerialized)
-							then
-								Config.bumpExportMetric(state, "propertiesEncoded")
-								properties[propertyName] = serialized
-							else
-								Config.bumpExportMetric(state, "propertiesDefaultSkipped")
-							end
-						end
-					end
-				end
-			end
-		end
-
-		if instance:IsA("LuaSourceContainer") then
-			properties.Source = "__SOURCE_EXTERNAL__"
-			entry.sourceKey = IdentityModule.getCachedScriptSourceKey(state, instance)
-		end
-		if next(properties) ~= nil then
-			entry.properties = properties
-		end
-		if type(entry.attributes) == "table" and next(entry.attributes) == nil then
-			entry.attributes = nil
-		end
-		return entry
-	end
-
-	local function exportInstanceFast(
-		state: ServiceState,
-		instance: Instance,
-		path: string,
-		parentPath: string?,
-		debugId: string?,
-		parentDebugId: string?,
-		instanceId: string?,
-		parentInstanceId: string?,
-		includePathData: boolean?
-	): { [string]: any }
-		return exportInstanceInternal(
-			state,
-			instance,
-			false,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
 	end
 
 	local function getServicePropertyCandidates(state: ServiceState): { [string]: { string } }
@@ -2213,7 +1960,7 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-		if next(out) == nil then
+		if not next(out) then
 			local okEnum, liveItems = pcall(function()
 				return (Enum :: any)[enumName]:GetEnumItems()
 			end)
@@ -2223,7 +1970,7 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-		if next(out) == nil then
+		if not next(out) then
 			ENUM_VALUE_NAMES_BY_TYPE_CACHE[enumType] = false
 			return false
 		end
@@ -2387,93 +2134,8 @@ function BridgePluginRuntime.start(context)
 		return learned
 	end
 
-	local function exportInstanceSafe(
-		state: ServiceState,
-		instance: Instance,
-		path: string,
-		parentPath: string?,
-		debugId: string?,
-		parentDebugId: string?,
-		instanceId: string?,
-		parentInstanceId: string?,
-		includePathData: boolean?
-	): { [string]: any }
-		return exportInstanceInternal(
-			state,
-			instance,
-			true,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
-	end
-
-	local function exportInstanceWithoutSharedFallback(
-		state: ServiceState,
-		instance: Instance,
-		path: string,
-		parentPath: string?,
-		debugId: string?,
-		parentDebugId: string?,
-		instanceId: string?,
-		parentInstanceId: string?,
-		includePathData: boolean?
-	): { [string]: any }
-		local className = instance.ClassName
-		local safeMode = state.safeReadByClass[className]
-		if safeMode == true then
-			return exportInstanceSafe(
-				state,
-				instance,
-				path,
-				parentPath,
-				debugId,
-				parentDebugId,
-				instanceId,
-				parentInstanceId,
-				includePathData
-			)
-		end
-		if safeMode == false then
-			return exportInstanceFast(
-				state,
-				instance,
-				path,
-				parentPath,
-				debugId,
-				parentDebugId,
-				instanceId,
-				parentInstanceId,
-				includePathData
-			)
-		end
-
-		Config.learnClassPropertyFallbacks(
-			state,
-			instance,
-			className,
-			getClassPropertyCandidates(className) or PROPERTY_CANDIDATES
-		)
-		state.safeReadByClass[className] = false
-		return exportInstanceFast(
-			state,
-			instance,
-			path,
-			parentPath,
-			debugId,
-			parentDebugId,
-			instanceId,
-			parentInstanceId,
-			includePathData
-		)
-	end
-
 	local function serializeAttributesCompactV4(attributes: { [string]: any }, state: ServiceState): any
-		if type(attributes) ~= "table" or next(attributes) == nil then
+		if type(attributes) ~= "table" or not next(attributes) then
 			return false
 		end
 
@@ -4256,7 +3918,7 @@ function BridgePluginRuntime.start(context)
 		strings: { string },
 		stringIds: { [string]: number }
 	): any
-		if type(attributes) ~= "table" or next(attributes) == nil then
+		if type(attributes) ~= "table" or not next(attributes) then
 			return false
 		end
 
@@ -4322,30 +3984,6 @@ function BridgePluginRuntime.start(context)
 		)
 	end
 
-	function Config.exportCompactV5InstanceInternal(
-		state: ServiceState,
-		instance: Instance,
-		instanceIndex: number,
-		forceSafeReads: boolean,
-		strings: { string },
-		stringIds: { [string]: number }
-	): { any }
-		local className = state.classNameByIndex[instanceIndex] or instance.ClassName
-		local hotSchema = Config.getHotPropertySchema(state, className)
-		return Config.exportCompactV5InstanceWithHotSchema(
-			state,
-			instance,
-			instanceIndex,
-			className,
-			hotSchema,
-			forceSafeReads,
-			strings,
-			stringIds,
-			false,
-			false
-		)
-	end
-
 	function Config.exportCompactV5InstanceIndexed(
 		state: ServiceState,
 		inst: Instance,
@@ -4389,23 +4027,15 @@ function BridgePluginRuntime.start(context)
 	end
 
 	function Config.isCompactDemandActive(state: ServiceState): boolean
-		return (state.activeInstanceBatchRequests or state.compactDemandCount or 0) > 0
+		return state.activeInstanceBatchRequests > 0
 	end
 
 	function Config.beginCompactDemand(state: ServiceState)
-		local nextCount = (state.activeInstanceBatchRequests or state.compactDemandCount or 0) + 1
-		state.activeInstanceBatchRequests = nextCount
-		state.compactDemandCount = nextCount
+		state.activeInstanceBatchRequests += 1
 	end
 
 	function Config.endCompactDemand(state: ServiceState)
-		local nextCount = math.max(0, (state.activeInstanceBatchRequests or state.compactDemandCount or 0) - 1)
-		state.activeInstanceBatchRequests = nextCount
-		state.compactDemandCount = nextCount
-	end
-
-	function Config.getCompactDemandWorkerCount(_state: ServiceState, _totalItems: number): number
-		return 1
+		state.activeInstanceBatchRequests = math.max(0, state.activeInstanceBatchRequests - 1)
 	end
 
 	function Config.getDemandSerializerLimit(): number
@@ -4540,9 +4170,6 @@ function BridgePluginRuntime.start(context)
 			error("Unsupported service: " .. tostring(serviceName))
 		end
 		local service = game:GetService(serviceName)
-		if not service then
-			error("Service not found: " .. serviceName)
-		end
 
 			local nativeExport = nativeExportOnly == true
 			local snapshotInstances = if nativeExport and nativeSnapshot then nativeSnapshot.instances else nil
@@ -4554,13 +4181,18 @@ function BridgePluginRuntime.start(context)
 				end
 			else
 				descendants = service:GetDescendants()
-				local included = {}
-				for _, instance in ipairs(descendants) do
+				local descendantCount = #descendants
+				local includedCount = 0
+				for index = 1, descendantCount do
+					local instance = descendants[index]
 					if includeExportInstance(serviceName, instance) then
-						included[#included + 1] = instance
+						includedCount += 1
+						descendants[includedCount] = instance
 					end
 				end
-				descendants = included
+				for index = includedCount + 1, descendantCount do
+					descendants[index] = nil
+				end
 			end
 			local expectedCount = #descendants + 1
 			local instances = table.create(expectedCount)
@@ -4694,10 +4326,8 @@ function BridgePluginRuntime.start(context)
 			classDefaults = nil,
 			classDefaultsEncoded = nil,
 			transportDefaultProperties = nil,
-			serializedInstances = nil,
 			serializedCompactInstances = nil,
 			compactWarmStatus = "idle",
-			compactDemandCount = 0,
 			activeInstanceBatchRequests = 0,
 			scriptPathsEncoded = nil,
 			batchCacheByKey = {},
@@ -4746,42 +4376,16 @@ function BridgePluginRuntime.start(context)
 			IdentityModule.getCachedScriptSourceKey(state, inst)
 			scriptKeyYieldIfNeeded()
 		end
-		if PRE_SERIALIZE_ON_PREPARE then
-			if instanceCount <= PRE_SERIALIZE_MAX_INSTANCES then
-				local serialized = table.create(instanceCount)
-				local workerCount =
-					ParallelModule.getParallelChunkWorkerCount(instanceCount, PARALLEL_PRE_SERIALIZE_MIN_ITEMS)
-				ParallelModule.runParallelChunks(instanceCount, workerCount, function(startIndex, endIndex)
-					for i = startIndex, endIndex do
-						local inst = instances[i]
-						local path = IdentityModule.getCachedInstancePath(state, inst)
-						local parentPath = IdentityModule.getCachedParentPath(state, inst)
-						local debugId = IdentityModule.getCachedDebugId(state, inst)
-						local parentDebugId = IdentityModule.getCachedParentDebugId(state, inst)
-						local instanceId = IdentityModule.getCachedInstanceId(state, inst)
-						local parentInstanceId = IdentityModule.getCachedParentInstanceId(state, inst)
-						serialized[i] = exportInstanceWithoutSharedFallback(
-							state,
-							inst,
-							path,
-							parentPath,
-							debugId,
-							parentDebugId,
-							instanceId,
-							parentInstanceId,
-							true
-						)
-					end
-				end)
-				state.serializedInstances = serialized
-			elseif PRE_SERIALIZE_LARGE_SERVICE_WARM and instanceCount >= PRE_SERIALIZE_WARM_MIN_INSTANCES then
-				Config.startCompactWarm(state)
-			end
+		if
+			PRE_SERIALIZE_ON_PREPARE
+			and PRE_SERIALIZE_LARGE_SERVICE_WARM
+			and instanceCount >= PRE_SERIALIZE_WARM_MIN_INSTANCES
+		then
+			Config.startCompactWarm(state)
 		end
 
-		local preSerializedMode = if state.serializedInstances
-			then "full"
-			elseif state.compactWarmStatus == "scheduled" or state.compactWarmStatus == "warming" then "warming"
+		local preSerializedMode = if state.compactWarmStatus == "scheduled" or state.compactWarmStatus == "warming"
+			then "warming"
 			elseif state.compactWarmStatus == "ready" and state.serializedCompactInstances then "compact"
 			else "off"
 
@@ -4800,7 +4404,6 @@ function BridgePluginRuntime.start(context)
 			classNames = state.classNames,
 			performanceMode = PERFORMANCE_MODE,
 			modifiedDefaultBypass = MODIFIED_DEFAULT_BYPASS_ENABLED,
-			preSerialized = preSerializedMode ~= "off",
 			preSerializedMode = preSerializedMode,
 			propertyCandidatesByClass = getServicePropertyCandidates(state),
 			propertySchemaByClass = getServicePropertySchema(state),
@@ -4835,7 +4438,7 @@ function BridgePluginRuntime.start(context)
 			modifiedDefaultBypass = MODIFIED_DEFAULT_BYPASS_ENABLED,
 			preSerializeOnPrepare = PRE_SERIALIZE_ON_PREPARE,
 			preSerializeLargeServiceWarm = PRE_SERIALIZE_LARGE_SERVICE_WARM,
-			runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {},
+			runtimeSettings = Config.getBridgeSettings(),
 			explicitRuntimeSettings = if Config.getExplicitBridgeSettings
 				then Config.getExplicitBridgeSettings()
 				else {},
@@ -4854,99 +4457,12 @@ function BridgePluginRuntime.start(context)
 		return state
 	end
 
-	ProfilingModule.install(Config, {
-		httpService = HttpService,
-		identityModule = IdentityModule,
-		compactTypeIds = COMPACT_TYPE_IDS,
-		bridgeVersion = BRIDGE_VERSION,
-		runtimeId = Config.bridgeRuntimeId,
-		bridgeBuildUnix = BRIDGE_BUILD_UNIX,
-		protocolVersion = BRIDGE_PROTOCOL_VERSION,
-		codecVersion = CODEC_VERSION,
-		getState = getState,
-		tryRead = tryRead,
-		serializeValue = serializeValue,
-		encodeSchemaValueV5 = encodeSchemaValueV5,
-		serializeAttributesCompactV5 = serializeAttributesCompactV5,
-		exportCompactV5InstanceInternal = Config.exportCompactV5InstanceInternal,
-	})
 	function Config.boundedPositiveInteger(value: any, defaultValue: number, maximum: number): number
 		local numeric = tonumber(value)
 		if not numeric or numeric ~= numeric then
 			return defaultValue
 		end
 		return math.clamp(math.floor(numeric), 1, maximum)
-	end
-
-	function Config.getInstanceBatch(serviceName: string, startIndex: number?, maxCount: number?): (string, number)
-		local state = getState(serviceName)
-		local key = ChunkingModule.getInstanceBatchCacheKey(startIndex, maxCount)
-		local cachedPayload = state.batchCacheByKey[key]
-		if cachedPayload then
-			return cachedPayload, 0
-		end
-
-		local instances = state.instances
-		local total = #instances
-		local startPos = Config.boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
-		local take = Config.boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
-		local encoded: string
-		local encodeMs = 0
-
-		if startPos > total then
-			encoded, encodeMs =
-				ChunkingModule.jsonEncodeTimed({ start = startPos, nextStart = startPos, total = total, items = {} })
-		else
-			local finish = math.min(total, startPos + take - 1)
-			local items = table.create(finish - startPos + 1)
-			local count = finish - startPos + 1
-			if state.serializedInstances then
-				for i = startPos, finish do
-					items[#items + 1] = state.serializedInstances[i]
-				end
-			else
-				local workerCount = ParallelModule.getParallelChunkWorkerCount(count, PARALLEL_INSTANCE_BATCH_MIN_ITEMS)
-				ParallelModule.runParallelChunks(count, workerCount, function(startOffset, endOffset)
-					for offset = startOffset, endOffset do
-						local i = startPos + offset - 1
-						local inst = instances[i]
-						local path = IdentityModule.getCachedInstancePath(state, inst)
-						local parentPath = IdentityModule.getCachedParentPath(state, inst)
-						local debugId = IdentityModule.getCachedDebugId(state, inst)
-						local parentDebugId = IdentityModule.getCachedParentDebugId(state, inst)
-						local instanceId = IdentityModule.getCachedInstanceId(state, inst)
-						local parentInstanceId = IdentityModule.getCachedParentInstanceId(state, inst)
-						items[offset] = exportInstanceWithoutSharedFallback(
-							state,
-							inst,
-							path,
-							parentPath,
-							debugId,
-							parentDebugId,
-							instanceId,
-							parentInstanceId,
-							true
-						)
-					end
-				end)
-			end
-			encoded, encodeMs = ChunkingModule.jsonEncodeTimed({
-				start = startPos,
-				nextStart = finish + 1,
-				total = total,
-				items = items,
-			})
-		end
-
-		state.batchCacheByKey[key] = encoded
-		state.batchCacheKeys[#state.batchCacheKeys + 1] = key
-		if #state.batchCacheKeys > 256 then
-			local oldestKey = table.remove(state.batchCacheKeys, 1)
-			if oldestKey and oldestKey ~= key then
-				state.batchCacheByKey[oldestKey] = nil
-			end
-		end
-		return encoded, encodeMs
 	end
 
 	function Config.nativeRefSelectionContains(selection, instanceIndex: number): boolean
@@ -4993,7 +4509,7 @@ function BridgePluginRuntime.start(context)
 							local packed = game:GetService("EncodingService")
 								:Base64Decode(buffer.fromstring(rawSelection.packed))
 							local count = tonumber(rawSelection.count)
-							if count == nil or count < 1 or count % 1 ~= 0 or buffer.len(packed) ~= count * 3 then
+							if not count or count < 1 or count % 1 ~= 0 or buffer.len(packed) ~= count * 3 then
 								error("Invalid native reference selection")
 							end
 							requested[propertyEntry[1]] = 3
@@ -5200,15 +4716,13 @@ function BridgePluginRuntime.start(context)
 		local instances = state.instances
 		local total = #instances
 		local startPos = Config.boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
-			local take = Config.boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
+		local take = Config.boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
 
 		local function buildPayload(): { [string]: any }
 			if startPos > total then
 				return {
 					format = BRIDGE_PROTOCOL_VERSION,
 					codecVersion = CODEC_VERSION,
-					start = startPos,
-					nextStart = startPos,
 					total = total,
 					strings = {},
 					debugIds = if includeStableIds then {} else nil,
@@ -5221,7 +4735,6 @@ function BridgePluginRuntime.start(context)
 			local items = table.create(count)
 			local strings = table.create(math.min(count * 2, 65536))
 			local stringIds = {}
-			local workerCount = Config.getCompactDemandWorkerCount(state, count)
 			local overlayHotSchemaByClass = nil
 			local nativeRefCandidateSchemas = nil
 			if type(overlayPropertiesByClass) == "table" then
@@ -5311,7 +4824,7 @@ function BridgePluginRuntime.start(context)
 				end
 			elseif MODIFIED_DEFAULT_BYPASS_ENABLED then
 				local workerMetrics = {}
-				ParallelModule.runParallelChunks(count, workerCount, function(startOffset, endOffset)
+				ParallelModule.runParallelChunks(count, 1, function(startOffset, endOffset)
 					local modifiedDefaultChecks = 0
 					local modifiedDefaultElided = 0
 					local modifiedDefaultValidationReads = 0
@@ -5391,7 +4904,7 @@ function BridgePluginRuntime.start(context)
 				end
 				Config.mergeExportMetrics(state, mergedMetrics)
 			else
-				ParallelModule.runParallelChunks(count, workerCount, function(startOffset, endOffset)
+				ParallelModule.runParallelChunks(count, 1, function(startOffset, endOffset)
 					local lastClassName = nil
 					local lastHotSchema = nil
 					local yieldIfNeeded = nil
@@ -5445,11 +4958,7 @@ function BridgePluginRuntime.start(context)
 				return {
 					format = "native-overlay-v3",
 					codecVersion = CODEC_VERSION,
-					start = startPos,
-					nextStart = finish + 1,
 					total = total,
-					defaultElided = true,
-					defaultElisionVersion = 1,
 					strings = strings,
 					debugIdBuffer = debugIdBuffer,
 					debugIdEncoding = if debugIdBuffer then "nul-text-v1" else nil,
@@ -5463,11 +4972,7 @@ function BridgePluginRuntime.start(context)
 					return {
 						format = "compact-v5-shape",
 						codecVersion = CODEC_VERSION,
-						start = startPos,
-						nextStart = finish + 1,
 						total = total,
-						defaultElided = true,
-						defaultElisionVersion = 1,
 						strings = strings,
 						shapes = shapes,
 						debugIds = debugIds,
@@ -5479,11 +4984,7 @@ function BridgePluginRuntime.start(context)
 			return {
 				format = BRIDGE_PROTOCOL_VERSION,
 				codecVersion = CODEC_VERSION,
-				start = startPos,
-				nextStart = finish + 1,
 				total = total,
-				defaultElided = true,
-				defaultElisionVersion = 1,
 				strings = strings,
 				debugIds = debugIds,
 				items = items,
@@ -5552,9 +5053,8 @@ function BridgePluginRuntime.start(context)
 		if not scriptInstance then
 			error(description .. " no longer exists in the export snapshot")
 		end
-		local ok, source = pcall(function()
-			return ScriptEditorService:GetEditorSource(scriptInstance :: LuaSourceContainer)
-		end)
+		local ok, source =
+			pcall(ScriptEditorService.GetEditorSource, ScriptEditorService, scriptInstance :: LuaSourceContainer)
 		if not ok then
 			ok, source = pcall(function()
 				return scriptInstance.Source
@@ -5621,7 +5121,7 @@ function BridgePluginRuntime.start(context)
 			end
 			normalizedPaths[i] = sourceKey
 		end
-		local cacheKey = ChunkingModule.getSourceBatchCacheKey(instancePaths)
+		local cacheKey = ChunkingModule.getSourceBatchCacheKey(normalizedPaths)
 		local cachedPayload = state.sourceBatchCacheByKey[cacheKey]
 		if cachedPayload then
 			return cachedPayload, 0
@@ -5673,10 +5173,6 @@ function BridgePluginRuntime.start(context)
 		local encodeMs = 0
 		if startPos > total then
 			encoded, encodeMs = ChunkingModule.jsonEncodeTimed({
-				format = "source-pairs-v2",
-				start = startPos,
-				nextStart = startPos,
-				total = total,
 				items = {},
 			})
 		else
@@ -5700,10 +5196,6 @@ function BridgePluginRuntime.start(context)
 				items[#items + 1] = sourcesByIndex[offset]
 			end
 			encoded, encodeMs = ChunkingModule.jsonEncodeTimed({
-				format = "source-pairs-v2",
-				start = startPos,
-				nextStart = finish + 1,
-				total = total,
 				items = items,
 			})
 		end
@@ -5729,17 +5221,6 @@ function BridgePluginRuntime.start(context)
 		return ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
 	end
 
-	function Config.getInstanceBatchChunk(
-		serviceName: string,
-		startIndex: number?,
-		maxCount: number?,
-		chunkStart: number?,
-		maxLen: number?
-	): { [string]: any }
-		local encoded, encodeMs = Config.getInstanceBatch(serviceName, startIndex, maxCount)
-		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-	end
-
 	function Config.getInstanceBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
@@ -5753,8 +5234,8 @@ function BridgePluginRuntime.start(context)
 		overlayVariant: string?,
 		stateOverride: ServiceState?
 	): { [string]: any }
-			local encoded, encodeMs = Config.getInstanceBatchCompact(
-				serviceName,
+		local encoded, encodeMs = Config.getInstanceBatchCompact(
+			serviceName,
 			startIndex,
 			maxCount,
 			not not shapeBatchesEnabled,
@@ -5762,33 +5243,29 @@ function BridgePluginRuntime.start(context)
 			overlayPropertiesByClass,
 			overlayId,
 			overlayVariant,
-				stateOverride
+			stateOverride
+		)
+		local result = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
+		if type(overlayId) == "string" and overlayId ~= "" and result.nextStart > result.total then
+			local state = stateOverride or getState(serviceName)
+			local key = Config.getCompactInstanceBatchVariantCacheKey(
+				startIndex,
+				maxCount,
+				not not shapeBatchesEnabled,
+				not not stableIdsEnabled,
+				overlayId,
+				overlayVariant
 			)
-			local result = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-			if
-				type(overlayId) == "string"
-				and overlayId ~= ""
-				and result.nextStart > result.total
-			then
-				local state = stateOverride or getState(serviceName)
-				local key = Config.getCompactInstanceBatchVariantCacheKey(
-					startIndex,
-					maxCount,
-					not not shapeBatchesEnabled,
-					not not stableIdsEnabled,
-					overlayId,
-					overlayVariant
-				)
-				state.batchCacheByKey[key] = nil
-				for index, cachedKey in ipairs(state.batchCacheKeys) do
-					if cachedKey == key then
-						table.remove(state.batchCacheKeys, index)
-						break
-					end
+			state.batchCacheByKey[key] = nil
+			for index, cachedKey in ipairs(state.batchCacheKeys) do
+				if cachedKey == key then
+					table.remove(state.batchCacheKeys, index)
+					break
 				end
 			end
-			return result
 		end
+		return result
+	end
 
 	function Config.getClassDefaultsChunk(serviceName: string, startIndex: number?, maxLen: number?): { [string]: any }
 		local encoded, encodeMs = Config.getClassDefaults(serviceName)
@@ -5812,10 +5289,6 @@ function BridgePluginRuntime.start(context)
 	end
 
 	Config.bridgeMethodHandlers = {}
-
-	Config.bridgeMethodHandlers.ping = function()
-		return { ok = true, timestamp = os.time() }
-	end
 
 	Config.bridgeMethodHandlers.getBridgeInfo = function()
 		return Config.getBridgeInfo()
@@ -5936,7 +5409,7 @@ function BridgePluginRuntime.start(context)
 				changeCount = upload.changeCount,
 				rows = rows,
 			},
-			Config.getBridgeSettings and Config.getBridgeSettings() or {},
+			Config.getBridgeSettings(),
 			{
 				decodeValue = editorSync.decodeReviewValue,
 				readProperty = editorSync.readReviewProperty,
@@ -5954,7 +5427,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	Config.bridgeMethodHandlers.requestEditorPushReview = function(p)
-		return ui.requestEditorPushReview(p, Config.getBridgeSettings and Config.getBridgeSettings() or {}, {
+		return ui.requestEditorPushReview(p, Config.getBridgeSettings(), {
 			decodeValue = editorSync.decodeReviewValue,
 			readProperty = editorSync.readReviewProperty,
 			valuesEqual = EditorSyncModule.valuesEqual,
@@ -5974,15 +5447,10 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.getEditorPushReviewDecision = ui.getEditorPushReviewDecision
 	Config.bridgeMethodHandlers.setEditorPushReviewDecision = ui.setEditorPushReviewDecision
 
-	Config.bridgeMethodHandlers.savePlace = function()
-		return { ok = game:SavePlace(Enum.SaveFilter.SaveAll) }
-	end
-
 	Config.bridgeMethodHandlers.beginEditorBinaryExport = function(p)
 		return editorSync.beginBinaryExport(p)
 	end
 	Config.bridgeMethodHandlers.awaitEditorBinaryExport = editorSync.awaitBinaryExport
-	Config.bridgeMethodHandlers.getEditorBinaryExportStatus = editorSync.getBinaryExportStatus
 	Config.bridgeMethodHandlers.readEditorBinaryExport = editorSync.readBinaryExport
 	Config.bridgeMethodHandlers.readEditorBinaryExportBatch = editorSync.readBinaryExportBatch
 	Config.bridgeMethodHandlers.finishEditorBinaryExport = function(p)
@@ -6054,7 +5522,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	Config.bridgeMethodHandlers.getStudioChangeState = function(p)
-		local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
+		local runtimeSettings = Config.getBridgeSettings()
 		local explicitRuntimeSettings = if Config.getExplicitBridgeSettings
 			then Config.getExplicitBridgeSettings()
 			else {}
@@ -6117,32 +5585,15 @@ function BridgePluginRuntime.start(context)
 		return prepareService(tostring(p.service))
 	end
 
-	Config.bridgeMethodHandlers.profilePluginOps = function(p)
-		return Config.profilePluginOps(tostring(p.service), tonumber(p.sampleCount), tonumber(p.iterations), p.flags)
-	end
-
-	Config.bridgeMethodHandlers.getInstanceBatchChunk = function(p)
-		return Config.getInstanceBatchChunk(tostring(p.service), p.startIndex, p.maxCount, p.chunkStart, p.maxLen)
-	end
-
 	Config.bridgeMethodHandlers.getInstanceBatchCompactChunk = function(p)
-		local shapeBatchesEnabled = p.supportsShapeBatches == true or p.shapeCompact == true or p.shapeCompactV5 == true
-		if not shapeBatchesEnabled and type(p.supportedFormats) == "table" then
-			for _, formatName in pairs(p.supportedFormats) do
-				if formatName == "compact-v5-shape" or formatName == "compact-v6-shape" then
-					shapeBatchesEnabled = true
-					break
-				end
-			end
-		end
 		return Config.getInstanceBatchCompactChunk(
 			tostring(p.service),
 			p.startIndex,
 			p.maxCount,
 			p.chunkStart,
 			p.maxLen,
-			shapeBatchesEnabled,
-			p.supportsStableInstanceIds == true or p.stableInstanceIds == true
+			p.supportsShapeBatches == true,
+			p.supportsStableInstanceIds == true
 		)
 	end
 
@@ -6247,7 +5698,7 @@ function BridgePluginRuntime.start(context)
 		stallCountOver100MsSinceLastRead = 0,
 	}
 
-	RunService.Heartbeat:Connect(function(dt: number)
+	lifetimeConnections[#lifetimeConnections + 1] = RunService.Heartbeat:Connect(function(dt: number)
 		if dt <= 0 then
 			return
 		end
@@ -6287,7 +5738,6 @@ function BridgePluginRuntime.start(context)
 		finishEditorBinaryImport = true,
 		beginEditorBinaryExport = true,
 		finishEditorBinaryExport = true,
-		savePlace = true,
 		setConflictResolution = true,
 		deviceSimulator = true,
 		captureViewportProbe = true,
@@ -6302,7 +5752,6 @@ function BridgePluginRuntime.start(context)
 		cancelEditorReconcile = true,
 		cancelLuauExecution = true,
 		awaitEditorBinaryExport = true,
-		getEditorBinaryExportStatus = true,
 		readEditorBinaryExport = true,
 		readEditorBinaryExportBatch = true,
 		getEditorBinaryOverlayChunk = true,
@@ -6330,7 +5779,6 @@ function BridgePluginRuntime.start(context)
 		getEditorPushReviewDecision = true,
 		getEditorFilterCandidates = true,
 		setEditorPushReviewDecision = true,
-		savePlace = true,
 		beginEditorBinaryExport = true,
 		finishEditorBinaryExport = true,
 		getStudioChangeState = true,
@@ -6344,7 +5792,6 @@ function BridgePluginRuntime.start(context)
 		startStopPlay = true,
 		prepareForNextRun = true,
 		prepare = true,
-		profilePluginOps = true,
 		release = true,
 	}
 
@@ -6362,12 +5809,10 @@ function BridgePluginRuntime.start(context)
 		reconnectSeconds = RECONNECT_SECONDS,
 		fastReconnectSeconds = FAST_RECONNECT_SECONDS,
 		fastReconnectWindowSeconds = FAST_RECONNECT_WINDOW_SECONDS,
-		connectOpenTimeoutSeconds = CONNECT_OPEN_TIMEOUT_SECONDS,
-		fastConnectOpenTimeoutSeconds = FAST_CONNECT_OPEN_TIMEOUT_SECONDS,
+		maxConnectionFailures = MAX_CONNECTION_FAILURES,
 		connectSessionTimeoutSeconds = CONNECT_SESSION_TIMEOUT_SECONDS,
 		nextRunCloseDelaySeconds = NEXT_RUN_CLOSE_DELAY_SECONDS,
 		nextRunReconnectDelaySeconds = NEXT_RUN_RECONNECT_DELAY_SECONDS,
-		nextRunConnectTimeoutSeconds = NEXT_RUN_CONNECT_TIMEOUT_SECONDS,
 		nextRunFastWindowSeconds = NEXT_RUN_FAST_WINDOW_SECONDS,
 		debugBridgeConnection = DEBUG_BRIDGE_CONNECTION,
 		bridgeVersion = BRIDGE_VERSION,
@@ -6414,42 +5859,38 @@ function BridgePluginRuntime.start(context)
 		acquireSessionLock = sessionLock.acquire,
 		releaseSessionLock = sessionLock.release,
 		inspectSessionLock = sessionLock.inspect,
-		ownsSessionLock = sessionLock.owns,
 		captureSessionLock = sessionLock.capture,
 		validateSessionLock = sessionLock.validate,
 		setExclusiveSessionGeneration = function(generation)
 			activeExclusiveSessionGeneration = generation
 		end,
 		requestShutdown = function(unloading: boolean)
-			if editorSync ~= nil and type(editorSync.requestCancellation) == "function" then
-				editorSync.requestCancellation()
-			end
-			local runtimeCleanupGeneration = nil
-			if type(RuntimeApi.requestCancellation) == "function" then
-				runtimeCleanupGeneration = RuntimeApi.requestCancellation()
-			end
+			editorSync.requestCancellation()
+			local runtimeCleanupGeneration = RuntimeApi.requestCancellation()
 			return function()
 				if unloading and Config.studioChangeNotificationConnection then
 					Config.studioChangeNotificationConnection:Disconnect()
 					Config.studioChangeNotificationConnection = nil
 				end
-				table.clear(Config.editorReviewUploads)
-				if editorSync and type(editorSync.cleanup) == "function" then
-					editorSync.cleanup()
+				if unloading then
+					for _, connection in ipairs(lifetimeConnections) do
+						connection:Disconnect()
+					end
+					table.clear(lifetimeConnections)
 				end
-				if unloading and Config.studioChanges and type(Config.studioChanges.stop) == "function" then
+				table.clear(Config.editorReviewUploads)
+				editorSync.cleanup()
+				if unloading then
 					Config.studioChanges.stop()
 				end
 				table.clear(transactionExpectations)
-				if type(RuntimeApi.cleanup) == "function" then
-					RuntimeApi.cleanup(runtimeCleanupGeneration)
-				end
+				RuntimeApi.cleanup(runtimeCleanupGeneration)
 			end
 		end,
 	})
 	Config.studioChangeNotificationConnection = Config.studioChanges.onChanged(function()
 		Config.updateStatusText()
-		local runtimeSettings = Config.getBridgeSettings and Config.getBridgeSettings() or {}
+		local runtimeSettings = Config.getBridgeSettings()
 		local pendingCount = Config.studioChanges.pendingChangeCount()
 		if runtimeSettings.notifications ~= false and not Config.hasOpenChannel() and pendingCount > 0 then
 			local threshold = tonumber(runtimeSettings.changesThreshold) or 5

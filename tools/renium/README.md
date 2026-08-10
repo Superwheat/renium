@@ -103,8 +103,6 @@ default local endpoint).
 until it is stopped. `--editor-stdio` is reserved for the VS Code extension's
 owned child process: it reads daemon requests from stdin and exits when its
 owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.
-The older `-s`/`--serve` spelling is accepted for compatibility but is no
-longer required.
 
 ## Projects, adapters, and builds
 
@@ -539,8 +537,7 @@ rbx view links\ui-kit.renium --json                       # structured JSON
 ```
 
 Same decoder as the sync itself, so what you see is what syncs. In VS Code,
-double-click any `.renium` for the same view. Legacy `.rbsync` stores remain
-readable and are promoted on the next write.
+double-click any `.renium` for the same view.
 
 ## Wally packages
 
@@ -590,7 +587,6 @@ lx   execute-luau             ba   bytecode-add-instance
 dev  studio-device
 play start-stop-play          bcl  bytecode-clone-instance
 st   studio-change-state      br   bytecode-remove-instance
-prof profile-plugin-ops       bem  bytecode-export-model
 push push-editor-changes      bep  bytecode-export-place
 review editor-review-decision
 prop apply-editor-property    bim  bytecode-import-model

@@ -1,9 +1,12 @@
 local BridgeEditorSync = {}
 
 local BridgeCandidateMatch = require(script.Parent.BridgeCandidateMatch)
+local BridgeIdentity = require(script.Parent.BridgeIdentity)
 local BridgeInstanceSwap = require(script.Parent.BridgeInstanceSwap)
 local BridgeMaterialService = require(script.Parent.BridgeMaterialService)
+local BridgeReferenceOverlay = require(script.Parent.BridgeReferenceOverlay)
 local BridgeReferenceRetarget = require(script.Parent.BridgeReferenceRetarget)
+local BridgeScriptDocuments = require(script.Parent.BridgeScriptDocuments)
 local BridgeValueEquality = require(script.Parent.BridgeValueEquality)
 local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
 local AssetService = game:GetService("AssetService")
@@ -15,7 +18,6 @@ local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
 local SerializationService = game:GetService("SerializationService")
 local Workspace = game:GetService("Workspace")
-local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local RbxDomModule = require(script.Parent.RbxDom)
 
@@ -43,7 +45,7 @@ local function denseArrayLength(raw: any): (boolean, number)
 	return true, length
 end
 
-local PATH_SEPARATOR = "\0"
+local PATH_SEPARATOR = BridgeIdentity.PATH_SEPARATOR
 local reconcileSessions = {}
 local binaryImports = {}
 local completedBinaryImports = {}
@@ -73,7 +75,7 @@ local function expireSession(values: { [any]: any }, key: any, session: { [any]:
 	if values[key] ~= session then
 		return false
 	end
-	if (tonumber(session.activeOperations) or 0) > 0 then
+	if (session.activeOperations or 0) > 0 then
 		session.expireRequested = true
 		return false
 	end
@@ -91,27 +93,21 @@ local function expireSession(values: { [any]: any }, key: any, session: { [any]:
 end
 
 local function beginSessionOperation(session: { [any]: any })
-	session.activeOperations = (tonumber(session.activeOperations) or 0) + 1
+	session.activeOperations = (session.activeOperations or 0) + 1
 	session.updatedAt = os.clock()
 end
 
 local function endSessionOperation(values: { [any]: any }, key: any, session: { [any]: any })
-	session.activeOperations = math.max(0, (tonumber(session.activeOperations) or 1) - 1)
+	session.activeOperations -= 1
 	if session.activeOperations == 0 and session.expireRequested then
 		expireSession(values, key, session)
 	end
 end
 
 local function runWithStudioChangeSuppression(ctx: { [string]: any }, operation)
-	local suppress = type(ctx.beginStudioChangeSuppression) == "function"
-		and type(ctx.endStudioChangeSuppression) == "function"
-	if suppress then
-		ctx.beginStudioChangeSuppression(nil)
-	end
+	ctx.beginStudioChangeSuppression(nil)
 	local result = table.pack(xpcall(operation, debug.traceback))
-	if suppress then
-		ctx.endStudioChangeSuppression()
-	end
+	ctx.endStudioChangeSuppression()
 	if not result[1] then
 		error(result[2], 0)
 	end
@@ -131,12 +127,8 @@ end
 local function pruneExpiredSessions(values: { [any]: any })
 	local now = os.clock()
 	for key, session in pairs(values) do
-		if type(session) ~= "table" or now - (tonumber(session.updatedAt) or 0) > SESSION_TTL_SECONDS then
-			if type(session) == "table" then
-				expireSession(values, key, session)
-			else
-				values[key] = nil
-			end
+		if now - session.updatedAt > SESSION_TTL_SECONDS then
+			expireSession(values, key, session)
 		end
 	end
 end
@@ -167,18 +159,28 @@ local function armSessionExpiry(values: { [any]: any }, key: any, session: { [an
 		return
 	end
 	session.updatedAt = os.clock()
-	session.expiryToken = (tonumber(session.expiryToken) or 0) + 1
-	local expiryToken = session.expiryToken
-	task.delay(SESSION_TTL_SECONDS, function()
-		if values[key] == session and session.expiryToken == expiryToken then
-			expireSession(values, key, session)
+	if session.expiryArmed then
+		return
+	end
+	session.expiryArmed = true
+	local function expireWhenIdle()
+		if values[key] ~= session then
+			return
 		end
-	end)
+		local remaining = SESSION_TTL_SECONDS - (os.clock() - session.updatedAt)
+		if remaining > 0 then
+			task.delay(remaining, expireWhenIdle)
+			return
+		end
+		session.expiryArmed = nil
+		expireSession(values, key, session)
+	end
+	task.delay(SESSION_TTL_SECONDS, expireWhenIdle)
 end
 
 local function beginHistoryRecording(label: string): any?
 	return ChangeHistoryService:TryBeginRecording(
-		("Renium:%s:%s"):format(label, tostring(os.clock())),
+		`Renium:{label}:{os.clock()}`,
 		"Renium: " .. label
 	)
 end
@@ -192,8 +194,7 @@ local function finishHistoryRecording(recording: any?, operation: any?)
 end
 
 local function captureExplorerSelection(): { Instance }
-	local selected = Selection:Get()
-	return if type(selected) == "table" then selected else {}
+	return Selection:Get()
 end
 
 local function restoreExplorerSelection(selected: { Instance }, replacements: { [Instance]: Instance }?)
@@ -208,7 +209,7 @@ local function restoreExplorerSelection(selected: { Instance }, replacements: { 
 end
 
 local function cancelExpectedEvent(ctx: { [string]: any }?, token: any)
-	if token ~= nil and type(ctx) == "table" and type(ctx.cancelExpectedEvent) == "function" then
+	if token ~= nil and ctx ~= nil then
 		ctx.cancelExpectedEvent(token)
 	end
 end
@@ -218,7 +219,7 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		return
 	end
 	local token = nil
-	if type(ctx) == "table" and type(ctx.expectParentChange) == "function" then
+	if ctx ~= nil then
 		token = ctx.expectParentChange(instance, parent)
 	end
 	local ok, result = pcall(function()
@@ -235,7 +236,7 @@ local function setNameForSync(instance: Instance, name: string, ctx: { [string]:
 		return
 	end
 	local token = nil
-	if instance:IsDescendantOf(game) and type(ctx) == "table" and type(ctx.expectPropertyEvent) == "function" then
+	if instance:IsDescendantOf(game) and ctx ~= nil then
 		token = ctx.expectPropertyEvent(instance, "Name", name)
 	end
 	local ok, result = pcall(function()
@@ -252,7 +253,7 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 		return
 	end
 	local token = nil
-	if type(ctx) == "table" and type(ctx.expectPropertyEvent) == "function" then
+	if ctx ~= nil then
 		token = ctx.expectPropertyEvent(Workspace, "CurrentCamera", camera)
 	end
 	local ok, result = pcall(function()
@@ -268,96 +269,10 @@ local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?
 	setParentForSync(instance, nil, ctx)
 end
 
-local function pathKey(pathSegments: any): string
-	if type(pathSegments) ~= "table" then
-		return ""
-	end
-	local out = table.create(#pathSegments)
-	for i = 1, #pathSegments do
-		out[i] = tostring(pathSegments[i])
-	end
-	return table.concat(out, PATH_SEPARATOR)
-end
-
-local function pathOrdinalsKey(pathOrdinals: any): string
-	if type(pathOrdinals) ~= "table" then
-		return ""
-	end
-	local out = table.create(#pathOrdinals)
-	for i = 1, #pathOrdinals do
-		out[i] = tostring(tonumber(pathOrdinals[i]) or 1)
-	end
-	return table.concat(out, ",")
-end
-
-local function pathCacheKey(pathSegments: any, pathOrdinals: any): string
-	local base = pathKey(pathSegments)
-	local ordinals = pathOrdinalsKey(pathOrdinals)
-	if ordinals == "" then
-		return base
-	end
-	return base .. PATH_SEPARATOR .. "ord" .. PATH_SEPARATOR .. ordinals
-end
-
-local function resolveOrdinalChild(parent: Instance, childName: string, ordinal: number): Instance?
-	if ordinal <= 1 then
-		return parent:FindFirstChild(childName)
-	end
-	local seen = 0
-	for _, child in ipairs(parent:GetChildren()) do
-		if child.Name == childName then
-			seen += 1
-			if seen == ordinal then
-				return child
-			end
-		end
-	end
-	return nil
-end
-
-local function resolvePathSegments(pathSegments: any, resolveCache: { [string]: any }?, pathOrdinals: any?): Instance?
-	if type(pathSegments) ~= "table" or #pathSegments == 0 then
-		return nil
-	end
-
-	local cacheKey = nil
-	if resolveCache ~= nil then
-		cacheKey = pathCacheKey(pathSegments, pathOrdinals)
-		local cached = resolveCache[cacheKey]
-		if cached ~= nil then
-			if cached == false then
-				return nil
-			end
-			if typeof(cached) == "Instance" and cached.Parent ~= nil and cached:IsDescendantOf(game) then
-				return cached
-			end
-		end
-	end
-
-	local first = tostring(pathSegments[1])
-	local current = game:GetService(first)
-	if current == nil then
-		if resolveCache ~= nil and cacheKey ~= nil then
-			resolveCache[cacheKey] = false
-		end
-		return nil
-	end
-
-	for i = 2, #pathSegments do
-		local ordinal = if type(pathOrdinals) == "table" then tonumber(pathOrdinals[i]) or 1 else 1
-		current = resolveOrdinalChild(current, tostring(pathSegments[i]), ordinal)
-		if current == nil then
-			if resolveCache ~= nil and cacheKey ~= nil then
-				resolveCache[cacheKey] = false
-			end
-			return nil
-		end
-	end
-	if resolveCache ~= nil and cacheKey ~= nil then
-		resolveCache[cacheKey] = current
-	end
-	return current
-end
+local pathKey = BridgeIdentity.pathKey
+local pathCacheKey = BridgeIdentity.pathCacheKey
+local resolveOrdinalChild = BridgeIdentity.resolveOrdinalChild
+local resolvePathSegments = BridgeIdentity.resolvePathSegments
 
 local function containsPackageLink(root: Instance): boolean
 	return root:IsA("PackageLink") or root:FindFirstChildWhichIsA("PackageLink", true) ~= nil
@@ -379,12 +294,7 @@ local function strongSettingsId(raw: any): boolean
 	return settingsId ~= nil and string.sub(settingsId, 1, 6) == "debug:"
 end
 
-local function liveInstance(value: any): Instance?
-	if typeof(value) == "Instance" and value.Parent ~= nil and value:IsDescendantOf(game) then
-		return value
-	end
-	return nil
-end
+local liveInstance = BridgeIdentity.liveInstance
 
 local function matchedSettingsInstance(serviceName: string, rawSettingsId: any, ctx: { [string]: any }): Instance?
 	local settingsId = settingsIdText(rawSettingsId)
@@ -439,18 +349,16 @@ local function clearMatchedSettingsInstances(serviceName: string, ctx: { [string
 end
 
 local function getStateForService(serviceName: string, ctx: { [string]: any }): any
-	if serviceName == "" or type(ctx.getState) ~= "function" then
+	if serviceName == "" then
 		return nil
 	end
 	return ctx.getState(serviceName)
 end
 
 local function parseInstanceIndexId(settingsId: string, identityModule: any): number?
-	if type(identityModule) == "table" and type(identityModule.parseInstanceIndexId) == "function" then
-		local index = identityModule.parseInstanceIndexId(settingsId)
-		if type(index) == "number" then
-			return index
-		end
+	local index = identityModule.parseInstanceIndexId(settingsId)
+	if type(index) == "number" then
+		return index
 	end
 	return tonumber(settingsId, 16)
 end
@@ -483,11 +391,9 @@ local function settingsIdLookupForService(serviceName: string, ctx: { [string]: 
 						lookup[instanceId] = instance
 					end
 				end
-				if type(identityModule) == "table" and type(identityModule.getCachedDebugId) == "function" then
-					local debugId = identityModule.getCachedDebugId(state, instance)
-					if type(debugId) == "string" and debugId ~= "" then
-						lookup["debug:" .. debugId] = instance
-					end
+				local debugId = identityModule.getCachedDebugId(state, instance)
+				if type(debugId) == "string" and debugId ~= "" then
+					lookup["debug:" .. debugId] = instance
 				end
 			end
 		end
@@ -527,7 +433,7 @@ local function resolveInstanceBySettingsId(serviceName: string, rawSettingsId: a
 		return instance
 	end
 	local index = parseInstanceIndexId(settingsId, ctx.identityModule)
-	if index ~= nil and index >= 1 then
+	if index and index >= 1 then
 		instance = liveInstance(lookup[string.format("%x", index)])
 		if instance ~= nil then
 			return instance
@@ -556,7 +462,7 @@ local function resolveInstance(
 			end
 		end
 	end
-	if type(pathSegments) == "table" and type(ctx.resolveStagedPath) == "function" then
+	if type(pathSegments) == "table" and ctx.resolveStagedPath ~= nil then
 		local staged = ctx.resolveStagedPath(pathSegments, change.pathOrdinals)
 		if staged ~= nil and (allowClassMismatch or instanceMatchesExpectedClass(staged, change.className)) then
 			return staged
@@ -678,19 +584,13 @@ local function instanceSettingsIdKeys(
 		end
 	end
 	local identityModule = ctx.identityModule
-	if type(identityModule) == "table" then
-		if type(identityModule.getCachedInstanceIndex) == "function" then
-			local index = identityModule.getCachedInstanceIndex(state, instance)
-			if type(index) == "number" and index >= 1 then
-				keys[string.format("%x", index)] = true
-			end
-		end
-		if type(identityModule.getCachedDebugId) == "function" then
-			local debugId = identityModule.getCachedDebugId(state, instance)
-			if type(debugId) == "string" and debugId ~= "" then
-				keys["debug:" .. debugId] = true
-			end
-		end
+	local index = identityModule.getCachedInstanceIndex(state, instance)
+	if type(index) == "number" and index >= 1 then
+		keys[string.format("%x", index)] = true
+	end
+	local debugId = identityModule.getCachedDebugId(state, instance)
+	if type(debugId) == "string" and debugId ~= "" then
+		keys["debug:" .. debugId] = true
 	end
 	return keys
 end
@@ -716,8 +616,8 @@ local function rememberReplacementIdentity(
 	local parsedIndex = if settingsId ~= nil then parseInstanceIndexId(settingsId, ctx.identityModule) else nil
 	local index = if type(parsedIndex) == "number" and parsedIndex >= 1 then parsedIndex else nil
 	if type(state.instances) == "table" then
-		local indexedInstance = if index ~= nil then liveInstance(state.instances[index]) else nil
-		if index == nil or indexedInstance ~= oldInstance then
+		local indexedInstance = if index then liveInstance(state.instances[index]) else nil
+		if not index or indexedInstance ~= oldInstance then
 			for candidateIndex, candidate in ipairs(state.instances) do
 				if candidate == oldInstance then
 					index = candidateIndex
@@ -725,7 +625,7 @@ local function rememberReplacementIdentity(
 				end
 			end
 		end
-		if index ~= nil then
+		if index then
 			state.instances[index] = replacement
 			keys[string.format("%x", index)] = true
 		end
@@ -741,7 +641,7 @@ local function rememberReplacementIdentity(
 		local oldIndex = state.instanceIndexByInstance[oldInstance]
 		if oldIndex ~= nil then
 			state.instanceIndexByInstance[replacement] = oldIndex
-		elseif index ~= nil then
+		elseif index then
 			state.instanceIndexByInstance[replacement] = index
 		end
 	end
@@ -790,7 +690,7 @@ local function instanceMatchesDesiredSettingsId(
 	ctx: { [string]: any },
 	desiredSettingsIds: { [string]: boolean }
 ): boolean
-	if next(desiredSettingsIds) == nil then
+	if not next(desiredSettingsIds) then
 		return false
 	end
 	for key in pairs(instanceSettingsIdKeys(serviceName, instance, ctx)) do
@@ -822,65 +722,11 @@ local function shouldKeepInstanceByDesiredEntry(
 	return key ~= "" and (desiredKeys[key] or desiredKeys[legacyKey]) or false
 end
 
-local function getInstancePathSegments(instance: Instance): { string }?
-	if instance == game or not instance:IsDescendantOf(game) then
-		return nil
-	end
-	local segments = {}
-	local current: Instance? = instance
-	while current ~= nil and current ~= game do
-		table.insert(segments, 1, current.Name)
-		current = current.Parent
-	end
-	return segments
-end
-
-local function getSiblingNameOrdinal(instance: Instance): number
-	local parent = instance.Parent
-	if parent == nil then
-		return 1
-	end
-	local ordinal = 0
-	for _, child in ipairs(parent:GetChildren()) do
-		if child.Name == instance.Name then
-			ordinal += 1
-			if child == instance then
-				return ordinal
-			end
-		end
-	end
-	return 1
-end
-
-local function getInstancePathOrdinals(instance: Instance): { number }?
-	if instance == game or not instance:IsDescendantOf(game) then
-		return nil
-	end
-	local ordinals = {}
-	local current: Instance? = instance
-	while current ~= nil and current ~= game do
-		table.insert(ordinals, 1, getSiblingNameOrdinal(current))
-		current = current.Parent
-	end
-	return ordinals
-end
-
-local function getServiceRoot(serviceName: string): Instance?
-	if serviceName == "" then
-		return nil
-	end
-	return game:GetService(serviceName)
-end
-
 local function assertAllowedService(serviceName: string, ctx: { [string]: any }): Instance
-	if serviceName == "" or type(ctx.allowedServices) ~= "table" or not ctx.allowedServices[serviceName] then
+	if serviceName == "" or not ctx.allowedServices[serviceName] then
 		error("Refusing editor mutation outside an allowed service: " .. tostring(serviceName))
 	end
-	local service = getServiceRoot(serviceName)
-	if service == nil then
-		error("Service was not found: " .. serviceName)
-	end
-	return service
+	return game:GetService(serviceName)
 end
 
 local function validateChangePath(change: { [string]: any }, serviceName: string, ctx: { [string]: any })
@@ -939,68 +785,11 @@ local function isProtectedWorkspaceCameraInstance(instance: Instance?): boolean
 	return instance.Name == "Camera" or instance.Name == "CurrentCamera"
 end
 
-local function decodeNumberFields(raw: any, fields: { any }): (boolean, any)
-	if type(raw) ~= "table" then
-		return false, "Typed numeric value must be an object"
-	end
-	local values = table.create(#fields)
-	for index, field in ipairs(fields) do
-		local names = if type(field) == "table" then field else { field }
-		local rawValue = nil
-		for _, name in ipairs(names) do
-			if raw[name] ~= nil then
-				rawValue = raw[name]
-				break
-			end
-		end
-		local value = BridgeValueCodec.decodeNumber(rawValue)
-		if not value then
-			return false, tostring(names[1]) .. " must be a number"
-		end
-		values[index] = value
-	end
-	return true, values
-end
-
-local function decodeColor3(raw: any): (boolean, any)
-	if typeof(raw) == "Color3" then
-		return true, raw
-	end
-	local ok, values = decodeNumberFields(raw, {
-		{ "r", "R", 1 },
-		{ "g", "G", 2 },
-		{ "b", "B", 3 },
-	})
-	if not ok then
-		return false, "Color3 " .. tostring(values)
-	end
-	return true, Color3.new(values[1], values[2], values[3])
-end
-
-local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boolean, any)
-	local rawEnumType = tostring(raw.enumType or "")
-	local enumType = if rawEnumType ~= ""
-			or not enumHint
-			or enumHint == ""
-		then rawEnumType
-		elseif string.sub(enumHint, 1, 5) == "Enum." then enumHint
-		else "Enum." .. enumHint
-	local enumName = string.gsub(enumType, "^Enum%.", "")
-	local itemName = tostring(raw.name or "")
-	local ok, item = pcall(function()
-		return (Enum :: any)[enumName][itemName]
-	end)
-	if ok and item ~= nil then
-		return true, item
-	end
-	return false, ("Unknown enum item %s.%s"):format(enumType, itemName)
-end
-
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
 	local targetServiceName = if type(raw.pathSegments) == "table" and #raw.pathSegments > 0
 		then tostring(raw.pathSegments[1])
 		else serviceName
-	if type(ctx) == "table" and type(ctx.resolveStagedPath) == "function" and type(raw.pathSegments) == "table" then
+	if ctx ~= nil and ctx.resolveStagedPath ~= nil and type(raw.pathSegments) == "table" then
 		local staged = ctx.resolveStagedPath(raw.pathSegments, raw.pathOrdinals)
 		if staged ~= nil then
 			return staged
@@ -1013,7 +802,7 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 		end
 	end
 	local settingsInstance: Instance? = nil
-	if type(ctx) == "table" and type(targetServiceName) == "string" and targetServiceName ~= "" then
+	if ctx ~= nil and type(targetServiceName) == "string" and targetServiceName ~= "" then
 		local settingsId = raw.settingsId or raw.instanceId
 		if settingsId == nil and type(raw.debugId) == "string" and raw.debugId ~= "" then
 			settingsId = "debug:" .. raw.debugId
@@ -1031,251 +820,7 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 end
 
 local function decodeValue(raw: any, enumHint: string?, ctx: { [string]: any }?, serviceName: string?): (boolean, any)
-	if type(raw) ~= "table" then
-		return true, raw
-	end
-
-	local typeName = raw._type
-	if typeName == nil and enumHint == "FontFace" and raw.family ~= nil then
-		typeName = "Font"
-	elseif typeName == nil and raw.BrickColor ~= nil then
-		typeName = "BrickColor"
-	elseif typeName == nil and type(raw.ColorSequence) == "table" then
-		raw = raw.ColorSequence
-		typeName = "ColorSequence"
-	elseif typeName == nil and type(raw.NumberSequence) == "table" then
-		raw = raw.NumberSequence
-		typeName = "NumberSequence"
-	elseif typeName == nil and type(raw.NumberRange) == "table" then
-		raw = raw.NumberRange
-		typeName = "NumberRange"
-	elseif typeName == nil and type(raw.Ref) == "table" then
-		raw = raw.Ref
-		typeName = "Ref"
-	elseif typeName == nil and raw.customPhysics ~= nil then
-		typeName = "PhysicalProperties"
-	end
-	if typeName == nil then
-		return true, raw
-	end
-	typeName = tostring(typeName)
-
-	if typeName == "Float" then
-		local value = BridgeValueCodec.decodeNumber(raw)
-		if not value then
-			return false, "Float value must be a number or non-finite marker"
-		end
-		return true, value
-	elseif typeName == "BinaryString" then
-		local encoded = raw.base64
-		if type(encoded) ~= "string" then
-			return false, "BinaryString base64 must be a string"
-		end
-		local ok, decoded = pcall(EncodingService.Base64Decode, EncodingService, buffer.fromstring(encoded))
-		if not ok then
-			return false, decoded
-		end
-		return true, buffer.tostring(decoded)
-	elseif typeName == "PhysicalProperties" then
-		if raw.customPhysics == false or raw.density == nil then
-			return true, nil
-		end
-		local okNumbers, values = decodeNumberFields(raw, {
-			"density",
-			"friction",
-			"elasticity",
-			"frictionWeight",
-			"elasticityWeight",
-		})
-		if not okNumbers then
-			return false, "PhysicalProperties " .. tostring(values)
-		end
-		if raw.acousticAbsorption ~= nil then
-			local acousticAbsorption = tonumber(raw.acousticAbsorption)
-			if not acousticAbsorption then
-				return false, "PhysicalProperties acousticAbsorption must be a number"
-			end
-			local okCreate, physicalProperties = pcall(
-				PhysicalProperties.new :: any,
-				values[1],
-				values[2],
-				values[3],
-				values[4],
-				values[5],
-				acousticAbsorption
-			)
-			if not okCreate then
-				return false, physicalProperties
-			end
-			return true, physicalProperties
-		end
-		return true, PhysicalProperties.new(values[1], values[2], values[3], values[4], values[5])
-	elseif typeName == "NumberRange" then
-		local okNumbers, values = decodeNumberFields(raw, {
-			{ "min", "Min", 1 },
-			{ "max", "Max", 2 },
-		})
-		if not okNumbers then
-			return false, "NumberRange " .. tostring(values)
-		end
-		return true, NumberRange.new(values[1], values[2])
-	elseif typeName == "Vector2" then
-		local okNumbers, values = decodeNumberFields(raw, { "x", "y" })
-		if not okNumbers then
-			return false, "Vector2 " .. tostring(values)
-		end
-		return true, Vector2.new(values[1], values[2])
-	elseif typeName == "Vector3" then
-		local okNumbers, values = decodeNumberFields(raw, { "x", "y", "z" })
-		if not okNumbers then
-			return false, "Vector3 " .. tostring(values)
-		end
-		return true, Vector3.new(values[1], values[2], values[3])
-	elseif typeName == "UDim" then
-		local okNumbers, values = decodeNumberFields(raw, { "scale", "offset" })
-		if not okNumbers then
-			return false, "UDim " .. tostring(values)
-		end
-		return true, UDim.new(values[1], values[2])
-	elseif typeName == "UDim2" then
-		local okNumbers, values = decodeNumberFields(raw, { "xScale", "xOffset", "yScale", "yOffset" })
-		if not okNumbers then
-			return false, "UDim2 " .. tostring(values)
-		end
-		return true, UDim2.new(values[1], values[2], values[3], values[4])
-	elseif typeName == "Color3" then
-		return decodeColor3(raw)
-	elseif typeName == "BrickColor" then
-		local number = tonumber(raw.number or raw.BrickColor)
-		if not number then
-			return false, "BrickColor number must be numeric"
-		end
-		return true, BrickColor.new(number)
-	elseif typeName == "EnumItem" then
-		return decodeEnumItem(raw, enumHint)
-	elseif typeName == "CFrame" then
-		local components = raw.components
-		if type(components) ~= "table" or #components ~= 12 then
-			return false, "CFrame components must contain 12 numbers"
-		end
-		local values = table.create(12)
-		for i = 1, 12 do
-			local component = BridgeValueCodec.decodeNumber(components[i])
-			if not component then
-				return false, string.format("CFrame component %d must be a number", i)
-			end
-			values[i] = component
-		end
-		return true, CFrame.new(table.unpack(values))
-	elseif typeName == "Rect" then
-		local okNumbers, values = decodeNumberFields(raw, { "minX", "minY", "maxX", "maxY" })
-		if not okNumbers then
-			return false, "Rect " .. tostring(values)
-		end
-		return true, Rect.new(values[1], values[2], values[3], values[4])
-	elseif typeName == "Font" then
-		local ok, font = pcall(function()
-			return Font.new(
-				tostring(raw.family or ""),
-				(Enum.FontWeight :: any)[tostring(raw.weight or "Regular")],
-				(Enum.FontStyle :: any)[tostring(raw.style or "Normal")]
-			)
-		end)
-		if ok then
-			return true, font
-		end
-		return false, font
-	elseif typeName == "ColorSequence" then
-		local keypoints = raw.keypoints
-		if type(keypoints) ~= "table" then
-			return false, "ColorSequence keypoints must be a table"
-		end
-		local decoded = table.create(#keypoints)
-		for i, keypoint in ipairs(keypoints) do
-			if type(keypoint) ~= "table" then
-				return false, string.format("ColorSequence keypoint %d must be an object", i)
-			end
-			local colorRaw = if keypoint.value ~= nil then keypoint.value else keypoint.color or keypoint.Value
-			local okColor, color = decodeColor3(colorRaw)
-			if not okColor then
-				return false, color
-			end
-			local okNumbers, values = decodeNumberFields(keypoint, { "time" })
-			if not okNumbers then
-				return false, string.format("ColorSequence keypoint %d %s", i, tostring(values))
-			end
-			local okKeypoint, decodedKeypoint = pcall(ColorSequenceKeypoint.new, values[1], color)
-			if not okKeypoint then
-				return false, decodedKeypoint
-			end
-			decoded[i] = decodedKeypoint
-		end
-		local okSequence, sequence = pcall(ColorSequence.new, decoded)
-		return okSequence, sequence
-	elseif typeName == "NumberSequence" then
-		local keypoints = raw.keypoints
-		if type(keypoints) ~= "table" then
-			return false, "NumberSequence keypoints must be a table"
-		end
-		local decoded = table.create(#keypoints)
-		for i, keypoint in ipairs(keypoints) do
-			if type(keypoint) ~= "table" then
-				return false, string.format("NumberSequence keypoint %d must be an object", i)
-			end
-			local okNumbers, values = decodeNumberFields(keypoint, { "time", "value", "envelope" })
-			if not okNumbers then
-				return false, string.format("NumberSequence keypoint %d %s", i, tostring(values))
-			end
-			local okKeypoint, decodedKeypoint = pcall(NumberSequenceKeypoint.new, values[1], values[2], values[3])
-			if not okKeypoint then
-				return false, decodedKeypoint
-			end
-			decoded[i] = decodedKeypoint
-		end
-		local okSequence, sequence = pcall(NumberSequence.new, decoded)
-		return okSequence, sequence
-	elseif typeName == "Axes" then
-		if type(raw.axes) ~= "table" then
-			return false, "Axes axes must be an array"
-		end
-		local axes = {}
-		for _, name in ipairs(raw.axes) do
-			local item = (Enum.Axis :: any)[tostring(name)]
-			if item == nil then
-				return false, "Unknown axis " .. tostring(name)
-			end
-			axes[#axes + 1] = item
-		end
-		return true, Axes.new(table.unpack(axes))
-	elseif typeName == "Faces" then
-		if type(raw.faces) ~= "table" then
-			return false, "Faces faces must be an array"
-		end
-		local faces = {}
-		for _, name in ipairs(raw.faces) do
-			local item = (Enum.NormalId :: any)[tostring(name)]
-			if item == nil then
-				return false, "Unknown face " .. tostring(name)
-			end
-			faces[#faces + 1] = item
-		end
-		return true, Faces.new(table.unpack(faces))
-	elseif typeName == "Ray" then
-		local okOrigin, origin = decodeNumberFields(raw.origin, { "x", "y", "z" })
-		if not okOrigin then
-			return false, "Ray origin " .. tostring(origin)
-		end
-		local okDirection, direction = decodeNumberFields(raw.direction, { "x", "y", "z" })
-		if not okDirection then
-			return false, "Ray direction " .. tostring(direction)
-		end
-		return true,
-			Ray.new(Vector3.new(origin[1], origin[2], origin[3]), Vector3.new(direction[1], direction[2], direction[3]))
-	elseif typeName == "Ref" then
-		return true, decodeRefValue(raw, ctx, serviceName)
-	end
-
-	return true, raw
+	return BridgeValueCodec.decode(raw, enumHint, decodeRefValue, ctx, serviceName)
 end
 
 local function enumHintForProperty(instance: Instance, propertyName: string): string?
@@ -1318,14 +863,8 @@ local function decodePropertyValue(
 			return (instance :: any)[propertyName]
 		end)
 		if okCurrent and typeof(current) == "NumberRange" then
-			local okNumbers, values = decodeNumberFields(rawValue, {
-				{ "min", "Min", 1 },
-				{ "max", "Max", 2 },
-			})
-			if not okNumbers then
-				return false, "NumberRange " .. tostring(values)
-			end
-			return true, NumberRange.new(values[1], values[2])
+			rawValue = table.clone(rawValue)
+			rawValue._type = "NumberRange"
 		end
 	end
 	return decodeValue(rawValue, enumHintForProperty(instance, propertyName), ctx, serviceName)
@@ -1511,13 +1050,9 @@ end
 local function writeProperty(instance: Instance, propertyName: string, value: any): (boolean, any)
 	if instance:IsA("Model") or instance:IsA("WorldModel") then
 		if propertyName == "Scale" then
-			return pcall(function()
-				return (instance :: any):ScaleTo(value)
-			end)
+			return pcall((instance :: any).ScaleTo, instance, value)
 		elseif propertyName == "Origin" then
-			return pcall(function()
-				return (instance :: any):PivotTo(value)
-			end)
+			return pcall((instance :: any).PivotTo, instance, value)
 		elseif propertyName == "WorldPivot" or propertyName == "WorldPivotData" then
 			return pcall(function()
 				(instance :: any).WorldPivot = value
@@ -1560,7 +1095,7 @@ local function writePropertyForSync(
 	ctx: { [string]: any }?
 ): (boolean, any)
 	local token = nil
-	if instance:IsDescendantOf(game) and type(ctx) == "table" and type(ctx.expectPropertyEvent) == "function" then
+	if instance:IsDescendantOf(game) and ctx ~= nil then
 		token = ctx.expectPropertyEvent(instance, propertyName, value)
 	end
 	local ok, result = writeProperty(instance, propertyName, value)
@@ -1577,7 +1112,7 @@ local function setAttributeForSync(
 	ctx: { [string]: any }?
 ): (boolean, any)
 	local token = nil
-	if instance:IsDescendantOf(game) and type(ctx) == "table" and type(ctx.expectAttributeEvent) == "function" then
+	if instance:IsDescendantOf(game) and ctx ~= nil then
 		token = ctx.expectAttributeEvent(instance, attributeName, value)
 	end
 	local ok, result = pcall(instance.SetAttribute, instance, attributeName, value)
@@ -1711,7 +1246,7 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [stri
 	local targetTextureContent = targetMeshPart.TextureContent
 	local targetSize = targetMeshPart.Size
 	local applyTokens = {}
-	if targetMeshPart:IsDescendantOf(game) and type(ctx.expectPropertyEvent) == "function" then
+	if targetMeshPart:IsDescendantOf(game) then
 		for _, propertyName in ipairs({
 			"MeshId",
 			"MeshContent",
@@ -1742,7 +1277,7 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [stri
 	end
 	local restoreTokens = {}
 	local okRestore, restoreErr = pcall(function()
-		if targetMeshPart:IsDescendantOf(game) and type(ctx.expectPropertyEvent) == "function" then
+		if targetMeshPart:IsDescendantOf(game) then
 			restoreTokens[#restoreTokens + 1] = ctx.expectPropertyEvent(targetMeshPart, "Size", targetSize)
 			restoreTokens[#restoreTokens + 1] =
 				ctx.expectPropertyEvent(targetMeshPart, "TextureContent", targetTextureContent)
@@ -1771,7 +1306,7 @@ end
 
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
 	local token = nil
-	if instance:IsDescendantOf(game) and type(ctx.expectTagChange) == "function" then
+	if instance:IsDescendantOf(game) then
 		token = ctx.expectTagChange(instance, tag, added)
 	end
 	local ok, result = pcall(function()
@@ -1852,7 +1387,7 @@ local function retargetReplacementReferences(
 	ctx: { [string]: any },
 	stats: { [string]: any }
 )
-	if next(replacements) == nil then
+	if not next(replacements) then
 		return
 	end
 	local roots = {}
@@ -1879,946 +1414,29 @@ local function retargetReplacementReferences(
 	end
 end
 
-local function findScriptDocument(instance: Instance): any?
-	local ok, document = pcall(function()
-		return (ScriptEditorService :: any):FindScriptDocument(instance)
-	end)
-	if ok and document ~= nil then
-		return document
-	end
-	return nil
-end
+local readScriptSource = BridgeScriptDocuments.readSource
+local setSource = BridgeScriptDocuments.setSource
+local ScriptDocumentState = BridgeScriptDocuments
 
-local function readScriptSource(instance: Instance): (boolean, any)
-	local okEditor, editorSource = pcall(function()
-		return (ScriptEditorService :: any):GetEditorSource(instance)
-	end)
-	if okEditor then
-		return true, editorSource
-	end
-	return pcall(function()
-		return (instance :: any).Source
-	end)
-end
-
-local function documentLineEndCharacter(document: any, line: number): number
-	local okLine, lineText = pcall(function()
-		return document:GetLine(line)
-	end)
-	if okLine and type(lineText) == "string" then
-		return #lineText + 1
-	end
-	return 1
-end
-
-local function clampDocumentPosition(document: any, line: any, character: any): (number, number)
-	local okCount, lineCount = pcall(function()
-		return document:GetLineCount()
-	end)
-	if not okCount or type(lineCount) ~= "number" or lineCount < 1 then
-		return 1, 1
-	end
-	local clampedLine = math.clamp(math.floor(tonumber(line) or 1), 1, lineCount)
-	local lineEnd = documentLineEndCharacter(document, clampedLine)
-	local clampedCharacter = math.clamp(math.floor(tonumber(character) or 1), 1, lineEnd)
-	return clampedLine, clampedCharacter
-end
-
-local function getDocumentSelection(document: any): { number }?
-	local okSelection, cursorLine, cursorCharacter, anchorLine, anchorCharacter = pcall(function()
-		return document:GetSelection()
-	end)
-	if not okSelection or type(cursorLine) ~= "number" or type(cursorCharacter) ~= "number" then
-		return nil
-	end
-	local resolvedAnchorLine = if type(anchorLine) == "number" then anchorLine else cursorLine
-	local resolvedAnchorCharacter = if type(anchorCharacter) == "number" then anchorCharacter else cursorCharacter
-	return { cursorLine, cursorCharacter, resolvedAnchorLine, resolvedAnchorCharacter }
-end
-
-local function restoreDocumentSelection(document: any, selection: { number }?)
-	if selection == nil then
-		return
-	end
-	local cursorLine, cursorCharacter = clampDocumentPosition(document, selection[1], selection[2])
-	local anchorLine, anchorCharacter = clampDocumentPosition(document, selection[3], selection[4])
-	local okRequest, success = pcall(function()
-		return document:RequestSetSelectionAsync(cursorLine, cursorCharacter, anchorLine, anchorCharacter)
-	end)
-	if okRequest and success ~= false then
-		return
-	end
-	pcall(function()
-		document:ForceSetSelectionAsync(cursorLine, cursorCharacter, anchorLine, anchorCharacter)
-	end)
-end
-
-local function setOpenDocumentSource(document: any, source: string): (boolean, any)
-	local okText, currentText = pcall(function()
-		return document:GetText()
-	end)
-	if okText and currentText == source then
-		return true, nil
-	end
-
-	local okLineCount, lineCount = pcall(function()
-		return document:GetLineCount()
-	end)
-	if not okLineCount or type(lineCount) ~= "number" or lineCount < 1 then
-		return false, "open script document did not report a valid line count"
-	end
-
-	local selection = getDocumentSelection(document)
-	local endCharacter = documentLineEndCharacter(document, lineCount)
-	local okEdit, success, editErr = pcall(function()
-		return document:EditTextAsync(source, 1, 1, lineCount, endCharacter)
-	end)
-	if not okEdit then
-		return false, success
-	end
-	if success == false then
-		return false, editErr or "EditTextAsync failed"
-	end
-	restoreDocumentSelection(document, selection)
-	return true, nil
-end
-
-local function setSource(instance: Instance, source: string, ctx: { [string]: any }?): (boolean, any, string)
-	local document = findScriptDocument(instance)
-	local token = nil
-	if instance:IsDescendantOf(game) and type(ctx) == "table" and type(ctx.expectPropertyEvent) == "function" then
-		token = ctx.expectPropertyEvent(instance, "Source", source)
-	end
-	if document ~= nil then
-		local documentOk, documentErr = setOpenDocumentSource(document, source)
-		if documentOk then
-			return true, nil, "ScriptDocument"
-		end
-	end
-
-	local updateOk = pcall(function()
-		(ScriptEditorService :: any):UpdateSourceAsync(instance, function()
-			return source
-		end)
-	end)
-	if updateOk then
-		return true, nil, "UpdateSourceAsync"
-	end
-	local ok, err = pcall(function()
-		(instance :: any).Source = source
-	end)
-	if ok then
-		return true, nil, "Source"
-	end
-	cancelExpectedEvent(ctx, token)
-	return false, err, "Source"
-end
-
-local ScriptDocumentState = {}
-
-local function readInstanceDebugId(instance: Instance): string?
-	local ok, debugId = pcall(instance.GetDebugId, instance, 32)
-	return if ok and type(debugId) == "string" and debugId ~= "" then debugId else nil
-end
-
-function ScriptDocumentState.capture(serviceNames: { string }, includedKeys: { [string]: boolean }?): { any }
-	local includedServices = {}
-	for _, serviceName in ipairs(serviceNames) do
-		includedServices[serviceName] = true
-	end
-	local entries = {}
-	for _, document in ipairs(ScriptEditorService:GetScriptDocuments()) do
-		if not document:IsCommandBar() then
-			local scriptInstance = document:GetScript()
-			local pathSegments = getInstancePathSegments(scriptInstance)
-			local pathOrdinals = if pathSegments ~= nil then getInstancePathOrdinals(scriptInstance) else nil
-			local key = if pathSegments ~= nil then pathCacheKey(pathSegments, pathOrdinals) else nil
-			if
-				pathSegments ~= nil
-				and includedServices[pathSegments[1]]
-				and (includedKeys == nil or includedKeys[key] == true)
-			then
-				local source = document:GetText()
-				local okStored, storedSource = pcall(function()
-					return (scriptInstance :: any).Source
-				end)
-				entries[#entries + 1] = {
-					document = document,
-					instance = scriptInstance,
-					pathSegments = pathSegments,
-					pathOrdinals = pathOrdinals,
-					key = key,
-					debugId = readInstanceDebugId(scriptInstance),
-					source = source,
-					dirty = not okStored or storedSource ~= source,
-					selection = getDocumentSelection(document),
-				}
-			end
-		end
-	end
-	return entries
-end
-
-function ScriptDocumentState.apply(
-	entries: { any },
-	changedSourceInstances: { [Instance]: boolean }?,
-	changedSourceKeys: { [string]: boolean }?,
-	replacements: { [Instance]: Instance }?,
-	resolveStagedPath: (({ string }, { number }?) -> Instance?)?,
-	allSourcesChanged: boolean?
-)
-	for _, entry in ipairs(entries) do
-		local target = entry.instance
-		local seen = {}
-		while replacements ~= nil and replacements[target] ~= nil and not seen[target] do
-			seen[target] = true
-			target = replacements[target]
-		end
-		if liveInstance(target) == nil then
-			target = nil
-		end
-		if target == nil and resolveStagedPath ~= nil then
-			target = resolveStagedPath(entry.pathSegments, entry.pathOrdinals)
-		end
-		if target == nil and entry.debugId ~= nil then
-			local pathTarget = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
-			if pathTarget ~= nil and readInstanceDebugId(pathTarget) == entry.debugId then
-				target = pathTarget
-			end
-		end
-		if (target == nil or not target:IsA("LuaSourceContainer")) and allSourcesChanged then
-			local okClose, closed, closeError = pcall(entry.document.CloseAsync, entry.document)
-			if not okClose or closed == false then
-				error(`Could not close removed script document: {closeError or closed}`)
-			end
-			continue
-		end
-		if target == nil or not target:IsA("LuaSourceContainer") then
-			error("Could not restore open script document " .. table.concat(entry.pathSegments, "."))
-		end
-		local sourceChanged = allSourcesChanged or (changedSourceKeys ~= nil and changedSourceKeys[entry.key] == true)
-		if changedSourceInstances ~= nil then
-			sourceChanged = sourceChanged
-				or changedSourceInstances[entry.instance] == true
-				or changedSourceInstances[target] == true
-		end
-		local source = entry.source
-		local selection = entry.selection
-		if not sourceChanged then
-			local okCurrentSource, currentSource = pcall(entry.document.GetText, entry.document)
-			if okCurrentSource then
-				source = currentSource
-				selection = getDocumentSelection(entry.document)
-			end
-		end
-		local targetDocument = findScriptDocument(target)
-		if targetDocument == nil then
-			local okOpen, opened, openError =
-				pcall(ScriptEditorService.OpenScriptDocumentAsync, ScriptEditorService, target)
-			if not okOpen or opened == false then
-				error(`Could not open replacement script document {target:GetFullName()}: {openError or opened}`)
-			end
-			targetDocument = findScriptDocument(target)
-			if targetDocument == nil then
-				error("Replacement script document did not open for " .. target:GetFullName())
-			end
-		end
-		if not sourceChanged and targetDocument ~= entry.document then
-			local okWrite, writeError = setOpenDocumentSource(targetDocument, source)
-			if not okWrite then
-				error(`Could not restore open script document {target:GetFullName()}: {writeError}`)
-			end
-		end
-		restoreDocumentSelection(targetDocument, selection)
-		if entry.document ~= targetDocument then
-			local okClose, closed, closeError = pcall(entry.document.CloseAsync, entry.document)
-			if not okClose or closed == false then
-				error(`Could not close replaced script document: {closeError or closed}`)
-			end
-		end
-	end
-end
-
-local ReferenceOverlay = {}
-
-function ReferenceOverlay.beginNativeGuard(prepared: { any }): { [string]: any }
-	local guard = {
-		services = {},
-		connections = {},
-		changedService = nil,
-	}
-	for _, group in ipairs(prepared) do
-		guard.services[group.serviceName] = group.service
-	end
-	guard.connections[#guard.connections + 1] = (game :: any).ItemChanged:Connect(function(instance, propertyName)
-		if typeof(instance) ~= "Instance" or string.lower(tostring(propertyName)) ~= "name" then
-			return
-		end
-		for serviceName, service in pairs(guard.services) do
-			if instance == service or instance:IsDescendantOf(service) then
-				guard.changedService = serviceName
-				return
-			end
-		end
-	end)
-	for serviceName, service in pairs(guard.services) do
-		local guardedServiceName = serviceName
-		guard.connections[#guard.connections + 1] = service.DescendantAdded:Connect(function()
-			guard.changedService = guardedServiceName
-		end)
-		guard.connections[#guard.connections + 1] = service.DescendantRemoving:Connect(function()
-			guard.changedService = guardedServiceName
-		end)
-	end
-	return guard
-end
-
-function ReferenceOverlay.assertNativeGuard(guard: { [string]: any })
-	if guard.changedService ~= nil then
-		error(`Studio changed {guard.changedService} while native import was staged; retry the sync`)
-	end
-end
-
-function ReferenceOverlay.finishNativeGuard(guard: { [string]: any }?)
-	if guard == nil then
-		return
-	end
-	for _, connection in ipairs(guard.connections) do
-		connection:Disconnect()
-	end
-	table.clear(guard.connections)
-end
-
-function ReferenceOverlay.capture(prepared: { any }, replacedInstances: { [Instance]: boolean }?): { any }
-	local replaced = replacedInstances or {}
-	if replacedInstances == nil then
-		for _, group in ipairs(prepared) do
-			local outgoing = group.outgoing
-			if outgoing == nil then
-				outgoing = {}
-				for _, child in ipairs(group.target:GetChildren()) do
-					if not group.preserved[child] then
-						outgoing[#outgoing + 1] = child
-					end
-				end
-			end
-			for _, root in ipairs(outgoing) do
-				replaced[root] = true
-				for _, descendant in ipairs(root:GetDescendants()) do
-					replaced[descendant] = true
-				end
-			end
-		end
-	end
-	local entries = {}
-	for instance in pairs(replaced) do
-		for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
-			local okRead, target = readProperty(instance, propertyName)
-			if okRead and typeof(target) == "Instance" and not replaced[target] then
-				entries[#entries + 1] = {
-					instance = instance,
-					propertyName = propertyName,
-					target = target,
-					content = false,
-				}
-			end
-		end
-		for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
-			local okRead, value = readProperty(instance, propertyName)
-			if
-				okRead
-				and typeof(value) == "Content"
-				and value.SourceType == Enum.ContentSourceType.Object
-				and value.Object ~= nil
-				and not replaced[value.Object]
-			then
-				entries[#entries + 1] = {
-					instance = instance,
-					propertyName = propertyName,
-					target = value.Object,
-					content = true,
-				}
-			end
-		end
-	end
-	return entries
-end
-
-function ReferenceOverlay.indexSubtree(
-	byPath: { [string]: Instance },
-	instance: Instance,
-	pathSegments: { string },
-	pathOrdinals: { number }
-)
-	byPath[pathCacheKey(pathSegments, pathOrdinals)] = instance
-	local nameCounts = {}
-	for _, child in ipairs(instance:GetChildren()) do
-		local ordinal = (nameCounts[child.Name] or 0) + 1
-		nameCounts[child.Name] = ordinal
-		local depth = #pathSegments + 1
-		pathSegments[depth] = child.Name
-		pathOrdinals[depth] = ordinal
-		ReferenceOverlay.indexSubtree(byPath, child, pathSegments, pathOrdinals)
-		pathSegments[depth] = nil
-		pathOrdinals[depth] = nil
-	end
-end
-
-function ReferenceOverlay.resolvePreparedPath(
-	prepared: { any },
-	pathSegments: { string },
-	pathOrdinals: { number }?,
-	aliases: { [Instance]: Instance }
-): Instance?
-	for _, group in ipairs(prepared) do
-		local targetPath = group.targetPath
-		local targetLength = #targetPath
-		if #pathSegments <= targetLength then
-			continue
-		end
-		local matches = true
-		for index = 1, targetLength do
-			if pathSegments[index] ~= targetPath[index] then
-				matches = false
-				break
-			end
-		end
-		if not matches then
-			continue
-		end
-		local rootSegments = table.create(targetLength + 1)
-		local rootOrdinals = table.create(targetLength + 1)
-		for index = 1, targetLength + 1 do
-			rootSegments[index] = pathSegments[index]
-			rootOrdinals[index] = if pathOrdinals ~= nil then pathOrdinals[index] or 1 else 1
-		end
-		local current = group.incomingRootsByPath[pathCacheKey(rootSegments, rootOrdinals)]
-		if current == nil then
-			return nil
-		end
-		for index = targetLength + 2, #pathSegments do
-			current = resolveOrdinalChild(
-				current,
-				pathSegments[index],
-				if pathOrdinals ~= nil then pathOrdinals[index] or 1 else 1
-			)
-			if current == nil then
-				return nil
-			end
-		end
-		return aliases[current] or current
-	end
-	return nil
-end
-
-function ReferenceOverlay.lazyReplacements(
-	prepared: { any },
-	resolveStagedPath: ({ string }, { number }?) -> Instance?
-): { [Instance]: Instance }
-	local missing = setmetatable({}, { __mode = "k" })
-	local replacements = {}
-	setmetatable(replacements, {
-		__index = function(target, original)
-			if typeof(original) ~= "Instance" or missing[original] then
-				return nil
-			end
-			for _, group in ipairs(prepared) do
-				local root = original
-				while root.Parent ~= nil and root.Parent ~= group.target do
-					root = root.Parent
-				end
-				if root.Parent == group.target and group.outgoingRootSet[root] then
-					local pathSegments = getInstancePathSegments(original)
-					if pathSegments ~= nil then
-						local replacement = resolveStagedPath(pathSegments, getInstancePathOrdinals(original))
-						if replacement ~= nil then
-							rawset(target, original, replacement)
-							return replacement
-						end
-					end
-					break
-				end
-			end
-			missing[original] = true
-			return nil
-		end,
-	})
-	return replacements
-end
-
-function ReferenceOverlay.chainReplacements(target: { [Instance]: Instance }, fallback: { [Instance]: Instance })
-	setmetatable(target, {
-		__index = function(_, original)
-			return fallback[original]
-		end,
-	})
-end
-
-function ReferenceOverlay.retainedAliases(
-	liveRoot: Instance,
-	duplicateRoot: Instance,
-	pathSegments: { string },
-	pathOrdinals: { number },
-	aliases: { [Instance]: Instance }
-): { [string]: Instance }
-	local liveByPath = {}
-	local duplicateByPath = {}
-	ReferenceOverlay.indexSubtree(liveByPath, liveRoot, pathSegments, pathOrdinals)
-	ReferenceOverlay.indexSubtree(duplicateByPath, duplicateRoot, pathSegments, pathOrdinals)
-	if countEntries(liveByPath) ~= countEntries(duplicateByPath) then
-		error(`Retained package root {table.concat(pathSegments, ".")} changed during import`)
-	end
-	for key, duplicate in pairs(duplicateByPath) do
-		local live = liveByPath[key]
-		if live == nil or live.Name ~= duplicate.Name or live.ClassName ~= duplicate.ClassName then
-			error(`Retained package root {table.concat(pathSegments, ".")} changed during import`)
-		end
-		aliases[duplicate] = live
-	end
-	return liveByPath
-end
-
-function ReferenceOverlay.assertRetainedReferences(retainedRoots: { Instance }, outgoingRoots: { Instance })
-	if #retainedRoots == 0 then
-		return
-	end
-	local removed = {}
-	for _, root in ipairs(outgoingRoots) do
-		removed[root] = true
-		for _, descendant in ipairs(root:GetDescendants()) do
-			removed[descendant] = true
-		end
-	end
-	for _, root in ipairs(retainedRoots) do
-		local pending = { root }
-		while #pending > 0 do
-			local instance = table.remove(pending)
-			for _, child in ipairs(instance:GetChildren()) do
-				pending[#pending + 1] = child
-			end
-			for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
-				local okRead, target = readProperty(instance, propertyName)
-				if okRead and removed[target] then
-					error(`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`)
-				end
-			end
-			for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
-				local okRead, value = readProperty(instance, propertyName)
-				if
-					okRead
-					and typeof(value) == "Content"
-					and value.SourceType == Enum.ContentSourceType.Object
-					and removed[value.Object]
-				then
-					error(`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`)
-				end
-			end
-		end
-	end
-end
-
-function ReferenceOverlay.assertPackageRoots(group: { [string]: any })
-	local actual = {}
-	for _, root in ipairs(group.packageScanRoots) do
-		if root.Parent == group.target and containsPackageLink(root) then
-			actual[root] = true
-		end
-	end
-	local expected = 0
-	for _, descriptor in ipairs(group.packageRoots) do
-		local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
-		if root == nil or root.Parent ~= group.target or root.ClassName ~= descriptor.className or not actual[root] then
-			error(`Package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
-		end
-		actual[root] = nil
-		expected += 1
-	end
-	if next(actual) ~= nil then
-		error("Studio package roots changed during import")
-	end
-	return expected
-end
-
-function ReferenceOverlay.stripIncomingPackages(root: Instance): number
-	if root:IsA("PackageLink") then
-		error("A native import root cannot be a PackageLink")
-	end
-	local removed = 0
-	for _, instance in ipairs(root:GetDescendants()) do
-		if instance:IsA("PackageLink") then
-			removed += 1 + #instance:GetDescendants()
-			instance:Destroy()
-		end
-	end
-	if removed == 0 then
-		error(`Package root {root.Name} no longer contains a PackageLink`)
-	end
-	return removed
-end
-
-function ReferenceOverlay.assertNativeImportState(undo: { [string]: any }, ctx: { [string]: any })
-	ReferenceOverlay.assertNativeGuard(undo.guard)
-	for serviceName, generation in pairs(undo.generationsByService) do
-		if ctx.studioChangeGeneration(serviceName) ~= generation then
-			error(`Studio changed {serviceName} while native import was staged; retry the sync`)
-		end
-	end
-	for _, group in ipairs(undo.prepared) do
-		ReferenceOverlay.assertPackageRoots(group)
-	end
-end
-
-function ReferenceOverlay.apply(entries: { any }, replacements: { [Instance]: Instance }, ctx: { [string]: any }?)
-	for _, entry in ipairs(entries) do
-		local instance = replacements[entry.instance]
-		if instance ~= nil then
-			local target = replacements[entry.target] or entry.target
-			local value = if entry.content then Content.fromObject(target) else target
-			local okWrite, writeError = writePropertyForSync(instance, entry.propertyName, value, ctx)
-			if not okWrite then
-				error(`Could not restore {instance:GetFullName()}.{entry.propertyName}: {writeError}`)
-			end
-		end
-	end
-end
-
-function ReferenceOverlay.retargetPreservedContent(
-	roots: { Instance },
-	replacements: { [Instance]: Instance },
-	ctx: { [string]: any }?,
-	excludedRoots: { [Instance]: boolean }?
-): (number, number)
-	local updated = 0
-	local failed = 0
-	for _, root in ipairs(roots) do
-		local pending = { root }
-		while #pending > 0 do
-			local instance = table.remove(pending)
-			if excludedRoots ~= nil and excludedRoots[instance] then
-				continue
-			end
-			for _, child in ipairs(instance:GetChildren()) do
-				pending[#pending + 1] = child
-			end
-			for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
-				local okRead, value = readProperty(instance, propertyName)
-				if okRead and typeof(value) == "Content" and value.SourceType == Enum.ContentSourceType.Object then
-					local replacement = replacements[value.Object]
-					if replacement ~= nil then
-						local okWrite =
-							writePropertyForSync(instance, propertyName, Content.fromObject(replacement), ctx)
-						if okWrite then
-							updated += 1
-						else
-							failed += 1
-						end
-					end
-				end
-			end
-		end
-	end
-	return updated, failed
-end
-
-function ReferenceOverlay.prepareRetained(
-	prepared: { any },
-	ctx: { [string]: any },
-	externalReferencesPostApplied: boolean
-): { [string]: any }
-	local excludedIncoming = {}
-	local excludedOutgoing = {}
-	local incomingAliases = {}
-	local retainedDuplicates = {}
-	local retainedLiveRoots = {}
-	local retainedDuplicateInstanceCount = 0
-	for _, group in ipairs(prepared) do
-		group.packageScanRoots = table.clone(group.outgoing)
-		group.incomingRootsByPath = {}
-		for index, descriptor in ipairs(group.rootPaths) do
-			local incomingRoot = group.incomingByPayloadIndex[index]
-			if incomingRoot ~= nil then
-				group.incomingRootsByPath[pathCacheKey(descriptor.pathSegments, descriptor.pathOrdinals)] = incomingRoot
-			end
-		end
-		group.outgoingRootSet = {}
-		local outgoingInGroup = {}
-		for _, root in ipairs(group.outgoing) do
-			outgoingInGroup[root] = true
-			group.outgoingRootSet[root] = true
-		end
-		for _, descriptor in ipairs(group.retainedRoots) do
-			local duplicate = group.incomingByPayloadIndex[descriptor.payloadIndex]
-			local live = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
-			if
-				duplicate == nil
-				or live == nil
-				or live.Parent ~= group.target
-				or not outgoingInGroup[live]
-				or live.ClassName ~= descriptor.className
-				or duplicate.ClassName ~= descriptor.className
-				or live.Name ~= descriptor.pathSegments[#descriptor.pathSegments]
-				or duplicate.Name ~= live.Name
-				or (not live:IsA("PackageLink") and live:FindFirstChildWhichIsA("PackageLink", true) == nil)
-				or (not duplicate:IsA("PackageLink") and duplicate:FindFirstChildWhichIsA("PackageLink", true) == nil)
-				or 1 + #duplicate:GetDescendants() ~= descriptor.instanceCount
-			then
-				error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
-			end
-			excludedIncoming[duplicate] = true
-			excludedOutgoing[live] = true
-			retainedDuplicates[#retainedDuplicates + 1] = duplicate
-			retainedLiveRoots[#retainedLiveRoots + 1] = live
-			retainedDuplicateInstanceCount += descriptor.instanceCount
-			ReferenceOverlay.retainedAliases(
-				live,
-				duplicate,
-				descriptor.pathSegments,
-				descriptor.pathOrdinals,
-				incomingAliases
-			)
-		end
-	end
-	for duplicate, live in pairs(incomingAliases) do
-		excludedIncoming[duplicate] = true
-		excludedOutgoing[live] = true
-	end
-	local incomingScanRoots = {}
-	local outgoingScanRoots = {}
-	for _, group in ipairs(prepared) do
-		local incoming = {}
-		for _, root in ipairs(group.incoming) do
-			if not excludedIncoming[root] then
-				incoming[#incoming + 1] = root
-				incomingScanRoots[#incomingScanRoots + 1] = root
-			end
-		end
-		group.incoming = incoming
-		local outgoing = {}
-		for _, root in ipairs(group.outgoing) do
-			if not excludedOutgoing[root] then
-				outgoing[#outgoing + 1] = root
-				outgoingScanRoots[#outgoingScanRoots + 1] = root
-			end
-		end
-		group.outgoing = outgoing
-	end
-	ReferenceOverlay.assertRetainedReferences(retainedLiveRoots, outgoingScanRoots)
-	local aliasUpdated = 0
-	local aliasContentUpdated = 0
-	if next(incomingAliases) ~= nil then
-		local aliasUpdatedResult, aliasFailed, aliasFailures = BridgeReferenceRetarget.apply(
-			incomingScanRoots,
-			incomingAliases,
-			RbxDomModule.getReferencePropertyNames,
-			readProperty,
-			function(instance, propertyName, value)
-				return writePropertyForSync(instance, propertyName, value, ctx)
-			end
-		)
-		aliasUpdated = aliasUpdatedResult
-		if aliasFailed > 0 then
-			local first = aliasFailures[1]
-			error(
-				`Could not retain {aliasFailed} package references; first failure: {first.instance:GetFullName()}.{first.propertyName}: {first.error}`
-			)
-		end
-		local aliasContentFailed
-		aliasContentUpdated, aliasContentFailed =
-			ReferenceOverlay.retargetPreservedContent(incomingScanRoots, incomingAliases, ctx)
-		if aliasContentFailed > 0 then
-			error(`Could not retain {aliasContentFailed} package content references`)
-		end
-	end
-	local referenceOverlay = {}
-	if not externalReferencesPostApplied then
-		local replaced = {}
-		for _, root in ipairs(outgoingScanRoots) do
-			replaced[root] = true
-			for _, descendant in ipairs(root:GetDescendants()) do
-				replaced[descendant] = true
-			end
-		end
-		referenceOverlay = ReferenceOverlay.capture(prepared, replaced)
-	end
-	local function resolveStagedPath(pathSegments, pathOrdinals)
-		return ReferenceOverlay.resolvePreparedPath(prepared, pathSegments, pathOrdinals, incomingAliases)
-	end
-	local replacements = ReferenceOverlay.lazyReplacements(prepared, resolveStagedPath)
-	local removedRootCount = 0
-	for _, group in ipairs(prepared) do
-		removedRootCount += #group.outgoing
-	end
-	return {
-		referenceOverlay = referenceOverlay,
-		replacements = replacements,
-		resolveStagedPath = resolveStagedPath,
-		retainedDuplicates = retainedDuplicates,
-		retainedDuplicateInstanceCount = retainedDuplicateInstanceCount,
-		retainedLiveRoots = retainedLiveRoots,
-		outgoingScanRoots = outgoingScanRoots,
-		removedRootCount = removedRootCount,
-		referenceUpdates = #referenceOverlay + aliasUpdated + aliasContentUpdated,
-	}
-end
-
-function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }): (number, number)
-	ReferenceOverlay.assertNativeImportState(undo, ctx)
-	ReferenceOverlay.assertRetainedReferences(undo.retainedLiveRoots, undo.outgoingScanRoots)
-	ReferenceOverlay.finishNativeGuard(undo.guard)
-	undo.guard = nil
-	local selected = captureExplorerSelection()
-	local selectionPaths = {}
-	for _, instance in ipairs(selected) do
-		local pathSegments = getInstancePathSegments(instance)
-		if pathSegments ~= nil then
-			selectionPaths[instance] = {
-				pathSegments = pathSegments,
-				pathOrdinals = getInstancePathOrdinals(instance),
-			}
-		end
-	end
-	local excludedRoots = {}
-	for _, group in ipairs(undo.prepared) do
-		for _, instance in ipairs(group.outgoing) do
-			excludedRoots[instance] = true
-		end
-		for _, instance in ipairs(group.incoming) do
-			excludedRoots[instance] = true
-		end
-	end
-	local scanRoots = {}
-	for serviceName, allowed in pairs(ctx.allowedServices) do
-		if allowed then
-			scanRoots[#scanRoots + 1] = game:GetService(serviceName)
-		end
-	end
-	local updated, failed, failures = BridgeReferenceRetarget.apply(
-		scanRoots,
-		undo.replacements,
-		RbxDomModule.getReferencePropertyNames,
-		readProperty,
-		function(instance, propertyName, value)
-			return writePropertyForSync(instance, propertyName, value, ctx)
-		end,
-		excludedRoots
-	)
-	if failed > 0 then
-		local first = failures[1]
-		error(
-			`Could not retarget {failed} native import references; first failure: {first.instance:GetFullName()}.{first.propertyName}: {first.error}`
-		)
-	end
-	local contentUpdated, contentFailed =
-		ReferenceOverlay.retargetPreservedContent(scanRoots, undo.replacements, ctx, excludedRoots)
-	if contentFailed > 0 then
-		error(`Could not retarget {contentFailed} native import content references`)
-	end
-	local removedRootCount = 0
-	for _, group in ipairs(undo.prepared) do
-		for _, instance in ipairs(group.outgoing) do
-			removeInstanceForUndo(instance, ctx)
-			removedRootCount += 1
-		end
-	end
-	for _, group in ipairs(undo.prepared) do
-		for _, instance in ipairs(group.incoming) do
-			setParentForSync(instance, group.target, ctx)
-		end
-	end
-	local selectionReplacements = {}
-	for instance, path in pairs(selectionPaths) do
-		if instance.Parent == nil then
-			local replacement = undo.resolveStagedPath(path.pathSegments, path.pathOrdinals)
-			if replacement ~= nil then
-				selectionReplacements[instance] = replacement
-			end
-		end
-	end
-	restoreExplorerSelection(selected, selectionReplacements)
-	for _, group in ipairs(undo.prepared) do
-		ctx.invalidateService(group.serviceName)
-	end
-	return removedRootCount, updated + contentUpdated + undo.referenceUpdates
-end
-
-function ReferenceOverlay.rollbackNative(undo: { [string]: any }, ctx: { [string]: any }): { Instance }
-	ReferenceOverlay.finishNativeGuard(undo.guard)
-	undo.guard = nil
-	local incoming = {}
-	local structuralErrors = {}
-	local function restoreParent(instance: Instance, parent: Instance?)
-		local ok, result = pcall(function()
-			instance.Parent = parent
-		end)
-		if not ok then
-			structuralErrors[#structuralErrors + 1] = tostring(result)
-		end
-	end
-	for _, group in ipairs(undo.prepared) do
-		for _, instance in ipairs(group.incoming) do
-			incoming[#incoming + 1] = instance
-			if instance.Parent ~= nil then
-				restoreParent(instance, nil)
-			end
-		end
-		for _, instance in ipairs(group.outgoing) do
-			if instance.Parent == nil then
-				restoreParent(instance, group.target)
-			end
-		end
-	end
-	for _, instance in ipairs(undo.retainedDuplicates or {}) do
-		incoming[#incoming + 1] = instance
-		if instance.Parent ~= nil then
-			restoreParent(instance, nil)
-		end
-	end
-	if #structuralErrors > 0 then
-		error(`Could not roll back {#structuralErrors} native import roots: {structuralErrors[1]}`)
-	end
-	local reverseReplacements = {}
-	for original, replacement in pairs(undo.replacements) do
-		reverseReplacements[replacement] = original
-	end
-	local scanRoots = {}
-	for serviceName, allowed in pairs(ctx.allowedServices) do
-		if allowed then
-			scanRoots[#scanRoots + 1] = game:GetService(serviceName)
-		end
-	end
-	local _, failed = BridgeReferenceRetarget.apply(
-		scanRoots,
-		reverseReplacements,
-		RbxDomModule.getReferencePropertyNames,
-		readProperty,
-		function(instance, propertyName, value)
-			return writePropertyForSync(instance, propertyName, value, ctx)
-		end
-	)
-	if failed > 0 then
-		error(`Could not roll back {failed} native import references`)
-	end
-	local _, contentFailed = ReferenceOverlay.retargetPreservedContent(scanRoots, reverseReplacements, ctx)
-	if contentFailed > 0 then
-		error(`Could not roll back {contentFailed} native import content references`)
-	end
-	if undo.currentCamera ~= nil then
-		setCurrentCameraForSync(reverseReplacements[undo.currentCamera] or undo.currentCamera, ctx)
-	end
-	return incoming
-end
+local ReferenceOverlay = BridgeReferenceOverlay.create({
+	BridgeIdentity = BridgeIdentity,
+	BridgeReferenceRetarget = BridgeReferenceRetarget,
+	RbxDomModule = RbxDomModule,
+	captureExplorerSelection = captureExplorerSelection,
+	containsPackageLink = containsPackageLink,
+	pathCacheKey = pathCacheKey,
+	readProperty = readProperty,
+	removeInstanceForUndo = removeInstanceForUndo,
+	resolveOrdinalChild = resolveOrdinalChild,
+	resolvePathSegments = resolvePathSegments,
+	restoreExplorerSelection = restoreExplorerSelection,
+	setCurrentCameraForSync = setCurrentCameraForSync,
+	setParentForSync = setParentForSync,
+	writePropertyForSync = writePropertyForSync,
+})
 
 local function syncOptions(ctx: { [string]: any }): { [string]: any }
-	if type(ctx.syncOptions) == "table" then
-		return ctx.syncOptions
-	end
-	if type(ctx.getSyncOptions) == "function" then
-		local options = ctx.getSyncOptions()
-		if type(options) == "table" then
-			return options
-		end
-	end
-	return {}
+	return ctx.getSyncOptions()
 end
 
 local function liveHydrateEnabled(ctx: { [string]: any }): boolean
@@ -2830,7 +1448,7 @@ local function keepUnknownsEnabled(ctx: { [string]: any }): boolean
 end
 
 local function includeManagedInstance(ctx: { [string]: any }, serviceName: string, instance: Instance): boolean
-	return type(ctx.includeExportInstance) ~= "function" or ctx.includeExportInstance(serviceName, instance)
+	return ctx.includeExportInstance(serviceName, instance)
 end
 
 local function ensureSourceParentPath(
@@ -2966,6 +1584,141 @@ end
 
 local appendPreserveKeys
 
+local function sortedInstanceEntries(
+	change: { [string]: any },
+	serviceName: string,
+	maximumEntries: number?,
+	limitError: string?
+)
+	local rawInstances = change.instances
+	local entries = {}
+	if type(rawInstances) ~= "table" then
+		return entries
+	end
+	if #rawInstances > (maximumEntries or 5000) then
+		error(limitError or "Editor instance mutation has too many entries")
+	end
+
+	for _, raw in ipairs(rawInstances) do
+		if type(raw) == "table" then
+			local pathSegments = cloneArray(raw.pathSegments)
+			local className = tostring(raw.className or "Folder")
+			if #pathSegments > 0 then
+				if tostring(pathSegments[1]) ~= serviceName then
+					error("Instance path root does not match service: " .. pathKey(pathSegments))
+				end
+				if #pathSegments > 1 and className ~= serviceName and className ~= "PackageLink" then
+					entries[#entries + 1] = {
+						pathSegments = pathSegments,
+						pathOrdinals = cloneArray(raw.pathOrdinals),
+						key = pathCacheKey(pathSegments, raw.pathOrdinals),
+						className = className,
+						settingsId = settingsIdText(raw.settingsId),
+						ambiguousSiblings = raw.ambiguousSiblings == true,
+						anchorOnly = raw.anchorOnly == true,
+						matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
+						matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
+					}
+				end
+			end
+		end
+	end
+
+	table.sort(entries, function(a, b)
+		if #a.pathSegments == #b.pathSegments then
+			return a.key < b.key
+		end
+		return #a.pathSegments < #b.pathSegments
+	end)
+	return entries
+end
+
+local function syncDesiredEntry(
+	entry: { [string]: any },
+	serviceName: string,
+	ctx: { [string]: any },
+	stats: { [string]: any },
+	resolvedEntries: { [string]: any },
+	claimedInstances: { [Instance]: boolean },
+	createMissing: boolean
+): Instance?
+	if isProtectedWorkspaceCameraPath(entry.pathSegments) then
+		stats.noops += 1
+		return nil
+	end
+
+	local instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
+	if entry.anchorOnly and instance == nil then
+		error("Filtered ancestor was not found: " .. entry.key)
+	elseif entry.anchorOnly then
+		stats.noops += 1
+	elseif instance == nil and not createMissing then
+		stats.noops += 1
+		return nil
+	elseif instance == nil then
+		local parent = resolveEntryParent(entry, resolvedEntries)
+		if parent == nil then
+			error("Cannot create instance; parent path was not found: " .. entry.key)
+		end
+		local okCreate, created = pcall(Instance.new, entry.className)
+		if not okCreate or created == nil then
+			error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
+		end
+		created.Name = tostring(entry.pathSegments[#entry.pathSegments])
+		setParentForSync(created, parent, ctx)
+		instance = created
+		stats.instanceCreated += 1
+	else
+		syncEntryPlacement(entry, instance, stats, resolvedEntries, ctx)
+		if instance.ClassName ~= entry.className then
+			local oldInstance = instance
+			instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements, ctx)
+			rememberReplacementIdentity(serviceName, entry.settingsId, oldInstance, instance, ctx)
+		end
+	end
+
+	resolvedEntries[entry.key] = instance
+	rememberEntryResolution(entry, serviceName, instance, claimedInstances, ctx)
+	return instance
+end
+
+local function removeUnknownInstances(
+	serviceName: string,
+	service: Instance,
+	ctx: { [string]: any },
+	stats: { [string]: any },
+	preserveKeys: { [string]: boolean },
+	desiredKeys: { [string]: boolean },
+	desiredSettingsIds: { [string]: boolean },
+	desiredStableKeys: { [string]: boolean }
+)
+	local descendants = service:GetDescendants()
+	for index = #descendants, 1, -1 do
+		local instance = descendants[index]
+		local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+		local key = if pathSegments then pathCacheKey(pathSegments, pathOrdinals) else ""
+		if
+			key ~= ""
+			and not preserveKeys[key]
+			and includeManagedInstance(ctx, serviceName, instance)
+			and not shouldKeepInstanceByDesiredEntry(
+				serviceName,
+				instance,
+				pathSegments,
+				pathOrdinals,
+				ctx,
+				desiredKeys,
+				desiredSettingsIds,
+				desiredStableKeys
+			)
+			and not isProtectedWorkspaceCameraInstance(instance)
+		then
+			removeInstanceForUndo(instance, ctx)
+			stats.instanceDeleted += 1
+		end
+	end
+end
+
 local function applyInstanceReconcile(
 	change: { [string]: any },
 	ctx: { [string]: any },
@@ -2983,9 +1736,6 @@ local function applyInstanceReconcile(
 	if type(rawInstances) ~= "table" then
 		return
 	end
-	if #rawInstances > (tonumber(ctx.maxInstanceEntriesPerChange) or 5000) then
-		error("Editor instance reconcile has too many entries")
-	end
 
 	local beforeCreated = stats.instanceCreated
 	local beforeDeleted = stats.instanceDeleted
@@ -2993,109 +1743,36 @@ local function applyInstanceReconcile(
 	local desiredKeys = {}
 	local desiredSettingsIds = {}
 	local desiredStableKeys = {}
-	local desiredEntries = {}
+	local desiredEntries = sortedInstanceEntries(
+		change,
+		service.Name,
+		tonumber(ctx.maxInstanceEntriesPerChange) or 5000,
+		"Editor instance reconcile has too many entries"
+	)
 	local preserveKeys = {}
 	appendPreserveKeys(preserveKeys, change, service.Name)
-	for _, raw in ipairs(rawInstances) do
-		if type(raw) == "table" then
-			local pathSegments = cloneArray(raw.pathSegments)
-			local className = tostring(raw.className or "Folder")
-			if #pathSegments > 0 and className ~= "PackageLink" then
-				if tostring(pathSegments[1]) ~= service.Name then
-					error("Instance path root does not match service: " .. pathKey(pathSegments))
-				end
-				local entry = {
-					pathSegments = pathSegments,
-					pathOrdinals = cloneArray(raw.pathOrdinals),
-					key = pathCacheKey(pathSegments, raw.pathOrdinals),
-					className = className,
-					settingsId = settingsIdText(raw.settingsId),
-					ambiguousSiblings = raw.ambiguousSiblings == true,
-					anchorOnly = raw.anchorOnly == true,
-					matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
-					matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
-				}
-				desiredKeys[entry.key] = true
-				table.insert(desiredEntries, entry)
-			end
-		end
-	end
-
-	table.sort(desiredEntries, function(a, b)
-		if #a.pathSegments == #b.pathSegments then
-			return a.key < b.key
-		end
-		return #a.pathSegments < #b.pathSegments
-	end)
 
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	for _, entry in ipairs(desiredEntries) do
-		if #entry.pathSegments > 1 then
-			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
-				stats.noops += 1
-			else
-				local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
-				if entry.anchorOnly and instance == nil then
-					error("Filtered ancestor was not found: " .. entry.key)
-				elseif entry.anchorOnly then
-					stats.noops += 1
-				elseif instance == nil then
-					local parent = resolveEntryParent(entry, resolvedEntries)
-					if parent == nil then
-						error("Cannot create instance; parent path was not found: " .. entry.key)
-					end
-					local okCreate, created = pcall(Instance.new, entry.className)
-					if not okCreate or created == nil then
-						error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
-					end
-					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-					setParentForSync(created, parent, ctx)
-					instance = created
-					stats.instanceCreated += 1
-				else
-					syncEntryPlacement(entry, instance, stats, resolvedEntries, ctx)
-					if instance.ClassName ~= entry.className then
-						local oldInstance = instance
-						instance =
-							replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements, ctx)
-						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
-					end
-				end
-				resolvedEntries[entry.key] = instance
-				rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
-				recordDesiredStableEntry(entry, service.Name, instance, ctx, desiredSettingsIds, desiredStableKeys)
-			end
+		desiredKeys[entry.key] = true
+		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, true)
+		if instance ~= nil then
+			recordDesiredStableEntry(entry, service.Name, instance, ctx, desiredSettingsIds, desiredStableKeys)
 		end
 	end
 
 	if change.allowDeletes == true and not keepUnknownsEnabled(ctx) then
-		local descendants = service:GetDescendants()
-		for i = #descendants, 1, -1 do
-			local instance = descendants[i]
-			local pathSegments = getInstancePathSegments(instance)
-			local pathOrdinals = getInstancePathOrdinals(instance)
-			local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
-			if
-				key ~= ""
-				and not preserveKeys[key]
-				and includeManagedInstance(ctx, service.Name, instance)
-				and not shouldKeepInstanceByDesiredEntry(
-					service.Name,
-					instance,
-					pathSegments,
-					pathOrdinals,
-					ctx,
-					desiredKeys,
-					desiredSettingsIds,
-					desiredStableKeys
-				)
-				and not isProtectedWorkspaceCameraInstance(instance)
-			then
-				removeInstanceForUndo(instance, ctx)
-				stats.instanceDeleted += 1
-			end
-		end
+		removeUnknownInstances(
+			service.Name,
+			service,
+			ctx,
+			stats,
+			preserveKeys,
+			desiredKeys,
+			desiredSettingsIds,
+			desiredStableKeys
+		)
 	end
 
 	if
@@ -3105,50 +1782,6 @@ local function applyInstanceReconcile(
 	then
 		stats.noops += 1
 	end
-end
-
-local function sortedInstanceEntries(change: { [string]: any }, serviceName: string)
-	local rawInstances = change.instances
-	local entries = {}
-	if type(rawInstances) ~= "table" then
-		return entries
-	end
-	if #rawInstances > 5000 then
-		error("Editor instance mutation has too many entries")
-	end
-
-	for _, raw in ipairs(rawInstances) do
-		if type(raw) == "table" then
-			local pathSegments = cloneArray(raw.pathSegments)
-			local className = tostring(raw.className or "Folder")
-			if #pathSegments > 0 then
-				if tostring(pathSegments[1]) ~= serviceName then
-					error("Instance path root does not match service: " .. pathKey(pathSegments))
-				end
-				if #pathSegments > 1 and className ~= serviceName and className ~= "PackageLink" then
-					table.insert(entries, {
-						pathSegments = pathSegments,
-						pathOrdinals = cloneArray(raw.pathOrdinals),
-						key = pathCacheKey(pathSegments, raw.pathOrdinals),
-						className = className,
-						settingsId = settingsIdText(raw.settingsId),
-						ambiguousSiblings = raw.ambiguousSiblings == true,
-						anchorOnly = raw.anchorOnly == true,
-						matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
-						matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
-					})
-				end
-			end
-		end
-	end
-
-	table.sort(entries, function(a, b)
-		if #a.pathSegments == #b.pathSegments then
-			return a.key < b.key
-		end
-		return #a.pathSegments < #b.pathSegments
-	end)
-	return entries
 end
 
 local function reconcileSessionKey(serviceName: string, sessionId: any): string
@@ -3225,80 +1858,39 @@ local function applyInstanceReconcileChunk(
 	session.entryCount += newEntries
 	for _, entry in ipairs(entries) do
 		session.desiredKeys[entry.key] = true
-		if #entry.pathSegments > 1 then
-			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
-				stats.noops += 1
-			else
-				local instance =
-					resolveEntryInstance(entry, service.Name, ctx, session.resolvedEntries, session.claimedInstances)
-				if entry.anchorOnly and instance == nil then
-					error("Filtered ancestor was not found: " .. entry.key)
-				elseif entry.anchorOnly then
-					stats.noops += 1
-				elseif instance == nil then
-					local parent = resolveEntryParent(entry, session.resolvedEntries)
-					if parent == nil then
-						error("Cannot create instance; parent path was not found: " .. entry.key)
-					end
-					local okCreate, created = pcall(Instance.new, entry.className)
-					if not okCreate or created == nil then
-						error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
-					end
-					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-					setParentForSync(created, parent, ctx)
-					instance = created
-					stats.instanceCreated += 1
-				else
-					syncEntryPlacement(entry, instance, stats, session.resolvedEntries, ctx)
-					if instance.ClassName ~= entry.className then
-						local oldInstance = instance
-						instance =
-							replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements, ctx)
-						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
-					end
-				end
-				session.resolvedEntries[entry.key] = instance
-				rememberEntryResolution(entry, service.Name, instance, session.claimedInstances, ctx)
-				recordDesiredStableEntry(
-					entry,
-					service.Name,
-					instance,
-					ctx,
-					session.desiredSettingsIds,
-					session.desiredStableKeys
-				)
-			end
+		local instance = syncDesiredEntry(
+			entry,
+			service.Name,
+			ctx,
+			stats,
+			session.resolvedEntries,
+			session.claimedInstances,
+			true
+		)
+		if instance ~= nil then
+			recordDesiredStableEntry(
+				entry,
+				service.Name,
+				instance,
+				ctx,
+				session.desiredSettingsIds,
+				session.desiredStableKeys
+			)
 		end
 	end
 
 	if mode == "finishReconcileService" then
 		if not keepUnknownsEnabled(ctx) then
-			local descendants = service:GetDescendants()
-			for i = #descendants, 1, -1 do
-				local instance = descendants[i]
-				local pathSegments = getInstancePathSegments(instance)
-				local pathOrdinals = getInstancePathOrdinals(instance)
-				local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
-				if
-					key ~= ""
-					and not session.preserveKeys[key]
-					and includeManagedInstance(ctx, service.Name, instance)
-					and not shouldKeepInstanceByDesiredEntry(
-						service.Name,
-						instance,
-						pathSegments,
-						pathOrdinals,
-						ctx,
-						session.desiredKeys,
-						session.desiredSettingsIds,
-						session.desiredStableKeys
-					)
-					and not isProtectedWorkspaceCameraInstance(instance)
-				then
-					removeInstanceForUndo(instance, ctx)
-					stats.instanceDeleted += 1
-				end
-			end
+			removeUnknownInstances(
+				service.Name,
+				service,
+				ctx,
+				stats,
+				session.preserveKeys,
+				session.desiredKeys,
+				session.desiredSettingsIds,
+				session.desiredStableKeys
+			)
 		end
 		reconcileSessions[sessionKey] = nil
 	end
@@ -3325,46 +1917,9 @@ local function applyInstanceUpserts(
 	local beforeReplaced = stats.instanceReplaced
 	local resolvedEntries = {}
 	local claimedInstances = {}
+	local createMissing = liveHydrateEnabled(ctx)
 	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
-		if #entry.pathSegments > 1 then
-			if isProtectedWorkspaceCameraPath(entry.pathSegments) then
-				stats.noops += 1
-			else
-				local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
-				if entry.anchorOnly and instance == nil then
-					error("Filtered ancestor was not found: " .. entry.key)
-				elseif entry.anchorOnly then
-					stats.noops += 1
-				elseif instance == nil and not liveHydrateEnabled(ctx) then
-					stats.noops += 1
-				elseif instance == nil then
-					local parent = resolveEntryParent(entry, resolvedEntries)
-					if parent == nil then
-						error("Cannot create instance; parent path was not found: " .. entry.key)
-					end
-					local okCreate, created = pcall(Instance.new, entry.className)
-					if not okCreate or created == nil then
-						error(`Cannot create instance {entry.key}: {created}`)
-					end
-					created.Name = tostring(entry.pathSegments[#entry.pathSegments])
-					setParentForSync(created, parent, ctx)
-					instance = created
-					stats.instanceCreated += 1
-				else
-					syncEntryPlacement(entry, instance, stats, resolvedEntries, ctx)
-					if instance.ClassName ~= entry.className then
-						local oldInstance = instance
-						instance =
-							replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements, ctx)
-						rememberReplacementIdentity(service.Name, entry.settingsId, oldInstance, instance, ctx)
-					end
-				end
-				if instance ~= nil then
-					resolvedEntries[entry.key] = instance
-					rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
-				end
-			end
-		end
+		syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
 	end
 
 	if stats.instanceCreated == beforeCreated and stats.instanceReplaced == beforeReplaced then
@@ -3472,7 +2027,7 @@ local function applyPropertyChange(
 	if instance == nil then
 		error(`Target instance was not found: {pathKey(cloneArray(change.pathSegments))} [{change.className or ""}]`)
 	end
-	local staged = if type(ctx.resolveStagedPath) == "function"
+	local staged = if ctx.resolveStagedPath ~= nil
 		then ctx.resolveStagedPath(change.pathSegments, change.pathOrdinals)
 		else nil
 	if staged ~= instance then
@@ -3976,6 +2531,9 @@ local function mutationSnapshotLayout(serviceNames: { string }, ctx: { [string]:
 	return groups, roots, metadataTargets, metadataSeen
 end
 
+local captureNativeExportFingerprint
+local nativeExportFingerprintMatches
+
 local function captureMutationSnapshot(serviceNames: { string }, params: { [string]: any }, ctx: { [string]: any })
 	local sourceChanges = params.sourceChanges or {}
 	local hasStructuralChanges = false
@@ -4009,9 +2567,7 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 	if hasStructuralChanges then
 		for _, serviceName in ipairs(serviceNames) do
 			fingerprintsByService[serviceName] = captureNativeExportFingerprint(serviceName, ctx)
-			if type(ctx.studioChangeGeneration) == "function" then
-				generationsByService[serviceName] = ctx.studioChangeGeneration(serviceName)
-			end
+			generationsByService[serviceName] = ctx.studioChangeGeneration(serviceName)
 		end
 	end
 	local payload = nil
@@ -4023,9 +2579,7 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 		payload = serialized
 	end
 	for serviceName, fingerprint in pairs(fingerprintsByService) do
-		local currentGeneration = if type(ctx.studioChangeGeneration) == "function"
-			then ctx.studioChangeGeneration(serviceName)
-			else nil
+		local currentGeneration = ctx.studioChangeGeneration(serviceName)
 		if
 			not nativeExportFingerprintMatches(fingerprint, captureNativeExportFingerprint(serviceName, ctx))
 			or currentGeneration ~= generationsByService[serviceName]
@@ -4114,9 +2668,9 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 					table.insert(instances, descendant)
 				end
 				for _, instance in ipairs(instances) do
-					local pathSegments = getInstancePathSegments(instance)
+					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
 					if pathSegments ~= nil then
-						originalByPath[pathCacheKey(pathSegments, getInstancePathOrdinals(instance))] = instance
+						originalByPath[pathCacheKey(pathSegments, pathOrdinals)] = instance
 					end
 				end
 			end
@@ -4285,14 +2839,14 @@ local function restoreMutationSnapshot(
 			end
 		end
 	end
-	if next(replacements) ~= nil then
+	if next(replacements) then
 		local scanRoots = {}
 		for serviceName, allowed in pairs(ctx.allowedServices) do
 			if allowed then
 				table.insert(scanRoots, game:GetService(serviceName))
 			end
 		end
-		local updated, failed = BridgeReferenceRetarget.apply(
+		local _, failed = BridgeReferenceRetarget.apply(
 			scanRoots,
 			replacements,
 			RbxDomModule.getReferencePropertyNames,
@@ -4344,8 +2898,7 @@ local function appendTransactionJournalRecords(session: { [string]: any }, recor
 		record.currentInstance = instance
 		record.parent = instance.Parent
 		if record.parent ~= nil then
-			record.parentPathSegments = getInstancePathSegments(record.parent)
-			record.parentPathOrdinals = getInstancePathOrdinals(record.parent)
+			record.parentPathSegments, record.parentPathOrdinals = BridgeIdentity.getRefPathParts(record.parent)
 		end
 		if record.tagsChanged then
 			local okTags, tags = pcall(CollectionService.GetTags, CollectionService, instance)
@@ -4365,7 +2918,7 @@ local function appendTransactionJournalRecords(session: { [string]: any }, recor
 end
 
 local function drainTransactionJournal(session: { [string]: any }, ctx: { [string]: any }): { any }
-	if not session.journalActive or type(ctx.drainStudioChangeJournal) ~= "function" then
+	if not session.journalActive then
 		return {}
 	end
 	local records = ctx.drainStudioChangeJournal(session.transactionId)
@@ -4374,7 +2927,7 @@ local function drainTransactionJournal(session: { [string]: any }, ctx: { [strin
 end
 
 local function finishTransactionJournal(session: { [string]: any }, ctx: { [string]: any }): { any }
-	if session.journalActive and type(ctx.finishStudioChangeJournal) == "function" then
+	if session.journalActive then
 		local records = ctx.finishStudioChangeJournal(session.transactionId)
 		session.journalActive = false
 		appendTransactionJournalRecords(session, records)
@@ -4486,9 +3039,7 @@ local function replayTransactionJournal(
 		local instance = resolveReplacement(record.currentInstance, replacements)
 		if instance ~= nil then
 			local parent = resolveJournalParent(record, replacements)
-			if record.structural then
-				setParentForSync(instance, parent, ctx)
-			elseif instance.Parent == nil and parent ~= nil then
+			if record.structural or (instance.Parent == nil and parent ~= nil) then
 				setParentForSync(instance, parent, ctx)
 			end
 		end
@@ -4592,7 +3143,7 @@ local function rollbackTransactionSession(session: { [string]: any }, ctx: { [st
 		return replacements
 	end, debug.traceback)
 	if not ok then
-		if session.journalActive and type(ctx.finishStudioChangeJournal) == "function" then
+		if session.journalActive then
 			pcall(ctx.finishStudioChangeJournal, session.transactionId)
 			session.journalActive = false
 		end
@@ -4752,16 +3303,12 @@ local function captureNativeExportSnapshot(
 	fingerprint: { any },
 	ctx: { [string]: any }
 ): ({ Instance }, { [string]: any }, { [Instance]: Instance }, { Instance })
-	local generationBefore = if type(ctx.studioChangeGeneration) == "function"
-		then ctx.studioChangeGeneration(serviceName)
-		else nil
+	local generationBefore = ctx.studioChangeGeneration(serviceName)
 	local marker = roots[1]
 	local service = fingerprint[1][1]
-	local rootPropertyValues = if type(ctx.captureRootProperties) == "function"
-		then ctx.captureRootProperties(serviceName)
-		else {}
+	local rootPropertyValues = ctx.captureRootProperties(serviceName)
 	for name, value in pairs(service:GetAttributes()) do
-		pcall(marker.SetAttribute, marker, name, value)
+		marker:SetAttribute(name, value)
 	end
 	for _, tag in ipairs(CollectionService:GetTags(service)) do
 		CollectionService:AddTag(marker, tag)
@@ -4794,9 +3341,7 @@ local function captureNativeExportSnapshot(
 			end
 		end
 	end
-	if type(ctx.beginStudioChangeSuppression) == "function" then
-		ctx.beginStudioChangeSuppression(0)
-	end
+	ctx.beginStudioChangeSuppression(0)
 	local okClone, cloneError = xpcall(function()
 		for _, instance in ipairs(changed) do
 			if instance.Parent ~= nil and not instance.Archivable then
@@ -4845,9 +3390,7 @@ local function captureNativeExportSnapshot(
 			restoreError = result
 		end
 	end
-	if type(ctx.endStudioChangeSuppression) == "function" then
-		ctx.endStudioChangeSuppression(0)
-	end
+	ctx.endStudioChangeSuppression(0)
 	if not okClone or restoreError ~= nil then
 		destroyNativeSnapshotRoots(snapshotRoots, replacements)
 		error(restoreError or cloneError, 0)
@@ -4891,9 +3434,7 @@ local function captureNativeExportSnapshot(
 				nonArchivableClones[#nonArchivableClones + 1] = clone
 			end
 		end
-		local generationAfter = if type(ctx.studioChangeGeneration) == "function"
-			then ctx.studioChangeGeneration(serviceName)
-			else nil
+		local generationAfter = ctx.studioChangeGeneration(serviceName)
 		if
 			(generationBefore ~= nil and generationAfter ~= generationBefore)
 			or not nativeExportFingerprintMatches(fingerprint, captureNativeExportFingerprint(serviceName, ctx))
@@ -5064,9 +3605,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if operationGeneration ~= nil and operationGeneration ~= cancellationGeneration then
 			error("Renium operation was cancelled")
 		end
-		if type(ctx.assertSessionOwnership) == "function" then
-			ctx.assertSessionOwnership()
-		end
+		ctx.assertSessionOwnership()
 	end
 
 	local function runWithSessionOwnership(operationGeneration, cancellationCheck, operation, ...)
@@ -5107,7 +3646,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	function api.getServiceChangeGenerations(params: { [string]: any }): { [string]: any }
 		local servicesAreArray, serviceCount = denseArrayLength(params.services)
-		if not servicesAreArray or serviceCount < 1 or type(ctx.studioChangeGeneration) ~= "function" then
+		if not servicesAreArray or serviceCount < 1 then
 			error("Invalid service generation request")
 		end
 		local generations = {}
@@ -5177,19 +3716,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			historyRecording = beginHistoryRecording("Sync from filesystem"),
 			journalActive = false,
 		}
-		if type(ctx.beginStudioChangeJournal) == "function" then
-			local okJournal, journalError = pcall(ctx.beginStudioChangeJournal, transactionId, serviceNames)
-			if not okJournal then
-				finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
-				error(journalError, 0)
-			end
-			session.journalActive = true
+		local okJournal, journalError = pcall(ctx.beginStudioChangeJournal, transactionId, serviceNames)
+		if not okJournal then
+			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
+			error(journalError, 0)
 		end
+		session.journalActive = true
 		session.onExpire = function()
-			local ok, result = pcall(function()
-				return runWithStudioChangeSuppression(ctx, function()
-					return rollbackTransactionSession(session, ctx)
-				end)
+			local ok, result = pcall(runWithStudioChangeSuppression, ctx, function()
+				return rollbackTransactionSession(session, ctx)
 			end)
 			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
 			session.historyRecording = nil
@@ -5283,10 +3818,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		session.onExpire = nil
 		editorTransactions[transactionId] = nil
-		local ok, replacements = pcall(function()
-			return runWithStudioChangeSuppression(ctx, function()
-				return rollbackTransactionSession(session, ctx)
-			end)
+		local ok, replacements = pcall(runWithStudioChangeSuppression, ctx, function()
+			return rollbackTransactionSession(session, ctx)
 		end)
 		finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
 		session.historyRecording = nil
@@ -5384,9 +3917,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				service = serviceName,
 				targetPath = { serviceName },
 				count = #groupRoots - 1,
-				changeGeneration = if type(ctx.studioChangeGeneration) == "function"
-					then ctx.studioChangeGeneration(serviceName)
-					else nil,
+				changeGeneration = ctx.studioChangeGeneration(serviceName),
 			}
 			groups[#groups + 1] = group
 			groupByService[serviceName] = group
@@ -5410,11 +3941,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			groups = groups,
 			serviceNames = serviceNames,
 			nativeStates = {},
-			usesDedicatedNativeStates = type(ctx.prepareNativeState) == "function",
 			partitioned = partitioned,
 			status = "pending",
 			structureChanged = false,
-			structureConnections = {},
 			payloads = {},
 			payloadErrors = {},
 			binaryBatchPayloads = {},
@@ -5436,21 +3965,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			pendingPayloads = if partitioned then 0 else 1,
 			updatedAt = os.clock(),
 		}
-		if not session.usesDedicatedNativeStates then
-			for _, serviceName in ipairs(serviceNames) do
-				local service = game:GetService(serviceName)
-				session.structureConnections[#session.structureConnections + 1] = service.DescendantAdded:Connect(
-					function()
-						session.structureChanged = true
-					end
-				)
-				session.structureConnections[#session.structureConnections + 1] = service.DescendantRemoving:Connect(
-					function()
-						session.structureChanged = true
-					end
-				)
-			end
-		end
 		session.cleanupSnapshot = function()
 			if session.activeSerializations > 0 then
 				session.snapshotCleanupPending = true
@@ -5478,19 +3992,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			session.released = true
 			session.serializationScheduleReady = true
 			session.payloadReadyEvent:Fire()
-			for _, connection in ipairs(session.structureConnections) do
-				connection:Disconnect()
-			end
 			session.cleanupSnapshot()
-			table.clear(session.structureConnections)
 			table.clear(session.nativeStates)
 			table.clear(session.binaryBatchPayloads)
 			session.payloadReadyEvent:Destroy()
-			if not session.usesDedicatedNativeStates then
-				for _, serviceName in ipairs(serviceNames) do
-					ctx.releaseService(serviceName)
-				end
-			end
 		end
 		binaryExports[exportId] = session
 		armSessionExpiry(binaryExports, exportId, session)
@@ -5541,18 +4046,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							snapshot.rootPropertyValues[propertyName] = session.snapshotReplacements[value] or value
 						end
 					end
-					if session.usesDedicatedNativeStates then
-						local state = ctx.prepareNativeState(serviceName, snapshot)
-						if not validateNativeExportFingerprint(session, serviceName, ctx, state) then
-							error("Studio structure changed during native export")
-						end
-						session.nativeStates[serviceName] = state
-						if type(ctx.readRootProperties) == "function" then
-							local values = ctx.readRootProperties(serviceName, state)
-							if type(values) == "table" and next(values) then
-								groupByService[serviceName].rootProperties = values
-							end
-						end
+					local state = ctx.prepareNativeState(serviceName, snapshot)
+					if not validateNativeExportFingerprint(session, serviceName, ctx, state) then
+						error("Studio structure changed during native export")
+					end
+					session.nativeStates[serviceName] = state
+					local values = ctx.readRootProperties(serviceName, state)
+					if type(values) == "table" and next(values) then
+						groupByService[serviceName].rootProperties = values
 					end
 				end
 				if not partitioned then
@@ -5679,7 +4180,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				state.originalNonArchivableInstances = session.originalNonArchivableInstances
 				local instances = state.instances or {}
 				local group = groupByService[serviceName]
-				if group.rootProperties == nil and type(ctx.readRootProperties) == "function" then
+				if group.rootProperties == nil then
 					local values = ctx.readRootProperties(serviceName, state)
 					if type(values) == "table" and next(values) then
 						group.rootProperties = values
@@ -5751,21 +4252,25 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		api.getBinaryExportState(exportId, serviceName)
 	end
 
-	function api.awaitBinaryExport(params: { [string]: any }): { [string]: any }
+	local function binaryExportSession(params: { [string]: any }, requirePartitioned: boolean?): (string, string, any)
 		pruneExpiredSessions(binaryExports)
 		local exportId = tostring(params.exportId or "")
 		local session = binaryExports[exportId]
-		if type(session) ~= "table" then
-			error("Native export session was not found")
+		if type(session) ~= "table" or requirePartitioned and not session.partitioned then
+			error(if requirePartitioned then "Partitioned native export session was not found" else "Native export session was not found")
 		end
 		armSessionExpiry(binaryExports, exportId, session)
+		return exportId, tostring(params.service or ""), session
+	end
+
+	function api.awaitBinaryExport(params: { [string]: any }): { [string]: any }
+		local exportId, serviceName, session = binaryExportSession(params)
 		return runSessionOperation(binaryExports, exportId, session, function()
 			if session.structureChanged then
 				error("Studio structure changed during native export")
 			end
 			local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 30, 1, 120)
 			local deadline = os.clock() + timeoutSeconds
-			local serviceName = tostring(params.service or "")
 			local partitionedService = session.partitioned and serviceName ~= ""
 			if
 				partitionedService
@@ -5835,73 +4340,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end)
 	end
 
-	function api.getBinaryExportStatus(params: { [string]: any }): { [string]: any }
-		pruneExpiredSessions(binaryExports)
-		local exportId = tostring(params.exportId or "")
-		local serviceName = tostring(params.service or "")
-		local session = binaryExports[exportId]
-		if type(session) ~= "table" then
-			error("Native export session was not found")
-		end
-		armSessionExpiry(binaryExports, exportId, session)
-		return runSessionOperation(binaryExports, exportId, session, function()
-			if session.structureChanged then
-				error("Studio structure changed during native export")
-			end
-			if session.partitioned and serviceName ~= "" then
-				if session.nativeStates[serviceName] == nil and not session.serializationBatchIds[serviceName] then
-					error("Native export service was not found")
-				end
-				local payloadError = session.payloadErrors[serviceName]
-				if payloadError then
-					error(payloadError, 0)
-				end
-				local payload = session.payloads[serviceName]
-				if payload == nil then
-					return {
-						ok = true,
-						exportId = exportId,
-						service = serviceName,
-						pending = true,
-					}
-				end
-				return {
-					ok = true,
-					exportId = exportId,
-					service = serviceName,
-					pending = false,
-					totalBytes = buffer.len(payload),
-				}
-			end
-			if session.status == "pending" then
-				return {
-					ok = true,
-					exportId = exportId,
-					pending = true,
-				}
-			end
-			if session.status ~= "ready" then
-				local _, payloadError = next(session.payloadErrors)
-				error(session.error or payloadError or "Native export serialization failed", 0)
-			end
-			return {
-				ok = true,
-				exportId = exportId,
-				pending = false,
-				totalBytes = session.totalBytes,
-			}
-		end)
-	end
-
 	function api.readBinaryExport(params: { [string]: any }): { [string]: any }
-		pruneExpiredSessions(binaryExports)
-		local exportId = tostring(params.exportId or "")
-		local serviceName = tostring(params.service or "")
-		local session = binaryExports[exportId]
-		if type(session) ~= "table" then
-			error("Native export session was not found")
-		end
-		armSessionExpiry(binaryExports, exportId, session)
+		local exportId, serviceName, session = binaryExportSession(params)
 		return runSessionOperation(binaryExports, exportId, session, function()
 			if session.structureChanged then
 				error("Studio structure changed during native export")
@@ -5922,15 +4362,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				payload = session.payloads[serviceName]
 				totalBytes = if payload then buffer.len(payload) else nil
 			end
-			if payload == nil or totalBytes == nil then
+			if not payload or not totalBytes then
 				error("Native export serialization is not ready")
 			end
 			local offset = tonumber(params.offset)
 			local length = tonumber(params.length)
-			if offset == nil or offset < 0 or offset % 1 ~= 0 then
+			if not offset or offset < 0 or offset % 1 ~= 0 then
 				error("Invalid native export offset")
 			end
-			if length == nil or length < 1 or length > 8388608 or length % 1 ~= 0 then
+			if not length or length < 1 or length > 8388608 or length % 1 ~= 0 then
 				error("Invalid native export length")
 			end
 			if params.clampLength == true then
@@ -5965,13 +4405,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.readBinaryExportBatch(params: { [string]: any }): { [string]: any }
-		pruneExpiredSessions(binaryExports)
-		local exportId = tostring(params.exportId or "")
-		local session = binaryExports[exportId]
-		if type(session) ~= "table" or not session.partitioned then
-			error("Partitioned native export session was not found")
-		end
-		armSessionExpiry(binaryExports, exportId, session)
+		local exportId, _, session = binaryExportSession(params, true)
 		return runSessionOperation(binaryExports, exportId, session, function()
 			local denseServices, serviceCount = denseArrayLength(params.services)
 			if not denseServices or serviceCount < 2 or serviceCount > #session.serviceNames then
@@ -6069,10 +4503,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local totalBytes = batch.totalBytes
 			local offset = tonumber(params.offset)
 			local length = tonumber(params.length)
-			if offset == nil or offset < 0 or offset % 1 ~= 0 then
+			if not offset or offset < 0 or offset % 1 ~= 0 then
 				error("Invalid native export batch offset")
 			end
-			if length == nil or length < 1 or length > 8388608 or length % 1 ~= 0 then
+			if not length or length < 1 or length > 8388608 or length % 1 ~= 0 then
 				error("Invalid native export batch length")
 			end
 			if params.clampLength == true then
@@ -6152,12 +4586,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(editorTransactions, transactionId, transaction)
 		local totalBytes = tonumber(params.totalBytes)
 		local totalChunks = tonumber(params.totalChunks)
-		if importId == "" or totalBytes == nil or totalBytes < 1 or totalBytes > 536870912 or totalBytes % 1 ~= 0 then
+		if importId == "" or not totalBytes or totalBytes < 1 or totalBytes > 536870912 or totalBytes % 1 ~= 0 then
 			error("Invalid native import size")
 		end
 		local expectedChunks = math.ceil(totalBytes / BINARY_IMPORT_CHUNK_BYTES)
 		if
-			totalChunks == nil
+			not totalChunks
 			or totalChunks ~= expectedChunks
 			or totalChunks < 1
 			or totalChunks > 4096
@@ -6218,7 +4652,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 			local count = tonumber(rawGroup.count)
-			if count == nil or count < 0 or count % 1 ~= 0 then
+			if not count or count < 0 or count % 1 ~= 0 then
 				error("Invalid native import service count")
 			end
 			local rootPathsAreArray, rootPathCount = denseArrayLength(rawGroup.rootPaths)
@@ -6302,12 +4736,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					if
 						type(className) ~= "string"
 						or className == ""
-						or payloadIndex == nil
+						or not payloadIndex
 						or payloadIndex < 1
 						or payloadIndex > count
 						or payloadIndex % 1 ~= 0
 						or retainedPayloadIndexes[payloadIndex]
-						or retainedInstanceCount == nil
+						or not retainedInstanceCount
 						or retainedInstanceCount < 1
 						or retainedInstanceCount % 1 ~= 0
 					then
@@ -6340,7 +4774,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				for _, rawIndex in ipairs(rawGroup.stripPackagePayloads) do
 					local payloadIndex = tonumber(rawIndex)
 					if
-						payloadIndex == nil
+						not payloadIndex
 						or payloadIndex < 1
 						or payloadIndex > count
 						or payloadIndex % 1 ~= 0
@@ -6357,10 +4791,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if
 				(#retainedRoots > 0 or #packageRoots > 0)
 				and (
-					changeGeneration == nil
+					not changeGeneration
 					or changeGeneration < 0
 					or changeGeneration % 1 ~= 0
-					or type(ctx.studioChangeGeneration) ~= "function"
 				)
 			then
 				error("Native import retained roots require a Studio change generation")
@@ -6411,7 +4844,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(editorTransactions, session.transactionId, transaction)
 		armSessionExpiry(binaryImports, importId, session)
 		local index = tonumber(params.index)
-		if index == nil or index < 1 or index > session.totalChunks or index % 1 ~= 0 then
+		if not index or index < 1 or index > session.totalChunks or index % 1 ~= 0 then
 			error("Invalid native import chunk index")
 		end
 		if session.received[index] then
@@ -6500,10 +4933,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				outgoingByGroup[groupIndex] = outgoing
 				group.packageScanRoots = outgoing
 				ReferenceOverlay.assertPackageRoots(group)
-				if
-					generationsByService[group.serviceName] == nil
-					and type(ctx.studioChangeGeneration) == "function"
-				then
+				if generationsByService[group.serviceName] == nil then
 					generationsByService[group.serviceName] = ctx.studioChangeGeneration(group.serviceName)
 				end
 			end
@@ -6742,7 +5172,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local snapshotItems = {}
 			for _, instance in ipairs(service:GetDescendants()) do
 				if includeManagedInstance(ctx, params.service, instance) then
-					local pathSegments = getInstancePathSegments(instance)
+					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
 					if pathSegments ~= nil then
 						local attributes = {}
 						for name in pairs(instance:GetAttributes()) do
@@ -6750,7 +5180,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						end
 						snapshotItems[#snapshotItems + 1] = {
 							pathSegments = pathSegments,
-							pathOrdinals = getInstancePathOrdinals(instance),
+							pathOrdinals = pathOrdinals,
 							name = instance.Name,
 							className = instance.ClassName,
 							settingsId = settingsIdsByInstance[instance],
@@ -7202,10 +5632,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		table.clear(editorTransactions)
 		for _, session in ipairs(activeTransactions) do
-			local okRollback, rollbackError = pcall(function()
-				return runWithStudioChangeSuppression(ctx, function()
-					return rollbackTransactionSession(session, ctx)
-				end)
+			local okRollback, rollbackError = pcall(runWithStudioChangeSuppression, ctx, function()
+				return rollbackTransactionSession(session, ctx)
 			end)
 			if not okRollback then
 				warn("[Renium] transaction cleanup failed: " .. tostring(rollbackError))
@@ -7221,10 +5649,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		table.clear(reconcileSessions)
 		for _, session in ipairs(activeReconciles) do
-			local okRollback, rollbackError = pcall(function()
-				return runWithStudioChangeSuppression(ctx, function()
-					return rollbackReconcileSnapshot(session.rollbackSnapshot, session.serviceName)
-				end)
+			local okRollback, rollbackError = pcall(runWithStudioChangeSuppression, ctx, function()
+				return rollbackReconcileSnapshot(session.rollbackSnapshot, session.serviceName)
 			end)
 			if not okRollback then
 				warn("[Renium] reconcile cleanup failed: " .. tostring(rollbackError))

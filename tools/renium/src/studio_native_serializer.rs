@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, c_void};
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs;
 use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use memchr::memmem;
@@ -25,6 +24,11 @@ use windows_sys::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, OpenProcess, PROCESS_CREATE_THREAD,
     PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
     PROCESS_VM_WRITE, WaitForSingleObject,
+};
+
+use crate::native_snapshot::{
+    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, now_millis,
+    temporary_output_path,
 };
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
@@ -92,23 +96,6 @@ struct ActiveDataModel {
     outer: usize,
     owner: usize,
     roots: Vec<SharedEntry>,
-}
-
-#[derive(Debug)]
-pub struct NativeSnapshot {
-    pub instance_count: usize,
-    pub output_size: u64,
-    pub setup_ms: f64,
-    pub trace_ms: f64,
-    pub discover_ms: f64,
-    pub helper_ms: f64,
-    pub invoke_ms: f64,
-    pub validate_ms: f64,
-    pub context_ms: f64,
-    pub collect_ms: f64,
-    pub serialize_ms: f64,
-    pub write_ms: f64,
-    pub elapsed_ms: f64,
 }
 
 struct ProcessMemory {
@@ -458,13 +445,13 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
         fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
     let modified = metadata.modified().ok();
     let cache = TRACES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache
+    let cached = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
-        .cloned()
-    {
+        .cloned();
+    if let Some(cached) = cached {
         return Ok(cached.trace);
     }
 
@@ -581,13 +568,13 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
         fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
     let modified = metadata.modified().ok();
     let cache = LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache
+    let cached = cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
-        .cloned()
-    {
+        .cloned();
+    if let Some(cached) = cached {
         return Ok((cached.data, cached.trace));
     }
     let executable =
@@ -821,7 +808,11 @@ fn find_active_data_model(
         .context("Could not read Studio's data section")?;
     let mut references: HashMap<usize, Vec<usize>> = HashMap::new();
     for offset in (0..=bytes.len().saturating_sub(8)).step_by(8) {
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        let value = u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("data-section word is eight bytes"),
+        ) as usize;
         if likely_pointer(value) {
             references.entry(value).or_default().push(offset);
         }
@@ -870,9 +861,13 @@ fn find_active_data_model(
         let owner = offsets
             .iter()
             .filter_map(|offset| {
-                bytes
-                    .get(offset + 8..offset + 16)
-                    .map(|value| u64::from_le_bytes(value.try_into().unwrap()) as usize)
+                bytes.get(offset + 8..offset + 16).map(|value| {
+                    u64::from_le_bytes(
+                        value
+                            .try_into()
+                            .expect("data-section owner word is eight bytes"),
+                    ) as usize
+                })
             })
             .find(|owner| valid_owner(memory, *owner, module.base, module.size));
         let Some(owner) = owner else {
@@ -975,10 +970,13 @@ fn active_data_model(
     title: &str,
 ) -> Result<ActiveDataModel> {
     let cache = DATA_MODELS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(data_model) = cache
+    let cached = cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&pid)
+        .cloned();
+    if let Some(data_model) = cached
+        .as_ref()
         .and_then(|cached| refresh_active_data_model(memory, module, title, cached))
     {
         return Ok(data_model);
@@ -1206,26 +1204,6 @@ fn error_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&value[..end]).into_owned()
 }
 
-fn temporary_output_path(output: &Path, pid: u32) -> Result<PathBuf> {
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("place.rbxl");
-    Ok(parent.join(format!(".{name}.renium-native-{pid}-{}.rbxl", now_millis())))
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
-}
-
 fn write_live_snapshot(
     pid: u32,
     studio_title: &str,
@@ -1285,68 +1263,12 @@ fn write_live_snapshot(
             );
         }
         let output_size = read_u64(&parameters, PARAM_OUTPUT_SIZE)?;
-        let metadata = fs::metadata(&temporary)
-            .with_context(|| format!("Studio did not create {}", temporary.display()))?;
-        if output_size == 0 || metadata.len() != output_size {
-            bail!(
-                "Studio native serializer reported {output_size} bytes but wrote {}",
-                metadata.len()
-            );
-        }
-        let validate_started = Instant::now();
-        let file = File::open(&temporary)
-            .with_context(|| format!("Could not read {}", temporary.display()))?;
-        let database =
-            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-        let filter = database
-            .classes
-            .keys()
-            .map(|class| (class.to_string(), std::collections::HashSet::new()))
-            .collect::<HashMap<_, _>>();
-        let flat = rbx_binary::Deserializer::new()
-            .flat_property_filter(std::sync::Arc::new(filter))
-            .deserialize_flat(BufReader::new(file))
-            .context("Studio native serializer returned an invalid RBXL")?;
-        if service.is_none()
-            && flat
-                .metadata
-                .get("ExplicitAutoJoints")
-                .is_some_and(|value| value == "true")
-        {
-            bail!("Studio native serializer returned an instance model instead of a place");
-        }
-        if let Some(service) = service {
-            if flat.root_indices.len() != 1
-                || flat
-                    .instances
-                    .get(flat.root_indices[0])
-                    .is_none_or(|instance| instance.class.as_str() != service)
-            {
-                bail!("Studio native RBXL did not contain exactly one {service} root");
-            }
-        } else {
-            let root_classes = flat
-                .root_indices
-                .iter()
-                .filter_map(|index| flat.instances.get(*index))
-                .map(|instance| instance.class.as_str())
-                .collect::<Vec<_>>();
-            if !["Workspace", "Players", "MaterialService"]
-                .iter()
-                .all(|required| root_classes.iter().any(|class| class == required))
-            {
-                bail!("Studio native RBXL omitted required service roots");
-            }
-        }
-        let instance_count = flat.instances.len();
-        let validate_ms = validate_started.elapsed().as_secs_f64() * 1000.0;
-        fs::rename(&temporary, output).with_context(|| {
-            format!(
-                "Could not move validated native snapshot from {} to {}",
-                temporary.display(),
-                output.display()
-            )
-        })?;
+        let expected_roots = NativeSnapshotRoots {
+            exact_service: service,
+            containing_service: None,
+        };
+        let (instance_count, validate_ms) =
+            finalize_native_snapshot(&temporary, output, output_size, expected_roots)?;
         Ok(NativeSnapshot {
             instance_count,
             output_size,

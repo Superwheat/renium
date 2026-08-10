@@ -56,12 +56,7 @@ snapshots/
 *.log
 *.tmp
 .renium/
-.renium-cache/
-.roblox-sync/
-.roblox-sync-cache/
-.pi_tmp/
 tools/**/.renium/
-tools/**/.renium-cache/
 tools/**/.vscode-test/
 
 # OS/editor noise

@@ -13,13 +13,13 @@ local runnerSequence = 0
 
 local function truncateText(text, maxBytes)
 	if #text <= maxBytes then
-		return text, false
+		return text
 	end
 	local suffix = "\n[Renium truncated this message.]"
 	local contentBytes = math.max(0, maxBytes - #suffix)
 	local ok, boundary = pcall(utf8.offset, text, 0, contentBytes + 1)
 	local finish = if ok and boundary then boundary - 1 else contentBytes
-	return string.sub(text, 1, finish) .. suffix, true
+	return string.sub(text, 1, finish) .. suffix
 end
 
 local function appendCapturedOutput(output, state, kind, ...)
@@ -102,6 +102,13 @@ local function splitAutomationPath(text)
 	return segments
 end
 
+local function reverseArray(values)
+	for left = 1, math.floor(#values / 2) do
+		local right = #values - left + 1
+		values[left], values[right] = values[right], values[left]
+	end
+end
+
 local function compactInstancePath(instance)
 	local parts = {}
 	local current = instance
@@ -123,9 +130,10 @@ local function compactInstancePath(instance)
 		if duplicateCount > 1 then
 			segment ..= ("[%d]"):format(ordinal)
 		end
-		table.insert(parts, 1, segment)
+		parts[#parts + 1] = segment
 		current = current.Parent
 	end
+	reverseArray(parts)
 	return "game." .. table.concat(parts, ".")
 end
 
@@ -329,9 +337,7 @@ local function createTrackedTaskProxy(trackedThreads)
 		local scheduledThread = nil
 		local arguments = table.pack(...)
 		scheduledThread = scheduleCallback(function()
-			local result = table.pack(pcall(function()
-				return callback(table.unpack(arguments, 1, arguments.n))
-			end))
+			local result = table.pack(pcall(callback, table.unpack(arguments, 1, arguments.n)))
 			completed = true
 			if scheduledThread then
 				trackedThreads[scheduledThread] = nil
@@ -401,7 +407,6 @@ local function createTrackedCoroutineProxy(trackedThreads)
 end
 
 function BridgeRuntimeApi.create(plugin, runtimeContext)
-	runtimeContext = runtimeContext or {}
 	local HttpService = game:GetService("HttpService")
 	local LogService = game:GetService("LogService")
 	local RunService = game:GetService("RunService")
@@ -442,9 +447,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		if operationGeneration ~= cancellationGeneration then
 			error("Renium operation was cancelled")
 		end
-		if type(runtimeContext.assertSessionOwnership) == "function" then
-			runtimeContext.assertSessionOwnership(sessionGeneration)
-		end
+		runtimeContext.assertSessionOwnership(sessionGeneration)
 	end
 
 	local function appendConsoleEntry(message, messageType)
@@ -714,9 +717,7 @@ end)
 		local editModeOk, editModeValue = pcall(function()
 			return (StudioTestService :: any).EditModeActive
 		end)
-		local canLeaveOk, canLeaveValue = pcall(function()
-			return (StudioTestService :: any):CanLeaveTest()
-		end)
+		local canLeaveOk, canLeaveValue = pcall((StudioTestService :: any).CanLeaveTest, StudioTestService)
 		return {
 			editModeActive = if editModeOk and type(editModeValue) == "boolean" then editModeValue else nil,
 			canLeaveTest = if canLeaveOk and type(canLeaveValue) == "boolean" then canLeaveValue else nil,
@@ -847,9 +848,10 @@ end)
 					end
 				end
 			end
-			table.insert(parts, 1, segment)
+			parts[#parts + 1] = segment
 			current = parent
 		end
+		reverseArray(parts)
 		return table.concat(parts, ".")
 	end
 
@@ -1558,9 +1560,7 @@ updateMouse()
 				simulating = false,
 				viewport = { width = viewport.X, height = viewport.Y },
 			}
-			local okDevice, deviceId = pcall(function()
-				return service:GetDeviceAsync()
-			end)
+			local okDevice, deviceId = pcall(service.GetDeviceAsync, service)
 			if not okDevice or type(deviceId) ~= "string" or deviceId == "" then
 				return inactive
 			end
@@ -1588,11 +1588,9 @@ updateMouse()
 				},
 				pixelDensity = pixelDensity,
 			}
-			if type(deviceId) == "string" and deviceId ~= "" then
-				local okInfo, info = pcall(deviceInfo, deviceId)
-				if okInfo then
-					result.device = info
-				end
+			local okInfo, info = pcall(deviceInfo, deviceId)
+			if okInfo then
+				result.device = info
 			end
 			return result
 		end
@@ -1656,9 +1654,7 @@ updateMouse()
 			if not before.simulating then
 				return { ok = true, action = "stop", stopped = true, alreadyStopped = true }
 			end
-			local okStop, stopError = pcall(function()
-				service:StopSimulationAsync()
-			end)
+			local okStop, stopError = pcall(service.StopSimulationAsync, service)
 			if not okStop and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true) then
 				return { ok = false, error = tostring(stopError) }
 			end
@@ -1715,8 +1711,8 @@ updateMouse()
 
 		local width = tonumber(params.width)
 		local height = tonumber(params.height)
-		if width ~= nil or height ~= nil then
-			if width == nil or height == nil or width < 1 or height < 1 then
+		if width or height then
+			if not width or not height or width < 1 or height < 1 then
 				return { ok = false, error = "Resolution requires positive width and height" }
 			end
 		end
@@ -1724,12 +1720,12 @@ updateMouse()
 		local density = nil
 		if params.pixelDensity ~= nil then
 			density = tonumber(params.pixelDensity)
-			if density == nil or density <= 0 then
+			if not density or density <= 0 then
 				return { ok = false, error = "Pixel density must be greater than zero" }
 			end
 		end
 
-		if selectedDevice == nil and orientation == nil and scalingMode == nil and width == nil and density == nil then
+		if not selectedDevice and not orientation and not scalingMode and not width and not density then
 			return { ok = false, error = "Set requires a device or configuration option" }
 		end
 
@@ -1782,12 +1778,12 @@ updateMouse()
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "scalingMode"
 			end
-			if width ~= nil then
+			if width then
 				service:SetResolutionAsync(math.floor(width), math.floor(height))
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "resolution"
 			end
-			if density ~= nil then
+			if density then
 				service:SetPixelDensityAsync(density)
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "pixelDensity"
@@ -1858,8 +1854,8 @@ updateMouse()
 			backgroundLifetimeSeconds = math.clamp(backgroundLifetimeSeconds, 0.1, 610)
 		end
 
-		local context = string.lower(tostring(params.context or params.target or "plugin"))
-		if context == "client" or context == "local" then
+		local context = string.lower(tostring(params.context or "plugin"))
+		if context == "client" then
 			local players = game:GetService("Players")
 			local localPlayer = players.LocalPlayer
 			if localPlayer == nil then
@@ -1902,7 +1898,7 @@ updateMouse()
 			return { ok = false, error = "loadstring is not available in this Studio session" }
 		end
 
-		local requestedChunkName = tostring(params.chunkName or params.name or "Renium")
+		local requestedChunkName = tostring(params.chunkName or "Renium")
 		local chunkName = if requestedChunkName == "" then "Renium" else requestedChunkName
 
 		local loadOk, loadedChunk, loadedError = pcall(loadstring, code, chunkName)
@@ -2103,14 +2099,27 @@ updateMouse()
 			and game:GetAttribute("__ReniumEditRuntimeId") == playSession.ownerRuntimeId
 	end
 
+	local function playStatus(action)
+		return {
+			ok = true,
+			action = action,
+			running = api.isPlayModeRunning(),
+			starting = playSession.starting,
+			mode = playSession.mode,
+			launchNonce = playSession.launchNonce,
+			lastError = playSession.lastError,
+			lastResult = playSession.lastResult,
+			runState = currentRunStateText(),
+			studioTest = currentStudioTestState(),
+		}
+	end
+
 	local function cancelOwnedPlayLaunch(token, ownerGeneration)
 		if playSession.token ~= token or not matchingOwnedPlayLaunch(ownerGeneration) then
 			return
 		end
 		playSession.token += 1
-		pcall(function()
-			(StudioTestService :: any):EndTest(true)
-		end)
+		pcall((StudioTestService :: any).EndTest, StudioTestService, true)
 		playSession.active = false
 		playSession.starting = false
 		playSession.lastStoppedAt = os.clock()
@@ -2145,8 +2154,8 @@ updateMouse()
 	function api.startStopPlay(params)
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
-		local shouldStart = params.start == true or params.isStart == true or params.playing == true
-		local shouldStop = params.stop == true or params.isStart == false or params.playing == false
+		local shouldStart = params.start == true
+		local shouldStop = params.stop == true
 		if shouldStart and shouldStop then
 			return { ok = false, error = "Conflicting play state request" }
 		end
@@ -2155,11 +2164,7 @@ updateMouse()
 		if shouldStart then
 			action = "start"
 			local requestedLaunchNonce = tostring(params.launchNonce or "")
-			if
-				playSession.starting
-				and not api.isPlayModeRunning()
-				and os.clock() - (playSession.lastStartedAt or 0) > 60
-			then
+			if playSession.starting and not api.isPlayModeRunning() and os.clock() - playSession.lastStartedAt > 60 then
 				cancelOwnedPlayLaunch(playSession.token, playSession.ownerGeneration)
 				if playSession.starting then
 					playSession.token += 1
@@ -2255,20 +2260,10 @@ updateMouse()
 			end
 			if params.waitForStopped == false then
 				task.defer(requestStop)
-				return {
-					ok = true,
-					action = action,
-					stopRequested = true,
-					attempts = attempts,
-					running = api.isPlayModeRunning(),
-					starting = playSession.starting,
-					mode = playSession.mode,
-					launchNonce = playSession.launchNonce,
-					lastError = playSession.lastError,
-					lastResult = playSession.lastResult,
-					runState = currentRunStateText(),
-					studioTest = currentStudioTestState(),
-				}
+				local result = playStatus(action)
+				result.stopRequested = true
+				result.attempts = attempts
+				return result
 			end
 			requestStop()
 			local stopped =
@@ -2293,18 +2288,7 @@ updateMouse()
 		end
 
 		assertOperationOwnership(operationGeneration)
-		local result = {
-			ok = true,
-			action = action,
-			running = api.isPlayModeRunning(),
-			starting = playSession.starting,
-			mode = playSession.mode,
-			launchNonce = playSession.launchNonce,
-			lastError = playSession.lastError,
-			lastResult = playSession.lastResult,
-			runState = currentRunStateText(),
-			studioTest = currentStudioTestState(),
-		}
+		local result = playStatus(action)
 		if action == "status" and playSession.owned and not result.running and not result.starting then
 			releasePlayOwnership()
 		end
@@ -2343,17 +2327,13 @@ updateMouse()
 		captureProbeFrame = nil
 		local simulator = game:GetService("StudioDeviceSimulatorService")
 		if deviceSimulationOwned and deviceSimulationOwnerGeneration == cleanupGeneration then
-			pcall(function()
-				simulator:StopSimulationAsync()
-			end)
+			pcall(simulator.StopSimulationAsync, simulator)
 			deviceSimulationOwned = false
 			deviceSimulationOwnerGeneration = nil
 		end
 		if matchingOwnedPlayLaunch(cleanupGeneration) then
 			if api.isPlayModeRunning() or playSession.active or playSession.starting then
-				pcall(function()
-					(StudioTestService :: any):EndTest(true)
-				end)
+				pcall((StudioTestService :: any).EndTest, StudioTestService, true)
 			end
 			playSession.active = false
 			playSession.starting = false

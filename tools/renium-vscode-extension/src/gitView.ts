@@ -1,4 +1,4 @@
-export type GitViewEntry = {
+type GitViewEntry = {
   path: string;
   originalPath?: string;
   kind: string;
@@ -37,7 +37,35 @@ export type GitViewState = {
   lastUpdated: string;
 };
 
-export type GitViewContext = {
+export function emptyGitViewState(
+  projectRoot: string,
+  trusted: boolean,
+  message?: string,
+): GitViewState {
+  return {
+    ok: false,
+    message,
+    trusted,
+    projectRoot,
+    connected: false,
+    ahead: 0,
+    behind: 0,
+    counts: {
+      total: 0,
+      tracked: 0,
+      staged: 0,
+      unstaged: 0,
+      untracked: 0,
+      ignored: 0,
+      conflicted: 0,
+      deleted: 0,
+    },
+    entries: [],
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+type GitViewContext = {
   projectRoot: string;
 };
 

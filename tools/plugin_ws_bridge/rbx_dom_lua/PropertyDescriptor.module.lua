@@ -1,13 +1,6 @@
 local Error = require(script.Parent.Error)
 local customProperties = require(script.Parent.customProperties)
 
-
-
-
-
-
-
-
 local PropertyDescriptor = {}
 PropertyDescriptor.__index = PropertyDescriptor
 
@@ -23,15 +16,6 @@ function PropertyDescriptor.fromRaw(data, className, propertyName)
 	local key, value = next(data.DataType)
 
 	return setmetatable({
-
-
-
-
-
-
-
-
-
 
 		dataType = key == "Enum" and key or value,
 		enumType = key == "Enum" and ("Enum." .. value) or nil,

@@ -121,8 +121,8 @@ async function runTaskkill(pid: number, force: boolean): Promise<void> {
   });
 }
 
-async function posixDescendants(rootPid: number): Promise<number[]> {
-  return await new Promise<number[]>((resolve) => {
+function posixDescendants(rootPid: number): Promise<number[]> {
+  return new Promise<number[]>((resolve) => {
     let output = "";
     let settled = false;
     const ps = childProcess.spawn("ps", ["-eo", "pid=,ppid="], {
@@ -182,22 +182,15 @@ async function posixDescendants(rootPid: number): Promise<number[]> {
 
 async function signalPosixTree(pid: number, signal: NodeJS.Signals): Promise<void> {
   const targets = [...await posixDescendants(pid), pid];
-  const groups = new Set<number>();
   for (const target of targets) {
-    await new Promise<void>((resolve) => {
-      try {
-        if (!groups.has(target)) {
-          process.kill(-target, signal);
-          groups.add(target);
-        }
-      } catch {
-      }
-      try {
-        process.kill(target, signal);
-      } catch {
-      }
-      resolve();
-    });
+    try {
+      process.kill(-target, signal);
+    } catch {
+    }
+    try {
+      process.kill(target, signal);
+    } catch {
+    }
   }
 }
 
@@ -208,6 +201,22 @@ export function projectProcessOwner(projectRoot: string): string {
 
 export function trackProcess(child: childProcess.ChildProcess, owner: string): Promise<void> {
   return ensureEntry(child, owner).closed;
+}
+
+export function spawnTrackedProcess(
+  command: string,
+  args: readonly string[],
+  cwd: string,
+): { child: childProcess.ChildProcessWithoutNullStreams; closed: Promise<void> } {
+  const child = childProcess.spawn(command, args, {
+    cwd,
+    env: process.env,
+    detached: process.platform !== "win32",
+    shell: false,
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  return { child, closed: trackProcess(child, projectProcessOwner(cwd)) };
 }
 
 export async function terminateProcess(child: childProcess.ChildProcess, gracefulMs = 750): Promise<void> {

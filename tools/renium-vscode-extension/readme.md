@@ -65,16 +65,16 @@ single-place layout and behavior.
 ## .renium viewer
 
 Open the Renium panel and switch to the **Inspector** tab (next to Explorer /
-History / Git), then drag any `.rbsync` file onto it to see its instance tree —
+History / Git), then drag any `.renium` file onto it to see its instance tree:
 class icons, properties, attributes, script source, and settings id, with a
 filter box. You can also double-click a `.renium` in the file Explorer to open
 the same view full-width. Decoding is done by the `renium` CLI, so what you see
-matches exactly what syncs. Legacy `.rbsync` stores remain readable.
+matches exactly what syncs.
 
 ## Requirements
 
 - Renium Studio plugin running in Studio
-- Renium CLI bundled with the extension, installed on `PATH`, or selected with `renium.rustCliPath`
+- Renium CLI bundled with the extension, installed on `PATH`, or selected with `renium.cliPath`
 - For Wally package sync: `wally` on PATH, or configure `renium.wallySync.wallyPath`
 - `git` available on PATH, or configure `renium.gitSync.gitPath`
 
@@ -180,19 +180,15 @@ before Marketplace publication.
 
 ## Key settings
 
-- `renium.exportCliPath`
-- `renium.rustCliPath` (optional CLI override; blank uses the bundled CLI)
+- `renium.cliPath` (optional CLI override; blank uses the bundled CLI)
 - `renium.projectRoot` (default: `${workspaceFolder}`)
-- `renium.transport` (`ws` or `mcp`)
 - `renium.runImport` (default: `true`)
 - `renium.autoSyncOnSave` (default: `false`)
 - `renium.autoSyncDebounceMs` (default: `800`)
 - `renium.editorLiveSyncEnabled` (default: `false`)
-- `renium.editorLiveSyncOnStartup` (default: `false`, legacy)
 - `renium.studioLiveSyncEnabled` (default: `true`)
 - `renium.studioLiveSyncPollMs` (default: `250`, minimum: `10`; backs off while idle or after errors)
 - `renium.progressHeartbeatSeconds` (default: `2`)
-- `renium.usePersistentBridge` (default: `true`)
 - `renium.gitSync.gitPath` (default: `git`)
 - `renium.gitSync.remote` (default: `origin`)
 - `renium.gitSync.branch` (blank = current branch)
@@ -208,7 +204,6 @@ before Marketplace publication.
 - `renium.gitSync.timeoutSeconds` (default: `120`)
 - `renium.gitSync.outputBehavior` (`onStart`, `onError`, `silent`)
 - `renium.wallySync.wallyPath` (default: `wally`)
-- `renium.wallySync.rojoPath` (deprecated; ignored)
 - `renium.wallySync.packagesDir` (default: `Packages`)
 - `renium.wallySync.targetService` (default: `ReplicatedStorage`)
 - `renium.wallySync.targetName` (default: `Packages`)

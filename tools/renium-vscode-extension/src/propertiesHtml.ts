@@ -1,16 +1,50 @@
 ﻿import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
+const THEME_CSS = `
+:root,
+body.vscode-light {
+	--renium-webview-foreground: #000;
+}
 
-export interface PropertiesHtmlOptions {
+body.vscode-dark,
+body.vscode-high-contrast {
+	--renium-webview-foreground: #fff;
+}
+
+body.vscode-high-contrast[data-vscode-theme-name*="light" i],
+body.vscode-high-contrast[data-vscode-theme-id*="light" i] {
+	--renium-webview-foreground: #000;
+}
+
+body {
+	color: var(--renium-webview-foreground) !important;
+	--vscode-foreground: var(--renium-webview-foreground);
+	--vscode-sideBar-foreground: var(--renium-webview-foreground);
+	--vscode-input-foreground: var(--renium-webview-foreground);
+	--vscode-list-inactiveSelectionForeground: var(--renium-webview-foreground);
+	--vscode-list-activeSelectionForeground: var(--renium-webview-foreground);
+	--vscode-menu-foreground: var(--renium-webview-foreground);
+	--vscode-menu-selectionForeground: var(--renium-webview-foreground);
+	--vscode-dropdown-foreground: var(--renium-webview-foreground);
+	--vscode-descriptionForeground: var(--renium-webview-foreground);
+	--vscode-textLink-foreground: var(--renium-webview-foreground);
+	--vscode-button-foreground: var(--renium-webview-foreground);
+	--vscode-button-secondaryForeground: var(--renium-webview-foreground);
+	--vscode-badge-foreground: var(--renium-webview-foreground);
+}
+
+body * {
+	color: var(--renium-webview-foreground);
+}
+`;
+
+interface PropertiesHtmlOptions {
     showToggleButton?: boolean;
     showFilterInput?: boolean;
 }
 
 export function getPropertiesHtml(extensionUri: vscode.Uri, options: PropertiesHtmlOptions = {}): string {
-    const { showToggleButton = false, showFilterInput = false } = options;
-
     const htmlPath = path.join(extensionUri.fsPath, "resources", "properties.html");
     const cssPath = path.join(extensionUri.fsPath, "resources", "properties.css");
     const sortersPath = path.join(extensionUri.fsPath, "resources", "robloxPropertySorters.js");
@@ -34,12 +68,11 @@ export function getPropertiesHtml(extensionUri: vscode.Uri, options: PropertiesH
     try {
         let htmlContent = fs.readFileSync(htmlPath, 'utf8');
 
-        const styleTag = `<style>${getThemeCssBlock()}${cssContent}</style>`;
-        const themeScriptTag = getThemeScriptBlock();
+        const styleTag = `<style>${THEME_CSS}${cssContent}</style>`;
         const sortersScriptTag = `<script>\n${sortersContent}\n</script>`;
-        htmlContent = htmlContent.replace('[[themeStyle]]', getThemeStyleAttribute());
+        htmlContent = htmlContent.replace('[[themeStyle]]', '');
         htmlContent = htmlContent.replace('<link href="[[styleUri]]" rel="stylesheet">', styleTag);
-        htmlContent = htmlContent.replace('<script>', `${sortersScriptTag}\n${themeScriptTag}\n<script>`);
+        htmlContent = htmlContent.replace('<script>', `${sortersScriptTag}\n<script>`);
         htmlContent = htmlContent.replace('[[topbarHtml]]', getTopbarHtml(options));
         htmlContent = htmlContent.replace('[[scriptElements]]', getScriptElements(options));
         htmlContent = htmlContent.replace('[[filterLogic]]', getFilterLogic(options));
@@ -47,15 +80,13 @@ export function getPropertiesHtml(extensionUri: vscode.Uri, options: PropertiesH
         return htmlContent;
     } catch (error) {
         console.error("Failed to read properties.html:", error);
-        const themeScriptTag = getThemeScriptBlock();
         return `<!DOCTYPE html>
-<html style="${getThemeStyleAttribute()}">
+<html>
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Properties</title>
-	<style>${getThemeCssBlock()}${cssContent}</style>
-	${themeScriptTag}
+	<style>${THEME_CSS}${cssContent}</style>
 </head>
 <body>
 	<div class="root">

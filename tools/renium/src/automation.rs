@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const REGISTRY_JSON: &str = include_str!("../protocol/opcodes.json");
+static REGISTRY: OnceLock<std::result::Result<Vec<Opcode>, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Opcode {
@@ -26,7 +27,7 @@ struct Registry {
     operations: Vec<Opcode>,
 }
 
-pub fn registry() -> Result<Vec<Opcode>> {
+fn parse_registry() -> Result<Vec<Opcode>> {
     let registry: Registry =
         serde_json::from_str(REGISTRY_JSON).context("Invalid opcode registry")?;
     if registry.version != PROTOCOL_VERSION {
@@ -50,16 +51,23 @@ pub fn registry() -> Result<Vec<Opcode>> {
     Ok(registry.operations)
 }
 
-pub fn opcode_by_id(id: u16) -> Result<Opcode> {
+pub fn registry() -> Result<&'static [Opcode]> {
+    match REGISTRY.get_or_init(|| parse_registry().map_err(|error| format!("{error:#}"))) {
+        Ok(operations) => Ok(operations),
+        Err(error) => bail!("{error}"),
+    }
+}
+
+pub fn opcode_by_id(id: u16) -> Result<&'static Opcode> {
     registry()?
-        .into_iter()
+        .iter()
         .find(|operation| operation.id == id)
         .with_context(|| format!("Unknown opcode {id}"))
 }
 
-pub fn opcode_by_name(name: &str) -> Result<Opcode> {
+pub fn opcode_by_name(name: &str) -> Result<&'static Opcode> {
     registry()?
-        .into_iter()
+        .iter()
         .find(|operation| {
             operation.name == name || operation.aliases.iter().any(|alias| alias == name)
         })
@@ -70,21 +78,16 @@ pub fn opcode_by_name(name: &str) -> Result<Opcode> {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub v: u8,
-    #[serde(default)]
     pub id: u64,
     pub op: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cx: Option<u64>,
-    #[serde(default = "empty_object")]
+    #[serde(alias = "requestArgs")]
     pub p: Value,
 }
 
-fn empty_object() -> Value {
-    Value::Object(Map::new())
-}
-
 impl Request {
-    pub fn validate(&self) -> std::result::Result<Opcode, Failure> {
+    pub fn validate(&self) -> std::result::Result<&'static Opcode, Failure> {
         if self.v != PROTOCOL_VERSION {
             return Err(Failure::new(
                 "bad_req",
@@ -241,7 +244,7 @@ impl State {
         context.id = self.next_context.fetch_add(1, Ordering::Relaxed);
         self.contexts
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(context.id, context.clone());
         context
     }
@@ -249,7 +252,7 @@ impl State {
     pub fn context(&self, id: u64) -> Option<BoundContext> {
         self.contexts
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .cloned()
     }
@@ -257,7 +260,7 @@ impl State {
     pub fn remove_context(&self, id: u64) -> bool {
         self.contexts
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&id)
             .is_some()
     }
@@ -279,7 +282,7 @@ impl State {
         };
         self.reviews
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(id.clone(), review);
         id
     }
@@ -288,7 +291,7 @@ impl State {
         let review = self
             .reviews
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(id)?;
         (review.created.elapsed() <= Duration::from_secs(300)).then_some(review)
     }
@@ -296,7 +299,7 @@ impl State {
     pub fn reject_review(&self, id: &str) -> bool {
         self.reviews
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(id)
             .is_some()
     }
@@ -305,7 +308,7 @@ impl State {
 pub fn capabilities() -> Result<Value> {
     Ok(json!({
         "v": PROTOCOL_VERSION,
-        "ops": registry()?.into_iter().map(|operation| json!({
+        "ops": registry()?.iter().map(|operation| json!({
             "id": operation.id,
             "name": operation.name,
             "aliases": operation.aliases,

@@ -1,33 +1,33 @@
 local BridgePropertySchema = {}
 
-local SUPPORTED_RBX_DOM_VALUE_TYPES = {
-	Bool = true,
-	Int32 = true,
-	Int64 = true,
-	Float32 = true,
-	Float64 = true,
-	String = true,
-	BinaryString = true,
-	ContentId = true,
-	Ref = true,
-	Vector2 = true,
-	Vector3 = true,
-	UDim = true,
-	UDim2 = true,
-	Color3 = true,
-	Color3uint8 = true,
-	ColorSequence = true,
-	NumberRange = true,
-	NumberSequence = true,
-	PhysicalProperties = true,
-	CFrame = true,
-	OptionalCFrame = true,
-	Rect = true,
-	Font = true,
-	BrickColor = true,
-	Axes = true,
-	Faces = true,
-	Ray = true,
+local COMPACT_TYPE_KEY_BY_RBX_DOM_VALUE_TYPE = {
+	Bool = "Bool",
+	Int32 = "Number",
+	Int64 = "Number",
+	Float32 = "Number",
+	Float64 = "Number",
+	String = "String",
+	BinaryString = "BinaryString",
+	ContentId = "ContentId",
+	Ref = "Ref",
+	Vector2 = "Vector2",
+	Vector3 = "Vector3",
+	UDim = "UDim",
+	UDim2 = "UDim2",
+	Color3 = "Color3",
+	Color3uint8 = "Color3",
+	ColorSequence = "ColorSequence",
+	NumberRange = "NumberRange",
+	NumberSequence = "NumberSequence",
+	PhysicalProperties = "PhysicalProperties",
+	CFrame = "CFrame",
+	OptionalCFrame = "CFrame",
+	Rect = "Rect",
+	Font = "Font",
+	BrickColor = "BrickColor",
+	Axes = "Axes",
+	Faces = "Faces",
+	Ray = "Ray",
 }
 
 local VALUE_INSTANCE_VALUE_TYPES = {
@@ -196,7 +196,7 @@ local function isRbxDomPropertyTypeSupported(propertyData)
 		return true
 	end
 	local valueType = dataType.Value
-	return type(valueType) == "string" and SUPPORTED_RBX_DOM_VALUE_TYPES[valueType] == true
+	return type(valueType) == "string" and COMPACT_TYPE_KEY_BY_RBX_DOM_VALUE_TYPE[valueType] ~= nil
 end
 
 rbxDomPropertyTypeInfo = function(propertyData, compactTypeIds)
@@ -214,53 +214,8 @@ rbxDomPropertyTypeInfo = function(propertyData, compactTypeIds)
 end
 
 rbxDomValueTypeInfo = function(valueType, compactTypeIds)
-	if valueType == "Bool" then
-		return compactTypeIds.Bool, nil
-	elseif valueType == "Int32" or valueType == "Int64" or valueType == "Float32" or valueType == "Float64" then
-		return compactTypeIds.Number, nil
-	elseif valueType == "String" then
-		return compactTypeIds.String, nil
-	elseif valueType == "BinaryString" then
-		return compactTypeIds.BinaryString, nil
-	elseif valueType == "ContentId" then
-		return compactTypeIds.ContentId, nil
-	elseif valueType == "Ref" then
-		return compactTypeIds.Ref, nil
-	elseif valueType == "Vector2" then
-		return compactTypeIds.Vector2, nil
-	elseif valueType == "Vector3" then
-		return compactTypeIds.Vector3, nil
-	elseif valueType == "UDim" then
-		return compactTypeIds.UDim, nil
-	elseif valueType == "UDim2" then
-		return compactTypeIds.UDim2, nil
-	elseif valueType == "Color3" or valueType == "Color3uint8" then
-		return compactTypeIds.Color3, nil
-	elseif valueType == "ColorSequence" then
-		return compactTypeIds.ColorSequence, nil
-	elseif valueType == "NumberRange" then
-		return compactTypeIds.NumberRange, nil
-	elseif valueType == "NumberSequence" then
-		return compactTypeIds.NumberSequence, nil
-	elseif valueType == "PhysicalProperties" then
-		return compactTypeIds.PhysicalProperties, nil
-	elseif valueType == "CFrame" or valueType == "OptionalCFrame" then
-		return compactTypeIds.CFrame, nil
-	elseif valueType == "Rect" then
-		return compactTypeIds.Rect, nil
-	elseif valueType == "Font" then
-		return compactTypeIds.Font, nil
-	elseif valueType == "BrickColor" then
-		return compactTypeIds.BrickColor, nil
-	elseif valueType == "Axes" then
-		return compactTypeIds.Axes, nil
-	elseif valueType == "Faces" then
-		return compactTypeIds.Faces, nil
-	elseif valueType == "Ray" then
-		return compactTypeIds.Ray, nil
-	end
-
-	return nil, nil
+	local compactTypeKey = COMPACT_TYPE_KEY_BY_RBX_DOM_VALUE_TYPE[valueType]
+	return if compactTypeKey then compactTypeIds[compactTypeKey] else nil, nil
 end
 
 local function addValueInstanceFallbacks(byClass, compactTypeIds)
@@ -349,19 +304,11 @@ schemaPropertyNameForClass = function(className, propertyName)
 end
 
 function BridgePropertySchema.buildSchemasFromRbxDom(database, compactTypeIds, generatedStudioApiSchema)
-	local byClass = {}
-	if type(database) ~= "table" then
-		mergeGeneratedStudioApiSchema(byClass, generatedStudioApiSchema, compactTypeIds)
-		addValueInstanceFallbacks(byClass, compactTypeIds)
-		return byClass
-	end
-
-	local classes = database.Classes
+	local classes = type(database) == "table" and database.Classes or nil
 	if type(classes) ~= "table" then
-		mergeGeneratedStudioApiSchema(byClass, generatedStudioApiSchema, compactTypeIds)
-		addValueInstanceFallbacks(byClass, compactTypeIds)
-		return byClass
+		error("Renium's bundled rbx-dom database is missing or invalid")
 	end
+	local byClass = {}
 
 	local memo = {}
 	local visiting = {}
@@ -468,6 +415,7 @@ end
 
 function BridgePropertySchema.mergeSchemas(baseSchemas, overrideSchemas)
 	local out = {}
+	local indicesByClass = {}
 
 	local function mergeSource(source, replaceExisting)
 		for className, schemaEntries in pairs(source) do
@@ -475,13 +423,10 @@ function BridgePropertySchema.mergeSchemas(baseSchemas, overrideSchemas)
 			if not merged then
 				merged = {}
 				out[className] = merged
+				indicesByClass[className] = {}
 			end
 
-			local indexByName = {}
-			for index, entry in ipairs(merged) do
-				indexByName[string.lower(entry[1])] = index
-			end
-
+			local indexByName = indicesByClass[className]
 			for _, entry in ipairs(schemaEntries) do
 				local copied = { entry[1], entry[2], entry[3] }
 				local key = string.lower(copied[1])
@@ -495,15 +440,16 @@ function BridgePropertySchema.mergeSchemas(baseSchemas, overrideSchemas)
 					indexByName[key] = #merged
 				end
 			end
-
-			table.sort(merged, function(a, b)
-				return a[1] < b[1]
-			end)
 		end
 	end
 
 	mergeSource(baseSchemas, false)
 	mergeSource(overrideSchemas, true)
+	for _, merged in pairs(out) do
+		table.sort(merged, function(a, b)
+			return a[1] < b[1]
+		end)
+	end
 	return out
 end
 

@@ -96,3 +96,54 @@ export function reniumCliCandidates(options: {
       return true;
     });
 }
+
+function reniumCliFallbackRelativePaths(
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const binaryName = reniumBinaryName(platform);
+  return [
+    binaryName,
+    `bin/${binaryName}`,
+    `tools/renium/target/release/${binaryName}`,
+    `tools/renium/target/debug/${binaryName}`,
+  ];
+}
+
+export function resolveReniumCliPath(options: {
+  configuredPath?: string;
+  extensionRoot?: string;
+  roots?: readonly string[];
+  pathValue?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  pathExtValue?: string;
+}): string {
+  const platform = options.platform ?? process.platform;
+  const configuredPath = options.configuredPath?.trim();
+  const candidates = reniumCliCandidates({
+    ...options,
+    configuredPath,
+    fallbackRelativePaths: reniumCliFallbackRelativePaths(platform),
+  });
+  const existing = candidates.find((candidate) => {
+    try {
+      return fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  });
+  if (existing) {
+    return existing;
+  }
+  if (configuredPath) {
+    return configuredPath;
+  }
+  if (options.extensionRoot) {
+    return bundledReniumCliPath(
+      options.extensionRoot,
+      platform,
+      options.arch ?? process.arch,
+    );
+  }
+  return reniumBinaryName(platform);
+}

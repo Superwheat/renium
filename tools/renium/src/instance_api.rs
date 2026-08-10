@@ -3,7 +3,10 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Number, Value};
 
-use crate::settings_bytecode::{SettingsBytecode, SettingsBytecodeInstance};
+use crate::settings_bytecode::{
+    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
+    settings_reference_index,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PropertyScope {
@@ -67,19 +70,6 @@ impl PropertyPredicate {
             value: Some(value),
         }
     }
-}
-
-#[cfg(test)]
-fn set_property(
-    document: &mut SettingsBytecode,
-    selector: InstanceSelector<'_>,
-    property_name: &str,
-    value: Value,
-    scope: PropertyScope,
-) -> Result<()> {
-    let index = find_unique_instance_index(document, selector)?
-        .ok_or_else(|| anyhow::anyhow!("No matching instance"))?;
-    set_instance_property(document, index, property_name, value, scope)
 }
 
 pub(crate) fn find_instances(document: &SettingsBytecode, query: &InstanceQuery) -> Vec<usize> {
@@ -264,7 +254,7 @@ fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) -
 fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<usize>]) -> bool {
     let Some(old_index) = object
         .get("instanceIndex")
-        .and_then(settings_ref_index_to_document_index)
+        .and_then(settings_reference_index)
     else {
         return false;
     };
@@ -282,42 +272,12 @@ fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<
         }
         None => {
             let mut removed = false;
-            for selector in [
-                "instanceIndex",
-                "settingsId",
-                "instanceId",
-                "pathSegments",
-                "pathOrdinals",
-                "debugId",
-                "path",
-                "referent",
-                "ref",
-            ] {
+            for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
                 removed = object.remove(selector).is_some() || removed;
             }
             removed
         }
     }
-}
-
-fn settings_ref_index_to_document_index(value: &Value) -> Option<usize> {
-    let one_based = value
-        .as_u64()
-        .or_else(|| {
-            value
-                .as_i64()
-                .and_then(|number| (number >= 0).then_some(number as u64))
-        })
-        .or_else(|| {
-            value.as_f64().and_then(|number| {
-                number
-                    .is_finite()
-                    .then_some(number.trunc())
-                    .filter(|truncated| (*truncated - number).abs() < f64::EPSILON)
-                    .and_then(|truncated| (truncated >= 0.0).then_some(truncated as u64))
-            })
-        })?;
-    usize::try_from(one_based).ok()?.checked_sub(1)
 }
 
 pub(crate) fn find_unique_instance_index(
@@ -363,8 +323,7 @@ fn unique_position(
     }
     if duplicates.len() > 1 {
         bail!(
-            "Ambiguous selector {label}; matched multiple instances at indexes {:?}. Use --index/-x or --id/-i.",
-            duplicates
+            "Ambiguous selector {label}; matched multiple instances at indexes {duplicates:?}. Use --index/-x or --id/-i."
         );
     }
     Ok(found)
@@ -412,7 +371,7 @@ pub(crate) fn set_instance_property(
         if let Some(parent_index) = resolved {
             ensure_parent_is_not_descendant(document, index, parent_index)?;
         }
-        Some(resolved)
+        resolved
     } else {
         None
     };
@@ -507,8 +466,7 @@ fn metadata_value(
         "ClassName" => Some(Value::String(instance.class_name.clone())),
         "Parent" => Some(
             parent_settings_id(document, instance)
-                .map(|parent| Value::String(parent.to_string()))
-                .unwrap_or(Value::Null),
+                .map_or(Value::Null, |parent| Value::String(parent.to_string())),
         ),
         _ => None,
     }
@@ -518,7 +476,7 @@ fn set_metadata_value(
     instance: &mut SettingsBytecodeInstance,
     property_name: &str,
     value: Value,
-    resolved_parent_index: Option<Option<usize>>,
+    resolved_parent_index: Option<usize>,
 ) -> Result<()> {
     match property_name {
         "Name" => {
@@ -530,7 +488,7 @@ fn set_metadata_value(
             Ok(())
         }
         "Parent" => {
-            instance.parent_index = resolved_parent_index.unwrap_or(None);
+            instance.parent_index = resolved_parent_index;
             Ok(())
         }
         _ => bail!("{property_name} is not metadata"),
@@ -636,6 +594,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn set_property(
+        document: &mut SettingsBytecode,
+        selector: InstanceSelector<'_>,
+        property_name: &str,
+        value: Value,
+        scope: PropertyScope,
+    ) -> Result<()> {
+        let index = find_unique_instance_index(document, selector)?
+            .ok_or_else(|| anyhow::anyhow!("No matching instance"))?;
+        set_instance_property(document, index, property_name, value, scope)
+    }
 
     fn sample_document() -> SettingsBytecode {
         SettingsBytecode {

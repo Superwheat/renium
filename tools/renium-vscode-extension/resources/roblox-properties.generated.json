@@ -3,7 +3,7 @@
   "sources": {
     "propertySource": "tools/API-Dump.json",
     "propertySourceKind": "api-dump",
-    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-a57f2f633baf4a86/ReflectionMetadata.xml",
+    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-b2d03e4efaa04174/ReflectionMetadata.xml",
     "propertySorter": "tools/renium-vscode-extension/resources/robloxPropertySorters.js"
   },
   "classes": {

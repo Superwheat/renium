@@ -8,7 +8,7 @@ function BridgeReferenceRetarget.apply(
 	writeProperty: (Instance, string, any) -> (boolean, any),
 	excludedRoots: { [Instance]: boolean }?
 ): (number, number, { { instance: Instance, propertyName: string, error: any } })
-	if next(replacements) == nil and getmetatable(replacements) == nil then
+	if not next(replacements) and not getmetatable(replacements) then
 		return 0, 0, {}
 	end
 	local updated = 0

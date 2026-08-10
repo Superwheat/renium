@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::timing::current_millis;
+
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
 
@@ -240,7 +242,7 @@ fn parse_lifecycle_lock_owner(value: &str) -> Option<LifecycleLockOwner> {
 }
 
 fn lifecycle_lock_owner_is_alive(owner: &LifecycleLockOwner) -> bool {
-    crate::is_process_alive(owner.pid)
+    crate::daemon_control::is_process_alive(owner.pid)
         && owner
             .start
             .as_ref()
@@ -325,16 +327,11 @@ pub(crate) fn acquire_lifecycle_lock() -> Result<LifecycleLock> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let start = process_start_identity(std::process::id())
         .context("Could not read this process's start identity")?;
-    let token = format!(
-        "{}\t{}\t{}",
-        std::process::id(),
-        start,
-        crate::current_millis()
-    );
+    let token = format!("{}\t{}\t{}", std::process::id(), start, current_millis());
     let temporary = root.join(format!(
         ".lifecycle.lock.{}.{}.tmp",
         std::process::id(),
-        crate::current_millis()
+        current_millis()
     ));
     {
         let mut file = fs::OpenOptions::new()
@@ -480,7 +477,8 @@ fn clear_update_helper_reservation(transaction_id: &str) -> Result<()> {
 }
 
 fn reservation_process_is_alive(pid: u32, expected_start: &str) -> bool {
-    crate::is_process_alive(pid) && process_start_identity(pid).as_deref() == Some(expected_start)
+    crate::daemon_control::is_process_alive(pid)
+        && process_start_identity(pid).as_deref() == Some(expected_start)
 }
 
 fn validate_update_helper_reservation_for_current_process() -> Result<()> {
@@ -510,8 +508,9 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
         UpdateCommand::Check(args) => {
             let manifest = fetch_manifest(&args.manifest)?;
             let signature = verify_manifest(&manifest);
-            let current = Version::parse(crate::BUILD_VERSION)
-                .with_context(|| format!("Invalid current version {}", crate::BUILD_VERSION))?;
+            let current = Version::parse(crate::build_info::VERSION).with_context(|| {
+                format!("Invalid current version {}", crate::build_info::VERSION)
+            })?;
             let latest = Version::parse(&manifest.payload.version)
                 .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
             let platform = platform_key();
@@ -519,7 +518,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
             let signature_error = signature.err().map(|error| error.to_string());
             let response = json!({
                 "ok": true,
-                "currentVersion": crate::BUILD_VERSION,
+                "currentVersion": crate::build_info::VERSION,
                 "latestVersion": manifest.payload.version,
                 "updateAvailable": latest > current,
                 "downgrade": latest < current,
@@ -536,18 +535,18 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                 std::cmp::Ordering::Greater => format!(
                     "Renium {} is available; installed version is {}",
                     manifest.payload.version,
-                    crate::BUILD_VERSION
+                    crate::build_info::VERSION
                 ),
                 std::cmp::Ordering::Equal => {
-                    format!("Renium {} is up to date", crate::BUILD_VERSION)
+                    format!("Renium {} is up to date", crate::build_info::VERSION)
                 }
                 std::cmp::Ordering::Less => format!(
                     "Installed Renium {} is newer than release {}",
-                    crate::BUILD_VERSION,
+                    crate::build_info::VERSION,
                     manifest.payload.version
                 ),
             };
-            crate::emit_global_output(&response, &text)
+            crate::output::emit_global_output(&response, &text)
         }
         UpdateCommand::Apply(args) => {
             if delegate_extension_owned_update(&args)? {
@@ -556,7 +555,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
             let lifecycle_lock = acquire_lifecycle_lock()?;
             recover_running_core_install()?;
             if let Some(version) = recover_pending_update_transaction(&lifecycle_lock)? {
-                return crate::emit_global_output(
+                return crate::output::emit_global_output(
                     &json!({
                         "ok": true,
                         "version": version,
@@ -740,15 +739,15 @@ fn apply_update(
             requested.sort();
         }
     }
-    let current = Version::parse(crate::BUILD_VERSION)
-        .with_context(|| format!("Invalid current version {}", crate::BUILD_VERSION))?;
+    let current = Version::parse(crate::build_info::VERSION)
+        .with_context(|| format!("Invalid current version {}", crate::build_info::VERSION))?;
     let release = Version::parse(&manifest.payload.version)
         .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
     if release < current && !force {
         bail!(
             "Release {} is older than installed version {}; pass --force to downgrade",
             manifest.payload.version,
-            crate::BUILD_VERSION
+            crate::build_info::VERSION
         );
     }
     if release != current {
@@ -783,7 +782,9 @@ fn apply_update(
         );
     }
     let plugin_target = update_plugin
-        .then(|| crate::roblox_plugins_dir().map(|dir| dir.join(crate::PLUGIN_ASSET_NAME)))
+        .then(|| {
+            crate::setup::roblox_plugins_dir().map(|dir| dir.join(crate::setup::PLUGIN_ASSET_NAME))
+        })
         .transpose()?;
     let editor_installs = if requested.iter().any(|name| name == "extension") {
         find_installed_extension_editors()?
@@ -834,7 +835,7 @@ fn apply_update(
         }
     }
     if dry_run {
-        return crate::emit_global_output(
+        return crate::output::emit_global_output(
             &json!({
                 "ok": true,
                 "version": manifest.payload.version,
@@ -939,7 +940,7 @@ fn apply_update(
         }
     };
     if let Some(bytes) = plugin_bytes.as_deref() {
-        crate::validate_rbxm_version(bytes, &manifest.payload.version)?;
+        crate::setup::validate_rbxm_version(bytes, &manifest.payload.version)?;
     }
     if let Err(error) = crate::workflows::stop_all_daemons_for_update() {
         let _ = fs::remove_dir_all(&stage);
@@ -947,13 +948,13 @@ fn apply_update(
     }
     let target = env::current_exe().context("Failed to locate the running Renium CLI")?;
     let mut plan = DeferredUpdatePlan {
-        transaction_id: format!("{}-{}", std::process::id(), crate::current_millis()),
+        transaction_id: format!("{}-{}", std::process::id(), current_millis()),
         phase: "staged".to_string(),
         originals: None,
         version: manifest.payload.version.clone(),
-        target: target.clone(),
+        target,
         stage: stage.clone(),
-        core_stage: if apply_cli { core_root.clone() } else { None },
+        core_stage: if apply_cli { core_root } else { None },
         managed_studio_core_stage: managed_studio_core_root,
         plugin: plugin_target.as_ref().map(|target| DeferredFileInstall {
             source: stage.join("Renium.rbxm"),
@@ -975,7 +976,7 @@ fn apply_update(
     #[cfg(windows)]
     {
         schedule_windows_update(&plan, plan.core_stage.as_deref())?;
-        crate::emit_global_output(
+        crate::output::emit_global_output(
             &json!({
                 "ok": true,
                 "version": manifest.payload.version,
@@ -1042,7 +1043,7 @@ fn apply_update(
                 manifest.payload.version
             )
         };
-        crate::emit_global_output(
+        crate::output::emit_global_output(
             &json!({
                 "ok": true,
                 "version": manifest.payload.version,
@@ -1125,9 +1126,9 @@ fn default_update_components(components: &UpdateComponents) -> Result<Vec<String
     }
     if components.plugin.is_some()
         && !cfg!(target_os = "linux")
-        && crate::roblox_plugins_dir()
+        && crate::setup::roblox_plugins_dir()
             .ok()
-            .is_some_and(|dir| dir.join(crate::PLUGIN_ASSET_NAME).is_file())
+            .is_some_and(|dir| dir.join(crate::setup::PLUGIN_ASSET_NAME).is_file())
     {
         requested.push("plugin".to_string());
     }
@@ -1157,11 +1158,11 @@ fn fresh_temp_dir(prefix: &str) -> Result<PathBuf> {
         let candidate = root.join(format!(
             "{prefix}-{}-{}-{attempt}",
             std::process::id(),
-            crate::current_millis()
+            current_millis()
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Failed to create {}", candidate.display()));
@@ -1598,8 +1599,7 @@ fn extract_core_bundle(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
         let mut entry = archive.by_index(index)?;
         let relative = entry
             .enclosed_name()
-            .context("Core archive contains an unsafe path")?
-            .to_path_buf();
+            .context("Core archive contains an unsafe path")?;
         let target = destination.join(relative);
         if entry.is_dir() {
             fs::create_dir_all(&target)?;
@@ -1834,7 +1834,7 @@ fn prepare_core_directory(source: &Path, target_root: &Path) -> Result<PathBuf> 
         let candidate = parent.join(format!(
             ".renium-core-next-{}-{}-{attempt}",
             std::process::id(),
-            crate::current_millis()
+            current_millis()
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => {
@@ -1846,7 +1846,7 @@ fn prepare_core_directory(source: &Path, target_root: &Path) -> Result<PathBuf> 
                 }
                 return Ok(candidate);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -1860,7 +1860,7 @@ fn replace_core_directory(target_root: &Path, prepared: &Path) -> Result<()> {
     let backup = parent.join(format!(
         ".renium-core-previous-{}-{}",
         std::process::id(),
-        crate::current_millis()
+        current_millis()
     ));
     fs::rename(target_root, &backup)
         .with_context(|| format!("Failed to stage {}", target_root.display()))?;
@@ -1961,7 +1961,7 @@ fn apply_staged_update_plan(
     if let Some(plugin) = plan.plugin.as_ref() {
         let bytes = fs::read(&plugin.source)
             .with_context(|| format!("Failed to read {}", plugin.source.display()))?;
-        crate::validate_rbxm_version(&bytes, &plan.version)?;
+        crate::setup::validate_rbxm_version(&bytes, &plan.version)?;
         install_bytes(&plugin.target, &bytes)?;
         #[cfg(target_os = "macos")]
         if let Some(core_root) = plan
@@ -2046,16 +2046,6 @@ fn pending_update_transaction_path() -> Result<PathBuf> {
     Ok(lifecycle_state_dir()?.join("update-transaction.json"))
 }
 
-fn pending_update_transaction_paths() -> Result<Vec<PathBuf>> {
-    let current = pending_update_transaction_path()?;
-    let legacy = user_data_dir()?.join("update-transaction.json");
-    if paths_equal(&current, &legacy) {
-        Ok(vec![current])
-    } else {
-        Ok(vec![current, legacy])
-    }
-}
-
 fn write_pending_update_transaction(plan: &DeferredUpdatePlan) -> Result<()> {
     let path = pending_update_transaction_path()?;
     let mut bytes = serde_json::to_vec_pretty(plan)?;
@@ -2064,40 +2054,26 @@ fn write_pending_update_transaction(plan: &DeferredUpdatePlan) -> Result<()> {
 }
 
 fn clear_pending_update_transaction() -> Result<()> {
-    for path in pending_update_transaction_paths()? {
-        recover_file_install(&path)?;
-        if path.is_file() {
-            fs::remove_file(&path)
-                .with_context(|| format!("Failed to remove {}", path.display()))?;
-        }
+    let path = pending_update_transaction_path()?;
+    recover_file_install(&path)?;
+    if path.is_file() {
+        fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
     }
     Ok(())
 }
 
 fn recover_pending_update_transaction(lifecycle_lock: &LifecycleLock) -> Result<Option<String>> {
-    let mut journals = Vec::new();
-    for path in pending_update_transaction_paths()? {
-        recover_file_install(&path)?;
-        if path.is_file() {
-            journals.push(path);
-        }
-    }
-    if journals.len() > 1 {
-        bail!("Multiple interrupted Renium update journals need manual cleanup");
-    }
-    let Some(path) = journals.into_iter().next() else {
+    let path = pending_update_transaction_path()?;
+    recover_file_install(&path)?;
+    if !path.is_file() {
         return Ok(None);
-    };
+    }
     let mut plan: DeferredUpdatePlan = serde_json::from_slice(
         &fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?,
     )
     .with_context(|| format!("Invalid update transaction journal {}", path.display()))?;
     if plan.transaction_id.is_empty() {
-        plan.transaction_id = format!(
-            "recovery-{}-{}",
-            std::process::id(),
-            crate::current_millis()
-        );
+        plan.transaction_id = format!("recovery-{}-{}", std::process::id(), current_millis());
         write_pending_update_transaction(&plan)?;
     }
     let originals = plan
@@ -2168,7 +2144,7 @@ fn schedule_windows_update(plan: &DeferredUpdatePlan, core_root: Option<&Path>) 
     let helper = env::temp_dir().join(format!(
         "renium-update-helper-{}-{}.exe",
         std::process::id(),
-        crate::current_millis()
+        current_millis()
     ));
     fs::copy(&helper_source, &helper)
         .with_context(|| format!("Failed to create update helper {}", helper.display()))?;
@@ -2180,7 +2156,7 @@ fn schedule_windows_update(plan: &DeferredUpdatePlan, core_root: Option<&Path>) 
     let result_probe = result_parent.join(format!(
         ".update-result-probe-{}-{}",
         std::process::id(),
-        crate::current_millis()
+        current_millis()
     ));
     fs::write(&result_probe, b"probe")?;
     fs::remove_file(&result_probe)?;
@@ -2365,7 +2341,7 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
         target: plan.target,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
         helper,
-        completed_unix_ms: crate::current_millis(),
+        completed_unix_ms: current_millis(),
     };
     let result_written = match write_deferred_update_result(&args.result, &record) {
         Ok(()) => true,
@@ -2416,23 +2392,11 @@ fn fetch_artifact(artifact: &UpdateArtifact, stage: &Path, file_name: &str) -> R
 
 fn download(url: &str, file_name: &str) -> Result<Vec<u8>> {
     let path = env::temp_dir().join(format!("renium-{}-{}", std::process::id(), file_name));
-    let status = Command::new("curl")
-        .args(["-fsSL", "--retry", "2", "--connect-timeout", "15", "-o"])
-        .arg(&path)
-        .arg(url)
-        .status();
-    if let Err(error) = status {
-        let _ = fs::remove_file(&path);
-        return Err(error).context("Failed to run curl");
-    }
-    let status = status?;
-    if !status.success() {
-        let _ = fs::remove_file(&path);
-        bail!("Downloading {url} failed with {status}");
-    }
-    let bytes = fs::read(&path);
+    let result = super::external_tools::download_to_file(url, &path).and_then(|_| {
+        fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
+    });
     let _ = fs::remove_file(path);
-    Ok(bytes?)
+    result
 }
 
 pub(crate) fn install_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
@@ -2675,12 +2639,7 @@ pub(crate) fn report_pending_update_result() {
     let Ok(current) = env::current_exe() else {
         return;
     };
-    let mut candidates = vec![(primary.clone(), false)];
-    if let Ok(legacy) = user_data_dir().map(|root| root.join("update-result.json"))
-        && !paths_equal(&legacy, &primary)
-    {
-        candidates.push((legacy, false));
-    }
+    let mut candidates = vec![(primary, false)];
     let mut fallbacks = fs::read_dir(env::temp_dir())
         .ok()
         .into_iter()
@@ -2927,7 +2886,10 @@ fn editor_platform(editor: &EditorExtensionInstall) -> Result<String> {
     Ok(format!(
         "{}-{}",
         env::consts::OS,
-        architectures.into_iter().next().unwrap()
+        architectures
+            .into_iter()
+            .next()
+            .expect("architecture count was validated")
     ))
 }
 

@@ -5,10 +5,9 @@
 *.json text eol=lf
 *.toml text eol=lf
 *.md text eol=lf
-*.rbxmx text eol=lf
+*.rbxmx text eol=lf -whitespace
 *.rbxlx text eol=lf
 *.renium binary diff=renium merge=renium
-*.rbsync binary diff=renium merge=renium
 *.rbxm binary
 *.rbxl binary
 *.vsix binary

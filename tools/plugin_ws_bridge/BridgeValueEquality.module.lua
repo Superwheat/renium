@@ -1,6 +1,15 @@
 local BridgeValueEquality = {}
 
 local EPSILON = 0.0001
+local VECTOR2_FIELDS = { "X", "Y" }
+local VECTOR3_FIELDS = { "X", "Y", "Z" }
+local PHYSICAL_PROPERTIES_FIELDS = {
+	"Density",
+	"Friction",
+	"Elasticity",
+	"FrictionWeight",
+	"ElasticityWeight",
+}
 
 local function numbersEqual(a: number, b: number): boolean
 	if a == b then
@@ -103,9 +112,9 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
 	elseif typeA == "Color3" then
 		return colorsEqual(a, b)
 	elseif typeA == "Vector2" then
-		return vectorsEqual(a, b, { "X", "Y" })
+		return vectorsEqual(a, b, VECTOR2_FIELDS)
 	elseif typeA == "Vector3" then
-		return vectorsEqual(a, b, { "X", "Y", "Z" })
+		return vectorsEqual(a, b, VECTOR3_FIELDS)
 	elseif typeA == "CFrame" then
 		local left = { a:GetComponents() }
 		local right = { b:GetComponents() }
@@ -128,13 +137,7 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
 	elseif typeA == "ColorSequence" then
 		return keypointsEqual(a.Keypoints, b.Keypoints, true)
 	elseif typeA == "PhysicalProperties" then
-		local baseEqual = vectorsEqual(a, b, {
-			"Density",
-			"Friction",
-			"Elasticity",
-			"FrictionWeight",
-			"ElasticityWeight",
-		})
+		local baseEqual = vectorsEqual(a, b, PHYSICAL_PROPERTIES_FIELDS)
 		if not baseEqual then
 			return false
 		end

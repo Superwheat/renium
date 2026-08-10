@@ -7,9 +7,6 @@
       "BridgeSettings": {
         "$path": "BridgeSettings.module.lua"
       },
-      "BridgeTheme": {
-        "$path": "BridgeTheme.module.lua"
-      },
       "BridgeStatus": {
         "$path": "BridgeStatus.module.lua"
       },
@@ -34,6 +31,9 @@
       "BridgeIdentity": {
         "$path": "BridgeIdentity.module.lua"
       },
+      "BridgeScriptDocuments": {
+        "$path": "BridgeScriptDocuments.module.lua"
+      },
       "BridgeContent": {
         "$path": "BridgeContent.module.lua"
       },
@@ -49,6 +49,9 @@
       "BridgeReferenceRetarget": {
         "$path": "BridgeReferenceRetarget.module.lua"
       },
+      "BridgeReferenceOverlay": {
+        "$path": "BridgeReferenceOverlay.module.lua"
+      },
       "BridgeValueEquality": {
         "$path": "BridgeValueEquality.module.lua"
       },
@@ -57,6 +60,9 @@
       },
       "BridgeUi": {
         "$path": "BridgeUi.module.lua"
+      },
+      "BridgeReviewModel": {
+        "$path": "BridgeReviewModel.module.lua"
       },
       "BridgeRuntimeApi": {
         "$path": "BridgeRuntimeApi.module.lua"
@@ -69,9 +75,6 @@
       },
       "BridgeEditorSync": {
         "$path": "BridgeEditorSync.module.lua"
-      },
-      "BridgeProfiling": {
-        "$path": "BridgeProfiling.module.lua"
       },
       "BridgeStudioChanges": {
         "$path": "BridgeStudioChanges.module.lua"

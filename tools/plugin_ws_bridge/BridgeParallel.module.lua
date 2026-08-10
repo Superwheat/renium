@@ -46,34 +46,25 @@ function BridgeParallel.runParallelChunks(totalItems, workerCount, job)
 	end
 
 	local completedWorkers = 0
-	local activeWorkers = 0
 	local firstError = nil
 	local finished = Instance.new("BindableEvent")
 
 	for workerIndex = 1, clampedWorkers do
 		local startIndex = math.floor(((workerIndex - 1) * totalItems) / clampedWorkers) + 1
 		local endIndex = math.floor((workerIndex * totalItems) / clampedWorkers)
-		if startIndex <= endIndex then
-			activeWorkers += 1
-			task.spawn(function()
-				local ok, err = pcall(job, startIndex, endIndex)
-				if not ok and firstError == nil then
-					firstError = err
-				end
-				completedWorkers += 1
-				if completedWorkers >= activeWorkers then
-					finished:Fire()
-				end
-			end)
-		end
+		task.spawn(function()
+			local ok, err = pcall(job, startIndex, endIndex)
+			if not ok and firstError == nil then
+				firstError = err
+			end
+			completedWorkers += 1
+			if completedWorkers == clampedWorkers then
+				finished:Fire()
+			end
+		end)
 	end
 
-	if activeWorkers == 0 then
-		finished:Destroy()
-		return
-	end
-
-	if completedWorkers < activeWorkers then
+	if completedWorkers < clampedWorkers then
 		finished.Event:Wait()
 	end
 	finished:Destroy()

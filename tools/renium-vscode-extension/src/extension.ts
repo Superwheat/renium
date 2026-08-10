@@ -3,24 +3,60 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { URLSearchParams } from "url";
 import * as vscode from "vscode";
+import {
+  AutomationClient,
+  editorBridgeWaitSeconds,
+  type CommandRunResult,
+} from "./automationClient";
 import {
   ensureReniumAgentInstructions,
   isReniumProjectRoot,
 } from "./agentInstructions";
 import {
   bundledReniumCliPath,
-  reniumCliCandidates,
+  reniumBinaryName,
 } from "./cliResolution";
-import { mergeAndResolve, sameSourceText, withLineEnding, type ConflictPolicy } from "./conflictMerge";
-import { changedEditorLiveSyncPaths } from "./editorLiveSyncCache";
+import {
+  mergeAndResolve,
+  normalizeConflictPolicy,
+  sameSourceText,
+  withLineEnding,
+  type ConflictPolicy,
+} from "./conflictMerge";
+import { buildChangePreviewHtml, type ChangePreviewRow } from "./changePreviewHtml";
+import {
+  changedEditorLiveSyncPaths,
+  editorLiveSyncCacheKey,
+  editorLiveSyncFileHash,
+  emptyEditorLiveSyncCache,
+  loadEditorLiveSyncCache,
+  saveEditorLiveSyncCache,
+} from "./editorLiveSyncCache";
+import {
+  parseCliJsonObject,
+  parseEditorPushSummary,
+  parseStudioChangeState,
+  studioChangeAckOptions,
+  studioChangeLogEntries,
+  studioChangeSeq,
+  summaryNumber,
+  type StudioChangeLog,
+  type StudioChangeState,
+  type StudioEditorAction,
+  type StudioPropertyChange,
+} from "./studioSyncProtocol";
+import {
+  commitStudioSnapshotFingerprints,
+  diffStudioSnapshots,
+  type StudioSnapshotDiff,
+} from "./studioSnapshotFingerprint";
 import {
   projectProcessOwner,
+  spawnTrackedProcess,
   terminateAllProcesses,
   terminateProcess,
   terminateProcessesForOwner,
-  trackProcess,
 } from "./processSupervisor";
 import {
   ExperienceManifest,
@@ -31,6 +67,7 @@ import {
   normalizePublishedPlaceName,
   readExperienceManifest,
   resolveActiveExperiencePlace,
+  resolveExperiencePlaceByAlias,
   resolveExperiencePlaceRoot,
   setActiveExperiencePlace,
   uniquePlaceAlias,
@@ -42,42 +79,67 @@ import {
   logPackageDragDebug,
   loadAssetIconNames,
 } from "./fileExplorer";
+import { GitController } from "./gitController";
+import { renderCommandArgs } from "./gitSync";
+import type { GitViewActions } from "./gitView";
 import {
-  GitNameStatusEntry,
-  GitRunResult,
-  GitStatusEntry,
-  buildCommitMessage,
-  nameStatusAffectedPaths,
-  parseAheadBehind,
-  parseNameStatusZ,
-  parsePorcelainV1Z,
-  redactRemoteUrl,
-  remoteUrlToWebUrl,
-  renderGitArgs,
-  runGit,
-  shouldPullFromStudioBeforePush,
-  summarizeStatus,
-} from "./gitSync";
-import { GitViewActions, GitViewState } from "./gitView";
-import { pickWorkspaceRoot } from "./utils";
-import { DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
-import { RbsyncEditorProvider } from "./rbsyncViewer";
+  PackageSyncController,
+  type CliLinkApplyResult,
+  type CliLinkStatusResult,
+  type PendingPackageSource,
+} from "./packageSyncController";
+import {
+  SETTINGS_FILE_NAME,
+  collectFilesRecursively,
+  ensureFileExists,
+  ensurePlaceFileExtension,
+  filesystemPathKey,
+  isPathInside,
+  isLuaSourcePath,
+  isReniumSettingsFileName,
+  normalizeReportedServices,
+  normalizeServices,
+  pickWorkspaceRoot,
+  resolveConfigPath,
+  robloxPlaceFormatFromPath,
+  safeFileComponent,
+  tabInputUris,
+  writeUtf8FileIfChanged,
+  prefixProcessOutput,
+  type RobloxPlaceFormat,
+} from "./utils";
+import { SettingsStoreEditorProvider } from "./settingsStoreViewer";
 import { isRobloxModel, reniumPluginReleaseUrl } from "./pluginDistribution";
 import {
+  LinkDecorationProvider,
+  PackageScriptContentProvider,
+  PackageScriptDecorationProvider,
+  PackagesTreeProvider,
+  packageScriptUriInfo,
+  type CliLinkStatusLink,
+  type LinkedPackageScriptPreviewRequest,
+  type LinkFileInfo,
+  type OpenPackageScriptTab,
+  type PackagePreviewData,
+  type PackageTreeElement,
+} from "./packagesView";
+import {
   ProjectSourceGraph,
-  SharedConfig,
-  inferProjectScriptIdentity,
+  ProjectSourceOwner,
   invalidateProjectSourceGraph,
   loadProjectSourceGraph,
   loadProjectSourceRoot,
   loadProjectSourceLocations,
-  loadSharedConfig,
-  sharedConfigValue,
 } from "./sharedConfig";
+import {
+  DEFAULT_STUDIO_LIVE_SYNC_POLL_MS,
+  MIN_STUDIO_LIVE_SYNC_POLL_MS,
+  SyncConfigResolver,
+  type ReniumLogLevel,
+  type SyncConfig,
+} from "./syncConfig";
 import { AUTOMATION_OP } from "./automationProtocol.generated";
 
-const RENIUM_PACKAGE_DRAG_MIME = "application/vnd.renium.package";
-const RENIUM_PACKAGE_TEXT_PREFIX = "renium-package:";
 const RENIUM_OPEN_PACKAGE_SCRIPT_TABS_STATE_KEY = "renium.openPackageScriptTabs";
 const RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY = "renium.activeExperiencePlaces";
 const RENIUM_PLACE_PROJECT_FILES = [
@@ -88,7 +150,6 @@ const RENIUM_PLACE_PROJECT_FILES = [
   "wally.toml",
   "wally.lock",
   "Packages",
-  "snapshots",
   ".renium",
 ] as const;
 const RENIUM_SINGLE_PLACE_FILES = [
@@ -107,112 +168,6 @@ function hasSinglePlaceProject(root: string): boolean {
   return [loadProjectSourceRoot(root), ...RENIUM_SINGLE_PLACE_FILES]
     .some((name) => fs.existsSync(path.join(root, name)));
 }
-
-type GitSyncConfig = {
-  gitPath: string;
-  remote: string;
-  branch: string;
-  autoFetch: boolean;
-  pullFromStudioBeforePush: "ask" | "always" | "never";
-  stageMode: "tracked" | "configuredPaths";
-  stagePaths: string[];
-  includeUntracked: boolean;
-  commitMessageTemplate: string;
-  confirmBeforePush: boolean;
-  requireCleanWorktreeBeforePull: boolean;
-  applyPulledChangesToStudio: "ask" | "always" | "never";
-  timeoutSeconds: number;
-  outputBehavior: "onStart" | "onError" | "silent";
-};
-
-type WallySyncConfig = {
-  wallyPath: string;
-  rojoPath: string;
-  packagesDir: string;
-  targetService: string;
-  targetName: string;
-  serverPackagesDir: string;
-  serverTargetService: string;
-  serverTargetName: string;
-  devPackagesDir: string;
-  devTargetService: string;
-  devTargetName: string;
-  realms: string;
-  runInstall: boolean;
-  applyToStudio: "ask" | "always" | "never";
-};
-
-type LinkSyncConfig = {
-  manifest: string;
-  folder: string;
-  cacheDir: string;
-  gitPath: string;
-  wallyPath: string;
-  offline: boolean;
-  autoApply: boolean;
-  applyToStudio: "ask" | "always" | "never";
-};
-
-type ReniumLogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
-type InitialSyncPriority = "studio" | "editor" | "none";
-type DisplayPrompts = "always" | "initial" | "never";
-
-type SyncConfig = {
-  exportCliPath: string;
-  rustCliPath: string;
-  experienceRoot: string;
-  projectRoot: string;
-  srcDir: string;
-  activePlaceAlias?: string;
-  activePlace?: ExperiencePlace;
-  placeSelector?: string;
-  snapshotDir: string;
-  transport: "ws" | "mcp";
-  server: string;
-  configTomlPath: string;
-  services: string[];
-  sourceWorkers: number;
-  instanceWorkers: number;
-  importWorkers: number;
-  chunkSize: number;
-  snapshotInstanceChunkSize: number;
-  bridgeWaitSeconds: number;
-  bridgePorts: string;
-  usePersistentBridge: boolean;
-  verifyEditorPushSources: boolean;
-  adaptiveThrottle: boolean;
-  noUpdateEditorIcons: boolean;
-  autoSyncOnSave: boolean;
-  autoSyncDebounceMs: number;
-  editorLiveSyncEnabled: boolean;
-  editorLiveSyncOnStartup: boolean;
-  studioLiveSyncEnabled: boolean;
-  studioLiveSyncPollMs: number;
-  initialSyncPriority: InitialSyncPriority;
-  changesThreshold: number;
-  diffLinesLimit: number;
-  displayPrompts: DisplayPrompts;
-  logLevel: ReniumLogLevel;
-  overridePackages: boolean;
-  conflictResolution: ConflictPolicy;
-  runImport: boolean;
-  importMode: "direct" | "snapshot";
-  performanceMode: "throughput" | "balanced" | "smooth";
-  modifiedDefaultBypass: boolean;
-  wsWaitSeconds: number;
-  progressHeartbeatSeconds: number;
-  benchmarkRuns: number;
-  gitSync: GitSyncConfig;
-  wallySync: WallySyncConfig;
-  linkSync: LinkSyncConfig;
-};
-
-type CommandRunResult = {
-  code: number;
-  output: string;
-  result?: unknown;
-  automationError?: AutomationError;
-};
 
 type CapturedLocalScriptState = {
   content?: string;
@@ -234,8 +189,6 @@ type ConnectedStudioPlace = {
   placeName: string;
 };
 
-type RobloxPlaceFormat = "rbxl" | "rbxlx";
-
 type CliExportGameFileResult = {
   ok?: boolean;
   output?: string;
@@ -243,241 +196,6 @@ type CliExportGameFileResult = {
   services?: string[];
   serviceCount?: number;
   instances?: number;
-};
-
-type CliWallySourceWrite = {
-  settingsId?: string;
-  path?: string;
-};
-
-type CliWallyRemovedTarget = {
-  settingsId?: string;
-  className?: string;
-  pathSegments?: string[];
-  pathOrdinals?: number[];
-};
-
-type CliWallyRealmResult = {
-  realm?: string;
-  service?: string;
-  targetName?: string;
-  settingsFile?: string;
-  settingsIds?: string[];
-  sourceWrites?: CliWallySourceWrite[];
-  removedTarget?: CliWallyRemovedTarget | null;
-  skipped?: boolean;
-};
-
-type CliSyncWallyPackagesResult = {
-  ok?: boolean;
-  projectRoot?: string;
-  settingsFile?: string;
-  service?: string;
-  targetName?: string;
-  appliedRealms?: number;
-  skippedRealms?: number;
-  rootSettingsIds?: string[];
-  settingsIds?: string[];
-  sourceWrites?: CliWallySourceWrite[];
-  changedPaths?: string[];
-  targetSettingsIds?: string[];
-  removedTarget?: CliWallyRemovedTarget | null;
-  removedTargets?: CliWallyRemovedTarget[];
-  realms?: CliWallyRealmResult[];
-};
-
-type CliLinkApplyResult = {
-  ok?: boolean;
-  check?: boolean;
-  appliedTargets?: number;
-  driftedFiles?: number;
-  changedPaths?: string[];
-  targetSettingsIds?: string[];
-  warnings?: string[];
-};
-
-type CliLinkStatusMirror = {
-  path?: string;
-  canonical?: string;
-  drift?: boolean;
-  exists?: boolean;
-};
-
-type CliLinkStatusTarget = {
-  linkId?: string;
-  service?: string;
-  path?: string[];
-  pathKey?: string;
-  readOnly?: boolean;
-  broken?: boolean;
-  resolved?: boolean;
-  resolvedRef?: string | null;
-  drift?: boolean;
-  missing?: boolean;
-  files?: number;
-  mirrors?: CliLinkStatusMirror[];
-  reason?: string | null;
-};
-
-export type LinkFileInfo = {
-  linkId: string;
-  service: string;
-  pathSegments: string[];
-  canonical?: string;
-  readOnly: boolean;
-  broken: boolean;
-  drift: boolean;
-};
-
-export type CliLinkStatusLink = {
-  id?: string;
-  readOnly?: boolean;
-  sourceKind?: string;
-  source?: string;
-  sourcePath?: string;
-  targetCount?: number;
-  isPackage?: boolean;
-  rootClass?: string | null;
-  rootName?: string | null;
-  instances?: number;
-  updatedUnixMs?: number | null;
-};
-
-type CliLinkStatusResult = {
-  ok?: boolean;
-  manifest?: string;
-  manifestExists?: boolean;
-  linkCount?: number;
-  brokenTargets?: number;
-  driftedTargets?: number;
-  links?: CliLinkStatusLink[];
-  targets?: CliLinkStatusTarget[];
-};
-
-type LinkStatusResolution =
-  | { kind: "success"; value: CliLinkStatusResult }
-  | { kind: "missing" }
-  | { kind: "failed"; error: string };
-
-type CliLinkDeletePackageResult = {
-  ok?: boolean;
-  id?: string;
-  activeUses?: number;
-  deletedPackage?: string | null;
-  deletedTargets?: unknown[];
-  unlinkedTargets?: unknown[];
-  missingTargets?: unknown[];
-  removedSourcePaths?: string[];
-  externalizedSourcePaths?: string[];
-  changedPaths?: string[];
-  services?: string[];
-};
-
-type PackagePreviewNode = {
-  settingsId?: string;
-  name?: string;
-  className?: string;
-  parentId?: string;
-  childCount?: number;
-  pathSegments?: string[];
-  properties?: Record<string, unknown>;
-  attributes?: Record<string, unknown>;
-};
-
-type PackagePreviewData = {
-  id: string;
-  name: string;
-  source?: string;
-  sourcePath: string;
-  rootClass?: string | null;
-  rootName?: string | null;
-  nodes: PackagePreviewNode[];
-  rootIds: string[];
-};
-
-type LinkedPackageScriptPreviewRequest = {
-  service?: string;
-  pathSegments?: string[];
-  className?: string;
-  name?: string;
-};
-
-type OpenPackageScriptTab = {
-  linkId: string;
-  nodeKey: string;
-};
-
-type GitRepoState = {
-  view: GitViewState;
-  entries: GitStatusEntry[];
-  worktreeEntries: GitStatusEntry[];
-  repoRoot?: string;
-  branch?: string;
-  upstream?: string;
-  remote?: string;
-  remoteUrl?: string;
-  ahead: number;
-  behind: number;
-};
-
-type GitProjectToken = {
-  projectRoot: string;
-  generation: number;
-};
-
-type StudioChangeState = {
-  ok?: boolean;
-  tracking?: boolean;
-  role?: string;
-  seq?: number;
-  runtimeId?: string;
-  dirtyServices?: string[];
-  fullSyncServices?: string[];
-  propertyChanges?: StudioPropertyChange[];
-  editorActions?: StudioEditorAction[];
-  changes?: StudioChangeLog[];
-  trackedServices?: number;
-  itemChangedAvailable?: boolean;
-  eventDriven?: boolean;
-  waitSeconds?: number;
-  waitTimedOut?: boolean;
-  twoWaySyncEnabled?: boolean;
-  runtimeSettings?: Record<string, unknown>;
-  explicitRuntimeSettings?: Record<string, unknown>;
-  conflictResolution?: string;
-};
-
-type StudioPropertyChange = {
-  service?: string;
-  settingsId?: string;
-  className?: string;
-  pathSegments?: string[];
-  pathOrdinals?: number[];
-  scope?: "metadata" | "property" | "attribute";
-  property?: string;
-  value?: unknown;
-  seq?: number;
-};
-
-type StudioChangeLog = {
-  service?: string;
-  settingsId?: string;
-  action?: string;
-  reason?: string;
-  className?: string;
-  path?: string;
-  pathSegments?: string[];
-  pathOrdinals?: number[];
-  property?: string;
-  attribute?: string;
-  direct?: boolean;
-  fullSync?: boolean;
-  seq?: number;
-};
-
-type StudioSnapshotDiff = {
-  changedServices: string[];
-  fingerprintsByService: Map<string, string>;
 };
 
 type EditorPushOptions = {
@@ -502,7 +220,7 @@ type ExperienceChangeSnapshot = {
   blockedStudioImportServices: string[];
   pendingEditorServicesByPath: Array<[string, string[]]>;
   studioSnapshotFingerprintByService: Array<[string, string]>;
-  pendingLinkPackageSourcePaths: Array<[string, { projectRoot: string; generation: number }]>;
+  pendingLinkPackageSourcePaths: Array<[string, PendingPackageSource]>;
 };
 
 type ProjectRootConfigurationSnapshot = {
@@ -513,7 +231,7 @@ type ProjectRootConfigurationSnapshot = {
 
 type EditorPushOutcome = "applied" | "skipped";
 
-type EditorPropertyPushRequest = {
+type EditorDirectPushRequest = {
   force?: boolean;
   projectRoot?: string;
   settingsFile?: string;
@@ -522,31 +240,23 @@ type EditorPropertyPushRequest = {
   className?: string;
   pathSegments?: string[];
   pathOrdinals?: number[];
+  changedPaths?: string[];
+};
+
+type EditorPropertyPushRequest = EditorDirectPushRequest & {
   scope?: "metadata" | "property" | "attribute";
   property?: string;
   value?: unknown;
-  changedPaths?: string[];
 };
 
-type StudioEditorAction = {
-  id?: string;
-  type?: string;
-  service?: string;
-  settingsId?: string;
-  pathSegments?: string[];
-  pathOrdinals?: number[];
-};
+type EditorDeletePushRequest = EditorDirectPushRequest;
 
-type EditorDeletePushRequest = {
-  force?: boolean;
-  projectRoot?: string;
-  settingsFile?: string;
-  service?: string;
-  settingsId?: string;
-  className?: string;
-  pathSegments?: string[];
-  pathOrdinals?: number[];
-  changedPaths?: string[];
+type EditorDirectPushContext = {
+  cfg: SyncConfig;
+  service: string;
+  projectRoot: string;
+  changedPaths: string[];
+  retain: () => void;
 };
 
 type ProgrammaticEditorWriteRequest = {
@@ -554,13 +264,6 @@ type ProgrammaticEditorWriteRequest = {
   durationMs?: number;
   refreshCache?: boolean;
   forcePending?: boolean;
-};
-
-type EditorLiveSyncHashCache = {
-  version: number;
-  projectRoot: string;
-  updatedAtUnixMs: number;
-  files: Record<string, string>;
 };
 
 type SourcemapNode = {
@@ -576,141 +279,11 @@ type SourcemapCache = {
   root: SourcemapNode;
 };
 
-type DaemonPendingRequest = {
-  id: number;
-  label: string;
-  launchedAt: number;
-  lastOutputAt: number;
-  sawOutput: boolean;
-  output: string;
-  resolve: (result: CommandRunResult) => void;
-  reject: (err: Error) => void;
-  heartbeatTimer: NodeJS.Timeout | undefined;
-  timeoutTimer: NodeJS.Timeout | undefined;
-  quiet: boolean;
-};
-
-type AutomationError = {
-  c: string;
-  m: string;
-  rt: 0 | 1;
-  n?: string;
-  d?: unknown;
-};
-
-type AutomationResponse = {
-  v: 1;
-  id: number;
-  ok: 0 | 1;
-  ms: number;
-  r?: unknown;
-  e?: AutomationError;
-};
-
-type PluginProfileOperation = {
-  calls?: number;
-  totalUs?: number;
-  avgUs?: number;
-  perCallUs?: number;
-  p50Us?: number;
-  p90Us?: number;
-  emptyAvgUs?: number;
-  skipped?: boolean;
-  error?: string;
-  reason?: string;
-};
-
-type PluginProfileResult = {
-  service?: string;
-  profile?: {
-    service?: string;
-    instanceCount?: number;
-    sampleCount?: number;
-    iterations?: number;
-    projectedServerStoragePropertyReads?: number;
-  };
-  operations?: Record<string, PluginProfileOperation>;
-};
-
-type BenchmarkRunMetrics = {
-  totalMs?: number;
-  trackedService?: string;
-  coreExportMs?: number;
-  bridgeStartupMs?: number;
-  handshakeMs?: number;
-  serviceExportSumMs?: number;
-  importCriticalTailMs?: number;
-  unmeasuredOrSchedulerGapMs?: number;
-  trackedServiceInstanceFetchMs?: number;
-  trackedServicePluginServerMs?: number;
-  trackedServicePluginEncodeMs?: number;
-  trackedServicePayloadBytes?: number;
-  trackedServiceChunkCount?: number;
-  trackedServiceMaxFrameMs?: number;
-  trackedServiceStallCountOver33Ms?: number;
-  trackedServiceStallCountOver50Ms?: number;
-  trackedServiceStallCountOver100Ms?: number;
-  exportFingerprint?: string;
-  bridgeFingerprint?: string;
-  serviceMetrics?: BenchmarkServiceMetrics[];
-};
-
-type BenchmarkServiceMetrics = {
-  service: string;
-  instanceFetchMs?: number;
-  pluginServerMs?: number;
-  pluginEncodeMs?: number;
-  payloadBytes?: number;
-  chunkCount?: number;
-  maxFrameMs?: number;
-  stallCountOver33Ms?: number;
-  stallCountOver50Ms?: number;
-  stallCountOver100Ms?: number;
-};
-
-const DEFAULT_SERVICES = [...DEFAULT_SYNC_SERVICES];
-
-const DEFAULT_BRIDGE_PORTS = [8781, 8782];
-const PREVIOUS_DEFAULT_BRIDGE_PORTS = [8781, 8782, 8783];
-const LEGACY_BRIDGE_PORTS = [8781, 8782, 8783, 8784, 8785, 8786, 8787, 8788];
-const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
-const MAX_BRIDGE_CHUNK_SIZE = 8 * 1024 * 1024;
-const SETTINGS_FILE_NAME = "__roblox_sync_settings.renium";
-const LEGACY_SETTINGS_FILE_NAME = "__roblox_sync_settings.rbsync";
-
-function isReniumSettingsFileName(fileName: string): boolean {
-  const normalized = fileName.toLowerCase();
-  return normalized === SETTINGS_FILE_NAME || normalized === LEGACY_SETTINGS_FILE_NAME;
-}
-
-function isCanonicalReniumSettingsFileName(fileName: string): boolean {
-  return fileName.toLowerCase() === SETTINGS_FILE_NAME;
-}
-
 function existingReniumSettingsFile(projectRoot: string, srcDir: string, service: string): string {
   const serviceDir = path.join(projectRoot, srcDir, service);
-  const canonical = path.join(serviceDir, SETTINGS_FILE_NAME);
-  const legacy = path.join(serviceDir, LEGACY_SETTINGS_FILE_NAME);
-  return fs.existsSync(canonical) || !fs.existsSync(legacy) ? canonical : legacy;
+  return path.join(serviceDir, SETTINGS_FILE_NAME);
 }
-const RUST_CLI_BINARY = process.platform === "win32" ? "renium.exe" : "renium";
-const DEFAULT_RUST_CLI_RELATIVE_PATH = RUST_CLI_BINARY;
-const RUST_CLI_FALLBACK_RELATIVE_PATHS = [
-  DEFAULT_RUST_CLI_RELATIVE_PATH,
-  `bin/${RUST_CLI_BINARY}`,
-  `tools/renium/target/release/${RUST_CLI_BINARY}`,
-  `tools/renium/target-pi-release/release/${RUST_CLI_BINARY}`,
-  `tools/renium/target-drop-release/release/${RUST_CLI_BINARY}`,
-  `tools/renium/target-rename-release/release/${RUST_CLI_BINARY}`,
-  `tools/renium/target-resave-release/release/${RUST_CLI_BINARY}`,
-  `tools/renium/target/debug/${RUST_CLI_BINARY}`,
-  `tools/renium/target-pi-release/debug/${RUST_CLI_BINARY}`,
-  `tools/renium/target-drop-release/debug/${RUST_CLI_BINARY}`,
-  `tools/renium/target-rename-release/debug/${RUST_CLI_BINARY}`,
-  `tools/renium/target-resave-release/debug/${RUST_CLI_BINARY}`,
-];
-const DEFAULT_STUDIO_LIVE_SYNC_POLL_MS = 250;
-const MIN_STUDIO_LIVE_SYNC_POLL_MS = 10;
+const CLI_BINARY = reniumBinaryName();
 const MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS = 150;
 const MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS = 2000;
 const MAX_STUDIO_LIVE_SYNC_ERROR_POLL_MS = 5000;
@@ -719,141 +292,16 @@ const EDITOR_PUSH_RETRY_BASE_MS = 500;
 const EDITOR_PUSH_RETRY_MAX_MS = 10_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_DAEMON_OUTPUT_BUFFER_BYTES = 1024 * 1024;
-const DAEMON_CHANNEL_WAIT_MAX_MS = 30_000;
-
-const TRANSIENT_SNAPSHOT_PROPERTY_NAMES = new Set([
-  "absoluteposition",
-  "absoluterotation",
-  "absolutesize",
-  "absolutecanvassize",
-  "absolutewindowsize",
-  "absolutecontentsize",
-  "absolutecellcount",
-  "absolutecellsize",
-  "absolutepositionwrite",
-  "absolutesizewrite",
-  "arehingesdetected",
-  "channelcount",
-  "datamodelplaceversion",
-  "floormaterial",
-  "ispaused",
-  "issmooth",
-  "isspatial",
-  "lastusedmodificationmethod",
-  "localizedtext",
-  "localizationmatchedsourcetext",
-  "localizationmatchidentifier",
-  "maxextents",
-  "movedirection",
-  "movedirectioninternal",
-  "occupant",
-  "opentypefeatureserror",
-  "physicsreprrootpart",
-  "rolloffgain",
-  "rootpart",
-  "seatpart",
-  "steer",
-  "terrain",
-  "throttle",
-  "timeposition",
-  "timepositionreplicating",
-  "timepositionreplicator",
-  "resolution",
-  "walkdirection",
-  "weightcurrent",
-  "weighttarget",
-  "contenttext",
-  "textbounds",
-  "textfits",
-  "assemblyangularvelocity",
-  "assemblylinearvelocity",
-  "assemblycenterofmass",
-  "assemblymass",
-  "assemblyrootpart",
-  "centerofmass",
-  "currentcamera",
-  "currentphysicalproperties",
-  "distributedgametime",
-  "extentscframe",
-  "extentssize",
-  "isloaded",
-  "isplaying",
-  "mass",
-  "networkissleeping",
-  "playbackloudness",
-  "receiveage",
-  "rotvelocity",
-  "timelength",
-  "velocity",
-]);
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isTransientBridgeFailure(output: string): boolean {
-  return [
-    "Bridge call failed",
-    "Bridge send failed",
-    "Bridge read failed",
-    "Bridge closed while waiting",
-    "closed before hello",
-    "failed waiting for hello",
-    "No plugin bridge channels connected",
-    "Only ",
-    "proceeding with",
-  ].some((needle) => output.includes(needle));
-}
-
-function safeFileComponent(value: unknown): string {
-  const cleaned = String(value ?? "item")
-    .trim()
-    .replace(/[^A-Za-z0-9._-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
-  return cleaned || "item";
-}
 
 function safePlaceFileName(name: string, format: RobloxPlaceFormat): string {
   return `${safeFileComponent(name || "Game")}.${format}`;
 }
 
-function ensurePlaceFileExtension(filePath: string, format: RobloxPlaceFormat): string {
-  const expected = `.${format}`;
-  const current = path.extname(filePath).toLowerCase();
-  if (current === expected) {
-    return filePath;
+async function executeCommandBestEffort(command: string, ...args: unknown[]): Promise<void> {
+  try {
+    await vscode.commands.executeCommand(command, ...args);
+  } catch {
   }
-  if (current === ".rbxl" || current === ".rbxlx") {
-    return `${filePath.slice(0, -current.length)}${expected}`;
-  }
-  return `${filePath}${expected}`;
-}
-
-function robloxPlaceFormatFromPath(filePath: string): RobloxPlaceFormat | undefined {
-  const extension = path.extname(filePath).toLowerCase();
-  if (extension === ".rbxl" || extension === ".rbxlx") {
-    return extension.slice(1) as RobloxPlaceFormat;
-  }
-  return undefined;
-}
-
-function resolveExistingRustCliPath(
-  workspaceRoot: string,
-  projectRoot: string,
-  configuredPath: string,
-  extensionRoot: string,
-): string {
-  const roots = Array.from(new Set([workspaceRoot, projectRoot].map((value) => path.normalize(value))));
-  const candidates = reniumCliCandidates({
-    configuredPath,
-    extensionRoot,
-    roots,
-    fallbackRelativePaths: RUST_CLI_FALLBACK_RELATIVE_PATHS,
-  });
-  const existing = candidates.find((candidate) => fs.existsSync(candidate));
-  return existing ?? (configuredPath || bundledReniumCliPath(extensionRoot));
 }
 
 class RobloxSyncController {
@@ -883,7 +331,6 @@ class RobloxSyncController {
   private studioLiveSyncNextPollMs = DEFAULT_STUDIO_LIVE_SYNC_POLL_MS;
   private studioToEditorImportInProgress = false;
   private studioToEditorImportSuppressUntilMs = 0;
-  private studioToEditorLastSyncEndedAt = 0;
   private studioSnapshotFingerprintByService = new Map<string, string>();
   private editorLiveSyncRuntimeEnabled = false;
   private pendingEditorPaths = new Set<string>();
@@ -898,38 +345,10 @@ class RobloxSyncController {
   private studioConflictPolicyOverride: ConflictPolicy | undefined;
   private studioRuntimeSettings: Record<string, unknown> | undefined;
   private conflictMarkerWarnedKeys = new Set<string>();
-  private linkStatusCache: {
-    at: number;
-    projectRoot: string;
-    generation: number;
-    token: number;
-    value: CliLinkStatusResult | undefined;
-  } | undefined;
-  private linkStatusInflight: {
-    projectRoot: string;
-    generation: number;
-    token: number;
-    promise: Promise<CliLinkStatusResult | undefined>;
-  } | undefined;
-  private linkStatusToken = 0;
-  private linkPackageSourceApplyTimer: NodeJS.Timeout | undefined;
-  private readonly pendingLinkPackageSourcePaths = new Map<string, { projectRoot: string; generation: number }>();
-  private linkPackageSourceWatchers: vscode.Disposable[] = [];
-  private readonly activeLinkPackageSourceKeys = new Set<string>();
-  private readonly linkChangeEmitter = new vscode.EventEmitter<void>();
-  public readonly onLinksChanged = this.linkChangeEmitter.event;
-  private daemonProcess: childProcess.ChildProcessWithoutNullStreams | undefined;
-  private daemonKeyValue: string | undefined;
-  private daemonRequestId = 1;
-  private daemonOutputBuffer = "";
-  private daemonReady = false;
-  private daemonReadyPromise: Promise<void> | undefined;
-  private daemonReadyResolve: (() => void) | undefined;
-  private daemonReadyReject: ((err: Error) => void) | undefined;
-  private daemonClosePromise: Promise<void> | undefined;
-  private daemonStopPromise: Promise<void> | undefined;
-  private daemonPending = new Map<number, DaemonPendingRequest>();
-  private daemonContext: { key: string; id: number } | undefined;
+  private readonly automationClient: AutomationClient;
+  private readonly configResolver: SyncConfigResolver;
+  private readonly gitController: GitController<SyncConfig>;
+  private readonly packageSyncController: PackageSyncController<SyncConfig>;
   private publishedPlaceNames = new Map<number, string>();
   private publishedRootPlaceIds = new Map<number, number>();
   private bridgeServeRequested = false;
@@ -940,18 +359,11 @@ class RobloxSyncController {
   private autoSyncTimer: NodeJS.Timeout | undefined;
   private pendingAutoServices = new Set<string>();
   private activeTaskName: string | undefined;
-  private gitViewRefreshSuppression = 0;
   private experienceChangeInProgress = false;
   private experienceGeneration = 0;
   private configuredProjectRoot: string | undefined;
   private projectRootConfigurationSnapshot: ProjectRootConfigurationSnapshot;
   private configurationChangeQueue: Promise<void> = Promise.resolve();
-  private warnedLegacyStartupWaitSeconds = false;
-  private warnedMultiRootWorkspace = false;
-  private warnedLegacyBridgePorts = false;
-  private warnedBridgePortLimit = false;
-  private warnedLegacyChunkSize = false;
-  private warnedChunkSizeCap = false;
   private sourcemapCache: SourcemapCache | undefined;
   private readonly consoleOutput = vscode.window.createOutputChannel("Renium Console");
   private consoleFollowTimer: NodeJS.Timeout | undefined;
@@ -964,17 +376,69 @@ class RobloxSyncController {
   private consoleFollowOwnsServe = false;
   private displayedLiveSyncPrompt = false;
   private luauSourcemapQueue: Promise<void> = Promise.resolve();
-  private sharedConfig: SharedConfig = {};
 
   public constructor(private readonly context: vscode.ExtensionContext) {
     const output = vscode.window.createOutputChannel("Renium");
+    this.output = output;
+    this.configResolver = new SyncConfigResolver(
+      this.context,
+      output,
+      (experienceRoot) => this.restoreActiveExperiencePlace(experienceRoot),
+    );
     const appendLine = output.appendLine.bind(output);
     output.appendLine = (value: string): void => {
       if (this.shouldWriteOutput(this.outputLevel(value))) {
         appendLine(value);
       }
     };
-    this.output = output;
+    this.automationClient = new AutomationClient(
+      output,
+      () => this.configuredProjectRoot ?? this.context.extensionPath,
+    );
+    this.gitController = new GitController<SyncConfig>({
+      context: this.context,
+      output: this.output,
+      getConfig: () => this.getConfig(),
+      enqueue: (taskName, task) => this.enqueue(taskName, task),
+      experienceChanging: () => this.experienceChangeInProgress,
+      experienceGeneration: () => this.experienceGeneration,
+      servicesForProjectSourcePath: (filePath, config) =>
+        this.servicesForProjectSourcePath(filePath, config),
+      isProjectSourcePath: (filePath, config) => this.isProjectSourcePath(filePath, config),
+      pushEditorPathsNow: (paths, options) => this.pushEditorPathsNow(paths, options),
+      isLiveSyncActiveOrStarting: () =>
+        this.isEditorLiveSyncActive() || this.liveSyncStartPromise !== undefined,
+      stopLiveSync: () => this.stopLiveSync({ silent: true }),
+      startLiveSync: () => this.startLiveSync({ silent: true, bestEffort: true }),
+      pullFromStudio: async (config) => {
+        await this.runExport({
+          services: config.services,
+          runImport: true,
+          notifyOnSuccess: false,
+          reason: "",
+          quietTimings: false,
+          destructive: true,
+        });
+      },
+    });
+    this.packageSyncController = new PackageSyncController<SyncConfig>({
+      output: this.output,
+      getConfig: () => this.getConfig(),
+      tryGetConfig: () => this.tryGetConfig(),
+      enqueue: (taskName, task) => this.enqueue(taskName, task),
+      experienceChanging: () => this.experienceChangeInProgress,
+      experienceGeneration: () => this.experienceGeneration,
+      logResolvedConfig: (config) => this.logResolvedConfig(config),
+      runCommand: (command, args, cwd, label, heartbeat, options) =>
+        this.runCommand(command, args, cwd, label, heartbeat, options),
+      canUseStudioPushPipeline: () => this.canUseStudioPushPipeline(),
+      noteStudioPushSkipped: (reason) => this.noteStudioPushSkipped(reason),
+      pushEditorPathsNow: (paths, options) => this.pushEditorPathsNow(paths, options),
+      pushEditorDeleteNow: (request) => this.pushEditorDeleteNow(request),
+      noteProgrammaticEditorWrite: (request) => this.noteProgrammaticEditorWrite(request),
+      isEditorLiveSyncActive: () => this.isEditorLiveSyncActive(),
+      executeCommandBestEffort,
+    });
     this.restoreActiveExperiencePlace();
     const initialConfig = this.getConfig();
     this.configuredProjectRoot = initialConfig.projectRoot;
@@ -1183,7 +647,7 @@ class RobloxSyncController {
           if (manifest) {
             for (const place of Object.values(manifest.places)) {
               const placeRoot = resolveExperiencePlaceRoot(cfg.experienceRoot, place.root);
-              if (this.isPathInside(editor.document.uri.fsPath, placeRoot)) {
+              if (isPathInside(editor.document.uri.fsPath, placeRoot)) {
                 projectRoot = placeRoot;
                 break;
               }
@@ -1208,12 +672,7 @@ class RobloxSyncController {
       return undefined;
     }
     const cfg = vscode.workspace.getConfiguration("renium", vscode.Uri.file(workspaceRoot));
-    return this.resolveConfigPath(cfg.get<string>("projectRoot", "${workspaceFolder}"), workspaceRoot);
-  }
-
-  private experienceStateKey(experienceRoot: string): string {
-    const resolved = path.resolve(experienceRoot);
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    return resolveConfigPath(cfg.get<string>("projectRoot", "${workspaceFolder}"), workspaceRoot);
   }
 
   private restoreActiveExperiencePlace(
@@ -1226,7 +685,7 @@ class RobloxSyncController {
       RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY,
       {},
     );
-    setActiveExperiencePlace(experienceRoot, stored[this.experienceStateKey(experienceRoot)]);
+    setActiveExperiencePlace(experienceRoot, stored[filesystemPathKey(experienceRoot)]);
     try {
       const active = resolveActiveExperiencePlace(experienceRoot);
       if (active) {
@@ -1243,7 +702,7 @@ class RobloxSyncController {
         RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY,
         {},
       ),
-      [this.experienceStateKey(experienceRoot)]: alias,
+      [filesystemPathKey(experienceRoot)]: alias,
     };
     try {
       await this.context.workspaceState.update(RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY, stored);
@@ -1254,37 +713,54 @@ class RobloxSyncController {
     }
   }
 
-  private experiencePlaceByAlias(experienceRoot: string, alias: string) {
-    const manifest = readExperienceManifest(experienceRoot);
-    const place = manifest?.places[alias];
-    if (!manifest || !place) {
-      throw new Error(`Place alias '${alias}' is not configured.`);
-    }
-    const selector = manifest.gameId > 0 && place.placeId > 0
-      ? `${manifest.gameId}:${place.placeId}`
-      : place.placeId > 0
-        ? String(place.placeId)
-        : place.name;
+  private captureExperienceChange(experienceRoot: string): ExperienceChangeSnapshot {
     return {
-      alias,
-      manifest,
-      place,
-      projectRoot: resolveExperiencePlaceRoot(experienceRoot, place.root),
-      selector,
+      ...this.captureProjectSyncState(),
+      alias: activeExperienceAlias(experienceRoot),
     };
   }
 
-  private captureExperienceChange(experienceRoot: string): ExperienceChangeSnapshot {
+  private captureProjectSyncState(projectRoot = this.configuredProjectRoot): ExperienceChangeSnapshot {
     return {
-      alias: activeExperienceAlias(experienceRoot),
-      projectRoot: this.configuredProjectRoot,
+      projectRoot,
       pendingEditorPaths: [...this.pendingEditorPaths],
       blockedStudioImportServices: [...this.blockedStudioImportServices],
       pendingEditorServicesByPath: [...this.pendingEditorServicesByPath]
         .map(([filePath, services]) => [filePath, [...services]]),
       studioSnapshotFingerprintByService: [...this.studioSnapshotFingerprintByService],
-      pendingLinkPackageSourcePaths: [...this.pendingLinkPackageSourcePaths],
+      pendingLinkPackageSourcePaths: this.packageSyncController.pendingSourceEntries(),
     };
+  }
+
+  private restoreProjectSyncState(snapshot: ExperienceChangeSnapshot): void {
+    this.configuredProjectRoot = snapshot.projectRoot;
+    this.pendingEditorPaths = new Set(snapshot.pendingEditorPaths);
+    this.blockedStudioImportServices = new Set(snapshot.blockedStudioImportServices);
+    this.pendingEditorServicesByPath = new Map(
+      snapshot.pendingEditorServicesByPath.map(([filePath, services]) => [filePath, new Set(services)]),
+    );
+    this.studioSnapshotFingerprintByService = new Map(snapshot.studioSnapshotFingerprintByService);
+    this.packageSyncController.restorePendingSources(
+      snapshot.pendingLinkPackageSourcePaths,
+      snapshot.projectRoot,
+      this.experienceGeneration,
+    );
+    this.liveSyncProjectRoot = snapshot.projectRoot;
+    this.sourcemapCache = undefined;
+    this.studioRuntimeSettings = undefined;
+    this.studioConflictPolicyOverride = undefined;
+    this.packageSyncController.resetStatusCache();
+  }
+
+  private resetProjectScopedCaches(): void {
+    this.sourcemapCache = undefined;
+    this.studioRuntimeSettings = undefined;
+    this.studioConflictPolicyOverride = undefined;
+    this.studioSnapshotFingerprintByService.clear();
+    this.conflictMarkerWarnedKeys.clear();
+    this.recentDirectSaveAtByPath.clear();
+    this.editorPushFailureStreak = 0;
+    this.packageSyncController.resetStatusCache();
   }
 
   private async rollbackExperienceChange(
@@ -1293,33 +769,14 @@ class RobloxSyncController {
     resumeLiveSync: boolean,
   ): Promise<void> {
     setActiveExperiencePlace(experienceRoot, snapshot.alias);
-    this.configuredProjectRoot = snapshot.projectRoot;
-    this.pendingEditorPaths = new Set(snapshot.pendingEditorPaths);
-    this.blockedStudioImportServices = new Set(snapshot.blockedStudioImportServices);
-    this.pendingEditorServicesByPath = new Map(
-      snapshot.pendingEditorServicesByPath.map(([filePath, services]) => [filePath, new Set(services)]),
-    );
-    this.studioSnapshotFingerprintByService = new Map(snapshot.studioSnapshotFingerprintByService);
-    this.pendingLinkPackageSourcePaths.clear();
-    for (const [filePath, pending] of snapshot.pendingLinkPackageSourcePaths) {
-      this.pendingLinkPackageSourcePaths.set(filePath, {
-        projectRoot: snapshot.projectRoot ?? pending.projectRoot,
-        generation: this.experienceGeneration,
-      });
-    }
-    this.liveSyncProjectRoot = snapshot.projectRoot;
-    this.sourcemapCache = undefined;
-    this.studioRuntimeSettings = undefined;
-    this.studioConflictPolicyOverride = undefined;
-    this.linkStatusCache = undefined;
-    this.linkStatusInflight = undefined;
+    this.restoreProjectSyncState(snapshot);
     try {
       await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
       await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
     } finally {
       this.experienceChangeInProgress = false;
     }
-    this.linkChangeEmitter.fire();
+    this.packageSyncController.notifyLinksChanged();
     this.updateStatusBar();
     if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
       await this.serve({ silent: true, bestEffort: true });
@@ -1327,8 +784,11 @@ class RobloxSyncController {
     if (resumeLiveSync) {
       await this.startLiveSync({ silent: true, bestEffort: true });
     }
-    if (this.pendingLinkPackageSourcePaths.size > 0 && snapshot.projectRoot) {
-      this.scheduleLinkPackageSourceFlush(snapshot.projectRoot, this.experienceGeneration);
+    if (snapshot.projectRoot) {
+      this.packageSyncController.resumePendingSources(
+        snapshot.projectRoot,
+        this.experienceGeneration,
+      );
     }
   }
 
@@ -1363,10 +823,7 @@ class RobloxSyncController {
         clearTimeout(this.autoSyncTimer);
         this.autoSyncTimer = undefined;
       }
-      if (this.linkPackageSourceApplyTimer) {
-        clearTimeout(this.linkPackageSourceApplyTimer);
-        this.linkPackageSourceApplyTimer = undefined;
-      }
+      this.packageSyncController.pausePendingSources();
       this.pendingAutoServices.clear();
       await this.stopConsoleFollow();
       if (previousProjectRoot) {
@@ -1383,47 +840,30 @@ class RobloxSyncController {
   }
 
   private async finishExperienceChange(experienceRoot: string, alias: string): Promise<void> {
-    const active = this.experiencePlaceByAlias(experienceRoot, alias);
+    const active = resolveExperiencePlaceByAlias(experienceRoot, alias);
     setActiveExperiencePlace(experienceRoot, alias);
     this.configuredProjectRoot = active.projectRoot;
     fs.mkdirSync(active.projectRoot, { recursive: true });
     this.restorePendingEditorPaths();
-    this.sourcemapCache = undefined;
-    this.studioRuntimeSettings = undefined;
-    this.studioConflictPolicyOverride = undefined;
-    this.studioSnapshotFingerprintByService.clear();
-    this.conflictMarkerWarnedKeys.clear();
-    this.recentDirectSaveAtByPath.clear();
-    this.editorPushFailureStreak = 0;
-    this.linkStatusCache = undefined;
-    this.linkStatusInflight = undefined;
+    this.resetProjectScopedCaches();
     await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
     await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
     this.ensureAgentInstructions(experienceRoot);
-    this.linkChangeEmitter.fire();
+    this.packageSyncController.notifyLinksChanged();
     this.updateStatusBar();
     if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
       await this.serve({ silent: true, bestEffort: true });
     }
     await this.persistActiveExperiencePlace(experienceRoot, alias);
-    let pendingPackageSource = false;
-    for (const pending of this.pendingLinkPackageSourcePaths.values()) {
-      if (
-        this.normalizePathForCompare(pending.projectRoot)
-        === this.normalizePathForCompare(active.projectRoot)
-      ) {
-        pending.generation = this.experienceGeneration;
-        pendingPackageSource = true;
-      }
-    }
     this.experienceChangeInProgress = false;
-    if (pendingPackageSource) {
-      this.scheduleLinkPackageSourceFlush(active.projectRoot, this.experienceGeneration);
-    }
+    this.packageSyncController.resumePendingSources(
+      active.projectRoot,
+      this.experienceGeneration,
+    );
   }
 
   private async activateExperiencePlace(experienceRoot: string, alias: string): Promise<void> {
-    this.experiencePlaceByAlias(experienceRoot, alias);
+    resolveExperiencePlaceByAlias(experienceRoot, alias);
     const snapshot = this.captureExperienceChange(experienceRoot);
     const resumeLiveSync = await this.prepareExperienceChange();
     try {
@@ -1449,26 +889,7 @@ class RobloxSyncController {
   }
 
   private configuredLogLevel(): ReniumLogLevel {
-    const runtimeLevel = this.studioRuntimeSettings?.logLevel;
-    const workspaceConfig = vscode.workspace.getConfiguration("renium");
-    const configuredLevel = this.explicitConfigValue<string>(workspaceConfig, "logLevel");
-    const sharedLevel = sharedConfigValue<string>(this.sharedConfig, "logLevel");
-    const raw = String(
-      typeof runtimeLevel === "string"
-        ? runtimeLevel
-        : configuredLevel ?? sharedLevel ?? "info",
-    ).toLowerCase();
-    switch (raw) {
-      case "off":
-      case "error":
-      case "warn":
-      case "info":
-      case "debug":
-      case "trace":
-        return raw;
-      default:
-        return "info";
-    }
+    return this.configResolver.configuredLogLevel(this.studioRuntimeSettings);
   }
 
   private outputLevel(message: string): Exclude<ReniumLogLevel, "off"> {
@@ -1504,72 +925,11 @@ class RobloxSyncController {
   }
 
   public gitViewActions(): GitViewActions {
-    return {
-      refresh: (options) => this.getGitViewState(options),
-      runAction: (action, context) => this.runGitViewAction(action, context.projectRoot),
-      openOutput: () => this.output.show(true),
-      openDiff: (filePath, context) => this.openGitDiff(filePath, context.projectRoot),
-    };
+    return this.gitController.actions();
   }
 
-  private gitHeadProviderRegistered = false;
-
-
-  private ensureGitHeadProvider(): void {
-    if (this.gitHeadProviderRegistered) {
-      return;
-    }
-    this.gitHeadProviderRegistered = true;
-    const provider: vscode.TextDocumentContentProvider = {
-      provideTextDocumentContent: async (uri) => {
-        try {
-          const repoRoot = new URLSearchParams(uri.query).get("root") ?? "";
-          const relPath = uri.path.replace(/^\/+/, "");
-          if (!repoRoot || !relPath) {
-            return "";
-          }
-          return await this.gitOutput(this.getConfig(), repoRoot, ["show", `HEAD:${relPath}`], "read HEAD version");
-        } catch {
-          return "";
-        }
-      },
-    };
-    this.context.subscriptions.push(
-      vscode.workspace.registerTextDocumentContentProvider("renium-githead", provider),
-    );
-  }
-
-
-  private async openGitDiff(filePath: string, expectedProjectRoot: string): Promise<void> {
-    const requested = String(filePath ?? "").trim();
-    if (!requested) {
-      return;
-    }
-    this.ensureGitHeadProvider();
-    const token = this.captureGitProjectToken(expectedProjectRoot);
-    const cfg = this.gitConfigForToken(token);
-    let repoRoot: string;
-    try {
-      const state = await this.inspectGitRepo(cfg, { fetch: false });
-      this.gitConfigForToken(token);
-      repoRoot = this.requireGitRepoRoot(state);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Cannot open diff. ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-    const absFile = path.isAbsolute(requested) ? requested : path.join(repoRoot, requested);
-    const relForGit = path.relative(repoRoot, absFile).split(path.sep).join("/");
-    const title = `${path.basename(absFile)} (HEAD ↔ Working Tree)`;
-    const headUri = vscode.Uri.from({
-      scheme: "renium-githead",
-      path: `/${relForGit}`,
-      query: `root=${encodeURIComponent(repoRoot)}&t=${Date.now()}`,
-    });
-    if (!fs.existsSync(absFile)) {
-      await vscode.window.showTextDocument(headUri, { preview: true });
-      return;
-    }
-    await vscode.commands.executeCommand("vscode.diff", headUri, vscode.Uri.file(absFile), title);
+  public get onLinksChanged(): vscode.Event<void> {
+    return this.packageSyncController.onLinksChanged;
   }
 
   public dispose(): void {
@@ -1577,15 +937,7 @@ class RobloxSyncController {
       clearTimeout(this.autoSyncTimer);
       this.autoSyncTimer = undefined;
     }
-    if (this.linkPackageSourceApplyTimer) {
-      clearTimeout(this.linkPackageSourceApplyTimer);
-      this.linkPackageSourceApplyTimer = undefined;
-    }
-    for (const watcher of this.linkPackageSourceWatchers) {
-      watcher.dispose();
-    }
-    this.linkPackageSourceWatchers = [];
-    this.activeLinkPackageSourceKeys.clear();
+    this.packageSyncController.dispose();
     this.disposeLiveSyncRuntime();
     this.stopStudioActionPolling();
     void this.stopConsoleFollow({ releaseServe: false });
@@ -1602,12 +954,8 @@ class RobloxSyncController {
   }
 
   private canUseStudioPushPipeline(): boolean {
-    const cfg = this.getConfig();
     if (this.isEditorLiveSyncActive()) {
       return true;
-    }
-    if (cfg.transport !== "ws") {
-      return this.bridgeServeRequested;
     }
     return this.bridgeServeRequested && this.isBridgeDaemonRunning();
   }
@@ -1771,7 +1119,7 @@ class RobloxSyncController {
   private async connectedStudioPlaces(attempt = 0): Promise<ConnectedStudioPlace[]> {
     const cfg = this.getConfig();
     const result = await this.runAutomationOperation(
-      cfg.exportCliPath,
+      cfg.cliPath,
       cfg,
       "current-place",
       AUTOMATION_OP.studios,
@@ -1817,7 +1165,7 @@ class RobloxSyncController {
       await new Promise<void>((resolve) => {
         setTimeout(resolve, attempt === 0 ? 200 : 800);
       });
-      return await this.connectedStudioPlaces(attempt + 1);
+      return this.connectedStudioPlaces(attempt + 1);
     }
     return unique;
   }
@@ -2029,16 +1377,20 @@ class RobloxSyncController {
         current.placeName,
         currentPlaceId,
       );
-      const originalManifest = manifest
-        ? JSON.parse(JSON.stringify(manifest)) as ExperienceManifest
-        : undefined;
-      manifest = manifest ?? {
-        version: 2,
-        gameId: current.gameId,
-        startPlace: alias,
-        placeOrder: [],
-        places: {},
-      };
+      const originalManifest = manifest;
+      manifest = manifest
+        ? {
+          ...manifest,
+          placeOrder: [...manifest.placeOrder],
+          places: { ...manifest.places },
+        }
+        : {
+          version: 2,
+          gameId: current.gameId,
+          startPlace: alias,
+          placeOrder: [],
+          places: {},
+        };
       if (manifest.gameId === 0 && current.gameId > 0) {
         manifest.gameId = current.gameId;
       }
@@ -2471,7 +1823,7 @@ class RobloxSyncController {
         }
         try {
           const cfg = this.getConfig();
-          const command = this.resolveRustCliPathForCommand(cfg, "setup");
+          const command = cfg.cliPath;
           const result = await this.runCommand(
             command,
             ["setup", "--file", sourcePath],
@@ -2640,10 +1992,10 @@ class RobloxSyncController {
     let result: CommandRunResult | undefined;
     await this.enqueue(taskName, async () => {
       const cfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(cfg, cliCommand);
-      this.ensureFileExists(command);
+      const command = cfg.cliPath;
+      ensureFileExists(command);
       this.output.show(false);
-      this.output.appendLine(`[renium] ${taskName}: ${command} ${this.renderArgs(args)}`);
+      this.output.appendLine(`[renium] ${taskName}: ${command} ${renderCommandArgs(args)}`);
       result = await this.runCommand(
         command,
         args,
@@ -2697,8 +2049,8 @@ class RobloxSyncController {
       return;
     }
     const cfg = this.getConfig();
-    const command = this.resolveRustCliPathForCommand(cfg, "co");
-    this.ensureFileExists(command);
+    const command = cfg.cliPath;
+    ensureFileExists(command);
     const startedServe = !this.bridgeServeRequested;
     this.bridgeServeRequested = true;
     this.consoleFollowOwnsServe = startedServe;
@@ -2732,7 +2084,7 @@ class RobloxSyncController {
     let drainImmediately = false;
     try {
       const cfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(cfg, "co");
+      const command = cfg.cliPath;
       const result = await this.runAutomationOperation(
         command,
         cfg,
@@ -2757,7 +2109,7 @@ class RobloxSyncController {
       }
       const value = result.result && typeof result.result === "object" && !Array.isArray(result.result)
         ? result.result as Record<string, unknown>
-        : this.parseCliJsonObject<Record<string, unknown>>(result.output);
+        : parseCliJsonObject<Record<string, unknown>>(result.output);
       if (value) {
         const epoch = typeof value.epoch === "string" ? value.epoch : undefined;
         if (this.consoleFollowEpoch && epoch !== this.consoleFollowEpoch) {
@@ -2924,9 +2276,9 @@ class RobloxSyncController {
 
     await this.enqueue("Export game file", async () => {
       const runCfg = this.getConfig();
-      const selectedServices = this.normalizeServices(runCfg.services, runCfg.services);
-      const command = this.resolveRustCliPathForCommand(runCfg, "bytecode-export-place");
-      this.ensureFileExists(command);
+      const selectedServices = normalizeServices(runCfg.services, runCfg.services);
+      const command = runCfg.cliPath;
+      ensureFileExists(command);
       const args = [
         "bep",
         "-r",
@@ -2943,16 +2295,13 @@ class RobloxSyncController {
 
       this.output.show(false);
       this.logResolvedConfig(runCfg);
-      if (path.normalize(command) !== path.normalize(runCfg.rustCliPath)) {
-        this.output.appendLine(`[renium] export game file: using fallback rustCliPath=${command}`);
-      }
-      this.output.appendLine(`[renium] export game file command: ${command} ${this.renderArgs(args)}`);
+      this.output.appendLine(`[renium] export game file command: ${command} ${renderCommandArgs(args)}`);
       const result = await this.runCommand(command, args, runCfg.projectRoot, "export-game-file", runCfg.progressHeartbeatSeconds);
       if (result.code !== 0) {
         throw new Error(`Game file export exited with code ${result.code}`);
       }
 
-      const parsed = this.parseExportGameFileResult(result.output);
+      const parsed = parseCliJsonObject<CliExportGameFileResult>(result.output);
       const finalOutputPath = typeof parsed?.output === "string" && parsed.output.trim().length > 0
         ? parsed.output
         : outputPath;
@@ -2963,2604 +2312,188 @@ class RobloxSyncController {
     });
   }
 
-  public async importSnapshotsOnly(): Promise<void> {
-    await this.enqueue("Import snapshots", async () => {
-      const cfg = this.getConfig();
-      const snapshotPath = this.resolveSnapshotPath(cfg);
-      const serviceLabel = cfg.services.length === 1 ? cfg.services[0] : `${cfg.services.length} services`;
-      const confirmed = await vscode.window.showWarningMessage(
-        `Import Studio snapshots into ${cfg.srcDir} for ${serviceLabel}? Existing generated files may be replaced; stale files are recoverable from .renium/import-backups.`,
-        { modal: true },
-        "Import snapshots",
-      );
-      if (confirmed !== "Import snapshots") {
-        return;
-      }
-      await this.runRustImport(cfg, snapshotPath, cfg.services);
-
-      vscode.window.showInformationMessage("Snapshot import finished.");
-    });
+  public syncWallyPackages(): Promise<void> {
+    return this.packageSyncController.syncWallyPackages();
   }
 
-  public async syncWallyPackages(): Promise<void> {
-    this.output.appendLine(`[renium] Wally packages: requested at ${new Date().toISOString()}`);
-    const requestedConfig = this.getConfig();
-    const requestedRoot = this.normalizePathForCompare(requestedConfig.projectRoot);
-    const requestedGeneration = this.experienceGeneration;
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: "Syncing Wally packages",
-        cancellable: false,
-      },
-      async (progress) => {
-        progress.report({ message: "Waiting for Renium task queue..." });
-        await this.enqueue("Sync Wally packages", async () => {
-          const runCfg = this.getConfig();
-          if (
-            this.experienceGeneration !== requestedGeneration
-            || this.normalizePathForCompare(runCfg.projectRoot) !== requestedRoot
-          ) {
-            throw new Error("The active Renium place changed. Run Wally package sync again.");
-          }
-          if (!(await this.ensureWallyManifest(runCfg))) {
-            return;
-          }
-          const command = this.resolveRustCliPathForCommand(runCfg, "sync-wally-packages");
-          this.ensureFileExists(command);
-          const args = [
-            "sync-wally-packages",
-            "-r",
-            runCfg.projectRoot,
-            "-d",
-            runCfg.srcDir,
-            "--wally-path",
-            runCfg.wallySync.wallyPath,
-            "--packages-dir",
-            runCfg.wallySync.packagesDir,
-            "--target-service",
-            runCfg.wallySync.targetService,
-            "--target-name",
-            runCfg.wallySync.targetName,
-            "--server-packages-dir",
-            runCfg.wallySync.serverPackagesDir,
-            "--server-target-service",
-            runCfg.wallySync.serverTargetService,
-            "--server-target-name",
-            runCfg.wallySync.serverTargetName,
-            "--dev-packages-dir",
-            runCfg.wallySync.devPackagesDir,
-            "--dev-target-service",
-            runCfg.wallySync.devTargetService,
-            "--dev-target-name",
-            runCfg.wallySync.devTargetName,
-            "--realms",
-            runCfg.wallySync.realms,
-          ];
-          if (!runCfg.wallySync.runInstall) {
-            args.push("--skip-install");
-          }
-
-          progress.report({ message: "Running wally install and bytecode import..." });
-          this.output.show(false);
-          this.logResolvedConfig(runCfg);
-          if (path.normalize(command) !== path.normalize(runCfg.rustCliPath)) {
-            this.output.appendLine(`[renium] Wally packages: using fallback rustCliPath=${command}`);
-          }
-          this.output.appendLine(`[renium] Wally packages command: ${command} ${this.renderArgs(args)}`);
-          const result = await this.runCommand(command, args, runCfg.projectRoot, "wally-packages", runCfg.progressHeartbeatSeconds);
-          if (result.code !== 0) {
-            throw new Error(this.wallySyncFailureMessage(result));
-          }
-
-          const parsed = this.parseCliJsonObject<CliSyncWallyPackagesResult>(result.output);
-          if (!parsed || parsed.ok === false) {
-            throw new Error("Wally package sync didn't finish. Check the Renium output panel for details.");
-          }
-          if (
-            typeof parsed.projectRoot !== "string"
-            || this.normalizePathForCompare(parsed.projectRoot) !== requestedRoot
-            || this.experienceGeneration !== requestedGeneration
-            || this.normalizePathForCompare(this.getConfig().projectRoot) !== requestedRoot
-          ) {
-            throw new Error("Wally package sync returned results for a different Renium place.");
-          }
-          const importedCount = Array.isArray(parsed.settingsIds) ? parsed.settingsIds.length : 0;
-          progress.report({ message: `Imported ${importedCount} package instance(s).` });
-          this.output.appendLine(
-            `[renium] Wally packages: imported ${importedCount} instance(s) into ${parsed.service ?? runCfg.wallySync.targetService}.${parsed.targetName ?? runCfg.wallySync.targetName}`,
-          );
-          await this.applyWallyPackagesToStudio(parsed, runCfg);
-        });
-      },
-    );
+  public linkApply(options: {
+    silent?: boolean;
+    refreshExplorer?: boolean;
+    forceStudio?: boolean;
+    forceTargets?: boolean;
+    forceTargetPaths?: string[][];
+    taskName?: string;
+    linkId?: string;
+    skipStudio?: boolean;
+    expectedProjectRoot?: string;
+    expectedGeneration?: number;
+  } = {}): Promise<CliLinkApplyResult | undefined> {
+    return this.packageSyncController.linkApply(options);
   }
 
-  private wallySyncFailureMessage(result: CommandRunResult): string {
-    const detail = this.compactCommandOutput(result.output, 10, 1200);
-    const hint = this.wallySyncFailureHint(result.output);
-    const suffix = detail.length > 0 ? ` Details: ${detail}` : " Open the Renium output panel for details.";
-    return `Couldn't sync Wally packages.${hint ? ` ${hint}` : ""}${suffix}`;
+  public breakLink(
+    service: string,
+    pathSegments: string[],
+    options: { silent?: boolean; refreshExplorer?: boolean } = {},
+  ): Promise<void> {
+    return this.packageSyncController.breakLink(service, pathSegments, options);
   }
 
-  private wallySyncFailureHint(output: string): string {
-    const lower = output.toLowerCase();
-    if (lower.includes("failed to launch wally") || lower.includes("could not find command wally") || lower.includes("program not found")) {
-      return "Wally was not found. Install Wally or set renium.wallySync.wallyPath.";
-    }
-    if (lower.includes("failed to launch rojo") || lower.includes("could not find command rojo")) {
-      return "Rojo was not found. Install Rojo or set renium.wallySync.rojoPath.";
-    }
-    if (lower.includes("no wally manifest") || lower.includes("wally.toml")) {
-      return "Check that wally.toml exists at renium.projectRoot.";
-    }
-    if (lower.includes("no renium bytecode settings file") || lower.includes("run full sync once")) {
-      return "Pull from Studio once before syncing packages.";
-    }
-    if (lower.includes("aftman")) {
-      return "If you use Aftman shims, make sure the project has aftman.toml and the tool is trusted/installed.";
-    }
-    return "";
-  }
-
-  private compactCommandOutput(output: string, maxLines: number, maxChars: number): string {
-    const lines = output
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    const text = lines.slice(-maxLines).join(" | ");
-    if (text.length <= maxChars) {
-      return text;
-    }
-    return `...${text.slice(text.length - maxChars)}`;
-  }
-
-  private async ensureWallyManifest(cfg: SyncConfig): Promise<boolean> {
-    const manifestPath = path.join(cfg.projectRoot, "wally.toml");
-    if (fs.existsSync(manifestPath)) {
-      return true;
-    }
-
-    const create = "Create starter wally.toml";
-    const picked = await vscode.window.showWarningMessage(
-      "No wally.toml was found at the project root.",
-      create,
-      "Cancel",
-    );
-    if (picked !== create) {
-      vscode.window.showInformationMessage("Wally package sync cancelled because no wally.toml was found.");
-      return false;
-    }
-
-    if (!fs.existsSync(manifestPath)) {
-      fs.writeFileSync(manifestPath, this.starterWallyManifest(cfg.projectRoot), "utf8");
-      this.output.appendLine(`[renium] Wally packages: created ${manifestPath}`);
-    }
-    vscode.window.showInformationMessage("Created starter wally.toml. Add dependencies, then run Sync Wally Packages again.");
-    return false;
-  }
-
-  private starterWallyManifest(projectRoot: string): string {
-    const packageName = this.safeWallyPackageName(projectRoot);
-    return [
-      "[package]",
-      `name = "local/${packageName}"`,
-      'version = "0.1.0"',
-      'registry = "https://github.com/UpliftGames/wally-index"',
-      'realm = "shared"',
-      "",
-      "[dependencies]",
-      "",
-    ].join("\n");
-  }
-
-  private safeWallyPackageName(projectRoot: string): string {
-    const base = path.basename(projectRoot).toLowerCase()
-      .replace(/[^a-z0-9-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    return base || "project";
-  }
-
-  private async applyWallyPackagesToStudio(result: CliSyncWallyPackagesResult, cfg: SyncConfig): Promise<void> {
-    const mode = cfg.wallySync.applyToStudio;
-
-    const settingsFiles: string[] = [];
-    const sourceWritePaths: string[] = [];
-    const removedTargets: CliWallyRemovedTarget[] = [];
-    const collect = (
-      settingsFile: string | undefined,
-      sourceWrites: CliWallySourceWrite[] | undefined,
-      removed: CliWallyRemovedTarget | null | undefined,
-    ): void => {
-      if (typeof settingsFile === "string" && settingsFile.length > 0) {
-        settingsFiles.push(settingsFile);
-      }
-      for (const write of sourceWrites ?? []) {
-        if (typeof write.path === "string" && write.path.length > 0) {
-          sourceWritePaths.push(write.path);
-        }
-      }
-      const valid = this.validWallyRemovedTarget(removed);
-      if (valid) {
-        removedTargets.push(valid);
-      }
-    };
-
-    const realms = (Array.isArray(result.realms) ? result.realms : []).filter((realm) => realm && realm.skipped !== true);
-    let summaryTarget: string;
-    if (realms.length > 0) {
-      for (const realm of realms) {
-        collect(realm.settingsFile, realm.sourceWrites, realm.removedTarget);
-      }
-      summaryTarget = realms.map((realm) => `${realm.service}/${realm.targetName}`).join(", ");
-    } else {
-      collect(result.settingsFile, result.sourceWrites, result.removedTarget);
-      summaryTarget = `${result.service ?? cfg.wallySync.targetService}/${result.targetName ?? cfg.wallySync.targetName}`;
-    }
-
-    const extraChanged = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    const changedPaths = Array.from(new Set([...settingsFiles, ...sourceWritePaths, ...extraChanged]));
-
-    if (mode === "never" || (changedPaths.length === 0 && removedTargets.length === 0)) {
-      vscode.window.showInformationMessage(`Synced Wally packages to ${summaryTarget}.`);
-      return;
-    }
-
-    let shouldApply = mode === "always";
-    if (mode === "ask") {
-      const apply = "Apply to Studio";
-      const picked = await vscode.window.showInformationMessage(
-        `Synced Wally packages to ${summaryTarget}.`,
-        apply,
-        "Not now",
-      );
-      shouldApply = picked === apply;
-    }
-    if (!shouldApply) {
-      return;
-    }
-    if (!this.canUseStudioPushPipeline()) {
-      this.noteStudioPushSkipped("serve/live sync is not active");
-      vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
-      return;
-    }
-
-    try {
-      for (const removed of removedTargets) {
-        await this.pushEditorDeleteNow({
-          force: true,
-          service: removed.pathSegments?.[0] ?? "",
-          settingsId: removed.settingsId,
-          className: removed.className,
-          pathSegments: removed.pathSegments,
-          pathOrdinals: removed.pathOrdinals,
-        });
-      }
-      if (changedPaths.length > 0) {
-        const idSource = Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : result.settingsIds;
-        const targetSettingsIds = Array.isArray(idSource)
-          ? idSource.map((value) => String(value).trim()).filter((value) => value.length > 0)
-          : [];
-        const pushed = await this.pushEditorPathsNow(changedPaths, {
-          force: true,
-          skipChangeFilter: true,
-          taskName: "Wally packages -> Studio",
-          targetSettingsIds,
-        });
-        if (!pushed) {
-          vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
-          return;
-        }
-      }
-      vscode.window.showInformationMessage(`Applied Wally packages to Studio (${summaryTarget}).`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(`[renium] Wally packages Studio apply failed: ${message}`);
-      this.output.show(true);
-      vscode.window.showWarningMessage(`Wally packages synced locally, but Studio apply failed. ${message}`);
-    }
-  }
-
-  private validWallyRemovedTarget(target: CliWallyRemovedTarget | null | undefined): CliWallyRemovedTarget | undefined {
-    if (!target || typeof target !== "object") {
-      return undefined;
-    }
-    const settingsId = typeof target.settingsId === "string" ? target.settingsId.trim() : "";
-    const className = typeof target.className === "string" ? target.className.trim() : "";
-    const pathSegments = Array.isArray(target.pathSegments)
-      ? target.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
-      : [];
-    const pathOrdinals = Array.isArray(target.pathOrdinals)
-      ? target.pathOrdinals.map((ordinal) => Number(ordinal)).filter((ordinal) => Number.isInteger(ordinal) && ordinal > 0)
-      : [];
-    if (!settingsId || !className || pathSegments.length <= 1) {
-      return undefined;
-    }
-    return { settingsId, className, pathSegments, pathOrdinals };
-  }
-
-  private linkManifestPath(cfg: SyncConfig): string {
-    return path.isAbsolute(cfg.linkSync.manifest)
-      ? cfg.linkSync.manifest
-      : path.join(cfg.projectRoot, cfg.linkSync.manifest);
-  }
-
-
-  public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean; expectedProjectRoot?: string; expectedGeneration?: number } = {}): Promise<CliLinkApplyResult | undefined> {
-    let result: CliLinkApplyResult | undefined;
-    let executed = false;
-    await this.enqueue("Apply packages", async () => {
-      const cfg = this.getConfig();
-      if (
-        (options.expectedGeneration !== undefined && options.expectedGeneration !== this.experienceGeneration)
-        || (
-          options.expectedProjectRoot
-          && this.normalizePathForCompare(options.expectedProjectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
-        )
-      ) {
-        throw new Error("The active project changed before package apply.");
-      }
-      executed = true;
-      const manifestPath = this.linkManifestPath(cfg);
-      if (!fs.existsSync(manifestPath)) {
-        if (!options.silent) {
-          vscode.window.showInformationMessage(
-            `No link manifest found at ${manifestPath}. Use "Add Link" first.`,
-          );
-        }
-        return;
-      }
-      const command = this.resolveRustCliPathForCommand(cfg, "link-apply");
-      this.ensureFileExists(command);
-      const args = [
-        "link-apply",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-        "--git-path",
-        cfg.linkSync.gitPath,
-        "--wally-path",
-        cfg.linkSync.wallyPath,
-      ];
-      if (cfg.linkSync.offline) {
-        args.push("--offline");
-      }
-      const linkId = typeof options.linkId === "string" ? options.linkId.trim() : "";
-      if (linkId.length > 0) {
-        args.push("--link", linkId);
-      }
-      if (cfg.linkSync.cacheDir.length > 0) {
-        args.push("--cache-dir", cfg.linkSync.cacheDir);
-      }
-      if (options.forceTargets === true || options.forceStudio === true) {
-        args.push("--force-targets");
-      }
-      for (const targetPath of options.forceTargetPaths ?? []) {
-        if (Array.isArray(targetPath) && targetPath.length > 0) {
-          args.push("--force-target", JSON.stringify(targetPath));
-        }
-      }
-      const run = await this.runCommand(command, args, cfg.projectRoot, "link-apply", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't apply packages. Check the Renium output panel for details.");
-      }
-      const parsed = this.parseCliJsonObject<CliLinkApplyResult>(run.output);
-      if (!parsed || parsed.ok === false) {
-        throw new Error("Applying packages didn't finish. Check the Renium output panel for details.");
-      }
-      result = parsed;
-      for (const warning of Array.isArray(parsed.warnings) ? parsed.warnings : []) {
-        this.output.appendLine(`[renium] link warning: ${warning}`);
-      }
-      const applied = parsed.appliedTargets ?? 0;
-      if (!options.silent) {
-        const warnCount = Array.isArray(parsed.warnings) ? parsed.warnings.length : 0;
-        vscode.window.showInformationMessage(
-          `Applied ${applied} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
-        );
-      }
-    });
-    if ((options.expectedProjectRoot || options.expectedGeneration !== undefined) && !executed) {
-      throw new Error("Package apply was cancelled before it started.");
-    }
-    this.invalidateLinkStatusCache();
-    const forceStudioAllowed = options.forceStudio === true && this.canUseStudioPushPipeline();
-    if (options.forceStudio === true && !forceStudioAllowed) {
-      this.noteStudioPushSkipped("serve/live sync is not active");
-    }
-    if (result && options.skipStudio !== true && (forceStudioAllowed || (this.isEditorLiveSyncActive() && this.getConfig().linkSync.applyToStudio !== "never"))) {
-      const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
-        .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-      if (changedPaths.length > 0) {
-        this.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
-        if (forceStudioAllowed) {
-          const targetSettingsIds = (Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : [])
-            .map((value) => String(value).trim())
-            .filter((value) => value.length > 0);
-          await this.pushEditorPathsNow(changedPaths, {
-            force: true,
-            skipChangeFilter: true,
-            taskName: options.taskName ?? "Link -> Studio",
-            targetSettingsIds,
-          });
-        } else {
-          await this.applyLinksToStudio(result, { silent: options.silent === true });
-        }
-      }
-    }
-    if (options.refreshExplorer !== false) {
-      await this.refreshFileExplorerSafe();
-    }
-    return result;
-  }
-
-  private async applyLinksToStudio(result: CliLinkApplyResult, options: { silent?: boolean } = {}): Promise<void> {
-    const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    if (changedPaths.length === 0) {
-      return;
-    }
-    const mode = this.getConfig().linkSync.applyToStudio;
-    if (mode === "never") {
-      return;
-    }
-    if (mode === "ask") {
-      const apply = "Apply links to Studio";
-      const picked = await vscode.window.showWarningMessage(
-        "Apply the new package content to Studio now?",
-        { modal: true },
-        apply,
-      );
-      if (picked !== apply) {
-        return;
-      }
-    }
-    try {
-      const targetSettingsIds = (Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : [])
-        .map((value) => String(value).trim())
-        .filter((value) => value.length > 0);
-      await this.pushEditorPathsNow(changedPaths, {
-        force: true,
-        skipChangeFilter: true,
-        taskName: "Link -> Studio",
-        targetSettingsIds,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(`[renium] link Studio push failed: ${message}`);
-      if (!options.silent) {
-        vscode.window.showWarningMessage(`Link applied to the project files, but the Studio push failed. ${message}`);
-      }
-    }
-  }
-
-
-  public async breakLink(service: string, pathSegments: string[], options: { silent?: boolean; refreshExplorer?: boolean } = {}): Promise<void> {
-    await this.enqueue("Break link", async () => {
-      const cfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(cfg, "link-break");
-      this.ensureFileExists(command);
-      const args = [
-        "link-break",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      if (cfg.linkSync.cacheDir.length > 0) {
-        args.push("--cache-dir", cfg.linkSync.cacheDir);
-      }
-      const run = await this.runCommand(command, args, cfg.projectRoot, "link-break", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        const detail = run.output.trim();
-        throw new Error(
-          detail.length > 0
-            ? `renium-link break failed (exit ${run.code}). ${detail}`
-            : `renium-link break failed (exit ${run.code}). Open the Renium output panel for details.`,
-        );
-      }
-    });
-    this.invalidateLinkStatusCache();
-    if (options.refreshExplorer !== false) {
-      await this.refreshFileExplorerSafe();
-    }
-    if (!options.silent) {
-      vscode.window.showInformationMessage(`Broke link on ${service}.${pathSegments[pathSegments.length - 1] ?? ""}. It is now editable.`);
-    }
-  }
-
-
-  public async addLinkInteractive(seed?: { service?: string; pathSegments?: string[] }): Promise<void> {
-    const cfg = this.getConfig();
-    const sourceType = await vscode.window.showQuickPick(
-      [
-        { label: "Local path", value: "local", description: "A file or folder inside this project" },
-        { label: "Git repository", value: "git", description: "Public or private git repo (uses your git credentials)" },
-        { label: "Wally package", value: "wally", description: "A package installed via wally install" },
-      ],
-      { title: "Renium Link: source type", placeHolder: "Where does the controlled source live?" },
-    );
-    if (!sourceType) {
-      return;
-    }
-    let source: string | undefined;
-    if (sourceType.value === "local") {
-      const picked = await vscode.window.showOpenDialog({
-        title: "Renium Link: choose the source file or folder to control",
-        canSelectFiles: true,
-        canSelectFolders: true,
-        canSelectMany: false,
-        defaultUri: vscode.Uri.file(cfg.projectRoot),
-        openLabel: "Use as link source",
-      });
-      if (!picked || picked.length === 0) {
-        return;
-      }
-      const abs = picked[0].fsPath;
-      source = this.isPathInside(abs, cfg.projectRoot)
-        ? path.relative(cfg.projectRoot, abs).split(path.sep).join("/")
-        : abs;
-    } else {
-      const sourcePrompt = sourceType.value === "git"
-        ? "Git repository URL (https://... or git@...)"
-        : "Wally package (scope/name)";
-      source = await vscode.window.showInputBox({ title: "Renium Link: source", prompt: sourcePrompt, ignoreFocusOut: true });
-    }
-    if (!source) {
-      return;
-    }
-    let sourceRef: string | undefined;
-    let subpath: string | undefined;
-    if (sourceType.value === "git") {
-      sourceRef = await vscode.window.showInputBox({ title: "Renium Link: git ref", prompt: "Branch, tag, or commit (blank = default branch)", ignoreFocusOut: true });
-      subpath = await vscode.window.showInputBox({ title: "Renium Link: subpath", prompt: "Path within the repo (blank = repo root)", ignoreFocusOut: true });
-    } else if (sourceType.value === "wally") {
-      sourceRef = await vscode.window.showInputBox({ title: "Renium Link: version", prompt: "Version requirement (e.g. ^4.0.0, blank = installed)", ignoreFocusOut: true });
-    }
-
-    const service = seed?.service ?? await vscode.window.showQuickPick(cfg.services, { title: "Renium Link: target service", placeHolder: "First target service" });
-    if (!service) {
-      return;
-    }
-    let pathSegments = seed?.pathSegments;
-    if (!pathSegments) {
-      const raw = await vscode.window.showInputBox({
-        title: "Renium Link: target path",
-        prompt: `Instance path under ${service}, dot-separated (e.g. ${service}.Modules.Logger)`,
-        value: `${service}.`,
-        ignoreFocusOut: true,
-      });
-      if (!raw) {
-        return;
-      }
-      pathSegments = raw.split(".").map((segment) => segment.trim()).filter((segment) => segment.length > 0);
-    }
-    if (!pathSegments || pathSegments.length === 0) {
-      return;
-    }
-
-    await this.enqueue("Add link", async () => {
-      const command = this.resolveRustCliPathForCommand(cfg, "link-add");
-      this.ensureFileExists(command);
-      const args = [
-        "link-add",
-        "-r",
-        cfg.projectRoot,
-        "--manifest",
-        cfg.linkSync.manifest,
-        "--source-type",
-        sourceType.value,
-        "--source",
-        source,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      if (sourceRef && sourceRef.length > 0) {
-        args.push("--ref", sourceRef);
-      }
-      if (subpath && subpath.length > 0) {
-        args.push("--subpath", subpath);
-      }
-      const run = await this.runCommand(command, args, cfg.projectRoot, "link-add", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't add the link. Check the Renium output panel for details.");
-      }
-    });
-    const syncNow = await vscode.window.showInformationMessage("Link added. Apply it now?", "Sync now", "Later");
-    if (syncNow === "Sync now") {
-      await this.linkApply();
-    } else {
-      this.invalidateLinkStatusCache();
-      await this.refreshFileExplorerSafe();
-    }
+  public addLinkInteractive(seed?: { service?: string; pathSegments?: string[] }): Promise<void> {
+    return this.packageSyncController.addLinkInteractive(seed);
   }
 
   public invalidateLinkStatusCache(): void {
-    this.linkStatusToken += 1;
-    this.linkStatusCache = undefined;
-    this.linkStatusInflight = undefined;
-    this.linkChangeEmitter.fire();
+    this.packageSyncController.invalidateLinkStatusCache();
   }
 
-
-
-  public async pushLinkStateToExplorer(): Promise<void> {
-    const keys: Record<string, string> = {};
-    try {
-      const status = await this.getLinkStatus(true);
-      for (const target of status?.targets ?? []) {
-        if (target.missing === true || target.resolved === false) {
-          continue;
-        }
-        if (typeof target.pathKey === "string" && target.pathKey.length > 0) {
-          keys[target.pathKey] = target.broken ? "broken" : "linked";
-        }
-      }
-    } catch {
-    }
-    try {
-      await vscode.commands.executeCommand("renium.fileExplorer.setLinkState", keys);
-    } catch {
-    }
+  public pushLinkStateToExplorer(): Promise<void> {
+    return this.packageSyncController.pushLinkStateToExplorer();
   }
 
-  public normalizeLinkPathKey(fsPath: string): string {
-    const stripped = String(fsPath || "").replace(/^[\\/]{2}\?[\\/]/, "");
-    const normalized = path.resolve(stripped).replace(/\\/g, "/");
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  }
-
-
-  private globalPackagesDir(): string {
-    const custom = (process.env.RENIUM_GLOBAL_PACKAGES_DIR ?? "").trim();
-    if (custom) {
-      return path.normalize(custom);
-    }
-    const home = process.env.USERPROFILE || process.env.HOME || "";
-    return path.normalize(path.join(home, "Documents", "Renium", "Packages"));
-  }
-
-
-  private linkPackageFolderPath(cfg: SyncConfig): string {
-    const folder = cfg.linkSync.folder || "links";
-    return path.isAbsolute(folder)
-      ? path.normalize(folder)
-      : path.normalize(path.join(cfg.projectRoot, folder));
-  }
-
-
-  private isManagedPackagePath(cfg: SyncConfig, candidate: string): boolean {
-    return this.isPathInside(candidate, this.linkPackageFolderPath(cfg))
-      || this.isPathInside(candidate, this.globalPackagesDir());
-  }
-
-  private absoluteLinkSourcePath(cfg: SyncConfig, sourcePath: string | undefined): string | undefined {
-    const trimmed = String(sourcePath ?? "").trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const normalized = trimmed.replace(/\\/g, "/");
-    if (normalized.startsWith("~global/")) {
-      return path.normalize(path.join(this.globalPackagesDir(), normalized.slice("~global/".length)));
-    }
-    return path.isAbsolute(trimmed) ? path.normalize(trimmed) : path.normalize(path.join(cfg.projectRoot, trimmed));
+  public normalizeLinkPathKey(filePath: string): string {
+    return this.packageSyncController.normalizeLinkPathKey(filePath);
   }
 
   public onLinkPackageSourceChanged(uri: vscode.Uri): void {
-    if (this.experienceChangeInProgress || uri.scheme !== "file") {
-      return;
-    }
-    const cfg = this.getConfig();
-    const ext = path.extname(uri.fsPath).toLowerCase();
-    if (
-      (ext !== ".rbsync" && ext !== ".renium")
-      || !this.activeLinkPackageSourceKeys.has(this.normalizePathForCompare(uri.fsPath))
-    ) {
-      return;
-    }
-    const generation = this.experienceGeneration;
-    this.pendingLinkPackageSourcePaths.set(path.normalize(uri.fsPath), {
-      projectRoot: cfg.projectRoot,
-      generation,
-    });
-    this.scheduleLinkPackageSourceFlush(cfg.projectRoot, generation);
+    this.packageSyncController.onLinkPackageSourceChanged(uri);
   }
 
-  public async refreshLinkPackageSourceWatchers(): Promise<void> {
-    const cfg = this.getConfig();
-    const generation = this.experienceGeneration;
-    const resolution = await this.resolveLinkStatus(cfg);
-    if (resolution.kind === "failed") {
-      throw new Error(resolution.error);
-    }
-    if (generation !== this.experienceGeneration) {
-      return;
-    }
-    const links = resolution.kind === "success" ? resolution.value.links ?? [] : [];
-    const sources = Array.from(new Set(links
-      .map((link) => this.absoluteLinkSourcePath(cfg, link.sourcePath))
-      .filter((sourcePath): sourcePath is string =>
-        typeof sourcePath === "string" && /\.(rbsync|renium)$/i.test(sourcePath))
-      .map(path.normalize)));
-    for (const watcher of this.linkPackageSourceWatchers) {
-      watcher.dispose();
-    }
-    this.linkPackageSourceWatchers = [];
-    this.activeLinkPackageSourceKeys.clear();
-    for (const sourcePath of sources) {
-      this.activeLinkPackageSourceKeys.add(this.normalizePathForCompare(sourcePath));
-      const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(path.dirname(sourcePath), path.basename(sourcePath)),
-      );
-      watcher.onDidCreate((uri) => this.onLinkPackageSourceChanged(uri));
-      watcher.onDidChange((uri) => this.onLinkPackageSourceChanged(uri));
-      watcher.onDidDelete((uri) => this.onLinkPackageSourceChanged(uri));
-      this.linkPackageSourceWatchers.push(watcher);
-    }
-  }
-
-  private scheduleLinkPackageSourceFlush(projectRoot: string, generation: number, delayMs = 500): void {
-    if (this.linkPackageSourceApplyTimer) {
-      clearTimeout(this.linkPackageSourceApplyTimer);
-    }
-    this.linkPackageSourceApplyTimer = setTimeout(() => {
-      this.linkPackageSourceApplyTimer = undefined;
-      void this.flushLinkPackageSourceChanges(projectRoot, generation).catch((error) => {
-        this.output.appendLine(`[renium] package source auto-apply failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }, delayMs);
-  }
-
-  private async flushLinkPackageSourceChanges(projectRoot: string, generation: number): Promise<void> {
-    if (generation !== this.experienceGeneration || this.experienceChangeInProgress) {
-      return;
-    }
-    const cfg = this.getConfig();
-    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
-      return;
-    }
-    const changedPaths = [...this.pendingLinkPackageSourcePaths]
-      .filter(([, pending]) =>
-        pending.generation === generation
-        && this.normalizePathForCompare(pending.projectRoot) === this.normalizePathForCompare(projectRoot))
-      .map(([filePath]) => filePath);
-    if (changedPaths.length === 0) {
-      return;
-    }
-    const changedKeys = new Set(changedPaths.map((filePath) => this.normalizePathForCompare(filePath)));
-    this.invalidateLinkStatusCache();
-    const resolution = await this.resolveLinkStatus(cfg);
-    if (resolution.kind === "failed") {
-      this.scheduleLinkPackageSourceFlush(projectRoot, generation, 1000);
-      throw new Error(resolution.error);
-    }
-    const links = resolution.kind === "success" ? resolution.value.links ?? [] : [];
-    const linkIdsByPath = new Map<string, Set<string>>();
-    for (const link of links) {
-      const id = typeof link.id === "string" ? link.id.trim() : "";
-      const sourcePath = this.absoluteLinkSourcePath(cfg, link.sourcePath);
-      if (!id || !sourcePath || !changedKeys.has(this.normalizePathForCompare(sourcePath))) {
-        continue;
-      }
-      if (link.isPackage !== true && !/\.(rbsync|renium)$/i.test(sourcePath)) {
-        continue;
-      }
-      if (Number(link.targetCount ?? 0) <= 0) {
-        continue;
-      }
-      const key = this.normalizePathForCompare(sourcePath);
-      const ids = linkIdsByPath.get(key) ?? new Set<string>();
-      ids.add(id);
-      linkIdsByPath.set(key, ids);
-    }
-    let appliedAny = false;
-    let failed = false;
-    const linkIds = new Set(Array.from(linkIdsByPath.values()).flatMap((ids) => [...ids]));
-    this.output.appendLine(`[renium] package source changed: applying ${linkIds.size} active link package(s).`);
-    for (const changedPath of changedPaths) {
-      const ids = linkIdsByPath.get(this.normalizePathForCompare(changedPath)) ?? new Set<string>();
-      try {
-        for (const linkId of ids) {
-          await this.linkApply({
-            silent: true,
-            refreshExplorer: false,
-            linkId,
-            skipStudio: true,
-            expectedProjectRoot: projectRoot,
-            expectedGeneration: generation,
-          });
-          appliedAny = true;
-        }
-        this.pendingLinkPackageSourcePaths.delete(changedPath);
-      } catch (error) {
-        failed = true;
-        this.output.appendLine(
-          `[renium] package source apply retained for retry: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    if (appliedAny) {
-      await this.refreshFileExplorerSafe();
-    }
-    if (failed) {
-      this.scheduleLinkPackageSourceFlush(projectRoot, generation, 1000);
-    }
+  public refreshLinkPackageSourceWatchers(): Promise<void> {
+    return this.packageSyncController.refreshLinkPackageSourceWatchers();
   }
 
   public scheduleStartupLinkRefresh(): void {
-    setTimeout(() => {
-      void this.linkApply({
-        silent: true,
-        skipStudio: true,
-      }).catch((error) => {
-        this.output.appendLine(`[renium] startup link refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }, 750);
+    this.packageSyncController.scheduleStartupLinkRefresh();
   }
 
-
-  public async getLinkFileIndex(force = false): Promise<Map<string, LinkFileInfo>> {
-    const status = await this.getLinkStatus(force);
-    const index = new Map<string, LinkFileInfo>();
-    for (const target of status?.targets ?? []) {
-      const base: LinkFileInfo = {
-        linkId: target.linkId ?? "",
-        service: target.service ?? "",
-        pathSegments: Array.isArray(target.path) ? target.path : [],
-        readOnly: target.readOnly !== false,
-        broken: target.broken === true,
-        drift: target.drift === true,
-      };
-      for (const mirror of target.mirrors ?? []) {
-        if (typeof mirror.path === "string" && mirror.path.length > 0) {
-          index.set(this.normalizeLinkPathKey(mirror.path), {
-            ...base,
-            canonical: typeof mirror.canonical === "string" ? mirror.canonical : undefined,
-            drift: mirror.drift === true || base.drift,
-          });
-        }
-      }
-    }
-    return index;
-  }
-
-  private async linkInfoForFile(uri: vscode.Uri): Promise<LinkFileInfo | undefined> {
-    const index = await this.getLinkFileIndex();
-    return index.get(this.normalizeLinkPathKey(uri.fsPath));
-  }
-
-  private linkTargetFromFile(uri: vscode.Uri): { service: string; pathSegments: string[] } | undefined {
-    const cfg = this.getConfig();
-    const srcRoot = this.sourceRoot(cfg);
-    if (!this.isPathInside(uri.fsPath, srcRoot)) {
-      return undefined;
-    }
-    const parts = path.relative(srcRoot, uri.fsPath).split(path.sep).filter((segment) => segment.length > 0);
-    if (parts.length < 2) {
-      return undefined;
-    }
-    const service = parts[0];
-    const fileName = parts[parts.length - 1];
-    const identity = inferProjectScriptIdentity(cfg.projectRoot, fileName);
-    if (!identity) {
-      return undefined;
-    }
-    if (identity.leafName === undefined) {
-      const segments = parts.slice(0, parts.length - 1);
-      return segments.length >= 2 ? { service, pathSegments: segments } : undefined;
-    }
-    return {
-      service,
-      pathSegments: [...parts.slice(0, parts.length - 1), identity.leafName],
-    };
-  }
-
-
-  public async addLinkFromFile(uri: vscode.Uri | undefined): Promise<void> {
-    const cfg = this.getConfig();
-    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-    if (!target) {
-      vscode.window.showInformationMessage(`Right-click a script under ${cfg.srcDir}/ to link it.`);
-      return;
-    }
-    const seed = this.linkTargetFromFile(target);
-    if (!seed) {
-      vscode.window.showInformationMessage(`That file is not a script under ${cfg.srcDir}/.`);
-      return;
-    }
-    await this.addLinkInteractive(seed);
-  }
-
-
-  public async packInstanceLink(request: { service?: string; pathSegments?: string[]; id?: string; resave?: boolean }): Promise<void> {
-    const service = typeof request?.service === "string" ? request.service : "";
-    const pathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
-      : [];
-    const requestedLinkId = typeof request?.id === "string" ? request.id.trim() : "";
-    const resave = request?.resave === true;
-    if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Select an instance to link.");
-      return;
-    }
-
-    let packed: { id?: string; source?: string } | undefined;
-    await this.enqueue("Create package", async () => {
-      const cfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(cfg, "link-pack");
-      this.ensureFileExists(command);
-      const args = [
-        "link-pack",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      if (cfg.linkSync.folder) {
-        args.push("--link-folder", cfg.linkSync.folder);
-      }
-      if (requestedLinkId.length > 0) {
-        args.push("--id", requestedLinkId);
-      }
-      const run = await this.runCommand(command, args, cfg.projectRoot, "link-pack", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't save the package. Check the Renium output panel for details.");
-      }
-      packed = this.parseCliJsonObject<{ id?: string; source?: string }>(run.output) ?? undefined;
-    });
-    this.invalidateLinkStatusCache();
-
-    const leaf = pathSegments[pathSegments.length - 1];
-    if (!resave && packed?.id && packed?.source) {
-      const add = await vscode.window.showInformationMessage(
-        `Packaged ${leaf}. Mirror it to another location (read-only copy)?`,
-        "Add mirror",
-        "Not now",
-      );
-      if (add === "Add mirror") {
-        await this.addPackageMirror(packed.id, packed.source);
-      }
-    }
-    await this.linkApply({ silent: true, linkId: packed?.id ?? requestedLinkId, skipStudio: true });
-    await this.refreshFileExplorerSafe();
-    vscode.window.showInformationMessage(resave
-      ? `Saved new version of ${packed?.id ?? requestedLinkId}.`
-      : `Linked ${leaf}.`);
-  }
-
-  public async resavePackageLink(request: { service?: string; pathSegments?: string[] }): Promise<void> {
-    const service = typeof request?.service === "string" ? request.service.trim() : "";
-    const pathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
-      : [];
-    if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Select a linked package root to resave.");
-      return;
-    }
-    const targetPath = this.normalizeLinkTargetSegments(service, pathSegments);
-    const status = await this.getLinkStatus(true);
-    const target = (status?.targets ?? []).find((candidate) =>
-      candidate.missing !== true &&
-      candidate.resolved !== false &&
-      String(candidate.service ?? "") === service &&
-      this.samePathSegments(
-        this.normalizeLinkTargetSegments(service, Array.isArray(candidate.path) ? candidate.path : []),
-        targetPath,
-      )
-    );
-    const linkId = typeof target?.linkId === "string" ? target.linkId.trim() : "";
-    if (!linkId) {
-      vscode.window.showWarningMessage("Selected instance is not a package link target.");
-      return;
-    }
-    const link = (await this.getLinkPackages(true)).find((candidate) => candidate.id === linkId);
-    if (!link || link.sourceKind !== "local" || !link.sourcePath) {
-      vscode.window.showWarningMessage(`${linkId} is not a local Renium package, so it cannot be resaved from Explorer.`);
-      return;
-    }
-    const cfg = this.getConfig();
-    const sourcePath = this.absoluteLinkSourcePath(cfg, link.sourcePath);
-    if (!sourcePath || !this.isManagedPackagePath(cfg, sourcePath) || !/\.(rbsync|renium)$/i.test(sourcePath)) {
-      vscode.window.showWarningMessage(`${linkId} is not stored in a Renium packages folder.`);
-      return;
-    }
-    const label = this.linkTargetDisplay(service, pathSegments);
-    const relinkNote = target?.broken === true ? " This will relink the broken target." : "";
-    const picked = await vscode.window.showWarningMessage(
-      `Overwrite package ${linkId} with the current ${label} tree? Active uses will update from this new version.${relinkNote}`,
-      { modal: true },
-      "Save New Version",
-    );
-    if (picked !== "Save New Version") {
-      return;
-    }
-    await this.packInstanceLink({
-      service,
-      pathSegments,
-      id: linkId,
-      resave: true,
-    });
-  }
-
-  public async relinkPackageTarget(request: { service?: string; pathSegments?: string[] }): Promise<void> {
-    const service = typeof request?.service === "string" ? request.service.trim() : "";
-    const pathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
-      : [];
-    if (!service || pathSegments.length === 0) {
-      vscode.window.showWarningMessage("Select a broken package root to relink.");
-      return;
-    }
-    const targetPath = this.normalizeLinkTargetSegments(service, pathSegments);
-    const status = await this.getLinkStatus(true);
-    const target = (status?.targets ?? []).find((candidate) =>
-      String(candidate.service ?? "") === service &&
-      this.samePathSegments(
-        this.normalizeLinkTargetSegments(service, Array.isArray(candidate.path) ? candidate.path : []),
-        targetPath,
-      )
-    );
-    const linkId = typeof target?.linkId === "string" ? target.linkId.trim() : "";
-    if (!linkId) {
-      vscode.window.showWarningMessage("Selected instance is not a package link target.");
-      return;
-    }
-    if (target?.broken !== true) {
-      vscode.window.showInformationMessage(`${this.linkTargetDisplay(service, pathSegments)} is already linked.`);
-      return;
-    }
-    const picked = await vscode.window.showWarningMessage(
-      `Relink ${this.linkTargetDisplay(service, pathSegments)} from package ${linkId}? Local edits in this broken copy will be replaced by the saved package.`,
-      { modal: true },
-      "Relink Package",
-    );
-    if (picked !== "Relink Package") {
-      return;
-    }
-    await this.enqueue("Relink package", async () => {
-      const runCfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(runCfg, "link-add");
-      this.ensureFileExists(command);
-      const args = [
-        "link-add",
-        "-r",
-        runCfg.projectRoot,
-        "--manifest",
-        runCfg.linkSync.manifest,
-        "--id",
-        linkId,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      const run = await this.runCommand(command, args, runCfg.projectRoot, "link-add", runCfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't relink the package. Check the Renium output panel for details.");
-      }
-    });
-    this.invalidateLinkStatusCache();
-    await this.linkApply({ silent: true, linkId, skipStudio: true });
-    await this.refreshFileExplorerSafe();
-    vscode.window.showInformationMessage(`Relinked ${this.linkTargetDisplay(service, pathSegments)}.`);
-  }
-
-  private async addPackageMirror(linkId: string, source: string): Promise<void> {
-    const cfg = this.getConfig();
-    const service = await vscode.window.showQuickPick(cfg.services, {
-      title: "Renium Link: mirror target service",
-      placeHolder: "Service to receive the read-only copy",
-    });
-    if (!service) {
-      return;
-    }
-    const raw = await vscode.window.showInputBox({
-      title: "Renium Link: mirror target path",
-      prompt: `Instance path under ${service}, dot-separated (e.g. ${service}.Shared.Widget)`,
-      value: `${service}.`,
-      ignoreFocusOut: true,
-    });
-    if (!raw) {
-      return;
-    }
-    const pathSegments = raw.split(".").map((segment) => segment.trim()).filter((segment) => segment.length > 0);
-    if (pathSegments.length === 0) {
-      return;
-    }
-    await this.enqueue("Add link mirror", async () => {
-      const runCfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(runCfg, "link-add");
-      this.ensureFileExists(command);
-      const args = [
-        "link-add",
-        "-r",
-        runCfg.projectRoot,
-        "--manifest",
-        runCfg.linkSync.manifest,
-        "--id",
-        linkId,
-        "--source-type",
-        "local",
-        "--source",
-        source,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      const run = await this.runCommand(command, args, runCfg.projectRoot, "link-add", runCfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't add the mirror. Check the Renium output panel for details.");
-      }
-    });
-  }
-
-  public async breakInstanceLink(request: { service?: string; pathSegments?: string[]; silent?: boolean; refreshExplorer?: boolean }): Promise<void> {
-    const service = typeof request?.service === "string" ? request.service : "";
-    const pathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
-      : [];
-    if (!service || pathSegments.length === 0) {
-      return;
-    }
-    await this.breakLink(service, pathSegments, {
-      silent: request.silent === true,
-      refreshExplorer: request.refreshExplorer,
-    });
-  }
-
-  public async breakLinkForFile(uri: vscode.Uri | undefined): Promise<void> {
-    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-    if (!target) {
-      vscode.window.showInformationMessage("Open or select a linked file first.");
-      return;
-    }
-    const info = await this.linkInfoForFile(target);
-    if (!info || info.broken) {
-      vscode.window.showInformationMessage("That file is not a read-only link target.");
-      return;
-    }
-    const confirm = await vscode.window.showWarningMessage(
-      `Break the link on ${info.service}.${info.pathSegments[info.pathSegments.length - 1] ?? ""}? It will become an ordinary editable script.`,
-      { modal: true },
-      "Break link",
-    );
-    if (confirm !== "Break link") {
-      return;
-    }
-    await this.breakLink(info.service, info.pathSegments);
-  }
-
-  public async revealLinkSourceForFile(uri: vscode.Uri | undefined): Promise<void> {
-    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-    if (!target) {
-      return;
-    }
-    const info = await this.linkInfoForFile(target);
-    if (!info || !info.canonical) {
-      vscode.window.showInformationMessage("No link source is available for that file.");
-      return;
-    }
-    try {
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(info.canonical));
-      await vscode.window.showTextDocument(doc, { preview: true });
-    } catch (err) {
-      vscode.window.showWarningMessage(`Could not open link source. ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  public async showLinkStatus(): Promise<void> {
-    const status = await this.getLinkStatus(true);
-    if (!status || status.manifestExists === false) {
-      vscode.window.showInformationMessage('No links exist yet. Use "Add Link" to create one.');
-      return;
-    }
-    const targets = Array.isArray(status.targets) ? status.targets : [];
-    this.output.appendLine(
-      `[renium] link-status: ${status.linkCount ?? 0} link(s), ${targets.length} target(s), ${status.driftedTargets ?? 0} drifted, ${status.brokenTargets ?? 0} broken.`,
-    );
-    for (const target of targets) {
-      const flags = [
-        target.broken ? "broken" : target.readOnly ? "read-only" : "writable",
-        target.drift ? "drifted" : undefined,
-        target.resolved === false ? `unresolved(${target.reason ?? "?"})` : undefined,
-      ].filter(Boolean).join(", ");
-      this.output.appendLine(`  ${target.service}.${(target.path ?? []).join(".")} [${target.linkId}] ${flags}`);
-    }
-    this.output.show(true);
-    vscode.window.showInformationMessage(
-      `Renium links: ${status.linkCount ?? 0} link(s), ${targets.length} target(s), ${status.driftedTargets ?? 0} drifted, ${status.brokenTargets ?? 0} broken.`,
-    );
-  }
-
-
-  public async getLinkPackages(force = false): Promise<CliLinkStatusLink[]> {
-    const status = await this.getLinkStatus(force);
-    const links = (Array.isArray(status?.links) ? status!.links! : [])
-      .filter((link) => link.isPackage === true || /\.(rbsync|renium)$/i.test(String(link.sourcePath ?? "")));
-    if (!Array.isArray(status?.targets)) {
-      return links;
-    }
-    const activeTargetCounts = new Map<string, number>();
-    for (const target of status.targets) {
-      const linkId = typeof target.linkId === "string" ? target.linkId : "";
-      if (!linkId || target.broken === true || target.missing === true || target.resolved === false) {
-        continue;
-      }
-      activeTargetCounts.set(linkId, (activeTargetCounts.get(linkId) ?? 0) + 1);
-    }
-    return links.map((link) => {
-      const id = typeof link.id === "string" ? link.id : "";
-      return { ...link, targetCount: activeTargetCounts.get(id) ?? 0 };
-    });
-  }
-
-  private normalizeLinkTargetSegments(service: string, pathSegments: string[]): string[] {
-    const segments = pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0);
-    return segments[0] === service ? segments.slice(1) : segments;
-  }
-
-  private linkTargetDisplay(service: string, pathSegments: string[]): string {
-    const normalized = this.normalizeLinkTargetSegments(service, pathSegments);
-    return normalized.length > 0 ? `${service}.${normalized.join(".")}` : service;
-  }
-
-  private samePathSegments(left: readonly string[], right: readonly string[]): boolean {
-    return left.length === right.length && left.every((segment, index) => segment === right[index]);
-  }
-
-  private async uniquePackageInsertPath(service: string, requestedPathSegments: string[]): Promise<string[]> {
-    const requested = this.normalizeLinkTargetSegments(service, requestedPathSegments);
-    if (requested.length === 0) {
-      return requestedPathSegments;
-    }
-    const parent = requested.slice(0, -1);
-    const base = requested[requested.length - 1].trim() || "Instance";
-    const existingNames = new Set<string>();
-    const status = await this.getLinkStatus();
-    for (const target of status?.targets ?? []) {
-      if (String(target.service ?? "") !== service || target.broken === true || target.missing === true) {
-        continue;
-      }
-      const targetPath = this.normalizeLinkTargetSegments(service, Array.isArray(target.path) ? target.path : []);
-      if (targetPath.length === 0 || !this.samePathSegments(targetPath.slice(0, -1), parent)) {
-        continue;
-      }
-      existingNames.add(targetPath[targetPath.length - 1]);
-    }
-    if (!existingNames.has(base)) {
-      return [service, ...parent, base];
-    }
-    let index = 2;
-    let candidate = `${base} Copy`;
-    while (existingNames.has(candidate)) {
-      candidate = `${base} Copy ${index}`;
-      index += 1;
-    }
-    return [service, ...parent, candidate];
-  }
-
-
-  public async insertPackageAtPath(request: { linkId?: string; service?: string; pathSegments?: string[] }): Promise<void> {
-    const linkId = typeof request?.linkId === "string" ? request.linkId.trim() : "";
-    const service = typeof request?.service === "string" ? request.service.trim() : "";
-    const requestedPathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
-      : [];
-    if (!linkId || !service || requestedPathSegments.length === 0) {
-      return;
-    }
-    const link = (await this.getLinkPackages()).find((candidate) => candidate.id === linkId);
-    const name = (link?.rootName && link.rootName.length > 0 ? link.rootName : linkId) ?? linkId;
-    const pathSegments = await this.uniquePackageInsertPath(service, requestedPathSegments);
-    const targetLabel = this.linkTargetDisplay(service, pathSegments);
-    logPackageDragDebug(`packages.insertAtPath: start link=${linkId} target=${targetLabel}`);
-    await this.enqueue("Insert link", async () => {
-      const runCfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(runCfg, "link-add");
-      this.ensureFileExists(command);
-      const args = [
-        "link-add",
-        "-r",
-        runCfg.projectRoot,
-        "--manifest",
-        runCfg.linkSync.manifest,
-        "--id",
-        linkId,
-        "--service",
-        service,
-        "--path",
-        JSON.stringify(pathSegments),
-      ];
-      const run = await this.runCommand(command, args, runCfg.projectRoot, "link-add", runCfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't insert the package. Check the Renium output panel for details.");
-      }
-      logPackageDragDebug(`packages.insertAtPath: link-add ok link=${linkId} target=${targetLabel}`);
-    });
-    this.invalidateLinkStatusCache();
-    const applyResult = await this.linkApply({
-      silent: true,
-      refreshExplorer: false,
-      forceTargetPaths: [pathSegments],
-      linkId,
-    });
-    logPackageDragDebug(
-      `packages.insertAtPath: link-apply ok changed=${Array.isArray(applyResult?.changedPaths) ? applyResult!.changedPaths!.length : 0} targets=${Array.isArray(applyResult?.targetSettingsIds) ? applyResult!.targetSettingsIds!.length : 0}`,
-    );
-    const decorationsPush = this.pushLinkStateToExplorer().catch(() => undefined);
-    await this.refreshFileExplorerServicesSafe([service]);
-    void decorationsPush;
-    logPackageDragDebug(`packages.insertAtPath: complete link=${linkId} target=${targetLabel}`);
-    const normalizedTarget = this.normalizeLinkTargetSegments(service, pathSegments);
-    const leaf = normalizedTarget.length > 0 ? normalizedTarget[normalizedTarget.length - 1] : "";
-    vscode.window.showInformationMessage(`Inserted "${name}" at ${service}.${leaf}.`);
-  }
-
-  private tabInputUris(input: unknown): vscode.Uri[] {
-    const candidate = input as { uri?: unknown; original?: unknown; modified?: unknown };
-    const uris: vscode.Uri[] = [];
-    for (const value of [candidate.uri, candidate.original, candidate.modified]) {
-      if (value instanceof vscode.Uri && value.scheme === "file") {
-        uris.push(value);
-      }
-    }
-    return uris;
-  }
-
-  private async closeFileTabs(filePaths: readonly string[] | undefined): Promise<void> {
-    const pathKeys = new Set(
-      (filePaths ?? [])
-        .map((filePath) => String(filePath || "").trim())
-        .filter((filePath) => filePath.length > 0)
-        .map((filePath) => this.normalizeLinkPathKey(filePath)),
-    );
-    if (pathKeys.size === 0) {
-      return;
-    }
-    const tabs: vscode.Tab[] = [];
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        if (this.tabInputUris(tab.input).some((uri) => pathKeys.has(this.normalizeLinkPathKey(uri.fsPath)))) {
-          tabs.push(tab);
-        }
-      }
-    }
-    if (tabs.length > 0) {
-      await vscode.window.tabGroups.close(tabs, true);
-    }
-  }
-
-  public async deletePackage(rawLink: CliLinkStatusLink | string | undefined): Promise<void> {
-    const link = typeof rawLink === "string"
-      ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
-      : rawLink;
-    if (!link?.id) {
-      vscode.window.showInformationMessage("Select a package to delete.");
-      return;
-    }
-    const fresh = (await this.getLinkPackages(true)).find((candidate) => candidate.id === link.id) ?? link;
-    const label = (fresh.rootName && fresh.rootName.length > 0 ? fresh.rootName : fresh.id) ?? fresh.id;
-    const uses = Math.max(0, Number(fresh.targetCount ?? 0));
-    let action = "delete-unused";
-    if (uses > 0) {
-      const picked = await vscode.window.showWarningMessage(
-        `Delete package "${label}" completely? It has ${uses} active use${uses === 1 ? "" : "s"}. What should happen to those uses?`,
-        { modal: true },
-        "Delete all uses",
-        "Unlink uses",
-      );
-      if (picked === "Delete all uses") {
-        action = "delete-uses";
-      } else if (picked === "Unlink uses") {
-        action = "unlink-uses";
-      } else {
-        return;
-      }
-    }
-
-    let result: CliLinkDeletePackageResult | undefined;
-    await this.enqueue("Delete link package", async () => {
-      const cfg = this.getConfig();
-      const command = this.resolveRustCliPathForCommand(cfg, "link-delete-package");
-      this.ensureFileExists(command);
-      const args = [
-        "link-delete-package",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-        "--id",
-        fresh.id ?? "",
-        "--action",
-        action,
-      ];
-      const run = await this.runCommand(command, args, cfg.projectRoot, "link-delete-package", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't delete the package. Check the Renium output panel for details.");
-      }
-      const parsed = this.parseCliJsonObject<CliLinkDeletePackageResult>(run.output);
-      if (!parsed || parsed.ok === false) {
-        throw new Error("Package delete did not return a valid Renium result.");
-      }
-      result = parsed;
-    });
-
-    this.invalidateLinkStatusCache();
-    const removedSourcePaths = (Array.isArray(result?.removedSourcePaths) ? result!.removedSourcePaths! : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    await this.closeFileTabs(removedSourcePaths);
-    const changedPaths = (Array.isArray(result?.changedPaths) ? result!.changedPaths! : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    if (changedPaths.length > 0 && this.isEditorLiveSyncActive()) {
-      this.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
-      await this.pushEditorPathsNow(changedPaths, {
-        force: true,
-        skipChangeFilter: true,
-      });
-    }
-    const services = (Array.isArray(result?.services) ? result!.services! : [])
-      .filter((service): service is string => typeof service === "string" && service.length > 0);
-    if (services.length > 0) {
-      await this.refreshFileExplorerServicesSafe(services);
-    } else {
-      await this.refreshFileExplorerSafe();
-    }
-    await this.pushLinkStateToExplorer();
-    void vscode.commands.executeCommand("renium.packages.refresh");
-    const deleted = Array.isArray(result?.deletedTargets) ? result!.deletedTargets!.length : 0;
-    const unlinked = Array.isArray(result?.unlinkedTargets) ? result!.unlinkedTargets!.length : 0;
-    const suffix = deleted > 0 ? ` Deleted ${deleted} use${deleted === 1 ? "" : "s"}.`
-      : unlinked > 0 ? ` Unlinked ${unlinked} use${unlinked === 1 ? "" : "s"}.`
-        : "";
-    vscode.window.showInformationMessage(`Deleted package "${label}".${suffix}`);
-  }
-
-  public async viewPackageUses(rawLink: CliLinkStatusLink | string | undefined): Promise<void> {
-    const link = typeof rawLink === "string"
-      ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
-      : rawLink;
-    if (!link?.id) {
-      vscode.window.showInformationMessage("Select a package to view uses.");
-      return;
-    }
-    const status = await this.getLinkStatus(true);
-    const targets = (status?.targets ?? []).filter((target) => target.linkId === link.id);
-    const label = (link.rootName && link.rootName.length > 0 ? link.rootName : link.id) ?? link.id;
-    if (targets.length === 0) {
-      vscode.window.showInformationMessage(`Package "${label}" has no uses.`);
-      return;
-    }
-    const items = targets.map((target) => {
-      const path = [target.service ?? "?", ...(target.path ?? [])].join(".");
-      const state = target.broken
-        ? "broken"
-        : target.missing
-          ? "missing"
-          : target.drift
-            ? "drifted"
-            : undefined;
-      return {
-        label: `$(link) ${path}`,
-        description: state,
-        target,
-      };
-    });
-    await vscode.window.showQuickPick(items, {
-      title: `Uses of "${label}" (${targets.length})`,
-      placeHolder: "All instances linked to this package",
-      matchOnDescription: true,
-    });
-  }
-
-  public async revealPackageSource(rawLink: CliLinkStatusLink | string | undefined): Promise<void> {
-    const link = typeof rawLink === "string"
-      ? (await this.getLinkPackages(true)).find((candidate) => candidate.id === rawLink)
-      : rawLink;
-    if (!link || typeof link.sourcePath !== "string" || link.sourcePath.length === 0) {
-      vscode.window.showInformationMessage("This package has no local source to preview.");
-      return;
-    }
-    if (!/\.(rbsync|renium)$/i.test(link.sourcePath)) {
-      try {
-        const stat = fs.existsSync(link.sourcePath) ? fs.statSync(link.sourcePath) : undefined;
-        if (stat?.isDirectory()) {
-          await vscode.commands.executeCommand("revealInExplorer", vscode.Uri.file(link.sourcePath));
-          return;
-        }
-        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(link.sourcePath));
-        await vscode.window.showTextDocument(doc, { preview: true });
-        return;
-      } catch (err) {
-        vscode.window.showWarningMessage(`Could not open link source. ${err instanceof Error ? err.message : String(err)}`);
-        return;
-      }
-    }
-    try {
-      const preview = await this.loadPackagePreview(link);
-      this.showPackagePreview(preview);
-    } catch (err) {
-      vscode.window.showWarningMessage(`Could not preview package. ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  public async loadPackagePreview(link: CliLinkStatusLink): Promise<PackagePreviewData> {
-    if (!link.id || !link.sourcePath) {
-      throw new Error("Package link is missing an id or source path.");
-    }
-    const cfg = this.getConfig();
-    const command = this.resolveRustCliPathForCommand(cfg, "bytecode-explorer-batch");
-    this.ensureFileExists(command);
-    const args = [
-      "bytecode-explorer-batch",
-      "-f",
-      link.sourcePath,
-      "-j",
-      JSON.stringify([{ type: "service", fields: "brief,parentId,tree,properties,attributes" }]),
-      "-o",
-      "full",
-    ];
-    const run = await this.runCommand(command, args, cfg.projectRoot, "package-preview", cfg.progressHeartbeatSeconds, { quietLog: true });
-    if (run.code !== 0) {
-      throw new Error("Couldn't preview the package. Check the Renium output panel for details.");
-    }
-    const parsed = this.parseCliJsonObject<{
-      results?: Array<{ type?: string; nodes?: PackagePreviewNode[]; rootIds?: string[] }>;
-    }>(run.output);
-    const service = parsed?.results?.find((result) => result.type === "service") ?? parsed?.results?.[0];
-    const nodes = Array.isArray(service?.nodes) ? service.nodes : [];
-    const rootIds = Array.isArray(service?.rootIds) ? service.rootIds : [];
-    const name = (link.rootName && link.rootName.length > 0 ? link.rootName : link.id) ?? link.id;
-    return {
-      id: link.id,
-      name,
-      source: link.source,
-      sourcePath: link.sourcePath,
-      rootClass: link.rootClass,
-      rootName: link.rootName,
-      nodes,
-      rootIds,
-    };
-  }
-
-  private showPackagePreview(preview: PackagePreviewData): void {
-    const panel = vscode.window.createWebviewPanel(
-      "renium.packagePreview",
-      `Package: ${preview.name}`,
-      vscode.ViewColumn.Active,
-      { enableScripts: true },
-    );
-    panel.webview.html = packagePreviewHtml(preview);
-  }
-
-  private async resolveLinkStatus(cfg: SyncConfig): Promise<LinkStatusResolution> {
-    const manifestPath = this.linkManifestPath(cfg);
-    if (!fs.existsSync(manifestPath)) {
-      return { kind: "missing" };
-    }
-    try {
-      const command = this.resolveRustCliPathForCommand(cfg, "link-status");
-      if (!fs.existsSync(command)) {
-        return { kind: "failed", error: `Renium CLI not found: ${command}` };
-      }
-      const args = [
-        "link-status",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-      ];
-      if (cfg.linkSync.cacheDir.length > 0) {
-        args.push("--cache-dir", cfg.linkSync.cacheDir);
-      }
-      const run = await this.runCommand(
-        command,
-        args,
-        cfg.projectRoot,
-        "link-status",
-        cfg.progressHeartbeatSeconds,
-        { quietLog: true },
-      );
-      if (run.code !== 0) {
-        return {
-          kind: "failed",
-          error: `link-status exited with code ${run.code}`,
-        };
-      }
-      const value = this.parseCliJsonObject<CliLinkStatusResult>(run.output);
-      if (!value) {
-        return { kind: "failed", error: "link-status returned invalid JSON" };
-      }
-      return { kind: "success", value };
-    } catch (error) {
-      return {
-        kind: "failed",
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-
-  public async getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
-    const now = Date.now();
-    const cfg = this.getConfig();
-    const projectRoot = this.normalizePathForCompare(cfg.projectRoot);
-    const generation = this.experienceGeneration;
-    if (
-      !force
-      && this.linkStatusCache
-      && this.linkStatusCache.projectRoot === projectRoot
-      && this.linkStatusCache.generation === generation
-      && now - this.linkStatusCache.at < 2000
-    ) {
-      return this.linkStatusCache.value;
-    }
-    if (
-      !force
-      && this.linkStatusInflight
-      && this.linkStatusInflight.projectRoot === projectRoot
-      && this.linkStatusInflight.generation === generation
-    ) {
-      return this.linkStatusInflight.promise;
-    }
-    const token = ++this.linkStatusToken;
-    const promise = this.fetchLinkStatus(now, cfg, projectRoot, generation, token);
-    const inflight = { projectRoot, generation, token, promise };
-    this.linkStatusInflight = inflight;
-    try {
-      return await promise;
-    } finally {
-      if (this.linkStatusInflight === inflight) {
-        this.linkStatusInflight = undefined;
-      }
-    }
-  }
-
-  private async fetchLinkStatus(
-    now: number,
-    cfg: SyncConfig,
-    projectRoot: string,
-    generation: number,
-    token: number,
-  ): Promise<CliLinkStatusResult | undefined> {
-    const resolution = await this.resolveLinkStatus(cfg);
-    const value = resolution.kind === "success" ? resolution.value : undefined;
-    if (resolution.kind === "failed") {
-      this.output.appendLine(`[renium] link-status failed: ${resolution.error}`);
-    }
-    let currentRoot = "";
-    try {
-      currentRoot = this.normalizePathForCompare(this.getConfig().projectRoot);
-    } catch {
-    }
-    if (
-      this.linkStatusToken === token
-      && this.experienceGeneration === generation
-      && currentRoot === projectRoot
-    ) {
-      this.linkStatusCache = { at: now, projectRoot, generation, token, value };
-    }
-    return value;
-  }
-
-  private async refreshFileExplorerSafe(): Promise<void> {
-    try {
-      await vscode.commands.executeCommand("renium.fileExplorer.refresh");
-    } catch {
-    }
-  }
-
-  private async refreshFileExplorerServicesSafe(services: string[]): Promise<void> {
-    try {
-      await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", services);
-    } catch {
-      await this.refreshFileExplorerSafe();
-    }
-  }
-
-  public async syncActiveService(): Promise<void> {
-    await this.enqueue("Sync active service", async () => {
-      const cfg = this.getConfig();
-      const activePath = vscode.window.activeTextEditor?.document.uri.fsPath;
-
-      const activeServices = activePath ? this.servicesForProjectSourcePath(activePath, cfg) : [];
-      let service = activeServices.length === 1 ? activeServices[0] : undefined;
-
-      if (!service) {
-        service = await vscode.window.showQuickPick(cfg.services, {
-          title: "Renium",
-          placeHolder: "Select a service to sync",
-        });
-      }
-
-      if (!service) {
-        return;
-      }
-
-      await this.runExport({
-        services: [service],
-        runImport: cfg.runImport,
-        notifyOnSuccess: true,
-        reason: `Synced ${service}`,
-      });
-    });
-  }
-
-  public async openGitSync(): Promise<void> {
-    await vscode.commands.executeCommand("workbench.view.extension.reniumContainer");
-    await vscode.commands.executeCommand("renium.fileExplorer.showGit");
-  }
-
-  private captureGitProjectToken(expectedProjectRoot?: string): GitProjectToken {
-    const cfg = this.getConfig();
-    const projectRoot = this.normalizePathForCompare(cfg.projectRoot);
-    if (
-      this.experienceChangeInProgress
-      || (
-        expectedProjectRoot !== undefined
-        && this.normalizePathForCompare(expectedProjectRoot) !== projectRoot
-      )
-    ) {
-      throw new Error("The active Renium place changed. Run the Git action again.");
-    }
-    return { projectRoot, generation: this.experienceGeneration };
-  }
-
-  private gitConfigForToken(token: GitProjectToken): SyncConfig {
-    const cfg = this.getConfig();
-    if (
-      this.experienceChangeInProgress
-      || this.experienceGeneration !== token.generation
-      || this.normalizePathForCompare(cfg.projectRoot) !== token.projectRoot
-    ) {
-      throw new Error("The active Renium place changed. Run the Git action again.");
-    }
-    return cfg;
-  }
-
-  public async gitStatus(token = this.captureGitProjectToken()): Promise<void> {
-    await this.enqueue("Git status", async () => {
-      const cfg = this.gitConfigForToken(token);
-      const state = await this.inspectGitRepo(cfg, { fetch: false });
-      this.output.show(false);
-      this.logGitState(state);
-      await this.refreshGitView();
-    });
-  }
-
-  public async gitFetch(token = this.captureGitProjectToken()): Promise<void> {
-    await this.enqueue("Git fetch", async () => {
-      const cfg = this.gitConfigForToken(token);
-      this.ensureWorkspaceTrustedForGitSync();
-      const state = await this.inspectGitRepo(cfg, { fetch: false, requireRemote: true });
-      const repoRoot = this.requireGitRepoRoot(state);
-      const remote = state.remote ?? cfg.gitSync.remote;
-      const result = await this.runGitCommand(cfg, repoRoot, ["fetch", "--prune", remote], "fetch");
-      this.ensureGitSuccess(result, "fetch");
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Fetched ${remote}.`);
-    });
-  }
-
-  public async gitPull(token = this.captureGitProjectToken()): Promise<void> {
-    await this.enqueue("Git pull", async () => {
-      const cfg = this.gitConfigForToken(token);
-      this.ensureWorkspaceTrustedForGitSync();
-      let state = await this.inspectGitRepo(cfg, { fetch: cfg.gitSync.autoFetch, requireRemote: true });
-      const repoRoot = this.requireGitRepoRoot(state);
-      this.ensureNoGitConflicts(state);
-      if (cfg.gitSync.requireCleanWorktreeBeforePull && state.worktreeEntries.length > 0) {
-        throw new Error("Pull is blocked because the worktree has local changes. Commit, stash, or discard them before pulling.");
-      }
-
-      const remote = state.remote ?? cfg.gitSync.remote;
-      const branch = this.resolveGitBranch(cfg, state);
-      if (state.upstream && state.behind === 0 && state.ahead === 0) {
-        this.output.appendLine(`[git-sync] pull skipped: ${remote}/${branch} is already up to date.`);
-        vscode.window.showInformationMessage("Git pull is already up to date.");
-        return;
-      }
-      if (state.upstream && state.ahead > 0 && state.behind > 0) {
-        throw new Error("Pull is blocked because the branch has diverged. Resolve with VS Code Source Control or git manually.");
-      }
-
-      const resumeLiveSync = await this.ensureLiveSyncStoppedForGitPull();
-      try {
-        this.gitConfigForToken(token);
-        const oldHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD");
-        const pullResult = await this.runGitCommand(cfg, repoRoot, ["pull", "--ff-only", remote, branch], "pull --ff-only");
-        this.ensureGitSuccess(pullResult, "pull --ff-only");
-        const newHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD after pull");
-        const changedFiles = oldHead !== newHead
-          ? await this.gitChangedFilesBetween(cfg, repoRoot, oldHead, newHead)
-          : [];
-        await this.refreshExplorerForGitPaths(repoRoot, changedFiles, cfg);
-        await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
-        state = await this.inspectGitRepo(cfg, { fetch: false });
-        this.logGitState(state);
-        await this.refreshGitView();
-        vscode.window.showInformationMessage(`Pulled ${remote}/${branch}.`);
-      } catch (error) {
-        if (
-          resumeLiveSync
-          && this.experienceGeneration === token.generation
-          && this.normalizePathForCompare(this.getConfig().projectRoot) === token.projectRoot
-        ) {
-          await this.startLiveSync({ silent: true, bestEffort: true });
-        }
-        throw error;
-      }
-    });
-  }
-
-  public async gitCommitAndPush(
-    options: { pullFromStudioFirst?: boolean } = {},
-    token = this.captureGitProjectToken(),
-  ): Promise<void> {
-    await this.enqueue(options.pullFromStudioFirst ? "Pull from Studio, commit and push" : "Git commit & push", async () => {
-      const cfg = this.gitConfigForToken(token);
-      this.ensureWorkspaceTrustedForGitSync();
-      await this.maybePullFromStudioBeforeGitPush(cfg, options.pullFromStudioFirst === true);
-      this.gitConfigForToken(token);
-
-      let state = await this.inspectGitRepo(cfg, { fetch: cfg.gitSync.autoFetch, requireRemote: true });
-      const repoRoot = this.requireGitRepoRoot(state);
-      this.ensureNoGitConflicts(state);
-      if (state.behind > 0) {
-        throw new Error("Push is blocked because the remote has new commits. Pull first, then retry.");
-      }
-      const preexistingStaged = await this.gitStagedChanges(cfg, repoRoot);
-      if (preexistingStaged.length > 0) {
-        throw new Error(`Push is blocked because ${preexistingStaged.length} file(s) are already staged. Commit or unstage them first so Renium does not publish unintended changes.`);
-      }
-
-      const plannedChanges = await this.plannedGitStageChanges(cfg, repoRoot);
-      state = await this.inspectGitRepo(cfg, { fetch: false, requireRemote: true });
-      const remote = state.remote ?? cfg.gitSync.remote;
-      const branch = this.resolveGitBranch(cfg, state);
-
-      if (plannedChanges.length === 0) {
-        if (state.ahead > 0) {
-          await this.confirmGitPush(`No new files were staged, but ${state.ahead} local commit(s) are ahead of ${state.upstream ?? remote + "/" + branch}. Push them now?`, cfg);
-          await this.pushGitBranch(cfg, repoRoot, remote, branch, state.upstream === undefined);
-          await this.refreshGitView();
-          return;
-        }
-        throw new Error("No tracked changes are available to commit. Untracked files are excluded unless renium.gitSync.includeUntracked is enabled or stage paths are configured.");
-      }
-
-      await this.confirmGitCommitAndPush(plannedChanges, state, cfg);
-      const commitMessage = await this.gitCommitMessage(cfg, branch);
-      await this.stageGitSyncChanges(cfg, repoRoot);
-      const staged = await this.gitStagedChanges(cfg, repoRoot);
-      if (staged.length === 0) {
-        throw new Error("No files were staged after applying the configured Git sync path filters.");
-      }
-      const commitResult = await this.runGitCommand(cfg, repoRoot, ["commit", "-m", commitMessage], "commit");
-      this.ensureGitSuccess(commitResult, "commit");
-      const shortSha = await this.gitOutput(cfg, repoRoot, ["rev-parse", "--short", "HEAD"], "read commit sha");
-      await this.pushGitBranch(cfg, repoRoot, remote, branch, state.upstream === undefined);
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Pushed ${shortSha} to ${remote}/${branch}.`);
-    });
-  }
-
-  public async gitPublishBranch(token = this.captureGitProjectToken()): Promise<void> {
-    await this.enqueue("Git publish branch", async () => {
-      const cfg = this.gitConfigForToken(token);
-      this.ensureWorkspaceTrustedForGitSync();
-      const state = await this.inspectGitRepo(cfg, { fetch: false, requireRemote: true });
-      const repoRoot = this.requireGitRepoRoot(state);
-      const remote = state.remote ?? cfg.gitSync.remote;
-      const branch = this.resolveGitBranch(cfg, state);
-      await this.confirmGitPush(`Publish current branch to ${remote}/${branch}?`, cfg);
-      await this.pushGitBranch(cfg, repoRoot, remote, branch, true);
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Published ${remote}/${branch}.`);
-    });
-  }
-
-  public async gitCreateBranch(token = this.captureGitProjectToken()): Promise<void> {
-    const branchName = await vscode.window.showInputBox({
-      title: "Create Git Branch",
-      prompt: "New branch name",
-      validateInput: (value) => this.validateBranchName(value),
-    });
-    if (!branchName) {
-      return;
-    }
-    await this.enqueue("Git create branch", async () => {
-      const cfg = this.gitConfigForToken(token);
-      this.ensureWorkspaceTrustedForGitSync();
-      const state = await this.inspectGitRepo(cfg, { fetch: false });
-      const repoRoot = this.requireGitRepoRoot(state);
-      const result = await this.runGitCommand(cfg, repoRoot, ["switch", "-c", branchName.trim()], "create branch");
-      this.ensureGitSuccess(result, "create branch");
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Created branch ${branchName.trim()}.`);
-    });
-  }
-
-  public async gitCheckoutBranch(token = this.captureGitProjectToken()): Promise<void> {
-    const cfg = this.gitConfigForToken(token);
-    const state = await this.inspectGitRepo(cfg, { fetch: false });
-    const repoRoot = this.requireGitRepoRoot(state);
-    if (state.worktreeEntries.length > 0) {
-      vscode.window.showWarningMessage("Checkout is blocked while local changes are present.");
-      return;
-    }
-    const branchesResult = await this.runGitCommand(cfg, repoRoot, ["branch", "--format=%(refname:short)"], "list branches", { quiet: true });
-    this.ensureGitSuccess(branchesResult, "list branches");
-    const branches = branchesResult.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-    const branchName = await vscode.window.showQuickPick(branches, { title: "Checkout Git Branch" });
-    if (!branchName) {
-      return;
-    }
-    await this.enqueue("Git checkout branch", async () => {
-      const runCfg = this.gitConfigForToken(token);
-      const result = await this.runGitCommand(runCfg, repoRoot, ["switch", branchName], "checkout branch");
-      this.ensureGitSuccess(result, "checkout branch");
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Checked out ${branchName}.`);
-    });
-  }
-
-  public async gitConnectRepo(token = this.captureGitProjectToken()): Promise<void> {
-    const cfg = this.gitConfigForToken(token);
-    this.ensureWorkspaceTrustedForGitSync();
-    const state = await this.inspectGitRepo(cfg, { fetch: false, allowMissing: true });
-    let repoRoot = state.repoRoot;
-    if (!repoRoot) {
-      const init = await vscode.window.showWarningMessage(
-        `Initialize a Git repository at ${cfg.projectRoot}?`,
-        { modal: true },
-        "Initialize Repository",
-      );
-      if (init !== "Initialize Repository") {
-        return;
-      }
-      this.gitConfigForToken(token);
-      repoRoot = cfg.projectRoot;
-    }
-    const remote = await vscode.window.showInputBox({
-      title: "Git Remote Name",
-      value: cfg.gitSync.remote,
-      prompt: "Remote name to connect to Git",
-    });
-    if (!remote) {
-      return;
-    }
-    this.gitConfigForToken(token);
-    const remoteUrl = await vscode.window.showInputBox({
-      title: "Git Remote URL",
-      value: "",
-      placeHolder: state.view.remoteUrl ? `Current: ${state.view.remoteUrl}` : "https://github.com/owner/repo.git or git@github.com:owner/repo.git",
-      prompt: "HTTPS or SSH Git repository URL",
-      ignoreFocusOut: true,
-    });
-    if (!remoteUrl) {
-      return;
-    }
-
-    await this.enqueue("Git connect repo", async () => {
-      const runCfg = this.gitConfigForToken(token);
-      if (!state.repoRoot) {
-        const initResult = await this.runGitCommand(runCfg, runCfg.projectRoot, ["init"], "git init");
-        this.ensureGitSuccess(initResult, "git init");
-      }
-      const targetRoot = repoRoot ?? runCfg.projectRoot;
-      const currentRemote = await this.runGitCommand(runCfg, targetRoot, ["remote", "get-url", remote.trim()], "get remote", { quiet: true });
-      const args = currentRemote.code === 0
-        ? ["remote", "set-url", remote.trim(), remoteUrl.trim()]
-        : ["remote", "add", remote.trim(), remoteUrl.trim()];
-      const remoteResult = await this.runGitCommand(runCfg, targetRoot, args, currentRemote.code === 0 ? "set remote" : "add remote");
-      this.ensureGitSuccess(remoteResult, currentRemote.code === 0 ? "set remote" : "add remote");
-      await this.refreshGitView();
-      vscode.window.showInformationMessage(`Connected ${remote.trim()} to ${redactRemoteUrl(remoteUrl.trim())}.`);
-    });
-  }
-
-  public async gitOpenRemote(token = this.captureGitProjectToken()): Promise<void> {
-    const cfg = this.gitConfigForToken(token);
-    const state = await this.inspectGitRepo(cfg, { fetch: false, allowMissing: true });
-    this.gitConfigForToken(token);
-    const remoteWebUrl = state.view.remoteWebUrl;
-    if (!remoteWebUrl) {
-      vscode.window.showWarningMessage("No Git remote URL is configured.");
-      return;
-    }
-    await vscode.env.openExternal(vscode.Uri.parse(remoteWebUrl));
-  }
-
-  private async getGitViewState(options: { fetch?: boolean; projectRoot: string }): Promise<GitViewState> {
-    const token = this.captureGitProjectToken(options.projectRoot);
-    const state = await this.inspectGitRepo(this.gitConfigForToken(token), {
-      fetch: options.fetch === true,
-      allowMissing: true,
-    });
-    this.gitConfigForToken(token);
-    return state.view;
-  }
-
-  private async refreshGitView(options: { fetch?: boolean } = {}): Promise<void> {
-    if (this.gitViewRefreshSuppression > 0) {
-      return;
-    }
-    await vscode.commands.executeCommand("renium.fileExplorer.refreshGit", options);
-  }
-
-  private async runGitViewAction(action: string, expectedProjectRoot: string): Promise<void> {
-    const token = this.captureGitProjectToken(expectedProjectRoot);
-    this.gitViewRefreshSuppression += 1;
-    try {
-      switch (action) {
-        case "connect":
-          await this.gitConnectRepo(token);
-          return;
-        case "fetch":
-          await this.gitFetch(token);
-          return;
-        case "pull":
-          await this.gitPull(token);
-          return;
-        case "commitPush":
-          await this.gitCommitAndPush({}, token);
-          return;
-        case "pullCommitPush":
-          await this.gitCommitAndPush({ pullFromStudioFirst: true }, token);
-          return;
-        case "publishBranch":
-          await this.gitPublishBranch(token);
-          return;
-        case "createBranch":
-          await this.gitCreateBranch(token);
-          return;
-        case "checkoutBranch":
-          await this.gitCheckoutBranch(token);
-          return;
-        case "openRemote":
-          await this.gitOpenRemote(token);
-          return;
-        case "status":
-          await this.gitStatus(token);
-          return;
-        default:
-          return;
-      }
-    } finally {
-      this.gitViewRefreshSuppression -= 1;
-    }
-  }
-
-  private emptyGitViewState(projectRoot: string, message?: string): GitViewState {
-    return {
-      ok: false,
-      message,
-      trusted: vscode.workspace.isTrusted,
-      projectRoot,
-      connected: false,
-      ahead: 0,
-      behind: 0,
-      counts: { total: 0, tracked: 0, staged: 0, unstaged: 0, untracked: 0, ignored: 0, conflicted: 0, deleted: 0 },
-      entries: [],
-      lastUpdated: new Date().toISOString(),
-    };
-  }
-
-  private async inspectGitRepo(
-    cfg: SyncConfig,
-    options: { fetch?: boolean; requireRemote?: boolean; allowMissing?: boolean } = {},
-  ): Promise<GitRepoState> {
-    if (!vscode.workspace.isTrusted) {
-      const view = this.emptyGitViewState(cfg.projectRoot, "Workspace is not trusted. Trust this workspace before using Git sync.");
-      if (options.allowMissing) {
-        return { view, entries: [], worktreeEntries: [], ahead: 0, behind: 0 };
-      }
-      throw new Error(view.message);
-    }
-
-    const repoResult = await this.runGitCommand(cfg, cfg.projectRoot, ["rev-parse", "--show-toplevel"], "repo root", { quiet: true });
-    if (repoResult.code !== 0) {
-      const view = this.emptyGitViewState(cfg.projectRoot, "No Git repository is connected. Use Connect Repo to initialize or configure one.");
-      if (options.allowMissing) {
-        return { view, entries: [], worktreeEntries: [], ahead: 0, behind: 0 };
-      }
-      throw new Error(view.message);
-    }
-
-    const repoRoot = path.normalize(repoResult.stdout.trim());
-    if (!this.isPathInside(cfg.projectRoot, repoRoot)) {
-      throw new Error(`Configured projectRoot is outside the Git repository: ${cfg.projectRoot}`);
-    }
-
-    const branchResult = await this.runGitCommand(cfg, repoRoot, ["branch", "--show-current"], "branch", { quiet: true });
-    const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "";
-    const configuredRemote = cfg.gitSync.remote || "origin";
-    const remoteResult = await this.runGitCommand(cfg, repoRoot, ["remote", "get-url", configuredRemote], "remote", { quiet: true });
-    const remoteUrl = remoteResult.code === 0 ? remoteResult.stdout.trim() : undefined;
-    if (options.requireRemote && !remoteUrl) {
-      throw new Error(`Git remote '${configuredRemote}' is not configured. Use the Git tab's Connect Repo action.`);
-    }
-
-    if (options.fetch && remoteUrl) {
-      const fetchResult = await this.runGitCommand(cfg, repoRoot, ["fetch", "--prune", configuredRemote], "fetch");
-      this.ensureGitSuccess(fetchResult, "fetch");
-    }
-
-    const branchOverride = cfg.gitSync.branch.trim();
-    let upstream: string | undefined;
-    let comparisonRef: string | undefined;
-    if (branchOverride) {
-      const remoteRef = `refs/remotes/${configuredRemote}/${branchOverride}`;
-      const remoteBranchResult = await this.runGitCommand(
-        cfg,
-        repoRoot,
-        ["rev-parse", "--verify", `${remoteRef}^{commit}`],
-        "configured branch",
-        { quiet: true },
-      );
-      if (remoteBranchResult.code === 0) {
-        upstream = `${configuredRemote}/${branchOverride}`;
-        comparisonRef = remoteRef;
-      }
-    } else {
-      const upstreamResult = await this.runGitCommand(
-        cfg,
-        repoRoot,
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        "upstream",
-        { quiet: true },
-      );
-      if (upstreamResult.code === 0) {
-        upstream = upstreamResult.stdout.trim();
-        comparisonRef = "@{u}";
-      }
-    }
-    let ahead = 0;
-    let behind = 0;
-    if (comparisonRef) {
-      const aheadBehindResult = await this.runGitCommand(
-        cfg,
-        repoRoot,
-        ["rev-list", "--left-right", "--count", `HEAD...${comparisonRef}`],
-        "ahead/behind",
-        { quiet: true },
-      );
-      if (aheadBehindResult.code === 0) {
-        ({ ahead, behind } = parseAheadBehind(aheadBehindResult.stdout));
-      }
-    }
-
-    const statusResult = await this.runGitCommand(
-      cfg,
-      repoRoot,
-      ["status", "--porcelain=v1", "-z", "-uall"],
-      "status",
-      { quiet: true },
-    );
-    this.ensureGitSuccess(statusResult, "status");
-    const worktreeEntries = parsePorcelainV1Z(statusResult.stdout);
-    const statusScopes = this.defaultGitStageScopes(repoRoot, cfg);
-    const entries = worktreeEntries.filter((entry) =>
-      this.gitEntryMatchesScopes(entry, statusScopes));
-    const counts = summarizeStatus(entries);
-    const redactedRemoteUrl = remoteUrl ? redactRemoteUrl(remoteUrl) : undefined;
-    const remoteWebUrl = remoteUrlToWebUrl(remoteUrl ?? "");
-    const worktreeConflicts = worktreeEntries.filter((entry) => entry.conflicted).length;
-    const messages: string[] = [];
-    if (!remoteUrl) {
-      messages.push(`Remote '${configuredRemote}' is not configured.`);
-    } else if (worktreeConflicts > 0) {
-      messages.push(`${worktreeConflicts} conflicted file(s) need manual resolution.`);
-    } else if (behind > 0) {
-      messages.push(`${behind} remote commit(s) available to pull.`);
-    }
-    const hiddenChanges = worktreeEntries.length - entries.length;
-    if (hiddenChanges > 0) {
-      messages.push(`${hiddenChanges} repository change(s) outside this place's source files are hidden.`);
-    }
-    const message = messages.length > 0 ? messages.join(" ") : undefined;
-    const view: GitViewState = {
-      ok: Boolean(remoteUrl) && worktreeConflicts === 0,
-      message,
-      trusted: true,
-      projectRoot: cfg.projectRoot,
-      repoRoot,
-      connected: Boolean(remoteUrl),
-      branch: branch || undefined,
-      upstream,
-      remote: configuredRemote,
-      remoteUrl: redactedRemoteUrl,
-      remoteWebUrl,
-      ahead,
-      behind,
-      counts,
-      entries: entries.map((entry) => ({
-        path: entry.path,
-        originalPath: entry.originalPath,
-        kind: entry.kind,
-        staged: entry.staged,
-        unstaged: entry.unstaged,
-        untracked: entry.untracked,
-        conflicted: entry.conflicted,
-        deleted: entry.deleted,
-      })),
-      lastUpdated: new Date().toISOString(),
-    };
-    return {
-      view,
-      entries,
-      worktreeEntries,
-      repoRoot,
-      branch,
-      upstream,
-      remote: configuredRemote,
-      remoteUrl,
-      ahead,
-      behind,
-    };
+  public getLinkFileIndex(force = false): Promise<Map<string, LinkFileInfo>> {
+    return this.packageSyncController.getLinkFileIndex(force);
   }
 
-  private ensureWorkspaceTrustedForGitSync(): void {
-    if (!vscode.workspace.isTrusted) {
-      throw new Error("Workspace is not trusted. Trust this workspace before running Git sync commands.");
-    }
+  public addLinkFromFile(uri: vscode.Uri | undefined): Promise<void> {
+    return this.packageSyncController.addLinkFromFile(uri);
   }
 
-  private requireGitRepoRoot(state: GitRepoState): string {
-    if (!state.repoRoot) {
-      throw new Error(state.view.message || "No Git repository is connected.");
-    }
-    return state.repoRoot;
+  public packInstanceLink(request: {
+    service?: string;
+    pathSegments?: string[];
+    id?: string;
+    resave?: boolean;
+  }): Promise<void> {
+    return this.packageSyncController.packInstanceLink(request);
   }
 
-  private ensureNoGitConflicts(state: GitRepoState): void {
-    const conflicts = state.worktreeEntries.filter((entry) => entry.conflicted);
-    if (conflicts.length > 0) {
-      throw new Error(`Git sync is blocked by ${conflicts.length} conflicted file(s). Resolve conflicts before continuing.`);
-    }
+  public resavePackageLink(request: {
+    service?: string;
+    pathSegments?: string[];
+  }): Promise<void> {
+    return this.packageSyncController.resavePackageLink(request);
   }
 
-  private resolveGitBranch(cfg: SyncConfig, state: GitRepoState): string {
-    const branch = cfg.gitSync.branch.trim() || state.branch?.trim() || "";
-    if (!branch) {
-      throw new Error("Current Git HEAD is detached. Checkout or create a branch before using Git sync.");
-    }
-    return branch;
+  public relinkPackageTarget(request: {
+    service?: string;
+    pathSegments?: string[];
+  }): Promise<void> {
+    return this.packageSyncController.relinkPackageTarget(request);
   }
 
-  private async runGitCommand(
-    cfg: SyncConfig,
-    cwd: string,
-    args: string[],
-    label: string,
-    options: { quiet?: boolean } = {},
-  ): Promise<GitRunResult> {
-    const quiet = options.quiet === true || cfg.gitSync.outputBehavior === "silent";
-    if (!quiet && cfg.gitSync.outputBehavior === "onStart") {
-      this.output.show(false);
-    }
-    if (!quiet) {
-      this.output.appendLine(`[git-sync] ${label}: git ${renderGitArgs(args)}`);
-    }
-    const result = await runGit(args, {
-      cwd,
-      gitPath: cfg.gitSync.gitPath,
-      timeoutMs: Math.max(10, cfg.gitSync.timeoutSeconds) * 1000,
-      owner: projectProcessOwner(cfg.projectRoot),
-    });
-    if (!quiet) {
-      const output = redactRemoteUrl(result.output.trim());
-      if (output) {
-        for (const line of output.replace(/\r\n/g, "\n").split("\n").slice(-80)) {
-          this.output.appendLine(`[git-sync:git] ${line}`);
-        }
-      }
-      this.output.appendLine(`[git-sync] ${label}: exited code=${result.code}${result.timedOut ? " (timed out)" : ""}`);
-    }
-    return result;
+  public breakInstanceLink(request: {
+    service?: string;
+    pathSegments?: string[];
+    silent?: boolean;
+    refreshExplorer?: boolean;
+  }): Promise<void> {
+    return this.packageSyncController.breakInstanceLink(request);
   }
 
-  private ensureGitSuccess(result: GitRunResult, label: string): void {
-    if (result.code === 0 && !result.timedOut) {
-      return;
-    }
-    const detail = redactRemoteUrl((result.stderr || result.stdout || result.output || "").trim());
-    const timeout = result.timedOut ? " timed out" : "";
-    throw new Error(`Git ${label}${timeout} failed with code ${result.code}.${detail ? ` ${detail}` : ""}`);
+  public breakLinkForFile(uri: vscode.Uri | undefined): Promise<void> {
+    return this.packageSyncController.breakLinkForFile(uri);
   }
 
-  private async gitOutput(cfg: SyncConfig, repoRoot: string, args: string[], label: string): Promise<string> {
-    const result = await this.runGitCommand(cfg, repoRoot, args, label, { quiet: true });
-    this.ensureGitSuccess(result, label);
-    return result.stdout.trim();
+  public revealLinkSourceForFile(uri: vscode.Uri | undefined): Promise<void> {
+    return this.packageSyncController.revealLinkSourceForFile(uri);
   }
 
-  private async gitChangedFilesBetween(cfg: SyncConfig, repoRoot: string, oldHead: string, newHead: string): Promise<GitNameStatusEntry[]> {
-    const result = await this.runGitCommand(cfg, repoRoot, ["diff", "--name-status", "-z", oldHead, newHead], "changed files", { quiet: true });
-    this.ensureGitSuccess(result, "changed files");
-    return parseNameStatusZ(result.stdout);
+  public showLinkStatus(): Promise<void> {
+    return this.packageSyncController.showLinkStatus();
   }
 
-  private async gitStagedChanges(cfg: SyncConfig, repoRoot: string): Promise<GitNameStatusEntry[]> {
-    const result = await this.runGitCommand(cfg, repoRoot, ["diff", "--cached", "--name-status", "-z"], "staged changes", { quiet: true });
-    this.ensureGitSuccess(result, "staged changes");
-    return parseNameStatusZ(result.stdout);
+  public getLinkPackages(force = false): Promise<CliLinkStatusLink[]> {
+    return this.packageSyncController.getLinkPackages(force);
   }
 
-  private async refreshExplorerForGitPaths(repoRoot: string, changedFiles: GitNameStatusEntry[], cfg: SyncConfig): Promise<void> {
-    const services = new Set<string>();
-    for (const affectedPath of nameStatusAffectedPaths(changedFiles)) {
-      const absolutePath = path.join(repoRoot, affectedPath);
-      for (const service of this.servicesForProjectSourcePath(absolutePath, cfg)) {
-        services.add(service);
-      }
-    }
-    if (services.size === 0) {
-      return;
-    }
-    await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", Array.from(services));
+  public insertPackageAtPath(request: {
+    linkId?: string;
+    service?: string;
+    pathSegments?: string[];
+  }): Promise<void> {
+    return this.packageSyncController.insertPackageAtPath(request);
   }
 
-  private async maybeApplyPulledPathsToStudio(repoRoot: string, changedFiles: GitNameStatusEntry[], cfg: SyncConfig): Promise<void> {
-    const srcPaths = nameStatusAffectedPaths(changedFiles)
-      .map((affectedPath) => path.join(repoRoot, affectedPath))
-      .filter((filePath) => this.isProjectSourcePath(filePath, cfg));
-    if (srcPaths.length === 0 || cfg.gitSync.applyPulledChangesToStudio === "never") {
-      return;
-    }
-    let apply = cfg.gitSync.applyPulledChangesToStudio === "always";
-    if (!apply) {
-      const picked = await vscode.window.showInformationMessage(
-        `Apply ${srcPaths.length} pulled project source file(s) to Studio now?`,
-        { modal: true },
-        "Apply to Studio",
-      );
-      apply = picked === "Apply to Studio";
-    }
-    if (!apply) {
-      return;
-    }
-    const pushed = await this.pushEditorPathsNow(srcPaths, { force: true, skipChangeFilter: true, taskName: "Git pull -> Studio sync" });
-    if (!pushed) {
-      vscode.window.showInformationMessage("Pulled changes stayed local. Start Serve or live sync before applying to Studio.");
-    }
+  public deletePackage(link: CliLinkStatusLink | string | undefined): Promise<void> {
+    return this.packageSyncController.deletePackage(link);
   }
 
-  private async ensureLiveSyncStoppedForGitPull(): Promise<boolean> {
-    if (!this.isEditorLiveSyncActive() && !this.liveSyncStartPromise) {
-      return false;
-    }
-    const picked = await vscode.window.showWarningMessage(
-      "Git pull can rewrite project source files. Stop Renium live sync before pulling?",
-      { modal: true },
-      "Stop Live Sync",
-    );
-    if (picked !== "Stop Live Sync") {
-      throw new Error("Git pull cancelled because live sync is active.");
-    }
-    await this.stopLiveSync({ silent: true });
-    return true;
+  public viewPackageUses(link: CliLinkStatusLink | string | undefined): Promise<void> {
+    return this.packageSyncController.viewPackageUses(link);
   }
 
-  private async maybePullFromStudioBeforeGitPush(cfg: SyncConfig, forced: boolean): Promise<void> {
-    let choice: "pull" | "current" | undefined;
-    if (!forced && cfg.gitSync.pullFromStudioBeforePush === "ask") {
-      const picked = await vscode.window.showInformationMessage(
-        "Pull from Studio before committing to Git?",
-        { modal: true },
-        "Pull from Studio",
-        "Commit Current Files",
-      );
-      if (!picked) {
-        throw new Error("Git commit cancelled before the Studio pull choice.");
-      }
-      choice = picked === "Pull from Studio" ? "pull" : "current";
-    }
-    if (!shouldPullFromStudioBeforePush(cfg.gitSync.pullFromStudioBeforePush, forced, choice)) {
-      return;
-    }
-    await this.runExport({
-      services: cfg.services,
-      runImport: true,
-      notifyOnSuccess: false,
-      reason: "",
-      quietTimings: false,
-      destructive: true,
-    });
+  public loadPackagePreview(link: CliLinkStatusLink): Promise<PackagePreviewData> {
+    return this.packageSyncController.loadPackagePreview(link);
   }
 
-  private async stageGitSyncChanges(cfg: SyncConfig, repoRoot: string): Promise<void> {
-    const configuredPaths = cfg.gitSync.stagePaths.map((value) => value.trim()).filter((value) => value.length > 0);
-    const hasConfiguredPaths = cfg.gitSync.stageMode === "configuredPaths" && configuredPaths.length > 0;
-    const defaultScopes = this.defaultGitStageScopes(repoRoot, cfg);
-    const args = cfg.gitSync.includeUntracked
-      ? ["add", "-A", "--", ...(hasConfiguredPaths ? configuredPaths : defaultScopes)]
-      : ["add", "-u", "--", ...(hasConfiguredPaths ? configuredPaths : defaultScopes)];
-    const result = await this.runGitCommand(cfg, repoRoot, args, "stage changes");
-    this.ensureGitSuccess(result, "stage changes");
+  public getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
+    return this.packageSyncController.getLinkStatus(force);
   }
 
-  private async plannedGitStageChanges(cfg: SyncConfig, repoRoot: string): Promise<GitNameStatusEntry[]> {
-    const configuredPaths = cfg.gitSync.stagePaths.map((value) => value.trim()).filter((value) => value.length > 0);
-    const scopes = cfg.gitSync.stageMode === "configuredPaths" && configuredPaths.length > 0
-      ? configuredPaths
-      : this.defaultGitStageScopes(repoRoot, cfg);
-    const result = await this.runGitCommand(
-      cfg,
-      repoRoot,
-      ["status", "--porcelain=v1", "-z", "-uall", "--", ...scopes],
-      "stage preview",
-      { quiet: true },
-    );
-    this.ensureGitSuccess(result, "stage preview");
-    return parsePorcelainV1Z(result.stdout)
-      .filter((entry) => entry.tracked || cfg.gitSync.includeUntracked)
-      .map((entry) => ({
-        status: this.gitNameStatusForEntry(entry),
-        path: entry.path,
-        originalPath: entry.originalPath,
-      }));
+  public openGitSync(): Promise<void> {
+    return this.gitController.openGitSync();
   }
 
-  private gitNameStatusForEntry(entry: GitStatusEntry): string {
-    if (entry.conflicted) {
-      return "U";
-    }
-    if (entry.untracked) {
-      return "A";
-    }
-    const status = entry.index.trim() || entry.worktree.trim();
-    return status || "M";
+  public gitStatus(): Promise<void> {
+    return this.gitController.gitStatus();
   }
 
-  private defaultGitStageScopes(repoRoot: string, cfg: SyncConfig): string[] {
-    const scopes = Array.from(new Set(loadProjectSourceGraph(cfg.projectRoot).locations.map((location) => {
-      if (!this.isPathInside(location, repoRoot)) {
-        throw new Error(`Project source path is outside the Git repository: ${location}`);
-      }
-      return path.relative(repoRoot, location).split(path.sep).join("/") || ".";
-    })));
-    scopes.sort((left, right) => left.length - right.length || left.localeCompare(right));
-    return scopes.filter((scope, index) => {
-      const key = process.platform === "win32" ? scope.toLowerCase() : scope;
-      return !scopes.slice(0, index).some((parent) => {
-        const parentKey = process.platform === "win32" ? parent.toLowerCase() : parent;
-        return parentKey === "." || key === parentKey || key.startsWith(`${parentKey}/`);
-      });
-    });
+  public gitFetch(): Promise<void> {
+    return this.gitController.gitFetch();
   }
 
-  private gitEntryMatchesScopes(entry: GitStatusEntry, scopes: string[]): boolean {
-    const matches = (filePath: string | undefined): boolean => {
-      if (!filePath) {
-        return false;
-      }
-      const value = process.platform === "win32" ? filePath.toLowerCase() : filePath;
-      return scopes.some((scope) => {
-        const key = process.platform === "win32" ? scope.toLowerCase() : scope;
-        return key === "." || value === key || value.startsWith(`${key}/`);
-      });
-    };
-    return matches(entry.path) || matches(entry.originalPath);
+  public gitPull(): Promise<void> {
+    return this.gitController.gitPull();
   }
 
-  private async confirmGitCommitAndPush(staged: GitNameStatusEntry[], state: GitRepoState, cfg: SyncConfig): Promise<void> {
-    if (!cfg.gitSync.confirmBeforePush) {
-      return;
-    }
-    const deleted = staged.filter((entry) => entry.status.includes("D")).length;
-    const summary = `${staged.length} staged file(s)${deleted > 0 ? `, including ${deleted} deletion(s)` : ""}. Push target: ${state.remote}/${this.resolveGitBranch(cfg, state)}.`;
-    const picked = await vscode.window.showWarningMessage(
-      `${summary}\n\nUntracked files are ${cfg.gitSync.includeUntracked ? "included by setting" : "excluded by default"}.`,
-      { modal: true },
-      "Commit & Push",
-    );
-    if (picked !== "Commit & Push") {
-      throw new Error("Git commit & push cancelled.");
-    }
+  public gitCommitAndPush(options: { pullFromStudioFirst?: boolean } = {}): Promise<void> {
+    return this.gitController.gitCommitAndPush(options);
   }
 
-  private async confirmGitPush(message: string, cfg: SyncConfig): Promise<void> {
-    if (!cfg.gitSync.confirmBeforePush) {
-      return;
-    }
-    const picked = await vscode.window.showWarningMessage(message, { modal: true }, "Push");
-    if (picked !== "Push") {
-      throw new Error("Git push cancelled.");
-    }
+  public gitPublishBranch(): Promise<void> {
+    return this.gitController.gitPublishBranch();
   }
 
-  private async gitCommitMessage(cfg: SyncConfig, branch: string): Promise<string> {
-    const value = await vscode.window.showInputBox({
-      title: "Git Commit Message",
-      value: buildCommitMessage(cfg.gitSync.commitMessageTemplate, branch),
-      prompt: "Commit message for the selected Renium changes",
-      ignoreFocusOut: true,
-      validateInput: (input) => input.trim().length === 0 ? "Commit message is required." : undefined,
-    });
-    const message = value?.trim() ?? "";
-    if (!message) {
-      throw new Error("Git commit cancelled because no commit message was provided.");
-    }
-    return message;
+  public gitCreateBranch(): Promise<void> {
+    return this.gitController.gitCreateBranch();
   }
 
-  private async pushGitBranch(cfg: SyncConfig, repoRoot: string, remote: string, branch: string, setUpstream: boolean): Promise<void> {
-    const args = setUpstream
-      ? ["push", "-u", remote, `HEAD:${branch}`]
-      : ["push", remote, `HEAD:${branch}`];
-    const result = await this.runGitCommand(cfg, repoRoot, args, "push");
-    this.ensureGitSuccess(result, "push");
+  public gitCheckoutBranch(): Promise<void> {
+    return this.gitController.gitCheckoutBranch();
   }
 
-  private validateBranchName(value: string): string | undefined {
-    const branch = value.trim();
-    if (!branch) {
-      return "Branch name is required.";
-    }
-    if (/\s/.test(branch) || branch.startsWith("-") || branch.includes("..") || branch.includes("~") || branch.includes("^") || branch.includes(":")) {
-      return "Branch name contains invalid characters.";
-    }
-    return undefined;
+  public gitConnectRepo(): Promise<void> {
+    return this.gitController.gitConnectRepo();
   }
 
-  private logGitState(state: GitRepoState): void {
-    const counts = state.view.counts;
-    this.output.appendLine(`[git-sync] repo=${state.repoRoot ?? "not connected"}`);
-    this.output.appendLine(`[git-sync] branch=${state.branch ?? "detached"} upstream=${state.upstream ?? "none"} remote=${state.remote ?? "none"}`);
-    if (state.remoteUrl) {
-      this.output.appendLine(`[git-sync] remoteUrl=${redactRemoteUrl(state.remoteUrl)}`);
-    }
-    this.output.appendLine(`[git-sync] ahead=${state.ahead} behind=${state.behind} changed=${counts.total} staged=${counts.staged} unstaged=${counts.unstaged} untracked=${counts.untracked} conflicts=${counts.conflicted}`);
-    for (const entry of state.entries.slice(0, 40)) {
-      this.output.appendLine(`[git-sync] ${entry.kind.padEnd(10)} ${entry.path}`);
-    }
-    if (state.entries.length > 40) {
-      this.output.appendLine(`[git-sync] ... ${state.entries.length - 40} more file(s)`);
-    }
+  public gitOpenRemote(): Promise<void> {
+    return this.gitController.gitOpenRemote();
   }
 
   public async serve(options: { silent?: boolean; bestEffort?: boolean } = {}): Promise<void> {
     const cfg = this.getConfig();
-    if (cfg.transport !== "ws") {
-      const message = "serve requires WebSocket bridge transport.";
-      if (options.bestEffort) {
-        this.output.appendLine(`[renium] serve skipped: ${message}`);
-        return;
-      }
-      throw new Error(message);
-    }
-
     this.bridgeServeRequested = true;
     this.liveSyncOwnsServe = false;
     this.consoleFollowOwnsServe = false;
     try {
-      await this.ensureBridgeDaemon(cfg.exportCliPath, cfg, { serve: true });
+      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: true });
     } catch (err) {
       this.bridgeServeRequested = false;
       this.updateStatusBar();
@@ -5592,322 +2525,6 @@ class RobloxSyncController {
     if (!options.silent) {
       vscode.window.showInformationMessage("Serve stopped.");
     }
-  }
-
-  public async benchmarkFullSync(): Promise<void> {
-    await this.enqueue("Benchmark full sync", async () => {
-      const cfg = this.getConfig();
-      const runCount = Math.max(1, cfg.benchmarkRuns);
-      const runs: BenchmarkRunMetrics[] = [];
-      this.output.appendLine(`[renium] benchmark: running 1 warm-up + ${runCount} measured full sync iterations`);
-
-      this.output.appendLine("[renium] benchmark: warm-up start (not counted)");
-        const warmupResult = await this.runExport({
-          services: cfg.services,
-          runImport: cfg.runImport,
-          notifyOnSuccess: false,
-          reason: "",
-          quietTimings: false,
-        });
-      const warmupMetrics = this.parseBenchmarkMetrics(warmupResult.output);
-      this.logBenchmarkRun("[renium] benchmark: warm-up", warmupMetrics);
-
-      for (let index = 0; index < runCount; index += 1) {
-        this.output.appendLine(`[renium] benchmark: run ${index + 1}/${runCount} start`);
-        const result = await this.runExport({
-          services: cfg.services,
-          runImport: cfg.runImport,
-          notifyOnSuccess: false,
-          reason: "",
-          quietTimings: false,
-        });
-        const metrics = this.parseBenchmarkMetrics(result.output);
-        runs.push(metrics);
-        this.logBenchmarkRun(`[renium] benchmark: run ${index + 1}/${runCount}`, metrics);
-        if (metrics.exportFingerprint) {
-          this.output.appendLine(`[renium] benchmark: run ${index + 1}/${runCount} export=${metrics.exportFingerprint}`);
-        }
-        if (metrics.bridgeFingerprint) {
-          this.output.appendLine(`[renium] benchmark: run ${index + 1}/${runCount} bridge=${metrics.bridgeFingerprint}`);
-        }
-      }
-
-      this.output.appendLine("[renium] benchmark summary:");
-      this.output.appendLine(
-        `[renium] benchmark: total ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.totalMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.totalMs), 0.9))} min=${this.formatMetricMs(this.minMetric(runs.map((run) => run.totalMs)))} max=${this.formatMetricMs(this.maxMetric(runs.map((run) => run.totalMs)))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service instance fetch ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServiceInstanceFetchMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServiceInstanceFetchMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service plugin server ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServicePluginServerMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServicePluginServerMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service plugin encode ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServicePluginEncodeMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServicePluginEncodeMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service payload bytes p50=${this.formatMetricBytes(this.percentile(runs.map((run) => run.trackedServicePayloadBytes), 0.5))} p90=${this.formatMetricBytes(this.percentile(runs.map((run) => run.trackedServicePayloadBytes), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service chunk count p50=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceChunkCount), 0.5))} p90=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceChunkCount), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service max frame ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServiceMaxFrameMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.trackedServiceMaxFrameMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service stall count >50ms p50=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceStallCountOver50Ms), 0.5))} p90=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceStallCountOver50Ms), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: tracked-service stall count >100ms p50=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceStallCountOver100Ms), 0.5))} p90=${this.formatMetricInt(this.percentile(runs.map((run) => run.trackedServiceStallCountOver100Ms), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: core export ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.coreExportMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.coreExportMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: bridge startup ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.bridgeStartupMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.bridgeStartupMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: handshake ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.handshakeMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.handshakeMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: service export sum ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.serviceExportSumMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.serviceExportSumMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: import tail ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.importCriticalTailMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.importCriticalTailMs), 0.9))}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark: unmeasured/scheduler gap ms p50=${this.formatMetricMs(this.percentile(runs.map((run) => run.unmeasuredOrSchedulerGapMs), 0.5))} p90=${this.formatMetricMs(this.percentile(runs.map((run) => run.unmeasuredOrSchedulerGapMs), 0.9))}`,
-      );
-      const lastRun = runs[runs.length - 1];
-      if (lastRun?.exportFingerprint) {
-        this.output.appendLine(`[renium] benchmark: export fingerprint=${lastRun.exportFingerprint}`);
-      }
-      if (lastRun?.bridgeFingerprint) {
-        this.output.appendLine(`[renium] benchmark: bridge fingerprint=${lastRun.bridgeFingerprint}`);
-      }
-      const benchmarkPath = path.join(cfg.projectRoot, ".renium", "benchmark-full-sync.latest.json");
-      const benchmarkPayload = {
-        generatedAt: new Date().toISOString(),
-        runCount,
-        services: cfg.services,
-        runImport: cfg.runImport,
-        importMode: cfg.importMode,
-        performanceMode: cfg.performanceMode,
-        modifiedDefaultBypass: cfg.modifiedDefaultBypass,
-        chunkSize: cfg.chunkSize,
-        bridgePorts: cfg.bridgePorts,
-        warmup: warmupMetrics,
-        summary: this.buildBenchmarkSummary(runs),
-        runs: runs.map((metrics, index) => ({
-          index: index + 1,
-          ...metrics,
-        })),
-      };
-      fs.mkdirSync(path.dirname(benchmarkPath), { recursive: true });
-      fs.writeFileSync(benchmarkPath, JSON.stringify(benchmarkPayload, null, 2), "utf8");
-      this.output.appendLine(`[renium] benchmark: saved metrics JSON to ${benchmarkPath}`);
-      vscode.window.showInformationMessage(`Benchmark full sync saved to ${benchmarkPath}.`);
-    });
-  }
-
-  public async benchmarkModifiedDefaultBypassAB(): Promise<void> {
-    await this.enqueue("Benchmark modified-default bypass A/B", async () => {
-      const baseCfg = this.getConfig();
-      const runCount = Math.max(1, baseCfg.benchmarkRuns);
-      const variants = [
-        { label: "off", modifiedDefaultBypass: false },
-        { label: "on", modifiedDefaultBypass: true },
-      ];
-      const variantResults: Array<{
-        label: string;
-        modifiedDefaultBypass: boolean;
-        warmup: BenchmarkRunMetrics;
-        runs: BenchmarkRunMetrics[];
-        summary: Record<string, unknown>;
-      }> = [];
-
-      this.output.appendLine(
-        `[renium] benchmark-ab: running ${variants.length} variants, each with 1 warm-up + ${runCount} measured runs`,
-      );
-
-      for (const variant of variants) {
-        const cfg: SyncConfig = {
-          ...baseCfg,
-          modifiedDefaultBypass: variant.modifiedDefaultBypass,
-        };
-        const runs: BenchmarkRunMetrics[] = [];
-        this.output.appendLine(
-          `[renium] benchmark-ab: ${variant.label}: warm-up start (modifiedDefaultBypass=${variant.modifiedDefaultBypass}, not counted)`,
-        );
-        const warmupResult = await this.runExport({
-          services: cfg.services,
-          runImport: cfg.runImport,
-          notifyOnSuccess: false,
-          reason: "",
-          quietTimings: false,
-          configOverrides: {
-            modifiedDefaultBypass: variant.modifiedDefaultBypass,
-          },
-        });
-        const warmup = this.parseBenchmarkMetrics(warmupResult.output);
-        this.logBenchmarkRun(`[renium] benchmark-ab: ${variant.label}: warm-up`, warmup);
-
-        for (let index = 0; index < runCount; index += 1) {
-          this.output.appendLine(`[renium] benchmark-ab: ${variant.label}: run ${index + 1}/${runCount} start`);
-          const result = await this.runExport({
-            services: cfg.services,
-            runImport: cfg.runImport,
-            notifyOnSuccess: false,
-            reason: "",
-            quietTimings: false,
-            configOverrides: {
-              modifiedDefaultBypass: variant.modifiedDefaultBypass,
-            },
-          });
-          const metrics = this.parseBenchmarkMetrics(result.output);
-          runs.push(metrics);
-          this.logBenchmarkRun(`[renium] benchmark-ab: ${variant.label}: run ${index + 1}/${runCount}`, metrics);
-        }
-
-        const summary = this.buildBenchmarkSummary(runs);
-        variantResults.push({
-          label: variant.label,
-          modifiedDefaultBypass: variant.modifiedDefaultBypass,
-          warmup,
-          runs,
-          summary,
-        });
-      }
-
-      const offSummary = variantResults.find((variant) => !variant.modifiedDefaultBypass)?.summary as
-        | Record<string, unknown>
-        | undefined;
-      const onSummary = variantResults.find((variant) => variant.modifiedDefaultBypass)?.summary as
-        | Record<string, unknown>
-        | undefined;
-      const offTotal = this.summaryP50(offSummary, "totalMs");
-      const onTotal = this.summaryP50(onSummary, "totalMs");
-      const offPlugin = this.summaryP50(offSummary, "trackedServicePluginServerMs");
-      const onPlugin = this.summaryP50(onSummary, "trackedServicePluginServerMs");
-      const totalDeltaMs = this.metricDelta(offTotal, onTotal);
-      const pluginDeltaMs = this.metricDelta(offPlugin, onPlugin);
-
-      this.output.appendLine(
-        `[renium] benchmark-ab: total p50 off=${this.formatMetricMs(offTotal)} on=${this.formatMetricMs(onTotal)} delta=${this.formatSignedMetricMs(totalDeltaMs)}`,
-      );
-      this.output.appendLine(
-        `[renium] benchmark-ab: tracked-service plugin server p50 off=${this.formatMetricMs(offPlugin)} on=${this.formatMetricMs(onPlugin)} delta=${this.formatSignedMetricMs(pluginDeltaMs)}`,
-      );
-
-      const benchmarkPath = path.join(baseCfg.projectRoot, ".renium", "benchmark-modified-default-bypass-ab.latest.json");
-      const payload = {
-        generatedAt: new Date().toISOString(),
-        runCount,
-        warmupRunsPerVariant: 1,
-        services: baseCfg.services,
-        runImport: baseCfg.runImport,
-        importMode: baseCfg.importMode,
-        performanceMode: baseCfg.performanceMode,
-        chunkSize: baseCfg.chunkSize,
-        bridgePorts: baseCfg.bridgePorts,
-        comparison: {
-          totalP50DeltaMs: totalDeltaMs,
-          trackedServicePluginServerP50DeltaMs: pluginDeltaMs,
-          totalP50OffMs: offTotal,
-          totalP50OnMs: onTotal,
-          trackedServicePluginServerP50OffMs: offPlugin,
-          trackedServicePluginServerP50OnMs: onPlugin,
-        },
-        variants: variantResults.map((variant) => ({
-          label: variant.label,
-          modifiedDefaultBypass: variant.modifiedDefaultBypass,
-          warmup: variant.warmup,
-          summary: variant.summary,
-          runs: variant.runs.map((metrics, index) => ({
-            index: index + 1,
-            ...metrics,
-          })),
-        })),
-      };
-      fs.mkdirSync(path.dirname(benchmarkPath), { recursive: true });
-      fs.writeFileSync(benchmarkPath, JSON.stringify(payload, null, 2), "utf8");
-      this.output.appendLine(`[renium] benchmark-ab: saved metrics JSON to ${benchmarkPath}`);
-      vscode.window.showInformationMessage(`Modified-default A/B benchmark saved to ${benchmarkPath}.`);
-    });
-  }
-
-  public async profilePluginOperations(): Promise<void> {
-    await this.enqueue("Profile plugin operations", async () => {
-      const cfg = this.getConfig();
-      const service = "ServerStorage";
-      const sampleCount = 256;
-      const iterations = 11;
-      const flags = "luau,instance,serialize";
-      const command = cfg.exportCliPath;
-      const args = [
-        "profile-plugin-ops",
-        "--project-root",
-        cfg.projectRoot,
-        "--snapshot-dir",
-        cfg.snapshotDir,
-        "--service",
-        service,
-        "--transport",
-        cfg.transport,
-        "--source-workers",
-        String(Math.max(0, cfg.sourceWorkers)),
-        "--instance-workers",
-        String(Math.max(0, cfg.instanceWorkers)),
-        "--import-workers",
-        String(Math.max(0, cfg.importWorkers)),
-        "--performance-mode",
-        cfg.performanceMode,
-        ...(cfg.modifiedDefaultBypass ? ["--modified-default-bypass"] : ["--no-modified-default-bypass"]),
-        "--chunk-size",
-        String(Math.max(512, cfg.chunkSize)),
-        "--snapshot-instance-chunk-size",
-        String(Math.max(0, cfg.snapshotInstanceChunkSize)),
-        "--bridge-wait-seconds",
-        String(Math.max(1, cfg.bridgeWaitSeconds)),
-        "--bridge-ports",
-        cfg.bridgePorts,
-        "--server",
-        cfg.server,
-        "--config",
-        cfg.configTomlPath,
-        "--ws-wait-seconds",
-        String(Math.max(1, cfg.wsWaitSeconds)),
-        cfg.adaptiveThrottle ? "--adaptive-throttle" : "--no-adaptive-throttle",
-        cfg.noUpdateEditorIcons ? "--no-update-editor-icons" : "",
-        "--sample-count",
-        String(sampleCount),
-        "--iterations",
-        String(iterations),
-        "--flags",
-        flags,
-      ].filter((value) => value.length > 0);
-      const directArgs = this.withPlaceSelector(cfg, args);
-
-      this.output.show(false);
-      this.logResolvedConfig(cfg);
-      this.output.appendLine(`[renium] profile command: ${command} ${this.renderArgs(directArgs)}`);
-      const result = await this.runCommand(command, directArgs, cfg.projectRoot, "profile-plugin-ops", cfg.progressHeartbeatSeconds);
-      if (result.code !== 0) {
-        throw new Error(`Plugin op profile exited with code ${result.code}`);
-      }
-
-      const profile = this.extractPluginProfile(result.output);
-      const profilePath = path.join(cfg.projectRoot, ".renium", "profile-plugin-ops.latest.json");
-      fs.mkdirSync(path.dirname(profilePath), { recursive: true });
-      fs.writeFileSync(profilePath, JSON.stringify(profile, null, 2), "utf8");
-      this.output.appendLine(`[renium] profile: saved raw JSON to ${profilePath}`);
-      this.output.appendLine(`[renium] profile: ranked cost per 100k calls for ${service}`);
-      for (const line of this.formatPluginProfileRanking(profile, 18)) {
-        this.output.appendLine(line);
-      }
-
-      vscode.window.showInformationMessage(`Plugin profile saved to ${profilePath}.`);
-    });
   }
 
   public async startLiveSync(
@@ -5961,14 +2578,8 @@ class RobloxSyncController {
       }
 
       const cfg = this.getConfig();
-      if (cfg.transport !== "ws") {
-        if (!options.silent) {
-          vscode.window.showErrorMessage('Live sync needs the WebSocket transport. Set "renium.transport" to "ws" in Settings.');
-        }
-        return;
-      }
       try {
-        this.ensureFileExists(cfg.exportCliPath);
+        ensureFileExists(cfg.cliPath);
       } catch (err) {
         if (!options.bestEffort) {
           throw err;
@@ -6004,12 +2615,12 @@ class RobloxSyncController {
         }
         const changed = path.resolve(uri.fsPath);
         if (sourceGraph.manifests.some((manifest) =>
-          this.normalizePathForCompare(manifest) === this.normalizePathForCompare(changed))) {
+          filesystemPathKey(manifest) === filesystemPathKey(changed))) {
           this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
           return;
         }
         if (sourceGraph.locations.some((location) =>
-          this.normalizePathForCompare(location) === this.normalizePathForCompare(changed))) {
+          filesystemPathKey(location) === filesystemPathKey(changed))) {
           this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
         }
         if (this.isProjectSourcePath(changed, cfg, sourceGraph)) {
@@ -6017,14 +2628,14 @@ class RobloxSyncController {
           return;
         }
         if (sourceGraph.locations.some((location) =>
-          this.isPathInside(changed, location) || this.isPathInside(location, changed))) {
+          isPathInside(changed, location) || isPathInside(location, changed))) {
           this.scheduleLiveSyncGraphRefresh(cfg.projectRoot);
         }
       };
       const directories = [...sourceGraph.directories];
       if (fs.existsSync(srcRoot) && fs.statSync(srcRoot).isDirectory()
         && !directories.some((root) =>
-          this.normalizePathForCompare(root) === this.normalizePathForCompare(srcRoot))) {
+          filesystemPathKey(root) === filesystemPathKey(srcRoot))) {
         directories.unshift(srcRoot);
       }
       const exactFiles = [...sourceGraph.files, ...sourceGraph.manifests];
@@ -6044,7 +2655,7 @@ class RobloxSyncController {
         const pattern = recursive
           ? relative === "" ? "**/*" : `${relative}/**/*`
           : relative;
-        const key = `${this.normalizePathForCompare(base)}\0${pattern}`;
+        const key = `${filesystemPathKey(base)}\0${pattern}`;
         patterns.set(key, new vscode.RelativePattern(base, pattern));
       };
       for (const directory of directories) {
@@ -6090,8 +2701,8 @@ class RobloxSyncController {
           initialState = await this.getStudioChangeState(
             liveCfg,
             liveCfg.services,
-            this.studioChangeAckOptions(
-              this.studioChangeSeq(initialState),
+            studioChangeAckOptions(
+              studioChangeSeq(initialState),
               initialState.runtimeId,
             ),
           );
@@ -6119,13 +2730,7 @@ class RobloxSyncController {
       this.liveSyncStartupInProgress = false;
       if (this.liveSyncGraphRefreshPending) {
         this.liveSyncGraphRefreshPending = false;
-        let projectRoot = this.liveSyncProjectRoot;
-        if (!projectRoot) {
-          try {
-            projectRoot = this.getConfig().projectRoot;
-          } catch {
-          }
-        }
+        const projectRoot = this.liveSyncProjectRoot ?? this.tryGetConfig()?.projectRoot;
         if (projectRoot) {
           this.scheduleLiveSyncGraphRefresh(projectRoot);
         }
@@ -6140,9 +2745,6 @@ class RobloxSyncController {
     cfg: SyncConfig,
     options: { bestEffort?: boolean } = {},
   ): Promise<boolean> {
-    if (cfg.transport !== "ws") {
-      return true;
-    }
     const startedServe = !this.bridgeServeRequested;
     this.bridgeServeRequested = true;
     if (this.consoleFollowOwnsServe) {
@@ -6152,15 +2754,15 @@ class RobloxSyncController {
       this.liveSyncOwnsServe = true;
     }
     try {
-      await this.ensureBridgeDaemon(cfg.exportCliPath, cfg, { serve: true });
+      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: true });
       const result = await this.runAutomationOperation(
-        cfg.exportCliPath,
+        cfg.cliPath,
         cfg,
         "live-sync-wait-for-plugin",
         AUTOMATION_OP.liveStatus,
         {
-          services: this.normalizeServices(cfg.services, cfg.services).join(","),
-          bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+          services: normalizeServices(cfg.services, cfg.services).join(","),
+          bridgeWaitSeconds: editorBridgeWaitSeconds(cfg),
           bridgePorts: cfg.bridgePorts,
           contextBound: true,
         },
@@ -6287,8 +2889,8 @@ class RobloxSyncController {
         initialState = await this.getStudioChangeState(
           runtimeCfg,
           runtimeCfg.services,
-          this.studioChangeAckOptions(
-            this.studioChangeSeq(initialState),
+          studioChangeAckOptions(
+            studioChangeSeq(initialState),
             initialState.runtimeId,
           ),
         );
@@ -6333,13 +2935,7 @@ class RobloxSyncController {
   }
 
   public activeLinkManifest(): { filePath: string; autoApply: boolean; projectRoot: string; generation: number } {
-    const cfg = this.getConfig();
-    return {
-      filePath: path.normalize(this.linkManifestPath(cfg)),
-      autoApply: cfg.linkSync.autoApply,
-      projectRoot: cfg.projectRoot,
-      generation: this.experienceGeneration,
-    };
+    return this.packageSyncController.activeLinkManifest(this.experienceGeneration);
   }
 
   private trackStudioImport<T>(generation: number | undefined, task: Promise<T>): Promise<T> {
@@ -6358,6 +2954,11 @@ class RobloxSyncController {
     tasks.add(tracked);
     this.studioImportTasks.set(generation, tasks);
     return tracked;
+  }
+
+  private isStudioLiveSyncCurrent(generation?: number): boolean {
+    return generation === undefined
+      || (generation === this.studioLiveSyncGeneration && this.studioLiveSyncStarted);
   }
 
   private async waitForStudioImportTasks(maxGeneration: number): Promise<void> {
@@ -6382,21 +2983,11 @@ class RobloxSyncController {
     return delayMs;
   }
 
-  private nextIdleStudioLiveSyncPollDelay(cfg: SyncConfig): number {
+  private nextStudioLiveSyncPollDelay(cfg: SyncConfig, maxDelayMs: number): number {
     const baseDelayMs = this.studioLiveSyncBasePollDelayMs(cfg);
-    const currentDelayMs = Math.max(baseDelayMs, this.studioLiveSyncNextPollMs || baseDelayMs);
+    const currentDelayMs = Math.max(baseDelayMs, this.studioLiveSyncNextPollMs);
     this.studioLiveSyncNextPollMs = Math.min(
-      MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS,
-      Math.max(baseDelayMs, Math.ceil(currentDelayMs * STUDIO_LIVE_SYNC_POLL_BACKOFF_MULTIPLIER)),
-    );
-    return currentDelayMs;
-  }
-
-  private nextErrorStudioLiveSyncPollDelay(cfg: SyncConfig): number {
-    const baseDelayMs = this.studioLiveSyncBasePollDelayMs(cfg);
-    const currentDelayMs = Math.max(baseDelayMs, this.studioLiveSyncNextPollMs || baseDelayMs);
-    this.studioLiveSyncNextPollMs = Math.min(
-      MAX_STUDIO_LIVE_SYNC_ERROR_POLL_MS,
+      maxDelayMs,
       Math.max(baseDelayMs, Math.ceil(currentDelayMs * STUDIO_LIVE_SYNC_POLL_BACKOFF_MULTIPLIER)),
     );
     return currentDelayMs;
@@ -6434,7 +3025,7 @@ class RobloxSyncController {
           return;
         }
         const latestCfg = this.getConfig();
-        const nextDelayMs = this.nextErrorStudioLiveSyncPollDelay(latestCfg);
+        const nextDelayMs = this.nextStudioLiveSyncPollDelay(latestCfg, MAX_STUDIO_LIVE_SYNC_ERROR_POLL_MS);
         const message = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[renium] Studio -> editor live sync failed: ${message}`);
         this.scheduleStudioLiveSyncPoll(latestCfg, nextDelayMs, generation);
@@ -6454,7 +3045,7 @@ class RobloxSyncController {
     if (this.studioLiveSyncInFlightGenerations.has(generation)) {
       this.scheduleStudioLiveSyncPoll(
         cfg,
-        this.nextIdleStudioLiveSyncPollDelay(cfg),
+        this.nextStudioLiveSyncPollDelay(cfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS),
         generation,
       );
       return;
@@ -6462,7 +3053,7 @@ class RobloxSyncController {
     this.studioLiveSyncInFlightGenerations.add(generation);
     let nextDelayMs = this.studioLiveSyncBasePollDelayMs(cfg);
     try {
-      const idleWaitMs = this.nextIdleStudioLiveSyncPollDelay(cfg);
+      const idleWaitMs = this.nextStudioLiveSyncPollDelay(cfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       const state = await this.getStudioChangeState(cfg, cfg.services, {
         start: true,
         waitSeconds: this.studioLiveSyncWaitSeconds(idleWaitMs),
@@ -6477,10 +3068,10 @@ class RobloxSyncController {
         return;
       }
       this.studioConflictPolicyOverride = typeof state.conflictResolution === "string" && state.conflictResolution.trim().length > 0
-        ? this.normalizeConflictPolicy(state.conflictResolution)
+        ? normalizeConflictPolicy(state.conflictResolution)
         : undefined;
       const dirtyServices = Array.isArray(state.dirtyServices)
-        ? this.normalizeReportedServices(state.dirtyServices, cfg.services)
+        ? normalizeReportedServices(state.dirtyServices, cfg.services)
         : [];
       const pendingServices = this.pendingStudioImportServiceSet(runtimeCfg);
       const blockedServices = dirtyServices.filter((service) =>
@@ -6492,7 +3083,7 @@ class RobloxSyncController {
       }
       const importableServices = dirtyServices.filter((service) =>
         !pendingServices.has(service.toLowerCase()));
-      const observedSeq = this.studioChangeSeq(state);
+      const observedSeq = studioChangeSeq(state);
       const reviewKey = JSON.stringify([
         state.runtimeId ?? "",
         observedSeq,
@@ -6500,12 +3091,7 @@ class RobloxSyncController {
       ]);
       if (importableServices.length > 0) {
         nextDelayMs = this.resetStudioLiveSyncPollDelay(runtimeCfg);
-        const ackObservedDirty = this.studioChangeAckOptions(observedSeq, state.runtimeId);
-        if (this.shouldDropLikelySelfDirtyStudioState(importableServices, runtimeCfg)) {
-          ackObservedDirty.suppressSeconds = Math.max(1, Math.min(4, runtimeCfg.studioLiveSyncPollMs / 1000 + 1.5));
-          await this.getStudioChangeState(runtimeCfg, importableServices, ackObservedDirty);
-          return;
-        }
+        const ackObservedDirty = studioChangeAckOptions(observedSeq, state.runtimeId);
         let propertyImport: "applied" | "fallback" | "pending" = "fallback";
         try {
           propertyImport = await this.tryApplyStudioPropertyChangesToEditor(
@@ -6529,7 +3115,6 @@ class RobloxSyncController {
           await this.enqueueStudioToEditorSyncIfChanged(
             importableServices,
             runtimeCfg,
-            state,
             generation,
           );
         }
@@ -6538,16 +3123,18 @@ class RobloxSyncController {
         }
         await this.getStudioChangeState(runtimeCfg, importableServices, ackObservedDirty);
       } else if (dirtyServices.length > 0) {
-        nextDelayMs = this.nextIdleStudioLiveSyncPollDelay(runtimeCfg);
+        nextDelayMs = this.nextStudioLiveSyncPollDelay(runtimeCfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       } else {
-        nextDelayMs = state.eventDriven === true ? MIN_STUDIO_LIVE_SYNC_POLL_MS : this.nextIdleStudioLiveSyncPollDelay(runtimeCfg);
+        nextDelayMs = state.eventDriven === true
+          ? MIN_STUDIO_LIVE_SYNC_POLL_MS
+          : this.nextStudioLiveSyncPollDelay(runtimeCfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       }
     } catch (err) {
       if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
         return;
       }
       const latestCfg = this.getConfig();
-      nextDelayMs = this.nextErrorStudioLiveSyncPollDelay(latestCfg);
+      nextDelayMs = this.nextStudioLiveSyncPollDelay(latestCfg, MAX_STUDIO_LIVE_SYNC_ERROR_POLL_MS);
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[renium] Studio -> editor live sync failed: ${message}`);
     } finally {
@@ -6578,8 +3165,8 @@ class RobloxSyncController {
       waitSeconds?: number;
     } = {},
   ): Promise<StudioChangeState> {
-    const command = cfg.exportCliPath;
-    this.ensureFileExists(command);
+    const command = cfg.cliPath;
+    ensureFileExists(command);
     if (
       typeof options.ackSeq === "number"
       || options.ackActionIds?.length
@@ -6603,9 +3190,9 @@ class RobloxSyncController {
       "studio-change-state",
       operation,
       {
-        bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+        bridgeWaitSeconds: editorBridgeWaitSeconds(cfg),
         bridgePorts: cfg.bridgePorts,
-        services: this.normalizeServices(services, cfg.services).join(","),
+        services: normalizeServices(services, cfg.services).join(","),
         reset: options.reset === true,
         replaceServices: options.replaceServices === true,
         clearPending: options.clearPending === true,
@@ -6628,8 +3215,8 @@ class RobloxSyncController {
       throw new Error(`Studio change state exited with code ${result.code}`);
     }
     const state = result.result && typeof result.result === "object"
-      ? this.parseStudioChangeStatePayload(JSON.stringify(result.result))
-      : this.parseStudioChangeState(result.output);
+      ? parseStudioChangeState(JSON.stringify(result.result))
+      : parseStudioChangeState(result.output);
     if (!state) {
       throw new Error("Studio change state did not return a plugin result.");
     }
@@ -6674,8 +3261,8 @@ class RobloxSyncController {
     }
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
     const editor = await vscode.window.showTextDocument(document, { preview: false });
-    return this.normalizePathForCompare(editor.document.uri.fsPath) ===
-      this.normalizePathForCompare(sourcePath);
+    return filesystemPathKey(editor.document.uri.fsPath) ===
+      filesystemPathKey(sourcePath);
   }
 
   private scheduleStudioActionPoll(delayMs = 750): void {
@@ -6760,83 +3347,10 @@ class RobloxSyncController {
     };
   }
 
-  private studioChangeSeq(state: StudioChangeState): number | undefined {
-    if (typeof state.seq !== "number" || !Number.isFinite(state.seq)) {
-      return undefined;
-    }
-    return Math.max(0, Math.floor(state.seq));
-  }
-
-  private studioChangeAckOptions(
-    observedSeq: number | undefined,
-    runtimeId: string | undefined,
-  ): { reset?: boolean; ackSeq?: number; runtimeId?: string; start?: boolean; suppressSeconds?: number } {
-    const options: {
-      reset?: boolean;
-      ackSeq?: number;
-      runtimeId?: string;
-      start?: boolean;
-      suppressSeconds?: number;
-    } = { start: true };
-    if (observedSeq !== undefined) {
-      options.ackSeq = observedSeq;
-      options.runtimeId = runtimeId;
-    }
-    return options;
-  }
-
-  private studioChangeLogEntries(state: StudioChangeState | undefined, services?: string[]): StudioChangeLog[] {
-    if (!state || !Array.isArray(state.changes)) {
-      return [];
-    }
-    const serviceSet = services ? new Set(services.map((service) => service.trim()).filter(Boolean)) : undefined;
-    return state.changes
-      .filter((change) => {
-        const service = String(change.service ?? "").trim();
-        return service.length > 0 && (!serviceSet || serviceSet.has(service));
-      })
-      .sort((a, b) => (Number(a.seq ?? 0) || 0) - (Number(b.seq ?? 0) || 0));
-  }
-
-  private studioChangePath(change: StudioChangeLog): string {
-    if (typeof change.path === "string" && change.path.length > 0) {
-      return change.path;
-    }
-    if (Array.isArray(change.pathSegments) && change.pathSegments.length > 0) {
-      return change.pathSegments.map((segment) => String(segment)).join(".");
-    }
-    return String(change.service ?? "").trim() || "<unknown>";
-  }
-
-  private formatStudioChange(change: StudioChangeLog, mode: "property" | "full"): string {
-    const pathLabel = this.studioChangePath(change);
-    const action = String(change.action ?? (mode === "property" ? "property" : "fullSync"));
-    const className = String(change.className ?? "").trim();
-    const property = String(change.property ?? "").trim();
-    const attribute = String(change.attribute ?? "").trim();
-    const suffix = property
-      ? `.${property}`
-      : attribute
-        ? `.@${attribute}`
-        : "";
-    const detailParts = [
-      action,
-      className.length > 0 ? className : undefined,
-      mode === "full" || change.fullSync === true ? "full export" : "property write",
-    ].filter((value): value is string => typeof value === "string" && value.length > 0);
-    return `${pathLabel}${suffix} (${detailParts.join(", ")})`;
-  }
-
-  private logStudioChanges(state: StudioChangeState | undefined, mode: "property" | "full", services: string[]): void {
-    void state;
-    void mode;
-    void services;
-  }
-
   private logEditorChangedPaths(label: string, filePaths: string[], cfg: SyncConfig): void {
     const maxEntries = 25;
     for (const filePath of filePaths.slice(0, maxEntries)) {
-      this.output.appendLine(`[renium] ${label}: ${this.normalizePathForCompare(path.relative(cfg.projectRoot, filePath))}`);
+      this.output.appendLine(`[renium] ${label}: ${filesystemPathKey(path.relative(cfg.projectRoot, filePath))}`);
     }
     if (filePaths.length > maxEntries) {
       this.output.appendLine(`[renium] ${label}: ${filePaths.length - maxEntries} more file(s)`);
@@ -6862,24 +3376,17 @@ class RobloxSyncController {
   private async enqueueStudioToEditorSyncIfChanged(
     services: string[],
     cfg: SyncConfig,
-    state?: StudioChangeState,
     generation?: number,
   ): Promise<void> {
     const run = async (): Promise<void> => {
-      if (
-        generation !== undefined &&
-        (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-      ) {
+      if (!this.isStudioLiveSyncCurrent(generation)) {
         return;
       }
       let taskStarted = false;
       const taskName = "Studio -> Editor sync";
       try {
         const diff = await this.exportStudioLiveSyncSnapshotAndDiff(services, cfg, { quietProbe: true });
-        if (
-          generation !== undefined &&
-          (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-        ) {
+        if (!this.isStudioLiveSyncCurrent(generation)) {
           return;
         }
         if (diff.changedServices.length === 0) {
@@ -6887,7 +3394,6 @@ class RobloxSyncController {
         }
         taskStarted = true;
         this.setActiveTask(taskName);
-        this.logStudioChanges(state, "full", diff.changedServices);
         await this.importStudioLiveSyncSnapshot(diff.changedServices, cfg, diff.fingerprintsByService, {
           quietLog: true,
           generation,
@@ -6919,7 +3425,7 @@ class RobloxSyncController {
     cfg: SyncConfig,
     options: { quietProbe?: boolean } = {},
   ): Promise<StudioSnapshotDiff> {
-    const selectedServices = this.normalizeServices(services, cfg.services);
+    const selectedServices = normalizeServices(services, cfg.services);
     await this.getStudioChangeState(cfg, selectedServices, { start: true });
     await this.runExport({
       services: selectedServices,
@@ -6928,7 +3434,11 @@ class RobloxSyncController {
       reason: "",
       quietLog: options.quietProbe === true,
     });
-    return await this.diffServicesBySnapshotFingerprint(selectedServices, cfg);
+    return diffStudioSnapshots(
+      selectedServices,
+      this.resolveSnapshotPath(cfg),
+      this.studioSnapshotFingerprintByService,
+    );
   }
 
   private importStudioLiveSyncSnapshot(
@@ -6949,13 +3459,10 @@ class RobloxSyncController {
     fingerprintsByService?: Map<string, string>,
     options: { quietLog?: boolean; studioAuthoritative?: boolean; generation?: number } = {},
   ): Promise<void> {
-    if (
-      options.generation !== undefined &&
-      (options.generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-    ) {
+    if (!this.isStudioLiveSyncCurrent(options.generation)) {
       return;
     }
-    const selectedServices = this.normalizeServices(services, cfg.services);
+    const selectedServices = normalizeServices(services, cfg.services);
     this.studioToEditorImportInProgress = true;
     const capturedLocalEdits = await this.captureLocalScriptEditsForServices(
       selectedServices,
@@ -6963,27 +3470,30 @@ class RobloxSyncController {
       options.studioAuthoritative !== true,
     );
     try {
-      const changedPaths = await this.runRustImport(
+      const changedPaths = await this.importSnapshots(
         cfg,
         this.resolveSnapshotPath(cfg),
         selectedServices,
         { quietLog: options.quietLog === true },
       );
-      const stillCurrent = options.generation === undefined
-        || (options.generation === this.studioLiveSyncGeneration && this.studioLiveSyncStarted);
+      const stillCurrent = this.isStudioLiveSyncCurrent(options.generation);
       const affectedKeys = new Set(
-        changedPaths.map((filePath) => this.normalizePathForCompare(filePath)),
+        changedPaths.map((filePath) => filesystemPathKey(filePath)),
       );
       const affectedLocalEdits = new Map(
         [...capturedLocalEdits].filter(([filePath]) =>
-          affectedKeys.has(this.normalizePathForCompare(filePath))),
+          affectedKeys.has(filesystemPathKey(filePath))),
       );
       const survivingLocalEdits = this.reconcileLocalEditsAfterFullImport(
         changedPaths,
         cfg,
         affectedLocalEdits,
       );
-      this.commitStudioSnapshotFingerprints(selectedServices, fingerprintsByService);
+      commitStudioSnapshotFingerprints(
+        selectedServices,
+        fingerprintsByService,
+        this.studioSnapshotFingerprintByService,
+      );
       await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
       if (survivingLocalEdits.length > 0) {
         this.invalidateEditorLiveSyncCacheEntries(survivingLocalEdits, cfg);
@@ -6996,15 +3506,11 @@ class RobloxSyncController {
         }
       }
       if (stillCurrent) {
-        try {
-          await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
-        } catch {
-        }
+        await executeCommandBestEffort("renium.fileExplorer.refreshServices", selectedServices);
       }
     } finally {
       this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
       this.studioToEditorImportInProgress = false;
-      this.studioToEditorLastSyncEndedAt = Date.now();
     }
   }
 
@@ -7017,10 +3523,7 @@ class RobloxSyncController {
     generation?: number,
     reviewKey?: string,
   ): Promise<"apply" | "full" | "discard" | "pending"> {
-    if (
-      generation !== undefined
-      && (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-    ) {
+    if (!this.isStudioLiveSyncCurrent(generation)) {
       return "pending";
     }
     if (
@@ -7057,21 +3560,7 @@ class RobloxSyncController {
       this.changePreviewIconNames = new Set(loadAssetIconNames(this.context.extensionUri));
     }
     const iconNames = this.changePreviewIconNames;
-    const rows: Array<{
-      service: string;
-      path: string;
-      pathSegments: string[];
-      pathOrdinals: number[];
-      identity: string;
-      leaf: string;
-      className: string;
-      icon: string;
-      scope: string;
-      property: string;
-      status?: string;
-      oldValue?: unknown;
-      newValue?: unknown;
-    }> = propertyChanges.map((change, index) => {
+    const rows: ChangePreviewRow[] = propertyChanges.map((change, index) => {
       const segments = Array.isArray(change.pathSegments)
         ? change.pathSegments.map((segment) => String(segment))
         : [];
@@ -7136,7 +3625,7 @@ class RobloxSyncController {
       });
     }
 
-    return await this.showChangeReviewPanel(
+    return this.showChangeReviewPanel(
       rows,
       changeCount,
       cfg.changesThreshold,
@@ -7148,21 +3637,7 @@ class RobloxSyncController {
   }
 
   private async showChangeReviewPanel(
-    rows: Array<{
-      service: string;
-      path: string;
-      pathSegments: string[];
-      pathOrdinals: number[];
-      identity: string;
-      leaf: string;
-      className: string;
-      icon: string;
-      scope: string;
-      property: string;
-      status?: string;
-      oldValue?: unknown;
-      newValue?: unknown;
-    }>,
+    rows: ChangePreviewRow[],
     changeCount: number,
     threshold: number,
     mode: "property" | "structural",
@@ -7170,10 +3645,7 @@ class RobloxSyncController {
     generation?: number,
     reviewKey?: string,
   ): Promise<"apply" | "full" | "discard" | "pending"> {
-    if (
-      generation !== undefined &&
-      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-    ) {
+    if (!this.isStudioLiveSyncCurrent(generation)) {
       return "pending";
     }
     const defaultDecision = "pending";
@@ -7192,9 +3664,16 @@ class RobloxSyncController {
     );
     this.changePreviewPanel = panel;
     const assetBase = panel.webview.asWebviewUri(assetsUri).toString();
-    panel.webview.html = this.buildChangePreviewHtml(rows, changeCount, threshold, assetBase, mode);
+    panel.webview.html = buildChangePreviewHtml(
+      rows,
+      changeCount,
+      threshold,
+      assetBase,
+      mode,
+      this.changePreviewIconNames ?? new Set<string>(),
+    );
 
-    return await new Promise<"apply" | "full" | "discard" | "pending">((resolve) => {
+    return new Promise<"apply" | "full" | "discard" | "pending">((resolve) => {
       let settled = false;
       const finish = (decision: "apply" | "full" | "discard" | "pending"): void => {
         if (settled) {
@@ -7215,10 +3694,12 @@ class RobloxSyncController {
                 return;
               }
               this.forcedStudioReviewKey = reviewKey;
-              try {
-                const cfg = this.effectiveLiveSyncConfig(this.getConfig());
-                this.scheduleStudioLiveSyncPoll(cfg, MIN_STUDIO_LIVE_SYNC_POLL_MS);
-              } catch {
+              const cfg = this.tryGetConfig();
+              if (cfg) {
+                this.scheduleStudioLiveSyncPoll(
+                  this.effectiveLiveSyncConfig(cfg),
+                  MIN_STUDIO_LIVE_SYNC_POLL_MS,
+                );
               }
             });
           }
@@ -7238,491 +3719,6 @@ class RobloxSyncController {
       });
       panel.onDidDispose(() => finish(defaultDecision));
     });
-  }
-
-  private buildChangePreviewHtml(
-    rows: Array<{
-      service: string;
-      path: string;
-      pathSegments: string[];
-      pathOrdinals: number[];
-      identity: string;
-      leaf: string;
-      className: string;
-      icon: string;
-      scope: string;
-      property: string;
-      status?: string;
-      oldValue?: unknown;
-      newValue?: unknown;
-    }>,
-    changeCount: number,
-    threshold: number,
-    assetBase: string,
-    mode: "property" | "structural",
-  ): string {
-    const payload = JSON.stringify(rows).replace(/</g, "\\u003c");
-    const instanceCount = new Set(rows.map((row) => `${row.service}\0${row.identity}`)).size;
-    const services = [...new Set(rows.map((row) => row.service).filter((service) => service.length > 0))];
-    const iconNames = this.changePreviewIconNames ?? new Set<string>();
-    const folderIcon = iconAssetNameForClass("Folder", iconNames);
-    const serviceIcons = Object.fromEntries(
-      services.map((service) => [service, iconAssetNameForClass(service, iconNames)]),
-    );
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-  :root {
-    color-scheme: light dark;
-    --ink: rgba(255,255,255,0.92);
-    --ink-mid: rgba(255,255,255,0.60);
-    --ink-dim: rgba(255,255,255,0.38);
-    --surface: rgba(255,255,255,0.032);
-    --surface-hover: rgba(255,255,255,0.055);
-    --edge: rgba(255,255,255,0.085);
-    --edge-soft: rgba(255,255,255,0.05);
-    --amber: #e8b53f;
-    --red: #f47f76;
-    --green: #66c88e;
-  }
-  body.vscode-light, body.vscode-high-contrast-light {
-    --ink: rgba(20,22,28,0.92);
-    --ink-mid: rgba(20,22,28,0.62);
-    --ink-dim: rgba(20,22,28,0.40);
-    --surface: rgba(18,20,26,0.035);
-    --surface-hover: rgba(18,20,26,0.06);
-    --edge: rgba(18,20,26,0.12);
-    --edge-soft: rgba(18,20,26,0.07);
-    --amber: #b8860b;
-    --red: #d0453a;
-    --green: #1f8a4c;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  ::-webkit-scrollbar { width: 9px; }
-  ::-webkit-scrollbar-thumb { background: var(--edge); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--ink-dim); border: 2px solid transparent; background-clip: padding-box; }
-  body {
-    font-family: "Segoe UI Variable Text", "Inter", var(--vscode-font-family, "Segoe UI"), sans-serif;
-    -webkit-font-smoothing: antialiased;
-    font-size: 13px; line-height: 1.5;
-    color: var(--ink);
-    background: var(--vscode-editor-background, #17171a);
-    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
-  }
-  .header { padding: 26px 30px 20px; flex: none; }
-  .kicker {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--ink-dim);
-  }
-  .kicker b { color: var(--ink-mid); font-weight: 700; }
-  .pulse {
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--amber);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent);
-    animation: pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite; flex: none;
-  }
-  @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent); }
-    70% { box-shadow: 0 0 0 7px transparent; }
-    100% { box-shadow: 0 0 0 0 transparent; }
-  }
-  h1 { font-size: 19px; font-weight: 640; letter-spacing: -0.018em; margin-top: 10px; }
-  .subtitle { margin-top: 4px; font-size: 12.5px; color: var(--ink-mid); max-width: 60ch; }
-  .subtitle b { color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; }
-  .subtitle .threshold { color: var(--amber); font-weight: 620; font-variant-numeric: tabular-nums; }
-  .toolbar { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
-  .filter {
-    flex: none; width: 240px; font-family: inherit; font-size: 12px;
-    color: var(--ink); background: var(--surface); border: 1px solid var(--edge);
-    border-radius: 7px; padding: 5px 11px; outline: none;
-    transition: border-color 0.12s ease, background 0.12s ease;
-  }
-  .filter:focus { border-color: var(--ink-dim); background: var(--surface-hover); }
-  .filter::placeholder { color: var(--ink-dim); }
-  .toolbar-hint { font-size: 11px; color: var(--ink-dim); }
-  .list { flex: 1; overflow-y: auto; padding: 6px 22px 26px; position: relative; animation: rise 0.3s cubic-bezier(0.16, 1, 0.3, 1) both; }
-  #sizer { position: relative; width: 100%; }
-  #viewport { position: absolute; left: 0; right: 0; top: 0; }
-  .row {
-    display: flex; align-items: center; height: 26px; border-radius: 6px;
-    padding-right: 10px; cursor: pointer; user-select: none; min-width: 0;
-  }
-  .row:hover { background: var(--surface-hover); }
-  .twisty {
-    width: 17px; flex: none; text-align: center; color: var(--ink-dim);
-    font-size: 10px; line-height: 1; transition: transform 0.12s ease;
-  }
-  .twisty.open { transform: rotate(90deg); }
-  .twisty.blank { visibility: hidden; }
-  .icon {
-    width: 16px; height: 16px; flex: none; margin-right: 6px;
-    display: block; object-fit: contain; object-position: center center; image-rendering: pixelated;
-  }
-  .rname { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .row.folder .rname { color: var(--ink-mid); }
-  .rsep { color: var(--ink-dim); margin: 0 4px; font-size: 11px; }
-  .count {
-    margin-left: auto; flex: none; font-size: 10px; font-weight: 650;
-    padding: 1px 8px; border-radius: 999px;
-    background: var(--surface-hover); color: var(--ink-mid);
-    font-variant-numeric: tabular-nums;
-  }
-  .prop-row {
-    display: grid; grid-template-columns: minmax(120px, 190px) 1fr;
-    gap: 16px; align-items: center; height: 26px; padding: 0 10px; border-radius: 6px;
-  }
-  .prop-row:hover { background: var(--surface-hover); }
-  .prop-name-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
-  .prop-name {
-    font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
-    font-size: 11.5px; font-weight: 450; color: var(--ink-mid);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .scope-badge {
-    font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.1em;
-    padding: 1px 6px; border-radius: 4px; flex: none;
-    color: var(--ink-dim);
-    background: var(--surface-hover);
-  }
-  .values { display: flex; align-items: center; gap: 8px; min-width: 0; font-variant-numeric: tabular-nums; }
-  .val {
-    font-family: "Cascadia Code", "JetBrains Mono", var(--vscode-editor-font-family, Consolas), monospace;
-    font-size: 11.5px; padding: 2px 9px; border-radius: 6px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .val.old {
-    color: color-mix(in srgb, var(--red) 82%, var(--ink));
-    background: color-mix(in srgb, var(--red) 9%, transparent);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--red) 22%, transparent);
-    text-decoration: line-through; text-decoration-thickness: 1px;
-    text-decoration-color: color-mix(in srgb, var(--red) 55%, transparent);
-    max-width: 42%; flex: none;
-  }
-  .val.new {
-    color: color-mix(in srgb, var(--green) 85%, var(--ink));
-    background: color-mix(in srgb, var(--green) 10%, transparent);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--green) 24%, transparent);
-  }
-  .val.neutral {
-    color: var(--ink-mid);
-    background: var(--surface-hover);
-    box-shadow: inset 0 0 0 1px var(--edge-soft);
-  }
-  .row.added .rname { color: color-mix(in srgb, var(--green) 70%, var(--ink)); }
-  .row.removed .rname {
-    color: color-mix(in srgb, var(--red) 70%, var(--ink));
-    text-decoration: line-through;
-    text-decoration-color: color-mix(in srgb, var(--red) 50%, transparent);
-  }
-  .row.removed .icon { opacity: 0.55; }
-  .arrow { color: var(--ink-dim); flex: none; font-size: 11px; }
-  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3.5px; margin-right: 6px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(128,128,128,0.4); }
-  .footer {
-    flex: none; display: flex; align-items: center; gap: 18px;
-    padding: 15px 30px; border-top: 1px solid var(--edge-soft);
-    background: color-mix(in srgb, var(--vscode-editor-background, #17171a) 72%, transparent);
-    backdrop-filter: blur(14px);
-  }
-  .countdown { font-size: 11.5px; color: var(--ink-dim); flex: 1; min-width: 0; }
-  .countdown b { color: var(--ink-mid); font-weight: 620; font-variant-numeric: tabular-nums; }
-  .countdown-bar { height: 2px; border-radius: 2px; background: var(--edge); margin-top: 8px; overflow: hidden; }
-  .countdown-fill { height: 100%; width: 100%; background: var(--green); transition: width 1s linear, background 1s linear; border-radius: 2px; }
-  button {
-    font-family: inherit; font-size: 12.5px; font-weight: 590; letter-spacing: 0.005em;
-    padding: 8px 18px; border-radius: 8px;
-    border: 1px solid transparent; cursor: pointer; flex: none;
-    transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease;
-  }
-  button:active { transform: translateY(1px) scale(0.98); }
-  .apply { background: #2e9e5b; color: #fff; }
-  .apply:hover { background: #35b268; }
-  body.vscode-light .apply, body.vscode-high-contrast-light .apply { background: #1f8a4c; }
-  body.vscode-light .apply:hover, body.vscode-high-contrast-light .apply:hover { background: #23994f; }
-  .full { background: var(--surface-hover); color: var(--ink); border-color: var(--edge); }
-  .full:hover { background: var(--edge); }
-  .skip { background: transparent; font-weight: 480; color: var(--ink-dim); }
-  .skip:hover { color: var(--red); }
-  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-</style>
-</head>
-<body>
-  <div class="header">
-    <div class="kicker"><div class="pulse"></div><span><b>Renium</b>&ensp;&middot;&ensp;Live sync paused</span></div>
-    <h1>Studio changes awaiting review</h1>
-    <div class="subtitle"><b>${changeCount}</b> change${changeCount === 1 ? "" : "s"} across <b>${instanceCount}</b> instance${instanceCount === 1 ? "" : "s"} in ${services.join(", ") || "your project"}. This batch is over your review threshold of <span class="threshold">${threshold}</span>.</div>
-    <div class="toolbar">
-      <input class="filter" id="filter" type="text" placeholder="Filter by name, class, or property" spellcheck="false">
-      <span class="toolbar-hint" id="toolbar-hint"></span>
-    </div>
-  </div>
-  <div class="list" id="list"><div id="sizer"><div id="viewport"></div></div></div>
-  <div class="footer">
-    <div class="countdown">
-      <span id="count-label">Protected full import in <b id="secs">90</b>s &mdash; hover the list to pause</span>
-      <div class="countdown-bar"><div class="countdown-fill" id="fill"></div></div>
-    </div>
-    <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
-    ${mode === "structural"
-      ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import</button>'
-      : '<button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>\n    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>'}
-  </div>
-<script>
-  const vscode = acquireVsCodeApi();
-  const DATA = ${payload};
-  const ASSET = ${JSON.stringify(assetBase)};
-  const SERVICE_ICONS = ${JSON.stringify(serviceIcons)};
-  const FOLDER_ICON = ${JSON.stringify(folderIcon)};
-
-  function esc(text) {
-    return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  }
-  function fmtNum(n) {
-    if (!isFinite(n)) return String(n);
-    return Math.abs(n) >= 1e6 || (Math.abs(n) < 1e-4 && n !== 0) ? n.toExponential(3) : String(Math.round(n * 1000) / 1000);
-  }
-  function fmt(value) {
-    if (value === undefined) return null;
-    if (value === null) return '<i>nil</i>';
-    const t = typeof value;
-    if (t === "boolean") return String(value);
-    if (t === "number") return esc(fmtNum(value));
-    if (t === "string") return '"' + esc(value.length > 90 ? value.slice(0, 90) + "\\u2026" : value) + '"';
-    if (t === "object") {
-      const k = value._type;
-      if (k === "Color3") {
-        const r = Math.round((value.r ?? 0) * 255), g = Math.round((value.g ?? 0) * 255), b = Math.round((value.b ?? 0) * 255);
-        return '<span class="swatch" style="background:rgb(' + r + "," + g + "," + b + ')"></span>' + r + ", " + g + ", " + b;
-      }
-      if (k === "Vector3") return esc(fmtNum(value.x ?? 0) + ", " + fmtNum(value.y ?? 0) + ", " + fmtNum(value.z ?? 0));
-      if (k === "Vector2") return esc(fmtNum(value.x ?? 0) + ", " + fmtNum(value.y ?? 0));
-      if (k === "EnumItem") return esc(String(value.value ?? value.name ?? "Enum"));
-      if (k === "Float") return esc(String(value.value));
-      if (k === "CFrame") return "CFrame (" + ((value.components || []).slice(0, 3).map(fmtNum).join(", ") || "\\u2026") + ", \\u2026)";
-      if (k === "Ref" || value.Ref) return "\\u2192 " + esc(String((value.Ref || value).settingsId ?? (value.Ref || value).instanceId ?? "instance"));
-      const json = JSON.stringify(value);
-      return esc(json.length > 90 ? json.slice(0, 90) + "\\u2026" : json);
-    }
-    return esc(String(value));
-  }
-
-  const root = { children: new Map(), changes: null, icon: null, className: "", status: null };
-  for (const row of DATA) {
-    const segments = Array.isArray(row.pathSegments) && row.pathSegments.length > 0
-      ? row.pathSegments
-      : [row.leaf];
-    const ordinals = Array.isArray(row.pathOrdinals) ? row.pathOrdinals : [];
-    let node = root;
-    for (let index = 0; index < segments.length; index += 1) {
-      const segment = segments[index];
-      const ordinal = Math.max(1, Number(ordinals[index]) || 1);
-      const segmentKey = JSON.stringify([segment, ordinal]);
-      if (!node.children.has(segmentKey)) {
-        node.children.set(segmentKey, {
-          name: segment,
-          ordinal,
-          children: new Map(),
-          changes: null,
-          icon: null,
-          className: "",
-          status: null,
-        });
-      }
-      node = node.children.get(segmentKey);
-    }
-    if (row.scope === "__status") {
-      node.status = row.status;
-      node.icon = node.icon || row.icon;
-      node.className = node.className || row.className;
-      if (!node.changes) node.changes = [];
-      continue;
-    }
-    if (!node.changes) {
-      node.changes = [];
-      node.icon = row.icon;
-      node.className = row.className;
-    }
-    node.changes.push(row);
-  }
-
-  const list = document.getElementById("list");
-  const sizer = document.getElementById("sizer");
-  const viewport = document.getElementById("viewport");
-  const filterInput = document.getElementById("filter");
-  const hintEl = document.getElementById("toolbar-hint");
-  const ROW_HEIGHT = 26;
-  const OVERSCAN = 20;
-  const instanceTotal = ${instanceCount};
-  const collapsed = new Set();
-  const propsOpen = new Set();
-  const autoOpenProps = instanceTotal <= 12;
-  let filterText = "";
-  let flat = [];
-  let renderFrame = 0;
-  let lastStart = -1;
-  let lastCount = -1;
-
-  const matchCache = new Map();
-  function childKey(child) {
-    return JSON.stringify([child.name, Math.max(1, Number(child.ordinal) || 1)]);
-  }
-  function nodeMatches(node, pathKey) {
-    if (!filterText) return true;
-    const cached = matchCache.get(pathKey);
-    if (cached !== undefined) return cached;
-    let out = node.name.toLowerCase().includes(filterText)
-      || (node.className && node.className.toLowerCase().includes(filterText))
-      || (node.changes && node.changes.some((c) => c.property.toLowerCase().includes(filterText)));
-    if (!out) {
-      for (const child of node.children.values()) {
-        if (nodeMatches(child, pathKey + "/" + childKey(child))) { out = true; break; }
-      }
-    }
-    matchCache.set(pathKey, out);
-    return out;
-  }
-
-  function flattenNode(node, pathKey, depth) {
-    if (!nodeMatches(node, pathKey)) return;
-    let chain = [node.name];
-    let current = node;
-    let key = pathKey;
-    while (!current.changes && current.children.size === 1 && !filterText) {
-      const child = current.children.values().next().value;
-      chain.push(child.name);
-      key = key + "/" + childKey(child);
-      current = child;
-    }
-    const isFolder = !current.changes;
-    const hasKids = current.children.size > 0;
-    const propCount = current.changes ? current.changes.length : 0;
-    const isCollapsed = collapsed.has(key);
-    const propsShown = propCount > 0 && !isCollapsed && (propsOpen.has(key) || autoOpenProps || !!filterText);
-    flat.push({ kind: "node", key, chain, depth, isFolder, hasKids, propCount, isCollapsed, propsShown,
-      status: current.status,
-      className: current.className, icon: isFolder ? (depth === 0 ? (SERVICE_ICONS[chain[0]] || FOLDER_ICON) : FOLDER_ICON) : current.icon });
-    if (isCollapsed) return;
-    if (propsShown) {
-      for (const change of current.changes) {
-        flat.push({ kind: "prop", depth, change, neutral: current.status === "added" });
-      }
-    }
-    const children = [...current.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-    for (const child of children) {
-      flattenNode(child, key + "/" + childKey(child), depth + 1);
-    }
-  }
-
-  function rebuildFlat() {
-    flat = [];
-    matchCache.clear();
-    for (const service of root.children.values()) {
-      flattenNode(service, childKey(service), 0);
-    }
-    sizer.style.height = (flat.length * ROW_HEIGHT) + "px";
-    hintEl.textContent = filterText && flat.length === 0 ? "No changes match" : "";
-    lastStart = -1;
-    renderWindow();
-  }
-
-  function nodeRowHtml(item) {
-    const expandable = item.hasKids || item.propCount > 0;
-    const open = !(item.isCollapsed || (item.propCount > 0 && !item.propsShown && !item.hasKids));
-    const statusClass = item.status === "added" ? " added" : item.status === "removed" ? " removed" : "";
-    const statusTitle = item.status === "added" ? "Added in Studio" : item.status === "removed" ? "Removed in Studio" : (item.className || "");
-    return '<div class="row' + (item.isFolder ? " folder" : "") + statusClass + '" data-key="' + esc(item.key) + '" title="' + esc(statusTitle) + '" style="padding-left:' + (item.depth * 14 + 6) + 'px">' +
-      '<span class="twisty' + (open ? " open" : "") + (expandable ? "" : " blank") + '">\\u25B8</span>' +
-      '<img class="icon" src="' + ASSET + "/" + esc(item.icon || "Folder") + '.png">' +
-      '<span class="rname">' + item.chain.map(esc).join('<span class="rsep">\\u203A</span>') + "</span>" +
-      (item.propCount > 0 ? '<span class="count">' + item.propCount + "</span>" : "") +
-      "</div>";
-  }
-
-  function propRowHtml(item) {
-    const row = item.change;
-    const oldHtml = item.neutral ? null : fmt(row.oldValue);
-    const neutral = item.neutral || oldHtml === null;
-    const scopeBadge = row.scope !== "property" ? '<span class="scope-badge">' + esc(row.scope) + "</span>" : "";
-    return '<div class="prop-row" style="margin-left:' + (item.depth * 14 + 23) + 'px">' +
-      '<span class="prop-name-cell"><span class="prop-name">' + esc(row.property) + "</span>" + scopeBadge + "</span>" +
-      '<span class="values">' + (oldHtml !== null ? '<span class="val old">' + oldHtml + '</span><span class="arrow">\\u2192</span>' : "") +
-      '<span class="val ' + (neutral ? "neutral" : "new") + '">' + fmt(row.newValue) + "</span></span></div>";
-  }
-
-  function renderWindow() {
-    const start = Math.max(0, Math.floor(list.scrollTop / ROW_HEIGHT) - OVERSCAN);
-    const count = Math.min(flat.length - start, Math.ceil((list.clientHeight || 400) / ROW_HEIGHT) + OVERSCAN * 2);
-    if (start === lastStart && count === lastCount) return;
-    lastStart = start;
-    lastCount = count;
-    const parts = [];
-    for (let i = start; i < start + count; i++) {
-      const item = flat[i];
-      parts.push(item.kind === "node" ? nodeRowHtml(item) : propRowHtml(item));
-    }
-    viewport.style.top = (start * ROW_HEIGHT) + "px";
-    viewport.innerHTML = parts.join("");
-  }
-
-  list.addEventListener("scroll", () => {
-    if (renderFrame) return;
-    renderFrame = requestAnimationFrame(() => { renderFrame = 0; renderWindow(); });
-  });
-
-  viewport.addEventListener("click", (event) => {
-    const row = event.target.closest(".row");
-    if (!row) return;
-    const key = row.dataset.key;
-    const item = flat.find((entry) => entry.kind === "node" && entry.key === key);
-    if (!item || !(item.hasKids || item.propCount > 0)) return;
-    if (item.isFolder || item.hasKids) {
-      if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
-    }
-    if (item.propCount > 0 && !item.hasKids) {
-      if (item.propsShown) { propsOpen.delete(key); if (autoOpenProps || filterText) collapsed.add(key); }
-      else { propsOpen.add(key); collapsed.delete(key); }
-    }
-    rebuildFlat();
-  });
-
-  filterInput.addEventListener("input", () => {
-    filterText = filterInput.value.trim().toLowerCase();
-    rebuildFlat();
-  });
-  filterInput.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { filterInput.value = ""; filterText = ""; rebuildFlat(); }
-  });
-  rebuildFlat();
-
-  let secs = 90;
-  let paused = false;
-  const secsEl = document.getElementById("secs");
-  const fillEl = document.getElementById("fill");
-  const labelEl = document.getElementById("count-label");
-  list.addEventListener("mouseenter", () => { paused = true; labelEl.innerHTML = "Auto import paused while reviewing"; });
-  list.addEventListener("mouseleave", () => {
-    paused = false;
-    labelEl.innerHTML = 'Protected full import in <b id="secs">' + secs + "</b>s &mdash; hover the list to pause";
-  });
-  const timer = setInterval(() => {
-    if (paused) return;
-    secs -= 1;
-    const liveSecs = document.getElementById("secs");
-    if (liveSecs) liveSecs.textContent = String(secs);
-    fillEl.style.width = (secs / 90 * 100) + "%";
-    fillEl.style.background = "hsl(" + Math.round(120 * secs / 90) + ", 55%, 45%)";
-    if (secs <= 0) { clearInterval(timer); vscode.postMessage({ action: "full" }); }
-  }, 1000);
-
-  const applyButton = document.getElementById("apply");
-  if (applyButton) applyButton.addEventListener("click", () => vscode.postMessage({ action: "apply" }));
-  document.getElementById("full").addEventListener("click", () => vscode.postMessage({ action: "full" }));
-  document.getElementById("skip").addEventListener("click", () => vscode.postMessage({ action: "discard" }));
-</script>
-</body>
-</html>`;
   }
 
   private tryApplyStudioPropertyChangesToEditor(
@@ -7751,17 +3747,14 @@ class RobloxSyncController {
     generation?: number,
     reviewKey?: string,
   ): Promise<"applied" | "fallback" | "pending"> {
-    if (
-      generation !== undefined &&
-      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-    ) {
+    if (!this.isStudioLiveSyncCurrent(generation)) {
       return "pending";
     }
     const fullSyncServices = Array.isArray(state.fullSyncServices)
       ? state.fullSyncServices.map((service) => service.trim()).filter((service) => service.length > 0)
       : [];
     const propertyChanges = Array.isArray(state.propertyChanges) ? state.propertyChanges : [];
-    const trackedChanges = this.studioChangeLogEntries(state, dirtyServices);
+    const trackedChanges = studioChangeLogEntries(state, dirtyServices);
     const changeCount = trackedChanges.length > 0 ? trackedChanges.length : propertyChanges.length;
     const reviewStudioBatches = this.canDisplayLiveSyncPrompt(cfg);
     if (propertyChanges.length === 0 || fullSyncServices.length > 0) {
@@ -7775,10 +3768,7 @@ class RobloxSyncController {
           generation,
           reviewKey,
         );
-        if (
-          generation !== undefined &&
-          (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-        ) {
+        if (!this.isStudioLiveSyncCurrent(generation)) {
           return "pending";
         }
         if (decision === "pending") {
@@ -7814,10 +3804,7 @@ class RobloxSyncController {
         generation,
         reviewKey,
       );
-      if (
-        generation !== undefined &&
-        (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-      ) {
+      if (!this.isStudioLiveSyncCurrent(generation)) {
         return "pending";
       }
       if (decision === "pending") {
@@ -7853,7 +3840,7 @@ class RobloxSyncController {
       }
     }
 
-    this.ensureFileExists(cfg.rustCliPath);
+    ensureFileExists(cfg.cliPath);
     const batchEntries: Array<{
       service: string;
       settingsId?: string;
@@ -7919,10 +3906,7 @@ class RobloxSyncController {
       `renium-property-batch-${process.pid}-${crypto.randomUUID()}.json`,
     );
     fs.writeFileSync(batchFile, JSON.stringify(batchEntries), "utf8");
-    if (
-      generation !== undefined &&
-      (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted)
-    ) {
+    if (!this.isStudioLiveSyncCurrent(generation)) {
       fs.rmSync(batchFile, { force: true });
       return "pending";
     }
@@ -7930,7 +3914,7 @@ class RobloxSyncController {
     let result: CommandRunResult;
     try {
       result = await this.runCommand(
-        cfg.rustCliPath,
+        cfg.cliPath,
         [
           "bytecode-apply-property-batch",
           "--project-root",
@@ -7952,8 +3936,7 @@ class RobloxSyncController {
     if (result.code !== 0) {
       throw new Error(`Rust property import exited with code ${result.code}`);
     }
-    const stillCurrent = generation === undefined
-      || (generation === this.studioLiveSyncGeneration && this.studioLiveSyncStarted);
+    const stillCurrent = this.isStudioLiveSyncCurrent(generation);
     let batchResult: {
       changedPaths?: unknown[];
       sourcePaths?: Array<{ entryIndex?: unknown; path?: unknown }>;
@@ -7984,28 +3967,16 @@ class RobloxSyncController {
       refreshCache: true,
     });
 
-    const changedServices = Array.from(dirtySet);
     await this.updateEditorLiveSyncCacheAfterPush(Array.from(changedFiles), cfg);
     if (stillCurrent && changedSettingsFiles.size > 0) {
-      try {
-        await vscode.commands.executeCommand("renium.fileExplorer.refreshPropertyChanges", Array.from(changedSettingsFiles));
-      } catch {
-      }
+      await executeCommandBestEffort(
+        "renium.fileExplorer.refreshPropertyChanges",
+        Array.from(changedSettingsFiles),
+      );
     }
     this.studioToEditorImportSuppressUntilMs = Date.now() + Math.max(1000, Math.min(3000, cfg.studioLiveSyncPollMs * 2));
-    this.studioToEditorLastSyncEndedAt = Date.now();
-    this.logStudioChanges(state, "property", changedServices);
     return stillCurrent ? "applied" : "pending";
   }
-
-
-
-
-
-
-
-
-
 
   private reconcileStudioSourceWithLocalEdits(cfg: SyncConfig, sourcePath: string, theirs: string): string {
     let ours: string;
@@ -8030,11 +4001,6 @@ class RobloxSyncController {
 
     return this.mergeSourceAgainstBase(cfg, sourcePath, ours, theirs, base);
   }
-
-
-
-
-
 
   private mergeSourceAgainstBase(
     cfg: SyncConfig,
@@ -8072,11 +4038,6 @@ class RobloxSyncController {
     }
     return resolvedText;
   }
-
-
-
-
-
 
   private canDisplayLiveSyncPrompt(cfg: SyncConfig): boolean {
     return cfg.displayPrompts === "always" ||
@@ -8128,8 +4089,6 @@ class RobloxSyncController {
       });
   }
 
-
-
   private conflictDiffPreview(cfg: SyncConfig, backupPath: string): { path: string; truncated: boolean } {
     try {
       const content = fs.readFileSync(backupPath, "utf8");
@@ -8153,19 +4112,19 @@ class RobloxSyncController {
 
   private syncBasePathForSource(cfg: SyncConfig, sourcePath: string): string | undefined {
     const srcRoot = this.sourceRoot(cfg);
-    if (this.isPathInside(sourcePath, srcRoot)) {
+    if (isPathInside(sourcePath, srcRoot)) {
       return path.join(cfg.projectRoot, ".renium", "sync-base", path.relative(srcRoot, sourcePath));
     }
     const owner = loadProjectSourceLocations(cfg.projectRoot)
       .filter((location) => {
         try {
           return fs.statSync(location).isFile()
-            ? this.normalizePathForCompare(sourcePath) === this.normalizePathForCompare(location)
-            : this.isPathInside(sourcePath, location);
+            ? filesystemPathKey(sourcePath) === filesystemPathKey(location)
+            : isPathInside(sourcePath, location);
         } catch {
           return path.extname(location) !== ""
-            ? this.normalizePathForCompare(sourcePath) === this.normalizePathForCompare(location)
-            : this.isPathInside(sourcePath, location);
+            ? filesystemPathKey(sourcePath) === filesystemPathKey(location)
+            : isPathInside(sourcePath, location);
         }
       })
       .sort((left, right) => right.length - left.length)[0];
@@ -8174,7 +4133,7 @@ class RobloxSyncController {
     }
     const ownerKey = crypto
       .createHash("sha256")
-      .update(this.normalizePathForCompare(owner))
+      .update(filesystemPathKey(owner))
       .digest("hex")
       .slice(0, 20);
     const relative = path.extname(owner) !== "" && !fs.existsSync(owner)
@@ -8217,11 +4176,10 @@ class RobloxSyncController {
     }
   }
 
-
   private refreshSyncBasesForPaths(paths: string[], cfg: SyncConfig): void {
     for (const filePath of paths) {
       const abs = path.isAbsolute(filePath) ? filePath : path.resolve(cfg.projectRoot, filePath);
-      if (!this.isLuaSourcePath(abs)) {
+      if (!isLuaSourcePath(abs)) {
         continue;
       }
       try {
@@ -8235,12 +4193,6 @@ class RobloxSyncController {
     const basePath = this.syncBasePathForSource(cfg, sourcePath);
     return basePath !== undefined && fs.existsSync(basePath);
   }
-
-
-
-
-
-
 
   private async captureLocalScriptEditsForServices(
     services: string[],
@@ -8268,11 +4220,6 @@ class RobloxSyncController {
     }
     return captured;
   }
-
-
-
-
-
 
   private reconcileLocalEditsAfterFullImport(
     affectedPaths: string[],
@@ -8325,7 +4272,7 @@ class RobloxSyncController {
         const localBackup = this.backupConflictCopy(cfg, filePath, local.content, "local");
         const policy = this.resolveConflictPolicy(cfg);
         if (policy !== "studio") {
-          this.writeUtf8FileIfChanged(filePath, local.content);
+          writeUtf8FileIfChanged(filePath, local.content);
           surviving.push(filePath);
         } else {
           const basePath = this.syncBasePathForSource(cfg, filePath);
@@ -8350,11 +4297,11 @@ class RobloxSyncController {
         this.writeSyncBase(cfg, filePath, newDisk);
         continue;
       }
-      this.writeUtf8FileIfChanged(filePath, resolved);
+      writeUtf8FileIfChanged(filePath, resolved);
       surviving.push(filePath);
     }
 
-    for (const filePath of affectedPaths.filter((filePath) => this.isLuaSourcePath(filePath))) {
+    for (const filePath of affectedPaths.filter((filePath) => isLuaSourcePath(filePath))) {
       if (captured.has(filePath) || this.syncBaseExists(cfg, filePath)) {
         continue;
       }
@@ -8371,7 +4318,7 @@ class RobloxSyncController {
     if (!fs.existsSync(baseRoot)) {
       return [];
     }
-    const selectedServices = this.normalizeServices(services, cfg.services);
+    const selectedServices = normalizeServices(services, cfg.services);
     const selected = new Set(selectedServices.map((service) => service.toLowerCase()));
     const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
     const locations = sourceGraph.locations;
@@ -8379,7 +4326,7 @@ class RobloxSyncController {
     for (const location of locations) {
       const ownerKey = crypto
         .createHash("sha256")
-        .update(this.normalizePathForCompare(location))
+        .update(filesystemPathKey(location))
         .digest("hex")
         .slice(0, 20);
       externalByKey.set(ownerKey, location);
@@ -8402,7 +4349,7 @@ class RobloxSyncController {
       }
       if (
         sourcePath
-        && this.isLuaSourcePath(sourcePath)
+        && isLuaSourcePath(sourcePath)
         && this.projectSourcePathMatchesServices(sourcePath, selected, sourceGraph)
       ) {
         paths.add(path.resolve(sourcePath));
@@ -8441,13 +4388,12 @@ class RobloxSyncController {
   private async liveSyncLuaSourceFiles(services: string[], cfg: SyncConfig): Promise<string[]> {
     const paths = new Set<string>();
     const srcRoot = this.sourceRoot(cfg);
-    const selectedServices = this.normalizeServices(services, cfg.services);
-    const selected = new Set(selectedServices.map((service) => service.toLowerCase()));
+    const selectedServices = normalizeServices(services, cfg.services);
     for (const service of selectedServices) {
       const serviceDir = path.join(srcRoot, service);
       if (fs.existsSync(serviceDir)) {
         for (const filePath of await this.collectInitialEditorLiveSyncPathsAsync(serviceDir)) {
-          if (this.isLuaSourcePath(filePath)) {
+          if (isLuaSourcePath(filePath)) {
             paths.add(path.resolve(filePath));
           }
         }
@@ -8455,7 +4401,7 @@ class RobloxSyncController {
     }
     const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
     for (const location of this.projectSourceScanLocations(selectedServices, sourceGraph)) {
-      if (this.isPathInside(location, srcRoot)) {
+      if (isPathInside(location, srcRoot)) {
         continue;
       }
       let stat: fs.Stats;
@@ -8465,7 +4411,7 @@ class RobloxSyncController {
         continue;
       }
       if (stat.isFile()) {
-        if (this.isLuaSourcePath(location)) {
+        if (isLuaSourcePath(location)) {
           paths.add(path.resolve(location));
         }
         continue;
@@ -8474,7 +4420,7 @@ class RobloxSyncController {
         continue;
       }
       for (const filePath of await this.collectInitialEditorLiveSyncPathsAsync(location)) {
-        if (this.isLuaSourcePath(filePath)) {
+        if (isLuaSourcePath(filePath)) {
           paths.add(path.resolve(filePath));
         }
       }
@@ -8489,9 +4435,9 @@ class RobloxSyncController {
     const selected = new Set(services.map((service) => service.toLowerCase()));
     const locations = new Set<string>();
     for (const location of sourceGraph.locations) {
-      const normalized = this.normalizePathForCompare(location);
+      const normalized = filesystemPathKey(location);
       const owners = sourceGraph.owners.filter((owner) =>
-        this.normalizePathForCompare(owner.location) === normalized);
+        filesystemPathKey(owner.location) === normalized);
       if (owners.some((owner) => owner.target[0] && selected.has(owner.target[0].toLowerCase()))) {
         locations.add(location);
       }
@@ -8520,29 +4466,11 @@ class RobloxSyncController {
     selected: Set<string>,
     sourceGraph: ProjectSourceGraph,
   ): boolean {
-    const matches = sourceGraph.owners
-      .filter((owner) => {
-        let isFile = false;
-        try {
-          isFile = fs.statSync(owner.location).isFile();
-        } catch {
-          isFile = path.extname(owner.location) !== "";
-        }
-        return isFile
-          ? this.normalizePathForCompare(filePath) === this.normalizePathForCompare(owner.location)
-          : this.isPathInside(filePath, owner.location);
-      })
-      .sort((left, right) =>
-        path.resolve(right.location).split(path.sep).length
-        - path.resolve(left.location).split(path.sep).length);
+    const matches = this.sourceOwnersForPath(filePath, sourceGraph);
     if (matches.length === 0) {
       return false;
     }
-    const specificity = path.resolve(matches[0].location).split(path.sep).length;
     for (const owner of matches) {
-      if (path.resolve(owner.location).split(path.sep).length !== specificity) {
-        break;
-      }
       const fixedService = owner.target[0];
       if (fixedService) {
         if (selected.has(fixedService.toLowerCase())) {
@@ -8560,24 +4488,24 @@ class RobloxSyncController {
   }
 
   private invalidateEditorLiveSyncCacheEntries(paths: string[], cfg: SyncConfig): void {
-    const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
+    const { cache } = loadEditorLiveSyncCache(cfg.projectRoot);
     let changed = false;
     for (const filePath of paths) {
-      const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+      const key = editorLiveSyncCacheKey(filePath, cfg.projectRoot);
       if (cache.files[key] !== undefined) {
         delete cache.files[key];
         changed = true;
       }
     }
     if (changed) {
-      this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
+      saveEditorLiveSyncCache(cfg.projectRoot, cache);
     }
   }
 
   private backupConflictCopy(cfg: SyncConfig, sourcePath: string, content: string, side: "local" | "studio"): string | undefined {
     try {
       const srcRoot = this.sourceRoot(cfg);
-      let rel = this.isPathInside(sourcePath, srcRoot) ? path.relative(srcRoot, sourcePath) : undefined;
+      let rel = isPathInside(sourcePath, srcRoot) ? path.relative(srcRoot, sourcePath) : undefined;
       if (rel === undefined) {
         const syncBase = this.syncBasePathForSource(cfg, sourcePath);
         if (syncBase) {
@@ -8587,7 +4515,7 @@ class RobloxSyncController {
       if (rel === undefined) {
         const ownerKey = crypto
           .createHash("sha256")
-          .update(this.normalizePathForCompare(sourcePath))
+          .update(filesystemPathKey(sourcePath))
           .digest("hex")
           .slice(0, 20);
         rel = path.join("external", ownerKey, path.basename(sourcePath));
@@ -8600,36 +4528,6 @@ class RobloxSyncController {
     } catch (err) {
       this.output.appendLine(`[renium] conflict: failed to back up ${side} copy of ${sourcePath}: ${String(err)}`);
       return undefined;
-    }
-  }
-
-  private notifyConflict(sourcePath: string, policy: ConflictPolicy, manual: boolean, detail: string): void {
-    const label = path.basename(sourcePath);
-    this.output.appendLine(`[renium] live-sync conflict on ${sourcePath} (policy=${policy}; ${detail})`);
-    if (policy === "prompt" || manual) {
-      void vscode.window
-        .showWarningMessage(
-          `Concurrent edits to ${label} — ${manual ? "conflict markers written; resolve manually" : detail}. Backups in .renium/conflicts.`,
-          "Open File",
-        )
-        .then((choice) => {
-          if (choice === "Open File") {
-            void vscode.window.showTextDocument(vscode.Uri.file(sourcePath));
-          }
-        });
-    }
-  }
-
-  private normalizeConflictPolicy(raw: string | undefined): ConflictPolicy {
-    switch (String(raw ?? "").trim().toLowerCase()) {
-      case "filesystem":
-        return "filesystem";
-      case "studio":
-        return "studio";
-      case "prompt":
-      case "none":
-      default:
-        return "prompt";
     }
   }
 
@@ -8726,7 +4624,7 @@ class RobloxSyncController {
     }
     const rawPath = node.filePaths
       .map((value) => String(value))
-      .find((value) => this.isLuaSourcePath(value));
+      .find((value) => isLuaSourcePath(value));
     if (!rawPath) {
       return undefined;
     }
@@ -8738,298 +4636,16 @@ class RobloxSyncController {
     return sourcePath;
   }
 
-  private writeUtf8FileIfChanged(filePath: string, content: string): void {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const next = Buffer.from(content, "utf8");
-    try {
-      const current = fs.readFileSync(filePath);
-      if (current.length === next.length && current.equals(next)) {
-        return;
-      }
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        throw err;
-      }
-    }
-    fs.writeFileSync(filePath, next);
-  }
-
-  private shouldDropLikelySelfDirtyStudioState(_dirtyServices: string[], _cfg: SyncConfig): boolean {
-    return false;
-  }
-
-  private async diffServicesBySnapshotFingerprint(
-    services: string[],
-    cfg: SyncConfig,
-  ): Promise<StudioSnapshotDiff> {
-    const changedServices: string[] = [];
-    const fingerprintsByService = new Map<string, string>();
-    for (const service of services) {
-      const fingerprint = await this.snapshotFingerprintForService(service, cfg);
-      if (!fingerprint) {
-        changedServices.push(service);
-        continue;
-      }
-      fingerprintsByService.set(service, fingerprint);
-      const previous = this.studioSnapshotFingerprintByService.get(service);
-      if (previous !== fingerprint) {
-        changedServices.push(service);
-      }
-    }
-    if (changedServices.length === 0) {
-      return { changedServices, fingerprintsByService };
-    }
-    return { changedServices, fingerprintsByService };
-  }
-
-  private commitStudioSnapshotFingerprints(services: string[], fingerprintsByService?: Map<string, string>): void {
-    if (!fingerprintsByService) {
-      return;
-    }
-    for (const service of services) {
-      const fingerprint = fingerprintsByService.get(service);
-      if (fingerprint) {
-        this.studioSnapshotFingerprintByService.set(service, fingerprint);
-      }
-    }
-  }
-
-  private async snapshotFingerprintForService(
-    service: string,
-    cfg: SyncConfig,
-  ): Promise<string | undefined> {
-    const snapshotRoot = this.resolveSnapshotPath(cfg);
-    const paths = await this.collectSnapshotFingerprintPaths(snapshotRoot, service);
-    if (paths.length === 0) {
-      return undefined;
-    }
-
-    const rootFile = path.join(snapshotRoot, service + ".json");
-    const hash = crypto.createHash("sha256");
-    let hashedAnyFile = false;
-    for (const filePath of paths) {
-      let stat: fs.Stats;
-      try {
-        stat = await fs.promises.stat(filePath);
-      } catch {
-        continue;
-      }
-      if (!stat.isFile()) {
-        continue;
-      }
-      const relPath = this.normalizePathForCompare(path.relative(snapshotRoot, filePath));
-      const content = await fs.promises.readFile(filePath);
-      const fingerprintContent = path.resolve(filePath) === path.resolve(rootFile)
-        ? this.normalizeSnapshotRootForFingerprint(content, service)
-        : content;
-      hash.update(relPath);
-      hash.update("\0");
-      hash.update(String(fingerprintContent.length));
-      hash.update("\0");
-      hash.update(fingerprintContent);
-      hash.update("\0");
-      hashedAnyFile = true;
-    }
-    return hashedAnyFile ? hash.digest("hex") : undefined;
-  }
-
-  private normalizeSnapshotRootForFingerprint(content: Buffer, service: string): Buffer {
-    const text = content.toString("utf8");
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const snapshot = parsed as Record<string, unknown>;
-        const filteredInstanceCount = this.normalizeSnapshotInstancesForFingerprint(snapshot, service);
-        const metadata = snapshot.metadata;
-        if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
-          const stableMetadata = { ...(metadata as Record<string, unknown>) };
-          delete stableMetadata.generatedAtUnix;
-          if (filteredInstanceCount !== undefined) {
-            stableMetadata.instanceCount = filteredInstanceCount;
-          }
-          snapshot.metadata = stableMetadata;
-        }
-        return Buffer.from(this.stableJsonStringify(snapshot), "utf8");
-      }
-    } catch {
-    }
-
-    return Buffer.from(
-      text.replace(/(\"generatedAtUnix\"\s*:\s*)-?\d+(\s*,?)/g, (_match, prefix, suffix) => prefix + "0" + suffix),
-      "utf8",
-    );
-  }
-
-  private normalizeSnapshotInstancesForFingerprint(snapshot: Record<string, unknown>, service: string): number | undefined {
-    const rawInstances = snapshot.instances;
-    if (!Array.isArray(rawInstances)) {
-      return undefined;
-    }
-
-    const entries = rawInstances.map((entry) => (
-      entry && typeof entry === "object" && !Array.isArray(entry)
-        ? { ...(entry as Record<string, unknown>) }
-        : entry
-    ));
-    const removedIndices = new Set<number>();
-    let changed = false;
-
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index];
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        continue;
-      }
-      const instance = entry as Record<string, unknown>;
-      if (this.normalizeSnapshotPropertiesForFingerprint(instance)) {
-        changed = true;
-      }
-      if (service === "Workspace" && index === 0) {
-        const properties = instance.properties;
-        if (properties && typeof properties === "object" && !Array.isArray(properties) && "CurrentCamera" in properties) {
-          const stableProperties = { ...(properties as Record<string, unknown>) };
-          delete stableProperties.CurrentCamera;
-          instance.properties = stableProperties;
-          changed = true;
-        }
-      }
-      if (instance.className === "Camera") {
-        removedIndices.add(this.snapshotInstanceIndex(instance, index));
-        changed = true;
-      }
-    }
-
-    const filtered = entries.filter((entry, index) => {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        return true;
-      }
-      return !removedIndices.has(this.snapshotInstanceIndex(entry as Record<string, unknown>, index));
-    });
-    if (changed || filtered.length !== rawInstances.length) {
-      snapshot.instances = filtered;
-    }
-    return filtered.length;
-  }
-
-  private normalizeSnapshotPropertiesForFingerprint(instance: Record<string, unknown>): boolean {
-    const properties = instance.properties;
-    if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
-      return false;
-    }
-
-    const source = properties as Record<string, unknown>;
-    let stableProperties: Record<string, unknown> | undefined;
-    for (const key of Object.keys(source)) {
-      if (TRANSIENT_SNAPSHOT_PROPERTY_NAMES.has(key.toLowerCase())) {
-        if (!stableProperties) {
-          stableProperties = { ...source };
-        }
-        delete stableProperties[key];
-      }
-    }
-
-    if (!stableProperties) {
-      return false;
-    }
-    instance.properties = stableProperties;
-    return true;
-  }
-
-  private snapshotInstanceIndex(instance: Record<string, unknown>, fallbackIndex: number): number {
-    return this.snapshotNumericIndex(instance.instanceIndex) ?? fallbackIndex + 1;
-  }
-
-  private snapshotNumericIndex(value: unknown): number | undefined {
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      return undefined;
-    }
-    const index = Math.floor(value);
-    return index > 0 ? index : undefined;
-  }
-
-  private stableJsonStringify(value: unknown): string {
-    if (Array.isArray(value)) {
-      return "[" + value.map((entry) => this.stableJsonStringify(entry)).join(",") + "]";
-    }
-    if (value && typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      return "{" + Object.keys(record)
-        .sort()
-        .map((key) => JSON.stringify(key) + ":" + this.stableJsonStringify(record[key]))
-        .join(",") + "}";
-    }
-    const primitive = JSON.stringify(value);
-    return primitive === undefined ? "null" : primitive;
-  }
-
-  private async collectSnapshotFingerprintPaths(
-    snapshotRoot: string,
-    service: string,
-  ): Promise<string[]> {
-    const paths: string[] = [];
-    const rootFile = path.join(snapshotRoot, `${service}.json`);
-    if (fs.existsSync(rootFile)) {
-      paths.push(rootFile);
-    }
-
-    const rootDir = path.join(snapshotRoot, service);
-    if (fs.existsSync(rootDir)) {
-      const stack = [rootDir];
-      while (stack.length > 0) {
-        const dir = stack.pop();
-        if (!dir) {
-          continue;
-        }
-        let entries: fs.Dirent[];
-        try {
-          entries = await fs.promises.readdir(dir, { withFileTypes: true });
-        } catch {
-          continue;
-        }
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            stack.push(fullPath);
-          } else if (entry.isFile()) {
-            paths.push(fullPath);
-          }
-        }
-      }
-    }
-
-    return paths.sort((a, b) => this.comparePathsForStableOrder(a, b));
-  }
-
   private async collectInitialEditorLiveSyncPathsAsync(srcRoot: string): Promise<string[]> {
     const settingsPathsByDirectory = new Map<string, string>();
     const otherPaths: string[] = [];
-    const stack = [srcRoot];
-    while (stack.length > 0) {
-      const dir = stack.pop();
-      if (!dir) {
-        continue;
-      }
-      let entries: fs.Dirent[];
-      try {
-        entries = await fs.promises.readdir(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          stack.push(fullPath);
-        } else if (entry.isFile()) {
-          if (isReniumSettingsFileName(entry.name)) {
-            const directory = path.resolve(path.dirname(fullPath));
-            const previous = settingsPathsByDirectory.get(directory);
-            if (!previous || isCanonicalReniumSettingsFileName(entry.name)) {
-              settingsPathsByDirectory.set(directory, fullPath);
-            }
-          } else {
-            otherPaths.push(fullPath);
-          }
-        }
+    for (const filePath of await collectFilesRecursively(srcRoot)) {
+      const fileName = path.basename(filePath);
+      if (isReniumSettingsFileName(fileName)) {
+        const directory = path.resolve(path.dirname(filePath));
+        settingsPathsByDirectory.set(directory, filePath);
+      } else {
+        otherPaths.push(filePath);
       }
     }
     return [
@@ -9049,7 +4665,7 @@ class RobloxSyncController {
   ): Promise<{ paths: string[]; targetSettingsIds: string[] }> {
     const cfg = this.getConfig();
     const result = await this.runCommand(
-      cfg.exportCliPath,
+      cfg.cliPath,
       [
         "bt",
         "-d",
@@ -9067,7 +4683,7 @@ class RobloxSyncController {
       this.output.appendLine(`[renium] editor live sync initial target scan failed: ${message || `exit ${result.code}`}`);
       return { paths: settingsPaths, targetSettingsIds: [] };
     }
-    const parsed = this.parseCliJsonObject<{ paths?: unknown; targetSettingsIds?: unknown }>(result.output);
+    const parsed = parseCliJsonObject<{ paths?: unknown; targetSettingsIds?: unknown }>(result.output);
     if (!parsed) {
       this.output.appendLine("[renium] editor live sync initial target scan returned invalid JSON");
       return { paths: settingsPaths, targetSettingsIds: [] };
@@ -9078,10 +4694,10 @@ class RobloxSyncController {
     const rawIds = Array.isArray(parsed.targetSettingsIds)
       ? parsed.targetSettingsIds
       : [];
-    const validSettingsPaths = new Set(settingsPaths.map((settingsPath) => this.normalizePathForCompare(settingsPath)));
+    const validSettingsPaths = new Set(settingsPaths.map((settingsPath) => filesystemPathKey(settingsPath)));
     const paths = rawPaths
       .map((value) => String(value))
-      .filter((value) => validSettingsPaths.has(this.normalizePathForCompare(value)));
+      .filter((value) => validSettingsPaths.has(filesystemPathKey(value)));
     paths.push(...settingsPaths.filter((value) => !isReniumSettingsFileName(path.basename(value))));
     return {
       paths: [...new Set(paths)],
@@ -9089,112 +4705,38 @@ class RobloxSyncController {
     };
   }
 
-  private editorLiveSyncCachePath(projectRoot: string): string {
-    return path.join(projectRoot, ".renium", "editor-live-sync-cache.json");
-  }
-
-  private emptyEditorLiveSyncCache(projectRoot: string): EditorLiveSyncHashCache {
-    return {
-      version: 1,
-      projectRoot: path.resolve(projectRoot),
-      updatedAtUnixMs: Date.now(),
-      files: {},
-    };
-  }
-
-  private loadEditorLiveSyncCache(projectRoot: string): { cache: EditorLiveSyncHashCache; existed: boolean } {
-    const cachePath = this.editorLiveSyncCachePath(projectRoot);
-    try {
-      const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8")) as Partial<EditorLiveSyncHashCache>;
-      if (
-        parsed &&
-        parsed.version === 1 &&
-        parsed.files &&
-        typeof parsed.files === "object" &&
-        !Array.isArray(parsed.files)
-      ) {
-        return {
-          existed: true,
-          cache: {
-            version: 1,
-            projectRoot: typeof parsed.projectRoot === "string" ? parsed.projectRoot : path.resolve(projectRoot),
-            updatedAtUnixMs: typeof parsed.updatedAtUnixMs === "number" ? parsed.updatedAtUnixMs : 0,
-            files: Object.fromEntries(
-              Object.entries(parsed.files).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-            ),
-          },
-        };
-      }
-    } catch {
-    }
-    return { existed: false, cache: this.emptyEditorLiveSyncCache(projectRoot) };
-  }
-
-  private saveEditorLiveSyncCache(projectRoot: string, cache: EditorLiveSyncHashCache): void {
-    const cachePath = this.editorLiveSyncCachePath(projectRoot);
-    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-    const nextCache: EditorLiveSyncHashCache = {
-      version: 1,
-      projectRoot: path.resolve(projectRoot),
-      updatedAtUnixMs: Date.now(),
-      files: cache.files,
-    };
-    fs.writeFileSync(cachePath, `${JSON.stringify(nextCache, null, 2)}${os.EOL}`, "utf8");
-  }
-
-  private editorLiveSyncCacheKey(filePath: string, projectRoot: string): string {
-    const absolutePath = path.resolve(projectRoot, filePath);
-    const relative = path.relative(projectRoot, absolutePath);
-    const normalized = relative.split(path.sep).join("/");
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  }
-
-  private async editorLiveSyncFileHash(filePath: string): Promise<string | undefined> {
-    try {
-      const stat = await fs.promises.stat(filePath);
-      if (!stat.isFile()) {
-        return undefined;
-      }
-      const hash = crypto.createHash("sha256");
-      hash.update(await fs.promises.readFile(filePath));
-      return `sha256:${stat.size}:${hash.digest("hex")}`;
-    } catch {
-      return undefined;
-    }
-  }
-
   private async primeEditorLiveSyncCache(paths: string[], cfg: SyncConfig): Promise<void> {
-    const cache = this.emptyEditorLiveSyncCache(cfg.projectRoot);
+    const cache = emptyEditorLiveSyncCache(cfg.projectRoot);
     for (const filePath of paths) {
-      const hash = await this.editorLiveSyncFileHash(filePath);
+      const hash = await editorLiveSyncFileHash(filePath);
       if (hash) {
-        cache.files[this.editorLiveSyncCacheKey(filePath, cfg.projectRoot)] = hash;
+        cache.files[editorLiveSyncCacheKey(filePath, cfg.projectRoot)] = hash;
       }
     }
-    this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
+    saveEditorLiveSyncCache(cfg.projectRoot, cache);
   }
 
   private async classifyEditorLiveSyncPaths(
     paths: string[],
     cfg: SyncConfig,
   ): Promise<{ pushable: string[]; unchanged: string[]; blocked: string[] }> {
-    const { cache, existed } = this.loadEditorLiveSyncCache(cfg.projectRoot);
+    const { cache, existed } = loadEditorLiveSyncCache(cfg.projectRoot);
     const seen = new Set<string>();
     const observations: { path: string; key: string; hash: string | undefined }[] = [];
 
     for (const filePath of paths) {
-      const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+      const key = editorLiveSyncCacheKey(filePath, cfg.projectRoot);
       if (!seen.add(key)) {
         continue;
       }
-      const hash = await this.editorLiveSyncFileHash(filePath);
+      const hash = await editorLiveSyncFileHash(filePath);
       observations.push({ path: filePath, key, hash });
     }
 
     const changed = changedEditorLiveSyncPaths(observations, existed, cache.files);
-    const changedKeys = new Set(changed.map((filePath) => this.normalizePathForCompare(filePath)));
+    const changedKeys = new Set(changed.map((filePath) => filesystemPathKey(filePath)));
     const unchanged = observations
-      .filter((observation) => !changedKeys.has(this.normalizePathForCompare(observation.path)))
+      .filter((observation) => !changedKeys.has(filesystemPathKey(observation.path)))
       .map((observation) => observation.path);
     const { pushable, blocked } = await this.partitionUnresolvedConflictMarkerPaths(changed);
     return { pushable, unchanged, blocked };
@@ -9206,8 +4748,8 @@ class RobloxSyncController {
     const pushable: string[] = [];
     const blocked: string[] = [];
     for (const filePath of paths) {
-      const key = this.normalizePathForCompare(filePath);
-      if (this.isLuaSourcePath(filePath) && await this.fileHasConflictMarkers(filePath)) {
+      const key = filesystemPathKey(filePath);
+      if (isLuaSourcePath(filePath) && await this.fileHasConflictMarkers(filePath)) {
         this.output.appendLine(
           `[renium] live-sync: holding back ${filePath} — unresolved conflict markers present; resolve them to resume syncing this file.`,
         );
@@ -9253,16 +4795,12 @@ class RobloxSyncController {
 
   private editorLiveSyncSuppressedUntil(filePath: string, now = Date.now()): number {
     this.clearExpiredSuppressedEditorLiveSyncPaths(now);
-    const fileKey = this.normalizePathForCompare(filePath);
+    const fileKey = filesystemPathKey(filePath);
     const pathUntilMs = this.suppressedEditorLiveSyncPathUntilByKey.get(fileKey) ?? 0;
     const globalUntilMs = this.studioToEditorImportInProgress
       ? Math.max(this.studioToEditorImportSuppressUntilMs, now + 100)
       : this.studioToEditorImportSuppressUntilMs;
     return Math.max(pathUntilMs, globalUntilMs);
-  }
-
-  private isEditorLiveSyncPathSuppressed(filePath: string, now = Date.now()): boolean {
-    return this.editorLiveSyncSuppressedUntil(filePath, now) > now;
   }
 
   private scheduleEditorLiveSyncFlush(delayMs: number): void {
@@ -9332,7 +4870,7 @@ class RobloxSyncController {
 
     const cachePaths: string[] = [];
     for (const filePath of paths) {
-      this.suppressedEditorLiveSyncPathUntilByKey.set(this.normalizePathForCompare(filePath), untilMs);
+      this.suppressedEditorLiveSyncPathUntilByKey.set(filesystemPathKey(filePath), untilMs);
       if (request.refreshCache === true && fs.existsSync(filePath)) {
         cachePaths.push(filePath);
       }
@@ -9353,17 +4891,17 @@ class RobloxSyncController {
     const write = this.editorLiveSyncCacheWrites
       .catch(() => undefined)
       .then(async () => {
-        const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
+        const { cache } = loadEditorLiveSyncCache(cfg.projectRoot);
         for (const filePath of paths) {
-          const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
-          const hash = await this.editorLiveSyncFileHash(filePath);
+          const key = editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+          const hash = await editorLiveSyncFileHash(filePath);
           if (hash) {
             cache.files[key] = hash;
           } else {
             delete cache.files[key];
           }
         }
-        this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
+        saveEditorLiveSyncCache(cfg.projectRoot, cache);
       });
     this.editorLiveSyncCacheWrites = write.catch((error) => {
       this.output.appendLine(
@@ -9377,11 +4915,11 @@ class RobloxSyncController {
     if (paths.length === 0) {
       return;
     }
-    const { cache } = this.loadEditorLiveSyncCache(cfg.projectRoot);
+    const { cache } = loadEditorLiveSyncCache(cfg.projectRoot);
     for (const filePath of paths) {
-      delete cache.files[this.editorLiveSyncCacheKey(filePath, cfg.projectRoot)];
+      delete cache.files[editorLiveSyncCacheKey(filePath, cfg.projectRoot)];
     }
-    this.saveEditorLiveSyncCache(cfg.projectRoot, cache);
+    saveEditorLiveSyncCache(cfg.projectRoot, cache);
   }
 
   private async suppressStudioLiveSyncAfterEditorPush(paths: string[], cfg: SyncConfig): Promise<void> {
@@ -9465,7 +5003,7 @@ class RobloxSyncController {
       void vscode.window.showWarningMessage("Wait for the place change to finish.");
       return false;
     }
-    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
+    if (filesystemPathKey(projectRoot) !== filesystemPathKey(cfg.projectRoot)) {
       retain();
       return false;
     }
@@ -9487,7 +5025,7 @@ class RobloxSyncController {
       await this.enqueue(options.taskName ?? "Editor -> Studio sync", async () => {
         const runCfg = this.getConfig();
         if (
-          this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(runCfg.projectRoot)
+          filesystemPathKey(projectRoot) !== filesystemPathKey(runCfg.projectRoot)
           || (!options.force && !this.isEditorLiveSyncActive())
         ) {
           this.output.appendLine("[renium] editor direct sync cancelled before apply");
@@ -9540,7 +5078,9 @@ class RobloxSyncController {
     return pushed;
   }
 
-  public async pushEditorPropertyNow(request: EditorPropertyPushRequest): Promise<EditorPushOutcome> {
+  private prepareDirectEditorPush(
+    request: EditorDirectPushRequest,
+  ): EditorDirectPushContext | undefined {
     const cfg = this.getConfig();
     const service = String(request.service ?? "").trim();
     const projectRoot = typeof request.projectRoot === "string" && request.projectRoot.length > 0
@@ -9552,29 +5092,74 @@ class RobloxSyncController {
       ...(settingsFile.length > 0 ? [settingsFile] : []),
     ].map((filePath) => String(filePath).trim()).filter((filePath) => filePath.length > 0)));
     const retain = (): void => {
-      this.markEditorPathsPendingAtRoot(changedPaths, cfg, projectRoot, service ? [service] : undefined);
+      this.markEditorPathsPendingAtRoot(
+        changedPaths,
+        cfg,
+        projectRoot,
+        service ? [service] : undefined,
+      );
     };
     if (this.experienceChangeInProgress) {
       retain();
       void vscode.window.showWarningMessage("Wait for the place change to finish.");
-      return "skipped";
+      return undefined;
     }
     if (!request.force && !this.isEditorLiveSyncActive()) {
       retain();
-      return "skipped";
+      return undefined;
     }
     if (request.force === true && !this.canUseStudioPushPipeline()) {
       this.noteStudioPushSkipped("serve/live sync is not active");
       retain();
-      return "skipped";
+      return undefined;
     }
     if (
       request.projectRoot
-      && this.normalizePathForCompare(request.projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
+      && filesystemPathKey(request.projectRoot) !== filesystemPathKey(cfg.projectRoot)
     ) {
+      retain();
+      return undefined;
+    }
+    return { cfg, service, projectRoot, changedPaths, retain };
+  }
+
+  private async finishDirectEditorPush(
+    kind: "property" | "delete",
+    result: CommandRunResult,
+    context: EditorDirectPushContext,
+  ): Promise<EditorPushOutcome> {
+    const { cfg, changedPaths, retain } = context;
+    if (result.code !== 0) {
+      retain();
+      throw new Error(`Editor ${kind} push exited with code ${result.code}`);
+    }
+    const summary = parseEditorPushSummary(result.output, result.result);
+    if (!summary) {
+      retain();
+      throw new Error(`Editor ${kind} push did not return a Studio apply result.`);
+    }
+    if (summary.skippedByReview === true) {
       retain();
       return "skipped";
     }
+    if (summary.ok === false || summaryNumber(summary, "errors") > 0) {
+      retain();
+      throw new Error(`Studio rejected or failed editor ${kind} apply.`);
+    }
+    if (changedPaths.length > 0) {
+      this.clearAppliedEditorPaths(changedPaths);
+      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
+      await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
+    }
+    return "applied";
+  }
+
+  public async pushEditorPropertyNow(request: EditorPropertyPushRequest): Promise<EditorPushOutcome> {
+    const context = this.prepareDirectEditorPush(request);
+    if (!context) {
+      return "skipped";
+    }
+    const { cfg, service, retain } = context;
 
     const property = String(request.property ?? "").trim();
     const pathSegments = Array.isArray(request.pathSegments)
@@ -9585,39 +5170,10 @@ class RobloxSyncController {
       throw new Error("Editor property push requires service, property, and path segments.");
     }
 
-    const command = cfg.exportCliPath;
-    this.ensureFileExists(command);
-    const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
-    const args = [
-      "prop",
-      "-r",
-      projectRoot,
-      "-d",
-      cfg.srcDir,
-      "-w",
-      String(bridgeWaitSeconds),
-      "-P",
-      cfg.bridgePorts,
-      "-s",
-      service,
-      "-c",
-      String(request.className ?? ""),
-      "-p",
-      JSON.stringify(pathSegments),
-      "-o",
-      JSON.stringify(Array.isArray(request.pathOrdinals) ? request.pathOrdinals : []),
-      "-S",
-      request.scope ?? "property",
-      "-n",
-      property,
-      `--value-json=${JSON.stringify(request.value ?? null)}`,
-    ];
+    const command = cfg.cliPath;
+    ensureFileExists(command);
+    const bridgeWaitSeconds = editorBridgeWaitSeconds(cfg);
     const settingsId = String(request.settingsId ?? "").trim();
-    if (settingsId.length > 0) {
-      args.push("-i", settingsId);
-    }
-
-    const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
     const automationParameters = {
       editor: true,
       bridgeWaitSeconds,
@@ -9632,9 +5188,19 @@ class RobloxSyncController {
       ...(settingsId.length > 0 ? { settingsId } : {}),
       overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
     };
-    let result: CommandRunResult;
-    if (usePersistentBridge) {
-      result = await this.runAutomationOperation(
+    let result = await this.runAutomationOperation(
+      command,
+      cfg,
+      "editor-property",
+      AUTOMATION_OP.setProperty,
+      automationParameters,
+      { quietWait: true },
+    );
+    if (
+      result.automationError?.c === "rejected"
+      && result.automationError.n === "review-prepare"
+    ) {
+      result = await this.runReviewedAutomationOperation(
         command,
         cfg,
         "editor-property",
@@ -9642,91 +5208,16 @@ class RobloxSyncController {
         automationParameters,
         { quietWait: true },
       );
-      if (
-        result.automationError?.c === "rejected"
-        && result.automationError.n === "review-prepare"
-      ) {
-        result = await this.runReviewedAutomationOperation(
-          command,
-          cfg,
-          "editor-property",
-          AUTOMATION_OP.setProperty,
-          automationParameters,
-          { quietWait: true },
-        );
-      }
-    } else {
-      result = await this.runCommand(
-        command,
-        this.withPlaceSelector(cfg, args),
-        cfg.projectRoot,
-        "editor-property",
-        cfg.progressHeartbeatSeconds,
-        { quietLog: true },
-      );
     }
-    if (result.code !== 0) {
-      retain();
-      throw new Error(`Editor property push exited with code ${result.code}`);
-    }
-    const summary = this.parseEditorPushSummary(result.output, result.result);
-    if (!summary) {
-      retain();
-      throw new Error("Editor property push did not return a Studio apply result.");
-    }
-    if (summary.skippedByReview === true) {
-      retain();
-      return "skipped";
-    }
-    const errors = this.summaryNumber(summary, "errors");
-    if (summary.ok === false || errors > 0) {
-      retain();
-      throw new Error("Studio rejected or failed editor property apply.");
-    }
-
-    if (changedPaths.length > 0) {
-      this.clearAppliedEditorPaths(changedPaths);
-      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
-      await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
-    }
-    return "applied";
+    return this.finishDirectEditorPush("property", result, context);
   }
 
   public async pushEditorDeleteNow(request: EditorDeletePushRequest): Promise<EditorPushOutcome> {
-    const cfg = this.getConfig();
-    const service = String(request.service ?? "").trim();
-    const projectRoot = typeof request.projectRoot === "string" && request.projectRoot.length > 0
-      ? request.projectRoot
-      : cfg.projectRoot;
-    const settingsFile = String(request.settingsFile ?? "").trim();
-    const changedPaths = Array.from(new Set([
-      ...(Array.isArray(request.changedPaths) ? request.changedPaths : []),
-      ...(settingsFile.length > 0 ? [settingsFile] : []),
-    ].map((filePath) => String(filePath).trim()).filter((filePath) => filePath.length > 0)));
-    const retain = (): void => {
-      this.markEditorPathsPendingAtRoot(changedPaths, cfg, projectRoot, service ? [service] : undefined);
-    };
-    if (this.experienceChangeInProgress) {
-      retain();
-      void vscode.window.showWarningMessage("Wait for the place change to finish.");
+    const context = this.prepareDirectEditorPush(request);
+    if (!context) {
       return "skipped";
     }
-    if (!request.force && !this.isEditorLiveSyncActive()) {
-      retain();
-      return "skipped";
-    }
-    if (request.force === true && !this.canUseStudioPushPipeline()) {
-      this.noteStudioPushSkipped("serve/live sync is not active");
-      retain();
-      return "skipped";
-    }
-    if (
-      request.projectRoot
-      && this.normalizePathForCompare(request.projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)
-    ) {
-      retain();
-      return "skipped";
-    }
+    const { cfg, service, retain } = context;
 
     const pathSegments = Array.isArray(request.pathSegments)
       ? request.pathSegments.map((segment) => String(segment)).filter((segment) => segment.length > 0)
@@ -9736,86 +5227,29 @@ class RobloxSyncController {
       throw new Error("Editor delete push requires service and a non-root path.");
     }
 
-    const command = cfg.exportCliPath;
-    this.ensureFileExists(command);
-    const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
-    const args = [
-      "del",
-      "-r",
-      projectRoot,
-      "-d",
-      cfg.srcDir,
-      "-w",
-      String(bridgeWaitSeconds),
-      "-P",
-      cfg.bridgePorts,
-      "-s",
-      service,
-      "-c",
-      String(request.className ?? ""),
-      "-p",
-      JSON.stringify(pathSegments),
-      "-o",
-      JSON.stringify(Array.isArray(request.pathOrdinals) ? request.pathOrdinals : []),
-    ];
+    const command = cfg.cliPath;
+    ensureFileExists(command);
+    const bridgeWaitSeconds = editorBridgeWaitSeconds(cfg);
     const settingsId = String(request.settingsId ?? "").trim();
-    if (settingsId.length > 0) {
-      args.push("-i", settingsId);
-    }
-
-    const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
-    const result = usePersistentBridge
-      ? await this.runAutomationOperation(
-        command,
-        cfg,
-        "editor-delete",
-        AUTOMATION_OP.remove,
-        {
-          editor: true,
-          bridgeWaitSeconds,
-          bridgePorts: cfg.bridgePorts,
-          service,
-          className: String(request.className ?? ""),
-          pathSegments,
-          pathOrdinals: Array.isArray(request.pathOrdinals) ? request.pathOrdinals : [],
-          ...(settingsId.length > 0 ? { settingsId } : {}),
-          overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
-        },
-        { quietWait: true },
-      )
-      : await this.runCommand(
-        command,
-        this.withPlaceSelector(cfg, args),
-        cfg.projectRoot,
-        "editor-delete",
-        cfg.progressHeartbeatSeconds,
-        { quietLog: true },
-      );
-    if (result.code !== 0) {
-      retain();
-      throw new Error(`Editor delete push exited with code ${result.code}`);
-    }
-    const summary = this.parseEditorPushSummary(result.output, result.result);
-    if (!summary) {
-      retain();
-      throw new Error("Editor delete push did not return a Studio apply result.");
-    }
-    if (summary.skippedByReview === true) {
-      retain();
-      return "skipped";
-    }
-    const errors = this.summaryNumber(summary, "errors");
-    if (summary.ok === false || errors > 0) {
-      retain();
-      throw new Error("Studio rejected or failed editor delete apply.");
-    }
-
-    if (changedPaths.length > 0) {
-      this.clearAppliedEditorPaths(changedPaths);
-      await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
-      await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
-    }
-    return "applied";
+    const result = await this.runAutomationOperation(
+      command,
+      cfg,
+      "editor-delete",
+      AUTOMATION_OP.remove,
+      {
+        editor: true,
+        bridgeWaitSeconds,
+        bridgePorts: cfg.bridgePorts,
+        service,
+        className: String(request.className ?? ""),
+        pathSegments,
+        pathOrdinals: Array.isArray(request.pathOrdinals) ? request.pathOrdinals : [],
+        ...(settingsId.length > 0 ? { settingsId } : {}),
+        overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
+      },
+      { quietWait: true },
+    );
+    return this.finishDirectEditorPush("delete", result, context);
   }
 
   public async onDocumentSaved(doc: vscode.TextDocument): Promise<void> {
@@ -9834,7 +5268,7 @@ class RobloxSyncController {
       this.liveSyncWatcher &&
       this.isProjectSourcePath(doc.uri.fsPath, cfg)
     ) {
-      const fileKey = this.normalizePathForCompare(doc.uri.fsPath);
+      const fileKey = filesystemPathKey(doc.uri.fsPath);
       this.recentDirectSaveAtByPath.set(fileKey, Date.now());
       this.forcedEditorLiveSyncPathKeys.add(fileKey);
       this.pendingEditorPaths.add(doc.uri.fsPath);
@@ -9900,7 +5334,7 @@ class RobloxSyncController {
     }
 
     if (!immediate) {
-      const fileKey = this.normalizePathForCompare(filePath);
+      const fileKey = filesystemPathKey(filePath);
       const lastDirectSaveAt = this.recentDirectSaveAtByPath.get(fileKey) ?? 0;
       if (now - lastDirectSaveAt < 1000) {
         return;
@@ -9935,7 +5369,7 @@ class RobloxSyncController {
     const queuedPaths: string[] = [];
     let earliestSuppressedUntil: number | undefined;
     for (const filePath of this.pendingEditorPaths) {
-      const fileKey = this.normalizePathForCompare(filePath);
+      const fileKey = filesystemPathKey(filePath);
       const forceEditorPush = this.forcedEditorLiveSyncPathKeys.has(fileKey);
       const suppressedUntil = this.editorLiveSyncSuppressedUntil(filePath, now);
       if (!forceEditorPush && suppressedUntil > now) {
@@ -9956,7 +5390,7 @@ class RobloxSyncController {
     const classified = await this.classifyEditorLiveSyncPaths(queuedPaths, cfg);
     const changedPaths = classified.pushable;
     for (const filePath of classified.unchanged) {
-      const key = this.normalizePathForCompare(filePath);
+      const key = filesystemPathKey(filePath);
       this.pendingEditorPaths.delete(filePath);
       this.pendingEditorServicesByPath.delete(key);
       this.forcedEditorLiveSyncPathKeys.delete(key);
@@ -9969,16 +5403,16 @@ class RobloxSyncController {
 
     const pushedHashes = new Map(
       await Promise.all(changedPaths.map(async (filePath) => [
-        this.normalizePathForCompare(filePath),
-        await this.editorLiveSyncFileHash(filePath),
+        filesystemPathKey(filePath),
+        await editorLiveSyncFileHash(filePath),
       ] as const)),
     );
-    const previousCache = this.loadEditorLiveSyncCache(cfg.projectRoot).cache.files;
+    const previousCache = loadEditorLiveSyncCache(cfg.projectRoot).cache.files;
     const structuralServices = new Set<string>();
     for (const filePath of changedPaths) {
-      const key = this.editorLiveSyncCacheKey(filePath, cfg.projectRoot);
+      const key = editorLiveSyncCacheKey(filePath, cfg.projectRoot);
       const existedBefore = previousCache[key] !== undefined;
-      const existsNow = pushedHashes.get(this.normalizePathForCompare(filePath)) !== undefined;
+      const existsNow = pushedHashes.get(filesystemPathKey(filePath)) !== undefined;
       if (
         existedBefore === existsNow &&
         !isReniumSettingsFileName(path.basename(filePath))
@@ -10005,8 +5439,8 @@ class RobloxSyncController {
       }
       const changedDuringPush: string[] = [];
       for (const filePath of changedPaths) {
-        const key = this.normalizePathForCompare(filePath);
-        if (pushedHashes.get(key) === await this.editorLiveSyncFileHash(filePath)) {
+        const key = filesystemPathKey(filePath);
+        if (pushedHashes.get(key) === await editorLiveSyncFileHash(filePath)) {
           this.pendingEditorPaths.delete(filePath);
           this.pendingEditorServicesByPath.delete(key);
         } else {
@@ -10043,7 +5477,7 @@ class RobloxSyncController {
     } finally {
       if (applied) {
         for (const filePath of changedPaths) {
-          this.forcedEditorLiveSyncPathKeys.delete(this.normalizePathForCompare(filePath));
+          this.forcedEditorLiveSyncPathKeys.delete(filesystemPathKey(filePath));
         }
       }
     }
@@ -10054,55 +5488,15 @@ class RobloxSyncController {
     cfg: SyncConfig,
     options: EditorPushOptions = {},
   ): Promise<EditorPushOutcome> {
-    const command = cfg.exportCliPath;
-    this.ensureFileExists(command);
-    const bridgeWaitSeconds = this.editorBridgeWaitSeconds(cfg);
-    const args = [
-      "push",
-      "-r",
-      cfg.projectRoot,
-      "-d",
-      cfg.srcDir,
-      "-w",
-      String(bridgeWaitSeconds),
-      "-P",
-      cfg.bridgePorts,
-    ];
+    const command = cfg.cliPath;
+    ensureFileExists(command);
+    const bridgeWaitSeconds = editorBridgeWaitSeconds(cfg);
     const verifySources = options.fullSync !== true
       && (options.verifySources === true || cfg.verifyEditorPushSources);
-    if (verifySources) {
-      args.push("-v");
-    }
-    if (cfg.linkSync.cacheDir.length > 0) {
-      args.push("--link-cache-dir", cfg.linkSync.cacheDir);
-    }
-    if (this.effectiveLiveSyncConfig(cfg).overridePackages) {
-      args.push("--override-packages");
-    }
-    if (options.fullSync === true) {
-      args.push("--no-review", "--yes");
-    }
-    const usePersistentBridge = this.shouldUsePersistentBridgeForEditorPush(cfg);
-    let changedPathsFile: string | undefined;
     const changedPathArgs = options.fullSync === true
       ? []
       : changedPaths.map((changedPath) => this.editorChangedPathArg(changedPath, cfg.projectRoot));
-    if (!usePersistentBridge && changedPathArgs.length > 32) {
-      const listDir = path.join(cfg.projectRoot, ".renium", "editor-push-paths");
-      fs.mkdirSync(listDir, { recursive: true });
-      changedPathsFile = path.join(
-        listDir,
-        `paths-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
-      );
-      fs.writeFileSync(changedPathsFile, `${changedPathArgs.join(os.EOL)}${os.EOL}`, "utf8");
-      args.push("-f", changedPathsFile);
-    } else {
-      for (const changedPath of changedPathArgs) {
-        args.push("-p", changedPath);
-      }
-    }
     const targetSettingsId = typeof options.targetSettingsId === "string" ? options.targetSettingsId.trim() : "";
-    let targetIdsFile: string | undefined;
     const targetSettingsIds = [
       ...(targetSettingsId.length > 0 ? [targetSettingsId] : []),
       ...(Array.isArray(options.targetSettingsIds) ? options.targetSettingsIds : []),
@@ -10110,362 +5504,74 @@ class RobloxSyncController {
       .map((value) => String(value).trim())
       .filter((value) => value.length > 0);
     const uniqueTargetSettingsIds = [...new Set(targetSettingsIds)];
-    if (!usePersistentBridge && uniqueTargetSettingsIds.length > 128) {
-      const listDir = path.join(cfg.projectRoot, ".renium", "editor-push-paths");
-      fs.mkdirSync(listDir, { recursive: true });
-      targetIdsFile = path.join(
-        listDir,
-        `target-settings-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
-      );
-      fs.writeFileSync(targetIdsFile, `${uniqueTargetSettingsIds.join(os.EOL)}${os.EOL}`, "utf8");
-      args.push("-I", targetIdsFile);
-    } else {
-      for (const targetId of uniqueTargetSettingsIds) {
-        args.push("-i", targetId);
-      }
-    }
     const targetProperties = [
       ...(typeof options.targetProperty === "string" ? [options.targetProperty] : []),
       ...(Array.isArray(options.targetProperties) ? options.targetProperties : []),
     ]
       .map((value) => String(value).trim())
       .filter((value) => value.length > 0);
-    for (const targetProperty of [...new Set(targetProperties)]) {
-      args.push("-t", targetProperty);
-    }
-    if (options.upsertInstancesOnly === true) {
-      args.push("-u");
-    }
-
-    try {
-      const parameters = {
-        bridgeWaitSeconds,
-        bridgePorts: cfg.bridgePorts,
-        changedPaths: changedPathArgs,
-        targetSettingsIds: uniqueTargetSettingsIds,
-        targetProperties: [...new Set(targetProperties)],
-        verifySources,
-        upsertInstancesOnly: options.upsertInstancesOnly === true,
-        overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
-        ...(cfg.linkSync.cacheDir.length > 0 ? { linkCacheDir: cfg.linkSync.cacheDir } : {}),
-        destructive: options.fullSync === true,
-      };
-      const result = usePersistentBridge
-        ? options.fullSync === true
-          ? await this.runReviewedAutomationOperation(
-            command,
-            cfg,
-            "editor-push",
-            AUTOMATION_OP.push,
-            parameters,
-            { quietWait: true },
-          )
-          : await this.runAutomationOperation(
-            command,
-            cfg,
-            "editor-push",
-            AUTOMATION_OP.push,
-            parameters,
-            { quietWait: true },
-          )
-        : await this.runCommand(
-          command,
-          this.withPlaceSelector(cfg, args),
-          cfg.projectRoot,
-          "editor-push",
-          cfg.progressHeartbeatSeconds,
-          { quietLog: true },
-        );
-
-      if (result.code !== 0) {
-        throw new Error(result.automationError?.m ?? `Editor push exited with code ${result.code}`);
-      }
-      const summary = this.parseEditorPushSummary(result.output, result.result);
-      if (!summary) {
-        throw new Error("Editor push did not return a Studio apply result.");
-      }
-      if (summary.skippedByReview === true) {
-        this.output.appendLine("[renium] editor push was skipped in Studio and remains pending");
-        return "skipped";
-      }
-      const sourceVerified = this.summaryNumber(summary, "sourceVerified");
-      const sourceVerifyFailed = this.summaryNumber(summary, "sourceVerifyFailed");
-      const errors = this.summaryNumber(summary, "errors");
-      const sourceQueued = this.summaryNumber(summary, "sourceQueued");
-      const sourceUpdated = this.summaryNumber(summary, "sourceUpdated");
-      const noops = this.summaryNumber(summary, "noops");
-      void sourceQueued;
-      void sourceUpdated;
-      void noops;
-      if (errors > 0) {
-        const detail = Array.isArray(summary.sourceVerifyErrors) ? ` ${summary.sourceVerifyErrors.join("; ")}` : "";
-        throw new Error(`Studio rejected or failed editor Source verification.${detail}`);
-      }
-      if (summary.ok === false || sourceVerifyFailed > 0) {
-        const detail = Array.isArray(summary.sourceVerifyErrors) ? ` ${summary.sourceVerifyErrors.join("; ")}` : "";
-        throw new Error(`Studio reported a failed editor push.${detail}`);
-      }
-      if (summary.ok !== false && errors === 0 && sourceVerifyFailed === 0) {
-        await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
-        await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
-      }
-
-      const existingSourceSaves = changedPaths.filter((changedPath) => this.isLuaSourcePath(changedPath) && fs.existsSync(changedPath)).length;
-      if (verifySources && existingSourceSaves > 0 && sourceVerified < existingSourceSaves) {
-        this.output.appendLine(
-          `[renium] editor push verification warning: verified ${sourceVerified}/${existingSourceSaves} saved Lua source file(s).`,
-        );
-      }
-      return "applied";
-    } finally {
-      if (changedPathsFile) {
-        try {
-          fs.unlinkSync(changedPathsFile);
-        } catch {
-        }
-      }
-      if (targetIdsFile) {
-        try {
-          fs.unlinkSync(targetIdsFile);
-        } catch {
-        }
-      }
-    }
-  }
-
-  private parseEditorPushSummary(output: string, daemonResult?: unknown): Record<string, unknown> | undefined {
-    if (daemonResult && typeof daemonResult === "object" && !Array.isArray(daemonResult)) {
-      return daemonResult as Record<string, unknown>;
-    }
-    const prefix = "__ROBLOX_SYNC_EDITOR_PUSH_RESULT__ ";
-    let found: Record<string, unknown> | undefined;
-    for (const rawLine of output.replace(/\r\n/g, "\n").split("\n")) {
-      const line = rawLine.trim();
-      const index = line.indexOf(prefix);
-      if (index < 0) {
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(line.slice(index + prefix.length)) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          found = parsed as Record<string, unknown>;
-        }
-      } catch {
-      }
-    }
-    if (!found) {
-      try {
-        const parsed = JSON.parse(output.trim()) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
-        }
-      } catch {
-      }
-    }
-    return found;
-  }
-
-  private parseCliJsonObject<T extends object>(output: string): T | undefined {
-    const lines = output.replace(/\r\n/g, "\n").split("\n");
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
-      const line = lines[index].trim();
-      if (!line) {
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(line) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return parsed as T;
-        }
-      } catch {
-      }
-    }
-
-    const trimmed = output.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as T;
-      }
-    } catch {
-    }
-    return undefined;
-  }
-
-  private parseExportGameFileResult(output: string): CliExportGameFileResult | undefined {
-    return this.parseCliJsonObject<CliExportGameFileResult>(output);
-  }
-
-  private parseStudioChangeState(output: string): StudioChangeState | undefined {
-    const prefix = "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ ";
-    let found: StudioChangeState | undefined;
-    for (const rawLine of output.replace(/\r\n/g, "\n").split("\n")) {
-      const line = rawLine.trim();
-      const index = line.indexOf(prefix);
-      const payload = index >= 0 ? line.slice(index + prefix.length) : undefined;
-      if (!payload) {
-        continue;
-      }
-      const state = this.parseStudioChangeStatePayload(payload);
-      if (state) {
-        found = state;
-      }
-    }
-    if (!found) {
-      found = this.parseStudioChangeStatePayload(output.trim());
-    }
-    return found;
-  }
-
-  private parseStudioChangeStatePayload(payload: string): StudioChangeState | undefined {
-    if (!payload) {
-      return undefined;
-    }
-    try {
-      const parsed = JSON.parse(payload) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return undefined;
-      }
-      const record = parsed as Record<string, unknown>;
-      const nestedResult = record.result;
-      if (nestedResult && typeof nestedResult === "object" && !Array.isArray(nestedResult)) {
-        return this.studioChangeStateFromRecord(nestedResult as Record<string, unknown>);
-      }
-      if (!this.looksLikeStudioChangeStateRecord(record)) {
-        return undefined;
-      }
-      return this.studioChangeStateFromRecord(record);
-    } catch {
-      return undefined;
-    }
-  }
-
-  private looksLikeStudioChangeStateRecord(record: Record<string, unknown>): boolean {
-    return Array.isArray(record.dirtyServices)
-      || Array.isArray(record.fullSyncServices)
-      || Array.isArray(record.propertyChanges)
-      || Array.isArray(record.changes)
-      || Array.isArray(record.editorActions)
-      || typeof record.tracking === "boolean"
-      || typeof record.seq === "number"
-      || typeof record.trackedServices === "number"
-      || typeof record.itemChangedAvailable === "boolean"
-      || typeof record.eventDriven === "boolean"
-      || typeof record.waitTimedOut === "boolean";
-  }
-
-  private studioChangeStateFromRecord(record: Record<string, unknown>): StudioChangeState {
-    return {
-      ok: typeof record.ok === "boolean" ? record.ok : undefined,
-      tracking: typeof record.tracking === "boolean" ? record.tracking : undefined,
-      role: typeof record.role === "string" ? record.role : undefined,
-      seq: typeof record.seq === "number" ? record.seq : undefined,
-      runtimeId: typeof record.runtimeId === "string" ? record.runtimeId : undefined,
-      dirtyServices: Array.isArray(record.dirtyServices)
-        ? record.dirtyServices.map((value) => String(value))
-        : undefined,
-      fullSyncServices: Array.isArray(record.fullSyncServices)
-        ? record.fullSyncServices.map((value) => String(value))
-        : undefined,
-      propertyChanges: Array.isArray(record.propertyChanges)
-        ? record.propertyChanges
-          .filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
-          .map((value) => ({
-            service: typeof value.service === "string" ? value.service : undefined,
-            settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
-            className: typeof value.className === "string" ? value.className : undefined,
-            pathSegments: Array.isArray(value.pathSegments) ? value.pathSegments.map((segment) => String(segment)) : undefined,
-            pathOrdinals: Array.isArray(value.pathOrdinals)
-              ? value.pathOrdinals
-                .map((ordinal) => Number(ordinal))
-                .filter((ordinal) => Number.isFinite(ordinal))
-              : undefined,
-            scope: value.scope === "metadata" || value.scope === "attribute" ? value.scope : "property",
-            property: typeof value.property === "string" ? value.property : undefined,
-            value: value.value,
-            seq: typeof value.seq === "number" ? value.seq : undefined,
-          }))
-        : undefined,
-      editorActions: Array.isArray(record.editorActions)
-        ? record.editorActions
-          .filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
-          .map((value) => ({
-            id: typeof value.id === "string" ? value.id : undefined,
-            type: typeof value.type === "string" ? value.type : undefined,
-            service: typeof value.service === "string" ? value.service : undefined,
-            settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
-            pathSegments: Array.isArray(value.pathSegments) ? value.pathSegments.map(String) : undefined,
-            pathOrdinals: Array.isArray(value.pathOrdinals)
-              ? value.pathOrdinals.map((entry) => Number(entry))
-              : undefined,
-          }))
-        : undefined,
-      changes: Array.isArray(record.changes)
-        ? record.changes
-          .filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
-          .map((value) => ({
-            service: typeof value.service === "string" ? value.service : undefined,
-            settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
-            action: typeof value.action === "string" ? value.action : undefined,
-            reason: typeof value.reason === "string" ? value.reason : undefined,
-            className: typeof value.className === "string" ? value.className : undefined,
-            path: typeof value.path === "string" ? value.path : undefined,
-            pathSegments: Array.isArray(value.pathSegments) ? value.pathSegments.map((segment) => String(segment)) : undefined,
-            pathOrdinals: Array.isArray(value.pathOrdinals)
-              ? value.pathOrdinals
-                .map((ordinal) => Number(ordinal))
-                .filter((ordinal) => Number.isFinite(ordinal))
-              : undefined,
-            property: typeof value.property === "string" ? value.property : undefined,
-            attribute: typeof value.attribute === "string" ? value.attribute : undefined,
-            direct: typeof value.direct === "boolean" ? value.direct : undefined,
-            fullSync: typeof value.fullSync === "boolean" ? value.fullSync : undefined,
-            seq: typeof value.seq === "number" ? value.seq : undefined,
-          }))
-        : undefined,
-      trackedServices: typeof record.trackedServices === "number" ? record.trackedServices : undefined,
-      itemChangedAvailable: typeof record.itemChangedAvailable === "boolean" ? record.itemChangedAvailable : undefined,
-      eventDriven: typeof record.eventDriven === "boolean" ? record.eventDriven : undefined,
-      waitSeconds: typeof record.waitSeconds === "number" ? record.waitSeconds : undefined,
-      waitTimedOut: typeof record.waitTimedOut === "boolean" ? record.waitTimedOut : undefined,
-      twoWaySyncEnabled: typeof record.twoWaySyncEnabled === "boolean" ? record.twoWaySyncEnabled : undefined,
-      runtimeSettings: record.runtimeSettings && typeof record.runtimeSettings === "object" && !Array.isArray(record.runtimeSettings)
-        ? record.runtimeSettings as Record<string, unknown>
-        : undefined,
-      explicitRuntimeSettings: record.explicitRuntimeSettings && typeof record.explicitRuntimeSettings === "object" && !Array.isArray(record.explicitRuntimeSettings)
-        ? record.explicitRuntimeSettings as Record<string, unknown>
-        : undefined,
+    const parameters = {
+      bridgeWaitSeconds,
+      bridgePorts: cfg.bridgePorts,
+      changedPaths: changedPathArgs,
+      targetSettingsIds: uniqueTargetSettingsIds,
+      targetProperties: [...new Set(targetProperties)],
+      verifySources,
+      upsertInstancesOnly: options.upsertInstancesOnly === true,
+      overridePackages: this.effectiveLiveSyncConfig(cfg).overridePackages,
+      ...(cfg.linkSync.cacheDir.length > 0 ? { linkCacheDir: cfg.linkSync.cacheDir } : {}),
+      destructive: options.fullSync === true,
     };
-  }
+    const result = options.fullSync === true
+      ? await this.runReviewedAutomationOperation(
+        command,
+        cfg,
+        "editor-push",
+        AUTOMATION_OP.push,
+        parameters,
+        { quietWait: true },
+      )
+      : await this.runAutomationOperation(
+        command,
+        cfg,
+        "editor-push",
+        AUTOMATION_OP.push,
+        parameters,
+        { quietWait: true },
+      );
 
-  private parseBytecodeSetSourceResult(output: string): { sourcePath?: string } | undefined {
-    const trimmed = output.trim();
-    if (!trimmed) {
-      return undefined;
+    if (result.code !== 0) {
+      throw new Error(result.automationError?.m ?? `Editor push exited with code ${result.code}`);
     }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const record = parsed as Record<string, unknown>;
-        return {
-          sourcePath: typeof record.sourcePath === "string" ? record.sourcePath : undefined,
-        };
-      }
-    } catch {
+    const summary = parseEditorPushSummary(result.output, result.result);
+    if (!summary) {
+      throw new Error("Editor push did not return a Studio apply result.");
     }
-    return undefined;
-  }
+    if (summary.skippedByReview === true) {
+      this.output.appendLine("[renium] editor push was skipped in Studio and remains pending");
+      return "skipped";
+    }
+    const sourceVerified = summaryNumber(summary, "sourceVerified");
+    const sourceVerifyFailed = summaryNumber(summary, "sourceVerifyFailed");
+    const errors = summaryNumber(summary, "errors");
+    if (errors > 0) {
+      const detail = Array.isArray(summary.sourceVerifyErrors) ? ` ${summary.sourceVerifyErrors.join("; ")}` : "";
+      throw new Error(`Studio rejected or failed editor Source verification.${detail}`);
+    }
+    if (summary.ok === false || sourceVerifyFailed > 0) {
+      const detail = Array.isArray(summary.sourceVerifyErrors) ? ` ${summary.sourceVerifyErrors.join("; ")}` : "";
+      throw new Error(`Studio reported a failed editor push.${detail}`);
+    }
+    await this.updateEditorLiveSyncCacheAfterPush(changedPaths, cfg);
+    await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
 
-  private summaryNumber(summary: Record<string, unknown>, key: string): number {
-    const value = summary[key];
-    return typeof value === "number" && Number.isFinite(value) ? value : 0;
-  }
-
-  private isLuaSourcePath(filePath: string): boolean {
-    return /\.(lua|luau)$/i.test(filePath);
+    const existingSourceSaves = changedPaths.filter((changedPath) => isLuaSourcePath(changedPath) && fs.existsSync(changedPath)).length;
+    if (verifySources && existingSourceSaves > 0 && sourceVerified < existingSourceSaves) {
+      this.output.appendLine(
+        `[renium] editor push verification warning: verified ${sourceVerified}/${existingSourceSaves} saved Lua source file(s).`,
+      );
+    }
+    return "applied";
   }
 
   public onConfigurationChanged(event?: vscode.ConfigurationChangeEvent): void {
@@ -10486,21 +5592,13 @@ class RobloxSyncController {
       const previousRoot = this.configuredProjectRoot;
       if (
         previousRoot !== undefined
-        && this.normalizePathForCompare(previousRoot) === this.normalizePathForCompare(cfg.projectRoot)
+        && filesystemPathKey(previousRoot) === filesystemPathKey(cfg.projectRoot)
       ) {
         this.configuredProjectRoot = cfg.projectRoot;
         this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
       } else {
         const previousConfiguration = this.projectRootConfigurationSnapshot;
-        const previousState: ExperienceChangeSnapshot = {
-          projectRoot: previousRoot,
-          pendingEditorPaths: [...this.pendingEditorPaths],
-          blockedStudioImportServices: [...this.blockedStudioImportServices],
-          pendingEditorServicesByPath: [...this.pendingEditorServicesByPath]
-            .map(([filePath, services]) => [filePath, [...services]]),
-          studioSnapshotFingerprintByService: [...this.studioSnapshotFingerprintByService],
-          pendingLinkPackageSourcePaths: [...this.pendingLinkPackageSourcePaths],
-        };
+        const previousState = this.captureProjectSyncState(previousRoot);
         const resumeLiveSync = !!(
           this.liveSyncWatcher
           || this.liveSyncStartPromise
@@ -10531,59 +5629,19 @@ class RobloxSyncController {
           this.restorePendingEditorPaths(cfg.projectRoot);
           this.configuredProjectRoot = cfg.projectRoot;
           this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
-          this.sourcemapCache = undefined;
-          this.studioRuntimeSettings = undefined;
-          this.studioConflictPolicyOverride = undefined;
-          this.studioSnapshotFingerprintByService.clear();
-          this.conflictMarkerWarnedKeys.clear();
-          this.recentDirectSaveAtByPath.clear();
-          this.editorPushFailureStreak = 0;
-          this.linkStatusCache = undefined;
-          this.linkStatusInflight = undefined;
+          this.resetProjectScopedCaches();
           await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
           await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
           explorerPrepared = false;
           this.ensureAgentInstructions(cfg.experienceRoot);
-          let pendingPackageSource = false;
-          for (const pending of this.pendingLinkPackageSourcePaths.values()) {
-            if (
-              this.normalizePathForCompare(pending.projectRoot)
-              === this.normalizePathForCompare(cfg.projectRoot)
-            ) {
-              pending.generation = this.experienceGeneration;
-              pendingPackageSource = true;
-            }
-          }
-          if (pendingPackageSource) {
-            this.scheduleLinkPackageSourceFlush(
-              cfg.projectRoot,
-              this.experienceGeneration,
-              1000,
-            );
-          }
+          this.packageSyncController.resumePendingSources(
+            cfg.projectRoot,
+            this.experienceGeneration,
+            1000,
+          );
         } catch (error) {
           await this.restoreProjectRootConfiguration(previousConfiguration);
-          this.configuredProjectRoot = previousRoot;
-          this.pendingEditorPaths = new Set(previousState.pendingEditorPaths);
-          this.blockedStudioImportServices = new Set(previousState.blockedStudioImportServices);
-          this.pendingEditorServicesByPath = new Map(
-            previousState.pendingEditorServicesByPath
-              .map(([filePath, services]) => [filePath, new Set(services)]),
-          );
-          this.studioSnapshotFingerprintByService = new Map(previousState.studioSnapshotFingerprintByService);
-          this.pendingLinkPackageSourcePaths.clear();
-          for (const [filePath, pending] of previousState.pendingLinkPackageSourcePaths) {
-            this.pendingLinkPackageSourcePaths.set(filePath, {
-              projectRoot: previousRoot ?? pending.projectRoot,
-              generation: this.experienceGeneration,
-            });
-          }
-          this.liveSyncProjectRoot = previousRoot;
-          this.sourcemapCache = undefined;
-          this.studioRuntimeSettings = undefined;
-          this.studioConflictPolicyOverride = undefined;
-          this.linkStatusCache = undefined;
-          this.linkStatusInflight = undefined;
+          this.restoreProjectSyncState(previousState);
           if (previousRoot) {
             invalidateProjectSourceGraph(previousRoot);
           }
@@ -10600,8 +5658,11 @@ class RobloxSyncController {
           if (resumeLiveSync) {
             await this.startLiveSync({ silent: true, bestEffort: true });
           }
-          if (this.pendingLinkPackageSourcePaths.size > 0 && previousRoot) {
-            this.scheduleLinkPackageSourceFlush(previousRoot, this.experienceGeneration);
+          if (previousRoot) {
+            this.packageSyncController.resumePendingSources(
+              previousRoot,
+              this.experienceGeneration,
+            );
           }
           throw error;
         } finally {
@@ -10613,22 +5674,19 @@ class RobloxSyncController {
       }
     }
     const bridgeConfigChanged = !event || [
-      "renium.exportCliPath",
+      "renium.cliPath",
       "renium.projectRoot",
-      "renium.transport",
       "renium.bridgeWaitSeconds",
       "renium.bridgePorts",
     ].some((key) => event.affectsConfiguration(key));
-    const persistentBridgeChanged = event?.affectsConfiguration("renium.usePersistentBridge") === true;
-
     if (bridgeConfigChanged) {
       await this.stopConsoleFollow();
     }
-    if (bridgeConfigChanged || (persistentBridgeChanged && !this.bridgeServeRequested)) {
+    if (bridgeConfigChanged) {
       await this.stopBridgeDaemon();
       if (this.bridgeServeRequested) {
         void this.serve({ silent: true, bestEffort: true });
-      } else if (cfg.editorLiveSyncEnabled && this.liveSyncWatcher && this.shouldUsePersistentBridge(cfg)) {
+      } else if (cfg.editorLiveSyncEnabled && this.liveSyncWatcher) {
         void this.prewarmPersistentBridgeDaemon("configuration");
       }
     }
@@ -10654,7 +5712,7 @@ class RobloxSyncController {
       }
     }
     if (!event || event.affectsConfiguration("renium.gitSync") || event.affectsConfiguration("renium.projectRoot")) {
-      void this.refreshGitView();
+      void this.gitController.refreshView();
     }
     if (
       !event
@@ -10668,21 +5726,18 @@ class RobloxSyncController {
 
   public async prewarmPersistentBridgeDaemon(reason = "activation"): Promise<void> {
     const cfg = this.getConfig();
-    if (!this.shouldUsePersistentBridge(cfg)) {
-      return;
-    }
     if (!this.bridgeServeRequested && !(cfg.editorLiveSyncEnabled && this.liveSyncWatcher)) {
       return;
     }
-    if (!fs.existsSync(cfg.exportCliPath)) {
+    if (!fs.existsSync(cfg.cliPath)) {
       this.output.appendLine(
-        `[renium] bridge daemon prewarm skipped (${reason}): export CLI does not exist yet: ${cfg.exportCliPath}`,
+        `[renium] bridge daemon prewarm skipped (${reason}): CLI does not exist yet: ${cfg.cliPath}`,
       );
       return;
     }
 
     try {
-      await this.ensureBridgeDaemon(cfg.exportCliPath, cfg, { serve: this.bridgeServeRequested });
+      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: this.bridgeServeRequested });
       this.output.appendLine(`[renium] bridge daemon prewarm ready (${reason})`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -10742,37 +5797,25 @@ class RobloxSyncController {
       ...this.getConfig(),
       ...(options.configOverrides ?? {}),
     };
-    const selectedServices = this.normalizeServices(options.services, cfg.services);
-    const useRustImportInExporter = options.runImport;
-    const { command, args } = this.resolveExportCommand(
-      cfg,
-      selectedServices,
-      options.runImport,
-      useRustImportInExporter,
-      options.quietTimings !== false,
-    );
-    const usePersistentBridge = this.shouldUsePersistentBridge(cfg);
-    const directArgs = this.withPlaceSelector(cfg, args);
+    const selectedServices = normalizeServices(options.services, cfg.services);
+    const command = cfg.cliPath;
+    ensureFileExists(command);
 
     const quietLog = options.quietLog === true;
     if (!quietLog) {
       this.output.show(false);
       this.logResolvedConfig(cfg);
-      if (usePersistentBridge) {
-        this.output.appendLine(
-          `[renium] export daemon command: ${command} bd -w ${Math.max(1, cfg.bridgeWaitSeconds)} -P ${cfg.bridgePorts}`,
-        );
-        this.output.appendLine(`[renium] automation operation: ${options.runImport ? "pull" : "export-snapshots"}`);
-      } else {
-        this.output.appendLine(`[renium] export command: ${command} ${this.renderArgs(directArgs)}`);
-      }
+      this.output.appendLine(
+        `[renium] export daemon command: ${command} bd -w ${Math.max(1, cfg.bridgeWaitSeconds)} -P ${cfg.bridgePorts}`,
+      );
+      this.output.appendLine(`[renium] automation operation: ${options.runImport ? "pull" : "export-snapshots"}`);
     }
 
     const operation = options.runImport ? AUTOMATION_OP.pull : AUTOMATION_OP.exportSnapshots;
     const parameters = {
       services: selectedServices,
       snapshotDir: cfg.snapshotDir,
-      bridgeWaitSeconds: this.editorBridgeWaitSeconds(cfg),
+      bridgeWaitSeconds: editorBridgeWaitSeconds(cfg),
       bridgePorts: cfg.bridgePorts,
       performanceMode: cfg.performanceMode,
       modifiedDefaultBypass: cfg.modifiedDefaultBypass,
@@ -10784,41 +5827,29 @@ class RobloxSyncController {
       noUpdateEditorIcons: cfg.noUpdateEditorIcons,
       destructive: options.destructive === true,
     };
-    const result = usePersistentBridge
-      ? options.destructive === true
-        ? await this.runReviewedAutomationOperation(
-          command,
-          cfg,
-          "pull",
-          operation,
-          parameters,
-          { quietWait: quietLog },
-        )
-        : await this.runAutomationOperation(
-          command,
-          cfg,
-          "export",
-          operation,
-          parameters,
-          { quietWait: quietLog },
-        )
-      : await this.runCommand(
+    const result = options.destructive === true
+      ? await this.runReviewedAutomationOperation(
         command,
-        directArgs,
-        cfg.projectRoot,
+        cfg,
+        "pull",
+        operation,
+        parameters,
+        { quietWait: quietLog },
+      )
+      : await this.runAutomationOperation(
+        command,
+        cfg,
         "export",
-        cfg.progressHeartbeatSeconds,
-        { quietLog },
+        operation,
+        parameters,
+        { quietWait: quietLog },
       );
     if (result.code !== 0) {
       throw new Error(result.automationError?.m ?? `Export exited with code ${result.code}`);
     }
 
     if (options.runImport && options.notifyOnSuccess) {
-      try {
-        await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", selectedServices);
-      } catch {
-      }
+      await executeCommandBestEffort("renium.fileExplorer.refreshServices", selectedServices);
     }
 
     if (options.notifyOnSuccess && options.reason) {
@@ -10827,25 +5858,7 @@ class RobloxSyncController {
     return result;
   }
 
-  private daemonKey(command: string, cfg: SyncConfig, serve: boolean): string {
-    let binaryMtimeMs = 0;
-    try {
-      binaryMtimeMs = Math.floor(fs.statSync(command).mtimeMs);
-    } catch {
-      binaryMtimeMs = 0;
-    }
-
-    return JSON.stringify({
-      command,
-      binaryMtimeMs,
-      projectRoot: cfg.projectRoot,
-      bridgePorts: cfg.bridgePorts,
-      bridgeWaitSeconds: Math.max(1, cfg.bridgeWaitSeconds),
-      serve,
-    });
-  }
-
-  private async runAutomationOperation(
+  private runAutomationOperation(
     command: string,
     cfg: SyncConfig,
     label: string,
@@ -10853,12 +5866,13 @@ class RobloxSyncController {
     parameters: Record<string, unknown>,
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    await this.ensureBridgeDaemon(command, cfg, { serve: this.bridgeServeRequested });
-    const contextId = await this.ensureDaemonContext(command, cfg);
-    return await this.sendAutomationRequest(cfg, label, op, contextId, parameters, options);
+    return this.automationClient.runOperation(command, cfg, label, op, parameters, {
+      ...options,
+      serve: this.bridgeServeRequested,
+    });
   }
 
-  private async runReviewedAutomationOperation(
+  private runReviewedAutomationOperation(
     command: string,
     cfg: SyncConfig,
     label: string,
@@ -10866,550 +5880,26 @@ class RobloxSyncController {
     parameters: Record<string, unknown>,
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    await this.ensureBridgeDaemon(command, cfg, { serve: this.bridgeServeRequested });
-    const contextId = await this.ensureDaemonContext(command, cfg);
-    const prepared = await this.sendAutomationRequest(
-      cfg,
-      `${label}-review`,
-      AUTOMATION_OP.reviewPrepare,
-      contextId,
-      { op, p: parameters },
-      { ...options, quietWait: true },
-    );
-    if (prepared.code !== 0) {
-      return prepared;
-    }
-    const result = prepared.result as Record<string, unknown> | undefined;
-    const reviewId = typeof result?.reviewId === "string" ? result.reviewId : undefined;
-    if (!reviewId) {
-      return { code: 1, output: "Review preparation did not return reviewId." };
-    }
-    return await this.sendAutomationRequest(
-      cfg,
-      label,
-      AUTOMATION_OP.reviewApply,
-      contextId,
-      { reviewId },
-      options,
-    );
-  }
-
-  private async ensureDaemonContext(command: string, cfg: SyncConfig): Promise<number> {
-    const key = JSON.stringify({
-      projectRoot: path.resolve(cfg.projectRoot),
-      place: cfg.placeSelector ?? "",
-      daemon: this.daemonKeyValue ?? "",
+    return this.automationClient.runReviewedOperation(command, cfg, label, op, parameters, {
+      ...options,
+      serve: this.bridgeServeRequested,
     });
-    if (this.daemonContext?.key === key) {
-      return this.daemonContext.id;
-    }
-    const bound = await this.sendAutomationRequest(
-      cfg,
-      "bind",
-      AUTOMATION_OP.bind,
-      undefined,
-      { root: cfg.projectRoot, place: cfg.placeSelector },
-      { quietWait: true, timeoutMs: 2_000 },
-    );
-    if (bound.code !== 0) {
-      throw new Error(bound.automationError?.m ?? "Renium could not bind this project.");
-    }
-    const result = bound.result as Record<string, unknown> | undefined;
-    const id = Number(result?.id);
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new Error("Renium bind response omitted the context ID.");
-    }
-    if (typeof result?.runtimeId === "string" && result.runtimeId.length > 0) {
-      this.daemonContext = { key, id };
-    }
-    void command;
-    return id;
-  }
-
-  private async sendAutomationRequest(
-    cfg: SyncConfig,
-    label: string,
-    op: number,
-    contextId: number | undefined,
-    parameters: Record<string, unknown>,
-    options: { quietWait?: boolean; timeoutMs?: number } = {},
-  ): Promise<CommandRunResult> {
-
-    return await new Promise<CommandRunResult>((resolve, reject) => {
-      const proc = this.daemonProcess;
-      if (!proc || proc.killed || !proc.stdin?.writable) {
-        reject(new Error("Persistent bridge daemon is not running."));
-        return;
-      }
-
-      const launchedAt = Date.now();
-      const id = this.daemonRequestId++;
-      const pending: DaemonPendingRequest = {
-        id,
-        label,
-        launchedAt,
-        lastOutputAt: launchedAt,
-        sawOutput: false,
-        output: "",
-        resolve,
-        reject,
-        heartbeatTimer: undefined,
-        timeoutTimer: undefined,
-        quiet: options.quietWait === true,
-      };
-
-      if (!options.quietWait) {
-        const heartbeatMs = Math.max(2, Math.round(cfg.progressHeartbeatSeconds)) * 1000;
-        pending.heartbeatTimer = setInterval(() => {
-          const now = Date.now();
-          const elapsedSec = ((now - launchedAt) / 1000).toFixed(1);
-          const idleSec = ((now - pending.lastOutputAt) / 1000).toFixed(1);
-          if (!pending.sawOutput) {
-            this.output.appendLine(`[renium] ${label}: waiting for daemon output (${elapsedSec}s elapsed)`);
-          } else {
-            this.output.appendLine(`[renium] ${label}: daemon still running (${elapsedSec}s elapsed, idle ${idleSec}s)`);
-          }
-        }, heartbeatMs);
-      }
-
-      const timeoutMs = this.daemonRequestTimeoutMs(cfg, op, options.timeoutMs);
-      pending.timeoutTimer = setTimeout(() => {
-        if (!this.daemonPending.has(id)) {
-          return;
-        }
-        const timeoutMessage = `[renium] ${label}: daemon request timed out after ${Math.round(timeoutMs / 1000)}s; restarting the bridge daemon.\n`;
-        this.output.appendLine(timeoutMessage.trim());
-        this.finishDaemonRequest(id, { code: 124, output: pending.output + `\n${timeoutMessage}` });
-        void this.stopBridgeDaemon(new Error(`Persistent bridge daemon request timed out (${label}).`));
-      }, timeoutMs);
-
-      this.daemonPending.set(id, pending);
-      const request = JSON.stringify({
-        v: 1,
-        id,
-        op,
-        ...(contextId === undefined ? {} : { cx: contextId }),
-        p: parameters,
-      }) + "\n";
-
-      const writeFailed = (): void => {
-        if (this.daemonPending.has(id)) {
-          this.finishDaemonRequest(id, {
-            code: 1,
-            output: pending.output + "\nThe daemon transport closed before the request was written.",
-          });
-        }
-        void this.stopBridgeDaemon(new Error("Persistent bridge daemon transport closed."));
-      };
-      try {
-        proc.stdin.write(request, "utf8", (error) => {
-          if (error) {
-            writeFailed();
-          }
-        });
-      } catch {
-        writeFailed();
-      }
-    });
-  }
-
-  private shouldUsePersistentBridge(cfg: SyncConfig): boolean {
-    return cfg.transport === "ws";
-  }
-
-  private shouldUsePersistentBridgeForEditorPush(cfg: SyncConfig): boolean {
-    return cfg.transport === "ws";
-  }
-
-  private editorBridgeWaitSeconds(cfg: SyncConfig): number {
-    return Math.max(1, Math.min(2, Number(cfg.bridgeWaitSeconds) || 2));
-  }
-
-  private daemonRequestTimeoutMs(cfg: SyncConfig, op: number, requestedTimeoutMs?: number): number {
-    if (op === AUTOMATION_OP.liveStatus) {
-      const bridgeWaitMs = (Math.max(1, Number(cfg.bridgeWaitSeconds) || 1) + 3) * 1000;
-      return Math.max(5_000, Math.min(DAEMON_CHANNEL_WAIT_MAX_MS, bridgeWaitMs));
-    }
-    return Math.max(
-      1_000,
-      Math.min(MAX_COMMAND_TIMEOUT_MS, Math.floor(Number(requestedTimeoutMs) || DEFAULT_COMMAND_TIMEOUT_MS)),
-    );
   }
 
   private isBridgeDaemonRunning(): boolean {
-    return !!this.daemonProcess
-      && !this.daemonProcess.killed
-      && this.daemonProcess.exitCode === null
-      && this.daemonProcess.signalCode === null;
+    return this.automationClient.isRunning();
   }
 
-  private async ensureBridgeDaemon(command: string, cfg: SyncConfig, options: { serve?: boolean } = {}): Promise<void> {
-    this.ensureFileExists(command);
-    const key = this.daemonKey(command, cfg, options.serve === true);
-    if (this.isBridgeDaemonRunning() && this.daemonKeyValue === key) {
-      await this.awaitBridgeDaemonReady(cfg);
-      return;
-    }
-
-    await this.stopBridgeDaemon();
-
-    const args = [
-      "bd",
-      "-w",
-      String(Math.max(1, cfg.bridgeWaitSeconds)),
-      "-P",
-      cfg.bridgePorts,
-      "--parent-pid",
-      String(process.pid),
-      "--editor-stdio",
-    ];
-
-    const child = childProcess.spawn(command, args, {
-      cwd: cfg.projectRoot,
-      env: process.env,
-      detached: process.platform !== "win32",
-      shell: false,
-      stdio: "pipe",
-      windowsHide: true,
-    });
-    this.daemonClosePromise = trackProcess(child, projectProcessOwner(cfg.projectRoot));
-
-    this.daemonProcess = child;
-    this.daemonKeyValue = key;
-    this.daemonOutputBuffer = "";
-    this.daemonReady = false;
-    this.daemonReadyPromise = new Promise<void>((resolve, reject) => {
-      this.daemonReadyResolve = resolve;
-      this.daemonReadyReject = reject;
-    });
-    child.once("spawn", () => {
-      this.daemonReady = true;
-      this.daemonReadyResolve?.();
-      this.daemonReadyResolve = undefined;
-      this.daemonReadyReject = undefined;
-    });
-    child.stdout.on("data", (data: Buffer | string) => {
-      this.handleDaemonOutput(command, data, false);
-    });
-    child.stderr.on("data", (data: Buffer | string) => {
-      this.handleDaemonOutput(`${command}:err`, data, true);
-    });
-    child.on("error", (err: Error) => {
-      this.output.appendLine(`[renium] bridge daemon error: ${err.message}`);
-      this.daemonReadyReject?.(err);
-      this.rejectDaemonPending(err);
-    });
-    child.on("exit", (code: number | null) => {
-      const exitError = new Error(`Persistent bridge daemon exited with code ${code ?? 0}`);
-      if (code !== 0 && code !== null) {
-        this.output.appendLine(`[renium] bridge daemon exited code=${code}`);
-      }
-      this.daemonReadyReject?.(exitError);
-      this.rejectDaemonPending(exitError);
-    });
-    child.on("close", () => this.clearBridgeDaemonProcess(child));
-
-    await this.awaitBridgeDaemonReady(cfg);
-  }
-
-  private async awaitBridgeDaemonReady(cfg: SyncConfig): Promise<void> {
-    if (this.daemonReady) {
-      return;
-    }
-    const readyPromise = this.daemonReadyPromise;
-    if (!readyPromise) {
-      throw new Error("Persistent bridge daemon was not started.");
-    }
-
-    const timeoutMs = Math.max(
-      1_000,
-      Math.min(DAEMON_CHANNEL_WAIT_MAX_MS, (Math.max(1, Number(cfg.bridgeWaitSeconds) || 1) + 2) * 1000),
-    );
-    let timeoutHandle: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        readyPromise,
-        new Promise<void>((_resolve, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error(`Persistent bridge daemon did not become ready within ${Math.round(timeoutMs / 1000)}s.`));
-          }, timeoutMs);
-        }),
-      ]);
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      await this.stopBridgeDaemon(error);
-      throw error;
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-    }
-  }
-
-  private handleDaemonOutput(prefix: string, data: Buffer | string, isStderr: boolean): void {
-    const text = data.toString();
-    const hasQuietPending = Array.from(this.daemonPending.values()).some((pending) => pending.quiet);
-    if (isStderr && !hasQuietPending) {
-      this.output.append(this.prefixOutput(prefix, data));
-    }
-
-    if (isStderr) {
-      this.appendDaemonOutputToActiveRequest(text);
-      return;
-    }
-
-    this.daemonOutputBuffer += text;
-    if (this.daemonOutputBuffer.length > MAX_DAEMON_OUTPUT_BUFFER_BYTES) {
-      const error = new Error("Persistent bridge daemon emitted more than 1 MiB without a complete protocol line.");
-      this.output.appendLine(`[renium] bridge daemon protocol error: ${error.message}`);
-      void this.stopBridgeDaemon(error);
-      return;
-    }
-    let newlineIndex = this.daemonOutputBuffer.indexOf("\n");
-    while (newlineIndex >= 0) {
-      const rawLine = this.daemonOutputBuffer.slice(0, newlineIndex + 1);
-      const line = this.daemonOutputBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      this.daemonOutputBuffer = this.daemonOutputBuffer.slice(newlineIndex + 1);
-      this.processDaemonLine(line);
-      void rawLine;
-      newlineIndex = this.daemonOutputBuffer.indexOf("\n");
-    }
-  }
-
-  private appendDaemonOutputToActiveRequest(text: string): void {
-    const active = this.daemonPending.values().next().value as DaemonPendingRequest | undefined;
-    if (!active) {
-      return;
-    }
-    active.output += text;
-    if (active.output.length > 8_000_000) {
-      active.output = active.output.slice(-8_000_000);
-    }
-    active.sawOutput = true;
-    active.lastOutputAt = Date.now();
-  }
-
-  private processDaemonLine(line: string): void {
-    let payload: AutomationResponse;
-    try {
-      payload = JSON.parse(line) as AutomationResponse;
-    } catch (err) {
-      this.output.appendLine(
-        `[renium] bridge daemon returned invalid protocol JSON: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return;
-    }
-    if (payload.v !== 1 || (payload.ok !== 0 && payload.ok !== 1)) {
-      this.output.appendLine("[renium] bridge daemon returned an incompatible protocol response.");
-      return;
-    }
-    const id = Number(payload.id ?? 0);
-    const code = payload.ok === 1 ? 0 : 1;
-    const pending = this.daemonPending.get(id);
-    if (!pending) {
-      return;
-    }
-    if (payload.e?.c === "stale_cx") {
-      this.daemonContext = undefined;
-    }
-
-    let output = pending.output;
-    if (payload.e?.m) {
-      output += `\n${payload.e.m}\n`;
-    }
-    this.finishDaemonRequest(id, {
-      code,
-      output,
-      result: payload.r,
-      automationError: payload.e,
-    });
-  }
-
-  private finishDaemonRequest(id: number, result: CommandRunResult): void {
-    const pending = this.daemonPending.get(id);
-    if (!pending) {
-      return;
-    }
-
-    if (pending.heartbeatTimer) {
-      clearInterval(pending.heartbeatTimer);
-    }
-    if (pending.timeoutTimer) {
-      clearTimeout(pending.timeoutTimer);
-    }
-    this.daemonPending.delete(id);
-    const elapsedSec = ((Date.now() - pending.launchedAt) / 1000).toFixed(1);
-    if (!pending.quiet) {
-      this.output.appendLine(`[renium] ${pending.label}: daemon result code=${result.code} after ${elapsedSec}s`);
-    }
-    pending.resolve(result);
-  }
-
-  private rejectDaemonPending(err: Error): void {
-    for (const [id, pending] of this.daemonPending.entries()) {
-      if (pending.heartbeatTimer) {
-        clearInterval(pending.heartbeatTimer);
-      }
-      if (pending.timeoutTimer) {
-        clearTimeout(pending.timeoutTimer);
-      }
-      this.daemonPending.delete(id);
-      pending.reject(err);
-    }
-  }
-
-  private sendDaemonShutdown(): void {
-    const proc = this.daemonProcess;
-    if (!proc || proc.killed || !proc.stdin?.writable) {
-      return;
-    }
-
-    try {
-      proc.stdin.end();
-    } catch {
-    }
-  }
-
-  private clearBridgeDaemonProcess(proc: childProcess.ChildProcess): void {
-    if (this.daemonProcess !== proc) {
-      return;
-    }
-    this.daemonProcess = undefined;
-    this.daemonKeyValue = undefined;
-    this.daemonOutputBuffer = "";
-    this.daemonReady = false;
-    this.daemonReadyPromise = undefined;
-    this.daemonReadyResolve = undefined;
-    this.daemonReadyReject = undefined;
-    this.daemonClosePromise = undefined;
-    this.daemonContext = undefined;
-  }
-
-  private stopBridgeDaemon(reason = new Error("Persistent bridge daemon was stopped.")): Promise<void> {
-    if (this.daemonStopPromise) {
-      return this.daemonStopPromise;
-    }
-    const stop = this.stopBridgeDaemonProcess(reason);
-    const tracked = stop.finally(() => {
-      if (this.daemonStopPromise === tracked) {
-        this.daemonStopPromise = undefined;
-      }
-    });
-    this.daemonStopPromise = tracked;
-    return tracked;
-  }
-
-  private async stopBridgeDaemonProcess(reason: Error): Promise<void> {
-    const proc = this.daemonProcess;
-    if (!proc) {
-      this.rejectDaemonPending(reason);
-      this.daemonReadyReject?.(reason);
-      this.daemonReady = false;
-      this.daemonReadyPromise = undefined;
-      this.daemonReadyResolve = undefined;
-      this.daemonReadyReject = undefined;
-      return;
-    }
-
-    this.sendDaemonShutdown();
-    this.daemonReadyReject?.(reason);
-    this.rejectDaemonPending(reason);
-    const closed = this.daemonClosePromise ?? trackProcess(
-      proc,
-      projectProcessOwner(this.configuredProjectRoot ?? this.context.extensionPath),
-    );
-    let closedGracefully = false;
-    await Promise.race([
-      closed.then(() => {
-        closedGracefully = true;
-      }),
-      sleep(500),
-    ]);
-    if (!closedGracefully) {
-      await terminateProcess(proc);
-    }
-    this.clearBridgeDaemonProcess(proc);
-  }
-
-  private resolveExportCommand(
+  private ensureBridgeDaemon(
+    command: string,
     cfg: SyncConfig,
-    selectedServices: string[],
-    requestedRunImport: boolean,
-    useRustImportInExporter: boolean,
-    quietTimings: boolean,
-  ): { command: string; args: string[] } {
-    const runImportFlag = requestedRunImport ? "-i" : "--no-import";
-    const extraImportArgs: string[] = [];
-    if (useRustImportInExporter) {
-      const importCliPath = resolveExistingRustCliPath(
-        this.getWorkspaceRoot(),
-        cfg.projectRoot,
-        cfg.rustCliPath,
-        this.context.extensionPath,
-      );
-      this.ensureFileExists(importCliPath);
-      extraImportArgs.push("--import-cli", importCliPath);
-    }
-    this.ensureFileExists(cfg.exportCliPath);
-    return {
-      command: cfg.exportCliPath,
-      args: [
-        "x",
-        "-r",
-        cfg.projectRoot,
-        "--src-dir",
-        cfg.srcDir,
-        "-d",
-        cfg.snapshotDir,
-        "-t",
-        cfg.transport,
-        "-s",
-        selectedServices.join(","),
-        "--sw",
-        String(Math.max(0, cfg.sourceWorkers)),
-        "--iw",
-        String(Math.max(0, cfg.instanceWorkers)),
-        "--mw",
-        String(Math.max(0, cfg.importWorkers)),
-        "--perf",
-        cfg.performanceMode,
-        ...(cfg.modifiedDefaultBypass ? ["--mdb"] : ["--no-mdb"]),
-        "-c",
-        String(Math.max(512, cfg.chunkSize)),
-        "--ic",
-        String(Math.max(0, cfg.snapshotInstanceChunkSize)),
-        "-w",
-        String(Math.max(1, cfg.bridgeWaitSeconds)),
-        "-P",
-        cfg.bridgePorts,
-        "-S",
-        cfg.server,
-        "-C",
-        cfg.configTomlPath,
-        "-W",
-        String(Math.max(1, cfg.wsWaitSeconds)),
-        "-m",
-        cfg.importMode,
-        runImportFlag,
-        quietTimings ? "-q" : "",
-        cfg.adaptiveThrottle ? "--adaptive-throttle" : "--no-adaptive-throttle",
-        cfg.noUpdateEditorIcons ? "--no-icons" : "",
-        ...extraImportArgs,
-      ].filter((x) => x.length > 0),
-    };
+    options: { serve?: boolean } = {},
+  ): Promise<void> {
+    return this.automationClient.ensure(command, cfg, options);
   }
 
-  private resolveRustCliPathForCommand(cfg: SyncConfig, command: string): string {
-    const workspaceRoot = this.getWorkspaceRoot();
-    const roots = Array.from(new Set([workspaceRoot, cfg.projectRoot].map((value) => path.normalize(value))));
-    const candidates = reniumCliCandidates({
-      configuredPath: cfg.rustCliPath,
-      extensionRoot: this.context.extensionPath,
-      roots,
-      fallbackRelativePaths: RUST_CLI_FALLBACK_RELATIVE_PATHS,
-    });
-    void command;
-    return candidates.find((candidate) => fs.existsSync(candidate)) ?? cfg.rustCliPath;
+  private stopBridgeDaemon(reason?: Error): Promise<void> {
+    return this.automationClient.stop(reason);
   }
 
   public async detectedCliVersion(cliPath: string): Promise<string | undefined> {
@@ -11427,26 +5917,15 @@ class RobloxSyncController {
     return result.output.match(/(\d+\.\d+\.\d+)/)?.[1];
   }
 
-  private withPlaceSelector(cfg: SyncConfig, args: string[]): string[] {
-    return cfg.placeSelector
-      ? ["--place", cfg.placeSelector, ...args]
-      : args;
-  }
-
-  private async runRustImport(
+  private async importSnapshots(
     cfg: SyncConfig,
     snapshotPath: string,
     services: string[],
     options: { quietLog?: boolean } = {},
   ): Promise<string[]> {
-    const rustCliPath = resolveExistingRustCliPath(
-      this.getWorkspaceRoot(),
-      cfg.projectRoot,
-      cfg.rustCliPath,
-      this.context.extensionPath,
-    );
-    this.ensureFileExists(rustCliPath);
-    const selectedServices = this.normalizeServices(services, cfg.services);
+    const cliPath = cfg.cliPath;
+    ensureFileExists(cliPath);
+    const selectedServices = normalizeServices(services, cfg.services);
     const args = [
       "--output-mode",
       "json",
@@ -11459,35 +5938,31 @@ class RobloxSyncController {
       cfg.srcDir,
       "--services",
       selectedServices.join(","),
-      "--compact-meta-json",
     ];
     const quietLog = options.quietLog === true;
     if (!quietLog) {
       this.output.show(false);
       this.logResolvedConfig(cfg);
-      if (path.normalize(rustCliPath) !== path.normalize(cfg.rustCliPath)) {
-        this.output.appendLine(`[renium] rust import: using fallback rustCliPath=${rustCliPath}`);
-      }
-      this.output.appendLine(`[renium] rust import command: ${rustCliPath} ${this.renderArgs(args)}`);
+      this.output.appendLine(`[renium] import command: ${cliPath} ${renderCommandArgs(args)}`);
     }
     const result = await this.runCommand(
-      rustCliPath,
+      cliPath,
       args,
       cfg.projectRoot,
-      "rust-import",
+      "snapshot-import",
       cfg.progressHeartbeatSeconds,
       { quietLog },
     );
     if (result.code !== 0) {
-      throw new Error(`Rust import exited with code ${result.code}`);
+      throw new Error(`Snapshot import exited with code ${result.code}`);
     }
-    const parsed = this.parseCliJsonObject<{ changedPaths?: unknown }>(result.output);
+    const parsed = parseCliJsonObject<{ changedPaths?: unknown }>(result.output);
     if (!parsed || !Array.isArray(parsed.changedPaths)) {
-      throw new Error("Rust import returned invalid structured output.");
+      throw new Error("Snapshot import returned invalid structured output.");
     }
     return parsed.changedPaths.map((filePath) => {
       if (typeof filePath !== "string") {
-        throw new Error("Rust import returned a non-string changed path.");
+        throw new Error("Snapshot import returned a non-string changed path.");
       }
       return path.resolve(cfg.projectRoot, filePath);
     });
@@ -11497,7 +5972,7 @@ class RobloxSyncController {
     return path.isAbsolute(cfg.snapshotDir) ? cfg.snapshotDir : path.join(cfg.projectRoot, cfg.snapshotDir);
   }
 
-  private async runCommand(
+  private runCommand(
     command: string,
     args: string[],
     cwd: string,
@@ -11505,7 +5980,7 @@ class RobloxSyncController {
     progressHeartbeatSeconds: number,
     options: { quietLog?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    return await new Promise<CommandRunResult>((resolve, reject) => {
+    return new Promise<CommandRunResult>((resolve, reject) => {
       const quietLog = options.quietLog === true;
       const timeoutMs = Math.max(
         1_000,
@@ -11559,15 +6034,7 @@ class RobloxSyncController {
       };
 
       try {
-        child = childProcess.spawn(command, args, {
-          cwd,
-          env: process.env,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: "pipe",
-          windowsHide: true,
-        });
-        trackProcess(child, projectProcessOwner(cwd));
+        child = spawnTrackedProcess(command, args, cwd).child;
       } catch (err) {
         fail(err instanceof Error ? err : new Error(String(err)));
         return;
@@ -11625,7 +6092,7 @@ class RobloxSyncController {
       onActivity?.();
       onChunk?.(data.toString());
       if (!options.quietLog) {
-        this.output.append(this.prefixOutput(prefix, data));
+        this.output.append(prefixProcessOutput(prefix, data));
       }
     });
 
@@ -11633,508 +6100,33 @@ class RobloxSyncController {
       onActivity?.();
       onChunk?.(data.toString());
       if (!options.quietLog) {
-        this.output.append(this.prefixOutput(`${prefix}:err`, data));
+        this.output.append(prefixProcessOutput(`${prefix}:err`, data));
       }
     });
   }
 
-  private prefixOutput(prefix: string, data: Buffer | string): string {
-    const text = data.toString();
-    const lines = text.replace(/\r\n/g, "\n").split("\n");
-    if (lines.length === 1) {
-      return `[${prefix}] ${lines[0]}`;
-    }
-
-    return lines
-      .filter((line, index) => !(line.length === 0 && index === lines.length - 1))
-      .map((line) => `[${prefix}] ${line}`)
-      .join("\n") + "\n";
-  }
-
-  private ensureFileExists(filePath: string): void {
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Required file not found: ${filePath}`);
-    }
-  }
-
-  private normalizeServices(requested: string[], fallback: string[]): string[] {
-    const requestedSet = new Set(requested.map((x) => x.trim()).filter((x) => x.length > 0));
-    if (requestedSet.size === 0) {
-      fallback.forEach((s) => requestedSet.add(s));
-    }
-    return Array.from(requestedSet);
-  }
-
-  private normalizeReportedServices(reported: string[], allowedServices: string[]): string[] {
-    const allowed = new Set(allowedServices.map((service) => service.trim()).filter((service) => service.length > 0));
-    const services = new Set<string>();
-    for (const value of reported) {
-      const service = String(value).trim();
-      if (service.length > 0 && allowed.has(service)) {
-        services.add(service);
-      }
-    }
-    return Array.from(services);
-  }
-
-
-  public rbsyncViewerCli(): { cliPath: string; cwd: string } | undefined {
+  public settingsStoreViewerCli(): { cliPath: string; cwd: string } | undefined {
     const cfg = this.getConfig();
-    if (!cfg.exportCliPath) {
+    if (!cfg.cliPath) {
       return undefined;
     }
-    return { cliPath: cfg.exportCliPath, cwd: cfg.projectRoot };
-  }
-
-  private explicitConfigValue<T>(cfg: vscode.WorkspaceConfiguration, key: string): T | undefined {
-    const inspected = cfg.inspect<T>(key);
-    return inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
-  }
-
-  private mergedConfigValue<T>(
-    cfg: vscode.WorkspaceConfiguration,
-    shared: SharedConfig,
-    key: string,
-    defaultValue: T,
-  ): T {
-    return this.explicitConfigValue<T>(cfg, key) ?? sharedConfigValue<T>(shared, key) ?? defaultValue;
+    return { cliPath: cfg.cliPath, cwd: cfg.projectRoot };
   }
 
   private getConfig(): SyncConfig {
-    const root = this.getWorkspaceRoot();
-    const cfg = vscode.workspace.getConfiguration("renium", vscode.Uri.file(root));
-
-    const preliminaryShared = loadSharedConfig(root, root);
-    const projectRootSetting = this.mergedConfigValue(
-      cfg,
-      preliminaryShared,
-      "projectRoot",
-      "${workspaceFolder}",
-    );
-    const experienceRoot = this.resolveConfigPath(projectRootSetting, root);
-    if (!activeExperienceAlias(experienceRoot)) {
-      this.restoreActiveExperiencePlace(experienceRoot);
-    }
-    const activePlace = resolveActiveExperiencePlace(experienceRoot);
-    if (activePlace && activeExperienceAlias(experienceRoot) !== activePlace.alias) {
-      setActiveExperiencePlace(experienceRoot, activePlace.alias);
-    }
-    const projectRoot = activePlace?.projectRoot ?? experienceRoot;
-    const shared = loadSharedConfig(root, projectRoot);
-    const srcDir = loadProjectSourceRoot(projectRoot);
-    this.sharedConfig = shared;
-    const read = <T>(key: string, defaultValue: T): T =>
-      this.mergedConfigValue(cfg, shared, key, defaultValue);
-    const configTomlPath = this.resolveConfigPath(
-      read("configTomlPath", "${userHome}/.codex/config.toml"),
-      root,
-    );
-    const configuredExportCliPathRaw = read("exportCliPath", "").trim();
-    const configuredExportCliPath = configuredExportCliPathRaw.length > 0
-      ? this.resolveConfigPath(configuredExportCliPathRaw, root)
-      : "";
-    const exportCliPath = resolveExistingRustCliPath(
-      root,
-      projectRoot,
-      configuredExportCliPath,
-      this.context.extensionPath,
-    );
-
-    const servicesRaw = read<string[]>("services", DEFAULT_SERVICES);
-    const services = (Array.isArray(servicesRaw) ? servicesRaw : DEFAULT_SERVICES)
-      .map((s) => String(s).trim())
-      .filter((s) => s.length > 0);
-
-    const transportRaw = read<string>("transport", "ws");
-    const transport = transportRaw === "mcp" ? "mcp" : "ws";
-
-    const importModeRaw = read<string>("importMode", "direct");
-    const importMode = importModeRaw === "snapshot" ? "snapshot" : "direct";
-    const performanceModeRaw = read<string>("performanceMode", "throughput");
-    const performanceMode =
-      performanceModeRaw === "smooth"
-        ? "smooth"
-        : performanceModeRaw === "balanced"
-          ? "balanced"
-          : "throughput";
-    const modifiedDefaultBypass = read<boolean>("modifiedDefaultBypass", false) === true;
-    const wsWaitSeconds = this.getWsWaitSeconds(cfg, shared);
-    const chunkSize = this.normalizeChunkSize(read("chunkSize", DEFAULT_CHUNK_SIZE));
-    const configuredRustCliPathRaw = read("rustCliPath", "").trim();
-    const configuredRustCliPath = configuredRustCliPathRaw.length > 0
-      ? this.resolveConfigPath(configuredRustCliPathRaw, root)
-      : "";
-    const rustCliPath = resolveExistingRustCliPath(
-      root,
-      projectRoot,
-      configuredRustCliPath,
-      this.context.extensionPath,
-    );
-
-    const gitStagePathsRaw = read<string[]>("gitSync.stagePaths", []);
-    const gitStagePaths = (Array.isArray(gitStagePathsRaw) ? gitStagePathsRaw : [])
-      .map((value) => String(value).trim())
-      .filter((value) => value.length > 0);
-    const gitPullFromStudioBeforePushRaw = read<string>("gitSync.pullFromStudioBeforePush", "ask");
-    const gitPullFromStudioBeforePush = gitPullFromStudioBeforePushRaw === "always"
-      ? "always"
-      : gitPullFromStudioBeforePushRaw === "never"
-        ? "never"
-        : "ask";
-    const gitStageModeRaw = read<string>("gitSync.stageMode", "tracked");
-    const gitStageMode = gitStageModeRaw === "configuredPaths" ? "configuredPaths" : "tracked";
-    const gitApplyPulledChangesRaw = read<string>("gitSync.applyPulledChangesToStudio", "ask");
-    const gitApplyPulledChangesToStudio = gitApplyPulledChangesRaw === "always"
-      ? "always"
-      : gitApplyPulledChangesRaw === "never"
-        ? "never"
-        : "ask";
-    const gitOutputBehaviorRaw = read<string>("gitSync.outputBehavior", "onStart");
-    const gitOutputBehavior = gitOutputBehaviorRaw === "silent"
-      ? "silent"
-      : gitOutputBehaviorRaw === "onError"
-        ? "onError"
-        : "onStart";
-    const wallyApplyToStudioRaw = read<string>("wallySync.applyToStudio", "ask");
-    const wallyApplyToStudio = wallyApplyToStudioRaw === "always"
-      ? "always"
-      : wallyApplyToStudioRaw === "never"
-        ? "never"
-        : "ask";
-    const linkApplyToStudioRaw = read<string>("link.applyToStudio", "ask");
-    const linkApplyToStudio = linkApplyToStudioRaw === "always"
-      ? "always"
-      : linkApplyToStudioRaw === "never"
-        ? "never"
-        : "ask";
-    const initialSyncPriorityRaw = read<string>("liveSync.initialSyncPriority", "studio");
-    const initialSyncPriority: InitialSyncPriority = initialSyncPriorityRaw === "editor"
-      ? "editor"
-      : initialSyncPriorityRaw === "none"
-        ? "none"
-        : "studio";
-    const displayPromptsRaw = read<string>("liveSync.displayPrompts", "always");
-    const displayPrompts: DisplayPrompts = displayPromptsRaw === "initial"
-      ? "initial"
-      : displayPromptsRaw === "never"
-        ? "never"
-        : "always";
-    const logLevel = this.configuredLogLevel();
-    const number = (
-      key: string,
-      defaultValue: number,
-      options: { min?: number; integer?: boolean } = {},
-    ): number => this.normalizeConfigNumber(read<unknown>(key, defaultValue), defaultValue, options);
-
-    return {
-      exportCliPath,
-      rustCliPath,
-      experienceRoot,
-      projectRoot,
-      srcDir,
-      activePlaceAlias: activePlace?.alias,
-      activePlace: activePlace?.place,
-      placeSelector: activePlace?.selector,
-      snapshotDir: read("snapshotDir", "snapshots"),
-      transport,
-      server: read("server", "Roblox_Studio"),
-      configTomlPath,
-      services: services.length > 0 ? services : [...DEFAULT_SERVICES],
-      sourceWorkers: number("sourceWorkers", 0, { min: 0, integer: true }),
-      instanceWorkers: number("instanceWorkers", 0, { min: 0, integer: true }),
-      importWorkers: number("importWorkers", 0, { min: 0, integer: true }),
-      chunkSize,
-      snapshotInstanceChunkSize: number("snapshotInstanceChunkSize", 5000, { min: 0, integer: true }),
-      bridgeWaitSeconds: number("bridgeWaitSeconds", 8, { min: 1 }),
-      bridgePorts: this.normalizeBridgePorts(
-        String(
-          read("bridgePorts", DEFAULT_BRIDGE_PORTS.join(",")),
-        ),
-      ),
-      usePersistentBridge: read<boolean>("usePersistentBridge", true) !== false,
-      verifyEditorPushSources: read<boolean>("verifyEditorPushSources", false) === true,
-      adaptiveThrottle: read<boolean>("adaptiveThrottle", true),
-      noUpdateEditorIcons: read<boolean>("noUpdateEditorIcons", true),
-      autoSyncOnSave: read<boolean>("autoSyncOnSave", false),
-      autoSyncDebounceMs: number("autoSyncDebounceMs", 800, { min: 100, integer: true }),
-      editorLiveSyncEnabled: read<boolean>("editorLiveSyncEnabled", false) === true,
-      editorLiveSyncOnStartup: read<boolean>("editorLiveSyncOnStartup", false) === true,
-      studioLiveSyncEnabled: read<boolean>("studioLiveSyncEnabled", true) !== false,
-      studioLiveSyncPollMs: number(
-        "studioLiveSyncPollMs",
-        DEFAULT_STUDIO_LIVE_SYNC_POLL_MS,
-        { min: MIN_STUDIO_LIVE_SYNC_POLL_MS, integer: true },
-      ),
-      initialSyncPriority,
-      changesThreshold: number("liveSync.changesThreshold", 5, { min: 0, integer: true }),
-      diffLinesLimit: number("liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
-      displayPrompts,
-      logLevel,
-      overridePackages: read<boolean>("liveSync.overridePackages", false) === true,
-      conflictResolution: this.normalizeConflictPolicy(read("liveSync.conflictResolution", "prompt")),
-      runImport: read<boolean>("runImport", true),
-      importMode,
-      performanceMode,
-      modifiedDefaultBypass,
-      wsWaitSeconds,
-      progressHeartbeatSeconds: number("progressHeartbeatSeconds", 2, { min: 2 }),
-      benchmarkRuns: number("benchmarkRuns", 5, { min: 1, integer: true }),
-      gitSync: {
-        gitPath: read("gitSync.gitPath", "git"),
-        remote: read("gitSync.remote", "origin"),
-        branch: read("gitSync.branch", ""),
-        autoFetch: read<boolean>("gitSync.autoFetch", true) !== false,
-        pullFromStudioBeforePush: gitPullFromStudioBeforePush,
-        stageMode: gitStageMode,
-        stagePaths: gitStagePaths.length > 0 ? gitStagePaths : [srcDir],
-        includeUntracked: read<boolean>("gitSync.includeUntracked", false) === true,
-        commitMessageTemplate: read("gitSync.commitMessageTemplate", "Renium sync: ${date}"),
-        confirmBeforePush: read<boolean>("gitSync.confirmBeforePush", true) !== false,
-        requireCleanWorktreeBeforePull: read<boolean>("gitSync.requireCleanWorktreeBeforePull", true) !== false,
-        applyPulledChangesToStudio: gitApplyPulledChangesToStudio,
-        timeoutSeconds: number("gitSync.timeoutSeconds", 120, { min: 10 }),
-        outputBehavior: gitOutputBehavior,
-      },
-      wallySync: {
-        wallyPath: read("wallySync.wallyPath", "wally"),
-        rojoPath: read("wallySync.rojoPath", "rojo"),
-        packagesDir: read("wallySync.packagesDir", "Packages"),
-        targetService: read("wallySync.targetService", "ReplicatedStorage"),
-        targetName: read("wallySync.targetName", "Packages"),
-        serverPackagesDir: read("wallySync.serverPackagesDir", "ServerPackages"),
-        serverTargetService: read("wallySync.serverTargetService", "ServerStorage"),
-        serverTargetName: read("wallySync.serverTargetName", "ServerPackages"),
-        devPackagesDir: read("wallySync.devPackagesDir", "DevPackages"),
-        devTargetService: read("wallySync.devTargetService", "ReplicatedStorage"),
-        devTargetName: read("wallySync.devTargetName", "DevPackages"),
-        realms: read("wallySync.realms", "shared,server,dev"),
-        runInstall: read<boolean>("wallySync.runInstall", true) !== false,
-        applyToStudio: wallyApplyToStudio,
-      },
-      linkSync: {
-        manifest: read("link.manifest", "renium-link.json"),
-        folder: read("link.folder", "").trim(),
-        cacheDir: read("link.cacheDir", "").trim(),
-        gitPath: read("link.gitPath", "git"),
-        wallyPath: read("wallySync.wallyPath", "wally"),
-        offline: read<boolean>("link.offline", false) === true,
-        autoApply: read<boolean>("link.autoApplyOnManifestChange", false) === true,
-        applyToStudio: linkApplyToStudio,
-      },
-    };
+    return this.configResolver.get(this.studioRuntimeSettings);
   }
 
-  private normalizeChunkSize(value: unknown): number {
-    const rawValue = Number(value ?? DEFAULT_CHUNK_SIZE);
-
-    if (!Number.isFinite(rawValue) || rawValue < 512) {
-      return DEFAULT_CHUNK_SIZE;
-    }
-
-    if (rawValue <= 262144) {
-      if (!this.warnedLegacyChunkSize) {
-        this.warnedLegacyChunkSize = true;
-        this.output.appendLine(`[renium] config: chunkSize 262144 is legacy; using ${DEFAULT_CHUNK_SIZE} for this run.`);
-      }
-      return DEFAULT_CHUNK_SIZE;
-    }
-
-    const normalized = Math.max(512, Math.floor(rawValue));
-    if (normalized > MAX_BRIDGE_CHUNK_SIZE) {
-      if (!this.warnedChunkSizeCap) {
-        this.warnedChunkSizeCap = true;
-        this.output.appendLine(
-          `[renium] config: chunkSize ${normalized} exceeds the ${MAX_BRIDGE_CHUNK_SIZE}-byte bridge transport limit; using ${MAX_BRIDGE_CHUNK_SIZE} for this run.`,
-        );
-      }
-      return MAX_BRIDGE_CHUNK_SIZE;
-    }
-
-    return normalized;
+  private tryGetConfig(): SyncConfig | undefined {
+    return this.configResolver.tryGet(this.studioRuntimeSettings);
   }
 
-  private normalizeConfigNumber(
-    value: unknown,
-    defaultValue: number,
-    options: { min?: number; integer?: boolean } = {},
-  ): number {
-    const rawValue = Number(value ?? defaultValue);
-    const fallback = this.applyConfigNumberOptions(defaultValue, options);
-    if (!Number.isFinite(rawValue)) {
-      return fallback;
-    }
-    return this.applyConfigNumberOptions(rawValue, options);
-  }
-
-  private applyConfigNumberOptions(
-    value: number,
-    options: { min?: number; integer?: boolean },
-  ): number {
-    const min = typeof options.min === "number" ? options.min : undefined;
-    const normalized = options.integer === true ? Math.floor(value) : value;
-    return min === undefined ? normalized : Math.max(min, normalized);
-  }
-
-  private configOrigin(cfg: vscode.WorkspaceConfiguration, key: string): string {
-    const inspected = cfg.inspect(key);
-    if (inspected?.workspaceFolderValue !== undefined) {
-      return "workspace-folder";
-    }
-    if (inspected?.workspaceValue !== undefined) {
-      return "workspace";
-    }
-    if (inspected?.globalValue !== undefined) {
-      return "user";
-    }
-    if (sharedConfigValue(this.sharedConfig, key) !== undefined) {
-      return "shared";
-    }
-    if (inspected?.defaultValue !== undefined) {
-      return "default";
-    }
-    return "unset";
-  }
-
-  private configuredValue(cfg: vscode.WorkspaceConfiguration, key: string): unknown {
-    const inspected = cfg.inspect(key);
-    return (
-      inspected?.workspaceFolderValue ??
-      inspected?.workspaceValue ??
-      inspected?.globalValue ??
-      sharedConfigValue(this.sharedConfig, key) ??
-      inspected?.defaultValue
-    );
-  }
-
-  private logResolvedConfig(cfg: SyncConfig): void {
-    const workspaceCfg = vscode.workspace.getConfiguration("renium");
-    const extensionVersion = String(this.context.extension.packageJSON.version ?? "unknown");
-    const extensionEntryPath = path.join(this.context.extensionPath, "out", "extension.js");
-    const extensionBuildUnix = fs.existsSync(extensionEntryPath)
-      ? Math.floor(fs.statSync(extensionEntryPath).mtimeMs / 1000)
-      : 0;
-    this.output.appendLine(`[renium] extension version=${extensionVersion}`);
-    this.output.appendLine(`[renium] extension build_unix=${extensionBuildUnix}`);
-    this.output.appendLine(`[renium] config: exportCliPath=${cfg.exportCliPath}`);
-    this.output.appendLine(`[renium] config: rustCliPath=${cfg.rustCliPath}`);
-    this.output.appendLine(
-      `[renium] config: chunkSize=${cfg.chunkSize} (origin=${this.configOrigin(workspaceCfg, "chunkSize")}, raw=${String(this.configuredValue(workspaceCfg, "chunkSize"))})`,
-    );
-    this.output.appendLine(
-      `[renium] config: bridgePorts=${cfg.bridgePorts} (origin=${this.configOrigin(workspaceCfg, "bridgePorts")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: usePersistentBridge=${cfg.usePersistentBridge} (origin=${this.configOrigin(workspaceCfg, "usePersistentBridge")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: sourceWorkers=${cfg.sourceWorkers} (origin=${this.configOrigin(workspaceCfg, "sourceWorkers")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: instanceWorkers=${cfg.instanceWorkers} (origin=${this.configOrigin(workspaceCfg, "instanceWorkers")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: importWorkers=${cfg.importWorkers} (origin=${this.configOrigin(workspaceCfg, "importWorkers")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: importMode=${cfg.importMode} (origin=${this.configOrigin(workspaceCfg, "importMode")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: performanceMode=${cfg.performanceMode} (origin=${this.configOrigin(workspaceCfg, "performanceMode")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: modifiedDefaultBypass=${cfg.modifiedDefaultBypass} (origin=${this.configOrigin(workspaceCfg, "modifiedDefaultBypass")})`,
-    );
-    this.output.appendLine(
-      `[renium] config: benchmarkRuns=${cfg.benchmarkRuns} (origin=${this.configOrigin(workspaceCfg, "benchmarkRuns")})`,
-    );
-  }
-
-  private normalizeBridgePorts(raw: string): string {
-    const parsed = raw
-      .split(",")
-      .map((token) => Number(token.trim()))
-      .filter((value) => Number.isInteger(value) && value > 0 && value <= 65535)
-      .filter((value, index, all) => all.indexOf(value) === index);
-
-    let normalized = parsed;
-    const matchesPreviousDefault =
-      normalized.length === PREVIOUS_DEFAULT_BRIDGE_PORTS.length &&
-      normalized.every((value, index) => value === PREVIOUS_DEFAULT_BRIDGE_PORTS[index]);
-    const matchesLegacyDefault =
-      normalized.length === LEGACY_BRIDGE_PORTS.length &&
-      normalized.every((value, index) => value === LEGACY_BRIDGE_PORTS[index]);
-    if (matchesPreviousDefault || matchesLegacyDefault) {
-      if (!this.warnedLegacyBridgePorts) {
-        this.warnedLegacyBridgePorts = true;
-        this.output.appendLine(
-          `[renium] config: migrating legacy bridge default to ${DEFAULT_BRIDGE_PORTS.join(",")}.`,
-        );
-      }
-      normalized = [...DEFAULT_BRIDGE_PORTS];
-    }
-
-    if (normalized.length !== DEFAULT_BRIDGE_PORTS.length) {
-      if (!this.warnedBridgePortLimit) {
-        this.warnedBridgePortLimit = true;
-      this.output.appendLine(
-          `[renium] config: exactly ${DEFAULT_BRIDGE_PORTS.length} bridge ports are required; using ${DEFAULT_BRIDGE_PORTS.join(",")}.`,
-        );
-      }
-      normalized = [...DEFAULT_BRIDGE_PORTS];
-    }
-
-    return normalized.join(",");
-  }
-
-  private getWsWaitSeconds(cfg: vscode.WorkspaceConfiguration, shared: SharedConfig): number {
-    const configuredWsWaitSeconds =
-      this.explicitConfigValue<unknown>(cfg, "wsWaitSeconds") ??
-      sharedConfigValue<unknown>(shared, "wsWaitSeconds");
-    if (configuredWsWaitSeconds !== undefined) {
-      return this.normalizeConfigNumber(configuredWsWaitSeconds, 20, { min: 1 });
-    }
-
-    const legacyStartupWaitSeconds =
-      this.explicitConfigValue<unknown>(cfg, "startupWaitSeconds") ??
-      sharedConfigValue<unknown>(shared, "startupWaitSeconds");
-    if (legacyStartupWaitSeconds !== undefined) {
-      if (!this.warnedLegacyStartupWaitSeconds) {
-        this.warnedLegacyStartupWaitSeconds = true;
-        this.output.appendLine(
-          "[renium] config: using legacy renium.startupWaitSeconds as renium.wsWaitSeconds; update your settings to renium.wsWaitSeconds.",
-        );
-      }
-      return this.normalizeConfigNumber(legacyStartupWaitSeconds, 20, { min: 1 });
-    }
-
-    return 20;
-  }
-
-  private resolveConfigPath(raw: string, workspaceRoot: string): string {
-    const replaced = raw
-      .replaceAll("${workspaceFolder}", workspaceRoot)
-      .replaceAll("${userHome}", os.homedir());
-    return path.isAbsolute(replaced) ? path.normalize(replaced) : path.normalize(path.join(workspaceRoot, replaced));
+  private logResolvedConfig(config: SyncConfig): void {
+    this.configResolver.log(config);
   }
 
   private getWorkspaceRoot(): string {
-    const folders = vscode.workspace.workspaceFolders;
-    const root = pickWorkspaceRoot();
-    if (!root) {
-      throw new Error("Open a workspace folder before using Renium.");
-    }
-    if (folders && folders.length > 1 && root === folders[0].uri.fsPath && !this.warnedMultiRootWorkspace) {
-      this.warnedMultiRootWorkspace = true;
-      this.output.appendLine(
-        `[renium] multi-root workspace: using ${root}. Open a file in another workspace folder or set renium.projectRoot to switch projects.`,
-      );
-    }
-    return root;
-  }
-
-  private isPathInside(filePath: string, rootPath: string): boolean {
-    const relative = path.relative(this.normalizePathForCompare(rootPath), this.normalizePathForCompare(filePath));
-    return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+    return this.configResolver.workspaceRoot();
   }
 
   private sourceRoot(cfg: SyncConfig): string {
@@ -12146,12 +6138,36 @@ class RobloxSyncController {
     cfg: SyncConfig,
     sourceGraph = loadProjectSourceGraph(cfg.projectRoot),
   ): boolean {
-    if (sourceGraph.ignored.some((ignored) => this.isPathInside(filePath, ignored))) {
+    if (sourceGraph.ignored.some((ignored) => isPathInside(filePath, ignored))) {
       return false;
     }
     return sourceGraph.files.some((location) =>
-      this.normalizePathForCompare(filePath) === this.normalizePathForCompare(location))
-      || sourceGraph.directories.some((location) => this.isPathInside(filePath, location));
+      filesystemPathKey(filePath) === filesystemPathKey(location))
+      || sourceGraph.directories.some((location) => isPathInside(filePath, location));
+  }
+
+  private sourceLocationIsFile(location: string): boolean {
+    try {
+      return fs.statSync(location).isFile();
+    } catch {
+      return path.extname(location) !== "";
+    }
+  }
+
+  private sourceOwnersForPath(
+    filePath: string,
+    sourceGraph: ProjectSourceGraph,
+  ): ProjectSourceOwner[] {
+    const matches = sourceGraph.owners.filter((owner) =>
+      this.sourceLocationIsFile(owner.location)
+        ? filesystemPathKey(filePath) === filesystemPathKey(owner.location)
+        : isPathInside(filePath, owner.location));
+    const specificity = matches.reduce(
+      (maximum, owner) => Math.max(maximum, path.resolve(owner.location).split(path.sep).length),
+      0,
+    );
+    return matches.filter((owner) =>
+      path.resolve(owner.location).split(path.sep).length === specificity);
   }
 
   private servicesForProjectSourcePath(
@@ -12162,32 +6178,14 @@ class RobloxSyncController {
     if (!this.isProjectSourcePath(filePath, cfg, sourceGraph)) {
       return [];
     }
-    const matches = sourceGraph.owners
-      .filter((owner) => {
-        let isFile = false;
-        try {
-          isFile = fs.statSync(owner.location).isFile();
-        } catch {
-          isFile = path.extname(owner.location) !== "";
-        }
-        return isFile
-          ? this.normalizePathForCompare(filePath) === this.normalizePathForCompare(owner.location)
-          : this.isPathInside(filePath, owner.location);
-      })
-      .sort((left, right) =>
-        path.resolve(right.location).split(path.sep).length
-        - path.resolve(left.location).split(path.sep).length);
+    const matches = this.sourceOwnersForPath(filePath, sourceGraph);
     if (matches.length === 0) {
       return [];
     }
-    const specificity = path.resolve(matches[0].location).split(path.sep).length;
     const byLower = new Map(cfg.services.map((service) => [service.toLowerCase(), service]));
     const services = new Set<string>();
     let ambiguous = false;
     for (const owner of matches) {
-      if (path.resolve(owner.location).split(path.sep).length !== specificity) {
-        break;
-      }
       const fixed = owner.target[0];
       if (fixed) {
         const service = byLower.get(fixed.toLowerCase());
@@ -12196,13 +6194,7 @@ class RobloxSyncController {
         }
         continue;
       }
-      let isFile = false;
-      try {
-        isFile = fs.statSync(owner.location).isFile();
-      } catch {
-        isFile = path.extname(owner.location) !== "";
-      }
-      if (isFile) {
+      if (this.sourceLocationIsFile(owner.location)) {
         ambiguous = true;
         continue;
       }
@@ -12218,438 +6210,18 @@ class RobloxSyncController {
     return ambiguous && services.size === 0 ? [...cfg.services] : [...services];
   }
 
-  private normalizePathForCompare(filePath: string): string {
-    const normalized = path.resolve(filePath);
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  }
-
   private comparePathsForStableOrder(a: string, b: string): number {
-    const left = this.normalizePathForCompare(a);
-    const right = this.normalizePathForCompare(b);
+    const left = filesystemPathKey(a);
+    const right = filesystemPathKey(b);
     return left < right ? -1 : left > right ? 1 : 0;
   }
 
   private editorChangedPathArg(filePath: string, projectRoot: string): string {
-    if (!this.isPathInside(filePath, projectRoot)) {
+    if (!isPathInside(filePath, projectRoot)) {
       return filePath;
     }
     return path.relative(projectRoot, filePath);
   }
-
-  private parseBenchmarkMetrics(output: string): BenchmarkRunMetrics {
-    const lines = output.replace(/\r\n/g, "\n").split("\n");
-    type ServiceBenchmarkMetrics = {
-      instanceFetchMs?: number;
-      pluginServerMs: number;
-      pluginEncodeMs: number;
-      payloadBytes: number;
-      chunkCount: number;
-      sawPerfLine: boolean;
-      maxFrameMs?: number;
-      stallCountOver33Ms: number;
-      stallCountOver50Ms: number;
-      stallCountOver100Ms: number;
-    };
-    const serviceMetrics = new Map<string, ServiceBenchmarkMetrics>();
-    const metricsForService = (service: string): ServiceBenchmarkMetrics => {
-      let metrics = serviceMetrics.get(service);
-      if (!metrics) {
-        metrics = {
-          pluginServerMs: 0,
-          pluginEncodeMs: 0,
-          payloadBytes: 0,
-          chunkCount: 0,
-          sawPerfLine: false,
-          stallCountOver33Ms: 0,
-          stallCountOver50Ms: 0,
-          stallCountOver100Ms: 0,
-        };
-        serviceMetrics.set(service, metrics);
-      }
-      return metrics;
-    };
-    let runTimingSummary: Partial<BenchmarkRunMetrics> = {};
-
-    for (const line of lines) {
-      const payloadMatch = /([A-Za-z][A-Za-z0-9_]*): (?:(?:adaptive wave \d+)|instance) payloads chunk metrics -> chunks=(\d+), bytes=(\d+), .*plugin_server_ms=([0-9.]+), plugin_encode_ms=([0-9.]+)/.exec(
-        line,
-      );
-      if (payloadMatch) {
-        const metrics = metricsForService(payloadMatch[1]);
-        metrics.chunkCount += Number.parseInt(payloadMatch[2], 10);
-        metrics.payloadBytes += Number.parseInt(payloadMatch[3], 10);
-        metrics.pluginServerMs += Number.parseFloat(payloadMatch[4]);
-        metrics.pluginEncodeMs += Number.parseFloat(payloadMatch[5]);
-      }
-
-      const perfMatch = /([A-Za-z][A-Za-z0-9_]*): adaptive wave \d+ perf stats -> last_frame_ms=([^,]+), max_frame_ms=([^,]+), stalls33=([^,]+), stalls50=([^,]+), stalls100=([^,]+)/.exec(
-        line,
-      );
-      if (perfMatch) {
-        const metrics = metricsForService(perfMatch[1]);
-        metrics.sawPerfLine = true;
-        const maxFrameMs = Number.parseFloat(perfMatch[3]);
-        if (Number.isFinite(maxFrameMs)) {
-          metrics.maxFrameMs = metrics.maxFrameMs === undefined ? maxFrameMs : Math.max(metrics.maxFrameMs, maxFrameMs);
-        }
-        const stalls33 = Number.parseInt(perfMatch[4], 10);
-        if (Number.isFinite(stalls33)) {
-          metrics.stallCountOver33Ms += stalls33;
-        }
-        const stalls50 = Number.parseInt(perfMatch[5], 10);
-        if (Number.isFinite(stalls50)) {
-          metrics.stallCountOver50Ms += stalls50;
-        }
-        const stalls100 = Number.parseInt(perfMatch[6], 10);
-        if (Number.isFinite(stalls100)) {
-          metrics.stallCountOver100Ms += stalls100;
-        }
-      }
-
-      const instanceFetchMatch = /timing: ([A-Za-z][A-Za-z0-9_]*): instance fetch took ([0-9.]+)ms/.exec(line);
-      if (instanceFetchMatch) {
-        metricsForService(instanceFetchMatch[1]).instanceFetchMs = Number.parseFloat(instanceFetchMatch[2]);
-      }
-
-      const runTimingMatch =
-        /run timing summary: total_ms=([0-9.]+), core_export_ms=([0-9.]+), bridge_startup_ms=([0-9.]+), handshake_ms=([0-9.]+), service_export_sum_ms=([0-9.]+), import_critical_tail_ms=([0-9.]+), unmeasured_or_scheduler_gap_ms=([0-9.]+)/.exec(
-          line,
-        );
-      if (runTimingMatch) {
-        runTimingSummary = {
-          totalMs: Number.parseFloat(runTimingMatch[1]),
-          coreExportMs: Number.parseFloat(runTimingMatch[2]),
-          bridgeStartupMs: Number.parseFloat(runTimingMatch[3]),
-          handshakeMs: Number.parseFloat(runTimingMatch[4]),
-          serviceExportSumMs: Number.parseFloat(runTimingMatch[5]),
-          importCriticalTailMs: Number.parseFloat(runTimingMatch[6]),
-          unmeasuredOrSchedulerGapMs: Number.parseFloat(runTimingMatch[7]),
-        };
-      }
-    }
-
-    let trackedService: string | undefined;
-    let trackedMetrics: ServiceBenchmarkMetrics | undefined;
-    let bestScore = -1;
-    for (const [service, metrics] of serviceMetrics.entries()) {
-      const score =
-        (metrics.instanceFetchMs ?? 0) * 1_000_000 +
-        metrics.pluginServerMs * 10_000 +
-        metrics.pluginEncodeMs * 1_000 +
-        metrics.payloadBytes;
-      if (score > bestScore) {
-        bestScore = score;
-        trackedService = service;
-        trackedMetrics = metrics;
-      }
-    }
-    const serviceMetricList = Array.from(serviceMetrics.entries())
-      .map(([service, metrics]) => ({
-        service,
-        instanceFetchMs: metrics.instanceFetchMs,
-        pluginServerMs: metrics.chunkCount > 0 ? metrics.pluginServerMs : undefined,
-        pluginEncodeMs: metrics.chunkCount > 0 ? metrics.pluginEncodeMs : undefined,
-        payloadBytes: metrics.chunkCount > 0 ? metrics.payloadBytes : undefined,
-        chunkCount: metrics.chunkCount > 0 ? metrics.chunkCount : undefined,
-        maxFrameMs: metrics.maxFrameMs,
-        stallCountOver33Ms: metrics.sawPerfLine ? metrics.stallCountOver33Ms : undefined,
-        stallCountOver50Ms: metrics.sawPerfLine ? metrics.stallCountOver50Ms : undefined,
-        stallCountOver100Ms: metrics.sawPerfLine ? metrics.stallCountOver100Ms : undefined,
-      }))
-      .sort((a, b) => this.benchmarkServiceScore(b) - this.benchmarkServiceScore(a));
-
-    return {
-      totalMs: runTimingSummary.totalMs ?? this.matchLastNumber(output, /full export-snapshots run took ([0-9.]+)ms/g),
-      trackedService,
-      coreExportMs: runTimingSummary.coreExportMs,
-      bridgeStartupMs: runTimingSummary.bridgeStartupMs,
-      handshakeMs: runTimingSummary.handshakeMs,
-      serviceExportSumMs: runTimingSummary.serviceExportSumMs,
-      importCriticalTailMs: runTimingSummary.importCriticalTailMs,
-      unmeasuredOrSchedulerGapMs: runTimingSummary.unmeasuredOrSchedulerGapMs,
-      trackedServiceInstanceFetchMs: trackedMetrics?.instanceFetchMs,
-      trackedServicePluginServerMs: trackedMetrics && trackedMetrics.chunkCount > 0 ? trackedMetrics.pluginServerMs : undefined,
-      trackedServicePluginEncodeMs: trackedMetrics && trackedMetrics.chunkCount > 0 ? trackedMetrics.pluginEncodeMs : undefined,
-      trackedServicePayloadBytes: trackedMetrics && trackedMetrics.chunkCount > 0 ? trackedMetrics.payloadBytes : undefined,
-      trackedServiceChunkCount: trackedMetrics && trackedMetrics.chunkCount > 0 ? trackedMetrics.chunkCount : undefined,
-      trackedServiceMaxFrameMs: trackedMetrics?.maxFrameMs,
-      trackedServiceStallCountOver33Ms: trackedMetrics?.sawPerfLine ? trackedMetrics.stallCountOver33Ms : undefined,
-      trackedServiceStallCountOver50Ms: trackedMetrics?.sawPerfLine ? trackedMetrics.stallCountOver50Ms : undefined,
-      trackedServiceStallCountOver100Ms: trackedMetrics?.sawPerfLine ? trackedMetrics.stallCountOver100Ms : undefined,
-      exportFingerprint: this.matchLastString(
-        output,
-        /export start: version=([^,\n]+), git=([^,\n]+), build_ts=([^,\n]+), features=([^,\n]+), protocol=([^,\n]+)/g,
-        (match) =>
-          `version=${match[1]}, git=${match[2]}, build_ts=${match[3]}, features=${match[4]}, protocol=${match[5]}`,
-      ),
-      bridgeFingerprint: this.matchLastString(
-        output,
-        /bridge info: version=([^,\n]+), build_unix=([^,\n]+), protocol=([^,\n]+), codec=([^,\n]+), chunk_frame=([^,\n]+), compact_value=([^,\n]+), warm_mode=([^,\n]+), serializer_mode=([^,\n]+)/g,
-        (match) =>
-          `version=${match[1]}, build_unix=${match[2]}, protocol=${match[3]}, codec=${match[4]}, chunk_frame=${match[5]}, compact_value=${match[6]}, warm_mode=${match[7]}, serializer_mode=${match[8]}`,
-      ),
-      serviceMetrics: serviceMetricList,
-    };
-  }
-
-  private extractPluginProfile(output: string): PluginProfileResult {
-    const marker = "[renium] plugin op profile";
-    const markerIndex = output.lastIndexOf(marker);
-    const jsonStart = output.indexOf("{", markerIndex >= 0 ? markerIndex : 0);
-    const jsonEnd = output.lastIndexOf("}");
-    if (jsonStart < 0 || jsonEnd <= jsonStart) {
-      throw new Error("Plugin profile JSON was not found in CLI output.");
-    }
-
-    const rawJson = output.slice(jsonStart, jsonEnd + 1);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawJson);
-    } catch (error) {
-      throw new Error(`Failed to parse plugin profile JSON: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("Plugin profile JSON did not decode to an object.");
-    }
-    return parsed as PluginProfileResult;
-  }
-
-  private formatPluginProfileRanking(profile: PluginProfileResult, limit: number): string[] {
-    const projectedCalls =
-      typeof profile.profile?.projectedServerStoragePropertyReads === "number" &&
-      Number.isFinite(profile.profile.projectedServerStoragePropertyReads)
-        ? profile.profile.projectedServerStoragePropertyReads
-        : 1_259_770;
-    const entries: Array<{
-      name: string;
-      perCallUs: number;
-      p90Us: number | undefined;
-      projectedMsPer100k: number;
-      projectedServerStorageMs: number;
-    }> = [];
-    for (const [name, operation] of Object.entries(profile.operations ?? {})) {
-      const perCallUs =
-        typeof operation?.perCallUs === "number" && Number.isFinite(operation.perCallUs)
-          ? operation.perCallUs
-          : undefined;
-      if (perCallUs === undefined) {
-        continue;
-      }
-      entries.push({
-        name,
-        perCallUs,
-        p90Us: typeof operation?.p90Us === "number" && Number.isFinite(operation.p90Us) ? operation.p90Us : undefined,
-        projectedMsPer100k: perCallUs * 100,
-        projectedServerStorageMs: (perCallUs * projectedCalls) / 1000,
-      });
-    }
-    entries.sort((a, b) => b.projectedMsPer100k - a.projectedMsPer100k);
-    const ranked = entries.slice(0, Math.max(1, limit));
-
-    if (ranked.length === 0) {
-      return ["[renium] profile: no per-call operations were available to rank."];
-    }
-
-    return ranked.map(
-      (entry, index) =>
-        `[renium] profile: ${String(index + 1).padStart(2, "0")} ${entry.name} per_call=${entry.perCallUs.toFixed(3)}us p90=${entry.p90Us?.toFixed(1) ?? "n/a"}us per_100k=${entry.projectedMsPer100k.toFixed(1)}ms projected_serverstorage=${entry.projectedServerStorageMs.toFixed(1)}ms`,
-    );
-  }
-
-  private matchLastNumber(output: string, pattern: RegExp): number | undefined {
-    const match = this.matchLastString(output, pattern);
-    if (!match) {
-      return undefined;
-    }
-    const value = Number.parseFloat(match);
-    return Number.isFinite(value) ? value : undefined;
-  }
-
-  private matchLastString(
-    output: string,
-    pattern: RegExp,
-    formatter?: (match: RegExpExecArray) => string,
-  ): string | undefined {
-    let matched: string | undefined;
-    let result: RegExpExecArray | null;
-    pattern.lastIndex = 0;
-    while ((result = pattern.exec(output)) !== null) {
-      matched = formatter ? formatter(result) : result[1];
-    }
-    return matched;
-  }
-
-  private percentile(values: Array<number | undefined>, percentile: number): number | undefined {
-    const filtered = values.filter((value): value is number => value !== undefined && Number.isFinite(value)).sort((a, b) => a - b);
-    if (filtered.length === 0) {
-      return undefined;
-    }
-    const rank = Math.max(0, Math.ceil(percentile * filtered.length) - 1);
-    return filtered[Math.min(filtered.length - 1, rank)];
-  }
-
-  private minMetric(values: Array<number | undefined>): number | undefined {
-    const filtered = values.filter((value): value is number => value !== undefined && Number.isFinite(value));
-    return filtered.length > 0 ? Math.min(...filtered) : undefined;
-  }
-
-  private maxMetric(values: Array<number | undefined>): number | undefined {
-    const filtered = values.filter((value): value is number => value !== undefined && Number.isFinite(value));
-    return filtered.length > 0 ? Math.max(...filtered) : undefined;
-  }
-
-  private buildBenchmarkSummary(runs: BenchmarkRunMetrics[]): Record<string, unknown> {
-    const lastRun = runs[runs.length - 1];
-    return {
-      totalMs: this.benchmarkMetricSummary(runs.map((run) => run.totalMs)),
-      trackedServiceInstanceFetchMs: this.benchmarkMetricSummary(runs.map((run) => run.trackedServiceInstanceFetchMs)),
-      trackedServicePluginServerMs: this.benchmarkMetricSummary(runs.map((run) => run.trackedServicePluginServerMs)),
-      trackedServicePluginEncodeMs: this.benchmarkMetricSummary(runs.map((run) => run.trackedServicePluginEncodeMs)),
-      trackedServicePayloadBytes: this.benchmarkMetricSummary(runs.map((run) => run.trackedServicePayloadBytes)),
-      trackedServiceChunkCount: this.benchmarkMetricSummary(runs.map((run) => run.trackedServiceChunkCount)),
-      trackedServiceMaxFrameMs: this.benchmarkMetricSummary(runs.map((run) => run.trackedServiceMaxFrameMs)),
-      trackedServiceStallCountOver50Ms: this.benchmarkMetricSummary(runs.map((run) => run.trackedServiceStallCountOver50Ms)),
-      trackedServiceStallCountOver100Ms: this.benchmarkMetricSummary(runs.map((run) => run.trackedServiceStallCountOver100Ms)),
-      coreExportMs: this.benchmarkMetricSummary(runs.map((run) => run.coreExportMs)),
-      bridgeStartupMs: this.benchmarkMetricSummary(runs.map((run) => run.bridgeStartupMs)),
-      handshakeMs: this.benchmarkMetricSummary(runs.map((run) => run.handshakeMs)),
-      serviceExportSumMs: this.benchmarkMetricSummary(runs.map((run) => run.serviceExportSumMs)),
-      importCriticalTailMs: this.benchmarkMetricSummary(runs.map((run) => run.importCriticalTailMs)),
-      unmeasuredOrSchedulerGapMs: this.benchmarkMetricSummary(runs.map((run) => run.unmeasuredOrSchedulerGapMs)),
-      perService: this.benchmarkPerServiceSummary(runs),
-      exportFingerprint: lastRun?.exportFingerprint,
-      bridgeFingerprint: lastRun?.bridgeFingerprint,
-    };
-  }
-
-  private benchmarkMetricSummary(values: Array<number | undefined>): {
-    p50?: number;
-    p90?: number;
-    min?: number;
-    max?: number;
-  } {
-    return {
-      p50: this.percentile(values, 0.5),
-      p90: this.percentile(values, 0.9),
-      min: this.minMetric(values),
-      max: this.maxMetric(values),
-    };
-  }
-
-  private benchmarkPerServiceSummary(runs: BenchmarkRunMetrics[]): Record<string, Record<string, unknown>> {
-    const byService = new Map<string, BenchmarkServiceMetrics[]>();
-    for (const run of runs) {
-      for (const metrics of run.serviceMetrics ?? []) {
-        const serviceRuns = byService.get(metrics.service) ?? [];
-        serviceRuns.push(metrics);
-        byService.set(metrics.service, serviceRuns);
-      }
-    }
-
-    const entries = Array.from(byService.entries()).sort((a, b) => {
-      const aP50 = this.percentile(a[1].map((metrics) => metrics.instanceFetchMs), 0.5) ?? 0;
-      const bP50 = this.percentile(b[1].map((metrics) => metrics.instanceFetchMs), 0.5) ?? 0;
-      return bP50 - aP50;
-    });
-    const out: Record<string, Record<string, unknown>> = {};
-    for (const [service, serviceRuns] of entries) {
-      out[service] = {
-        instanceFetchMs: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.instanceFetchMs)),
-        pluginServerMs: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.pluginServerMs)),
-        pluginEncodeMs: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.pluginEncodeMs)),
-        payloadBytes: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.payloadBytes)),
-        chunkCount: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.chunkCount)),
-        maxFrameMs: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.maxFrameMs)),
-        stallCountOver33Ms: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.stallCountOver33Ms)),
-        stallCountOver50Ms: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.stallCountOver50Ms)),
-        stallCountOver100Ms: this.benchmarkMetricSummary(serviceRuns.map((metrics) => metrics.stallCountOver100Ms)),
-      };
-    }
-    return out;
-  }
-
-  private benchmarkServiceScore(metrics: BenchmarkServiceMetrics): number {
-    return (
-      (metrics.instanceFetchMs ?? 0) * 1_000_000 +
-      (metrics.pluginServerMs ?? 0) * 10_000 +
-      (metrics.pluginEncodeMs ?? 0) * 1_000 +
-      (metrics.payloadBytes ?? 0)
-    );
-  }
-
-  private logBenchmarkRun(prefix: string, metrics: BenchmarkRunMetrics): void {
-    this.output.appendLine(
-      `${prefix} total=${this.formatMetricMs(metrics.totalMs)} core_export=${this.formatMetricMs(metrics.coreExportMs)} bridge_startup=${this.formatMetricMs(metrics.bridgeStartupMs)} handshake=${this.formatMetricMs(metrics.handshakeMs)} service_export_sum=${this.formatMetricMs(metrics.serviceExportSumMs)} import_tail=${this.formatMetricMs(metrics.importCriticalTailMs)} gap=${this.formatMetricMs(metrics.unmeasuredOrSchedulerGapMs)} trackedService=${metrics.trackedService ?? "n/a"} fetch=${this.formatMetricMs(metrics.trackedServiceInstanceFetchMs)} pluginServer=${this.formatMetricMs(metrics.trackedServicePluginServerMs)} pluginEncode=${this.formatMetricMs(metrics.trackedServicePluginEncodeMs)} payload=${this.formatMetricBytes(metrics.trackedServicePayloadBytes)} chunks=${this.formatMetricInt(metrics.trackedServiceChunkCount)} maxFrame=${this.formatMetricMs(metrics.trackedServiceMaxFrameMs)} stalls50=${this.formatMetricInt(metrics.trackedServiceStallCountOver50Ms)} stalls100=${this.formatMetricInt(metrics.trackedServiceStallCountOver100Ms)}`,
-    );
-  }
-
-  private summaryP50(summary: Record<string, unknown> | undefined, key: string): number | undefined {
-    const metricSummary = summary?.[key];
-    if (!metricSummary || typeof metricSummary !== "object" || !("p50" in metricSummary)) {
-      return undefined;
-    }
-    const value = (metricSummary as { p50?: unknown }).p50;
-    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-  }
-
-  private metricDelta(before: number | undefined, after: number | undefined): number | undefined {
-    return before === undefined || after === undefined ? undefined : after - before;
-  }
-
-  private formatMetricMs(value: number | undefined): string {
-    return value === undefined ? "n/a" : `${value.toFixed(1)}ms`;
-  }
-
-  private formatSignedMetricMs(value: number | undefined): string {
-    if (value === undefined) {
-      return "n/a";
-    }
-    return `${value >= 0 ? "+" : ""}${value.toFixed(1)}ms`;
-  }
-
-  private formatMetricBytes(value: number | undefined): string {
-    return value === undefined ? "n/a" : `${Math.round(value)}B`;
-  }
-
-  private formatMetricInt(value: number | undefined): string {
-    return value === undefined ? "n/a" : String(Math.round(value));
-  }
-
-  private summarizeBenchmarkOutput(output: string): string[] {
-    const lines = output
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    const interesting = lines.filter((line) =>
-      line.includes("effective chunk size:") ||
-      line.includes("prepared bridge_version=") ||
-      line.includes("instance fetch") ||
-      line.includes("script source fetch") ||
-      line.includes("build service state") ||
-      line.includes("settings binary collect") ||
-      line.includes("settings binary write") ||
-      line.includes("direct import worker total") ||
-      line.includes("direct import dispatcher drain") ||
-      line.includes("export start:")
-    );
-
-    return interesting.slice(-16);
-  }
-
-  private renderArgs(args: string[]): string {
-    return args
-      .map((arg) => {
-        if (/\s/.test(arg) || arg.includes('"')) {
-          return `"${arg.replaceAll('"', '\\"')}"`;
-        }
-        return arg;
-      })
-      .join(" ");
-  }
-
   private updateStatusBar(): void {
     const experienceRoot = this.configuredExperienceRoot();
     const placeAlias = experienceRoot ? activeExperienceAlias(experienceRoot) : undefined;
@@ -12740,29 +6312,25 @@ class RobloxSyncController {
     }
     this.liveSyncGraphRefreshRunning = true;
     try {
-    let cfg: SyncConfig;
-    try {
-      cfg = this.getConfig();
-    } catch {
-      return;
-    }
-    if (this.normalizePathForCompare(cfg.projectRoot) !== this.normalizePathForCompare(projectRoot)) {
-      return;
-    }
-    invalidateProjectSourceGraph(projectRoot);
-    await vscode.commands.executeCommand("renium.fileExplorer.refreshProjectGraph");
-    if (this.liveSyncStartupInProgress) {
-      this.liveSyncGraphRefreshPending = true;
-      return;
-    }
-    if (!this.liveSyncWatcher) {
-      return;
-    }
-    await this.disposeLiveSyncRuntime();
-    if (this.normalizePathForCompare(this.getConfig().projectRoot) !== this.normalizePathForCompare(projectRoot)) {
-      return;
-    }
-    await this.startLiveSync({ silent: true, bestEffort: true, graphRefresh: true });
+      const cfg = this.tryGetConfig();
+      if (!cfg || filesystemPathKey(cfg.projectRoot) !== filesystemPathKey(projectRoot)) {
+        return;
+      }
+      invalidateProjectSourceGraph(projectRoot);
+      await vscode.commands.executeCommand("renium.fileExplorer.refreshProjectGraph");
+      if (this.liveSyncStartupInProgress) {
+        this.liveSyncGraphRefreshPending = true;
+        return;
+      }
+      if (!this.liveSyncWatcher) {
+        return;
+      }
+      await this.disposeLiveSyncRuntime();
+      const currentConfig = this.tryGetConfig();
+      if (!currentConfig || filesystemPathKey(currentConfig.projectRoot) !== filesystemPathKey(projectRoot)) {
+        return;
+      }
+      await this.startLiveSync({ silent: true, bestEffort: true, graphRefresh: true });
     } finally {
       this.liveSyncGraphRefreshRunning = false;
       if (this.liveSyncGraphRefreshPending && !this.liveSyncStartupInProgress) {
@@ -12773,24 +6341,12 @@ class RobloxSyncController {
   }
 
   private pendingEditorPathsStorageKey(projectRoot?: string): string {
-    let resolvedRoot = projectRoot ?? "";
-    if (!resolvedRoot) {
-      try {
-        resolvedRoot = this.getConfig().projectRoot;
-      } catch {
-      }
-    }
-    return `renium.pendingEditorPaths:${this.normalizePathForCompare(resolvedRoot || this.context.extensionPath)}`;
+    const resolvedRoot = projectRoot ?? this.tryGetConfig()?.projectRoot ?? this.context.extensionPath;
+    return `renium.pendingEditorPaths:${filesystemPathKey(resolvedRoot)}`;
   }
 
   private restorePendingEditorPaths(projectRoot?: string): void {
-    let resolvedRoot = projectRoot;
-    if (!resolvedRoot) {
-      try {
-        resolvedRoot = this.getConfig().projectRoot;
-      } catch {
-      }
-    }
+    const resolvedRoot = projectRoot ?? this.tryGetConfig()?.projectRoot;
     this.liveSyncProjectRoot = resolvedRoot;
     this.pendingEditorPaths.clear();
     this.blockedStudioImportServices.clear();
@@ -12824,7 +6380,7 @@ class RobloxSyncController {
           .map((service) => service.toLowerCase());
         if (services.length > 0) {
           this.pendingEditorServicesByPath.set(
-            this.normalizePathForCompare(filePath),
+            filesystemPathKey(filePath),
             new Set(services),
           );
         }
@@ -12833,13 +6389,9 @@ class RobloxSyncController {
     const blockedServices = stored && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as { blockedServices?: unknown }).blockedServices
       : undefined;
-    let cfg: SyncConfig | undefined;
-    try {
-      cfg = this.getConfig();
-    } catch {
-    }
+    const cfg = this.tryGetConfig();
     for (const filePath of this.pendingEditorPaths) {
-      const key = this.normalizePathForCompare(filePath);
+      const key = filesystemPathKey(filePath);
       if (this.pendingEditorServicesByPath.has(key)) {
         continue;
       }
@@ -12865,7 +6417,7 @@ class RobloxSyncController {
     this.pendingEditorPaths.add(filePath);
     const detected = services ?? this.servicesForProjectSourcePath(filePath, cfg);
     this.pendingEditorServicesByPath.set(
-      this.normalizePathForCompare(filePath),
+      filesystemPathKey(filePath),
       new Set((detected.length > 0 ? detected : cfg.services).map((service) => service.toLowerCase())),
     );
   }
@@ -12874,7 +6426,7 @@ class RobloxSyncController {
     this.blockedStudioImportServices.clear();
     const pendingKeys = new Set<string>();
     for (const filePath of this.pendingEditorPaths) {
-      const key = this.normalizePathForCompare(filePath);
+      const key = filesystemPathKey(filePath);
       pendingKeys.add(key);
       let services = this.pendingEditorServicesByPath.get(key);
       if (!services) {
@@ -12897,7 +6449,7 @@ class RobloxSyncController {
 
   public onProjectGraphChanged(projectRoot: string): void {
     const cfg = this.getConfig();
-    if (this.normalizePathForCompare(projectRoot) !== this.normalizePathForCompare(cfg.projectRoot)) {
+    if (filesystemPathKey(projectRoot) !== filesystemPathKey(cfg.projectRoot)) {
       return;
     }
     invalidateProjectSourceGraph(projectRoot);
@@ -12905,7 +6457,7 @@ class RobloxSyncController {
     for (const filePath of this.pendingEditorPaths) {
       const services = this.servicesForProjectSourcePath(filePath, cfg);
       this.pendingEditorServicesByPath.set(
-        this.normalizePathForCompare(filePath),
+        filesystemPathKey(filePath),
         new Set((services.length > 0 ? services : cfg.services).map((service) => service.toLowerCase())),
       );
     }
@@ -12937,7 +6489,7 @@ class RobloxSyncController {
     if (uniquePaths.length === 0) {
       return;
     }
-    if (this.normalizePathForCompare(projectRoot) === this.normalizePathForCompare(cfg.projectRoot)) {
+    if (filesystemPathKey(projectRoot) === filesystemPathKey(cfg.projectRoot)) {
       this.markEditorPathsPending(uniquePaths, cfg, services);
       return;
     }
@@ -12988,16 +6540,16 @@ class RobloxSyncController {
   }
 
   private clearAppliedEditorPaths(paths: string[]): void {
-    const applied = new Set(paths.map((filePath) => this.normalizePathForCompare(filePath)));
+    const applied = new Set(paths.map((filePath) => filesystemPathKey(filePath)));
     for (const filePath of this.pendingEditorPaths) {
-      if (applied.has(this.normalizePathForCompare(filePath))) {
+      if (applied.has(filesystemPathKey(filePath))) {
         this.pendingEditorPaths.delete(filePath);
-        this.pendingEditorServicesByPath.delete(this.normalizePathForCompare(filePath));
+        this.pendingEditorServicesByPath.delete(filesystemPathKey(filePath));
       }
     }
-    try {
-      this.recomputeBlockedStudioImportServices(this.getConfig());
-    } catch {
+    const cfg = this.tryGetConfig();
+    if (cfg) {
+      this.recomputeBlockedStudioImportServices(cfg);
     }
     this.persistPendingEditorPaths();
   }
@@ -13010,7 +6562,7 @@ class RobloxSyncController {
       pathServices: Object.fromEntries(
         [...this.pendingEditorPaths].map((filePath) => [
           filePath,
-          [...(this.pendingEditorServicesByPath.get(this.normalizePathForCompare(filePath)) ?? [])],
+          [...(this.pendingEditorServicesByPath.get(filesystemPathKey(filePath)) ?? [])],
         ]),
       ),
     };
@@ -13066,984 +6618,6 @@ class RobloxSyncController {
   }
 }
 
-
-
-
-
-class LinkDecorationProvider implements vscode.FileDecorationProvider {
-  private readonly emitter = new vscode.EventEmitter<vscode.Uri[] | undefined>();
-  public readonly onDidChangeFileDecorations = this.emitter.event;
-  private index = new Map<string, LinkFileInfo>();
-  private refreshGeneration = 0;
-
-  public constructor(private readonly controller: RobloxSyncController) {}
-
-  public async refresh(): Promise<void> {
-    const generation = ++this.refreshGeneration;
-    let index: Map<string, LinkFileInfo>;
-    try {
-      index = await this.controller.getLinkFileIndex(true);
-    } catch {
-      index = new Map();
-    }
-    if (generation !== this.refreshGeneration) {
-      return;
-    }
-    this.index = index;
-    this.emitter.fire(undefined);
-  }
-
-  public provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-    if (uri.scheme !== "file" || this.index.size === 0) {
-      return undefined;
-    }
-    const info = this.index.get(this.controller.normalizeLinkPathKey(uri.fsPath));
-    if (!info || info.broken) {
-      return undefined;
-    }
-    if (info.drift) {
-      return new vscode.FileDecoration(
-        "L!",
-        `Link → ${info.linkId} (edited — reverts to source on sync)`,
-        new vscode.ThemeColor("gitDecoration.modifiedResourceForeground"),
-      );
-    }
-    return new vscode.FileDecoration(
-      "L",
-      `Link → ${info.linkId} (read-only mirror)`,
-      new vscode.ThemeColor("gitDecoration.submoduleResourceForeground"),
-    );
-  }
-}
-
-function relativeTimeLabel(unixMs?: number | null): string {
-  if (!unixMs || unixMs <= 0) {
-    return "unknown";
-  }
-  const diff = Date.now() - unixMs;
-  if (diff < 45_000) {
-    return "just now";
-  }
-  const minutes = Math.floor(diff / 60_000);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 30) {
-    return `${days}d ago`;
-  }
-  const months = Math.floor(days / 30);
-  if (months < 12) {
-    return `${months}mo ago`;
-  }
-  return `${Math.floor(months / 12)}y ago`;
-}
-
-function escapeHtml(value: unknown): string {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function scriptJson(value: unknown): string {
-  return (JSON.stringify(value) ?? "null")
-    .replace(/</g, "\\u003c")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
-}
-
-function packagePreviewHtml(preview: PackagePreviewData): string {
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(preview.name)}</title>
-<style>
-body{margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family);font-size:12px}
-.toolbar{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-sideBar-background)}
-.title{font-weight:600;font-size:13px}.muted{color:var(--vscode-descriptionForeground)}
-.layout{display:grid;grid-template-columns:minmax(220px,34%) 1fr;height:calc(100vh - 43px)}
-.tree{border-right:1px solid var(--vscode-panel-border);overflow:auto;padding:8px}.details{overflow:auto;padding:12px}
-.row{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:3px;cursor:pointer;white-space:nowrap}
-.row:hover{background:var(--vscode-list-hoverBackground)}.row.selected{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
-.twisty{width:12px;color:var(--vscode-descriptionForeground)}.name{font-weight:500}.class{color:var(--vscode-descriptionForeground)}
-h2{font-size:15px;margin:0 0 4px}h3{font-size:12px;margin:18px 0 8px;text-transform:uppercase;color:var(--vscode-descriptionForeground);letter-spacing:.04em}
-table{border-collapse:collapse;width:100%}td{border-top:1px solid var(--vscode-panel-border);padding:5px 6px;vertical-align:top}td:first-child{width:190px;color:var(--vscode-descriptionForeground)}
-pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeBlock-background);padding:10px;border-radius:4px;max-height:45vh;overflow:auto}
-.empty{padding:16px;color:var(--vscode-descriptionForeground)}
-</style>
-</head>
-<body>
-<div class="toolbar"><span class="title">${escapeHtml(preview.name)}</span><span class="muted">${escapeHtml(preview.source ?? preview.sourcePath)}</span></div>
-<div class="layout"><div id="tree" class="tree"></div><div id="details" class="details"></div></div>
-<script>
-const data=${scriptJson(preview)};
-const tree=document.getElementById('tree');
-const details=document.getElementById('details');
-const byId=new Map();
-const children=new Map();
-for(const node of data.nodes||[]){
-  const id=node.settingsId||node.name||Math.random().toString(36);
-  node.__id=id; byId.set(id,node);
-  const parent=node.parentId||'';
-  if(!children.has(parent))children.set(parent,[]);
-  children.get(parent).push(node);
-}
-let selected=(data.rootIds&&data.rootIds[0])||(data.nodes&&data.nodes[0]&&data.nodes[0].__id)||'';
-function esc(value){return String(value??'').replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]))}
-function rows(parent,depth){
-  const list=children.get(parent)||[];
-  let html='';
-  for(const node of list){
-    const kids=children.get(node.__id)||[];
-    html+='<div class="row'+(selected===node.__id?' selected':'')+'" data-id="'+esc(node.__id)+'" style="padding-left:'+(depth*14+4)+'px">';
-    html+='<span class="twisty">'+(kids.length?'v':'')+'</span><span class="name">'+esc(node.name||node.__id)+'</span><span class="class">'+esc(node.className||'')+'</span></div>';
-    html+=rows(node.__id,depth+1);
-  }
-  return html;
-}
-function renderTree(){
-  const roots=(data.rootIds||[]).filter(id=>byId.has(id));
-  if(roots.length&&!children.has(''))children.set('',roots.map(id=>byId.get(id)));
-  tree.innerHTML=rows('',0)||'<div class="empty">Package is empty.</div>';
-}
-function valueText(value){if(value===undefined)return ''; if(typeof value==='string')return value; try{return JSON.stringify(value,null,2)}catch(_){return String(value)}}
-function propTable(title,obj){
-  const entries=Object.entries(obj||{});
-  if(!entries.length)return '';
-  return '<h3>'+title+'</h3><table>'+entries.map(([k,v])=>'<tr><td>'+esc(k)+'</td><td><pre>'+esc(valueText(v))+'</pre></td></tr>').join('')+'</table>';
-}
-function renderDetails(){
-  const node=byId.get(selected);
-  if(!node){details.innerHTML='<div class="empty">Select an instance.</div>';return}
-  details.innerHTML='<h2>'+esc(node.name||'Instance')+'</h2><div class="muted">'+esc(node.className||'')+' - '+esc(node.settingsId||'')+'</div>'
-    +'<h3>Path</h3><pre>'+esc((node.pathSegments||[node.name]).join('.'))+'</pre>'
-    +propTable('Properties',node.properties)
-    +propTable('Attributes',node.attributes);
-}
-tree.addEventListener('click',event=>{const row=event.target.closest('.row'); if(!row)return; selected=row.dataset.id; renderTree(); renderDetails();});
-renderTree(); renderDetails();
-</script>
-</body>
-</html>`;
-}
-
-type PackageLinkElement = {
-  kind: "link";
-  link: CliLinkStatusLink;
-  selectionVersion: number;
-};
-
-type PackageNodeElement = {
-  kind: "node";
-  link: CliLinkStatusLink;
-  preview: PackagePreviewData;
-  node: PackagePreviewNode;
-  nodeKey: string;
-  parentKey: string;
-  childCount: number;
-  selectionVersion: number;
-};
-
-type PackageTreeElement = PackageLinkElement | PackageNodeElement;
-
-type PackagePreviewTree = {
-  generation: number;
-  preview: PackagePreviewData;
-  nodesByKey: Map<string, PackagePreviewNode>;
-  elementsByKey: Map<string, PackageNodeElement>;
-  childrenByParent: Map<string, PackageNodeElement[]>;
-  roots: PackageNodeElement[];
-};
-
-function isPackageScriptClass(className: string | undefined): boolean {
-  return className === "Script" || className === "LocalScript" || className === "ModuleScript";
-}
-
-function packageNodeKey(node: PackagePreviewNode, index = 0): string {
-  const settingsId = String(node.settingsId ?? "").trim();
-  if (settingsId.length > 0) {
-    return settingsId;
-  }
-  const pathKey = Array.isArray(node.pathSegments) ? node.pathSegments.join("/") : "";
-  return pathKey.length > 0 ? pathKey : `${String(node.name ?? "node")}:${index}`;
-}
-
-function packageNodeSource(node: PackagePreviewNode): string | undefined {
-  const value = node.properties?.Source ?? node.properties?.source;
-  return typeof value === "string" ? value : undefined;
-}
-
-function packageScriptFileName(node: PackagePreviewNode): string {
-  const name = String(node.name ?? "Script").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
-  if (/\.(lua|luau)$/i.test(name)) {
-    return name;
-  }
-  switch (node.className) {
-    case "Script":
-      return `${name}.server.luau`;
-    case "LocalScript":
-      return `${name}.client.luau`;
-    default:
-      return `${name}.luau`;
-  }
-}
-
-function packageScriptUriInfo(uri: vscode.Uri): OpenPackageScriptTab | undefined {
-  if (uri.scheme !== "renium-package") {
-    return undefined;
-  }
-  const params = new URLSearchParams(uri.query);
-  const linkId = params.get("link")?.trim() ?? "";
-  const nodeKey = params.get("node")?.trim() ?? "";
-  if (!linkId || !nodeKey) {
-    return undefined;
-  }
-  return { linkId, nodeKey };
-}
-
-function packageDisplayPath(node: PackagePreviewNode): string {
-  return Array.isArray(node.pathSegments) && node.pathSegments.length > 0
-    ? node.pathSegments.join(".")
-    : String(node.name ?? "Instance");
-}
-
-function packageValueText(value: unknown): string {
-  if (value === undefined) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function packageTableHtml(title: string, object: Record<string, unknown> | undefined, omitKeys = new Set<string>()): string {
-  const entries = Object.entries(object ?? {}).filter(([key]) => !omitKeys.has(key));
-  if (entries.length === 0) {
-    return "";
-  }
-  return `<h2>${escapeHtml(title)}</h2><table>${entries
-    .map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td><pre>${escapeHtml(packageValueText(value))}</pre></td></tr>`)
-    .join("")}</table>`;
-}
-
-function packagePropertiesHtml(preview: PackagePreviewData, node: PackagePreviewNode | undefined): string {
-  const selected = node ? packageDisplayPath(node) : preview.name;
-  const className = node?.className ?? preview.rootClass ?? "Package";
-  const omit = new Set<string>(["Source", "source"]);
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family);font-size:12px}
-.head{padding:10px 12px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-sideBar-background)}
-.title{font-size:13px;font-weight:700;letter-spacing:.05em}.tag{display:inline-block;margin-left:8px;border:1px solid var(--vscode-focusBorder);border-radius:999px;padding:1px 7px;color:var(--vscode-focusBorder)}
-.meta{margin-top:4px;color:var(--vscode-descriptionForeground)}
-.body{padding:12px}h2{font-size:12px;margin:16px 0 8px;text-transform:uppercase;color:var(--vscode-descriptionForeground);letter-spacing:.04em}
-table{border-collapse:collapse;width:100%}td{border-top:1px solid var(--vscode-panel-border);padding:5px 6px;vertical-align:top}td:first-child{width:190px;color:var(--vscode-descriptionForeground)}
-pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeBlock-background);padding:8px;border-radius:4px}
-</style>
-</head>
-<body>
-<div class="head"><span class="title">PROPERTIES</span><span class="tag">${escapeHtml(preview.name)}</span><div class="meta">${escapeHtml(selected)}  -  ${escapeHtml(className)}</div></div>
-<div class="body">
-<h2>Package</h2>
-<table>
-<tr><td>Package</td><td><pre>${escapeHtml(preview.name)}</pre></td></tr>
-<tr><td>Source</td><td><pre>${escapeHtml(preview.source ?? preview.sourcePath)}</pre></td></tr>
-${node ? `<tr><td>Path</td><td><pre>${escapeHtml(packageDisplayPath(node))}</pre></td></tr>` : ""}
-</table>
-${packageTableHtml("Properties", node?.properties, omit)}
-${packageTableHtml("Attributes", node?.attributes)}
-</div>
-</body>
-</html>`;
-}
-
-class PackageScriptContentProvider implements vscode.TextDocumentContentProvider, vscode.Disposable {
-  private readonly contents = new Map<string, string>();
-  private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
-  public readonly onDidChange = this.changeEmitter.event;
-  private generation = 0;
-
-  public constructor(private readonly resolveContent?: (linkId: string, nodeKey: string) => Promise<string | undefined>) {}
-
-  public provideTextDocumentContent(uri: vscode.Uri): vscode.ProviderResult<string> {
-    const key = uri.toString();
-    const cached = this.contents.get(key);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const info = packageScriptUriInfo(uri);
-    if (!info || !this.resolveContent) {
-      return "";
-    }
-    const generation = this.generation;
-    return this.resolveContent(info.linkId, info.nodeKey).then(
-      (source) => {
-        const text = source ?? "";
-        if (generation === this.generation) {
-          this.contents.set(key, text);
-        }
-        return text;
-      },
-      () => "",
-    );
-  }
-
-  public uriFor(preview: PackagePreviewData, node: PackagePreviewNode): vscode.Uri {
-    const source = packageNodeSource(node) ?? "";
-    const nodeKey = packageNodeKey(node);
-    const hash = crypto.createHash("sha1").update(`${preview.id}\0${nodeKey}\0${source}`).digest("hex").slice(0, 12);
-    const packageName = preview.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_") || "package";
-    const query = new URLSearchParams({
-      link: preview.id,
-      node: nodeKey,
-      v: hash,
-    });
-    const uri = vscode.Uri.from({
-      scheme: "renium-package",
-      authority: "preview",
-      path: `/${encodeURIComponent(packageName)}/${encodeURIComponent(packageScriptFileName(node))}`,
-      query: query.toString(),
-    });
-    this.contents.set(uri.toString(), source);
-    this.changeEmitter.fire(uri);
-    return uri;
-  }
-
-  public refresh(): void {
-    this.generation += 1;
-    for (const document of vscode.workspace.textDocuments) {
-      if (document.uri.scheme !== "renium-package") {
-        continue;
-      }
-      this.contents.delete(document.uri.toString());
-      this.changeEmitter.fire(document.uri);
-    }
-  }
-
-  public dispose(): void {
-    this.generation += 1;
-    this.contents.clear();
-    this.changeEmitter.dispose();
-  }
-}
-
-class PackageScriptDecorationProvider implements vscode.FileDecorationProvider {
-  public provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-    if (uri.scheme !== "renium-package" && uri.scheme !== "renium-readonly-script") {
-      return undefined;
-    }
-    return new vscode.FileDecoration(
-      undefined,
-      uri.scheme === "renium-package"
-        ? "Renium package script preview (read-only)"
-        : "Renium linked script preview (read-only)",
-      new vscode.ThemeColor("renium.packagePreviewForeground"),
-    );
-  }
-}
-
-
-class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTreeElement>, vscode.TreeDragAndDropController<PackageTreeElement>, vscode.Disposable {
-  private readonly changeEmitter = new vscode.EventEmitter<PackageTreeElement | undefined | null | void>();
-  public readonly onDidChangeTreeData = this.changeEmitter.event;
-  public readonly dragMimeTypes = [RENIUM_PACKAGE_DRAG_MIME, "text/plain"];
-  public readonly dropMimeTypes: string[] = [];
-  private readonly iconNames: ReadonlySet<string>;
-  private readonly previewCache = new Map<string, Promise<PackagePreviewTree>>();
-  private readonly expandedLinkIds = new Set<string>();
-  private readonly expandedNodeKeys = new Map<string, Set<string>>();
-  private clearDragTimer: NodeJS.Timeout | undefined;
-  private propertiesPanel: vscode.WebviewPanel | undefined;
-  private selectionGeneration = 0;
-  private suppressExpansionTracking = false;
-  private propertiesUpdateChain: Promise<void> = Promise.resolve();
-
-  public constructor(
-    private readonly controller: RobloxSyncController,
-    private readonly extensionUri: vscode.Uri,
-    private readonly scriptContentProvider: PackageScriptContentProvider,
-    private readonly setPackageDrag: (link?: { id: string; name?: string; mode?: string }) => void,
-  ) {
-    this.iconNames = new Set(loadAssetIconNames(extensionUri));
-  }
-
-  public dispose(): void {
-    this.changeEmitter.dispose();
-    if (this.clearDragTimer) {
-      clearTimeout(this.clearDragTimer);
-      this.clearDragTimer = undefined;
-    }
-    this.setPackageDrag(undefined);
-  }
-
-  public refresh(): void {
-    if (this.clearDragTimer) {
-      clearTimeout(this.clearDragTimer);
-      this.clearDragTimer = undefined;
-    }
-    this.setPackageDrag(undefined);
-    this.selectionGeneration += 1;
-    this.previewCache.clear();
-    this.scriptContentProvider.refresh();
-    this.queuePackagePropertiesClear();
-    this.changeEmitter.fire();
-  }
-
-  public clearSelection(_element: PackageTreeElement | undefined): void {
-    this.selectionGeneration += 1;
-    this.suppressExpansionTracking = true;
-    this.queuePackagePropertiesClear();
-    this.changeEmitter.fire();
-  }
-
-  public isCurrentElement(element: PackageTreeElement | undefined): element is PackageTreeElement {
-    return !!element && element.selectionVersion === this.selectionGeneration;
-  }
-
-  private linkSelectionVersion(link: CliLinkStatusLink): number {
-    return this.selectionGeneration;
-  }
-
-  private nodeSelectionVersion(link: CliLinkStatusLink, nodeKey: string): number {
-    return this.selectionGeneration;
-  }
-
-  public noteExpansion(element: PackageTreeElement, expanded: boolean): void {
-    if (this.suppressExpansionTracking) {
-      return;
-    }
-    const linkId = String(element.link.id ?? "").trim();
-    if (!linkId) {
-      return;
-    }
-    if (element.kind === "link") {
-      if (expanded) {
-        this.expandedLinkIds.add(linkId);
-      } else {
-        this.expandedLinkIds.delete(linkId);
-        this.expandedNodeKeys.delete(linkId);
-      }
-      return;
-    }
-    const nodeKeys = this.expandedNodeKeys.get(linkId) ?? new Set<string>();
-    if (expanded) {
-      nodeKeys.add(element.nodeKey);
-      this.expandedNodeKeys.set(linkId, nodeKeys);
-    } else {
-      nodeKeys.delete(element.nodeKey);
-      if (nodeKeys.size === 0) {
-        this.expandedNodeKeys.delete(linkId);
-      }
-    }
-  }
-
-  public async restoreExpansion(treeView: vscode.TreeView<PackageTreeElement>): Promise<void> {
-    try {
-      const linkIds = Array.from(this.expandedLinkIds);
-      for (const linkId of linkIds) {
-        const linkElement = await this.elementForLinkId(linkId);
-        if (linkElement) {
-          await treeView.reveal(linkElement, { expand: true, select: false, focus: false });
-        }
-      }
-      const nodeElements: PackageNodeElement[] = [];
-      for (const [linkId, nodeKeys] of this.expandedNodeKeys) {
-        for (const nodeKey of nodeKeys) {
-          const nodeElement = await this.elementForNodeKey(linkId, nodeKey);
-          if (nodeElement) {
-            nodeElements.push(nodeElement);
-          }
-        }
-      }
-      nodeElements.sort((a, b) => (a.node.pathSegments?.length ?? 0) - (b.node.pathSegments?.length ?? 0));
-      for (const nodeElement of nodeElements) {
-        await treeView.reveal(nodeElement, { expand: true, select: false, focus: false });
-      }
-    } finally {
-      setTimeout(() => {
-        this.suppressExpansionTracking = false;
-      }, 0);
-    }
-  }
-
-  public linkFromElement(element: PackageTreeElement | CliLinkStatusLink | string | undefined): CliLinkStatusLink | string | undefined {
-    if (!element || typeof element === "string") {
-      return element;
-    }
-    if ("kind" in element) {
-      return element.link;
-    }
-    return element;
-  }
-
-  public async handleDrag(source: readonly PackageTreeElement[], dataTransfer: vscode.DataTransfer): Promise<void> {
-    const link = source.find((candidate): candidate is PackageLinkElement => candidate.kind === "link")?.link;
-    if (!link?.id) {
-      logPackageDragDebug("packages.handleDrag: no link id in drag source");
-      return;
-    }
-    const name = (link.rootName && link.rootName.length > 0 ? link.rootName : link.id) ?? link.id;
-    const payload = JSON.stringify({ type: "renium-package", id: link.id, name });
-    dataTransfer.set(RENIUM_PACKAGE_DRAG_MIME, new vscode.DataTransferItem(payload));
-    dataTransfer.set("text/plain", new vscode.DataTransferItem(`${RENIUM_PACKAGE_TEXT_PREFIX}${payload}`));
-    logPackageDragDebug(`packages.handleDrag: armed ${link.id} name=${name}`);
-    this.setPackageDrag({ id: link.id, name, mode: "drag" });
-    if (this.clearDragTimer) {
-      clearTimeout(this.clearDragTimer);
-    }
-    this.clearDragTimer = setTimeout(() => {
-      this.clearDragTimer = undefined;
-      logPackageDragDebug(`packages.handleDrag: cleared ${link.id} after timeout`);
-      this.setPackageDrag(undefined);
-    }, 30_000);
-  }
-
-  public getTreeItem(element: PackageTreeElement): vscode.TreeItem {
-    if (element.kind === "node") {
-      return this.getPackageNodeTreeItem(element);
-    }
-    const link = element.link;
-    const name = (link.rootName && link.rootName.length > 0 ? link.rootName : link.id) ?? "link";
-    const hasVisibleChildren = typeof link.instances === "number" ? link.instances > 1 : true;
-    const item = new vscode.TreeItem(
-      name,
-      hasVisibleChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-    );
-    const uses = link.targetCount ?? 0;
-    item.description = `${relativeTimeLabel(link.updatedUnixMs)}${uses > 0 ? `  -  ${uses} use${uses === 1 ? "" : "s"}` : ""}`;
-
-    const rootClass = link.rootClass && link.rootClass.length > 0 ? link.rootClass : "";
-    if (rootClass) {
-      const iconUri = vscode.Uri.joinPath(this.extensionUri, "assets", `${iconAssetNameForClass(rootClass, this.iconNames)}.png`);
-      item.iconPath = fs.existsSync(iconUri.fsPath) ? iconUri : new vscode.ThemeIcon("package");
-    } else {
-      item.iconPath = new vscode.ThemeIcon("package");
-    }
-
-    const tooltip = new vscode.MarkdownString(undefined, true);
-    tooltip.appendMarkdown(`**${name}**${rootClass ? `  \`${rootClass}\`` : ""}\n\n`);
-    tooltip.appendMarkdown(`- Source: \`${link.source ?? "?"}\`\n`);
-    if (typeof link.instances === "number" && link.instances > 0) {
-      tooltip.appendMarkdown(`- Instances: ${link.instances}\n`);
-    }
-    tooltip.appendMarkdown(`- Used in: ${uses} place${uses === 1 ? "" : "s"}\n`);
-    tooltip.appendMarkdown(`- ${link.readOnly === false ? "Writable" : "Read-only"}\n`);
-    tooltip.appendMarkdown(`- Last edited: ${link.updatedUnixMs ? new Date(link.updatedUnixMs).toLocaleString() : "unknown"}`);
-    item.tooltip = tooltip;
-
-    item.contextValue = "reniumPackage";
-    item.id = `package:${link.id ?? name}:${this.linkSelectionVersion(link)}`;
-    item.command = {
-      command: "renium.packages.openItem",
-      title: "Open Package",
-      arguments: [element],
-    };
-    return item;
-  }
-
-  private getPackageNodeTreeItem(element: PackageNodeElement): vscode.TreeItem {
-    const node = element.node;
-    const label = String(node.name ?? node.settingsId ?? "Instance");
-    const item = new vscode.TreeItem(
-      label,
-      element.childCount > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-    );
-    const className = String(node.className ?? "");
-    item.description = className && className !== label ? className : undefined;
-    item.tooltip = new vscode.MarkdownString(
-      `**${label}**${className ? `  \`${className}\`` : ""}\n\nPackage: \`${element.preview.name}\`\n\nPath: \`${packageDisplayPath(node)}\``,
-      true,
-    );
-    const iconUri = vscode.Uri.joinPath(this.extensionUri, "assets", `${iconAssetNameForClass(className || "Folder", this.iconNames)}.png`);
-    item.iconPath = fs.existsSync(iconUri.fsPath) ? iconUri : new vscode.ThemeIcon(isPackageScriptClass(className) ? "symbol-method" : "symbol-class");
-    item.contextValue = isPackageScriptClass(className) ? "reniumPackageNode.script" : "reniumPackageNode";
-    item.id = `package-node:${element.link.id}:${element.nodeKey}:${this.nodeSelectionVersion(element.link, element.nodeKey)}`;
-    item.command = {
-      command: "renium.packages.openItem",
-      title: isPackageScriptClass(className) ? "Open Package Script" : "Show Package Properties",
-      arguments: [element],
-    };
-    return item;
-  }
-
-  public async getChildren(element?: PackageTreeElement): Promise<PackageTreeElement[]> {
-    if (element?.kind === "node") {
-      const tree = await this.previewTree(element.link);
-      if (tree.generation !== this.selectionGeneration) {
-        return [];
-      }
-      return (tree.childrenByParent.get(element.nodeKey) ?? []).map((child) => this.currentPackageElement(child) as PackageNodeElement);
-    }
-    if (element?.kind === "link") {
-      const tree = await this.previewTree(element.link);
-      if (tree.generation !== this.selectionGeneration) {
-        return [];
-      }
-      if (tree.roots.length === 1) {
-        return (tree.childrenByParent.get(tree.roots[0].nodeKey) ?? [])
-          .map((child) => this.currentPackageElement(child) as PackageNodeElement);
-      }
-      return tree.roots.map((root) => this.currentPackageElement(root) as PackageNodeElement);
-    }
-    const links = await this.controller.getLinkPackages(false);
-    return [...links]
-      .sort((a, b) => (b.updatedUnixMs ?? 0) - (a.updatedUnixMs ?? 0))
-      .map((link) => this.linkElement(link));
-  }
-
-  public async getParent(element: PackageTreeElement): Promise<PackageTreeElement | undefined> {
-    if (element.kind === "link") {
-      return undefined;
-    }
-    if (!element.parentKey) {
-      return this.linkElement(element.link);
-    }
-    const tree = await this.previewTree(element.link);
-    if (tree.generation !== this.selectionGeneration) {
-      return undefined;
-    }
-    if (tree.roots.length === 1 && element.parentKey === tree.roots[0].nodeKey) {
-      return this.linkElement(element.link);
-    }
-    return tree.elementsByKey.get(element.parentKey);
-  }
-
-  private linkElement(link: CliLinkStatusLink): PackageLinkElement {
-    return { kind: "link", link, selectionVersion: this.linkSelectionVersion(link) };
-  }
-
-  private currentPackageElement(element: PackageTreeElement): PackageTreeElement {
-    if (element.kind === "link") {
-      return this.linkElement(element.link);
-    }
-    return { ...element, selectionVersion: this.nodeSelectionVersion(element.link, element.nodeKey) };
-  }
-
-  private async elementForLinkId(linkId: string): Promise<PackageLinkElement | undefined> {
-    const links = await this.controller.getLinkPackages(false);
-    const link = links.find((candidate) => String(candidate.id ?? "").trim() === linkId);
-    return link ? this.linkElement(link) : undefined;
-  }
-
-  private async elementForNodeKey(linkId: string, nodeKey: string): Promise<PackageNodeElement | undefined> {
-    const linkElement = await this.elementForLinkId(linkId);
-    if (!linkElement) {
-      return undefined;
-    }
-    const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
-      return undefined;
-    }
-    return tree.elementsByKey.get(nodeKey);
-  }
-
-  public async packageScriptSourceFor(linkId: string, nodeKey: string): Promise<string | undefined> {
-    const linkElement = await this.elementForLinkId(linkId);
-    if (!linkElement) {
-      return undefined;
-    }
-    const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
-      return undefined;
-    }
-    const node = tree.nodesByKey.get(nodeKey);
-    if (!node || !isPackageScriptClass(node.className)) {
-      return undefined;
-    }
-    return packageNodeSource(node);
-  }
-
-  public async openPackageScriptByKey(
-    linkId: string,
-    nodeKey: string,
-    options: { preview?: boolean; preserveFocus?: boolean } = {},
-  ): Promise<boolean> {
-    const linkElement = await this.elementForLinkId(linkId);
-    if (!linkElement) {
-      return false;
-    }
-    const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
-      return false;
-    }
-    const node = tree.nodesByKey.get(nodeKey);
-    if (!node) {
-      return false;
-    }
-    return this.openPackageScript(tree.preview, node, options);
-  }
-
-  private previewTree(link: CliLinkStatusLink): Promise<PackagePreviewTree> {
-    const id = String(link.id ?? "");
-    const generation = this.selectionGeneration;
-    const cacheKey = `${generation}\0${id}`;
-    const existing = this.previewCache.get(cacheKey);
-    if (existing) {
-      return existing;
-    }
-    const loading = this.controller.loadPackagePreview(link).then((preview) => {
-      const nodesByKey = new Map<string, PackagePreviewNode>();
-      const elementsByKey = new Map<string, PackageNodeElement>();
-      const childrenByParent = new Map<string, PackageNodeElement[]>();
-      const keyByRawId = new Map<string, string>();
-      const childCounts = new Map<string, number>();
-      preview.nodes.forEach((node, index) => {
-        const key = packageNodeKey(node, index);
-        nodesByKey.set(key, node);
-        if (node.settingsId) {
-          keyByRawId.set(node.settingsId, key);
-        }
-      });
-      preview.nodes.forEach((node, index) => {
-        const key = packageNodeKey(node, index);
-        const parentKey = node.parentId ? (keyByRawId.get(node.parentId) ?? node.parentId) : "";
-        childCounts.set(parentKey, (childCounts.get(parentKey) ?? 0) + 1);
-        const element: PackageNodeElement = {
-          kind: "node",
-          link,
-          preview,
-          node,
-          nodeKey: key,
-          parentKey,
-          childCount: 0,
-          selectionVersion: this.nodeSelectionVersion(link, key),
-        };
-        elementsByKey.set(key, element);
-      });
-      for (const element of elementsByKey.values()) {
-        element.childCount = childCounts.get(element.nodeKey) ?? 0;
-        const bucket = childrenByParent.get(element.parentKey) ?? [];
-        bucket.push(element);
-        childrenByParent.set(element.parentKey, bucket);
-      }
-      const roots = (preview.rootIds.length > 0
-        ? preview.rootIds.map((rootId) => keyByRawId.get(rootId) ?? rootId)
-        : Array.from(childrenByParent.get("") ?? []).map((root) => root.nodeKey))
-        .map((key) => elementsByKey.get(key))
-        .filter((element): element is PackageNodeElement => !!element);
-      return { generation, preview, nodesByKey, elementsByKey, childrenByParent, roots };
-    });
-    this.previewCache.set(cacheKey, loading);
-    return loading;
-  }
-
-  public async openItem(element: PackageTreeElement | undefined): Promise<void> {
-    if (!this.isCurrentElement(element)) {
-      return;
-    }
-    if (element.kind === "link") {
-      const tree = await this.previewTree(element.link);
-      if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
-        return;
-      }
-      const root = tree.roots[0];
-      const generation = this.selectionGeneration;
-      await this.showPackageProperties(tree.preview, root?.node, generation);
-      if (root && tree.roots.length === 1 && await this.openPackageScript(tree.preview, root.node, {}, generation)) {
-        return;
-      }
-      return;
-    }
-    const generation = this.selectionGeneration;
-    await this.showPackageProperties(element.preview, element.node, generation);
-    if (await this.openPackageScript(element.preview, element.node, {}, generation)) {
-      return;
-    }
-  }
-
-  private normalizedTargetPath(target: CliLinkStatusTarget): string[] {
-    const service = String(target.service ?? "").trim();
-    const pathSegments = Array.isArray(target.path)
-      ? target.path.map((segment) => String(segment)).filter((segment) => segment.length > 0)
-      : [];
-    if (!service) {
-      return pathSegments;
-    }
-    return pathSegments[0] === service ? pathSegments : [service, ...pathSegments];
-  }
-
-  private pathStartsWith(pathSegments: readonly string[], prefix: readonly string[]): boolean {
-    return pathSegments.length >= prefix.length
-      && prefix.every((segment, index) => pathSegments[index] === segment);
-  }
-
-  private packageNodeRelativePath(node: PackagePreviewNode): string[] {
-    const pathSegments = Array.isArray(node.pathSegments) && node.pathSegments.length > 0
-      ? node.pathSegments.map((segment) => String(segment))
-      : [String(node.name ?? "Instance")];
-    return pathSegments.length > 1 ? pathSegments.slice(1) : [];
-  }
-
-  private packageNodeMatchesExplorerRequest(
-    node: PackagePreviewNode,
-    relativePath: readonly string[],
-    request: LinkedPackageScriptPreviewRequest,
-  ): boolean {
-    if (!isPackageScriptClass(node.className)) {
-      return false;
-    }
-    const nodeRelativePath = this.packageNodeRelativePath(node);
-    if (nodeRelativePath.length !== relativePath.length
-      || !nodeRelativePath.every((segment, index) => segment === relativePath[index])) {
-      return false;
-    }
-    if (request.className && node.className && request.className !== node.className) {
-      return false;
-    }
-    if (relativePath.length > 0 && request.name && node.name && request.name !== node.name) {
-      return false;
-    }
-    return true;
-  }
-
-  public async openLinkedScriptPreview(request: LinkedPackageScriptPreviewRequest | undefined): Promise<boolean> {
-    const generation = this.selectionGeneration;
-    const service = typeof request?.service === "string" ? request.service.trim() : "";
-    const pathSegments = Array.isArray(request?.pathSegments)
-      ? request.pathSegments.map((segment) => String(segment).trim()).filter((segment) => segment.length > 0)
-      : [];
-    if (!service || pathSegments.length < 2) {
-      return false;
-    }
-    const normalizedPath = pathSegments[0] === service ? pathSegments : [service, ...pathSegments];
-    const status = await this.controller.getLinkStatus(false);
-    if (generation !== this.selectionGeneration) {
-      return false;
-    }
-    const targets = (status?.targets ?? [])
-      .filter((target) =>
-        target.broken !== true
-        && target.missing !== true
-        && target.resolved !== false
-        && target.service === service
-        && typeof target.linkId === "string"
-        && target.linkId.length > 0,
-      )
-      .map((target) => ({ target, targetPath: this.normalizedTargetPath(target) }))
-      .filter(({ targetPath }) => this.pathStartsWith(normalizedPath, targetPath))
-      .sort((a, b) => b.targetPath.length - a.targetPath.length);
-    if (targets.length === 0) {
-      return false;
-    }
-    const packages = await this.controller.getLinkPackages(false);
-    if (generation !== this.selectionGeneration) {
-      return false;
-    }
-    for (const { target, targetPath } of targets) {
-      const link = packages.find((candidate) => candidate.id === target.linkId);
-      if (!link) {
-        continue;
-      }
-      const relativePath = normalizedPath.slice(targetPath.length);
-      const tree = await this.previewTree(link);
-      if (generation !== this.selectionGeneration || tree.generation !== generation) {
-        return false;
-      }
-      const node = Array.from(tree.nodesByKey.values()).find((candidate) =>
-        this.packageNodeMatchesExplorerRequest(candidate, relativePath, request ?? {}),
-      );
-      if (node && await this.openPackageScript(tree.preview, node, {}, generation)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  public async showSelection(element: PackageTreeElement | undefined): Promise<void> {
-    if (!this.isCurrentElement(element)) {
-      return;
-    }
-    if (element.kind === "link") {
-      const tree = await this.previewTree(element.link);
-      if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
-        return;
-      }
-      await this.showPackageProperties(tree.preview, tree.roots[0]?.node, this.selectionGeneration);
-      return;
-    }
-    await this.showPackageProperties(element.preview, element.node, this.selectionGeneration);
-  }
-
-  private async showPackageProperties(
-    preview: PackagePreviewData,
-    node: PackagePreviewNode | undefined,
-    generation: number,
-  ): Promise<void> {
-    const payload = {
-      packageId: preview.id,
-      packageName: preview.name,
-      source: preview.source,
-      sourcePath: preview.sourcePath,
-      rootClass: preview.rootClass,
-      rootName: preview.rootName,
-      node,
-    };
-    const update = this.propertiesUpdateChain.then(async () => {
-      if (generation === this.selectionGeneration) {
-        await vscode.commands.executeCommand("renium.properties.showPackageNode", payload);
-      }
-    });
-    this.propertiesUpdateChain = update.catch(() => undefined);
-    await update;
-  }
-
-  private queuePackagePropertiesClear(): void {
-    const update = this.propertiesUpdateChain.then(async () => {
-      await vscode.commands.executeCommand("renium.properties.clearPackageNode");
-    });
-    this.propertiesUpdateChain = update.catch(() => undefined);
-  }
-
-  private async openPackageScript(
-    preview: PackagePreviewData,
-    node: PackagePreviewNode,
-    options: { preview?: boolean; preserveFocus?: boolean } = {},
-    generation = this.selectionGeneration,
-  ): Promise<boolean> {
-    if (generation !== this.selectionGeneration) {
-      return false;
-    }
-    if (!isPackageScriptClass(node.className)) {
-      return false;
-    }
-    const source = packageNodeSource(node);
-    if (source === undefined) {
-      return false;
-    }
-    const uri = this.scriptContentProvider.uriFor(preview, node);
-    const doc = await vscode.workspace.openTextDocument(uri);
-    if (generation !== this.selectionGeneration) {
-      return false;
-    }
-    await vscode.window.showTextDocument(doc, {
-      preview: options.preview ?? false,
-      preserveFocus: options.preserveFocus,
-    });
-    try {
-      await vscode.languages.setTextDocumentLanguage(doc, "luau");
-    } catch {
-    }
-    return generation === this.selectionGeneration;
-  }
-}
-
 let activeController: RobloxSyncController | undefined;
 let activeFileExplorerController: FileExplorerController | undefined;
 
@@ -14056,23 +6630,18 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   const controller = new RobloxSyncController(context);
   activeController = controller;
-  setTimeout(() => {
-    void (async () => {
-    try {
-      const cli = controller.rbsyncViewerCli();
-      const extensionVersion = String(context.extension.packageJSON.version ?? "");
-      if (cli && extensionVersion && fs.existsSync(cli.cliPath)) {
-        const cliVersion = await controller.detectedCliVersion(cli.cliPath);
-        if (cliVersion && cliVersion !== extensionVersion) {
-          void vscode.window.showWarningMessage(
-            `This extension is v${extensionVersion} but ${RUST_CLI_BINARY} is v${cliVersion}. Update whichever is older so they match — syncing may misbehave until then.`,
-          );
-        }
+  void (async () => {
+    const cli = controller.settingsStoreViewerCli();
+    const extensionVersion = String(context.extension.packageJSON.version ?? "");
+    if (cli && extensionVersion && fs.existsSync(cli.cliPath)) {
+      const cliVersion = await controller.detectedCliVersion(cli.cliPath);
+      if (cliVersion && cliVersion !== extensionVersion) {
+        void vscode.window.showWarningMessage(
+            `This extension is v${extensionVersion} but ${CLI_BINARY} is v${cliVersion}. Update whichever is older so they match — syncing may misbehave until then.`,
+        );
       }
-    } catch {
     }
-    })();
-  }, 0);
+  })().catch(() => undefined);
   const fileExplorerController = new FileExplorerController(context, controller.gitViewActions());
   activeFileExplorerController = fileExplorerController;
   const linkDecorationProvider = new LinkDecorationProvider(controller);
@@ -14098,10 +6667,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
     void (async () => {
-      try {
-        await vscode.commands.executeCommand("list.clear");
-      } catch {
-      }
+      await executeCommandBestEffort("list.clear");
       setTimeout(() => {
         const currentSelection = packagesTreeView.selection[0];
         if (currentSelection && currentSelection !== selectedPackage) {
@@ -14115,16 +6681,6 @@ export function activate(context: vscode.ExtensionContext): void {
     })();
   };
   const packageTabKey = (tab: OpenPackageScriptTab): string => `${tab.linkId}\u0000${tab.nodeKey}`;
-  const tabInputUris = (input: unknown): vscode.Uri[] => {
-    const candidate = input as { uri?: unknown; original?: unknown; modified?: unknown };
-    const uris: vscode.Uri[] = [];
-    for (const value of [candidate.uri, candidate.original, candidate.modified]) {
-      if (value instanceof vscode.Uri) {
-        uris.push(value);
-      }
-    }
-    return uris;
-  };
   const openPackageScriptTabs = (): OpenPackageScriptTab[] => {
     const tabs = new Map<string, OpenPackageScriptTab>();
     for (const group of vscode.window.tabGroups.all) {
@@ -14168,7 +6724,7 @@ export function activate(context: vscode.ExtensionContext): void {
     persistOpenPackageScriptTabs();
   };
 
-  const resolveViewerCli = () => controller.rbsyncViewerCli();
+  const resolveViewerCli = () => controller.settingsStoreViewerCli();
   context.subscriptions.push(
     controller,
     fileExplorerController,
@@ -14176,11 +6732,11 @@ export function activate(context: vscode.ExtensionContext): void {
       void controller.configureLuauSourcemapForEditor(editor);
     }),
     vscode.window.registerCustomEditorProvider(
-      RbsyncEditorProvider.viewType,
-      new RbsyncEditorProvider(
+      SettingsStoreEditorProvider.viewType,
+      new SettingsStoreEditorProvider(
         context.extensionUri,
         resolveViewerCli,
-        (node) => fileExplorerController.showRbsyncPropertiesReadonly(node),
+        (node) => fileExplorerController.showSettingsStorePropertiesReadonly(node),
       ),
       { supportsMultipleEditorsPerDocument: true, webviewOptions: { retainContextWhenHidden: true } },
     ),
@@ -14334,11 +6890,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let linkManifestDisposables: vscode.Disposable[] = [];
   let linkApplyTimer: NodeJS.Timeout | undefined;
   const sameLinkManifestPath = (left: string, right: string): boolean => {
-    const normalize = (value: string): string => {
-      const normalized = path.resolve(value);
-      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-    };
-    return normalize(left) === normalize(right);
+    return filesystemPathKey(left) === filesystemPathKey(right);
   };
   const onLinkManifestChanged = (uri: vscode.Uri): void => {
     let active: { filePath: string; autoApply: boolean; projectRoot: string; generation: number };
@@ -14422,7 +6974,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }, 500);
 
   const cfg = vscode.workspace.getConfiguration("renium");
-  if (cfg.get<boolean>("editorLiveSyncEnabled", false) === true || cfg.get<boolean>("editorLiveSyncOnStartup", false) === true) {
+  if (cfg.get<boolean>("editorLiveSyncEnabled", false) === true) {
     void controller.startLiveSync({ silent: true, bestEffort: true });
   }
 }

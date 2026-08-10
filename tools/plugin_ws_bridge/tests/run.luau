@@ -31,12 +31,6 @@ local exhausted = Chunking.chunkEncodedString("abc", 9, 4, 1)
 equal(exhausted.chunk, "", "exhausted body")
 equal(exhausted.nextStart, 9, "exhausted next start")
 
-local cache = { first = "a", second = "b" }
-local cacheKeys = { "first", "second" }
-Chunking.removeCachedPayload(cache, cacheKeys, "first")
-equal(cache.first, nil, "cache removal")
-equal(cacheKeys[1], "second", "cache key removal")
-
 equal(Settings.normalizeLoopbackHost(" localhost "), "127.0.0.1", "localhost normalization")
 equal(Settings.normalizeLoopbackHost("[::1]"), "::1", "IPv6 normalization")
 equal(Settings.normalizeLoopbackHost("0.0.0.0"), nil, "remote host rejection")
@@ -60,7 +54,7 @@ local child = roblox.Instance.new("Folder")
 child.Name = "Child"
 child.Parent = folder
 
-local segments = Identity.getRefPathSegments(child)
+local segments = Identity.getRefPathParts(child)
 equal(#segments, 3, "reference path length")
 equal(segments[1], "Workspace", "reference service")
 equal(segments[2], "Parent", "reference parent")
@@ -74,10 +68,6 @@ local state = {
 local reference = Identity.serializeRefValue(state, child)
 equal(reference._type, "Ref", "reference type")
 equal(reference.instanceId, "2a", "reference id")
-
-local hash = Identity.shortenIdentifier("renium")
-equal(#hash, 16, "short identifier length")
-equal(hash, Identity.shortenIdentifier("renium"), "short identifier stability")
 
 equal(ValueEquality.valuesEqual(1, 1.00005), true, "number epsilon")
 equal(ValueEquality.valuesEqual(1, 1.001), false, "number difference")
