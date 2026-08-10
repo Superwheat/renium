@@ -19,12 +19,15 @@ use crate::command_line::{
     PluginConsoleOutputArgs, PushEditorChangesArgs, ShotArgs, WaitUntilArgs,
 };
 use crate::daemon_control::daemon_control_endpoints;
+#[cfg(any(windows, target_os = "macos"))]
 use crate::editor_review::studio_pid_for_bridge;
 use crate::editor_sync::{
     apply_editor_delete_with_warm_bridge, apply_editor_property_with_warm_bridge,
     push_editor_changes_with_warm_bridge,
 };
 use crate::file_io::{absolutize_for_daemon, canonical_path, replace_file_with_backup};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::input_inject;
 use crate::local_transport::{
     BoundedLineRead, DAEMON_CONTROL_CONNECT_TIMEOUT, DAEMON_CONTROL_IDLE_TIMEOUT,
     DAEMON_CONTROL_QUEUE_TIMEOUT, DAEMON_CONTROL_RESPONSE_TIMEOUT, MAX_DAEMON_LINE_BYTES,
@@ -39,7 +42,7 @@ use crate::studio_automation::{
     wait_until_result,
 };
 use crate::timing::current_millis;
-use crate::{automation, input_inject, project_config, workflows};
+use crate::{automation, project_config, workflows};
 
 fn parse_daemon_request_args<T: Parser>(command: &str, request_args: &[String]) -> Result<T> {
     let mut argv = Vec::with_capacity(request_args.len() + 1);

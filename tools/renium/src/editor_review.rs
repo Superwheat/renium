@@ -1,7 +1,14 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter};
+#[cfg(windows)]
+use std::fs;
+use std::fs::File;
+#[cfg(windows)]
+use std::io;
+use std::io::BufReader;
+#[cfg(any(windows, test))]
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -14,31 +21,35 @@ use rbx_reflection::{
 };
 use serde_json::{Map, Value, json};
 
-use super::bridge_server::{BridgeServer, BridgeTarget};
+use super::bridge_server::BridgeServer;
+#[cfg(any(windows, target_os = "macos"))]
+use super::bridge_server::BridgeTarget;
 use super::command_line::PushEditorChangesArgs;
 use super::editor_types::{EditorChangeSet, EditorInstancePath};
+#[cfg(windows)]
 use super::input_inject;
 #[cfg(any(windows, target_os = "macos"))]
 use super::local_transport::pid_for_local_tcp_port;
+use super::native_editor::wait_for_editor_review_decision;
+#[cfg(windows)]
+use super::native_editor::write_live_editor_place_snapshot;
+#[cfg(any(windows, target_os = "macos"))]
 use super::native_editor::{
     merge_live_service_root_property_values, read_live_service_root_property_values,
-    wait_for_editor_review_decision, write_live_editor_place_snapshot,
 };
 use super::output::global_log_enabled;
 use super::property_schema::{
     MATERIAL_SERVICE_CLASS, PropertySchemaEntry, PropertySchemaMap, USE_2022_MATERIALS_PROPERTY,
 };
 use super::rbx_decode::rbx_variant_to_settings_json;
+#[cfg(any(windows, test))]
 use super::rbx_encode::{
-    json_to_rbx_attribute_variant, json_to_rbx_property_variant, rbx_model_property_descriptor,
-    rbx_model_top_level_refs, rbx_property_descriptor,
+    json_to_rbx_attribute_variant, json_to_rbx_property_variant, rbx_model_top_level_refs,
 };
-use super::rbx_model::{
-    BytecodeModelExportRefs, RbxPlaceFormat, rbx_dom_instance_by_path_unique,
-    rbx_dom_path_import_refs,
-};
-#[cfg(target_os = "macos")]
-use super::studio_native_serializer;
+use super::rbx_encode::{rbx_model_property_descriptor, rbx_property_descriptor};
+#[cfg(any(windows, test))]
+use super::rbx_model::BytecodeModelExportRefs;
+use super::rbx_model::{RbxPlaceFormat, rbx_dom_instance_by_path_unique, rbx_dom_path_import_refs};
 use super::timing::current_millis;
 
 pub(super) fn is_workspace_camera_sync_target(

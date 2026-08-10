@@ -141,7 +141,6 @@ pub(crate) fn emit_global_output(value: &Value, text: &str) -> Result<()> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn ensure_plugin_api_ok(result: &Value) -> Result<()> {
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let message = result

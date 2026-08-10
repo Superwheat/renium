@@ -18,10 +18,12 @@ use super::automation_runtime::{
 use super::bridge_server::{BridgeServer, clamp_bridge_chunk_size};
 use super::bytecode_explorer::watch_parent_and_exit;
 use super::command_args::CursorPollArgs;
+#[cfg(any(windows, target_os = "macos"))]
+use super::command_line::NativeSnapshotArgs;
 use super::command_line::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeDaemonArgs, BridgeGetSourceArgs,
-    ExecuteLuauArgs, ExportSnapshotsArgs, NativeSnapshotArgs, PluginConsoleOutputArgs,
-    PushEditorChangesArgs, StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs,
+    ExecuteLuauArgs, ExportSnapshotsArgs, PluginConsoleOutputArgs, PushEditorChangesArgs,
+    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs,
 };
 use super::file_io::{absolutize_for_daemon, canonical_path, fnv1a_hex};
 use super::local_transport::{
@@ -30,6 +32,7 @@ use super::local_transport::{
     MAX_DAEMON_CONTROL_CONNECTIONS, MAX_DAEMON_LINE_BYTES, host_port, is_loopback_endpoint,
     normalize_loopback_host, read_bounded_line,
 };
+#[cfg(any(windows, target_os = "macos"))]
 use super::native_editor::read_place_service_root_property_values;
 use super::output::global_yes;
 use super::place_target::place_filter;
@@ -39,6 +42,7 @@ use super::studio_native_serializer;
 use super::timing::current_millis;
 use super::{automation, lifecycle};
 
+#[cfg(any(windows, target_os = "macos"))]
 pub(super) fn native_snapshot_command(args: NativeSnapshotArgs) -> Result<()> {
     let result = if let Some(service) = args.service.as_deref() {
         studio_native_serializer::write_live_service(args.pid, &args.title, service, &args.output)?
