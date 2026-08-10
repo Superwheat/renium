@@ -70,7 +70,7 @@ thread_local! {
     static PROJECT_TARGET_STACK: RefCell<Vec<(Vec<String>, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProjectTarget {
     Shorthand(String),
@@ -216,38 +216,24 @@ fn active_target_ordinals(target: &[String]) -> Vec<usize> {
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReniumProject {
-    #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    #[serde(default = "project_schema_version")]
     pub schema_version: u32,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default = "default_source_root")]
     pub source_root: PathBuf,
-    #[serde(default)]
     pub build_target: Option<ProjectTarget>,
-    #[serde(default)]
     pub root: ProjectNode,
-    #[serde(default)]
     pub tree: BTreeMap<String, ProjectNode>,
-    #[serde(default)]
     pub mounts: Vec<ProjectMount>,
-    #[serde(default)]
     pub adapters: Vec<AdapterSpec>,
-    #[serde(default)]
     pub sync_rules: Vec<SyncRule>,
-    #[serde(default)]
     pub glob_ignore_paths: Vec<String>,
-    #[serde(default)]
     pub filters: Vec<FilterRule>,
-    #[serde(default)]
     pub script_extension: ScriptExtensionPolicy,
-    #[serde(default)]
     pub export_naming: ExportNaming,
-    #[serde(default)]
     pub settings: Value,
 }
 
@@ -257,7 +243,7 @@ impl Default for ReniumProject {
             schema: Some(PROJECT_SCHEMA_URL.to_string()),
             schema_version: PROJECT_SCHEMA_VERSION,
             name: None,
-            source_root: default_source_root(),
+            source_root: PathBuf::from("src"),
             build_target: None,
             root: ProjectNode::default(),
             tree: BTreeMap::new(),
@@ -273,29 +259,29 @@ impl Default for ReniumProject {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProjectNode {
-    #[serde(default, rename = "$id")]
+    #[serde(rename = "$id")]
     pub id: Option<String>,
-    #[serde(default, rename = "$path")]
+    #[serde(rename = "$path")]
     pub path: Option<PathBuf>,
-    #[serde(default, rename = "$className")]
+    #[serde(rename = "$className")]
     pub class_name: Option<String>,
-    #[serde(default, rename = "$properties")]
+    #[serde(rename = "$properties")]
     pub properties: Map<String, Value>,
-    #[serde(default, rename = "$attributes")]
+    #[serde(rename = "$attributes")]
     pub attributes: Map<String, Value>,
-    #[serde(default, rename = "$tags")]
+    #[serde(rename = "$tags")]
     pub tags: Option<Vec<String>>,
-    #[serde(default, rename = "$ignoreUnknownInstances")]
+    #[serde(rename = "$ignoreUnknownInstances")]
     pub ignore_unknown_instances: Option<bool>,
-    #[serde(default, flatten)]
+    #[serde(flatten)]
     pub children: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectMount {
     pub source: PathBuf,
     pub target: ProjectTarget,
@@ -305,7 +291,7 @@ pub struct ProjectMount {
     pub optional: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MountOwnership {
     #[default]
@@ -314,14 +300,12 @@ pub enum MountOwnership {
     ReadOnly,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterSpec {
     pub source: PathBuf,
     pub target: ProjectTarget,
-    #[serde(default)]
     pub output: Option<PathBuf>,
-    #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
     pub direction: AdapterDirection,
@@ -329,19 +313,17 @@ pub struct AdapterSpec {
     pub generated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncRule {
     pub pattern: String,
-    #[serde(default)]
     pub exclude: Option<String>,
     #[serde(rename = "use")]
     pub middleware: String,
-    #[serde(default)]
     pub suffix: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterDirection {
     #[default]
@@ -350,30 +332,21 @@ pub enum AdapterDirection {
     TwoWay,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilterRule {
-    #[serde(default)]
     pub action: FilterAction,
-    #[serde(default)]
     pub direction: FilterDirection,
-    #[serde(default)]
     pub glob: Option<String>,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub class: Option<String>,
-    #[serde(default)]
     pub tag: Option<String>,
-    #[serde(default)]
     pub attribute: Option<String>,
-    #[serde(default)]
     pub property: Option<String>,
-    #[serde(default)]
     pub id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilterAction {
     Include,
@@ -381,7 +354,7 @@ pub enum FilterAction {
     Ignore,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilterDirection {
     #[default]
@@ -390,7 +363,7 @@ pub enum FilterDirection {
     FilesToStudio,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptExtensionPolicy {
     #[default]
@@ -399,34 +372,28 @@ pub enum ScriptExtensionPolicy {
     Lua,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportNaming {
-    #[serde(default = "default_server_suffix")]
     pub server_suffix: String,
-    #[serde(default = "default_client_suffix")]
     pub client_suffix: String,
-    #[serde(default = "default_module_suffix")]
     pub module_suffix: String,
-    #[serde(default = "default_plugin_suffix")]
     pub plugin_suffix: String,
-    #[serde(default = "default_client_run_context_suffix")]
     pub client_run_context_suffix: String,
 }
 
 impl Default for ExportNaming {
     fn default() -> Self {
         Self {
-            server_suffix: default_server_suffix(),
-            client_suffix: default_client_suffix(),
-            module_suffix: default_module_suffix(),
-            plugin_suffix: default_plugin_suffix(),
-            client_run_context_suffix: default_client_run_context_suffix(),
+            server_suffix: ".server".to_string(),
+            client_suffix: ".client".to_string(),
+            module_suffix: String::new(),
+            plugin_suffix: ".plugin".to_string(),
+            client_run_context_suffix: ".run-client".to_string(),
         }
     }
 }
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProjectScriptNaming {
     pub extension: ScriptExtensionPolicy,
     pub server_suffix: String,
@@ -436,71 +403,48 @@ pub struct ProjectScriptNaming {
     pub client_run_context_suffix: String,
 }
 
-impl Default for ProjectScriptNaming {
-    fn default() -> Self {
+impl ProjectScriptNaming {
+    fn from_export(extension: ScriptExtensionPolicy, naming: ExportNaming) -> Self {
         Self {
-            extension: ScriptExtensionPolicy::Preserve,
-            server_suffix: default_server_suffix(),
-            client_suffix: default_client_suffix(),
-            module_suffix: default_module_suffix(),
-            plugin_suffix: default_plugin_suffix(),
-            client_run_context_suffix: default_client_run_context_suffix(),
+            extension,
+            server_suffix: naming.server_suffix,
+            client_suffix: naming.client_suffix,
+            module_suffix: naming.module_suffix,
+            plugin_suffix: naming.plugin_suffix,
+            client_run_context_suffix: naming.client_run_context_suffix,
         }
     }
 }
 
-fn project_schema_version() -> u32 {
-    PROJECT_SCHEMA_VERSION
+impl Default for ProjectScriptNaming {
+    fn default() -> Self {
+        Self::from_export(ScriptExtensionPolicy::Preserve, ExportNaming::default())
+    }
 }
 
-fn default_source_root() -> PathBuf {
-    PathBuf::from("src")
-}
-
-fn default_server_suffix() -> String {
-    ".server".to_string()
-}
-
-fn default_client_suffix() -> String {
-    ".client".to_string()
-}
-
-fn default_module_suffix() -> String {
-    String::new()
-}
-
-fn default_plugin_suffix() -> String {
-    ".plugin".to_string()
-}
-
-fn default_client_run_context_suffix() -> String {
-    ".run-client".to_string()
-}
-
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct FmtProjectArgs {
-    #[arg(value_name = "PROJECT")]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub check: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ExplainPathArgs {
     pub path: PathBuf,
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub pretty: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigArgs {
     #[command(subcommand)]
     pub command: ConfigCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 pub enum ConfigCommand {
     Get(ConfigGetArgs),
     Set(ConfigSetArgs),
@@ -512,7 +456,7 @@ pub enum ConfigCommand {
     Export(ConfigExportArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigGetArgs {
     pub key: Option<String>,
     #[arg(long, value_enum, default_value_t = ConfigScope::Merged)]
@@ -521,7 +465,7 @@ pub struct ConfigGetArgs {
     pub root: PathBuf,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigSetArgs {
     pub key: String,
     pub value: String,
@@ -529,11 +473,11 @@ pub struct ConfigSetArgs {
     pub scope: ConfigScope,
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub string: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigUnsetArgs {
     pub key: String,
     #[arg(long, value_enum, default_value_t = ConfigScope::Place)]
@@ -542,7 +486,7 @@ pub struct ConfigUnsetArgs {
     pub root: PathBuf,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigScopeArgs {
     #[arg(long, value_enum, default_value_t = ConfigScope::Place)]
     pub scope: ConfigScope,
@@ -550,17 +494,17 @@ pub struct ConfigScopeArgs {
     pub root: PathBuf,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigListArgs {
     #[arg(long, value_enum, default_value_t = ConfigScope::Merged)]
     pub scope: ConfigScope,
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub origins: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ConfigExportArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -568,7 +512,7 @@ pub struct ConfigExportArgs {
     pub root: PathBuf,
 }
 
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum ConfigScope {
     User,
     Workspace,
@@ -577,13 +521,13 @@ pub enum ConfigScope {
     Merged,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct AdaptersArgs {
     #[command(subcommand)]
     pub command: AdaptersCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 pub enum AdaptersCommand {
     Validate(AdapterProjectArgs),
     Build(AdapterBuildArgs),
@@ -591,54 +535,53 @@ pub enum AdaptersCommand {
     Watch(AdapterWatchArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct AdapterProjectArgs {
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct AdapterBuildArgs {
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub check: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct AdapterSyncbackArgs {
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "preview")]
+    #[arg(long, conflicts_with = "preview")]
     pub check: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub preview: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct AdapterWatchArgs {
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 250)]
     pub interval_ms: u64,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct ImportRojoArgs {
     #[arg(long, value_name = "PATH")]
     pub project: PathBuf,
-    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "apply")]
+    #[arg(long, conflicts_with = "apply")]
     pub preview: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub apply: bool,
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub force: bool,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct ProjectionEntry {
     id: String,
     kind: String,
@@ -648,7 +591,7 @@ struct ProjectionEntry {
     direction: Option<AdapterDirection>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompiledProjection {
     schema_version: u32,
@@ -656,32 +599,26 @@ struct CompiledProjection {
     entries: Vec<ProjectionEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct MetadataSidecar {
-    #[serde(default, rename = "$schema")]
+    #[serde(rename = "$schema")]
     _schema: Option<String>,
-    #[serde(default)]
     schema_version: Option<u32>,
-    #[serde(default, rename = "$id", alias = "id")]
+    #[serde(rename = "$id", alias = "id")]
     id: Option<String>,
-    #[serde(default, rename = "$className", alias = "className")]
+    #[serde(rename = "$className", alias = "className")]
     class_name: Option<String>,
-    #[serde(default, rename = "$properties", alias = "properties")]
+    #[serde(rename = "$properties", alias = "properties")]
     properties: Map<String, Value>,
-    #[serde(default, rename = "$attributes", alias = "attributes")]
+    #[serde(rename = "$attributes", alias = "attributes")]
     attributes: Map<String, Value>,
-    #[serde(default, rename = "$tags", alias = "tags")]
+    #[serde(rename = "$tags", alias = "tags")]
     tags: Option<Vec<String>>,
-    #[serde(
-        default,
-        rename = "$ignoreUnknownInstances",
-        alias = "ignoreUnknownInstances"
-    )]
-    _ignore_unknown_instances: Option<bool>,
+    #[serde(rename = "$ignoreUnknownInstances", alias = "ignoreUnknownInstances")]
+    ignore_unknown_instances: Option<bool>,
 }
 
-#[derive(Debug)]
 pub struct LoadedProject {
     pub path: PathBuf,
     pub root: PathBuf,
@@ -695,14 +632,12 @@ pub struct ProjectionStage {
     transforms: Vec<ProjectionTransform>,
     identities: HashMap<String, ProjectionIdentity>,
 }
-
 #[derive(Clone)]
 struct ProjectionTransform {
     target: Vec<String>,
     source: PathBuf,
     script_class_name: Option<&'static str>,
 }
-
 #[derive(Clone)]
 struct ProjectionIdentity {
     source: PathBuf,
@@ -795,7 +730,6 @@ fn remove_empty_stage_parents(path: &Path) {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct FilterCandidate<'a> {
     pub id: &'a str,
     pub path: &'a str,
@@ -810,6 +744,26 @@ pub struct FilterCandidateFields {
     pub tags: BTreeSet<String>,
     pub attributes: BTreeSet<String>,
     pub properties: BTreeSet<String>,
+}
+
+impl FilterCandidateFields {
+    pub fn candidate<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        name: &'a str,
+        class: &'a str,
+    ) -> FilterCandidate<'a> {
+        FilterCandidate {
+            id,
+            path,
+            name,
+            class,
+            tags: &self.tags,
+            attributes: &self.attributes,
+            properties: &self.properties,
+        }
+    }
 }
 
 pub fn filter_candidate_fields(
@@ -838,6 +792,16 @@ pub(crate) fn filter_path_segments(segments: &[String]) -> String {
         .join("/")
 }
 
+fn json_string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    value?.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 struct OwnedFilterCandidate {
     id: String,
     path: String,
@@ -862,7 +826,6 @@ impl OwnedFilterCandidate {
     }
 }
 
-#[derive(Clone)]
 struct ReverseOwner {
     target: Vec<String>,
     ordinals: Vec<usize>,
@@ -872,7 +835,6 @@ struct ReverseOwner {
     optional: bool,
 }
 
-#[derive(Clone)]
 struct ProjectionFieldOwner {
     target: Vec<String>,
     source: String,
@@ -883,33 +845,27 @@ struct ProjectionFieldOwner {
     tags: bool,
 }
 
-#[derive(Clone)]
 struct ReverseSource {
     text: String,
     extension: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize, Default)]
 struct AdapterBaseline {
     #[serde(default)]
     entries: BTreeMap<String, AdapterBaselineEntry>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AdapterBaselineEntry {
     source_hash: String,
     target_hash: String,
-    #[serde(default)]
     format: Option<String>,
-    #[serde(default)]
     output: Option<String>,
-    #[serde(default)]
     output_hash: Option<String>,
     #[serde(default)]
     output_owned: bool,
-    #[serde(default)]
     model_json_hierarchical: Option<bool>,
 }
 
@@ -973,21 +929,16 @@ fn project_source_roots_into(
         bail!("Nested project cycle includes {}", project_path.display());
     }
     roots.insert(loaded.root.join(&loaded.project.source_root));
-    for (_, node) in project_tree_nodes(&loaded.project.tree) {
-        if let Some(path) = node.path.as_deref() {
-            let path = loaded.root.join(path);
-            roots.insert(if path.is_file() {
-                path.parent().unwrap_or(&loaded.root).to_path_buf()
-            } else {
-                path.clone()
-            });
-            if path.is_file() && is_nested_project_path(&path) {
-                project_source_roots_into(&load_nested_project(&path)?, roots, visited)?;
-            }
-        }
-    }
-    for mount in &loaded.project.mounts {
-        let path = loaded.root.join(&mount.source);
+    let tree_sources = project_tree_nodes(&loaded.project.tree)
+        .into_iter()
+        .filter_map(|(_, node)| node.path);
+    let mount_sources = loaded
+        .project
+        .mounts
+        .iter()
+        .map(|mount| mount.source.clone());
+    for source in tree_sources.chain(mount_sources) {
+        let path = loaded.root.join(source);
         roots.insert(if path.is_file() {
             path.parent().unwrap_or(&loaded.root).to_path_buf()
         } else {
@@ -1015,23 +966,27 @@ fn project_source_roots_into(
     Ok(())
 }
 
-pub fn staged_path_to_project_source(
-    loaded: &LoadedProject,
-    staged_relative: &Path,
-) -> Result<Option<PathBuf>> {
-    let segments = staged_relative
-        .components()
+fn path_segments(path: &Path) -> Vec<String> {
+    path.components()
         .filter_map(|component| match component {
             Component::Normal(value) => value.to_str().map(str::to_string),
             _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+pub fn staged_path_to_project_source(
+    loaded: &LoadedProject,
+    staged_relative: &Path,
+) -> Result<Option<PathBuf>> {
+    let segments = path_segments(staged_relative);
     let mut mappings = project_target_source_mappings(loaded)?;
     mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.target.len()));
     for mapping in mappings {
         let mut target_segments = segments.clone();
-        if let Some(file_name) = target_segments.last().cloned()
-            && let Some((_, leaf, _)) = infer_source_script(&file_name, &mapping.naming)
+        if let Some((_, leaf, _)) = target_segments
+            .last()
+            .and_then(|file_name| infer_source_script(file_name, &mapping.naming))
         {
             target_segments.pop();
             if let Some(leaf) = leaf {
@@ -1072,13 +1027,7 @@ pub fn resolve_project_write_path(
     loaded: &LoadedProject,
     staged_relative: &Path,
 ) -> Result<ProjectWriteResolution> {
-    let segments = staged_relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_string),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let segments = path_segments(staged_relative);
     resolve_project_write_segments_inner(loaded, &segments, false)
 }
 
@@ -1194,8 +1143,7 @@ fn resolve_project_write_segments_inner(
     }
     let service_root = segments
         .first()
-        .map(|service| source_root.join(service))
-        .unwrap_or_else(|| source_root.clone());
+        .map_or_else(|| source_root.clone(), |service| source_root.join(service));
     Ok(ProjectWriteResolution {
         path: source_root.join(segments.iter().collect::<PathBuf>()),
         source_root: service_root,
@@ -1209,13 +1157,7 @@ pub fn project_staged_path_to_source(
     loaded: &LoadedProject,
     staged_relative: &Path,
 ) -> Result<PathBuf> {
-    let segments = staged_relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_string),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let segments = path_segments(staged_relative);
     let mut candidates = Vec::new();
     for (target, node) in project_tree_nodes(&loaded.project.tree) {
         if let Some(source) = node.path
@@ -1656,8 +1598,7 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         .iter()
         .map(|path| {
             path.strip_prefix(projection.root())
-                .map(path_slash)
-                .unwrap_or_else(|_| path_slash(path))
+                .map_or_else(|_| path_slash(path), path_slash)
         })
         .collect::<Vec<_>>();
     let staged_absolute = staged_absolute
@@ -1678,7 +1619,7 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         if !service.file_type()?.is_dir() {
             continue;
         }
-        let service_name = service.file_name().to_string_lossy().to_string();
+        let service_name = service.file_name().to_string_lossy().into_owned();
         let settings = service_settings_path(&service.path());
         if !settings.is_file() {
             continue;
@@ -1700,15 +1641,12 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
             let instance = &document.instances[index];
             let fields = filter_candidate_fields(&instance.properties, &instance.attributes);
             let candidate_path = filter_path_segments(&paths[index]);
-            let candidate = FilterCandidate {
-                id: &instance.settings_id,
-                path: &candidate_path,
-                name: &instance.name,
-                class: &instance.class_name,
-                tags: &fields.tags,
-                attributes: &fields.attributes,
-                properties: &fields.properties,
-            };
+            let candidate = fields.candidate(
+                &instance.settings_id,
+                &candidate_path,
+                &instance.name,
+                &instance.class_name,
+            );
             let mut candidate_rules = Vec::new();
             for (rule_index, rule) in loaded.project.filters.iter().enumerate() {
                 if filter_matches(rule, &candidate, FilterScope::Any)? {
@@ -2062,7 +2000,7 @@ pub fn refresh_script_naming(root: &Path) -> Result<()> {
     let cache = SCRIPT_NAMING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(absolute_path(root), naming);
     Ok(())
 }
@@ -2072,7 +2010,7 @@ pub fn cache_script_naming(root: &Path, project: &ReniumProject) {
     SCRIPT_NAMING_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(absolute_path(root), naming);
 }
 
@@ -2081,7 +2019,7 @@ fn remove_cached_script_naming(root: &Path) {
         let root = absolute_path(root);
         cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|path, _| !path.starts_with(&root));
     }
 }
@@ -2092,7 +2030,7 @@ fn relocate_cached_script_naming(source: &Path, destination: &Path) {
     let cache = SCRIPT_NAMING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let moved = cache
         .iter()
         .filter_map(|(path, naming)| {
@@ -2106,14 +2044,7 @@ fn relocate_cached_script_naming(source: &Path, destination: &Path) {
 }
 
 pub fn project_script_naming(project: &ReniumProject) -> ProjectScriptNaming {
-    ProjectScriptNaming {
-        extension: project.script_extension,
-        server_suffix: project.export_naming.server_suffix.clone(),
-        client_suffix: project.export_naming.client_suffix.clone(),
-        module_suffix: project.export_naming.module_suffix.clone(),
-        plugin_suffix: project.export_naming.plugin_suffix.clone(),
-        client_run_context_suffix: project.export_naming.client_run_context_suffix.clone(),
-    }
+    ProjectScriptNaming::from_export(project.script_extension, project.export_naming.clone())
 }
 
 pub fn cached_script_naming(root: &Path) -> ProjectScriptNaming {
@@ -2123,7 +2054,7 @@ pub fn cached_script_naming(root: &Path) -> ProjectScriptNaming {
         .and_then(|cache| {
             cache
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .filter(|(path, _)| root.starts_with(path))
                 .max_by_key(|(path, _)| path.components().count())
@@ -2310,7 +2241,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "instanceWorkers"
                 | "importWorkers"
                 | "chunkSize"
-                | "snapshotInstanceChunkSize"
                 | "autoSyncDebounceMs"
                 | "studioLiveSyncPollMs"
                 | "liveSync.changesThreshold"
@@ -2320,17 +2250,13 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                     "an integer",
                     value.as_i64().is_some() || value.as_u64().is_some(),
                 )?,
-                "bridgeWaitSeconds"
-                | "wsWaitSeconds"
-                | "progressHeartbeatSeconds"
-                | "gitSync.timeoutSeconds" => {
+                "bridgeWaitSeconds" | "progressHeartbeatSeconds" | "gitSync.timeoutSeconds" => {
                     require_kind(&path, value, "a number", value.is_number())?
                 }
                 "yes"
                 | "backtrace"
                 | "verifyEditorPushSources"
                 | "adaptiveThrottle"
-                | "noUpdateEditorIcons"
                 | "autoSyncOnSave"
                 | "editorLiveSyncEnabled"
                 | "studioLiveSyncEnabled"
@@ -2346,12 +2272,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "link.autoApplyOnManifestChange" => {
                     require_kind(&path, value, "a boolean", value.is_boolean())?
                 }
-                "transport" => require_kind(
-                    &path,
-                    value,
-                    "'ws' or 'mcp'",
-                    matches!(value.as_str(), Some("ws" | "mcp")),
-                )?,
                 "importMode" => require_kind(
                     &path,
                     value,
@@ -2426,8 +2346,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 )?,
                 "projectRoot"
                 | "snapshotDir"
-                | "server"
-                | "configTomlPath"
                 | "cliPath"
                 | "bridgePorts"
                 | "place"
@@ -2540,7 +2458,7 @@ fn filter_allows_scope(
             continue;
         }
         if filter_matches(rule, candidate, scope)? {
-            allowed = rule.action == FilterAction::Include;
+            allowed = matches!(&rule.action, FilterAction::Include);
         }
     }
     Ok(allowed)
@@ -2620,7 +2538,7 @@ fn convert_rojo_project(path: &Path) -> Result<ReniumProject> {
     if let Some(source_root) = tree_value.get("$path").and_then(Value::as_str) {
         project.source_root = PathBuf::from(source_root);
     }
-    project.root = convert_rojo_root_node(tree_value)?;
+    project.root = convert_rojo_node_fields(tree_value, None)?;
     for (name, node) in tree_value {
         if name.starts_with('$') {
             continue;
@@ -2638,22 +2556,9 @@ fn convert_rojo_project(path: &Path) -> Result<ReniumProject> {
     } else {
         project.sync_rules = rojo_default_sync_rules();
     }
-    project.glob_ignore_paths = object
-        .get("globIgnorePaths")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    project.glob_ignore_paths =
+        json_string_array(object.get("globIgnorePaths")).unwrap_or_default();
     Ok(project)
-}
-
-fn convert_rojo_root_node(node: &Map<String, Value>) -> Result<ProjectNode> {
-    convert_rojo_node_fields(node, None)
 }
 
 fn normalize_rojo_node_value(
@@ -2690,13 +2595,7 @@ fn convert_rojo_node_fields(
             .get("$className")
             .and_then(Value::as_str)
             .map(str::to_string),
-        tags: node.get("$tags").and_then(Value::as_array).map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }),
+        tags: json_string_array(node.get("$tags")),
         ignore_unknown_instances: node.get("$ignoreUnknownInstances").and_then(Value::as_bool),
         ..ProjectNode::default()
     };
@@ -2925,9 +2824,11 @@ fn config_scope_path(scope: ConfigScope, root: &Path) -> Result<PathBuf> {
     match scope {
         ConfigScope::User => user_config_path(),
         ConfigScope::Workspace => {
-            Ok(find_workspace_root(root).join(".renium/workspace.config.json"))
+            Ok(config_scope_root(root, ".git").join(".renium/workspace.config.json"))
         }
-        ConfigScope::Experience => Ok(find_experience_root(root).join("renium.config.json")),
+        ConfigScope::Experience => {
+            Ok(config_scope_root(root, "renium.experience.json").join("renium.config.json"))
+        }
         ConfigScope::Place => {
             let root = if nearest_project_marker(root).is_some() {
                 load_project(None, Some(root))?.root
@@ -2973,12 +2874,8 @@ fn user_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/renium/config.json"))
 }
 
-fn find_workspace_root(root: &Path) -> PathBuf {
-    find_ancestor_with(root, ".git").unwrap_or_else(|| absolute_path(root))
-}
-
-fn find_experience_root(root: &Path) -> PathBuf {
-    find_ancestor_with(root, "renium.experience.json").unwrap_or_else(|| absolute_path(root))
+fn config_scope_root(root: &Path, marker: &str) -> PathBuf {
+    find_ancestor_with(root, marker).unwrap_or_else(|| absolute_path(root))
 }
 
 fn find_ancestor_with(root: &Path, marker: &str) -> Option<PathBuf> {
@@ -3252,12 +3149,12 @@ fn instance_target_overlaps(left: &ProjectTarget, right: &ProjectTarget) -> bool
 
 fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
     let cache = GLOB_MATCHER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(matcher) = cache
+    let existing = cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(pattern)
-        .cloned()
-    {
+        .cloned();
+    if let Some(matcher) = existing {
         return Ok(matcher);
     }
     let matcher = Glob::new(pattern)
@@ -3265,7 +3162,7 @@ fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
         .compile_matcher();
     cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(pattern.to_string(), matcher.clone());
     Ok(matcher)
 }
@@ -3318,25 +3215,13 @@ mod tests {
         let rules = vec![
             FilterRule {
                 action: FilterAction::Ignore,
-                direction: FilterDirection::Both,
                 glob: Some("Workspace/**".to_string()),
-                name: None,
-                class: None,
-                tag: None,
-                attribute: None,
-                property: None,
-                id: None,
+                ..Default::default()
             },
             FilterRule {
                 action: FilterAction::Include,
-                direction: FilterDirection::Both,
                 glob: Some("Workspace/Keep/**".to_string()),
-                name: None,
-                class: None,
-                tag: None,
-                attribute: None,
-                property: None,
-                id: None,
+                ..Default::default()
             },
         ];
         assert!(filter_allows(&rules, FilterDirection::StudioToFiles, &candidate).unwrap());

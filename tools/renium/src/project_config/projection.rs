@@ -12,11 +12,11 @@ use globset::escape as escape_glob;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::bytecode_api::settings_document_bytes;
 use crate::editor_paths::infer_source_script;
 use crate::file_io::{atomic_write_file, service_settings_path, sha256_hex};
 use crate::settings_bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
+    SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, is_reference_object,
+    reindex_reference_indices,
 };
 use crate::settings_tree::settings_children_by_parent;
 use crate::timing::current_millis;
@@ -230,7 +230,7 @@ pub fn stage_project_cached(
     let cache = PROJECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let reusable = cache
         .get(&key)
         .is_some_and(|entry| entry.project_hash == project_hash && entry.root.is_dir());
@@ -941,21 +941,20 @@ fn update_stage_instance(
                 .collect::<Vec<_>>()
                 .join(".");
             let settings_id = if final_node {
-                explicit_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| projection_settings_id("instance", &identity))
+                explicit_id.map_or_else(
+                    || projection_settings_id("instance", &identity),
+                    str::to_string,
+                )
             } else {
                 projection_settings_id("folder", &identity)
             };
             let index = document.instances.len();
-            document.instances.push(SettingsBytecodeInstance {
+            document.instances.push(SettingsBytecodeInstance::new(
                 settings_id,
-                name: name.clone(),
-                class_name: expected_class.to_string(),
-                parent_index: Some(parent_index),
-                properties: Map::new(),
-                attributes: Map::new(),
-            });
+                name.clone(),
+                expected_class.to_string(),
+                Some(parent_index),
+            ));
             index
         };
         parent_index = index;
@@ -985,10 +984,7 @@ fn update_stage_instance(
     document.write_file(&settings_path)
 }
 
-fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Result<()> {
-    if target.len() < 2 {
-        bail!("Model target must include a service and parent path");
-    }
+fn ensure_stage_parent<'a>(stage: &Path, target: &'a [String]) -> Result<&'a [String]> {
     let parent = &target[..target.len() - 1];
     update_stage_instance(
         stage,
@@ -1003,6 +999,14 @@ fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Resu
         &Map::new(),
         None,
     )?;
+    Ok(parent)
+}
+
+fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Result<()> {
+    if target.len() < 2 {
+        bail!("Model target must include a service and parent path");
+    }
+    let parent = ensure_stage_parent(stage, target)?;
     let service = &target[0];
     let service_dir = stage.join(service);
     let settings_path = service_settings_path(&service_dir);
@@ -1021,7 +1025,7 @@ fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Resu
             .iter_mut()
             .find(|instance| instance.settings_id == outcome.root_settings_ids[0])
     {
-        instance.name = target[target.len() - 1].clone();
+        instance.name.clone_from(&target[target.len() - 1]);
     } else if outcome.root_settings_ids.len() > 1 {
         let mut settings_id = projection_settings_id("model-container", &target.join("."));
         let mut suffix = 2usize;
@@ -1037,14 +1041,12 @@ fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Resu
             suffix += 1;
         }
         let container_index = document.instances.len();
-        document.instances.push(SettingsBytecodeInstance {
+        document.instances.push(SettingsBytecodeInstance::new(
             settings_id,
-            name: target[target.len() - 1].clone(),
-            class_name: "Folder".to_string(),
-            parent_index: Some(parent_index),
-            properties: Map::new(),
-            attributes: Map::new(),
-        });
+            target[target.len() - 1].clone(),
+            "Folder".to_string(),
+            Some(parent_index),
+        ));
         let roots = outcome
             .root_settings_ids
             .iter()
@@ -1071,10 +1073,7 @@ fn import_model_at_target(stage: &Path, target: &[String], model: &Path) -> Resu
             .with_context(|| format!("Imported script {settings_id} has no source path"))?;
         writes.push((source_path.clone(), bytes));
     }
-    writes.push((
-        settings_path.clone(),
-        settings_document_bytes(&document, &settings_path)?,
-    ));
+    writes.push((settings_path.clone(), encode_settings_bytecode(&document)?));
     write_file_transaction(&writes)
 }
 
@@ -1082,20 +1081,7 @@ fn merge_settings_mount(stage: &Path, target: &[String], source: &Path) -> Resul
     if target.len() < 2 {
         bail!("Settings mount target must include a service and parent path");
     }
-    let parent = &target[..target.len() - 1];
-    update_stage_instance(
-        stage,
-        parent,
-        if parent.len() == 1 {
-            parent[0].as_str()
-        } else {
-            "Folder"
-        },
-        None,
-        &Map::new(),
-        &Map::new(),
-        None,
-    )?;
+    let parent = ensure_stage_parent(stage, target)?;
     let mounted = SettingsBytecode::read_file(source)?;
     let roots = mounted
         .instances
@@ -1122,7 +1108,7 @@ fn merge_settings_mount(stage: &Path, target: &[String], source: &Path) -> Resul
     } else {
         find_document_target(&destination, parent)?
     };
-    let mut remap = BTreeMap::new();
+    let mut remap = HashMap::new();
     let mut remapped_ids = HashMap::new();
     for (index, instance) in mounted.instances.iter().enumerate() {
         let next = destination.instances.len();
@@ -1136,7 +1122,7 @@ fn merge_settings_mount(stage: &Path, target: &[String], source: &Path) -> Resul
         let mut instance = instance.clone();
         instance.parent_index = parent;
         if roots.len() == 1 && roots[0] == index {
-            instance.name = target[target.len() - 1].clone();
+            instance.name.clone_from(&target[target.len() - 1]);
         }
         let old_settings_id = instance.settings_id.clone();
         if destination
@@ -1151,47 +1137,15 @@ fn merge_settings_mount(stage: &Path, target: &[String], source: &Path) -> Resul
         destination.instances.push(instance);
         remap.insert(index, next);
     }
-    let remapped_indices = remap
-        .iter()
-        .map(|(old, new)| (*old, *new))
-        .collect::<HashMap<_, _>>();
-    let mut mounted_paths = HashMap::<Vec<String>, Vec<Vec<usize>>>::new();
-    for (segments, ordinals) in projection_instance_path_parts(&mounted) {
-        mounted_paths.entry(segments).or_default().push(ordinals);
-    }
-    let mut target_ordinals = active_target_ordinals(target);
-    if target_ordinals.is_empty() {
-        target_ordinals.resize(target.len(), 1);
-    }
-    let path_root_components = usize::from(roots.len() == 1);
-    for source_index in 0..mounted.instances.len() {
-        let Some(destination_index) = remap.get(&source_index).copied() else {
-            continue;
-        };
-        remap_settings_document_references(
-            &mut destination.instances[destination_index].properties,
-            &remapped_ids,
-            &remapped_indices,
-            target,
-            &target_ordinals,
-            &mounted_paths,
-            path_root_components,
-        )?;
-        remap_settings_document_references(
-            &mut destination.instances[destination_index].attributes,
-            &remapped_ids,
-            &remapped_indices,
-            target,
-            &target_ordinals,
-            &mounted_paths,
-            path_root_components,
-        )?;
-        record_projection_identity(
-            &destination.instances[destination_index].settings_id,
-            source,
-            &mounted.instances[source_index].settings_id,
-        );
-    }
+    remap_mounted_document_references(
+        &mounted,
+        &mut destination,
+        &remap,
+        &remapped_ids,
+        target,
+        roots.len() == 1,
+        source,
+    )?;
     destination.write_file(&settings_path)
 }
 
@@ -1206,8 +1160,7 @@ fn merge_settings_document_at_target(stage: &Path, target: &[String], source: &P
     let root_class = roots
         .first()
         .and_then(|index| mounted.instances.get(*index))
-        .map(|instance| instance.class_name.as_str())
-        .unwrap_or("Folder");
+        .map_or("Folder", |instance| instance.class_name.as_str());
     update_stage_instance(
         stage,
         target,
@@ -1252,14 +1205,12 @@ fn merge_settings_document_at_target(stage: &Path, target: &[String], source: &P
                 [index] => *index,
                 [] => {
                     let index = destination.instances.len();
-                    destination.instances.push(SettingsBytecodeInstance {
-                        settings_id: String::new(),
-                        name: source_instance.name.clone(),
-                        class_name: source_instance.class_name.clone(),
-                        parent_index: Some(parent),
-                        properties: Map::new(),
-                        attributes: Map::new(),
-                    });
+                    destination.instances.push(SettingsBytecodeInstance::new(
+                        String::new(),
+                        source_instance.name.clone(),
+                        source_instance.class_name.clone(),
+                        Some(parent),
+                    ));
                     index
                 }
                 _ => bail!(
@@ -1280,265 +1231,235 @@ fn merge_settings_document_at_target(stage: &Path, target: &[String], source: &P
         used_ids.remove(&current_id);
         used_ids.insert(output_id.clone());
         let output = &mut destination.instances[destination_index];
-        output.settings_id = output_id.clone();
-        output.class_name = source_instance.class_name.clone();
+        output.settings_id.clone_from(&output_id);
+        output.class_name.clone_from(&source_instance.class_name);
         output.properties.extend(source_instance.properties.clone());
         output.attributes.extend(source_instance.attributes.clone());
         index_map.insert(source_index, destination_index);
         id_map.insert(source_instance.settings_id.clone(), output_id);
     }
-    let target_prefix = target.to_vec();
+    remap_mounted_document_references(
+        &mounted,
+        &mut destination,
+        &index_map,
+        &id_map,
+        target,
+        single_root,
+        source,
+    )?;
+    destination.write_file(&settings_path)
+}
+
+fn remap_mounted_document_references(
+    mounted: &SettingsBytecode,
+    destination: &mut SettingsBytecode,
+    indices: &HashMap<usize, usize>,
+    ids: &HashMap<String, String>,
+    target: &[String],
+    single_root: bool,
+    source: &Path,
+) -> Result<()> {
     let mut mounted_paths = HashMap::<Vec<String>, Vec<Vec<usize>>>::new();
-    for (segments, ordinals) in projection_instance_path_parts(&mounted) {
+    for (segments, ordinals) in projection_instance_path_parts(mounted) {
         mounted_paths.entry(segments).or_default().push(ordinals);
     }
     let mut target_ordinals = active_target_ordinals(target);
     if target_ordinals.is_empty() {
         target_ordinals.resize(target.len(), 1);
     }
-    let path_root_components = usize::from(single_root);
-    for source_index in 0..mounted.instances.len() {
-        let Some(destination_index) = index_map.get(&source_index).copied() else {
+    let remapper = MountedReferenceRemapper {
+        ids,
+        indices,
+        target,
+        target_ordinals: &target_ordinals,
+        internal_paths: &mounted_paths,
+        path_root_components: usize::from(single_root),
+    };
+    for (source_index, source_instance) in mounted.instances.iter().enumerate() {
+        let Some(destination_index) = indices.get(&source_index).copied() else {
             continue;
         };
-        remap_settings_document_references(
-            &mut destination.instances[destination_index].properties,
-            &id_map,
-            &index_map,
-            &target_prefix,
-            &target_ordinals,
-            &mounted_paths,
-            path_root_components,
-        )?;
-        remap_settings_document_references(
-            &mut destination.instances[destination_index].attributes,
-            &id_map,
-            &index_map,
-            &target_prefix,
-            &target_ordinals,
-            &mounted_paths,
-            path_root_components,
-        )?;
-        record_projection_identity(
-            &destination.instances[destination_index].settings_id,
-            source,
-            &mounted.instances[source_index].settings_id,
-        );
-    }
-    destination.write_file(&settings_path)
-}
-
-fn remap_settings_document_references(
-    record: &mut Map<String, Value>,
-    ids: &HashMap<String, String>,
-    indices: &HashMap<usize, usize>,
-    target: &[String],
-    target_ordinals: &[usize],
-    internal_paths: &HashMap<Vec<String>, Vec<Vec<usize>>>,
-    path_root_components: usize,
-) -> Result<()> {
-    for value in record.values_mut() {
-        remap_settings_document_reference_value(
-            value,
-            ids,
-            indices,
-            target,
-            target_ordinals,
-            internal_paths,
-            path_root_components,
-        )?;
+        let output = &mut destination.instances[destination_index];
+        remapper.remap_record(&mut output.properties)?;
+        remapper.remap_record(&mut output.attributes)?;
+        record_projection_identity(&output.settings_id, source, &source_instance.settings_id);
     }
     Ok(())
 }
 
-fn remap_settings_document_reference_value(
-    value: &mut Value,
-    ids: &HashMap<String, String>,
-    indices: &HashMap<usize, usize>,
-    target: &[String],
-    target_ordinals: &[usize],
-    internal_paths: &HashMap<Vec<String>, Vec<Vec<usize>>>,
+struct MountedReferenceRemapper<'a> {
+    ids: &'a HashMap<String, String>,
+    indices: &'a HashMap<usize, usize>,
+    target: &'a [String],
+    target_ordinals: &'a [usize],
+    internal_paths: &'a HashMap<Vec<String>, Vec<Vec<usize>>>,
     path_root_components: usize,
-) -> Result<()> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                remap_settings_document_reference_value(
-                    value,
-                    ids,
-                    indices,
-                    target,
-                    target_ordinals,
-                    internal_paths,
-                    path_root_components,
-                )?;
-            }
+}
+
+impl MountedReferenceRemapper<'_> {
+    fn remap_record(&self, record: &mut Map<String, Value>) -> Result<()> {
+        for value in record.values_mut() {
+            self.remap_value(value)?;
         }
-        Value::Object(object) => {
-            let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
-                || object.contains_key("settingsId")
-                || object.contains_key("instanceId")
-                || object.contains_key("instanceIndex");
-            if is_reference {
-                let mut internal_signal = false;
-                let mut external_signal = false;
-                for key in ["settingsId", "instanceId"] {
-                    if let Some(old) = object.get(key).and_then(Value::as_str) {
-                        if ids.contains_key(old) {
+        Ok(())
+    }
+
+    fn remap_value(&self, value: &mut Value) -> Result<()> {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    self.remap_value(value)?;
+                }
+            }
+            Value::Object(object) => {
+                if is_reference_object(object) {
+                    let mut internal_signal = false;
+                    let mut external_signal = false;
+                    for key in ["settingsId", "instanceId"] {
+                        if let Some(old) = object.get(key).and_then(Value::as_str) {
+                            if self.ids.contains_key(old) {
+                                internal_signal = true;
+                            } else if !old.is_empty() {
+                                external_signal = true;
+                            }
+                        }
+                    }
+                    let old_index = object
+                        .get("instanceIndex")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .and_then(|index| index.checked_sub(1));
+                    if let Some(old) = old_index {
+                        if self.indices.contains_key(&old) {
                             internal_signal = true;
-                        } else if !old.is_empty() {
+                        } else {
                             external_signal = true;
                         }
                     }
-                }
-                let old_index = object
-                    .get("instanceIndex")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok())
-                    .and_then(|index| index.checked_sub(1));
-                if let Some(old) = old_index {
-                    if indices.contains_key(&old) {
-                        internal_signal = true;
-                    } else {
-                        external_signal = true;
-                    }
-                }
-                let path_segments = object
-                    .get("pathSegments")
-                    .and_then(Value::as_array)
-                    .and_then(|values| {
-                        values
-                            .iter()
-                            .map(Value::as_str)
-                            .map(|value| value.map(str::to_string))
-                            .collect::<Option<Vec<_>>>()
-                    });
-                let path_ordinals = object
-                    .get("pathOrdinals")
-                    .and_then(Value::as_array)
-                    .and_then(|values| {
-                        values
-                            .iter()
-                            .map(Value::as_u64)
-                            .map(|value| {
-                                value
-                                    .filter(|value| *value > 0)
-                                    .and_then(|value| usize::try_from(value).ok())
-                            })
-                            .collect::<Option<Vec<_>>>()
-                    });
-                let mut resolved_path_ordinals = None;
-                if let Some(path) = path_segments.as_ref() {
-                    if let Some(candidates) = internal_paths.get(path) {
-                        if let Some(ordinals) = path_ordinals.as_ref() {
-                            if ordinals.len() != path.len() {
+                    let path_segments = object
+                        .get("pathSegments")
+                        .and_then(Value::as_array)
+                        .and_then(|values| {
+                            values
+                                .iter()
+                                .map(Value::as_str)
+                                .map(|value| value.map(str::to_string))
+                                .collect::<Option<Vec<_>>>()
+                        });
+                    let path_ordinals = object
+                        .get("pathOrdinals")
+                        .and_then(Value::as_array)
+                        .and_then(|values| {
+                            values
+                                .iter()
+                                .map(Value::as_u64)
+                                .map(|value| {
+                                    value
+                                        .filter(|value| *value > 0)
+                                        .and_then(|value| usize::try_from(value).ok())
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        });
+                    let mut resolved_path_ordinals = None;
+                    if let Some(path) = path_segments.as_ref() {
+                        if let Some(candidates) = self.internal_paths.get(path) {
+                            if let Some(ordinals) = path_ordinals.as_ref() {
+                                if ordinals.len() != path.len() {
+                                    bail!(
+                                        "Mounted settings reference pathOrdinals must contain one value per path segment"
+                                    );
+                                }
+                                if candidates.contains(ordinals) {
+                                    internal_signal = true;
+                                    resolved_path_ordinals = Some(ordinals.clone());
+                                } else {
+                                    external_signal = true;
+                                }
+                            } else if candidates.len() == 1 {
+                                internal_signal = true;
+                                resolved_path_ordinals = candidates.first().cloned();
+                            } else {
                                 bail!(
-                                    "Mounted settings reference pathOrdinals must contain one value per path segment"
+                                    "Mounted settings reference path '{}' is ambiguous; include pathOrdinals",
+                                    path.join(".")
                                 );
                             }
-                            if candidates.contains(ordinals) {
-                                internal_signal = true;
-                                resolved_path_ordinals = Some(ordinals.clone());
-                            } else {
-                                external_signal = true;
+                        } else if !path.is_empty() {
+                            external_signal = true;
+                        }
+                    }
+                    if internal_signal && external_signal {
+                        bail!("Mounted settings contain contradictory instance reference fields");
+                    }
+                    if internal_signal {
+                        for key in ["settingsId", "instanceId"] {
+                            if let Some(old) = object.get(key).and_then(Value::as_str)
+                                && let Some(new) = self.ids.get(old)
+                            {
+                                object.insert(key.to_string(), Value::String(new.clone()));
                             }
-                        } else if candidates.len() == 1 {
-                            internal_signal = true;
-                            resolved_path_ordinals = candidates.first().cloned();
-                        } else {
-                            bail!(
-                                "Mounted settings reference path '{}' is ambiguous; include pathOrdinals",
-                                path.join(".")
+                        }
+                        if let Some(old) = object
+                            .get("instanceIndex")
+                            .and_then(Value::as_u64)
+                            .and_then(|index| usize::try_from(index).ok())
+                            .and_then(|index| index.checked_sub(1))
+                            && let Some(new) = self.indices.get(&old)
+                        {
+                            object.insert(
+                                "instanceIndex".to_string(),
+                                Value::Number(serde_json::Number::from((new + 1) as u64)),
                             );
                         }
-                    } else if !path.is_empty() {
-                        external_signal = true;
-                    }
-                }
-                if internal_signal && external_signal {
-                    bail!("Mounted settings contain contradictory instance reference fields");
-                }
-                if !internal_signal {
-                    for value in object.values_mut() {
-                        remap_settings_document_reference_value(
-                            value,
-                            ids,
-                            indices,
-                            target,
-                            target_ordinals,
-                            internal_paths,
-                            path_root_components,
-                        )?;
-                    }
-                    return Ok(());
-                }
-                for key in ["settingsId", "instanceId"] {
-                    if let Some(old) = object.get(key).and_then(Value::as_str)
-                        && let Some(new) = ids.get(old)
-                    {
-                        object.insert(key.to_string(), Value::String(new.clone()));
-                    }
-                }
-                if let Some(old) = object
-                    .get("instanceIndex")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok())
-                    .and_then(|index| index.checked_sub(1))
-                    && let Some(new) = indices.get(&old)
-                {
-                    object.insert(
-                        "instanceIndex".to_string(),
-                        Value::Number(serde_json::Number::from((new + 1) as u64)),
-                    );
-                }
-                if let Some(paths) = object.get_mut("pathSegments").and_then(Value::as_array_mut) {
-                    let tail = paths
-                        .iter()
-                        .skip(path_root_components)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    *paths = target
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .chain(tail)
-                        .collect();
-                    if let Some(source_ordinals) = resolved_path_ordinals {
-                        let tail = source_ordinals
-                            .into_iter()
-                            .skip(path_root_components)
-                            .map(|ordinal| Value::Number(serde_json::Number::from(ordinal as u64)))
-                            .collect::<Vec<_>>();
-                        object.insert(
-                            "pathOrdinals".to_string(),
-                            Value::Array(
-                                target_ordinals
-                                    .iter()
+                        if let Some(paths) =
+                            object.get_mut("pathSegments").and_then(Value::as_array_mut)
+                        {
+                            let tail = paths
+                                .iter()
+                                .skip(self.path_root_components)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            *paths = self
+                                .target
+                                .iter()
+                                .cloned()
+                                .map(Value::String)
+                                .chain(tail)
+                                .collect();
+                            if let Some(source_ordinals) = resolved_path_ordinals {
+                                let tail = source_ordinals
+                                    .into_iter()
+                                    .skip(self.path_root_components)
                                     .map(|ordinal| {
-                                        Value::Number(serde_json::Number::from(*ordinal as u64))
+                                        Value::Number(serde_json::Number::from(ordinal as u64))
                                     })
-                                    .chain(tail)
-                                    .collect(),
-                            ),
-                        );
+                                    .collect::<Vec<_>>();
+                                object.insert(
+                                    "pathOrdinals".to_string(),
+                                    Value::Array(
+                                        self.target_ordinals
+                                            .iter()
+                                            .map(|ordinal| {
+                                                Value::Number(serde_json::Number::from(
+                                                    *ordinal as u64,
+                                                ))
+                                            })
+                                            .chain(tail)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
+                for value in object.values_mut() {
+                    self.remap_value(value)?;
+                }
             }
-            for value in object.values_mut() {
-                remap_settings_document_reference_value(
-                    value,
-                    ids,
-                    indices,
-                    target,
-                    target_ordinals,
-                    internal_paths,
-                    path_root_components,
-                )?;
-            }
+            _ => {}
         }
-        _ => {}
+        Ok(())
     }
-    Ok(())
 }
 
 fn stage_nested_project_at_target(
@@ -1655,38 +1576,6 @@ fn stage_nested_project_at_target(
         stack.borrow_mut().remove(&path);
     });
     result
-}
-
-pub(super) fn remap_settings_references(
-    record: &mut Map<String, Value>,
-    ids: &HashMap<String, String>,
-) {
-    for value in record.values_mut() {
-        remap_settings_reference_value(value, ids);
-    }
-}
-
-fn remap_settings_reference_value(value: &mut Value, ids: &HashMap<String, String>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                remap_settings_reference_value(value, ids);
-            }
-        }
-        Value::Object(object) => {
-            for key in ["settingsId", "instanceId"] {
-                if let Some(old) = object.get(key).and_then(Value::as_str)
-                    && let Some(new) = ids.get(old)
-                {
-                    object.insert(key.to_string(), Value::String(new.clone()));
-                }
-            }
-            for value in object.values_mut() {
-                remap_settings_reference_value(value, ids);
-            }
-        }
-        _ => {}
-    }
 }
 
 pub(super) fn find_document_target_optional(
@@ -1834,7 +1723,7 @@ pub(super) fn adapter_target_script_path(
         ScriptExtensionPolicy::Lua => "lua",
         ScriptExtensionPolicy::Preserve | ScriptExtensionPolicy::Luau => "luau",
     };
-    let leaf = target.last().map(String::as_str).unwrap_or("Adapter");
+    let leaf = target.last().map_or("Adapter", String::as_str);
     let parent = target_fs_path(stage, &target[..target.len().saturating_sub(1)]);
     parent.join(format!(
         "{}{}.{}",
@@ -1894,23 +1783,15 @@ pub(super) fn owned_filter_candidate(
     instance: &SettingsBytecodeInstance,
     path: String,
 ) -> OwnedFilterCandidate {
-    let tags = instance
-        .properties
-        .get("Tags")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let tags = super::json_string_array(instance.properties.get("Tags"))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     OwnedFilterCandidate {
         id: instance.settings_id.clone(),
         path,
         name: instance.name.clone(),
-        class: instance.class_name.to_string(),
+        class: instance.class_name.clone(),
         tags,
         attributes: instance.attributes.keys().cloned().collect(),
         properties: instance.properties.keys().cloned().collect(),
@@ -2080,9 +1961,8 @@ fn stage_source_directory(
             sidecars.push((entry.path().to_path_buf(), target));
             continue;
         }
-        let rule_relative = rule_prefix
-            .map(|prefix| prefix.join(relative))
-            .unwrap_or_else(|| relative.to_path_buf());
+        let rule_relative =
+            rule_prefix.map_or_else(|| relative.to_path_buf(), |prefix| prefix.join(relative));
         let mut rule = None;
         for candidate in &loaded.project.sync_rules {
             if sync_rule_matches(candidate, &rule_relative)? {
@@ -2346,7 +2226,7 @@ fn metadata_sidecar_ignore_unknown_targets(loaded: &LoadedProject) -> Result<Vec
             .with_context(|| format!("{} is not UTF-8", source.display()))?;
         let metadata: MetadataSidecar = serde_json::from_value(parse_jsonc_value(&text)?)
             .with_context(|| format!("Invalid metadata sidecar {}", source.display()))?;
-        if metadata._ignore_unknown_instances != Some(true) {
+        if metadata.ignore_unknown_instances != Some(true) {
             continue;
         }
         let staged_relative = project_source_to_staged_relative(loaded, &source)?
@@ -2884,7 +2764,7 @@ fn override_stage_identity(
 
 pub(super) fn refresh_stage_settings(stage: &Path) -> Result<()> {
     let mut service_dirs = fs::read_dir(stage)?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
@@ -2915,7 +2795,7 @@ fn merge_source_only_document(
     generated: &SettingsBytecode,
 ) -> Result<()> {
     if destination.instances.is_empty() {
-        destination.instances = generated.instances.clone();
+        destination.instances.clone_from(&generated.instances);
         return Ok(());
     }
     let mut remap = BTreeMap::new();
@@ -2984,7 +2864,7 @@ pub(super) fn file_target_destination(
         let source_name = source.file_name().and_then(OsStr::to_str).unwrap_or("");
         let naming = project_script_naming(&loaded.project);
         if let Some((_, stem, _)) = infer_source_script(source_name, &naming) {
-            let prefix_len = stem.as_deref().map(str::len).unwrap_or(4);
+            let prefix_len = stem.as_deref().map_or(4, str::len);
             let suffix = &source_name[prefix_len..];
             target.with_file_name(format!(
                 "{}{suffix}",

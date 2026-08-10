@@ -9,16 +9,10 @@ use crate::bytecode_api::{
 };
 use crate::bytecode_edit::{
     bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
-    bytecode_move_instance, bytecode_remove_instance, bytecode_repair_removed_refs,
+    bytecode_remove_instance,
 };
-use crate::bytecode_explorer::{
-    bytecode_editor_targets, bytecode_explorer_batch, bytecode_explorer_children,
-    bytecode_explorer_counts, bytecode_explorer_instance, bytecode_explorer_search,
-    bytecode_explorer_service, bytecode_find_instances, explorer_daemon,
-};
+use crate::bytecode_explorer::{bytecode_editor_targets, bytecode_explorer_batch, explorer_daemon};
 use crate::command_line::Commands;
-#[cfg(any(windows, target_os = "macos"))]
-use crate::daemon_control::native_snapshot_command;
 use crate::daemon_control::{bridge_daemon, bridge_get_source, cursor_poll};
 use crate::editor_history::editor_revert;
 use crate::editor_sync::{apply_editor_delete, apply_editor_property, push_editor_changes};
@@ -52,7 +46,10 @@ use crate::workflows;
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
     match command {
-        Commands::Automation(args) => automation_command(args),
+        Commands::Automation(args) => {
+            automation_command(args);
+            Ok(())
+        }
         Commands::FmtProject(args) => project_config::run_fmt_project(args, project),
         Commands::ExplainPath(args) => project_config::run_explain_path(args, project),
         Commands::Config(args) => project_config::run_config(args),
@@ -109,20 +106,12 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::BytecodeSetProperty(args) => bytecode_set_property(args),
         Commands::BytecodeApplyPropertyBatch(args) => bytecode_apply_property_batch(args),
         Commands::BytecodeSetSource(args) => bytecode_set_source(args),
-        Commands::BytecodeFindInstances(args) => bytecode_find_instances(args),
-        Commands::BytecodeExplorerCounts(args) => bytecode_explorer_counts(args),
         Commands::BytecodeExplorerBatch(args) => bytecode_explorer_batch(args),
-        Commands::BytecodeExplorerChildren(args) => bytecode_explorer_children(args),
-        Commands::BytecodeExplorerService(args) => bytecode_explorer_service(args),
         Commands::BytecodeEditorTargets(args) => bytecode_editor_targets(args),
-        Commands::BytecodeExplorerSearch(args) => bytecode_explorer_search(args),
-        Commands::BytecodeExplorerInstance(args) => bytecode_explorer_instance(args),
         Commands::BytecodeAddInstance(args) => bytecode_add_instance(args),
         Commands::BytecodeCloneInstance(args) => bytecode_clone_instance(args),
-        Commands::BytecodeMoveInstance(args) => bytecode_move_instance(args),
         Commands::BytecodeRemoveInstance(args) => bytecode_remove_instance(args),
         Commands::BytecodeDesyncPackageLink(args) => bytecode_desync_package_link(args),
-        Commands::BytecodeRepairRemovedRefs(args) => bytecode_repair_removed_refs(args),
         Commands::BytecodeExportModel(args) => bytecode_export_model(args),
         Commands::BytecodeExportPlace(args) => bytecode_export_place(args),
         Commands::PlaceDesyncPackageLink(args) => place_desync_package_link(args),
@@ -144,7 +133,5 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::View(args) => view_command(args),
         Commands::VcMerge(args) => vc_merge(args),
         Commands::CursorPoll(args) => cursor_poll(args),
-        #[cfg(any(windows, target_os = "macos"))]
-        Commands::NativeSnapshot(args) => native_snapshot_command(args),
     }
 }

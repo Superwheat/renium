@@ -33,19 +33,36 @@ while (ports.length < 3) {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-agent-docs-"));
 fs.mkdirSync(path.join(root, "src"));
 fs.writeFileSync(path.join(root, "renium.project.jsonc"), JSON.stringify({ schemaVersion: 1, sourceRoot: "src", tree: {} }));
-fs.writeFileSync(path.join(root, "find.json"), JSON.stringify({ service: "Workspace", name: "Door", limit: 5 }));
-fs.writeFileSync(path.join(root, "tree.json"), JSON.stringify({ service: "Workspace", name: "Name", depth: 2 }));
-fs.writeFileSync(path.join(root, "inspect.json"), JSON.stringify({ service: "Workspace", id: "editor:missing" }));
-fs.writeFileSync(path.join(root, "ops.json"), JSON.stringify({ ops: [{ type: "counts" }] }));
-fs.writeFileSync(path.join(root, "set-property.json"), JSON.stringify({
-  editor: true,
-  service: "Workspace",
-  className: "Part",
-  pathSegments: ["Workspace", "Part"],
-  pathOrdinals: [1, 1],
-  property: "Name",
-  value: "Part",
-}));
+for (const [name, payload] of Object.entries({
+  "find.json": { service: "Workspace", name: "Door", limit: 5 },
+  "tree.json": { service: "Workspace", name: "Name", depth: 2 },
+  "inspect.json": { service: "Workspace", settingsId: "editor:missing" },
+  "ops.json": { ops: [{ type: "counts" }] },
+  "push-selected.json": { changedPaths: ["src/Example.server.luau"] },
+  "live.json": { services: "Workspace,ReplicatedStorage,ServerScriptService" },
+  "play.json": { players: 2, mode: "play" },
+  "server-luau.json": { code: "return game.PlaceId" },
+  "client-luau.json": { player: "2", code: "return game.PlaceId" },
+  "console.json": { player: "2", limit: 20 },
+  "shot.json": { player: "2", output: "shot.png" },
+  "ui.json": { player: "2", limit: 100 },
+  "press.json": { player: "2", path: "PlayerGui.Shop.BuyButton" },
+  "type.json": { player: "2", path: "PlayerGui.Chat.Box", text: "hello", enter: true },
+  "goto.json": { player: "2", target: "Workspace.Shop.Door" },
+  "wait.json": { player: "2", condition: "workspace:GetAttribute('Ready') == true", timeout: 1 },
+  "device.json": { action: "status" },
+  "set-property.json": {
+    editor: true,
+    service: "Workspace",
+    className: "Part",
+    pathSegments: ["Workspace", "Part"],
+    pathOrdinals: [1, 1],
+    property: "Name",
+    value: "Part",
+  },
+})) {
+  fs.writeFileSync(path.join(root, name), JSON.stringify(payload));
+}
 
 const environment = {
   ...process.env,

@@ -20,7 +20,7 @@ const STRING_CONFIG_KEYS = new Set([
   "link.manifest", "link.folder", "link.cacheDir", "link.gitPath",
 ]);
 const BOOLEAN_CONFIG_KEYS = new Set([
-  "yes", "backtrace", "verifyEditorPushSources", "adaptiveThrottle", "noUpdateEditorIcons",
+  "yes", "backtrace", "verifyEditorPushSources", "adaptiveThrottle",
   "autoSyncOnSave", "editorLiveSyncEnabled",
   "studioLiveSyncEnabled", "liveSync.overridePackages", "runImport", "modifiedDefaultBypass",
   "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",
@@ -29,11 +29,11 @@ const BOOLEAN_CONFIG_KEYS = new Set([
 ]);
 const INTEGER_CONFIG_KEYS = new Set([
   "schemaVersion", "sourceWorkers", "instanceWorkers", "importWorkers", "chunkSize",
-  "snapshotInstanceChunkSize", "autoSyncDebounceMs", "studioLiveSyncPollMs",
+  "autoSyncDebounceMs", "studioLiveSyncPollMs",
   "liveSync.changesThreshold", "liveSync.diffLinesLimit",
 ]);
 const NUMBER_CONFIG_KEYS = new Set([
-  "bridgeWaitSeconds", "wsWaitSeconds", "progressHeartbeatSeconds",
+  "bridgeWaitSeconds", "progressHeartbeatSeconds",
   "gitSync.timeoutSeconds",
 ]);
 const STRING_ARRAY_CONFIG_KEYS = new Set(["services", "gitSync.stagePaths"]);

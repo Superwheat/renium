@@ -41,7 +41,7 @@ export type GitSyncConfig = {
   outputBehavior: "onStart" | "onError" | "silent";
 };
 
-export type GitControllerConfig = {
+type GitControllerConfig = {
   projectRoot: string;
   services: string[];
   gitSync: GitSyncConfig;
@@ -65,7 +65,7 @@ type GitProjectToken = {
   generation: number;
 };
 
-export type GitControllerHost<TConfig extends GitControllerConfig> = {
+type GitControllerHost<TConfig extends GitControllerConfig> = {
   context: vscode.ExtensionContext;
   output: vscode.OutputChannel;
   getConfig: () => TConfig;
@@ -96,10 +96,6 @@ export class GitController<TConfig extends GitControllerConfig> {
       openOutput: () => this.host.output.show(true),
       openDiff: (filePath, context) => this.openGitDiff(filePath, context.projectRoot),
     };
-  }
-
-  public refreshView(options: { fetch?: boolean } = {}): Promise<void> {
-    return this.refreshGitView(options);
   }
 
   private gitHeadProviderRegistered = false;
@@ -198,7 +194,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       const state = await this.inspectGitRepo(cfg, { fetch: false });
       this.host.output.show(false);
       this.logGitState(state);
-      await this.refreshGitView();
+      await this.refreshView();
     });
   }
 
@@ -211,7 +207,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       const remote = state.remote ?? cfg.gitSync.remote;
       const result = await this.runGitCommand(cfg, repoRoot, ["fetch", "--prune", remote], "fetch");
       this.ensureGitSuccess(result, "fetch");
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Fetched ${remote}.`);
     });
   }
@@ -252,7 +248,7 @@ export class GitController<TConfig extends GitControllerConfig> {
         await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
         state = await this.inspectGitRepo(cfg, { fetch: false });
         this.logGitState(state);
-        await this.refreshGitView();
+        await this.refreshView();
         vscode.window.showInformationMessage(`Pulled ${remote}/${branch}.`);
       } catch (error) {
         if (
@@ -297,7 +293,7 @@ export class GitController<TConfig extends GitControllerConfig> {
         if (state.ahead > 0) {
           await this.confirmGitPush(`No new files were staged, but ${state.ahead} local commit(s) are ahead of ${state.upstream ?? remote + "/" + branch}. Push them now?`, cfg);
           await this.pushGitBranch(cfg, repoRoot, remote, branch, state.upstream === undefined);
-          await this.refreshGitView();
+          await this.refreshView();
           return;
         }
         throw new Error("No tracked changes are available to commit. Untracked files are excluded unless renium.gitSync.includeUntracked is enabled or stage paths are configured.");
@@ -314,7 +310,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       this.ensureGitSuccess(commitResult, "commit");
       const shortSha = await this.gitOutput(cfg, repoRoot, ["rev-parse", "--short", "HEAD"], "read commit sha");
       await this.pushGitBranch(cfg, repoRoot, remote, branch, state.upstream === undefined);
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Pushed ${shortSha} to ${remote}/${branch}.`);
     });
   }
@@ -329,7 +325,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       const branch = this.resolveGitBranch(cfg, state);
       await this.confirmGitPush(`Publish current branch to ${remote}/${branch}?`, cfg);
       await this.pushGitBranch(cfg, repoRoot, remote, branch, true);
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Published ${remote}/${branch}.`);
     });
   }
@@ -350,7 +346,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       const repoRoot = this.requireGitRepoRoot(state);
       const result = await this.runGitCommand(cfg, repoRoot, ["switch", "-c", branchName.trim()], "create branch");
       this.ensureGitSuccess(result, "create branch");
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Created branch ${branchName.trim()}.`);
     });
   }
@@ -374,7 +370,7 @@ export class GitController<TConfig extends GitControllerConfig> {
       const runCfg = this.gitConfigForToken(token);
       const result = await this.runGitCommand(runCfg, repoRoot, ["switch", branchName], "checkout branch");
       this.ensureGitSuccess(result, "checkout branch");
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Checked out ${branchName}.`);
     });
   }
@@ -429,7 +425,7 @@ export class GitController<TConfig extends GitControllerConfig> {
         : ["remote", "add", remote.trim(), remoteUrl.trim()];
       const remoteResult = await this.runGitCommand(runCfg, targetRoot, args, currentRemote.code === 0 ? "set remote" : "add remote");
       this.ensureGitSuccess(remoteResult, currentRemote.code === 0 ? "set remote" : "add remote");
-      await this.refreshGitView();
+      await this.refreshView();
       vscode.window.showInformationMessage(`Connected ${remote.trim()} to ${redactRemoteUrl(remoteUrl.trim())}.`);
     });
   }
@@ -456,7 +452,7 @@ export class GitController<TConfig extends GitControllerConfig> {
     return state.view;
   }
 
-  private async refreshGitView(options: { fetch?: boolean } = {}): Promise<void> {
+  public async refreshView(options: { fetch?: boolean } = {}): Promise<void> {
     if (this.gitViewRefreshSuppression > 0) {
       return;
     }

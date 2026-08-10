@@ -14,7 +14,7 @@ pub(crate) fn set_cli_project(project: Option<PathBuf>) {
 pub(crate) fn project_override() -> Option<PathBuf> {
     AUTOMATION_PROJECT
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .or_else(|| CLI_PROJECT.get().cloned().flatten())
 }
@@ -22,25 +22,25 @@ pub(crate) fn project_override() -> Option<PathBuf> {
 pub(crate) fn select_automation(runtime: Option<String>, project: PathBuf) {
     *AUTOMATION_RUNTIME
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = runtime;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime;
     *AUTOMATION_PROJECT
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(project);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(project);
 }
 
 pub(crate) fn clear_automation() {
     *AUTOMATION_RUNTIME
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     *AUTOMATION_PROJECT
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 pub(crate) fn automation_runtime() -> Option<String> {
     AUTOMATION_RUNTIME
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 

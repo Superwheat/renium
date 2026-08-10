@@ -114,10 +114,6 @@ fn configured_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usi
     })?))
 }
 
-fn configured_f64(object: &Map<String, Value>, key: &str) -> Option<f64> {
-    object.get(key).and_then(Value::as_f64)
-}
-
 fn configured_services(object: &Map<String, Value>) -> Option<String> {
     object
         .get("services")
@@ -154,6 +150,25 @@ fn apply_default_usize(
     Ok(())
 }
 
+fn apply_default_path(
+    matches: &clap::ArgMatches,
+    id: &str,
+    target: &mut PathBuf,
+    object: &Map<String, Value>,
+    key: &str,
+) {
+    let value = object.get(key).and_then(Value::as_str).map(PathBuf::from);
+    apply_default(matches, id, target, value);
+}
+
+fn apply_default_services(
+    matches: &clap::ArgMatches,
+    target: &mut String,
+    object: &Map<String, Value>,
+) {
+    apply_default(matches, "services", target, configured_services(object));
+}
+
 fn apply_default_pair(
     matches: &clap::ArgMatches,
     ids: (&str, &str),
@@ -178,7 +193,7 @@ fn apply_bridge(
         matches,
         "bridge_wait_seconds",
         &mut bridge.wait_seconds,
-        configured_f64(object, "bridgeWaitSeconds"),
+        object.get("bridgeWaitSeconds").and_then(Value::as_f64),
     );
     apply_default(
         matches,
@@ -198,43 +213,27 @@ fn apply_command(
 ) -> Result<()> {
     match command {
         Commands::ExportSnapshots(args) => {
-            apply_default(
+            apply_default_path(
                 matches,
                 "project_root",
                 &mut args.project_root,
-                object
-                    .get("projectRoot")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from),
+                object,
+                "projectRoot",
             );
-            apply_default(
+            apply_default_path(
                 matches,
                 "snapshot_dir",
                 &mut args.snapshot_dir,
-                object
-                    .get("snapshotDir")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from),
+                object,
+                "snapshotDir",
             );
-            apply_default(
-                matches,
-                "services",
-                &mut args.services,
-                configured_services(object),
-            );
+            apply_default_services(matches, &mut args.services, object);
             apply_default_usize(
                 matches,
                 "chunk_size",
                 &mut args.chunk_size,
                 object,
                 "chunkSize",
-            )?;
-            apply_default_usize(
-                matches,
-                "snapshot_instance_chunk_size",
-                &mut args.snapshot_instance_chunk_size,
-                object,
-                "snapshotInstanceChunkSize",
             )?;
             apply_default_usize(
                 matches,
@@ -257,16 +256,7 @@ fn apply_command(
                 object,
                 "importWorkers",
             )?;
-            apply_default(
-                matches,
-                "ws_wait_seconds",
-                &mut args.ws_wait_seconds,
-                configured_f64(object, "wsWaitSeconds"),
-            );
             for (id, key, target) in [
-                ("transport", "transport", &mut args.transport),
-                ("server", "server", &mut args.server),
-                ("config", "configTomlPath", &mut args.config),
                 ("import_mode", "importMode", &mut args.import_mode),
                 (
                     "performance_mode",
@@ -296,39 +286,21 @@ fn apply_command(
                 ),
                 object.get("modifiedDefaultBypass").and_then(Value::as_bool),
             );
-            apply_default_pair(
-                matches,
-                ("adaptive_throttle", "no_adaptive_throttle"),
-                (&mut args.adaptive_throttle, &mut args.no_adaptive_throttle),
-                object.get("adaptiveThrottle").and_then(Value::as_bool),
-            );
-            apply_default(
-                matches,
-                "no_update_editor_icons",
-                &mut args.no_update_editor_icons,
-                object.get("noUpdateEditorIcons").and_then(Value::as_bool),
-            );
-            apply_default(
-                matches,
-                "import_cli",
-                &mut args.import_cli,
-                object
-                    .get("cliPath")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            );
+            if command_value_uses_default(matches, "no_adaptive_throttle")
+                && let Some(enabled) = object.get("adaptiveThrottle").and_then(Value::as_bool)
+            {
+                args.no_adaptive_throttle = !enabled;
+            }
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::BridgeDaemon(args) => apply_bridge(matches, object, &mut args.bridge),
         Commands::PushEditorChanges(args) => {
-            apply_default(
+            apply_default_path(
                 matches,
                 "project_root",
-                &mut args.project_root,
-                object
-                    .get("projectRoot")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from),
+                &mut args.project.project_root,
+                object,
+                "projectRoot",
             );
             apply_default(
                 matches,
@@ -351,38 +323,18 @@ fn apply_command(
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::ExplorerDaemon(args) => {
-            apply_default(
+            apply_default_path(
                 matches,
                 "project_root",
-                &mut args.project_root,
-                object
-                    .get("projectRoot")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from),
+                &mut args.project.project_root,
+                object,
+                "projectRoot",
             );
-            apply_default(
-                matches,
-                "services",
-                &mut args.services,
-                configured_services(object),
-            );
+            apply_default_services(matches, &mut args.services, object);
         }
         Commands::Syncback(args) => {
-            apply_default(
-                matches,
-                "input",
-                &mut args.input,
-                object
-                    .get("snapshotDir")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from),
-            );
-            apply_default(
-                matches,
-                "services",
-                &mut args.services,
-                configured_services(object),
-            );
+            apply_default_path(matches, "input", &mut args.input, object, "snapshotDir");
+            apply_default_services(matches, &mut args.services, object);
         }
         _ => {}
     }

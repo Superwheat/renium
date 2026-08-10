@@ -28,14 +28,10 @@ local TERRAIN_MATERIAL_COLORS = {
 }
 
 local function isAttributeNameValid(attributeName)
-
-	return #attributeName <= 100
-
-		and attributeName:match("[^%w%.%-_/]") == nil
+	return #attributeName <= 100 and attributeName:match("[^%w%.%-_/]") == nil
 end
 
 local function isAttributeNameReserved(attributeName)
-
 	return attributeName:sub(1, 3) == "RBX"
 end
 
@@ -55,7 +51,6 @@ return {
 
 				for attributeName, attributeValue in pairs(value) do
 					if isAttributeNameReserved(attributeName) then
-
 						continue
 					end
 
@@ -165,7 +160,6 @@ return {
 	Terrain = {
 		MaterialColors = {
 			read = function(instance: Terrain)
-
 				local colors = {}
 				for _, material in TERRAIN_MATERIAL_COLORS do
 					colors[material] = instance:GetMaterialColor(material)

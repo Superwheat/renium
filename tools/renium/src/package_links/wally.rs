@@ -6,18 +6,16 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use crate::bytecode_api::{
-    acquire_settings_file_lock, apply_file_mutations, settings_document_bytes,
-};
+use crate::bytecode_api::{acquire_settings_file_lock, apply_file_mutations};
 use crate::bytecode_edit::{
-    collect_settings_subtree_preorder, instance_path_parts_key, prune_empty_source_dirs,
+    collect_settings_subtree_preorder, instance_path_parts_key, prune_removed_source_dirs,
 };
 use crate::command_line::SyncWallyPackagesArgs;
 use crate::editor_document::ensure_editor_source_target_in_bytecode;
 use crate::editor_paths::{build_editor_instance_paths, infer_editor_source_path_spec_in_service};
 use crate::external_tools::run_checked_external_tool;
 use crate::file_io::{
-    absolutize_under, ensure_existing_ancestor_inside, exact_path_key, fnv1a_hex, path_key,
+    absolutize_under, ensure_existing_ancestor_inside, fnv1a_hex, path_key,
     resolve_existing_project_root, service_settings_path, validate_filesystem_instance_name,
 };
 use crate::instance_api::{self, InstanceSelector};
@@ -28,13 +26,13 @@ use crate::settings_tree::{editor_service_root_index, settings_children_by_paren
 
 use super::{
     LinkLock, LinkTargetRef, LinkTargetStorage, apply_preserved_subtree_identity,
-    canonicalize_loaded_settings_documents, collect_project_settings_files,
-    ensure_editor_container_path, ensure_renium_gitignore, link_lock_path, link_manifest_path,
-    link_target_document_selector_parts, link_target_file_pairs_at, link_target_ordinals,
-    link_target_ref_key, link_target_segments, package_target_fingerprint,
-    prepare_external_package_references, read_link_lock, read_link_manifest,
-    referenced_settings_ids, resolve_editor_instance_by_path_ordinals, resolve_link_target_storage,
-    selector_starts_with, subtree_relative_indices,
+    collect_project_settings_files, ensure_editor_container_path, ensure_renium_gitignore,
+    link_lock_path, link_manifest_path, link_target_document_selector_parts,
+    link_target_file_pairs_at, link_target_ordinals, link_target_ref_key, link_target_segments,
+    load_settings_documents, package_target_fingerprint, prepare_package_replacement,
+    read_link_lock, read_link_manifest, referenced_settings_ids_outside,
+    resolve_editor_instance_by_path_ordinals, resolve_link_target_storage, selector_starts_with,
+    serialize_link_lock, stage_settings_document_writes, subtree_relative_indices,
 };
 
 struct WallyRealm {
@@ -51,14 +49,6 @@ fn wally_realm_target(realm: &WallyRealm) -> LinkTargetRef {
         path: vec![realm.service.clone(), realm.target_name.clone()],
         ords: Vec::new(),
     }
-}
-
-fn wally_realm_storage(
-    project_root: &Path,
-    src_root: &Path,
-    realm: &WallyRealm,
-) -> Result<LinkTargetStorage> {
-    resolve_link_target_storage(project_root, src_root, &wally_realm_target(realm), true)
 }
 
 fn wally_realm_lock_key(realm: &WallyRealm, storage: &LinkTargetStorage) -> String {
@@ -308,20 +298,12 @@ fn import_wally_realm(
             preserved.insert(key.clone(), settings_id.clone());
             preserved_by_index.insert(index, settings_id);
         }
-        let preserved_ids = preserved_by_index.values().cloned().collect::<HashSet<_>>();
-        if let Some(removed_id) = subtree
-            .iter()
-            .map(|index| document.instances[*index].settings_id.as_str())
-            .find(|settings_id| {
-                !preserved_ids.contains(*settings_id) && external_references.contains(*settings_id)
-            })
-        {
-            bail!("Wally replacement would remove externally referenced instance {removed_id}");
-        }
-        prepare_external_package_references(
+        prepare_package_replacement(
             document,
-            &subtree.iter().copied().collect(),
+            &subtree,
             &preserved_by_index,
+            external_references,
+            "Wally",
         )?;
         let removed_indexes = if target_segments.is_empty() {
             subtree.iter().copied().skip(1).collect::<Vec<_>>()
@@ -329,7 +311,7 @@ fn import_wally_realm(
             let paths_by_index = build_editor_instance_paths(document, &service);
             if let Some(path_info) = paths_by_index
                 .get(existing_index)
-                .and_then(|path| path.clone())
+                .and_then(std::clone::Clone::clone)
             {
                 removed_target = json!({
                     "settingsId": existing.settings_id,
@@ -385,7 +367,7 @@ fn import_wally_realm(
             source_writes: Vec::new(),
             changed_paths: removals
                 .iter()
-                .map(|path| path.to_string_lossy().to_string())
+                .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
             writes: BTreeMap::new(),
             removals,
@@ -415,7 +397,7 @@ fn import_wally_realm(
             ensured.target.path_segments.clone(),
             ensured.target.path_ordinals.clone(),
         ));
-        let mirror_str = pair.mirror.to_string_lossy().to_string();
+        let mirror_str = pair.mirror.to_string_lossy().into_owned();
         if seen.insert(path_key(&pair.mirror)) {
             changed_paths.push(mirror_str.clone());
         }
@@ -548,7 +530,8 @@ fn resolve_wally_realm_storages(
 ) -> Result<HashMap<&'static str, LinkTargetStorage>> {
     let mut storages = HashMap::new();
     for realm in realms {
-        match wally_realm_storage(project_root, src_root, realm) {
+        match resolve_link_target_storage(project_root, src_root, &wally_realm_target(realm), true)
+        {
             Ok(storage) => {
                 storages.insert(realm.realm, storage);
             }
@@ -640,36 +623,14 @@ fn commit_wally_changes(
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     removals: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let mut settings_files = documents.keys().collect::<Vec<_>>();
-    settings_files.sort();
-    for settings_file in settings_files {
-        let output_file = &settings_outputs[settings_file];
-        writes.insert(
-            output_file.clone(),
-            settings_document_bytes(&documents[settings_file], output_file)?,
-        );
-        if exact_path_key(output_file) != exact_path_key(settings_file) {
-            removals.push(settings_file.clone());
-        }
-    }
+    stage_settings_document_writes(documents, settings_outputs, writes, removals)?;
     ensure_renium_gitignore(project_root);
-    writes.insert(
-        link_lock_path(project_root),
-        (serde_json::to_string_pretty(lock)? + "\n").into_bytes(),
-    );
+    writes.insert(link_lock_path(project_root), serialize_link_lock(lock)?);
     removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
     removals.sort_by_key(|path| path_key(path));
     removals.dedup_by(|left, right| path_key(left) == path_key(right));
     apply_file_mutations(writes, removals)?;
-    let mut directories = removals
-        .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    directories.dedup();
-    for directory in directories {
-        let _ = prune_empty_source_dirs(src_root, &directory);
-    }
+    prune_removed_source_dirs(src_root, removals);
     Ok(())
 }
 
@@ -680,9 +641,9 @@ pub(crate) fn sync_wally_packages(args: SyncWallyPackagesArgs) -> Result<()> {
 }
 
 pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Result<Value> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_existing_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
+    apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
+    let project_root = resolve_existing_project_root(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
     let manifest = absolutize_under(&project_root, &args.manifest);
     if !manifest.exists() {
         bail!(
@@ -709,17 +670,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
     for settings_file in &settings_files {
         guards.push(acquire_settings_file_lock(settings_file)?);
     }
-    let mut documents = HashMap::new();
-    let mut settings_outputs = HashMap::new();
-    for settings_file in &settings_files {
-        documents.insert(
-            settings_file.clone(),
-            SettingsBytecode::read_file(settings_file)
-                .with_context(|| format!("Failed to read {}", settings_file.display()))?,
-        );
-        settings_outputs.insert(settings_file.clone(), settings_file.clone());
-    }
-    canonicalize_loaded_settings_documents(&mut documents)?;
+    let (mut documents, mut settings_outputs) = load_settings_documents(&settings_files)?;
     for storage in realm_storages.values() {
         if let Some(settings_file) = storage.settings_file.as_ref() {
             settings_outputs.insert(
@@ -764,14 +715,15 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
 
     for realm in &realms {
         let storage = realm_storages.get(realm.realm);
-        let lock_key = storage
-            .map(|storage| wally_realm_lock_key(realm, storage))
-            .unwrap_or_else(|| {
+        let lock_key = storage.map_or_else(
+            || {
                 format!(
                     "wally:{}:{}/{}",
                     realm.realm, realm.service, realm.target_name
                 )
-            });
+            },
+            |storage| wally_realm_lock_key(realm, storage),
+        );
         if !realm.packages_dir.is_dir() {
             if !realm.required {
                 if !lock.entries.contains_key(&lock_key) {
@@ -780,11 +732,8 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
                 if let Some(storage) = storage
                     && let Some(settings_file) = storage.settings_file.as_ref()
                 {
-                    let external_references = documents
-                        .iter()
-                        .filter(|(path, _)| exact_path_key(path) != exact_path_key(settings_file))
-                        .flat_map(|(_, document)| referenced_settings_ids(document))
-                        .collect::<HashSet<_>>();
+                    let external_references =
+                        referenced_settings_ids_outside(&documents, settings_file);
                     let document = documents
                         .get_mut(settings_file)
                         .context("Wally owner settings store was not loaded")?;
@@ -812,9 +761,10 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
                         "removed": true,
                     }));
                 } else {
-                    let target_dir = storage
-                        .map(|storage| storage.target_path.clone())
-                        .unwrap_or_else(|| src_root.join(&realm.service).join(&realm.target_name));
+                    let target_dir = storage.map_or_else(
+                        || src_root.join(&realm.service).join(&realm.target_name),
+                        |storage| storage.target_path.clone(),
+                    );
                     if target_dir.is_dir() {
                         for entry in WalkDir::new(&target_dir).follow_links(false) {
                             let entry = entry?;
@@ -890,11 +840,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
             continue;
         }
 
-        let external_references = documents
-            .iter()
-            .filter(|(path, _)| exact_path_key(path) != exact_path_key(settings_file))
-            .flat_map(|(_, document)| referenced_settings_ids(document))
-            .collect::<HashSet<_>>();
+        let external_references = referenced_settings_ids_outside(&documents, settings_file);
         let document = documents
             .get_mut(settings_file)
             .context("Wally owner settings store was not loaded")?;

@@ -20,9 +20,9 @@ use super::editor_diff::{NativeEditorPropertyRules, append_native_editor_full_pr
 #[cfg(any(windows, target_os = "macos"))]
 use super::editor_review::{studio_pid_for_bridge, studio_title_for_bridge};
 use super::editor_types::{
-    EditorBinaryImport, EditorBinaryPackageRoot, EditorBinaryRetainedRoot, EditorBinaryRootPath,
-    EditorBinaryServiceGroup, EditorChangeSet, EditorInstanceChange, EditorInstancePath,
-    EditorSettingsWrite,
+    EditorBinaryExport, EditorBinaryImport, EditorBinaryImportGroup, EditorBinaryPackageRoot,
+    EditorBinaryRetainedRoot, EditorBinaryRootPath, EditorChangeSet, EditorInstanceChange,
+    EditorInstancePath, EditorSettingsWrite,
 };
 use super::file_io::{absolutize_under, resolve_project_root_if_present, service_settings_path};
 use super::native_editor::{
@@ -113,6 +113,7 @@ fn ensure_package_fingerprint_references_resolve<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 struct CanonicalRbxSubtree<'a> {
     dom: &'a RbxWeakDom,
     root: RbxRef,
@@ -460,8 +461,7 @@ fn package_preflight_overlay_property_requests(
                         filter
                             .renamed
                             .get(name.as_str())
-                            .map(String::as_str)
-                            .unwrap_or(name.as_str())
+                            .map_or(name.as_str(), String::as_str)
                             .to_string()
                     })
                     .collect::<HashSet<_>>();
@@ -519,7 +519,7 @@ fn package_preflight_overlay_schema(
 
 fn fetch_package_preflight_overlay_properties(
     bridge: &BridgeServer,
-    export: &EditorBinaryImport,
+    export: &EditorBinaryExport,
     live_dom: &RbxWeakDom,
     schema: &PropertySchemaMap,
     package_services: &HashSet<String>,
@@ -835,8 +835,7 @@ fn plan_editor_package_root_retention(
         overlay_requests,
         live_export
             .as_ref()
-            .map(|export| &export.property_schema_by_class)
-            .unwrap_or(&empty_schema),
+            .map_or(&empty_schema, |export| &export.property_schema_by_class),
     )?;
     if verbose_timing_logs() {
         let mut properties = overlay_schema
@@ -1115,9 +1114,10 @@ fn build_editor_binary_import_for_services(
     bridge: &BridgeServer,
     merge_source_files: bool,
 ) -> Result<Option<PreparedEditorBinaryImport>> {
-    let project_root = resolve_project_root_if_present(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_dir);
-    let mut ordered_services = services.iter().cloned().collect::<Vec<_>>();
+    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
+    let service_count = services.len();
+    let mut ordered_services = services.into_iter().collect::<Vec<_>>();
     ordered_services.sort_by(|a, b| {
         explorer_service_order(a)
             .unwrap_or(usize::MAX)
@@ -1143,7 +1143,7 @@ fn build_editor_binary_import_for_services(
     );
     let mut build = build?;
     let live_preflight = live_preflight?;
-    if build.service_roots.len() != services.len() {
+    if build.service_roots.len() != service_count {
         return Ok(None);
     }
     let phase_started = Instant::now();
@@ -1271,16 +1271,12 @@ fn build_editor_binary_import_for_services(
             build.dom.transfer_within(*referent, payload_root_ref);
         }
         top_level_refs.push(payload_root_ref);
-        groups.push(EditorBinaryServiceGroup {
+        groups.push(EditorBinaryImportGroup {
             service: pending.service,
             target_path: pending.target_path,
             count: pending.roots.len(),
-            payload_root_name: Some(payload_root_name),
-            payload_root_names: Vec::new(),
+            payload_root_name,
             root_paths,
-            instance_count: 0,
-            class_names: Vec::new(),
-            root_properties: Map::new(),
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,
             strip_package_payloads: package_plan.strip_package_payloads,
@@ -1300,11 +1296,7 @@ fn build_editor_binary_import_for_services(
         binary_import: EditorBinaryImport {
             bytes,
             groups,
-            serialization_batches: Vec::new(),
             instance_count,
-            export_id: None,
-            property_schema_by_class: HashMap::new(),
-            enum_value_names_by_type: HashMap::new(),
             post_apply_properties_by_class: build.omitted_properties_by_class,
             post_apply_properties_by_path,
             external_references_post_applied: true,
@@ -1317,8 +1309,8 @@ pub(super) fn prepare_native_editor_full_push(
     bridge: &BridgeServer,
 ) -> Result<(EditorChangeSet, EditorBinaryImport)> {
     let started = Instant::now();
-    let project_root = resolve_project_root_if_present(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_dir);
+    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
     let services = explorer_daemon_services(&src_root, "")?
         .into_iter()
         .filter(|service| {

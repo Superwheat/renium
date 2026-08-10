@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -124,8 +125,7 @@ pub(super) fn vc_init(args: VcInitArgs) -> Result<()> {
             &["rev-parse", "--is-inside-work-tree"],
             &project_root,
         )
-        .map(|out| out.trim() == "true")
-        .unwrap_or(false);
+        .is_ok_and(|out| out.trim() == "true");
         if !inside {
             vc_run_git(&args.git_path, &["init"], &project_root)?;
             git_initialized = true;
@@ -242,30 +242,32 @@ pub(super) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
         } else {
             format!("{parent_path}/{}", instance.name)
         };
-        out.push_str(&format!(
-            "= {path} [{}] id={}\n",
+        let _ = writeln!(
+            out,
+            "= {path} [{}] id={}",
             instance.class_name, instance.settings_id
-        ));
+        );
         let mut properties: Vec<(&String, &Value)> = instance.properties.iter().collect();
         properties.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in properties {
             if key == "Source"
                 && let Some(text) = value.as_str()
             {
-                out.push_str(&format!(
-                    "  Source = <{} lines, {} bytes, fnv1a={}>\n",
+                let _ = writeln!(
+                    out,
+                    "  Source = <{} lines, {} bytes, fnv1a={}>",
                     text.lines().count(),
                     text.len(),
                     fnv1a_hex(text.as_bytes())
-                ));
+                );
                 continue;
             }
-            out.push_str(&format!("  {key} = {value}\n"));
+            let _ = writeln!(out, "  {key} = {value}");
         }
         let mut attributes: Vec<(&String, &Value)> = instance.attributes.iter().collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in attributes {
-            out.push_str(&format!("  @{key} = {value}\n"));
+            let _ = writeln!(out, "  @{key} = {value}");
         }
         if let Some(kids) = children.get(&Some(index)) {
             for kid in kids.iter().rev() {
@@ -420,13 +422,11 @@ pub(super) fn view_command(args: ViewArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
 pub(super) struct VcMergeConflict {
     path: String,
     pub(super) detail: String,
 }
 
-#[derive(Clone)]
 struct VcMergedInstance {
     settings_id: String,
     name: String,
@@ -484,28 +484,6 @@ fn vc_render_short(value: Option<&Value>) -> String {
     }
 }
 
-fn vc_merge_scalar<T: Clone + PartialEq>(
-    base: Option<&T>,
-    ours: &T,
-    theirs: &T,
-    prefer: Option<bool>,
-) -> Result<T, ()> {
-    if ours == theirs {
-        return Ok(ours.clone());
-    }
-    if Some(ours) == base {
-        return Ok(theirs.clone());
-    }
-    if Some(theirs) == base {
-        return Ok(ours.clone());
-    }
-    match prefer {
-        Some(true) => Ok(ours.clone()),
-        Some(false) => Ok(theirs.clone()),
-        None => Err(()),
-    }
-}
-
 struct VcMergeContext<'a> {
     prefer: Option<bool>,
     path: &'a str,
@@ -513,6 +491,35 @@ struct VcMergeContext<'a> {
 }
 
 impl VcMergeContext<'_> {
+    fn merge_scalar<T: Clone + PartialEq>(
+        &mut self,
+        base: Option<&T>,
+        ours: &T,
+        theirs: &T,
+        detail: impl FnOnce() -> String,
+    ) -> T {
+        if ours == theirs {
+            return ours.clone();
+        }
+        if Some(ours) == base {
+            return theirs.clone();
+        }
+        if Some(theirs) == base {
+            return ours.clone();
+        }
+        match self.prefer {
+            Some(true) => ours.clone(),
+            Some(false) => theirs.clone(),
+            None => {
+                self.conflicts.push(VcMergeConflict {
+                    path: self.path.to_string(),
+                    detail: detail(),
+                });
+                ours.clone()
+            }
+        }
+    }
+
     fn merge_maps(
         &mut self,
         base: &Map<String, Value>,
@@ -734,63 +741,37 @@ pub(super) fn merge_settings_documents(
             (Some(base_index), Some(theirs_index)) => {
                 let base_inst = &base.instances[base_index];
                 let theirs_inst = &theirs.instances[theirs_index];
-                let name = match vc_merge_scalar(
-                    Some(&base_inst.name),
-                    &instance.name,
-                    &theirs_inst.name,
-                    prefer,
-                ) {
-                    Ok(value) => value,
-                    Err(()) => {
-                        conflicts.push(VcMergeConflict {
-                            path: inst_path.clone(),
-                            detail: format!(
-                                "Name: ours={} theirs={}",
-                                instance.name, theirs_inst.name
-                            ),
-                        });
-                        instance.name.clone()
-                    }
-                };
-                let class_name = match vc_merge_scalar(
-                    Some(&base_inst.class_name),
-                    &instance.class_name,
-                    &theirs_inst.class_name,
-                    prefer,
-                ) {
-                    Ok(value) => value,
-                    Err(()) => {
-                        conflicts.push(VcMergeConflict {
-                            path: inst_path.clone(),
-                            detail: format!(
-                                "ClassName: ours={} theirs={}",
-                                instance.class_name, theirs_inst.class_name
-                            ),
-                        });
-                        instance.class_name.clone()
-                    }
-                };
-                let ours_parent = settings_parent_id(ours, ours_index);
-                let base_parent = settings_parent_id(base, base_index);
-                let theirs_parent = settings_parent_id(theirs, theirs_index);
-                let parent_id =
-                    match vc_merge_scalar(Some(&base_parent), &ours_parent, &theirs_parent, prefer)
-                    {
-                        Ok(value) => value,
-                        Err(()) => {
-                            conflicts.push(VcMergeConflict {
-                                path: inst_path.clone(),
-                                detail: "Parent: moved to different parents on both sides"
-                                    .to_string(),
-                            });
-                            ours_parent.clone()
-                        }
-                    };
                 let mut merge_context = VcMergeContext {
                     prefer,
                     path: &inst_path,
                     conflicts: &mut conflicts,
                 };
+                let name = merge_context.merge_scalar(
+                    Some(&base_inst.name),
+                    &instance.name,
+                    &theirs_inst.name,
+                    || format!("Name: ours={} theirs={}", instance.name, theirs_inst.name),
+                );
+                let class_name = merge_context.merge_scalar(
+                    Some(&base_inst.class_name),
+                    &instance.class_name,
+                    &theirs_inst.class_name,
+                    || {
+                        format!(
+                            "ClassName: ours={} theirs={}",
+                            instance.class_name, theirs_inst.class_name
+                        )
+                    },
+                );
+                let ours_parent = settings_parent_id(ours, ours_index);
+                let base_parent = settings_parent_id(base, base_index);
+                let theirs_parent = settings_parent_id(theirs, theirs_index);
+                let parent_id = merge_context.merge_scalar(
+                    Some(&base_parent),
+                    &ours_parent,
+                    &theirs_parent,
+                    || "Parent: moved to different parents on both sides".to_string(),
+                );
                 let properties = merge_context.merge_maps(
                     &base_inst.properties,
                     &instance.properties,

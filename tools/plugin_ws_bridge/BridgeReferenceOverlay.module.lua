@@ -278,7 +278,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
 					local okRead, target = readProperty(instance, propertyName)
 					if okRead and removed[target] then
-						error(`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`)
+						error(
+							`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`
+						)
 					end
 				end
 				for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
@@ -289,7 +291,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 						and value.SourceType == Enum.ContentSourceType.Object
 						and removed[value.Object]
 					then
-						error(`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`)
+						error(
+							`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`
+						)
 					end
 				end
 			end
@@ -306,7 +310,12 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		local expected = 0
 		for _, descriptor in ipairs(group.packageRoots) do
 			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
-			if root == nil or root.Parent ~= group.target or root.ClassName ~= descriptor.className or not actual[root] then
+			if
+				root == nil
+				or root.Parent ~= group.target
+				or root.ClassName ~= descriptor.className
+				or not actual[root]
+			then
 				error(`Package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
 			end
 			actual[root] = nil
@@ -403,7 +412,8 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			for index, descriptor in ipairs(group.rootPaths) do
 				local incomingRoot = group.incomingByPayloadIndex[index]
 				if incomingRoot ~= nil then
-					group.incomingRootsByPath[pathCacheKey(descriptor.pathSegments, descriptor.pathOrdinals)] = incomingRoot
+					group.incomingRootsByPath[pathCacheKey(descriptor.pathSegments, descriptor.pathOrdinals)] =
+						incomingRoot
 				end
 			end
 			group.outgoingRootSet = {}
@@ -425,7 +435,10 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 					or live.Name ~= descriptor.pathSegments[#descriptor.pathSegments]
 					or duplicate.Name ~= live.Name
 					or (not live:IsA("PackageLink") and live:FindFirstChildWhichIsA("PackageLink", true) == nil)
-					or (not duplicate:IsA("PackageLink") and duplicate:FindFirstChildWhichIsA("PackageLink", true) == nil)
+					or (
+						not duplicate:IsA("PackageLink")
+						and duplicate:FindFirstChildWhichIsA("PackageLink", true) == nil
+					)
 				then
 					error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
 				end

@@ -1,14 +1,17 @@
 use super::*;
 use crate::command_line::{
     LinkAddArgs, LinkApplyArgs, LinkDeletePackageArgs, LinkMoveTargetArgs, LinkPackArgs,
+    LinkTargetArgs, ProjectSourceArgs,
 };
 use crate::editor_document::read_editor_service_settings;
 use crate::test_support::{settings_document, settings_instance, temp_dir};
 
 fn test_link_apply_args(dir: &Path) -> LinkApplyArgs {
     LinkApplyArgs {
-        project_root: dir.to_path_buf(),
-        src_root: PathBuf::from("src"),
+        project: ProjectSourceArgs {
+            project_root: dir.to_path_buf(),
+            src_root: PathBuf::from("src"),
+        },
         manifest: PathBuf::from("renium-link.json"),
         link: None,
         check: false,
@@ -20,6 +23,15 @@ fn test_link_apply_args(dir: &Path) -> LinkApplyArgs {
         wally_path: "wally".into(),
         cache_dir: None,
         pretty: false,
+    }
+}
+
+fn link_target_args(service: &str, path: &str) -> LinkTargetArgs {
+    LinkTargetArgs {
+        service: service.into(),
+        path_segments_json: path.into(),
+        path_ordinals_json: "[]".into(),
+        writable: false,
     }
 }
 
@@ -57,6 +69,116 @@ fn write_single_file_link_manifest(dir: &Path, read_only: bool) {
         },
     )
     .unwrap();
+}
+
+fn write_package_link_manifest(dir: &Path, service: &str, read_only: bool, targets: &[&str]) {
+    write_link_manifest(
+        &dir.join("renium-link.json"),
+        &LinkManifest {
+            version: LINK_MANIFEST_VERSION,
+            cache_dir: None,
+            links: vec![LinkEntry {
+                id: "pkg".into(),
+                read_only,
+                source: LinkSource::Local {
+                    path: "links/pkg.renium".into(),
+                },
+                targets: targets
+                    .iter()
+                    .map(|target| LinkTargetRef {
+                        service: service.into(),
+                        path: vec![service.into(), (*target).into()],
+                        ords: Vec::new(),
+                    })
+                    .collect(),
+            }],
+            broken: Vec::new(),
+        },
+    )
+    .unwrap();
+}
+
+fn write_script_package_settings(service_dir: &Path, source: &str) -> PathBuf {
+    fs::create_dir_all(service_dir).unwrap();
+    let settings_path = service_settings_path(service_dir);
+    settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("pkg", "Pkg", "Folder", Some(0)),
+        SettingsBytecodeInstance {
+            settings_id: "script".into(),
+            name: "Child".into(),
+            class_name: "Script".into(),
+            parent_index: Some(1),
+            properties: Map::from_iter([("Source".to_string(), Value::String(source.to_string()))]),
+            attributes: Map::new(),
+        },
+    ])
+    .write_file(&settings_path)
+    .unwrap();
+    settings_path
+}
+
+fn setup_package_delete(name: &str, source: &str) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(name);
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    write_script_package_settings(&service_dir, source);
+    let package_dir = dir.join("links");
+    fs::create_dir_all(&package_dir).unwrap();
+    settings_document(Vec::new())
+        .write_file(&package_dir.join("pkg.renium"))
+        .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    (dir, service_dir)
+}
+
+fn delete_test_package(dir: &Path, action: &str) {
+    link_delete_package(LinkDeletePackageArgs {
+        project: ProjectSourceArgs {
+            project_root: dir.to_path_buf(),
+            src_root: PathBuf::from("src"),
+        },
+        manifest: PathBuf::from("renium-link.json"),
+        id: "pkg".into(),
+        action: action.into(),
+        pretty: false,
+    })
+    .unwrap();
+}
+
+fn setup_locked_missing_package_targets(name: &str, targets: &[&str]) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(name);
+    let src_root = dir.join("src");
+    write_link_test_service(&src_root.join("ReplicatedStorage"));
+
+    let package_dir = dir.join("links");
+    fs::create_dir_all(&package_dir).unwrap();
+    let package_path = package_dir.join("pkg.renium");
+    settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
+        .write_file(&package_path)
+        .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, targets);
+
+    let package_hash = fs::read(&package_path)
+        .map(|bytes| fnv1a_hex(&bytes))
+        .unwrap();
+    let mut lock = LinkLock {
+        version: LINK_MANIFEST_VERSION,
+        ..Default::default()
+    };
+    let files = &mut lock.entries.entry("pkg".into()).or_default().files;
+    for target in targets {
+        files.insert(
+            package_lock_key(
+                "package",
+                "ReplicatedStorage",
+                &[(*target).to_string()],
+                &[1],
+            ),
+            package_hash.clone(),
+        );
+    }
+    write_link_lock(&dir, &lock).unwrap();
+    (dir, src_root)
 }
 
 fn write_link_lock(project_root: &Path, lock: &LinkLock) -> Result<()> {
@@ -147,7 +269,7 @@ fn link_manifest_parses_source_variants() {
             assert_eq!(git_ref.as_deref(), Some("main"));
             assert_eq!(subpath.as_deref(), Some("src"));
         }
-        other => panic!("expected git source, got {other:?}"),
+        _ => panic!("expected git source"),
     }
     assert_eq!(manifest.links[2].source.kind(), "wally");
     assert_eq!(manifest.broken.len(), 1);
@@ -201,10 +323,7 @@ fn link_add_unbreaks_matching_target() {
         source: None,
         source_ref: None,
         source_subpath: None,
-        service: "ReplicatedStorage".into(),
-        path_segments_json: r#"["ReplicatedStorage","Pkg"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
         pretty: false,
     })
     .unwrap();
@@ -249,10 +368,7 @@ fn link_add_rejects_target_owned_by_another_link() {
         source: Some("links/b.renium".into()),
         source_ref: None,
         source_subpath: None,
-        service: "StarterGui".into(),
-        path_segments_json: r#"["StarterGui","CountryService"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("StarterGui", r#"["StarterGui","CountryService"]"#),
         pretty: false,
     })
     .unwrap_err()
@@ -363,15 +479,14 @@ fn link_pack_resaves_existing_package_source_path() {
     .unwrap();
 
     link_pack(LinkPackArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
         manifest: PathBuf::from("renium-link.json"),
         link_folder: Some(PathBuf::from("links")),
         id: Some("country".into()),
-        service: "ReplicatedStorage".into(),
-        path_segments_json: r#"["ReplicatedStorage","Pkg"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
         pretty: false,
     })
     .unwrap();
@@ -383,7 +498,7 @@ fn link_pack_resaves_existing_package_source_path() {
     assert_eq!(manifest.links[0].targets.len(), 1);
     match &manifest.links[0].source {
         LinkSource::Local { path } => assert_eq!(path, "packages/current.renium"),
-        other => panic!("expected local package source, got {other:?}"),
+        _ => panic!("expected local package source"),
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -406,15 +521,14 @@ fn link_pack_without_folder_saves_to_global_library() {
     .unwrap();
 
     link_pack(LinkPackArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
         manifest: PathBuf::from("renium-link.json"),
         link_folder: None,
         id: Some("pkg".into()),
-        service: "ReplicatedStorage".into(),
-        path_segments_json: r#"["ReplicatedStorage","Pkg"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
         pretty: false,
     })
     .unwrap();
@@ -424,7 +538,7 @@ fn link_pack_without_folder_saves_to_global_library() {
     let manifest = read_link_manifest(&dir.join("renium-link.json")).unwrap();
     match &manifest.links[0].source {
         LinkSource::Local { path } => assert_eq!(path, "~global/pkg.renium"),
-        other => panic!("expected local package source, got {other:?}"),
+        _ => panic!("expected local package source"),
     }
 
     link_add(LinkAddArgs {
@@ -435,10 +549,7 @@ fn link_pack_without_folder_saves_to_global_library() {
         source: None,
         source_ref: None,
         source_subpath: None,
-        service: "ReplicatedStorage".into(),
-        path_segments_json: r#"["ReplicatedStorage","PkgCopy"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","PkgCopy"]"#),
         pretty: false,
     })
     .unwrap();
@@ -464,37 +575,19 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
     let src_root = dir.join("src");
     let service_dir = src_root.join("ReplicatedStorage");
     fs::create_dir_all(service_dir.join("Pkg")).unwrap();
-    let settings_path = service_dir.join("__roblox_sync_settings.renium");
-    settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("pkg", "Pkg", "Folder", Some(0)),
-        SettingsBytecodeInstance {
-            settings_id: "script".into(),
-            name: "Child".into(),
-            class_name: "Script".into(),
-            parent_index: Some(1),
-            properties: Map::from_iter([(
-                "Source".to_string(),
-                Value::String("__SOURCE_EXTERNAL__".to_string()),
-            )]),
-            attributes: Map::new(),
-        },
-    ])
-    .write_file(&settings_path)
-    .unwrap();
+    let settings_path = write_script_package_settings(&service_dir, "__SOURCE_EXTERNAL__");
     let source_path = service_dir.join("Pkg").join("Child.server.luau");
     fs::write(&source_path, "print('packed')").unwrap();
 
     link_pack(LinkPackArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
         manifest: PathBuf::from("renium-link.json"),
         link_folder: Some(PathBuf::from("links")),
         id: None,
-        service: "ReplicatedStorage".into(),
-        path_segments_json: r#"["ReplicatedStorage","Pkg"]"#.into(),
-        path_ordinals_json: "[]".into(),
-        writable: false,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
         pretty: false,
     })
     .unwrap();
@@ -529,66 +622,11 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
 
 #[test]
 fn link_delete_package_unlinks_uses_and_externalizes_sources() {
-    let dir = temp_dir("link-delete-unlink");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    let settings_path = service_dir.join("__roblox_sync_settings.renium");
-    settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("pkg", "Pkg", "Folder", Some(0)),
-        SettingsBytecodeInstance {
-            settings_id: "script".into(),
-            name: "Child".into(),
-            class_name: "Script".into(),
-            parent_index: Some(1),
-            properties: Map::from_iter([(
-                "Source".to_string(),
-                Value::String("print('kept')".to_string()),
-            )]),
-            attributes: Map::new(),
-        },
-    ])
-    .write_file(&settings_path)
-    .unwrap();
-    let package_dir = dir.join("links");
-    fs::create_dir_all(&package_dir).unwrap();
-    let package_path = package_dir.join("pkg.renium");
-    settings_document(Vec::new())
-        .write_file(&package_path)
-        .unwrap();
+    let (dir, service_dir) = setup_package_delete("link-delete-unlink", "print('kept')");
+    let settings_path = service_settings_path(&service_dir);
+    let package_path = dir.join("links").join("pkg.renium");
     let manifest_path = dir.join("renium-link.json");
-    write_link_manifest(
-        &manifest_path,
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
-
-    link_delete_package(LinkDeletePackageArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        id: "pkg".into(),
-        action: "unlink-uses".into(),
-        pretty: false,
-    })
-    .unwrap();
+    delete_test_package(&dir, "unlink-uses");
 
     assert!(!package_path.exists());
     assert!(read_link_manifest(&manifest_path).unwrap().links.is_empty());
@@ -609,66 +647,11 @@ fn link_delete_package_unlinks_uses_and_externalizes_sources() {
 
 #[test]
 fn link_delete_package_deletes_uses_and_package_file() {
-    let dir = temp_dir("link-delete-uses");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    let settings_path = service_dir.join("__roblox_sync_settings.renium");
-    settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("pkg", "Pkg", "Folder", Some(0)),
-        SettingsBytecodeInstance {
-            settings_id: "script".into(),
-            name: "Child".into(),
-            class_name: "Script".into(),
-            parent_index: Some(1),
-            properties: Map::from_iter([(
-                "Source".to_string(),
-                Value::String("print('delete')".to_string()),
-            )]),
-            attributes: Map::new(),
-        },
-    ])
-    .write_file(&settings_path)
-    .unwrap();
-    let package_dir = dir.join("links");
-    fs::create_dir_all(&package_dir).unwrap();
-    let package_path = package_dir.join("pkg.renium");
-    settings_document(Vec::new())
-        .write_file(&package_path)
-        .unwrap();
+    let (dir, service_dir) = setup_package_delete("link-delete-uses", "print('delete')");
+    let settings_path = service_settings_path(&service_dir);
+    let package_path = dir.join("links").join("pkg.renium");
     let manifest_path = dir.join("renium-link.json");
-    write_link_manifest(
-        &manifest_path,
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
-
-    link_delete_package(LinkDeletePackageArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        id: "pkg".into(),
-        action: "delete-uses".into(),
-        pretty: false,
-    })
-    .unwrap();
+    delete_test_package(&dir, "delete-uses");
 
     assert!(!package_path.exists());
     assert!(read_link_manifest(&manifest_path).unwrap().links.is_empty());
@@ -679,78 +662,10 @@ fn link_delete_package_deletes_uses_and_package_file() {
 
 #[test]
 fn link_apply_breaks_previously_applied_missing_package_target() {
-    let dir = temp_dir("apply-missing-package");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    settings_document(vec![settings_instance(
-        "root",
-        "ReplicatedStorage",
-        "ReplicatedStorage",
-        None,
-    )])
-    .write_file(&service_settings_path(&service_dir))
-    .unwrap();
-
-    let package_dir = dir.join("links");
-    fs::create_dir_all(&package_dir).unwrap();
-    let package_path = package_dir.join("pkg.renium");
-    settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
-        .write_file(&package_path)
-        .unwrap();
-
+    let (dir, src_root) = setup_locked_missing_package_targets("apply-missing-package", &["Pkg"]);
     let manifest_path = dir.join("renium-link.json");
-    write_link_manifest(
-        &manifest_path,
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
 
-    let package_hash = fs::read(&package_path)
-        .map(|bytes| fnv1a_hex(&bytes))
-        .unwrap();
-    let mut lock = LinkLock {
-        version: LINK_MANIFEST_VERSION,
-        ..Default::default()
-    };
-    lock.entries.entry("pkg".into()).or_default().files.insert(
-        package_lock_key("package", "ReplicatedStorage", &["Pkg".to_string()], &[1]),
-        package_hash,
-    );
-    write_link_lock(&dir, &lock).unwrap();
-
-    link_apply(LinkApplyArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        link: None,
-        check: false,
-        force_targets: false,
-        force_target: Vec::new(),
-        offline: true,
-        strict: false,
-        git_path: "git".into(),
-        wally_path: "wally".into(),
-        cache_dir: None,
-        pretty: false,
-    })
-    .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
 
     let manifest = read_link_manifest(&manifest_path).unwrap();
     assert_eq!(manifest.broken.len(), 1);
@@ -770,78 +685,14 @@ fn link_apply_breaks_previously_applied_missing_package_target() {
 
 #[test]
 fn link_apply_force_targets_recreates_missing_locked_package_target() {
-    let dir = temp_dir("apply-force-missing-package");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    settings_document(vec![settings_instance(
-        "root",
-        "ReplicatedStorage",
-        "ReplicatedStorage",
-        None,
-    )])
-    .write_file(&service_settings_path(&service_dir))
-    .unwrap();
-
-    let package_dir = dir.join("links");
-    fs::create_dir_all(&package_dir).unwrap();
-    let package_path = package_dir.join("pkg.renium");
-    settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
-        .write_file(&package_path)
-        .unwrap();
-
+    let (dir, src_root) =
+        setup_locked_missing_package_targets("apply-force-missing-package", &["Pkg"]);
     let manifest_path = dir.join("renium-link.json");
-    write_link_manifest(
-        &manifest_path,
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
 
-    let package_hash = fs::read(&package_path)
-        .map(|bytes| fnv1a_hex(&bytes))
-        .unwrap();
-    let mut lock = LinkLock {
-        version: LINK_MANIFEST_VERSION,
-        ..Default::default()
-    };
-    lock.entries.entry("pkg".into()).or_default().files.insert(
-        package_lock_key("package", "ReplicatedStorage", &["Pkg".to_string()], &[1]),
-        package_hash,
-    );
-    write_link_lock(&dir, &lock).unwrap();
-
-    link_apply(LinkApplyArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        link: Some("pkg".into()),
-        check: false,
-        force_targets: true,
-        force_target: Vec::new(),
-        offline: true,
-        strict: false,
-        git_path: "git".into(),
-        wally_path: "wally".into(),
-        cache_dir: None,
-        pretty: false,
-    })
-    .unwrap();
+    let mut args = test_link_apply_args(&dir);
+    args.link = Some("pkg".into());
+    args.force_targets = true;
+    link_apply(args).unwrap();
 
     assert!(
         read_link_manifest(&manifest_path)
@@ -861,78 +712,9 @@ fn link_apply_force_targets_recreates_missing_locked_package_target() {
 
 #[test]
 fn link_apply_force_target_path_recreates_only_named_target() {
-    let dir = temp_dir("apply-force-target-path");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    settings_document(vec![settings_instance(
-        "root",
-        "ReplicatedStorage",
-        "ReplicatedStorage",
-        None,
-    )])
-    .write_file(&service_settings_path(&service_dir))
-    .unwrap();
-
-    let package_dir = dir.join("links");
-    fs::create_dir_all(&package_dir).unwrap();
-    let package_path = package_dir.join("pkg.renium");
-    settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
-        .write_file(&package_path)
-        .unwrap();
-
+    let (dir, src_root) =
+        setup_locked_missing_package_targets("apply-force-target-path", &["Pkg", "PkgOther"]);
     let manifest_path = dir.join("renium-link.json");
-    write_link_manifest(
-        &manifest_path,
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![
-                    LinkTargetRef {
-                        service: "ReplicatedStorage".into(),
-                        path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                        ords: Vec::new(),
-                    },
-                    LinkTargetRef {
-                        service: "ReplicatedStorage".into(),
-                        path: vec!["ReplicatedStorage".into(), "PkgOther".into()],
-                        ords: Vec::new(),
-                    },
-                ],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
-
-    let package_hash = fs::read(&package_path)
-        .map(|bytes| fnv1a_hex(&bytes))
-        .unwrap();
-    let mut lock = LinkLock {
-        version: LINK_MANIFEST_VERSION,
-        ..Default::default()
-    };
-    let entry = lock.entries.entry("pkg".into()).or_default();
-    entry.files.insert(
-        package_lock_key("package", "ReplicatedStorage", &["Pkg".to_string()], &[1]),
-        package_hash.clone(),
-    );
-    entry.files.insert(
-        package_lock_key(
-            "package",
-            "ReplicatedStorage",
-            &["PkgOther".to_string()],
-            &[1],
-        ),
-        package_hash,
-    );
-    write_link_lock(&dir, &lock).unwrap();
 
     let mut apply_args = test_link_apply_args(&dir);
     apply_args.link = Some("pkg".into());
@@ -1021,27 +803,7 @@ fn link_apply_writable_package_target_preserves_local_edits() {
         .write_file(&package_path)
         .unwrap();
 
-    write_link_manifest(
-        &dir.join("renium-link.json"),
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: false,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", false, &["Pkg"]);
 
     link_apply(test_link_apply_args(&dir)).unwrap();
 
@@ -1053,14 +815,7 @@ fn link_apply_writable_package_target_preserves_local_edits() {
             .unwrap();
     instance_api::add_instance(
         &mut document,
-        AddInstanceSpec {
-            settings_id: None,
-            name: "LocalChild".into(),
-            class_name: "Folder".into(),
-            parent_index: Some(pkg_index),
-            properties: Map::new(),
-            attributes: Map::new(),
-        },
+        AddInstanceSpec::new(None, "LocalChild".into(), "Folder".into(), Some(pkg_index)),
     )
     .unwrap();
     document
@@ -1417,7 +1172,12 @@ fn link_manifest_rejects_duplicate_ids() {
         )
         .unwrap();
 
-    let error = format!("{:#}", read_link_manifest(&path).unwrap_err());
+    let error = format!(
+        "{:#}",
+        read_link_manifest(&path)
+            .err()
+            .expect("duplicate ids should be rejected")
+    );
     assert!(error.contains("duplicate renium-link id"));
     let _ = fs::remove_dir_all(&root);
 }
@@ -1430,45 +1190,11 @@ fn link_apply_rejects_missing_target_service_with_clear_error() {
     settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
         .write_file(&dir.join("links").join("pkg.renium"))
         .unwrap();
-    write_link_manifest(
-        &dir.join("renium-link.json"),
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "MissingService".into(),
-                    path: vec!["MissingService".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
+    write_package_link_manifest(&dir, "MissingService", true, &["Pkg"]);
 
-    let error = link_apply(LinkApplyArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        link: None,
-        check: false,
-        force_targets: false,
-        force_target: Vec::new(),
-        offline: true,
-        strict: false,
-        git_path: "git".into(),
-        wally_path: "wally".into(),
-        cache_dir: None,
-        pretty: false,
-    })
-    .unwrap_err()
-    .to_string();
+    let error = link_apply(test_link_apply_args(&dir))
+        .unwrap_err()
+        .to_string();
     assert!(
         error.contains("Link target service MissingService has no Renium bytecode settings file")
     );
@@ -1580,43 +1306,9 @@ fn link_apply_replaces_locked_package_target_with_added_child_drift() {
     settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)])
         .write_file(&package_path)
         .unwrap();
-    write_link_manifest(
-        &dir.join("renium-link.json"),
-        &LinkManifest {
-            version: LINK_MANIFEST_VERSION,
-            cache_dir: None,
-            links: vec![LinkEntry {
-                id: "pkg".into(),
-                read_only: true,
-                source: LinkSource::Local {
-                    path: "links/pkg.renium".into(),
-                },
-                targets: vec![LinkTargetRef {
-                    service: "ReplicatedStorage".into(),
-                    path: vec!["ReplicatedStorage".into(), "Pkg".into()],
-                    ords: Vec::new(),
-                }],
-            }],
-            broken: Vec::new(),
-        },
-    )
-    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
 
-    let apply_args = || LinkApplyArgs {
-        project_root: dir.clone(),
-        src_root: PathBuf::from("src"),
-        manifest: PathBuf::from("renium-link.json"),
-        link: None,
-        check: false,
-        force_targets: false,
-        force_target: Vec::new(),
-        offline: true,
-        strict: false,
-        git_path: "git".into(),
-        wally_path: "wally".into(),
-        cache_dir: None,
-        pretty: false,
-    };
+    let apply_args = || test_link_apply_args(&dir);
     link_apply(apply_args()).unwrap();
 
     let settings_path = service_settings_path(&service_dir);

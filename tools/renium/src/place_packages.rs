@@ -1,12 +1,9 @@
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use rbx_dom_weak::WeakDom as RbxWeakDom;
 use rbx_dom_weak::types::{Ref as RbxRef, Variant as RbxVariant};
 use serde_json::{Value, json};
 
-use super::bytecode_api::{high_level_path_ordinals, high_level_split_path};
+use super::bytecode_api::{high_level_path_ordinals, parse_path_segments};
 use super::command_line::PlaceDesyncPackageLinkArgs;
 use super::output::print_json_output;
 use super::rbx_encode::rbx_model_top_level_refs;
@@ -19,17 +16,9 @@ pub(super) fn place_desync_package_link(args: PlaceDesyncPackageLinkArgs) -> Res
         Some(raw) => RbxPlaceFormat::parse(raw)?,
         None => RbxPlaceFormat::from_path(&args.output).unwrap_or(input_format),
     };
-    let input = File::open(&args.input)
-        .with_context(|| format!("Failed to read {}", args.input.display()))?;
-    let reader = BufReader::new(input);
-    let mut dom = match input_format {
-        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
-            .with_context(|| format!("Failed to read {}", args.input.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
-            .with_context(|| format!("Failed to read {}", args.input.display()))?,
-    };
+    let mut dom = input_format.read(&args.input)?;
 
-    let path_segments = parse_place_path_segments(&args.path_segments_json)?;
+    let path_segments = parse_path_segments(&args.path_segments_json)?;
     let path_ordinals = high_level_path_ordinals(Some(&args.path_ordinals_json))?;
     let target_ref = rbx_dom_instance_by_path_unique(&dom, &path_segments, &path_ordinals)?;
     let target_path = rbx_dom_instance_path_segments(&dom, target_ref);
@@ -42,22 +31,8 @@ pub(super) fn place_desync_package_link(args: PlaceDesyncPackageLinkArgs) -> Res
         dom.destroy(*referent);
     }
 
-    if let Some(parent) = args.output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let output = File::create(&args.output)
-        .with_context(|| format!("Failed to write {}", args.output.display()))?;
-    let writer = BufWriter::new(output);
     let top_level_refs = rbx_model_top_level_refs(&dom);
-    match output_format {
-        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", args.output.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", args.output.display()))?,
-    }
+    output_format.write(&args.output, &dom, &top_level_refs)?;
 
     print_json_output(
         &json!({
@@ -71,43 +46,6 @@ pub(super) fn place_desync_package_link(args: PlaceDesyncPackageLinkArgs) -> Res
         }),
         args.pretty,
     )
-}
-
-fn parse_place_path_segments(raw: &str) -> Result<Vec<String>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        bail!("Path target cannot be empty");
-    }
-    let segments = if raw.starts_with('[') {
-        parse_bracket_path_segments(raw).with_context(|| format!("Invalid path JSON: {raw}"))?
-    } else {
-        high_level_split_path(raw)
-    };
-    if segments.is_empty() {
-        bail!("Path target cannot be empty");
-    }
-    Ok(segments)
-}
-
-pub(super) fn parse_bracket_path_segments(raw: &str) -> Result<Vec<String>> {
-    if let Ok(segments) = serde_json::from_str::<Vec<String>>(raw) {
-        return Ok(segments);
-    }
-    let inner = raw
-        .trim()
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .context("Path must start with '[' and end with ']'")?;
-    let segments = inner
-        .split(',')
-        .map(|segment| segment.trim().trim_matches(['"', '\'']))
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        bail!("Path cannot be empty");
-    }
-    Ok(segments)
 }
 
 fn rbx_package_link_refs_for_desync(dom: &RbxWeakDom, target_ref: RbxRef) -> Result<Vec<RbxRef>> {

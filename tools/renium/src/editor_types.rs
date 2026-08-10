@@ -16,98 +16,77 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorSourceChange {
     pub(super) service: String,
-    #[serde(rename = "settingsId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) settings_id: Option<String>,
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals", skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) path_ordinals: Vec<usize>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) source: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub(super) deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorPropertyChange {
     pub(super) service: String,
-    #[serde(rename = "settingsId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) settings_id: Option<String>,
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals", skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) path_ordinals: Vec<usize>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    #[serde(skip_serializing_if = "Map::is_empty")]
     pub(super) properties: Map<String, Value>,
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    #[serde(skip_serializing_if = "Map::is_empty")]
     pub(super) attributes: Map<String, Value>,
-    #[serde(
-        rename = "deletedAttributes",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) deleted_attributes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorInstanceDescriptor {
-    #[serde(rename = "settingsId")]
     pub(super) settings_id: String,
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals", skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) path_ordinals: Vec<usize>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
-    #[serde(
-        rename = "ambiguousSiblings",
-        default,
-        skip_serializing_if = "is_false"
-    )]
+    #[serde(skip_serializing_if = "is_false")]
     pub(super) ambiguous_siblings: bool,
-    #[serde(rename = "anchorOnly", default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub(super) anchor_only: bool,
-    #[serde(
-        rename = "matchProperties",
-        default,
-        skip_serializing_if = "Map::is_empty"
-    )]
+    #[serde(skip_serializing_if = "Map::is_empty")]
     pub(super) match_properties: Map<String, Value>,
-    #[serde(
-        rename = "matchAttributes",
-        default,
-        skip_serializing_if = "Map::is_empty"
-    )]
+    #[serde(skip_serializing_if = "Map::is_empty")]
     pub(super) match_attributes: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorPreserveDescriptor {
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals", skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) path_ordinals: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorInstanceChange {
     pub(super) mode: String,
     pub(super) service: String,
-    #[serde(rename = "allowDeletes")]
     pub(super) allow_deletes: bool,
     pub(super) instances: Vec<EditorInstanceDescriptor>,
-    #[serde(rename = "preserveInstances", skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) preserve_instances: Vec<EditorPreserveDescriptor>,
 }
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct EditorSourceTarget {
     pub(super) service: String,
     pub(super) settings_id: Option<String>,
@@ -115,14 +94,23 @@ pub(super) struct EditorSourceTarget {
     pub(super) path_ordinals: Vec<usize>,
     pub(super) class_name: String,
 }
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct EditorInstancePath {
     pub(super) path_segments: Vec<String>,
     pub(super) path_ordinals: Vec<usize>,
 }
 
-#[derive(Debug, Default)]
+impl EditorInstancePath {
+    pub(super) fn is_descendant_of(&self, service: &str) -> bool {
+        self.path_segments.len() > 1
+            && self
+                .path_segments
+                .first()
+                .is_some_and(|segment| segment == service)
+    }
+}
+
+#[derive(Default)]
 pub(super) struct EditorPropertyFilter {
     pub(super) settings_ids: HashSet<String>,
     pub(super) property_names: HashSet<String>,
@@ -143,10 +131,6 @@ impl EditorPropertyFilter {
 
     pub(super) fn is_active(&self) -> bool {
         !self.settings_ids.is_empty() || !self.property_names.is_empty()
-    }
-
-    pub(super) fn has_settings_targets(&self) -> bool {
-        !self.settings_ids.is_empty()
     }
 
     pub(super) fn includes_instance(&self, settings_id: &str) -> bool {
@@ -189,7 +173,6 @@ pub(super) fn expand_editor_target_settings_ids(
     Ok(ids)
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct EditorSourceEnsureResult {
     pub(super) target: EditorSourceTarget,
     pub(super) upsert_instances: Vec<EditorInstanceDescriptor>,
@@ -197,7 +180,6 @@ pub(super) struct EditorSourceEnsureResult {
     pub(super) changed: bool,
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct EditorSourcePathSpec {
     pub(super) service: String,
     pub(super) class_name: String,
@@ -208,7 +190,7 @@ pub(super) struct EditorSourcePathSpec {
     pub(super) path_segments: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct EditorChangeSet {
     pub(super) instance_changes: Vec<EditorInstanceChange>,
     pub(super) source_changes: Vec<EditorSourceChange>,
@@ -216,6 +198,24 @@ pub(super) struct EditorChangeSet {
     pub(super) history_entries: Vec<EditorHistoryEntry>,
     pub(super) settings_writes: Vec<EditorSettingsWrite>,
     pub(super) files_to_studio_filters_active: bool,
+}
+
+impl EditorChangeSet {
+    pub(super) fn services(&self) -> impl Iterator<Item = &str> {
+        self.instance_changes
+            .iter()
+            .map(|change| change.service.as_str())
+            .chain(
+                self.source_changes
+                    .iter()
+                    .map(|change| change.service.as_str()),
+            )
+            .chain(
+                self.property_changes
+                    .iter()
+                    .map(|change| change.service.as_str()),
+            )
+    }
 }
 
 pub(super) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) -> Vec<Value> {
@@ -250,91 +250,59 @@ pub(super) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) ->
     rows
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(super) struct EditorBinaryServiceGroup {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct EditorBinaryExportGroup {
     pub(super) service: String,
-    #[serde(rename = "targetPath")]
     pub(super) target_path: Vec<String>,
     pub(super) count: usize,
-    #[serde(
-        default,
-        rename = "payloadRootName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(super) payload_root_name: Option<String>,
-    #[serde(
-        default,
-        rename = "payloadRootNames",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub(super) payload_root_names: Vec<String>,
-    #[serde(default, rename = "rootPaths")]
-    pub(super) root_paths: Vec<EditorBinaryRootPath>,
-    #[serde(default, rename = "instanceCount")]
     pub(super) instance_count: usize,
-    #[serde(default, rename = "classNames")]
     pub(super) class_names: Vec<String>,
-    #[serde(
-        default,
-        rename = "rootProperties",
-        deserialize_with = "deserialize_json_object_or_empty_array"
-    )]
+    #[serde(default, deserialize_with = "deserialize_json_object_or_empty_array")]
     pub(super) root_properties: Map<String, Value>,
-    #[serde(
-        default,
-        rename = "retainedRoots",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub(super) retained_roots: Vec<EditorBinaryRetainedRoot>,
-    #[serde(
-        default,
-        rename = "packageRoots",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub(super) package_roots: Vec<EditorBinaryPackageRoot>,
-    #[serde(
-        default,
-        rename = "stripPackagePayloads",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub(super) strip_package_payloads: Vec<usize>,
-    #[serde(
-        default,
-        rename = "changeGeneration",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub(super) change_generation: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct EditorBinaryImportGroup {
+    pub(super) service: String,
+    pub(super) target_path: Vec<String>,
+    pub(super) count: usize,
+    pub(super) payload_root_name: String,
+    pub(super) root_paths: Vec<EditorBinaryRootPath>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) retained_roots: Vec<EditorBinaryRetainedRoot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) package_roots: Vec<EditorBinaryPackageRoot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) strip_package_payloads: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) change_generation: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorBinaryRootPath {
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals")]
     pub(super) path_ordinals: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorBinaryRetainedRoot {
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals")]
     pub(super) path_ordinals: Vec<usize>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
-    #[serde(rename = "payloadIndex")]
     pub(super) payload_index: usize,
-    #[serde(rename = "instanceCount")]
     pub(super) instance_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorBinaryPackageRoot {
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "pathOrdinals")]
     pub(super) path_ordinals: Vec<usize>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
 }
 
@@ -351,20 +319,25 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct EditorBinarySerializationBatch {
     pub(super) id: String,
     pub(super) services: Vec<String>,
 }
 
-pub(super) struct EditorBinaryImport {
+pub(super) struct EditorBinaryExport {
     pub(super) bytes: Vec<u8>,
-    pub(super) groups: Vec<EditorBinaryServiceGroup>,
+    pub(super) groups: Vec<EditorBinaryExportGroup>,
     pub(super) serialization_batches: Vec<EditorBinarySerializationBatch>,
-    pub(super) instance_count: usize,
     pub(super) export_id: Option<String>,
     pub(super) property_schema_by_class: PropertySchemaMap,
     pub(super) enum_value_names_by_type: EnumValueNameMap,
+}
+
+pub(super) struct EditorBinaryImport {
+    pub(super) bytes: Vec<u8>,
+    pub(super) groups: Vec<EditorBinaryImportGroup>,
+    pub(super) instance_count: usize,
     pub(super) post_apply_properties_by_class: HashMap<String, HashSet<String>>,
     pub(super) post_apply_properties_by_path: HashMap<String, HashSet<String>>,
     pub(super) external_references_post_applied: bool,
@@ -391,13 +364,11 @@ impl EditorBinaryImport {
     }
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct EditorSettingsWrite {
     pub(super) path: PathBuf,
     pub(super) document: SettingsBytecode,
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct EditorHistoryEntry {
     pub(super) service: String,
     pub(super) source_path: Option<PathBuf>,
@@ -409,22 +380,20 @@ pub(super) struct EditorHistoryEntry {
     pub(super) settings_before: Option<SettingsBytecode>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct EditorRevertManifest {
     pub(super) version: u8,
-    #[serde(rename = "createdUnixMs")]
     pub(super) created_unix_ms: u128,
     pub(super) service: String,
-    #[serde(rename = "sourcePath", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) source_path: Option<String>,
-    #[serde(rename = "settingsId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) settings_id: Option<String>,
-    #[serde(rename = "pathSegments")]
     pub(super) path_segments: Vec<String>,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
-    #[serde(rename = "settingsBackup", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) settings_backup: Option<String>,
-    #[serde(rename = "sourceBackup", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) source_backup: Option<String>,
 }

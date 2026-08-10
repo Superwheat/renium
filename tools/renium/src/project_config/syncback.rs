@@ -12,17 +12,19 @@ use globset::escape as escape_glob;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{Map, Value, json};
 
-use crate::bytecode_api::{apply_file_mutations, settings_document_bytes};
+use crate::bytecode_api::apply_file_mutations;
 use crate::bytecode_edit::validate_settings_model_internal_references;
 use crate::editor_document::read_editor_service_documents;
 use crate::editor_paths::{infer_source_script, run_context_name};
 use crate::file_io::{
-    atomic_write_file, is_service_settings_file_name, service_settings_path, sha256_hex,
+    atomic_write_file, is_service_settings_file_name, read_file_if_present, service_settings_path,
+    sha256_hex,
 };
 use crate::settings_bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
+    SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
 };
 use crate::settings_tree::settings_children_by_parent;
+use crate::snapshot_refs::remap_record_reference_ids;
 
 use super::adapter_format::{
     adapter_format, adapter_output_path, compare_or_write, localization_json_to_csv,
@@ -32,8 +34,8 @@ use super::projection::{
     copy_directory_tree, filter_allows_candidate_pair, find_document_target,
     find_document_target_optional, find_document_target_optional_with_ordinals,
     fresh_projection_stage, owned_filter_candidate, projection_field_owners_with_root,
-    refresh_stage_settings, remap_settings_references, stage_adapter, stage_mount, stage_project,
-    target_segments, validate_projection_field_ownership,
+    refresh_stage_settings, stage_adapter, stage_mount, stage_project, target_segments,
+    validate_projection_field_ownership,
 };
 use super::projection_references::{
     canonicalize_projection_document_map, normalize_stage_references,
@@ -1216,17 +1218,21 @@ fn merge_nested_write(
     planned_writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     planned_removals: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if let Some(previous) = planned_writes.get(&path) {
-        if previous != &bytes {
-            bail!(
-                "Reverse projection planned conflicting writes to {}",
-                path.display()
-            );
+    match planned_writes.entry(path) {
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            if entry.get() != &bytes {
+                bail!(
+                    "Reverse projection planned conflicting writes to {}",
+                    entry.key().display()
+                );
+            }
+            planned_removals.remove(entry.key());
         }
-    } else {
-        planned_writes.insert(path.clone(), bytes);
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            planned_removals.remove(entry.key());
+            entry.insert(bytes);
+        }
     }
-    planned_removals.remove(&path);
     Ok(())
 }
 
@@ -1264,32 +1270,7 @@ fn extract_projection_subtree(
             stack.push(*child);
         }
     }
-    let index_map = selected
-        .iter()
-        .enumerate()
-        .map(|(new, old)| (*old, new))
-        .collect::<HashMap<_, _>>();
-    let id_set = selected
-        .iter()
-        .map(|index| document.instances[*index].settings_id.clone())
-        .collect::<HashSet<_>>();
-    let mut instances = selected
-        .iter()
-        .map(|old| {
-            let mut instance = document.instances[*old].clone();
-            instance.parent_index = instance
-                .parent_index
-                .and_then(|parent| index_map.get(&parent).copied());
-            remap_extracted_references(&mut instance.properties, &index_map, &id_set);
-            remap_extracted_references(&mut instance.attributes, &index_map, &id_set);
-            instance
-        })
-        .collect::<Vec<_>>();
-    instances[0].parent_index = None;
-    Ok(SettingsBytecode {
-        version: document.version,
-        instances,
-    })
+    Ok(extracted_settings_document(document, &selected))
 }
 
 fn reverse_owners(loaded: &LoadedProject) -> Result<Vec<ReverseOwner>> {
@@ -1521,12 +1502,19 @@ fn extract_projection_document(
             stack.push(*child);
         }
     }
+    Ok(extracted_settings_document(document, &selected))
+}
+
+fn extracted_settings_document(
+    document: &SettingsBytecode,
+    selected: &[usize],
+) -> SettingsBytecode {
     let index_map = selected
         .iter()
         .enumerate()
         .map(|(new, old)| (*old, new))
         .collect::<HashMap<_, _>>();
-    let id_set = selected
+    let ids = selected
         .iter()
         .map(|index| document.instances[*index].settings_id.clone())
         .collect::<HashSet<_>>();
@@ -1537,18 +1525,16 @@ fn extract_projection_document(
             instance.parent_index = instance
                 .parent_index
                 .and_then(|parent| index_map.get(&parent).copied());
-            remap_extracted_references(&mut instance.properties, &index_map, &id_set);
-            remap_extracted_references(&mut instance.attributes, &index_map, &id_set);
+            remap_extracted_references(&mut instance.properties, &index_map, &ids);
+            remap_extracted_references(&mut instance.attributes, &index_map, &ids);
             instance
         })
         .collect::<Vec<_>>();
-    if let Some(root) = instances.first_mut() {
-        root.parent_index = None;
-    }
-    Ok(SettingsBytecode {
+    instances[0].parent_index = None;
+    SettingsBytecode {
         version: document.version,
         instances,
-    })
+    }
 }
 
 fn remap_extracted_references(
@@ -1752,7 +1738,7 @@ enum FilteredFieldKind {
 }
 
 impl FilteredFieldKind {
-    fn scope<'a>(self, name: &'a str) -> FilterScope<'a> {
+    fn scope(self, name: &str) -> FilterScope<'_> {
         match self {
             Self::Property => FilterScope::Property(name),
             Self::Attribute => FilterScope::Attribute(name),
@@ -1950,8 +1936,8 @@ fn apply_reverse_filters(
         }
         let instance = &document.instances[index];
         if let Some((original, parent_id, _)) = baseline_by_id.get(&instance.settings_id) {
-            document.instances[index] = original.clone();
-            parent_ids[index] = parent_id.clone();
+            document.instances[index].clone_from(original);
+            parent_ids[index].clone_from(parent_id);
         } else if keep[index] {
             document.instances[index].properties.clear();
             document.instances[index].attributes.clear();
@@ -2033,16 +2019,8 @@ pub(super) fn stabilize_reference_indices(
     instances: &[SettingsBytecodeInstance],
 ) {
     let paths = projection_instance_path_parts_from_instances(instances);
-    crate::settings_bytecode::visit_reference_objects_mut(record, |object| {
-        if object.get("settingsId").and_then(Value::as_str).is_none()
-            && object.get("instanceId").and_then(Value::as_str).is_none()
-            && let Some(index) = object
-                .get("instanceIndex")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-                .and_then(|index| index.checked_sub(1))
-            && let Some(instance) = instances.get(index)
-        {
+    crate::settings_bytecode::stabilize_reference_objects(record, |object, index| {
+        if let Some(instance) = instances.get(index) {
             let (path_segments, path_ordinals) = &paths[index];
             object.insert(
                 "settingsId".to_string(),
@@ -2057,7 +2035,6 @@ pub(super) fn stabilize_reference_indices(
                 Value::Array(path_ordinals.iter().map(|value| json!(value)).collect()),
             );
         }
-        object.remove("instanceIndex");
     });
 }
 
@@ -2194,12 +2171,16 @@ fn restore_project_owned_fields(
             && projected_id != canonical_instance.settings_id
         {
             id_remap.insert(projected_id, canonical_instance.settings_id.clone());
-            output.instances[output_index].settings_id = canonical_instance.settings_id.clone();
+            output.instances[output_index]
+                .settings_id
+                .clone_from(&canonical_instance.settings_id);
         }
         if owner.class_name
             && let Some(canonical_instance) = canonical_instance
         {
-            output.instances[output_index].class_name = canonical_instance.class_name.clone();
+            output.instances[output_index]
+                .class_name
+                .clone_from(&canonical_instance.class_name);
         }
         for property in &owner.properties {
             if let Some(value) =
@@ -2237,8 +2218,8 @@ fn restore_project_owned_fields(
     }
     if !id_remap.is_empty() {
         for instance in &mut output.instances {
-            remap_settings_references(&mut instance.properties, &id_remap);
-            remap_settings_references(&mut instance.attributes, &id_remap);
+            remap_record_reference_ids(&mut instance.properties, &id_remap);
+            remap_record_reference_ids(&mut instance.attributes, &id_remap);
         }
     }
     let indices_by_id = output
@@ -2290,7 +2271,7 @@ fn plan_reverse_owner(
         ) {
             writes.insert(
                 destination.to_path_buf(),
-                settings_document_bytes(document, destination)?,
+                encode_settings_bytecode(document)?,
             );
             return Ok(ReverseOwnerPlan { writes, removals });
         }
@@ -2304,10 +2285,7 @@ fn plan_reverse_owner(
         return Ok(ReverseOwnerPlan { writes, removals });
     }
     let settings = service_settings_path(destination);
-    writes.insert(
-        settings.clone(),
-        settings_document_bytes(document, &settings)?,
-    );
+    writes.insert(settings, encode_settings_bytecode(document)?);
     for (path, source) in reverse_script_plan(destination, document, projected_sources, naming)? {
         writes.insert(path, source.into_bytes());
     }
@@ -2383,7 +2361,7 @@ fn restore_reverse_model_topology(destination: &Path, model: &mut SettingsByteco
         if root.parent_index.is_some() {
             bail!("Projected model root moved beneath another instance");
         }
-        root.name = canonical_root.name.clone();
+        root.name.clone_from(&canonical_root.name);
         return Ok(());
     }
     if canonical_roots.len() < 2 {
@@ -2650,22 +2628,14 @@ pub(super) fn plan_adapter_syncback(
                 }
             };
             let key = adapter_key(adapter);
-            let previous = baseline.entries.get(&key).cloned();
-            let model_json_hierarchical = if format == "model-json" {
-                Some(
-                    current
-                        .as_deref()
-                        .and_then(|bytes| model_json_bytes_are_hierarchical(bytes).ok())
-                        .or_else(|| {
-                            previous
-                                .as_ref()
-                                .and_then(|entry| entry.model_json_hierarchical)
-                        })
-                        .unwrap_or(true),
-                )
-            } else {
-                None
-            };
+            let previous = baseline.entries.get(&key);
+            let model_json_hierarchical = (format == "model-json").then(|| {
+                current
+                    .as_deref()
+                    .and_then(|bytes| model_json_bytes_are_hierarchical(bytes).ok())
+                    .or_else(|| previous.and_then(|entry| entry.model_json_hierarchical))
+                    .unwrap_or(true)
+            });
             let bytes = reversible_adapter_target_bytes(
                 adapter,
                 &format,
@@ -2679,7 +2649,7 @@ pub(super) fn plan_adapter_syncback(
             let mut write_target = adapter.direction == AdapterDirection::FromProject;
             let mut update_baseline = write_target;
             if adapter.direction == AdapterDirection::TwoWay {
-                if let Some(previous) = previous.as_ref() {
+                if let Some(previous) = previous {
                     let source_changed = source_hash
                         .as_ref()
                         .is_none_or(|hash| *hash != previous.source_hash);
@@ -2733,11 +2703,9 @@ pub(super) fn plan_adapter_syncback(
                         },
                         target_hash,
                         format: Some(format),
-                        output: previous.as_ref().and_then(|entry| entry.output.clone()),
-                        output_hash: previous
-                            .as_ref()
-                            .and_then(|entry| entry.output_hash.clone()),
-                        output_owned: previous.as_ref().is_some_and(|entry| entry.output_owned),
+                        output: previous.and_then(|entry| entry.output.clone()),
+                        output_hash: previous.and_then(|entry| entry.output_hash.clone()),
+                        output_owned: previous.is_some_and(|entry| entry.output_owned),
                         model_json_hierarchical,
                     },
                 );
@@ -2813,13 +2781,7 @@ fn reversible_adapter_target_bytes(
 pub(super) fn write_file_transaction(writes: &[(PathBuf, Vec<u8>)]) -> Result<()> {
     let originals = writes
         .iter()
-        .map(|(path, _)| {
-            if path.is_file() {
-                fs::read(path).map(Some)
-            } else {
-                Ok(None)
-            }
-        })
+        .map(|(path, _)| read_file_if_present(path))
         .collect::<io::Result<Vec<_>>>()?;
     for (index, (path, bytes)) in writes.iter().enumerate() {
         if let Err(error) = atomic_write_file(path, bytes) {
@@ -2967,7 +2929,7 @@ fn export_hierarchical_model_json_node(
         ),
         (
             "className".to_string(),
-            Value::String(instance.class_name.to_string()),
+            Value::String(instance.class_name.clone()),
         ),
         ("properties".to_string(), Value::Object(properties)),
         ("attributes".to_string(), Value::Object(attributes)),
@@ -3013,8 +2975,7 @@ pub(super) fn watch_adapters(loaded: &LoadedProject, interval_ms: u64) -> Result
                 (
                     input
                         .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| current.root.clone()),
+                        .map_or_else(|| current.root.clone(), Path::to_path_buf),
                     RecursiveMode::NonRecursive,
                 )
             };

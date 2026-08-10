@@ -44,12 +44,10 @@ export type SyncConfig = {
   instanceWorkers: number;
   importWorkers: number;
   chunkSize: number;
-  snapshotInstanceChunkSize: number;
   bridgeWaitSeconds: number;
   bridgePorts: string;
   verifyEditorPushSources: boolean;
   adaptiveThrottle: boolean;
-  noUpdateEditorIcons: boolean;
   autoSyncOnSave: boolean;
   autoSyncDebounceMs: number;
   editorLiveSyncEnabled: boolean;
@@ -66,7 +64,6 @@ export type SyncConfig = {
   importMode: "direct" | "snapshot";
   performanceMode: "throughput" | "balanced" | "smooth";
   modifiedDefaultBypass: boolean;
-  wsWaitSeconds: number;
   progressHeartbeatSeconds: number;
   gitSync: GitSyncConfig;
   wallySync: WallySyncConfig;
@@ -131,6 +128,10 @@ export class SyncConfigResolver {
       defaultValue: number,
       options: ConfigNumberOptions = {},
     ): number => this.normalizedNumber(read<unknown>(key, defaultValue), defaultValue, options);
+    const boolean = (key: string, defaultValue: boolean): boolean => {
+      const value = read<unknown>(key, defaultValue);
+      return typeof value === "boolean" ? value : defaultValue;
+    };
 
     const servicesRaw = read<string[]>("services", [...DEFAULT_SYNC_SERVICES]);
     const services = (Array.isArray(servicesRaw) ? servicesRaw : DEFAULT_SYNC_SERVICES)
@@ -179,16 +180,14 @@ export class SyncConfigResolver {
       instanceWorkers: number("instanceWorkers", 0, { min: 0, integer: true }),
       importWorkers: number("importWorkers", 0, { min: 0, integer: true }),
       chunkSize: this.normalizedChunkSize(read("chunkSize", DEFAULT_CHUNK_SIZE)),
-      snapshotInstanceChunkSize: number("snapshotInstanceChunkSize", 5000, { min: 0, integer: true }),
       bridgeWaitSeconds: number("bridgeWaitSeconds", 8, { min: 1 }),
       bridgePorts: this.normalizedBridgePorts(String(read("bridgePorts", DEFAULT_BRIDGE_PORTS.join(",")))),
-      verifyEditorPushSources: read<boolean>("verifyEditorPushSources", false) === true,
-      adaptiveThrottle: read<boolean>("adaptiveThrottle", true),
-      noUpdateEditorIcons: read<boolean>("noUpdateEditorIcons", true),
-      autoSyncOnSave: read<boolean>("autoSyncOnSave", false),
+      verifyEditorPushSources: boolean("verifyEditorPushSources", false),
+      adaptiveThrottle: boolean("adaptiveThrottle", true),
+      autoSyncOnSave: boolean("autoSyncOnSave", false),
       autoSyncDebounceMs: number("autoSyncDebounceMs", 800, { min: 100, integer: true }),
-      editorLiveSyncEnabled: read<boolean>("editorLiveSyncEnabled", false) === true,
-      studioLiveSyncEnabled: read<boolean>("studioLiveSyncEnabled", true) !== false,
+      editorLiveSyncEnabled: boolean("editorLiveSyncEnabled", false),
+      studioLiveSyncEnabled: boolean("studioLiveSyncEnabled", true),
       studioLiveSyncPollMs: number(
         "studioLiveSyncPollMs",
         DEFAULT_STUDIO_LIVE_SYNC_POLL_MS,
@@ -199,31 +198,25 @@ export class SyncConfigResolver {
       diffLinesLimit: number("liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
       displayPrompts,
       logLevel: this.configuredLogLevel(studioRuntimeSettings),
-      overridePackages: read<boolean>("liveSync.overridePackages", false) === true,
+      overridePackages: boolean("liveSync.overridePackages", false),
       conflictResolution: normalizeConflictPolicy(read("liveSync.conflictResolution", "prompt")),
-      runImport: read<boolean>("runImport", true),
+      runImport: boolean("runImport", true),
       importMode,
       performanceMode,
-      modifiedDefaultBypass: read<boolean>("modifiedDefaultBypass", false) === true,
-      wsWaitSeconds: this.normalizedNumber(
-        this.explicitValue<unknown>(workspaceConfig, "wsWaitSeconds")
-          ?? sharedConfigValue<unknown>(shared, "wsWaitSeconds"),
-        20,
-        { min: 1 },
-      ),
+      modifiedDefaultBypass: boolean("modifiedDefaultBypass", false),
       progressHeartbeatSeconds: number("progressHeartbeatSeconds", 2, { min: 2 }),
       gitSync: {
         gitPath: read("gitSync.gitPath", "git"),
         remote: read("gitSync.remote", "origin"),
         branch: read("gitSync.branch", ""),
-        autoFetch: read<boolean>("gitSync.autoFetch", true) !== false,
+        autoFetch: boolean("gitSync.autoFetch", true),
         pullFromStudioBeforePush: studioPolicy(read("gitSync.pullFromStudioBeforePush", "ask")),
         stageMode: gitStageMode,
         stagePaths: gitStagePaths.length > 0 ? gitStagePaths : [srcDir],
-        includeUntracked: read<boolean>("gitSync.includeUntracked", false) === true,
+        includeUntracked: boolean("gitSync.includeUntracked", false),
         commitMessageTemplate: read("gitSync.commitMessageTemplate", "Renium sync: ${date}"),
-        confirmBeforePush: read<boolean>("gitSync.confirmBeforePush", true) !== false,
-        requireCleanWorktreeBeforePull: read<boolean>("gitSync.requireCleanWorktreeBeforePull", true) !== false,
+        confirmBeforePush: boolean("gitSync.confirmBeforePush", true),
+        requireCleanWorktreeBeforePull: boolean("gitSync.requireCleanWorktreeBeforePull", true),
         applyPulledChangesToStudio: studioPolicy(read("gitSync.applyPulledChangesToStudio", "ask")),
         timeoutSeconds: number("gitSync.timeoutSeconds", 120, { min: 10 }),
         outputBehavior: gitOutputBehavior,
@@ -240,7 +233,7 @@ export class SyncConfigResolver {
         devTargetService: read("wallySync.devTargetService", "ReplicatedStorage"),
         devTargetName: read("wallySync.devTargetName", "DevPackages"),
         realms: read("wallySync.realms", "shared,server,dev"),
-        runInstall: read<boolean>("wallySync.runInstall", true) !== false,
+        runInstall: boolean("wallySync.runInstall", true),
         applyToStudio: studioPolicy(read("wallySync.applyToStudio", "ask")),
       },
       linkSync: {
@@ -249,8 +242,8 @@ export class SyncConfigResolver {
         cacheDir: read("link.cacheDir", "").trim(),
         gitPath: read("link.gitPath", "git"),
         wallyPath: read("wallySync.wallyPath", "wally"),
-        offline: read<boolean>("link.offline", false) === true,
-        autoApply: read<boolean>("link.autoApplyOnManifestChange", false) === true,
+        offline: boolean("link.offline", false),
+        autoApply: boolean("link.autoApplyOnManifestChange", false),
         applyToStudio: studioPolicy(read("link.applyToStudio", "ask")),
       },
     };

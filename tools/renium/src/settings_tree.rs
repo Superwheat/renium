@@ -19,11 +19,7 @@ pub(super) fn assign_editor_instance_paths(
         });
     }
     let mut seen_names: HashMap<String, usize> = HashMap::new();
-    for child_index in children_by_parent
-        .get(index)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-    {
+    for child_index in children_by_parent.get(index).map_or(&[][..], Vec::as_slice) {
         let child = &document.instances[*child_index];
         let child_ordinal = seen_names
             .entry(child.name.clone())

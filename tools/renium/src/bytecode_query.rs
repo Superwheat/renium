@@ -48,6 +48,7 @@ pub(super) fn bytecode_selector<'a>(
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct BytecodeInstanceTarget<'a> {
     pub(super) path_segments: Option<&'a [String]>,
     pub(super) path_ordinals: &'a [usize],

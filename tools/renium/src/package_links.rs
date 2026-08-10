@@ -17,7 +17,7 @@ use crate::bytecode_edit::{
 use crate::editor_document::editor_child_by_stem;
 use crate::editor_paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
-    build_editor_source_paths_by_index, infer_source_class_and_leaf_name, infer_source_script,
+    build_editor_source_paths_by_index, infer_source_script,
 };
 use crate::external_tools::{run_checked_external_tool, run_git_checked};
 use crate::file_io::{
@@ -31,7 +31,7 @@ use crate::rbx_encode::settings_root_indices;
 use crate::rbx_model::canonicalize_settings_reference_documents;
 use crate::settings_bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
-    reindex_reference_indices,
+    encode_settings_bytecode, reindex_reference_indices,
 };
 use crate::settings_tree::{editor_service_root_index, settings_children_by_parent};
 use crate::snapshot_refs::remap_record_reference_ids;
@@ -57,21 +57,15 @@ const LINK_GIT_CACHE_REF: &str = "refs/renium/cache";
 #[path = "package_links_tests.rs"]
 mod tests;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LinkManifest {
-    #[serde(default = "default_link_manifest_version")]
     version: u32,
 
-    #[serde(rename = "cacheDir", default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     cache_dir: Option<String>,
-    #[serde(default)]
     links: Vec<LinkEntry>,
-    #[serde(default)]
     broken: Vec<LinkTargetRef>,
-}
-
-fn default_link_manifest_version() -> u32 {
-    LINK_MANIFEST_VERSION
 }
 
 impl Default for LinkManifest {
@@ -85,10 +79,11 @@ impl Default for LinkManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LinkEntry {
     id: String,
-    #[serde(default = "default_true", rename = "readOnly")]
+    #[serde(default = "default_true")]
     read_only: bool,
     source: LinkSource,
     targets: Vec<LinkTargetRef>,
@@ -98,7 +93,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum LinkSource {
     Local {
@@ -106,14 +101,14 @@ enum LinkSource {
     },
     Git {
         url: String,
-        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         subpath: Option<String>,
     },
     Wally {
         package: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
 }
@@ -125,10 +120,6 @@ impl LinkSource {
             LinkSource::Git { .. } => "git",
             LinkSource::Wally { .. } => "wally",
         }
-    }
-
-    fn is_local(&self) -> bool {
-        matches!(self, LinkSource::Local { .. })
     }
 
     fn summary(&self) -> String {
@@ -158,7 +149,7 @@ impl LinkSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LinkTargetRef {
     service: String,
     path: Vec<String>,
@@ -166,47 +157,32 @@ struct LinkTargetRef {
     ords: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct LinkLock {
-    #[serde(default)]
     version: u32,
-    #[serde(default)]
     entries: BTreeMap<String, LinkLockEntry>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
 struct LinkLockEntry {
-    #[serde(
-        rename = "resolvedRef",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     resolved_ref: Option<String>,
-    #[serde(
-        rename = "sourceSummary",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    source_summary: Option<String>,
-    #[serde(default)]
     files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     targets: BTreeMap<String, LinkTargetLockEntry>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct LinkTargetLockEntry {
-    #[serde(default)]
     files: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
 struct LinkFilePair {
     mirror: PathBuf,
     canonical: PathBuf,
 }
 
-#[derive(Debug, Clone)]
 struct ResolvedLinkTarget {
     link_id: String,
     read_only: bool,
@@ -228,7 +204,6 @@ struct ResolvedLinkTarget {
     storage: Option<LinkTargetStorage>,
 }
 
-#[derive(Debug, Clone)]
 struct LinkTargetStorage {
     target_path: PathBuf,
     source_root: PathBuf,
@@ -241,7 +216,6 @@ struct LinkTargetStorage {
     filesystem_target: bool,
 }
 
-#[derive(Debug, Clone, Default)]
 struct LinkSourceMeta {
     is_package: bool,
     root_class: Option<String>,
@@ -276,8 +250,10 @@ fn read_link_source_meta(source_path: &Path) -> LinkSourceMeta {
         let root_class = source_path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(infer_source_class_and_leaf_name)
-            .map(|(class, _)| class.to_string());
+            .and_then(|name| {
+                infer_source_script(name, &project_config::ProjectScriptNaming::default())
+            })
+            .map(|(class, _, _)| class.to_string());
         return LinkSourceMeta {
             is_package: false,
             root_class,
@@ -301,7 +277,6 @@ fn is_package_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(RENIUM_STORE_EXTENSION))
 }
 
-#[derive(Debug, Clone)]
 struct LinkResolveOptions {
     only_link: Option<String>,
     offline: bool,
@@ -458,6 +433,12 @@ fn serialize_link_manifest(manifest: &LinkManifest) -> Result<String> {
     Ok(serde_json::to_string_pretty(manifest)? + "\n")
 }
 
+fn serialize_link_lock(lock: &LinkLock) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(lock)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 fn write_link_manifest(path: &Path, manifest: &LinkManifest) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -605,16 +586,12 @@ fn link_target_ref_key(target: &LinkTargetRef) -> String {
     )
 }
 
-fn resolved_link_target_ref(target: &ResolvedLinkTarget) -> LinkTargetRef {
-    LinkTargetRef {
+fn mark_manifest_target_broken(manifest: &mut LinkManifest, target: &ResolvedLinkTarget) -> bool {
+    let broken_target = LinkTargetRef {
         service: target.service.clone(),
         path: target.target_segments.clone(),
         ords: target.target_ordinals.clone(),
-    }
-}
-
-fn mark_manifest_target_broken(manifest: &mut LinkManifest, target: &ResolvedLinkTarget) -> bool {
-    let broken_target = resolved_link_target_ref(target);
+    };
     let key = link_target_ref_key(&broken_target);
     if manifest
         .broken
@@ -662,7 +639,7 @@ fn ensure_git_source(
     let git = |args: &[&str], cwd: &Path| -> Result<String> {
         let owned = args
             .iter()
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>();
         run_git_checked(git_path, &owned, cwd)
     };
@@ -675,14 +652,14 @@ fn ensure_git_source(
         }
         fs::create_dir_all(cache_root)
             .with_context(|| format!("Failed to create {}", cache_root.display()))?;
-        let dir_str = dir.to_string_lossy().to_string();
+        let dir_str = dir.to_string_lossy().into_owned();
         git(
             &["-c", "core.longpaths=true", "clone", url, &dir_str],
             cache_root,
         )?;
     }
 
-    let dir_str = dir.to_string_lossy().to_string();
+    let dir_str = dir.to_string_lossy().into_owned();
     if !read_only {
         git(&["-C", &dir_str, "config", "core.longpaths", "true"], &dir)?;
     }
@@ -837,11 +814,7 @@ fn resolve_wally_source(
         }
         let inner = entry.path().join(&leaf);
         let chosen = if inner.is_dir() { inner } else { entry.path() };
-        if best
-            .as_ref()
-            .map(|(_, current)| version > *current)
-            .unwrap_or(true)
-        {
+        if best.as_ref().is_none_or(|(_, current)| version > *current) {
             best = Some((chosen, version));
         }
     }
@@ -1138,7 +1111,7 @@ fn link_target_file_pairs_at(
         }
         let file_name = source_root
             .file_name()
-            .map(|name| name.to_string_lossy().to_string())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         infer_source_script(&file_name, naming).ok_or_else(|| {
             anyhow::anyhow!("link source is not a Lua script: {}", source_root.display())
@@ -1151,7 +1124,7 @@ fn link_target_file_pairs_at(
     if !source_is_dir {
         let file_name = source_root
             .file_name()
-            .map(|name| name.to_string_lossy().to_string())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let (class_name, _, run_context) =
             infer_source_script(&file_name, naming).ok_or_else(|| {
@@ -1184,7 +1157,7 @@ fn link_target_file_pairs_at(
         let path = entry.path();
         let file_name = path
             .file_name()
-            .map(|name| name.to_string_lossy().to_string())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let Some((class_name, leaf_name, run_context)) = infer_source_script(&file_name, naming)
         else {
@@ -1284,7 +1257,7 @@ fn resolve_link_targets(
             let mut entry = ResolvedLinkTarget {
                 link_id: link.id.clone(),
                 read_only: link.read_only,
-                source_is_local: link.source.is_local(),
+                source_is_local: matches!(link.source, LinkSource::Local { .. }),
                 resolved_ref: None,
                 service: target.service.clone(),
                 target_segments: segments,
@@ -1310,10 +1283,9 @@ fn resolve_link_targets(
                     continue;
                 }
             };
-            entry.storage = Some(storage.clone());
             match &source {
                 Ok((source_root, is_dir, resolved_ref)) => {
-                    entry.resolved_ref = resolved_ref.clone();
+                    entry.resolved_ref.clone_from(resolved_ref);
                     entry.source_path = Some(source_root.clone());
                     if !is_dir && is_package_path(source_root) {
                         if storage.settings_file.is_some() {
@@ -1336,33 +1308,33 @@ fn resolve_link_targets(
                                 target.service,
                                 link_target_segments(target).join(".")
                             ));
-                            resolved.push(entry);
-                            continue;
-                        }
-                        let containment_root = if storage.source_root.is_file() {
-                            storage.source_root.parent().unwrap_or(project_root)
                         } else {
-                            &storage.source_root
-                        };
-                        match link_target_file_pairs_at(
-                            target,
-                            source_root,
-                            *is_dir,
-                            &storage.naming,
-                            &storage.target_path,
-                            containment_root,
-                            storage.source_is_file,
-                        ) {
-                            Ok(files) => {
-                                entry.resolved = true;
-                                entry.files = files;
+                            let containment_root = if storage.source_root.is_file() {
+                                storage.source_root.parent().unwrap_or(project_root)
+                            } else {
+                                &storage.source_root
+                            };
+                            match link_target_file_pairs_at(
+                                target,
+                                source_root,
+                                *is_dir,
+                                &storage.naming,
+                                &storage.target_path,
+                                containment_root,
+                                storage.source_is_file,
+                            ) {
+                                Ok(files) => {
+                                    entry.resolved = true;
+                                    entry.files = files;
+                                }
+                                Err(error) => entry.unresolved_reason = Some(error.to_string()),
                             }
-                            Err(error) => entry.unresolved_reason = Some(error.to_string()),
                         }
                     }
                 }
                 Err(error) => entry.unresolved_reason = Some(error.to_string()),
             }
+            entry.storage = Some(storage);
             resolved.push(entry);
         }
     }
@@ -1374,20 +1346,15 @@ fn ensure_editor_container_path(
     service: &str,
     segments_after_service: &[String],
 ) -> Result<usize> {
-    let root_index = match editor_service_root_index(document, service) {
-        Some(index) => index,
-        None => {
-            document.instances.push(SettingsBytecodeInstance {
-                settings_id: "editor:0".to_string(),
-                name: service.to_string(),
-                class_name: service.into(),
-                parent_index: None,
-                properties: Map::new(),
-                attributes: Map::new(),
-            });
-            document.instances.len() - 1
-        }
-    };
+    let root_index = editor_service_root_index(document, service).unwrap_or_else(|| {
+        document.instances.push(SettingsBytecodeInstance::new(
+            "editor:0".to_string(),
+            service.to_string(),
+            service.into(),
+            None,
+        ));
+        document.instances.len() - 1
+    });
     let mut current = root_index;
     for component in segments_after_service {
         if let Some(child) = editor_child_by_stem(document, current, component) {
@@ -1396,14 +1363,7 @@ fn ensure_editor_container_path(
         }
         let added = instance_api::add_instance(
             document,
-            AddInstanceSpec {
-                settings_id: None,
-                name: component.clone(),
-                class_name: "Folder".to_string(),
-                parent_index: Some(current),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(None, component.clone(), "Folder".to_string(), Some(current)),
         )?;
         current = added.index;
     }
@@ -1494,12 +1454,14 @@ fn prepare_external_package_references(
     document: &mut SettingsBytecode,
     removed: &HashSet<usize>,
     preserved: &HashMap<usize, String>,
+    label: &str,
 ) -> Result<()> {
     fn normalize_ref(
         object: &mut Map<String, Value>,
         refs: &BytecodeCloneRefMap,
         removed: &HashSet<usize>,
         preserved: &HashMap<usize, String>,
+        label: &str,
     ) -> Result<()> {
         let Some(index) = ref_old_index(object, refs) else {
             return Ok(());
@@ -1509,7 +1471,7 @@ fn prepare_external_package_references(
         }
         let settings_id = preserved.get(&index).with_context(|| {
             format!(
-                "Package replacement would remove externally referenced instance {}",
+                "{label} replacement would remove externally referenced instance {}",
                 refs.old_index_by_settings_id
                     .iter()
                     .find_map(|(settings_id, candidate)| {
@@ -1530,24 +1492,25 @@ fn prepare_external_package_references(
         refs: &BytecodeCloneRefMap,
         removed: &HashSet<usize>,
         preserved: &HashMap<usize, String>,
+        label: &str,
     ) -> Result<()> {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    visit(value, refs, removed, preserved)?;
+                    visit(value, refs, removed, preserved, label)?;
                 }
             }
             Value::Object(object) => {
                 if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-                    normalize_ref(object, refs, removed, preserved)?;
+                    normalize_ref(object, refs, removed, preserved, label)?;
                     return Ok(());
                 }
                 if let Some(Value::Object(reference)) = object.get_mut("Ref") {
-                    normalize_ref(reference, refs, removed, preserved)?;
+                    normalize_ref(reference, refs, removed, preserved, label)?;
                 }
                 for (key, value) in object.iter_mut() {
                     if key != "Ref" {
-                        visit(value, refs, removed, preserved)?;
+                        visit(value, refs, removed, preserved, label)?;
                     }
                 }
             }
@@ -1577,13 +1540,41 @@ fn prepare_external_package_references(
             continue;
         }
         for value in instance.properties.values_mut() {
-            visit(value, &refs, removed, preserved)?;
+            visit(value, &refs, removed, preserved, label)?;
         }
         for value in instance.attributes.values_mut() {
-            visit(value, &refs, removed, preserved)?;
+            visit(value, &refs, removed, preserved, label)?;
         }
     }
     Ok(())
+}
+
+fn prepare_package_replacement(
+    document: &mut SettingsBytecode,
+    subtree: &[usize],
+    preserved: &HashMap<usize, String>,
+    external_references: &HashSet<String>,
+    label: &str,
+) -> Result<()> {
+    let preserved_ids = preserved
+        .values()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Some(removed_id) = subtree
+        .iter()
+        .map(|index| document.instances[*index].settings_id.as_str())
+        .find(|settings_id| {
+            !preserved_ids.contains(*settings_id) && external_references.contains(*settings_id)
+        })
+    {
+        bail!("{label} replacement would remove externally referenced instance {removed_id}");
+    }
+    prepare_external_package_references(
+        document,
+        &subtree.iter().copied().collect(),
+        preserved,
+        label,
+    )
 }
 
 fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
@@ -1630,6 +1621,18 @@ fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
         }
     }
     output
+}
+
+fn referenced_settings_ids_outside(
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    excluded: &Path,
+) -> HashSet<String> {
+    let excluded = exact_path_key(excluded);
+    documents
+        .iter()
+        .filter(|(path, _)| exact_path_key(path) != excluded)
+        .flat_map(|(_, document)| referenced_settings_ids(document))
+        .collect()
 }
 
 fn collect_project_settings_files(
@@ -1682,6 +1685,47 @@ fn canonicalize_loaded_settings_documents(
             .get(&service)
             .context("Canonical settings store path disappeared")?;
         documents.insert(path.clone(), document);
+    }
+    Ok(())
+}
+
+fn load_settings_documents(
+    settings_files: &[PathBuf],
+) -> Result<(
+    HashMap<PathBuf, SettingsBytecode>,
+    HashMap<PathBuf, PathBuf>,
+)> {
+    let mut documents = HashMap::with_capacity(settings_files.len());
+    let mut outputs = HashMap::with_capacity(settings_files.len());
+    for path in settings_files {
+        documents.insert(
+            path.clone(),
+            SettingsBytecode::read_file(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?,
+        );
+        outputs.insert(path.clone(), path.clone());
+    }
+    canonicalize_loaded_settings_documents(&mut documents)?;
+    Ok((documents, outputs))
+}
+
+fn stage_settings_document_writes(
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    outputs: &HashMap<PathBuf, PathBuf>,
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    removals: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut settings_files = documents.keys().collect::<Vec<_>>();
+    settings_files.sort_unstable();
+    for settings_file in settings_files {
+        let output_file = &outputs[settings_file];
+        writes.insert(
+            output_file.clone(),
+            encode_settings_bytecode(&documents[settings_file])?,
+        );
+        if exact_path_key(output_file) != exact_path_key(settings_file) {
+            removals.push(settings_file.clone());
+        }
     }
     Ok(())
 }
@@ -1839,6 +1883,7 @@ fn materialize_package_root(
     Ok((planned_removals, new_settings_ids, removed_target))
 }
 
+#[derive(Clone, Copy)]
 struct PackageMaterialization<'a> {
     service_dir: &'a Path,
     service: &'a str,
@@ -1929,7 +1974,10 @@ fn materialize_package_target(
         let source_paths_before =
             build_editor_source_paths_by_index(document, service, service_dir);
         let paths_by_index = build_editor_instance_paths(document, service);
-        if let Some(info) = paths_by_index.get(existing).and_then(|info| info.clone()) {
+        if let Some(info) = paths_by_index
+            .get(existing)
+            .and_then(std::clone::Clone::clone)
+        {
             removed_target = json!({
                 "settingsId": document.instances[existing].settings_id.clone(),
                 "className": document.instances[existing].class_name.clone(),
@@ -1941,24 +1989,12 @@ fn materialize_package_target(
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children, existing, &mut subtree);
         identity = package_identity_matches(document, existing, &package, package_root, false);
-        let preserved_ids = identity
-            .by_existing_index
-            .values()
-            .cloned()
-            .collect::<HashSet<_>>();
-        if let Some(removed_id) = subtree
-            .iter()
-            .map(|index| document.instances[*index].settings_id.as_str())
-            .find(|settings_id| {
-                !preserved_ids.contains(*settings_id) && external_references.contains(*settings_id)
-            })
-        {
-            bail!("Package replacement would remove externally referenced instance {removed_id}");
-        }
-        prepare_external_package_references(
+        prepare_package_replacement(
             document,
-            &subtree.iter().copied().collect(),
+            &subtree,
             &identity.by_existing_index,
+            external_references,
+            "Package",
         )?;
         let removed =
             instance_api::remove_instance(document, InstanceSelector::Index(existing), true)?;
@@ -2359,7 +2395,7 @@ fn package_target_settings_ids(
         .collect()
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct LinkEnforcement {
     mirror_to_canonical: HashMap<String, (PathBuf, bool)>,
     canonical_to_mirrors: HashMap<String, Vec<PathBuf>>,
@@ -2367,7 +2403,6 @@ pub(super) struct LinkEnforcement {
     active: bool,
 }
 
-#[derive(Debug)]
 pub(super) struct ReadOnlyPackageEnforcement {
     pub(super) link_id: String,
     pub(super) service: String,
@@ -2566,8 +2601,7 @@ pub(super) fn apply_link_enforcement_to_changed_paths(
                 let read_only = enforcement
                     .mirror_to_canonical
                     .get(&link_path_key(mirror))
-                    .map(|(_, read_only)| *read_only)
-                    .unwrap_or(true);
+                    .is_none_or(|(_, read_only)| *read_only);
                 if read_only {
                     set_path_readonly(mirror, true)?;
                 }

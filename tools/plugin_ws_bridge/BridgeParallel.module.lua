@@ -27,11 +27,7 @@ function BridgeParallel.getParallelChunkWorkerCount(totalItems, minItems)
 	if totalItems < minItems then
 		return 1
 	end
-	return math.clamp(
-		math.ceil(totalItems / PARALLEL_TARGET_ITEMS_PER_WORKER),
-		1,
-		MAX_PARALLEL_CHUNK_WORKERS
-	)
+	return math.clamp(math.ceil(totalItems / PARALLEL_TARGET_ITEMS_PER_WORKER), 1, MAX_PARALLEL_CHUNK_WORKERS)
 end
 
 function BridgeParallel.runParallelChunks(totalItems, workerCount, job)

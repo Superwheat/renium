@@ -60,7 +60,7 @@ local function trim(value)
 	return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
 end
 
-local function normalizePorts(values, maximumCount)
+local function normalizePorts(values)
 	if type(values) ~= "table" then
 		return nil
 	end
@@ -71,42 +71,24 @@ local function normalizePorts(values, maximumCount)
 		end
 		count += 1
 	end
-	if count < maximumCount or count ~= #values then
+	if count < MAX_BRIDGE_PORTS or count ~= #values then
 		return nil
 	end
-	local out = table.create(math.min(count, maximumCount))
+	local out = table.create(MAX_BRIDGE_PORTS)
 	local seen = {}
 	for _, port in ipairs(values) do
-		if
-			type(port) ~= "number"
-			or port ~= port
-			or port % 1 ~= 0
-			or port < 1
-			or port > 65535
-		then
+		if type(port) ~= "number" or port ~= port or port % 1 ~= 0 or port < 1 or port > 65535 then
 			return nil
 		end
 		if not seen[port] then
-			if #out >= maximumCount then
+			if #out == MAX_BRIDGE_PORTS then
 				return nil
 			end
 			seen[port] = true
 			out[#out + 1] = port
 		end
 	end
-	return if #out == maximumCount then out else nil
-end
-
-local function isDefaultPortSequence(values)
-	if #values ~= MAX_BRIDGE_PORTS then
-		return false
-	end
-	for index, port in ipairs(values) do
-		if port ~= 8780 + index then
-			return false
-		end
-	end
-	return true
+	return if #out == MAX_BRIDGE_PORTS then out else nil
 end
 
 function BridgeSettings.normalizeLoopbackHost(raw)
@@ -136,7 +118,7 @@ function BridgeSettings.parsePortsCsv(raw)
 		end
 		out[#out + 1] = num
 	end
-	return normalizePorts(out, MAX_BRIDGE_PORTS)
+	return normalizePorts(out)
 end
 
 function BridgeSettings.loadHost(plugin, prefix, defaultHost)
@@ -152,29 +134,18 @@ end
 
 function BridgeSettings.loadPorts(plugin, prefix, defaultPorts)
 	local configuredPorts = plugin:GetSetting(prefix .. "ports")
-	local valid = normalizePorts(configuredPorts, MAX_BRIDGE_PORTS)
-	if valid then
-		if isDefaultPortSequence(valid) and isDefaultPortSequence(defaultPorts) then
-			return defaultPorts
-		end
-		return valid
-	end
-	return defaultPorts
+	return normalizePorts(configuredPorts) or defaultPorts
 end
 
 function BridgeSettings.saveHostPorts(plugin, prefix, host, ports)
 	local normalizedHost = BridgeSettings.normalizeLoopbackHost(host)
-	local normalizedPorts = normalizePorts(ports, MAX_BRIDGE_PORTS)
+	local normalizedPorts = normalizePorts(ports)
 	if not normalizedHost or not normalizedPorts then
 		return false
 	end
 	plugin:SetSetting(prefix .. "host", normalizedHost)
 	plugin:SetSetting(prefix .. "ports", normalizedPorts)
 	return true
-end
-
-local function runtimeDefaults()
-	return table.clone(RUNTIME_DEFAULTS)
 end
 
 function BridgeSettings.normalizeRuntimeSetting(key, value)
@@ -205,7 +176,7 @@ function BridgeSettings.normalizeRuntimeSetting(key, value)
 end
 
 function BridgeSettings.loadRuntimeSettings(plugin, prefix)
-	local out = runtimeDefaults()
+	local out = table.clone(RUNTIME_DEFAULTS)
 	local explicit = {}
 	for key in pairs(out) do
 		local stored = plugin:GetSetting(prefix .. key)

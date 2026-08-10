@@ -21,8 +21,6 @@ use super::daemon_control::{
     studio_device_daemon_args, try_daemon_control_request,
 };
 use super::input_inject;
-#[cfg(windows)]
-use super::local_transport::pid_for_local_tcp_port;
 use super::output::{automation_token, ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
 use super::snapshot_export::parse_bridge_ports;
 use super::snapshot_import::parse_services;
@@ -31,17 +29,21 @@ use super::timing::current_millis;
 mod console;
 pub(super) use console::{get_console_output_command, get_console_output_result};
 
+fn console_entry_level(entry: &Value) -> &str {
+    entry
+        .get("type")
+        .or_else(|| entry.get("level"))
+        .and_then(Value::as_str)
+        .unwrap_or("output")
+}
+
 pub(super) fn execute_luau_command(args: ExecuteLuauArgs) -> Result<()> {
     if let Some(result) = try_daemon_control_request("lx", execute_luau_daemon_args(&args))? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let target = if args.client || args.player.is_some() {
-        BridgeTarget::Client
-    } else {
-        BridgeTarget::Main
-    };
+    let target = BridgeTarget::main_or_client(args.client || args.player.is_some());
     let (bridge, _listen_metrics) = BridgeServer::listen_with_initial_wait(
         &args.bridge.host,
         &ports,
@@ -49,11 +51,7 @@ pub(super) fn execute_luau_command(args: ExecuteLuauArgs) -> Result<()> {
         false,
     )?;
     bridge.wait_for_target(args.bridge.wait_seconds, target)?;
-    execute_luau_with_warm_bridge(args, &bridge)
-}
-
-fn execute_luau_with_warm_bridge(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<()> {
-    let result = execute_luau_result(args, bridge)?;
+    let result = execute_luau_result(args, &bridge)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -83,11 +81,7 @@ pub(super) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     validate_luau_syntax(&code)?;
     let client = args.client || args.player.is_some();
     let timeout = args.timeout.clamp(0.1, 20.0);
-    let target = if client {
-        BridgeTarget::Client
-    } else {
-        BridgeTarget::Main
-    };
+    let target = BridgeTarget::main_or_client(client);
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
@@ -202,11 +196,7 @@ pub(super) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    start_stop_play_with_warm_bridge(args, &bridge)
-}
-
-fn start_stop_play_with_warm_bridge(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result<()> {
-    let result = start_stop_play_result(args, bridge)?;
+    let result = start_stop_play_result(args, &bridge)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -223,14 +213,7 @@ pub(super) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    studio_change_state_with_warm_bridge(args, &bridge)
-}
-
-fn studio_change_state_with_warm_bridge(
-    args: StudioChangeStateArgs,
-    bridge: &BridgeServer,
-) -> Result<()> {
-    let result = studio_change_state_result(args, bridge)?;
+    let result = studio_change_state_result(args, &bridge)?;
     println!(
         "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ {}",
         serde_json::to_string(&result)?
@@ -494,14 +477,7 @@ fn resolve_player_window(
     player: Option<&str>,
     viewport: Option<(i32, i32)>,
 ) -> Result<(input_inject::StudioWindow, i32, i32)> {
-    let peer = bridge.peer_for_selector(BridgeTarget::Client, player)?;
-    let port: u16 = peer
-        .rsplit(':')
-        .next()
-        .and_then(|part| part.parse().ok())
-        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
-    let pid = pid_for_local_tcp_port(port)
-        .with_context(|| format!("Could not map bridge connection {peer} to a Studio process"))?;
+    let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
     let window = input_inject::window_for_pid(pid, viewport)?;
     Ok((window, 0, 0))
 }
@@ -556,14 +532,7 @@ fn resolve_edit_window(
     bridge: &BridgeServer,
     probe_target: BridgeTarget,
 ) -> Result<input_inject::StudioWindow> {
-    let peer = bridge.peer_for_selector(BridgeTarget::Edit, None)?;
-    let port: u16 = peer
-        .rsplit(':')
-        .next()
-        .and_then(|part| part.parse().ok())
-        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
-    let pid = pid_for_local_tcp_port(port)
-        .with_context(|| format!("Could not map bridge connection {peer} to a Studio process"))?;
+    let pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
     input_inject::verified_studio_window_for_pid(pid, |phase, colors| {
         set_capture_probe_phase(bridge, probe_target, phase, colors)
     })
@@ -758,16 +727,15 @@ fn calibrate_click_delta(
     x: i32,
     y: i32,
 ) -> (i32, i32) {
-    let start_seq = match read_client_probe_state(bridge, player) {
-        Ok((seq, _)) => seq,
-        Err(_) => {
-            thread::sleep(Duration::from_millis(200));
-            match read_client_probe_state(bridge, player) {
-                Ok((seq, _)) => seq,
-                Err(err) => {
-                    println!("[renium] warning: input calibration probe unavailable: {err:#}");
-                    return (0, 0);
-                }
+    let start_seq = if let Ok((seq, _)) = read_client_probe_state(bridge, player) {
+        seq
+    } else {
+        thread::sleep(Duration::from_millis(200));
+        match read_client_probe_state(bridge, player) {
+            Ok((seq, _)) => seq,
+            Err(err) => {
+                println!("[renium] warning: input calibration probe unavailable: {err:#}");
+                return (0, 0);
             }
         }
     };
@@ -891,11 +859,7 @@ pub(super) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
 pub(super) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let player = args.player.as_deref();
-    let target = if client {
-        BridgeTarget::Client
-    } else {
-        BridgeTarget::Main
-    };
+    let target = BridgeTarget::main_or_client(client);
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
@@ -1623,8 +1587,7 @@ pub(super) fn test_command(args: TestArgs) -> Result<()> {
         let count = result
             .get("errors")
             .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0);
+            .map_or(0, Vec::len);
         bail!("Test console reported {count} error(s)");
     }
     Ok(())
@@ -1666,7 +1629,7 @@ fn ingest_test_console_payload(
         .and_then(|cursor| cursor.epoch.clone());
     if previous_epoch.is_some() && previous_epoch != next_epoch {
         let cursor = capture.cursors.entry(runtime_id.to_string()).or_default();
-        cursor.epoch = next_epoch.clone();
+        cursor.epoch.clone_from(&next_epoch);
         cursor.seq = 0;
         if restart_on_epoch_change {
             return true;
@@ -1675,8 +1638,7 @@ fn ingest_test_console_payload(
     let previous_seq = capture
         .cursors
         .get(runtime_id)
-        .map(|cursor| cursor.seq)
-        .unwrap_or(0);
+        .map_or(0, |cursor| cursor.seq);
     let mut highest_seq = previous_seq;
     if let Some(entries) = console.get("entries").and_then(Value::as_array) {
         for entry in entries {
@@ -1687,11 +1649,7 @@ fn ingest_test_console_payload(
             if let Some(seq) = entry_seq {
                 highest_seq = highest_seq.max(seq);
             }
-            let level = entry
-                .get("type")
-                .or_else(|| entry.get("level"))
-                .and_then(Value::as_str)
-                .unwrap_or("output");
+            let level = console_entry_level(entry);
             let message = entry
                 .get("message")
                 .and_then(Value::as_str)
@@ -1747,8 +1705,7 @@ fn drain_test_console(
         let cursor_seq = capture
             .cursors
             .get(runtime_id)
-            .map(|cursor| cursor.seq)
-            .unwrap_or(0);
+            .map_or(0, |cursor| cursor.seq);
         let console = bridge.call_for_runtime_with_timeout(
             "getConsoleOutput",
             json!({
@@ -1771,8 +1728,7 @@ fn drain_test_console(
         let next_seq = capture
             .cursors
             .get(runtime_id)
-            .map(|cursor| cursor.seq)
-            .unwrap_or(0);
+            .map_or(0, |cursor| cursor.seq);
         if next_seq <= cursor_seq {
             bail!("Studio console page cursor did not advance");
         }
@@ -1820,9 +1776,7 @@ fn drain_test_consoles(
             .get("playerName")
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty());
-        let label = player
-            .map(|name| format!("{role}:{name}"))
-            .unwrap_or_else(|| role.to_string());
+        let label = player.map_or_else(|| role.to_string(), |name| format!("{role}:{name}"));
         drain_test_console(bridge, target, runtime_id, &label, capture, deadline)?;
     }
     for final_snapshot in bridge.take_final_console_snapshots(launch) {
@@ -1838,9 +1792,7 @@ fn drain_test_consoles(
             .get("playerName")
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty());
-        let label = player
-            .map(|name| format!("{role}:{name}"))
-            .unwrap_or_else(|| role.to_string());
+        let label = player.map_or_else(|| role.to_string(), |name| format!("{role}:{name}"));
         if let Some(snapshot) = final_snapshot.get("snapshot") {
             ingest_test_console_payload(runtime_id, &label, capture, snapshot, false);
         }

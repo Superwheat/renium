@@ -27,13 +27,21 @@ function BridgeStatus.view(state)
 
 	local mode = if openChannels > 0
 		then "connected"
-		elseif connectRequested or connectingChannels > 0 or string.find(connectionStatus, "Connecting", 1, true)
+		elseif
+			connectRequested
+			or connectingChannels > 0
+			or string.find(connectionStatus, "Connecting", 1, true)
 		then "connecting"
 		else "disconnected"
 
-	local title = if mode == "connected" then "Connected" elseif mode == "connecting" then "Connecting..." else "Disconnected"
+	local title = if mode == "connected"
+		then "Connected"
+		elseif mode == "connecting" then "Connecting..."
+		else "Disconnected"
 	local subtitle = if mode == "disconnected" and pendingEditCount > 0
-		then if pendingEditCount == 1 then "One Studio edit is waiting to sync." else `{pendingEditCount} Studio edits are waiting to sync.`
+		then if pendingEditCount == 1
+			then "One Studio edit is waiting to sync."
+			else `{pendingEditCount} Studio edits are waiting to sync.`
 		elseif mode == "connected" or mode == "connecting" then ""
 		elseif connectionStatus == "Disconnected" or connectionStatus == "Another Renium session is active" then ""
 		else connectionStatus

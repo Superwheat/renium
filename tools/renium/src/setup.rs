@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use serde_json::Value;
 use serde_json::json;
 
 use super::build_info::VERSION as BUILD_VERSION;
@@ -16,6 +18,15 @@ use super::studio_native_serializer;
 
 const GITHUB_REPO: &str = "Superwheat/renium";
 pub(crate) const PLUGIN_ASSET_NAME: &str = "Renium.rbxm";
+
+#[cfg(target_os = "macos")]
+fn response_with(mut response: Value, key: &str, value: Value) -> Value {
+    response
+        .as_object_mut()
+        .expect("setup response is an object")
+        .insert(key.to_string(), value);
+    response
+}
 
 pub(crate) fn roblox_plugins_dir() -> Result<PathBuf> {
     #[cfg(windows)]
@@ -95,12 +106,10 @@ pub(crate) fn validate_rbxm_version(bytes: &[u8], expected: &str) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn plugin_release_url(version: &str) -> String {
-    format!("https://github.com/{GITHUB_REPO}/releases/download/v{version}/{PLUGIN_ASSET_NAME}")
-}
-
 fn download_compatible_plugin(destination: &Path) -> Result<String> {
-    let url = plugin_release_url(BUILD_VERSION);
+    let url = format!(
+        "https://github.com/{GITHUB_REPO}/releases/download/v{BUILD_VERSION}/{PLUGIN_ASSET_NAME}"
+    );
     download_to_file(&url, destination).with_context(|| {
         format!(
             "Could not download the Studio plugin; check your network or pass --file with a local {PLUGIN_ASSET_NAME}"
@@ -204,17 +213,8 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<()> {
                 "installedVersion": installed_version,
             });
             #[cfg(target_os = "macos")]
-            let response = {
-                let mut response = response;
-                response
-                    .as_object_mut()
-                    .expect("setup response is an object")
-                    .insert(
-                        "wouldRemoveManagedStudio".to_string(),
-                        json!(managed_studio),
-                    );
-                response
-            };
+            let response =
+                response_with(response, "wouldRemoveManagedStudio", json!(managed_studio));
             return emit_global_output(
                 &response,
                 &format!("Would remove the Studio plugin at {}", target.display()),
@@ -281,17 +281,11 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<()> {
             "bytes": bytes.len(),
         });
         #[cfg(target_os = "macos")]
-        let response = {
-            let mut response = response;
-            response
-                .as_object_mut()
-                .expect("setup response is an object")
-                .insert(
-                    "wouldPrepareStudioAt".to_string(),
-                    json!(managed_studio.display().to_string()),
-                );
-            response
-        };
+        let response = response_with(
+            response,
+            "wouldPrepareStudioAt",
+            json!(managed_studio.display().to_string()),
+        );
         return emit_global_output(
             &response,
             &format!(
@@ -337,24 +331,15 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<()> {
         "note": "Restart Roblox Studio (or toggle the plugin) to load the new version",
     });
     #[cfg(target_os = "macos")]
-    let response = {
-        let mut response = response;
-        response
-            .as_object_mut()
-            .expect("setup response is an object")
-            .insert(
-                "managedStudio".to_string(),
-                json!(managed_studio.display().to_string()),
-            );
-        response
-            .as_object_mut()
-            .expect("setup response is an object")
-            .insert(
-                "note".to_string(),
-                json!("Open Renium Studio from Applications to use exact protected-property sync"),
-            );
-        response
-    };
+    let response = response_with(
+        response_with(
+            response,
+            "managedStudio",
+            json!(managed_studio.display().to_string()),
+        ),
+        "note",
+        json!("Open Renium Studio from Applications to use exact protected-property sync"),
+    );
     emit_global_output(
         &response,
         &format!(

@@ -170,7 +170,6 @@ function getFilterLogic(options: PropertiesHtmlOptions): string {
 		const category = (prop.category || "Other").toString().toLowerCase();
 		const type = (prop.type || "").toString().toLowerCase();
 		return name.includes(filterText) || category.includes(filterText) || type.includes(filterText);`;
-    } else {
-        return `return true;`;
     }
+    return `return true;`;
 }

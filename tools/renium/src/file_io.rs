@@ -66,21 +66,37 @@ pub(super) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_reader(reader).with_context(|| format!("Invalid JSON in {}", path.display()))
 }
 
+pub(super) fn read_file_if_present(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    if path.is_file() {
+        fs::read(path).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn create_output_writer(path: &Path) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    File::create(path)
+        .map(BufWriter::new)
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
 pub(super) fn write_json_file<T: Serialize>(path: &Path, value: &T, compact: bool) -> Result<()> {
     if compact {
         write_json_streaming(path, value)
     } else {
         let value =
             serde_json::to_value(value).context("Failed to convert JSON value for formatting")?;
-        let serialized = serialize_pretty_json_with_inline_numeric_arrays(&value)?;
-        write_utf8_file(path, &(serialized + "\n"))
+        let mut serialized = String::new();
+        write_pretty_json_value(&value, 0, &mut serialized)?;
+        serialized.push('\n');
+        write_utf8_file(path, &serialized)
     }
-}
-
-fn serialize_pretty_json_with_inline_numeric_arrays(value: &Value) -> Result<String> {
-    let mut out = String::new();
-    write_pretty_json_value(value, 0, &mut out)?;
-    Ok(out)
 }
 
 fn write_pretty_json_value(value: &Value, indent: usize, out: &mut String) -> Result<()> {
@@ -229,9 +245,7 @@ fn cleanup_stale_sibling_temps(path: &Path) {
 }
 
 fn publish_sibling_temp(temp_path: &Path, path: &Path) -> Result<()> {
-    let was_readonly = fs::metadata(path)
-        .map(|meta| meta.permissions().readonly())
-        .unwrap_or(false);
+    let was_readonly = fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly());
     publish_sibling_temp_with_permissions(temp_path, path, was_readonly)
 }
 
@@ -259,7 +273,7 @@ fn sibling_temp_path(path: &Path) -> PathBuf {
     let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = path
         .file_name()
-        .map(|value| value.to_os_string())
+        .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
     name.push(format!(".{}-{sequence}.renium-tmp", std::process::id()));
     path.with_file_name(name)
@@ -281,7 +295,7 @@ fn file_contents_match(path: &Path, content: &[u8]) -> Result<(bool, bool)> {
     let file = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let mut reader = BufReader::with_capacity(COMPARE_BUF_SIZE, file);
     let mut offset = 0usize;
-    let mut buffer = vec![0u8; COMPARE_BUF_SIZE.min(content.len().max(1))];
+    let mut buffer = vec![0u8; COMPARE_BUF_SIZE.min(content.len())];
     while offset < content.len() {
         let want = (content.len() - offset).min(buffer.len());
         reader
@@ -493,13 +507,17 @@ pub(super) fn unique_child_stem(
     }
 }
 
-pub(super) fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{hash:016x}")
+    hash
+}
+
+pub(super) fn fnv1a_hex(bytes: &[u8]) -> String {
+    format!("{:016x}", fnv1a(bytes))
 }
 
 pub(super) fn absolutize_under(root: &Path, path: &Path) -> PathBuf {

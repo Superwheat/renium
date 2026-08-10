@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 use super::editor_sync::is_lua_source_class;
 use super::project_config;
 use super::settings_bytecode::{
-    SettingsBytecode, reindex_reference_indices, visit_reference_objects_mut,
+    SettingsBytecode, reindex_reference_indices, stabilize_reference_objects,
+    visit_reference_objects_mut,
 };
 use super::snapshot_types::SnapshotInstance;
 
@@ -68,19 +69,16 @@ pub(super) fn settings_document_as_snapshot_instances(
                 name: current.name.clone(),
                 class_name: current.class_name.clone().into(),
                 properties,
-                source_key: None,
                 parent_path: current
                     .parent_index
                     .map(|parent| settings_instance_path(document, parent)),
                 attributes,
-                debug_id: None,
-                parent_debug_id: None,
                 instance_id: Some(current.settings_id.clone()),
                 parent_instance_id: current
                     .parent_index
                     .map(|parent| document.instances[parent].settings_id.clone()),
                 instance_index: current.parent_index.is_none().then_some(1),
-                parent_index: None,
+                ..Default::default()
             }
         })
         .collect()
@@ -102,19 +100,10 @@ pub(super) fn reindex_snapshot_references(
 }
 
 pub(super) fn stabilize_record_references(record: &mut Map<String, Value>, ids: &[String]) {
-    visit_reference_objects_mut(record, |object| {
-        if object.get("settingsId").and_then(Value::as_str).is_none()
-            && object.get("instanceId").and_then(Value::as_str).is_none()
-            && let Some(index) = object
-                .get("instanceIndex")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-                .and_then(|index| index.checked_sub(1))
-            && let Some(id) = ids.get(index)
-        {
+    stabilize_reference_objects(record, |object, index| {
+        if let Some(id) = ids.get(index) {
             object.insert("settingsId".to_string(), Value::String(id.clone()));
         }
-        object.remove("instanceIndex");
     });
 }
 
@@ -122,31 +111,15 @@ pub(super) fn remap_record_reference_ids(
     record: &mut Map<String, Value>,
     ids: &HashMap<String, String>,
 ) {
-    fn visit(value: &mut Value, ids: &HashMap<String, String>) {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    visit(value, ids);
-                }
+    visit_reference_objects_mut(record, |object| {
+        for key in ["settingsId", "instanceId"] {
+            if let Some(current) = object.get(key).and_then(Value::as_str)
+                && let Some(next) = ids.get(current)
+            {
+                object.insert(key.to_string(), Value::String(next.clone()));
             }
-            Value::Object(object) => {
-                for key in ["settingsId", "instanceId"] {
-                    if let Some(current) = object.get(key).and_then(Value::as_str)
-                        && let Some(next) = ids.get(current)
-                    {
-                        object.insert(key.to_string(), Value::String(next.clone()));
-                    }
-                }
-                for value in object.values_mut() {
-                    visit(value, ids);
-                }
-            }
-            _ => {}
         }
-    }
-    for value in record.values_mut() {
-        visit(value, ids);
-    }
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -189,15 +162,12 @@ fn syncback_filter_allows_one(
 ) -> Result<bool> {
     let fields =
         project_config::filter_candidate_fields(&instance.properties, &instance.attributes);
-    let candidate = project_config::FilterCandidate {
-        id: instance.instance_id.as_deref().unwrap_or(""),
-        path: &instance.path,
-        name: &instance.name,
-        class: &instance.class_name,
-        tags: &fields.tags,
-        attributes: &fields.attributes,
-        properties: &fields.properties,
-    };
+    let candidate = fields.candidate(
+        instance.instance_id.as_deref().unwrap_or(""),
+        &instance.path,
+        &instance.name,
+        &instance.class_name,
+    );
     match scope {
         SyncbackFilterScope::Instance => project_config::filter_allows_instance(
             filters,

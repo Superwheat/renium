@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rbx_dom_weak::types::{
@@ -44,7 +43,7 @@ use crate::rbx_model::{
     BytecodeModelExportRefs, BytecodeModelImportRefs,
 };
 use crate::settings_bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, settings_reference_index,
+    SettingsBytecode, SettingsBytecodeInstance, settings_reference_index, strict_reference_path,
 };
 
 #[derive(Default)]
@@ -168,8 +167,27 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             let property = property_metadata.property;
             let serialized_name = property_metadata.serialized_name.unwrap_or(name);
             let descriptor = property_metadata.descriptor;
-            let native_setter_property = property_metadata.native_setter_property;
-            if property.is_some() && descriptor.is_none() && !native_setter_property {
+            let unsupported = property.is_some()
+                && descriptor.is_none()
+                && !property_metadata.native_setter_property;
+            let variant = if unsupported {
+                None
+            } else {
+                json_to_rbx_property_variant(
+                    value,
+                    descriptor.or(property),
+                    self.database,
+                    self.refs,
+                )
+            };
+            let Some(variant) = variant else {
+                if !unsupported && options.omitted_properties_by_class.is_none() {
+                    bail!(
+                        "{} ({}) property {name} cannot be represented in a Roblox model",
+                        instance.name,
+                        instance.class_name
+                    );
+                }
                 if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut() {
                     omitted
                         .entry(instance.class_name.clone())
@@ -183,31 +201,6 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                     logical.insert(rbx_dom_weak::Ustr::from(name.as_str()), variant);
                 }
                 continue;
-            }
-            let Some(variant) = json_to_rbx_property_variant(
-                value,
-                descriptor.or(property),
-                self.database,
-                self.refs,
-            ) else {
-                if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut() {
-                    omitted
-                        .entry(instance.class_name.clone())
-                        .or_default()
-                        .insert(name.clone());
-                    if let Some(logical) = options.logical_omitted_properties.as_deref_mut()
-                        && let Some(variant) =
-                            json_to_rbx_property_variant(value, property, self.database, self.refs)
-                    {
-                        logical.insert(rbx_dom_weak::Ustr::from(name.as_str()), variant);
-                    }
-                    continue;
-                }
-                bail!(
-                    "{} ({}) property {name} cannot be represented in a Roblox model",
-                    instance.name,
-                    instance.class_name
-                );
             };
             builder.add_property(serialized_name, variant);
         }
@@ -367,14 +360,8 @@ pub(super) fn rbx_model_property_descriptor<'db>(
     class_name: &str,
     property_name: &str,
 ) -> Option<&'db RbxPropertyDescriptor<'db>> {
-    let class_descriptor = database.classes.get(class_name)?;
-    for class in database.superclasses_iter(class_descriptor) {
-        let Some(property) = class.properties.get(property_name) else {
-            continue;
-        };
-        return rbx_serialized_property_descriptor(class, property);
-    }
-    None
+    let (class, property) = rbx_class_property_descriptor(database, class_name, property_name)?;
+    rbx_serialized_property_descriptor(class, property)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -417,12 +404,22 @@ pub(super) fn rbx_property_descriptor<'db>(
     class_name: &str,
     property_name: &str,
 ) -> Option<&'db RbxPropertyDescriptor<'db>> {
+    rbx_class_property_descriptor(database, class_name, property_name).map(|(_, property)| property)
+}
+
+fn rbx_class_property_descriptor<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+    property_name: &str,
+) -> Option<(
+    &'db RbxClassDescriptor<'db>,
+    &'db RbxPropertyDescriptor<'db>,
+)> {
     let class_descriptor = database.classes.get(class_name)?;
     for class in database.superclasses_iter(class_descriptor) {
-        let Some(property) = class.properties.get(property_name) else {
-            continue;
-        };
-        return Some(property);
+        if let Some(property) = class.properties.get(property_name) {
+            return Some((class, property));
+        }
     }
     None
 }
@@ -682,7 +679,7 @@ fn json_to_rbx_inferred_variant(
             Some("SecurityCapabilities") => {
                 json_to_rbx_security_capabilities(value).map(RbxVariant::SecurityCapabilities)
             }
-            Some("Enum") | Some("EnumItem") => json_to_rbx_enum_variant(value, None, database),
+            Some("Enum" | "EnumItem") => json_to_rbx_enum_variant(value, None, database),
             Some("Ref") => Some(RbxVariant::Ref(json_to_rbx_ref(value, refs))),
             _ => object
                 .get("NumberRange")
@@ -720,15 +717,7 @@ pub(crate) fn normalize_project_typed_value(
 ) -> Result<Value> {
     let database =
         rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
-    let export_refs = BytecodeModelExportRefs {
-        by_index: HashMap::new(),
-        by_settings_id: HashMap::new(),
-        global_by_settings_id: None,
-        by_path_key: HashMap::new(),
-        global_by_path_key: None,
-        by_path_segments_key: HashMap::new(),
-        global_by_path_segments_key: None,
-    };
+    let export_refs = BytecodeModelExportRefs::default();
     let descriptor = class_name
         .zip(property_name)
         .and_then(|(class_name, property_name)| {
@@ -742,14 +731,7 @@ pub(crate) fn normalize_project_typed_value(
         }
         bail!("Value cannot be represented as a Roblox property literal");
     };
-    let import_refs = BytecodeModelImportRefs {
-        new_index_by_ref: HashMap::new(),
-        new_index_by_dense_ref: None,
-        settings_id_by_ref: HashMap::new(),
-        path_segments_by_index: Vec::new(),
-        path_segments_by_ref: Arc::new(HashMap::new()),
-        path_ordinals_by_ref: Arc::new(HashMap::new()),
-    };
+    let import_refs = BytecodeModelImportRefs::default();
     rbx_variant_to_settings_json(&variant, descriptor, database, &import_refs)
         .context("Roblox property literal isn't supported by Renium")
 }
@@ -1256,41 +1238,13 @@ fn strict_model_export_ref(
             )?;
         }
     }
-    if let Some(value) = object.get("pathSegments") {
-        let segments = value
-            .as_array()
-            .context("Ref pathSegments must be an array")?
-            .iter()
-            .map(|segment| {
-                segment
-                    .as_str()
-                    .map(str::to_string)
-                    .context("Ref pathSegments must contain strings")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let candidate = if let Some(value) = object.get("pathOrdinals") {
-            let ordinals = value
-                .as_array()
-                .context("Ref pathOrdinals must be an array")?
-                .iter()
-                .map(|ordinal| {
-                    ordinal
-                        .as_u64()
-                        .and_then(|ordinal| usize::try_from(ordinal).ok())
-                        .filter(|ordinal| *ordinal > 0)
-                        .context("Ref pathOrdinals must contain positive integers")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if segments.len() != ordinals.len() {
-                bail!("Ref pathOrdinals must match pathSegments length");
-            }
+    if let Some((segments, ordinals)) = strict_reference_path(object)? {
+        let candidate = if let Some(ordinals) = ordinals {
             model_export_ref_by_path_key(refs, &instance_path_parts_key(&segments, &ordinals))
         } else {
             model_export_ref_by_path_segments_key(refs, &instance_path_key(&segments))
         };
         accept_model_export_ref(&mut resolved, "pathSegments", candidate)?;
-    } else if object.contains_key("pathOrdinals") {
-        bail!("Ref pathOrdinals require pathSegments");
     }
     if let Some(value) = object.get("instanceIndex") {
         let index = settings_reference_index(value).context("Ref instanceIndex must be 1-based")?;

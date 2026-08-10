@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::command_line::Cli;
 use crate::timing::current_millis;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) enum OutputMode {
     Compact,
     Summary,
@@ -23,10 +23,6 @@ impl OutputMode {
             "full" | "f" => Ok(Self::Full),
             other => bail!("Invalid output mode: {other}. Use compact, summary, detail, or full."),
         }
-    }
-
-    pub(crate) fn includes_full_ids(self) -> bool {
-        matches!(self, Self::Detail | Self::Full)
     }
 
     pub(crate) fn uses_short_keys(self) -> bool {

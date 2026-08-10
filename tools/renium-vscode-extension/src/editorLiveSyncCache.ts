@@ -9,14 +9,14 @@ type EditorLiveSyncHashObservation = {
   hash: string | undefined;
 };
 
-export type EditorLiveSyncHashCache = {
+type EditorLiveSyncHashCache = {
   version: number;
   projectRoot: string;
   updatedAtUnixMs: number;
   files: Record<string, string>;
 };
 
-export function editorLiveSyncCachePath(projectRoot: string): string {
+function editorLiveSyncCachePath(projectRoot: string): string {
   return path.join(projectRoot, ".renium", "editor-live-sync-cache.json");
 }
 

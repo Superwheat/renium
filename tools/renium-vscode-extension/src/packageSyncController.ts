@@ -50,7 +50,7 @@ export type LinkSyncConfig = {
   applyToStudio: "ask" | "always" | "never";
 };
 
-export type PackageSyncControllerConfig = {
+type PackageSyncControllerConfig = {
   cliPath: string;
   projectRoot: string;
   srcDir: string;
@@ -106,7 +106,7 @@ type CliSyncWallyPackagesResult = {
   realms?: CliWallyRealmResult[];
 };
 
-export type CliLinkApplyResult = {
+type CliLinkApplyResult = {
   ok?: boolean;
   check?: boolean;
   appliedTargets?: number;
@@ -116,7 +116,7 @@ export type CliLinkApplyResult = {
   warnings?: string[];
 };
 
-export type CliLinkStatusResult = {
+type CliLinkStatusResult = {
   ok?: boolean;
   manifest?: string;
   manifestExists?: boolean;
@@ -162,7 +162,7 @@ type PackageDeleteRequest = {
   pathOrdinals?: number[];
 };
 
-export type PackageSyncControllerHost<TConfig extends PackageSyncControllerConfig> = {
+type PackageSyncControllerHost<TConfig extends PackageSyncControllerConfig> = {
   output: vscode.OutputChannel;
   getConfig: () => TConfig;
   tryGetConfig: () => TConfig | undefined;
@@ -576,7 +576,16 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       : path.join(cfg.projectRoot, cfg.linkSync.manifest);
   }
 
-  public activeLinkManifest(generation: number): {
+  private linkCommandArgs(cfg: TConfig, command: string, includeSource = true): string[] {
+    const args = [command, "-r", cfg.projectRoot];
+    if (includeSource) {
+      args.push("-d", cfg.srcDir);
+    }
+    args.push("--manifest", cfg.linkSync.manifest);
+    return args;
+  }
+
+  public activeLinkManifest(): {
     filePath: string;
     autoApply: boolean;
     projectRoot: string;
@@ -587,7 +596,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       filePath: path.normalize(this.linkManifestPath(config)),
       autoApply: config.linkSync.autoApply,
       projectRoot: config.projectRoot,
-      generation,
+      generation: this.host.experienceGeneration(),
     };
   }
 
@@ -617,19 +626,13 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       }
       const command = cfg.cliPath;
       ensureFileExists(command);
-      const args = [
-        "link-apply",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
+      const args = this.linkCommandArgs(cfg, "link-apply");
+      args.push(
         "--git-path",
         cfg.linkSync.gitPath,
         "--wally-path",
         cfg.linkSync.wallyPath,
-      ];
+      );
       if (cfg.linkSync.offline) {
         args.push("--offline");
       }
@@ -751,19 +754,13 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       const cfg = this.host.getConfig();
       const command = cfg.cliPath;
       ensureFileExists(command);
-      const args = [
-        "link-break",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
+      const args = this.linkCommandArgs(cfg, "link-break");
+      args.push(
         "--service",
         service,
         "--path",
         JSON.stringify(pathSegments),
-      ];
+      );
       if (cfg.linkSync.cacheDir.length > 0) {
         args.push("--cache-dir", cfg.linkSync.cacheDir);
       }
@@ -886,13 +883,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
     failure: string;
   }): Promise<void> {
     const cfg = this.host.getConfig();
-    const args = [
-      "link-add",
-      "-r",
-      cfg.projectRoot,
-      "--manifest",
-      cfg.linkSync.manifest,
-    ];
+    const args = this.linkCommandArgs(cfg, "link-add", false);
     const add = (flag: string, value: string | undefined): void => {
       if (value) {
         args.push(flag, value);
@@ -1218,19 +1209,13 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       const cfg = this.host.getConfig();
       const command = cfg.cliPath;
       ensureFileExists(command);
-      const args = [
-        "link-pack",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
+      const args = this.linkCommandArgs(cfg, "link-pack");
+      args.push(
         "--service",
         service,
         "--path",
         JSON.stringify(pathSegments),
-      ];
+      );
       if (cfg.linkSync.folder) {
         args.push("--link-folder", cfg.linkSync.folder);
       }
@@ -1640,19 +1625,13 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       const cfg = this.host.getConfig();
       const command = cfg.cliPath;
       ensureFileExists(command);
-      const args = [
-        "link-delete-package",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
+      const args = this.linkCommandArgs(cfg, "link-delete-package");
+      args.push(
         "--id",
         fresh.id ?? "",
         "--action",
         action,
-      ];
+      );
       const run = await this.host.runCommand(command, args, cfg.projectRoot, "link-delete-package", cfg.progressHeartbeatSeconds, { quietLog: true });
       if (run.code !== 0) {
         throw new Error("Couldn't delete the package. Check the Renium output panel for details.");
@@ -1780,15 +1759,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       if (!fs.existsSync(command)) {
         return { kind: "failed", error: `Renium CLI not found: ${command}` };
       }
-      const args = [
-        "link-status",
-        "-r",
-        cfg.projectRoot,
-        "-d",
-        cfg.srcDir,
-        "--manifest",
-        cfg.linkSync.manifest,
-      ];
+      const args = this.linkCommandArgs(cfg, "link-status");
       if (cfg.linkSync.cacheDir.length > 0) {
         args.push("--cache-dir", cfg.linkSync.cacheDir);
       }

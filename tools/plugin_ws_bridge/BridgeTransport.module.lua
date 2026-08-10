@@ -29,7 +29,7 @@ function BridgeTransport.sendEnvelope(client, envelope)
 end
 
 local function isRawChunkResult(method, result)
-	return RAW_CHUNK_METHODS[method] == true
+	return RAW_CHUNK_METHODS[method]
 		and type(result) == "table"
 		and type(result.chunk) == "string"
 		and type(result.nextStart) == "number"
@@ -53,7 +53,8 @@ local function sendRawChunkResponse(client, id, result, serverMs)
 	)
 	local payload = type(result.chunk) == "string" and result.chunk or ""
 	if #payload > MAX_RAW_CHUNK_BYTES then
-		return false, ("Bridge chunk exceeds safe size limit (%d bytes; maximum is %d)"):format(#payload, MAX_RAW_CHUNK_BYTES)
+		return false,
+			("Bridge chunk exceeds safe size limit (%d bytes; maximum is %d)"):format(#payload, MAX_RAW_CHUNK_BYTES)
 	end
 	local sent, sendErr = pcall(client.Send, client, header .. "\n" .. payload)
 	return sent, sendErr

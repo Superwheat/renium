@@ -252,10 +252,7 @@ function BridgeConnection.create(context)
 		local started = os.clock()
 		local exclusive = context.isExclusiveMethod(method)
 		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
-		local ownsSession = true
-		if sessionOwned then
-			ownsSession = context.validateSessionLock(sessionGeneration)
-		end
+		local ownsSession = not sessionOwned or context.validateSessionLock(sessionGeneration)
 		local okCall, result
 		if sessionOwned and not ownsSession then
 			okCall = false
@@ -460,13 +457,15 @@ function BridgeConnection.create(context)
 		task.spawn(executeRequest, channel, client, id, method, params, replayRequest, sessionGeneration)
 	end
 
+	local function reconnectAllowed(channel): boolean
+		return not pluginUnloading
+			and not Config.bridgePausedForPlay
+			and Config.bridgeConnectRequested
+			and channel.shouldReconnect
+	end
+
 	local function scheduleReconnect(channel)
-		if
-			pluginUnloading
-			or Config.bridgePausedForPlay
-			or not Config.bridgeConnectRequested
-			or not channel.shouldReconnect
-		then
+		if not reconnectAllowed(channel) then
 			return
 		end
 		if not autoReconnectEnabled() then
@@ -675,12 +674,7 @@ function BridgeConnection.create(context)
 	end
 
 	connectChannel = function(channel)
-		if
-			pluginUnloading
-			or Config.bridgePausedForPlay
-			or not Config.bridgeConnectRequested
-			or not channel.shouldReconnect
-		then
+		if not reconnectAllowed(channel) then
 			return
 		end
 		if not context.validateSessionLock(connectionSessionGeneration) then
@@ -762,19 +756,7 @@ function BridgeConnection.create(context)
 				id = nil,
 				ok = true,
 				event = "hello",
-				channel = channel.id,
-				version = context.bridgeVersion,
-				bridgeVersion = context.bridgeVersion,
-				runtimeId = Config.bridgeRuntimeId,
-				bridgeRole = Config.bridgeRole,
-				protocolVersion = context.protocolVersion,
-				codecVersion = context.codecVersion,
-				bridgeBuildUnix = context.bridgeBuildUnix,
-				chunkFrameProtocolVersion = context.chunkFrameProtocolVersion,
 				chunkSliceBudgetKb = 437,
-				compactValueProtocolVersion = context.compactValueProtocolVersion,
-				largeServiceWarmMode = context.preSerializeLargeServiceWarm and "coordinated" or "disabled",
-				serializerWorkerMode = context.serializerWorkerMode,
 			})
 		end)
 
@@ -897,7 +879,7 @@ function BridgeConnection.create(context)
 		local session = Config.bridgeConnectSession
 		Config.bridgeConnectionStatus = "Connecting..."
 		updateStatusText()
-		local acquired, details = context.acquireSessionLock(takeover == true)
+		local acquired, details = context.acquireSessionLock(takeover)
 		if session ~= Config.bridgeConnectSession or not Config.bridgeConnectRequested then
 			return
 		end
@@ -1228,7 +1210,6 @@ function BridgeConnection.create(context)
 	if runtimeSettings.autoConnect then
 		Config.connectAll()
 	end
-
 end
 
 return BridgeConnection

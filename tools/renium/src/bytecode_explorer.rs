@@ -7,19 +7,12 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::bytecode_api::{
-    ensure_bytecode_service_path_segments, parse_bytecode_path_ordinals,
-    parse_bytecode_path_segments, resolve_bytecode_read_input, resolve_bytecode_selector,
-};
+use super::bytecode_api::{ensure_bytecode_service_path_segments, resolve_bytecode_read_input};
 use super::bytecode_edit::has_direct_package_link_child;
-use super::bytecode_query::{
-    bytecode_selector, bytecode_selector_specified, parse_property_predicates,
-};
+use super::bytecode_query::{bytecode_selector, parse_property_predicates};
 use super::command_line::{
     BytecodeBatchFields, BytecodeEditorTargetsArgs, BytecodeExplorerBatchArgs,
-    BytecodeExplorerBatchOp, BytecodeExplorerBatchRequest, BytecodeExplorerChildrenArgs,
-    BytecodeExplorerCountsArgs, BytecodeExplorerInstanceArgs, BytecodeExplorerSearchArgs,
-    BytecodeExplorerServiceArgs, BytecodeFindInstancesArgs, ExplorerDaemonArgs,
+    BytecodeExplorerBatchOp, BytecodeExplorerBatchRequest, ExplorerDaemonArgs,
 };
 use super::editor_document::is_protected_starter_player_container;
 use super::editor_paths::{
@@ -52,21 +45,21 @@ pub(super) fn parse_requested_fields(raw: Option<&str>) -> Option<HashSet<String
                 fields.extend(
                     ["id", "n", "c", "path"]
                         .into_iter()
-                        .map(|field| field.to_string()),
+                        .map(std::string::ToString::to_string),
                 );
             }
             "tree" | "expand" | "kids" => {
                 fields.extend(
                     ["id", "n", "c", "cc", "ch"]
                         .into_iter()
-                        .map(|field| field.to_string()),
+                        .map(std::string::ToString::to_string),
                 );
             }
             "brief" | "node" => {
                 fields.extend(
                     ["id", "n", "c", "path", "cc"]
                         .into_iter()
-                        .map(|field| field.to_string()),
+                        .map(std::string::ToString::to_string),
                 );
             }
             _ => {
@@ -75,47 +68,6 @@ pub(super) fn parse_requested_fields(raw: Option<&str>) -> Option<HashSet<String
         }
     }
     (!fields.is_empty()).then_some(fields)
-}
-
-struct BytecodeProjectionData {
-    children_by_parent: Vec<Vec<usize>>,
-    path_segments_by_index: Vec<Option<Vec<String>>>,
-    path_ordinals_by_index: Vec<Option<Vec<usize>>>,
-    source_paths_by_index: Vec<Option<PathBuf>>,
-}
-
-impl BytecodeProjectionData {
-    fn new(document: &SettingsBytecode, service: &str, settings_file: &Path) -> Self {
-        let (path_segments_by_index, path_ordinals_by_index) =
-            build_editor_instance_path_parts(document, service);
-        let source_paths_by_index = settings_file
-            .parent()
-            .map(|service_dir| build_editor_source_paths_by_index(document, service, service_dir))
-            .unwrap_or_else(|| vec![None; document.instances.len()]);
-        Self {
-            children_by_parent: settings_children_by_parent(document),
-            path_segments_by_index,
-            path_ordinals_by_index,
-            source_paths_by_index,
-        }
-    }
-
-    fn projection<'a>(
-        &'a self,
-        document: &'a SettingsBytecode,
-        mode: OutputMode,
-        fields: Option<&'a HashSet<String>>,
-    ) -> BytecodeNodeProjection<'a> {
-        BytecodeNodeProjection {
-            document,
-            children_by_parent: &self.children_by_parent,
-            path_segments_by_index: &self.path_segments_by_index,
-            path_ordinals_by_index: &self.path_ordinals_by_index,
-            source_paths_by_index: &self.source_paths_by_index,
-            mode,
-            fields,
-        }
-    }
 }
 
 struct BytecodeExplorerBatchContext<'a> {
@@ -179,24 +131,32 @@ fn bytecode_project_explorer_node_json(
         .service_projection(mode, fields)
         .node(index, include_children);
     if let Some(map) = node.as_object_mut() {
-        map.insert(
-            "settingsFile".to_string(),
-            json!(
-                ctx.service_settings_files_by_index
-                    .get(index)
-                    .and_then(|path| path.as_ref())
-            ),
-        );
-        map.insert(
-            "canonicalSettingsId".to_string(),
-            json!(
-                ctx.service_canonical_settings_ids_by_index
-                    .get(index)
-                    .and_then(|settings_id| settings_id.as_deref())
-            ),
-        );
+        insert_project_node_metadata(ctx, index, map);
     }
     node
+}
+
+fn insert_project_node_metadata(
+    ctx: &BytecodeExplorerBatchContext<'_>,
+    index: usize,
+    node: &mut Map<String, Value>,
+) {
+    node.insert(
+        "settingsFile".to_string(),
+        json!(
+            ctx.service_settings_files_by_index
+                .get(index)
+                .and_then(|path| path.as_ref())
+        ),
+    );
+    node.insert(
+        "canonicalSettingsId".to_string(),
+        json!(
+            ctx.service_canonical_settings_ids_by_index
+                .get(index)
+                .and_then(|settings_id| settings_id.as_deref())
+        ),
+    );
 }
 
 fn read_bytecode_explorer_batch_ops(
@@ -232,14 +192,6 @@ fn parse_batch_requested_fields(
         }
         None => parse_requested_fields(fallback),
     }
-}
-
-fn batch_output_mode(
-    op_output: Option<&str>,
-    batch_output: Option<&str>,
-    default_output: &str,
-) -> Result<OutputMode> {
-    OutputMode::parse(op_output.or(batch_output).unwrap_or(default_output))
 }
 
 fn normalize_bytecode_batch_op(raw: &str) -> Result<&'static str> {
@@ -298,11 +250,6 @@ fn bytecode_batch_instance_index(
     )?;
     instance_api::find_unique_instance_index(document, selector)?
         .ok_or_else(|| anyhow::anyhow!("{missing_message}"))
-}
-
-fn field_matches(fields: &HashSet<String>, key: &str, aliases: &[&str]) -> bool {
-    let key = key.to_ascii_lowercase();
-    fields.contains(&key) || aliases.iter().any(|alias| fields.contains(*alias))
 }
 
 fn node_field_aliases(key: &str) -> &'static [&'static str] {
@@ -390,7 +337,10 @@ pub(super) fn insert_top_field(
 }
 
 fn requested_field(fields: Option<&HashSet<String>>, key: &str, aliases: &[&str]) -> bool {
-    fields.is_some_and(|fields| field_matches(fields, key, aliases))
+    fields.is_some_and(|fields| {
+        fields.contains(&key.to_ascii_lowercase())
+            || aliases.iter().any(|alias| fields.contains(*alias))
+    })
 }
 
 fn requested_property_field(fields: Option<&HashSet<String>>, key: &str) -> bool {
@@ -482,7 +432,7 @@ pub(super) fn bytecode_explorer_batch_result(args: BytecodeExplorerBatchArgs) ->
     let (settings_file, document, service) = if let Some(project_root) =
         args.project_root.as_deref()
     {
-        if args.settings_file.is_some() || args.service_or_file.is_some() {
+        if args.input.settings_file.is_some() || args.input.service_or_file.is_some() {
             bail!("--project-root cannot be combined with a settings file");
         }
         if args.service.trim().is_empty() {
@@ -503,22 +453,22 @@ pub(super) fn bytecode_explorer_batch_result(args: BytecodeExplorerBatchArgs) ->
         (display_settings, document, service)
     } else {
         resolve_bytecode_read_input(
-            args.settings_file.as_deref(),
-            args.service_or_file.as_deref(),
+            args.input.settings_file.as_deref(),
+            args.input.service_or_file.as_deref(),
             Some(args.service.as_str()),
         )?
     };
     let children_by_parent = settings_children_by_parent(&document);
     let (service_path_segments_by_index, service_path_ordinals_by_index) =
         build_editor_instance_path_parts(&document, &service);
-    let staged_settings_file = projection
-        .as_ref()
-        .map(|stage| service_settings_path(&stage.root().join(&service)))
-        .unwrap_or_else(|| settings_file.clone());
-    let mut service_source_paths_by_index = staged_settings_file
-        .parent()
-        .map(|service_dir| build_editor_source_paths_by_index(&document, &service, service_dir))
-        .unwrap_or_else(|| vec![None; document.instances.len()]);
+    let staged_settings_file = projection.as_ref().map_or_else(
+        || settings_file.clone(),
+        |stage| service_settings_path(&stage.root().join(&service)),
+    );
+    let mut service_source_paths_by_index = staged_settings_file.parent().map_or_else(
+        || vec![None; document.instances.len()],
+        |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
+    );
     if let (Some(loaded), Some(stage)) = (loaded_project.as_ref(), projection.as_ref()) {
         for source in &mut service_source_paths_by_index {
             let Some(path) = source.as_ref() else {
@@ -606,7 +556,12 @@ fn bytecode_explorer_batch_op_json(
     op: &BytecodeExplorerBatchOp,
 ) -> Result<Value> {
     let kind = normalize_bytecode_batch_op(&op.op)?;
-    let mode = batch_output_mode(op.output.as_deref(), ctx.default_output, "compact")?;
+    let mode = OutputMode::parse(
+        op.output
+            .as_deref()
+            .or(ctx.default_output)
+            .unwrap_or("compact"),
+    )?;
     let fields = parse_batch_requested_fields(op.fields.as_ref(), ctx.default_fields);
     let mut response = Map::new();
     insert_top_field(&mut response, mode, "type", Value::String(kind.to_string()));
@@ -660,8 +615,7 @@ fn bytecode_explorer_batch_op_json(
             let child_nodes = ctx
                 .children_by_parent
                 .get(parent_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+                .map_or(&[][..], Vec::as_slice)
                 .iter()
                 .filter_map(|child_index| {
                     ctx.document.instances.get(*child_index)?;
@@ -740,22 +694,7 @@ fn bytecode_explorer_batch_op_json(
                 .map(|index| {
                     let mut node = projection.search_node(index, &visible_indices);
                     if let Some(map) = node.as_object_mut() {
-                        map.insert(
-                            "settingsFile".to_string(),
-                            json!(
-                                ctx.service_settings_files_by_index
-                                    .get(index)
-                                    .and_then(|path| path.as_ref())
-                            ),
-                        );
-                        map.insert(
-                            "canonicalSettingsId".to_string(),
-                            json!(
-                                ctx.service_canonical_settings_ids_by_index
-                                    .get(index)
-                                    .and_then(|settings_id| settings_id.as_deref())
-                            ),
-                        );
+                        insert_project_node_metadata(ctx, index, map);
                     }
                     node
                 })
@@ -819,80 +758,6 @@ fn bytecode_explorer_batch_op_json(
     Ok(Value::Object(response))
 }
 
-pub(super) fn bytecode_find_instances(args: BytecodeFindInstancesArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        None,
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let fields = parse_requested_fields(args.fields.as_deref());
-    let query = InstanceQuery {
-        name: args.name,
-        class_name: args.class_name,
-        parent_settings_id: args.parent_settings_id,
-        tag: args.tag,
-        properties: parse_property_predicates(&args.properties)?,
-        attributes: parse_property_predicates(&args.attributes)?,
-    };
-    let projection_data = BytecodeProjectionData::new(&document, &service, &settings_file);
-    let projection = projection_data.projection(&document, mode, fields.as_ref());
-    let mut match_indices = instance_api::find_instances(&document, &query);
-    if args.limit > 0 {
-        match_indices.truncate(args.limit);
-    }
-    let matches = match_indices
-        .into_iter()
-        .map(|index| projection.node(index, false))
-        .collect::<Vec<_>>();
-    let mut response = Map::new();
-    insert_top_field(&mut response, mode, "settingsFile", json!(settings_file));
-    insert_top_field(&mut response, mode, "service", Value::String(service));
-    insert_top_field(&mut response, mode, "matches", Value::Array(matches));
-    print_json_output(&Value::Object(response), args.pretty)
-}
-
-pub(super) fn bytecode_explorer_counts(args: BytecodeExplorerCountsArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let children_by_parent = settings_children_by_parent(&document);
-    let root_index = editor_service_root_index(&document, &service);
-    let (root_id, root_children, descendants) = if let Some(index) = root_index {
-        let root_children = children_by_parent
-            .get(index)
-            .map(Vec::len)
-            .unwrap_or_default();
-        (
-            document
-                .instances
-                .get(index)
-                .map(|instance| instance.settings_id.clone()),
-            root_children,
-            count_settings_descendants(&children_by_parent, index),
-        )
-    } else {
-        (None, 0, 0)
-    };
-
-    let mut response = Map::new();
-    insert_top_field(&mut response, mode, "settingsFile", json!(settings_file));
-    insert_top_field(&mut response, mode, "service", Value::String(service));
-    insert_top_field(&mut response, mode, "rootId", json!(root_id));
-    insert_top_field(&mut response, mode, "rootChildren", json!(root_children));
-    insert_top_field(&mut response, mode, "descendants", json!(descendants));
-    insert_top_field(
-        &mut response,
-        mode,
-        "instances",
-        json!(document.instances.len()),
-    );
-    print_json_output(&Value::Object(response), args.pretty)
-}
-
 fn count_settings_descendants(children_by_parent: &[Vec<usize>], root_index: usize) -> usize {
     let mut count = 0usize;
     let mut stack = children_by_parent
@@ -906,69 +771,6 @@ fn count_settings_descendants(children_by_parent: &[Vec<usize>], root_index: usi
         }
     }
     count
-}
-
-pub(super) fn bytecode_explorer_children(args: BytecodeExplorerChildrenArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let fields = parse_requested_fields(args.fields.as_deref());
-    let projection_data = BytecodeProjectionData::new(&document, &service, &settings_file);
-    let path_segments =
-        parse_bytecode_path_segments(args.selector.path_segments_json.as_deref(), &service)?;
-    let path_ordinals =
-        parse_bytecode_path_ordinals(&args.selector.path_ordinals_json, path_segments.is_some())?;
-    let has_selector = bytecode_selector_specified(
-        args.selector.index,
-        args.selector.settings_id.as_deref(),
-        args.selector.name.as_deref(),
-        args.selector.class_name.as_deref(),
-    );
-    let parent_index = if let Some(path_segments) = path_segments.as_deref() {
-        if has_selector {
-            bail!("--path-segments-json cannot be combined with another selector");
-        }
-        document_instance_index_by_path_unique(&document, path_segments, &path_ordinals)?
-    } else if !has_selector {
-        editor_service_root_index(&document, &service)
-            .ok_or_else(|| anyhow::anyhow!("No service root in settings bytecode"))?
-    } else {
-        let selector = bytecode_selector(
-            args.selector.index,
-            args.selector.settings_id.as_deref(),
-            args.selector.name.as_deref(),
-            args.selector.class_name.as_deref(),
-        )?;
-        instance_api::find_unique_instance_index(&document, selector)?
-            .ok_or_else(|| anyhow::anyhow!("No matching parent instance"))?
-    };
-    let projection = projection_data.projection(&document, mode, fields.as_ref());
-    let child_nodes = projection_data
-        .children_by_parent
-        .get(parent_index)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|child_index| {
-            document.instances.get(*child_index)?;
-            Some(projection.node(*child_index, false))
-        })
-        .collect::<Vec<_>>();
-
-    let mut response = Map::new();
-    insert_top_field(&mut response, mode, "settingsFile", json!(settings_file));
-    insert_top_field(&mut response, mode, "service", Value::String(service));
-    insert_top_field(
-        &mut response,
-        mode,
-        "parent",
-        projection.node(parent_index, true),
-    );
-    insert_top_field(&mut response, mode, "children", Value::Array(child_nodes));
-    print_json_output(&Value::Object(response), args.pretty)
 }
 
 pub(super) struct BytecodeNodeProjection<'a> {
@@ -1026,20 +828,16 @@ impl BytecodeNodeProjection<'_> {
         if should_include_node_field(self.mode, self.fields, "parentIndex") {
             node.insert(
                 node_output_key(self.mode, "parentIndex").to_string(),
-                instance
-                    .parent_index
-                    .map(|parent_index| {
-                        Value::Number(serde_json::Number::from(parent_index as u64))
-                    })
-                    .unwrap_or(Value::Null),
+                instance.parent_index.map_or(Value::Null, |parent_index| {
+                    Value::Number(serde_json::Number::from(parent_index as u64))
+                }),
             );
         }
 
         let children = self
             .children_by_parent
             .get(index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
         if should_include_node_field(self.mode, self.fields, "childCount") {
             node.insert(
                 node_output_key(self.mode, "childCount").to_string(),
@@ -1106,7 +904,7 @@ impl BytecodeNodeProjection<'_> {
         {
             node.insert(
                 node_output_key(self.mode, "sourcePath").to_string(),
-                Value::String(source_path.to_string_lossy().to_string()),
+                Value::String(source_path.to_string_lossy().into_owned()),
             );
         }
         if let Some(properties) = filtered_record(
@@ -1136,39 +934,6 @@ impl BytecodeNodeProjection<'_> {
     }
 }
 
-pub(super) fn bytecode_explorer_service(args: BytecodeExplorerServiceArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let fields = parse_requested_fields(args.fields.as_deref());
-    let projection_data = BytecodeProjectionData::new(&document, &service, &settings_file);
-    let projection = projection_data.projection(&document, mode, fields.as_ref());
-
-    let nodes = document
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, _)| projection.node(index, true))
-        .collect::<Vec<_>>();
-
-    let root_ids = document
-        .instances
-        .iter()
-        .filter(|instance| instance.parent_index.is_none())
-        .map(|instance| Value::String(instance.settings_id.clone()))
-        .collect::<Vec<_>>();
-
-    let mut response = Map::new();
-    insert_top_field(&mut response, mode, "settingsFile", json!(settings_file));
-    insert_top_field(&mut response, mode, "service", Value::String(service));
-    insert_top_field(&mut response, mode, "rootIds", Value::Array(root_ids));
-    insert_top_field(&mut response, mode, "nodes", Value::Array(nodes));
-    print_json_output(&Value::Object(response), args.pretty)
-}
-
 pub(super) fn editor_target_settings_ids(
     document: &SettingsBytecode,
     service: &str,
@@ -1184,12 +949,7 @@ pub(super) fn editor_target_settings_ids(
                 return None;
             }
             let path_info = paths_by_index.get(index)?.as_ref()?;
-            if path_info.path_segments.len() <= 1
-                || path_info
-                    .path_segments
-                    .first()
-                    .is_none_or(|segment| segment != service)
-            {
+            if !path_info.is_descendant_of(service) {
                 return None;
             }
             Some(instance.settings_id.clone())
@@ -1216,7 +976,7 @@ pub(super) fn bytecode_editor_targets(args: BytecodeEditorTargetsArgs) -> Result
             continue;
         }
 
-        paths.push(settings_file.to_string_lossy().to_string());
+        paths.push(settings_file.to_string_lossy().into_owned());
         target_ids.extend(ids.iter().cloned());
         services_out.push(json!({
             "service": service,
@@ -1236,76 +996,6 @@ pub(super) fn bytecode_editor_targets(args: BytecodeEditorTargetsArgs) -> Result
     Ok(())
 }
 
-pub(super) fn bytecode_explorer_search(args: BytecodeExplorerSearchArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let fields = parse_requested_fields(args.fields.as_deref());
-    let projection_data = BytecodeProjectionData::new(&document, &service, &settings_file);
-    let root_index = editor_service_root_index(&document, &service);
-    let groups = explorer_search_groups(&args.query);
-    let mut match_indices = Vec::new();
-    let mut visible_indices = HashSet::new();
-
-    if !groups.is_empty() {
-        for index in 0..document.instances.len() {
-            if explorer_search_instance_matches(
-                &document,
-                &projection_data.path_segments_by_index,
-                index,
-                &groups,
-            ) {
-                if args.limit > 0 && match_indices.len() >= args.limit {
-                    break;
-                }
-                match_indices.push(index);
-                let mut current = Some(index);
-                while let Some(ancestor_index) = current {
-                    if !visible_indices.insert(ancestor_index) {
-                        break;
-                    }
-                    current = document.instances[ancestor_index].parent_index;
-                }
-            }
-        }
-    }
-    if let Some(index) = root_index {
-        visible_indices.insert(index);
-    }
-    let projection = projection_data.projection(&document, mode, fields.as_ref());
-
-    let nodes = (0..document.instances.len())
-        .filter(|index| visible_indices.contains(index))
-        .map(|index| projection.search_node(index, &visible_indices))
-        .collect::<Vec<_>>();
-    let root_ids = root_index
-        .and_then(|index| document.instances.get(index))
-        .map(|instance| vec![Value::String(instance.settings_id.clone())])
-        .unwrap_or_default();
-    let match_ids = match_indices
-        .iter()
-        .filter_map(|index| document.instances.get(*index))
-        .map(|instance| Value::String(instance.settings_id.clone()))
-        .collect::<Vec<_>>();
-    let visible_ids = visible_indices
-        .iter()
-        .filter_map(|index| document.instances.get(*index))
-        .map(|instance| Value::String(instance.settings_id.clone()))
-        .collect::<Vec<_>>();
-
-    let mut response = Map::new();
-    insert_top_field(&mut response, mode, "settingsFile", json!(settings_file));
-    insert_top_field(&mut response, mode, "service", Value::String(service));
-    insert_top_field(&mut response, mode, "rootIds", Value::Array(root_ids));
-    insert_top_field(&mut response, mode, "matchIds", Value::Array(match_ids));
-    insert_top_field(&mut response, mode, "visibleIds", Value::Array(visible_ids));
-    insert_top_field(&mut response, mode, "nodes", Value::Array(nodes));
-    print_json_output(&Value::Object(response), args.pretty)
-}
-
 impl BytecodeNodeProjection<'_> {
     pub fn search_node(&self, index: usize, visible_indices: &HashSet<usize>) -> Value {
         let mut node = self.node(index, false);
@@ -1315,8 +1005,7 @@ impl BytecodeNodeProjection<'_> {
         let visible_children = self
             .children_by_parent
             .get(index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .filter(|child_index| visible_indices.contains(child_index))
             .filter_map(|child_index| {
@@ -1370,7 +1059,7 @@ pub(super) fn explorer_search_instance_matches(
         while token_index < group.len() {
             let token = &group[token_index];
             let next = group.get(token_index + 1).map(String::as_str);
-            let next_value = group.get(token_index + 2).map(String::as_str).unwrap_or("");
+            let next_value = group.get(token_index + 2).map_or("", String::as_str);
             if let Some(operator @ ("=" | "==" | "!=" | "~=" | "<" | ">" | "<=" | ">=")) = next {
                 if !explorer_search_property_matches(document, index, token, operator, next_value) {
                     return false;
@@ -1508,8 +1197,7 @@ fn explorer_search_property_value(
                 instance
                     .parent_index
                     .and_then(|parent_index| document.instances.get(parent_index))
-                    .map(|parent| Value::String(parent.name.clone()))
-                    .unwrap_or(Value::Null),
+                    .map_or(Value::Null, |parent| Value::String(parent.name.clone())),
             );
         }
         _ => {}
@@ -1530,14 +1218,15 @@ fn explorer_search_tags(instance: &SettingsBytecodeInstance) -> Vec<String> {
                 .get(*name)
                 .or_else(|| instance.attributes.get(*name))
         })
-        .map(|value| match value {
-            Value::Array(values) => values
-                .iter()
-                .map(explorer_search_value_text)
-                .map(|text| explorer_search_compact(&text))
-                .filter(|text| !text.is_empty())
-                .collect(),
-            _ => {
+        .map(|value| {
+            if let Value::Array(values) = value {
+                values
+                    .iter()
+                    .map(explorer_search_value_text)
+                    .map(|text| explorer_search_compact(&text))
+                    .filter(|text| !text.is_empty())
+                    .collect()
+            } else {
                 let text = explorer_search_compact(&explorer_search_value_text(value));
                 if text.is_empty() {
                     Vec::new()
@@ -1555,12 +1244,11 @@ fn explorer_search_value_text(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         Value::String(value) => value.clone(),
-        Value::Object(map) => map
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
-        _ => serde_json::to_string(value).unwrap_or_default(),
+        Value::Object(map) => map.get("name").and_then(Value::as_str).map_or_else(
+            || serde_json::to_string(value).unwrap_or_default(),
+            str::to_string,
+        ),
+        Value::Array(_) => serde_json::to_string(value).unwrap_or_default(),
     }
 }
 
@@ -1572,7 +1260,7 @@ fn explorer_search_compact(value: &str) -> String {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum ExplorerViewMode {
     Normal,
     Search,
@@ -1617,8 +1305,6 @@ impl ExplorerViewMode {
         }
     }
 }
-
-#[derive(Debug, Clone)]
 struct ExplorerSearchView {
     search_id: u64,
     query: String,
@@ -1628,7 +1314,7 @@ struct ExplorerSearchView {
     match_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default)]
 struct ExplorerServiceState {
     service: String,
     document: Option<SettingsBytecode>,
@@ -1643,7 +1329,7 @@ struct ExplorerServiceState {
     name_search_text: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Default)]
 struct ExplorerDaemonState {
     project_root: PathBuf,
     src_root: PathBuf,
@@ -1658,20 +1344,18 @@ struct ExplorerDaemonState {
 
 impl ExplorerDaemonState {
     fn new(mut args: ExplorerDaemonArgs) -> Result<Self> {
-        apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
-        let project_root = args.project_root;
-        let src_root = absolutize_under(&project_root, &args.src_dir);
+        apply_configured_project_layout(
+            &mut args.project.project_root,
+            &mut args.project.src_root,
+        )?;
+        let project_root = args.project.project_root;
+        let src_root = absolutize_under(&project_root, &args.project.src_root);
         let services = explorer_daemon_services(&src_root, &args.services)?;
         Ok(Self {
             project_root,
             src_root,
             services,
-            service_states: HashMap::new(),
-            expanded: HashSet::new(),
-            search_collapsed: HashSet::new(),
-            search: None,
-            snapshot_version: 0,
-            view_version: 0,
+            ..Default::default()
         })
     }
 
@@ -1713,10 +1397,10 @@ impl ExplorerDaemonState {
             .as_ref()
             .map(|loaded| project_config::stage_project_cached(loaded, &changed_sources))
             .transpose()?;
-        let active_root = projection
-            .as_ref()
-            .map(project_config::ProjectionStage::root)
-            .unwrap_or(&self.src_root);
+        let active_root = projection.as_ref().map_or(
+            self.src_root.as_path(),
+            project_config::ProjectionStage::root,
+        );
         let requested = if services.is_empty() {
             explorer_daemon_services(active_root, "")?
         } else {
@@ -1791,17 +1475,15 @@ impl ExplorerDaemonState {
                 }
                 Err(error) => {
                     eprintln!("[renium] explorer-daemon: failed to load {service}: {error:?}");
-                    self.service_states.insert(
-                        service.clone(),
-                        ExplorerServiceState::empty(&self.src_root, service),
-                    );
+                    self.service_states
+                        .insert(service.clone(), ExplorerServiceState::empty(service));
                 }
             }
         }
         self.sort_services();
         self.snapshot_version += 1;
         self.view_version += 1;
-        if let Some(search) = self.search.clone() {
+        if let Some(search) = self.search.take() {
             self.search = Some(self.build_search_view(search.search_id, &search.query));
         }
         Ok(())
@@ -1833,8 +1515,7 @@ impl ExplorerDaemonState {
         let match_ids = if mode == ExplorerViewMode::Search && include_match_ids {
             self.search
                 .as_ref()
-                .map(|search| json!(&search.match_ids))
-                .unwrap_or(Value::Null)
+                .map_or(Value::Null, |search| json!(&search.match_ids))
         } else {
             Value::Null
         };
@@ -1888,6 +1569,19 @@ impl ExplorerDaemonState {
         self.view_version += 1;
     }
 
+    fn invalidate_rows(&self, request_id: u64, mode: ExplorerViewMode) -> Value {
+        let total_rows = self.total_rows(mode);
+        json!({
+            "type": "invalidateRows",
+            "requestId": request_id,
+            "snapshotVersion": self.snapshot_version,
+            "viewVersion": self.view_version,
+            "start": 0,
+            "end": total_rows,
+            "totalRows": total_rows,
+        })
+    }
+
     fn clear_search(&mut self) {
         self.search = None;
         self.search_collapsed.clear();
@@ -1899,11 +1593,7 @@ impl ExplorerDaemonState {
         self.search = Some(self.build_search_view(search_id, query));
         self.search_collapsed.clear();
         self.view_version += 1;
-        let match_count = self
-            .search
-            .as_ref()
-            .map(|search| search.match_count)
-            .unwrap_or(0);
+        let match_count = self.search.as_ref().map_or(0, |search| search.match_count);
         json!({
             "type": "searchStatus",
             "requestId": request_id,
@@ -1935,11 +1625,7 @@ impl ExplorerDaemonState {
                 for index in 0..document.instances.len() {
                     let matches = if let Some(fast_groups) = fast_name_groups.as_ref() {
                         explorer_search_fast_name_matches(
-                            state
-                                .name_search_text
-                                .get(index)
-                                .map(String::as_str)
-                                .unwrap_or(""),
+                            state.name_search_text.get(index).map_or("", String::as_str),
                             fast_groups,
                         )
                     } else {
@@ -1999,23 +1685,23 @@ impl ExplorerDaemonState {
         let path_segments = state
             .path_segments_by_index
             .get(index)
-            .and_then(|segments| segments.clone())
+            .and_then(std::clone::Clone::clone)
             .unwrap_or_else(|| vec![instance.name.clone()]);
         let path_ordinals = state
             .path_ordinals_by_index
             .get(index)
-            .and_then(|ordinals| ordinals.clone())
+            .and_then(std::clone::Clone::clone)
             .unwrap_or_default();
         let source_path = state
             .source_paths_by_index
             .get(index)
             .and_then(|path| path.as_ref())
-            .map(|path| path.to_string_lossy().to_string());
+            .map(|path| path.to_string_lossy().into_owned());
         let settings_file = state
             .settings_files_by_index
             .get(index)
             .and_then(|path| path.as_ref())
-            .map(|path| path.to_string_lossy().to_string());
+            .map(|path| path.to_string_lossy().into_owned());
         let settings_id = state
             .canonical_settings_ids_by_index
             .get(index)
@@ -2068,39 +1754,28 @@ impl ExplorerDaemonState {
         let mut window = ExplorerRowWindow::new(mode, start, count);
         for service in &self.services {
             let state = self.service_states.get(service);
-            match mode {
-                ExplorerViewMode::Search => {
-                    let Some(search) = self.search.as_ref() else {
-                        continue;
-                    };
-                    if !search.visible_by_service.contains_key(service) {
-                        continue;
-                    }
-                    if window.includes_current() {
-                        self.push_service_row(&mut window.rows, service, state, 0, mode);
-                    }
-                    window.index += 1;
-                    let service_id = explorer_service_tree_id(service);
-                    if !self.search_collapsed.contains(&service_id)
-                        && let Some(state) = state
-                        && let Some(root_index) = state.root_index
-                    {
-                        self.collect_instance_rows_window(state, root_index, 1, &mut window);
-                    }
-                }
-                ExplorerViewMode::Normal => {
-                    if window.includes_current() {
-                        self.push_service_row(&mut window.rows, service, state, 0, mode);
-                    }
-                    window.index += 1;
-                    let service_id = explorer_service_tree_id(service);
-                    if self.expanded.contains(&service_id)
-                        && let Some(state) = state
-                        && let Some(root_index) = state.root_index
-                    {
-                        self.collect_instance_rows_window(state, root_index, 1, &mut window);
-                    }
-                }
+            if mode == ExplorerViewMode::Search
+                && !self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.visible_by_service.contains_key(service))
+            {
+                continue;
+            }
+            if window.includes_current() {
+                self.push_service_row(&mut window.rows, service, state, 0, mode);
+            }
+            window.index += 1;
+            let service_id = explorer_service_tree_id(service);
+            let expanded = match mode {
+                ExplorerViewMode::Search => !self.search_collapsed.contains(&service_id),
+                ExplorerViewMode::Normal => self.expanded.contains(&service_id),
+            };
+            if expanded
+                && let Some(state) = state
+                && let Some(root_index) = state.root_index
+            {
+                self.collect_instance_rows_window(state, root_index, 1, &mut window);
             }
         }
         (window.rows, window.index)
@@ -2116,8 +1791,7 @@ impl ExplorerDaemonState {
         let children = state
             .children_by_parent
             .get(parent_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
         for child_index in children {
             if window.mode == ExplorerViewMode::Search
                 && !self.search_contains(&state.service, *child_index)
@@ -2146,42 +1820,6 @@ impl ExplorerDaemonState {
         }
     }
 
-    fn collect_rows(&self, mode: ExplorerViewMode) -> Vec<Value> {
-        let mut rows = Vec::new();
-        for service in &self.services {
-            let state = self.service_states.get(service);
-            match mode {
-                ExplorerViewMode::Search => {
-                    let Some(search) = self.search.as_ref() else {
-                        continue;
-                    };
-                    if !search.visible_by_service.contains_key(service) {
-                        continue;
-                    }
-                    self.push_service_row(&mut rows, service, state, 0, mode);
-                    let service_id = explorer_service_tree_id(service);
-                    if !self.search_collapsed.contains(&service_id)
-                        && let Some(state) = state
-                        && let Some(root_index) = state.root_index
-                    {
-                        self.collect_instance_rows(state, root_index, 1, mode, &mut rows);
-                    }
-                }
-                ExplorerViewMode::Normal => {
-                    self.push_service_row(&mut rows, service, state, 0, mode);
-                    let service_id = explorer_service_tree_id(service);
-                    if self.expanded.contains(&service_id)
-                        && let Some(state) = state
-                        && let Some(root_index) = state.root_index
-                    {
-                        self.collect_instance_rows(state, root_index, 1, mode, &mut rows);
-                    }
-                }
-            }
-        }
-        rows
-    }
-
     fn push_service_row(
         &self,
         rows: &mut Vec<Value>,
@@ -2197,25 +1835,24 @@ impl ExplorerDaemonState {
                 state
                     .canonical_settings_ids_by_index
                     .get(root_index)
-                    .and_then(|settings_id| settings_id.clone())
+                    .and_then(std::clone::Clone::clone)
             });
             let settings_file = root_index.and_then(|root_index| {
                 state
                     .settings_files_by_index
                     .get(root_index)
                     .and_then(|path| path.as_ref())
-                    .map(|path| path.to_string_lossy().to_string())
+                    .map(|path| path.to_string_lossy().into_owned())
             });
-            let child_count = root_index
-                .map(|root_index| self.visible_child_count(state, root_index, mode))
-                .unwrap_or(0);
+            let child_count = root_index.map_or(0, |root_index| {
+                self.visible_child_count(state, root_index, mode)
+            });
             let matched = self
                 .search
                 .as_ref()
                 .and_then(|search| search.matches_by_service.get(service))
                 .zip(root_index)
-                .map(|(matches, root_index)| matches.contains(&root_index))
-                .unwrap_or(false);
+                .is_some_and(|(matches, root_index)| matches.contains(&root_index));
             (settings_id, settings_file, root_index, child_count, matched)
         } else {
             (None, None, None, 0, false)
@@ -2251,44 +1888,6 @@ impl ExplorerDaemonState {
         }));
     }
 
-    fn collect_instance_rows(
-        &self,
-        state: &ExplorerServiceState,
-        parent_index: usize,
-        depth: usize,
-        mode: ExplorerViewMode,
-        rows: &mut Vec<Value>,
-    ) {
-        let children = state
-            .children_by_parent
-            .get(parent_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        for child_index in children {
-            if mode == ExplorerViewMode::Search
-                && !self.search_contains(&state.service, *child_index)
-            {
-                continue;
-            }
-            self.push_instance_row(rows, state, *child_index, depth, mode);
-            let node_id = state
-                .document
-                .as_ref()
-                .and_then(|document| document.instances.get(*child_index))
-                .map(|instance| explorer_instance_tree_id(&state.service, &instance.settings_id));
-            let is_open = match (mode, node_id.as_deref()) {
-                (ExplorerViewMode::Search, Some(node_id)) => {
-                    !self.search_collapsed.contains(node_id)
-                }
-                (ExplorerViewMode::Normal, Some(node_id)) => self.expanded.contains(node_id),
-                _ => false,
-            };
-            if is_open {
-                self.collect_instance_rows(state, *child_index, depth + 1, mode, rows);
-            }
-        }
-    }
-
     fn push_instance_row(
         &self,
         rows: &mut Vec<Value>,
@@ -2313,8 +1912,7 @@ impl ExplorerDaemonState {
             .search
             .as_ref()
             .and_then(|search| search.matches_by_service.get(&state.service))
-            .map(|matches| matches.contains(&index))
-            .unwrap_or(false);
+            .is_some_and(|matches| matches.contains(&index));
         let disabled = matches!(instance.class_name.as_str(), "Script" | "LocalScript")
             && instance
                 .properties
@@ -2325,12 +1923,12 @@ impl ExplorerDaemonState {
         let path_segments = state
             .path_segments_by_index
             .get(index)
-            .and_then(|segments| segments.clone())
+            .and_then(std::clone::Clone::clone)
             .unwrap_or_else(|| vec![state.service.clone(), instance.name.clone()]);
         let path_ordinals = state
             .path_ordinals_by_index
             .get(index)
-            .and_then(|ordinals| ordinals.clone())
+            .and_then(std::clone::Clone::clone)
             .unwrap_or_default();
         let has_package_link =
             has_direct_package_link_child(document, &state.children_by_parent, index);
@@ -2343,7 +1941,7 @@ impl ExplorerDaemonState {
             .settings_files_by_index
             .get(index)
             .and_then(|path| path.as_ref())
-            .map(|path| path.to_string_lossy().to_string());
+            .map(|path| path.to_string_lossy().into_owned());
         rows.push(json!({
             "id": id,
             "settingsId": settings_id,
@@ -2376,8 +1974,7 @@ impl ExplorerDaemonState {
         self.search
             .as_ref()
             .and_then(|search| search.visible_by_service.get(service))
-            .map(|visible| visible.contains(&index))
-            .unwrap_or(false)
+            .is_some_and(|visible| visible.contains(&index))
     }
 
     fn visible_child_count(
@@ -2389,8 +1986,7 @@ impl ExplorerDaemonState {
         let children = state
             .children_by_parent
             .get(index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
         match mode {
             ExplorerViewMode::Normal => children.len(),
             ExplorerViewMode::Search => children
@@ -2402,19 +1998,10 @@ impl ExplorerDaemonState {
 }
 
 impl ExplorerServiceState {
-    fn empty(_src_root: &Path, service: &str) -> Self {
+    fn empty(service: &str) -> Self {
         Self {
             service: service.to_string(),
-            document: None,
-            children_by_parent: Vec::new(),
-            path_segments_by_index: Vec::new(),
-            path_ordinals_by_index: Vec::new(),
-            source_paths_by_index: Vec::new(),
-            settings_files_by_index: Vec::new(),
-            canonical_settings_ids_by_index: Vec::new(),
-            index_by_settings_id: HashMap::new(),
-            root_index: None,
-            name_search_text: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -2423,7 +2010,7 @@ impl ExplorerServiceState {
         let service_dir = src_root.join(service);
         let settings_file = service_settings_path(&service_dir);
         if !settings_file.exists() {
-            return Ok(Self::empty(src_root, service));
+            return Ok(Self::empty(service));
         }
         let document = SettingsBytecode::read_file(&settings_file)?;
         let mut children_by_parent = settings_children_by_parent(&document);
@@ -2505,7 +2092,7 @@ pub(super) fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec
         for entry in fs::read_dir(src_root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                let service = entry.file_name().to_string_lossy().to_string();
+                let service = entry.file_name().to_string_lossy().into_owned();
                 push_explorer_service(&mut services, &service);
             }
         }
@@ -2544,17 +2131,12 @@ fn explorer_compare_nodes(
     b_class: &str,
     b_name: &str,
 ) -> std::cmp::Ordering {
-    let a_service_order = explorer_service_order(a_class);
-    let b_service_order = explorer_service_order(b_class);
-    match (a_service_order, b_service_order) {
-        (Some(a), Some(b)) => return a.cmp(&b),
-        (Some(_), None) => return std::cmp::Ordering::Less,
-        (None, Some(_)) => return std::cmp::Ordering::Greater,
-        _ => {}
-    }
-    explorer_class_rank(a_class)
-        .cmp(&explorer_class_rank(b_class))
-        .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
+    explorer_compare_ranked(
+        a_class,
+        &a_name.to_lowercase(),
+        b_class,
+        &b_name.to_lowercase(),
+    )
 }
 
 fn explorer_compare_ranked(
@@ -2610,11 +2192,10 @@ fn explorer_parent_tree_id(
     if Some(parent_index) == root_index {
         return Value::String(explorer_service_tree_id(service));
     }
-    document
-        .instances
-        .get(parent_index)
-        .map(|parent| Value::String(explorer_instance_tree_id(service, &parent.settings_id)))
-        .unwrap_or_else(|| Value::String(explorer_service_tree_id(service)))
+    document.instances.get(parent_index).map_or_else(
+        || Value::String(explorer_service_tree_id(service)),
+        |parent| Value::String(explorer_instance_tree_id(service, &parent.settings_id)),
+    )
 }
 
 fn icon_asset_name_for_class_rs(class_name: &str) -> &str {
@@ -2800,7 +2381,8 @@ pub(super) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
             }
         };
         let request_id = explorer_request_id(&request);
-        let response = match explorer_request_type(&request) {
+        let request_type = explorer_request_type(&request);
+        let response = match request_type {
             "initialize" => match state.initialize() {
                 Ok(()) => json!({
                     "type": "ready",
@@ -2820,38 +2402,21 @@ pub(super) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                     .min(2500) as usize;
                 state.rows_window(request_id, mode, start, count, false)
             }
-            "expand" => {
+            "expand" | "collapse" => {
                 let mode = ExplorerViewMode::parse(explorer_str(&request, &["mode", "m"]));
                 if let Some(node_id) = explorer_str(&request, &["nodeId", "n"]) {
-                    state.expand(node_id, mode);
-                    json!({
-                        "type": "invalidateRows",
-                        "requestId": request_id,
-                        "snapshotVersion": state.snapshot_version,
-                        "viewVersion": state.view_version,
-                        "start": 0,
-                        "end": state.total_rows(mode),
-                        "totalRows": state.total_rows(mode),
-                    })
+                    if request_type == "expand" {
+                        state.expand(node_id, mode);
+                    } else {
+                        state.collapse(node_id, mode);
+                    }
+                    state.invalidate_rows(request_id, mode)
                 } else {
-                    explorer_error(request_id, "bad_request", "expand requires nodeId")
-                }
-            }
-            "collapse" => {
-                let mode = ExplorerViewMode::parse(explorer_str(&request, &["mode", "m"]));
-                if let Some(node_id) = explorer_str(&request, &["nodeId", "n"]) {
-                    state.collapse(node_id, mode);
-                    json!({
-                        "type": "invalidateRows",
-                        "requestId": request_id,
-                        "snapshotVersion": state.snapshot_version,
-                        "viewVersion": state.view_version,
-                        "start": 0,
-                        "end": state.total_rows(mode),
-                        "totalRows": state.total_rows(mode),
-                    })
-                } else {
-                    explorer_error(request_id, "bad_request", "collapse requires nodeId")
+                    explorer_error(
+                        request_id,
+                        "bad_request",
+                        &format!("{request_type} requires nodeId"),
+                    )
                 }
             }
             "selectDetails" => {
@@ -2935,7 +2500,8 @@ pub(super) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                 } else {
                     None
                 };
-                let rows = state.collect_rows(ExplorerViewMode::Normal);
+                let (rows, total_rows) =
+                    state.collect_rows_window(ExplorerViewMode::Normal, 0, usize::MAX);
                 let row_index = revealed_node_id.as_deref().and_then(|node_id| {
                     rows.iter().position(|row| {
                         row.get("id")
@@ -2949,8 +2515,8 @@ pub(super) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                     "snapshotVersion": state.snapshot_version,
                     "viewVersion": state.view_version,
                     "start": 0,
-                    "end": rows.len(),
-                    "totalRows": rows.len(),
+                    "end": total_rows,
+                    "totalRows": total_rows,
                     "rowIndex": row_index,
                 })
             }
@@ -2986,32 +2552,4 @@ pub(super) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
-}
-
-pub(super) fn bytecode_explorer_instance(args: BytecodeExplorerInstanceArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let mode = OutputMode::parse(&args.output)?;
-    let fields = parse_requested_fields(args.fields.as_deref());
-    let index =
-        resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
-            .index;
-    let instance = document
-        .instances
-        .get(index)
-        .ok_or_else(|| anyhow::anyhow!("Invalid instance index {index}"))?;
-    let projection_data = BytecodeProjectionData::new(&document, &service, &settings_file);
-    let mut node = projection_data
-        .projection(&document, mode, fields.as_ref())
-        .node(index, true);
-    let include_id_alias = fields.as_ref().is_some_and(|fields| fields.contains("id"))
-        || (fields.is_none() && mode.includes_full_ids());
-    if include_id_alias && let Some(map) = node.as_object_mut() {
-        map.entry("id".to_string())
-            .or_insert_with(|| Value::String(instance.settings_id.clone()));
-    }
-    print_json_output(&node, args.pretty)
 }

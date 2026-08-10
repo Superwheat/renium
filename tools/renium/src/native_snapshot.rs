@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
-#[derive(Debug)]
+use crate::timing::current_millis;
+
 pub(crate) struct NativeSnapshot {
     pub instance_count: usize,
     pub output_size: u64,
-    pub setup_ms: f64,
     pub trace_ms: f64,
     pub discover_ms: f64,
     pub helper_ms: f64,
@@ -23,6 +23,7 @@ pub(crate) struct NativeSnapshot {
     pub elapsed_ms: f64,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct NativeSnapshotRoots<'a> {
     pub exact_service: Option<&'a str>,
     pub containing_service: Option<&'a str>,
@@ -38,7 +39,10 @@ pub(crate) fn temporary_output_path(output: &Path, pid: u32) -> Result<PathBuf> 
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("place.rbxl");
-    Ok(parent.join(format!(".{name}.renium-native-{pid}-{}.rbxl", now_millis())))
+    Ok(parent.join(format!(
+        ".{name}.renium-native-{pid}-{}.rbxl",
+        current_millis()
+    )))
 }
 
 pub(crate) fn validate_native_snapshot(
@@ -65,35 +69,32 @@ pub(crate) fn validate_native_snapshot(
     {
         bail!("Studio native serializer returned an instance model instead of a place");
     }
-    match expected_roots.exact_service {
-        Some(service) => {
-            if flat.root_indices.len() != 1
-                || flat
-                    .instances
-                    .get(flat.root_indices[0])
-                    .is_none_or(|instance| instance.class.as_str() != service)
-            {
-                bail!("Studio native RBXL did not contain exactly one {service} root");
-            }
+    if let Some(service) = expected_roots.exact_service {
+        if flat.root_indices.len() != 1
+            || flat
+                .instances
+                .get(flat.root_indices[0])
+                .is_none_or(|instance| instance.class.as_str() != service)
+        {
+            bail!("Studio native RBXL did not contain exactly one {service} root");
         }
-        None => {
-            let root_classes = flat
-                .root_indices
-                .iter()
-                .filter_map(|index| flat.instances.get(*index))
-                .map(|instance| instance.class.as_str())
-                .collect::<Vec<_>>();
-            if !["Workspace", "Players", "MaterialService"]
-                .iter()
-                .all(|required| root_classes.iter().any(|class| class == required))
-            {
-                bail!("Studio native RBXL omitted required service roots");
-            }
-            if let Some(service) = expected_roots.containing_service
-                && !root_classes.iter().any(|class| class == &service)
-            {
-                bail!("Studio native RBXL omitted the {service} service root");
-            }
+    } else {
+        let root_classes = flat
+            .root_indices
+            .iter()
+            .filter_map(|index| flat.instances.get(*index))
+            .map(|instance| instance.class.as_str())
+            .collect::<Vec<_>>();
+        if !["Workspace", "Players", "MaterialService"]
+            .iter()
+            .all(|required| root_classes.iter().any(|class| class == required))
+        {
+            bail!("Studio native RBXL omitted required service roots");
+        }
+        if let Some(service) = expected_roots.containing_service
+            && !root_classes.iter().any(|class| class == &service)
+        {
+            bail!("Studio native RBXL omitted the {service} service root");
         }
     }
     Ok((
@@ -123,11 +124,4 @@ pub(crate) fn finalize_native_snapshot(
         )
     })?;
     Ok(validated)
-}
-
-pub(crate) fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
 }

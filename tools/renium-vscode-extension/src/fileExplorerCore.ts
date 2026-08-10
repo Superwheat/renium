@@ -182,7 +182,7 @@ export type ReadonlyInstanceInfo = {
   pathSegments?: string[];
 };
 
-export type CommandRunResult = {
+type CommandRunResult = {
   code: number;
   stdout: string;
   stderr: string;

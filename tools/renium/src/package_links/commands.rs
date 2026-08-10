@@ -7,15 +7,15 @@ use serde_json::{Map, Number, Value, json};
 
 use crate::bytecode_api::{
     acquire_settings_file_lock, apply_file_mutations, apply_file_mutations_with_permissions,
-    settings_document_bytes,
 };
 use crate::bytecode_edit::{
     BytecodeCloneRefMap, CloneRefMapInput, build_clone_ref_map, collect_settings_subtree_preorder,
-    plan_editor_source_file_removals, prune_empty_source_dirs, strict_ref_old_index,
+    plan_editor_source_file_removals, prune_empty_source_dirs, prune_removed_source_dirs,
+    strict_ref_old_index,
 };
 use crate::command_line::{
     LinkAddArgs, LinkApplyArgs, LinkBreakArgs, LinkDeletePackageArgs, LinkMoveTargetArgs,
-    LinkPackArgs, LinkStatusArgs,
+    LinkPackArgs, LinkStatusArgs, ProjectSourceArgs,
 };
 use crate::editor_document::{editor_child_by_stem, ensure_editor_source_target_in_bytecode};
 use crate::editor_paths::{
@@ -33,7 +33,7 @@ use crate::project_layout::apply_configured_project_layout;
 use crate::rbx_encode::bytecode_export_script_source;
 use crate::settings_bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
-    SettingsBytecodeInstance,
+    SettingsBytecodeInstance, encode_settings_bytecode,
 };
 use crate::settings_tree::{editor_service_root_index, settings_children_by_parent};
 
@@ -41,17 +41,41 @@ use super::{
     GLOBAL_LINK_PREFIX, LINK_MANIFEST_VERSION, LinkEntry, LinkLockEntry, LinkManifest,
     LinkResolveOptions, LinkSource, LinkSourceMeta, LinkTargetRef, LinkTargetStorage,
     PackageMaterialization, RENIUM_DIR_GITIGNORE, RENIUM_STORE_EXTENSION, ResolvedLinkTarget,
-    canonicalize_loaded_settings_documents, collect_project_settings_files, is_global_link_path,
-    is_package_path, link_lock_path, link_manifest_path, link_mirror_lock_key, link_slug,
-    link_target_document_selector, link_target_document_selector_parts, link_target_key,
-    link_target_ordinals, link_target_ref_key, link_target_segments, mark_manifest_target_broken,
-    materialize_package_target, package_document_fingerprint, package_lock_key,
-    package_target_fingerprint, package_target_settings_ids, read_link_lock, read_link_manifest,
-    read_link_source_meta, referenced_settings_ids, renium_global_packages_dir,
-    resolve_link_cache_dir, resolve_link_target_storage, resolve_link_targets,
-    resolve_local_link_path, selector_starts_with, serialize_link_manifest,
-    validate_link_target_ref, write_link_manifest,
+    collect_project_settings_files, is_global_link_path, is_package_path, link_lock_path,
+    link_manifest_path, link_mirror_lock_key, link_slug, link_target_document_selector,
+    link_target_document_selector_parts, link_target_key, link_target_ordinals,
+    link_target_ref_key, link_target_segments, load_settings_documents,
+    mark_manifest_target_broken, materialize_package_target, package_document_fingerprint,
+    package_lock_key, package_target_fingerprint, package_target_settings_ids, read_link_lock,
+    read_link_manifest, read_link_source_meta, referenced_settings_ids_outside,
+    renium_global_packages_dir, resolve_link_cache_dir, resolve_link_target_storage,
+    resolve_link_targets, resolve_local_link_path, selector_starts_with, serialize_link_lock,
+    serialize_link_manifest, stage_settings_document_writes, validate_link_target_ref,
+    write_link_manifest,
 };
+
+fn load_link_project(
+    project: &mut ProjectSourceArgs,
+    manifest: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf, LinkManifest)> {
+    apply_configured_project_layout(&mut project.project_root, &mut project.src_root)?;
+    let project_root = resolve_link_project_root(&project.project_root)?;
+    let src_root = absolutize_under(&project_root, &project.src_root);
+    let manifest_path = link_manifest_path(&project_root, manifest);
+    let manifest = read_link_manifest(&manifest_path)?;
+    Ok((project_root, src_root, manifest_path, manifest))
+}
+
+fn parse_link_target(service: &str, path: &str, ordinals: &str) -> Result<LinkTargetRef> {
+    let target = LinkTargetRef {
+        service: service.to_string(),
+        path: serde_json::from_str(path).context("Failed to parse link target path JSON")?,
+        ords: serde_json::from_str(ordinals)
+            .context("Failed to parse link target ordinals JSON")?,
+    };
+    validate_link_target_ref(&target)?;
+    Ok(target)
+}
 
 #[derive(Default)]
 struct LinkApplyChanges {
@@ -92,6 +116,34 @@ impl LinkApplyChanges {
         }
         self.mark_path(&path);
         self.transaction_removals.push(path);
+    }
+
+    fn mark_deleted_target(
+        &mut self,
+        manifest: &mut LinkManifest,
+        target: &ResolvedLinkTarget,
+        check: bool,
+        package: bool,
+    ) {
+        if !check {
+            self.manifest_changed |= mark_manifest_target_broken(manifest, target);
+        }
+        self.drift += 1;
+        self.applied += 1;
+        let mut result = json!({
+            "id": target.link_id,
+            "service": target.service,
+            "path": target.target_segments,
+            "readOnly": target.read_only,
+            "resolvedRef": target.resolved_ref,
+            "skipped": true,
+            "broken": true,
+            "deletedTarget": true,
+        });
+        if package {
+            result["package"] = Value::Bool(true);
+        }
+        self.link_results.push(result);
     }
 }
 
@@ -164,22 +216,7 @@ impl PackageLinkApply<'_> {
         let target_matches_package =
             target_fingerprint.as_deref() == Some(package_fingerprint.as_str());
         if !target_exists && lock_entry.files.contains_key(&lock_key) && !target_forced {
-            if !args.check {
-                changes.manifest_changed |= mark_manifest_target_broken(manifest, target);
-            }
-            changes.drift += 1;
-            changes.applied += 1;
-            changes.link_results.push(json!({
-                "id": target.link_id,
-                "service": target.service,
-                "path": target.target_segments,
-                "readOnly": target.read_only,
-                "resolvedRef": target.resolved_ref,
-                "package": true,
-                "skipped": true,
-                "broken": true,
-                "deletedTarget": true,
-            }));
+            changes.mark_deleted_target(manifest, target, args.check, true);
             return Ok(());
         }
         let previous_package_hash = lock_entry.files.get(&lock_key).cloned();
@@ -350,21 +387,7 @@ impl MirrorLinkApply<'_> {
             && (!target_exists || missing_locked_mirror)
             && !target_forced
         {
-            if !args.check {
-                changes.manifest_changed |= mark_manifest_target_broken(manifest, target);
-            }
-            changes.drift += 1;
-            changes.applied += 1;
-            changes.link_results.push(json!({
-                "id": target.link_id,
-                "service": target.service,
-                "path": target.target_segments,
-                "readOnly": target.read_only,
-                "resolvedRef": target.resolved_ref,
-                "skipped": true,
-                "broken": true,
-                "deletedTarget": true,
-            }));
+            changes.mark_deleted_target(manifest, target, args.check, false);
             return Ok(());
         }
         for (pair, lock_key) in target.files.iter().zip(&locked_mirror_keys) {
@@ -467,11 +490,8 @@ impl MirrorLinkApply<'_> {
 }
 
 pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_link_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let manifest_path = link_manifest_path(&project_root, &args.manifest);
-    let mut manifest = read_link_manifest(&manifest_path)?;
+    let (project_root, src_root, manifest_path, mut manifest) =
+        load_link_project(&mut args.project, &args.manifest)?;
     let options = LinkResolveOptions {
         only_link: args.link.clone(),
         offline: args.offline || args.check,
@@ -493,17 +513,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         settings_guards.push(acquire_settings_file_lock(settings_file)?);
     }
 
-    let mut documents: HashMap<PathBuf, SettingsBytecode> = HashMap::new();
-    let mut settings_outputs = HashMap::<PathBuf, PathBuf>::new();
-    for settings_file in &settings_files {
-        documents.insert(
-            settings_file.clone(),
-            SettingsBytecode::read_file(settings_file)
-                .with_context(|| format!("Failed to read {}", settings_file.display()))?,
-        );
-        settings_outputs.insert(settings_file.clone(), settings_file.clone());
-    }
-    canonicalize_loaded_settings_documents(&mut documents)?;
+    let (mut documents, mut settings_outputs) = load_settings_documents(&settings_files)?;
     let mut lock = read_link_lock(&project_root)?;
     let mut changes = LinkApplyChanges::default();
 
@@ -579,7 +589,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
             None
         };
         let lock_entry = lock.entries.entry(target.link_id.clone()).or_default();
-        lock_entry.resolved_ref = target.resolved_ref.clone();
+        lock_entry.resolved_ref.clone_from(&target.resolved_ref);
 
         if target.package_source.is_some() {
             let settings_file = document_key
@@ -587,11 +597,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
             let document_selector = document_selector
                 .as_ref()
                 .context("Package link target has no bytecode selector")?;
-            let external_references = documents
-                .iter()
-                .filter(|(path, _)| exact_path_key(path) != exact_path_key(settings_file))
-                .flat_map(|(_, document)| referenced_settings_ids(document))
-                .collect::<HashSet<_>>();
+            let external_references = referenced_settings_ids_outside(&documents, settings_file);
             let document = documents
                 .get_mut(settings_file)
                 .context("Package link target settings were not loaded")?;
@@ -629,23 +635,16 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
     }
 
     if !args.check {
-        let mut settings_files = documents.keys().cloned().collect::<Vec<_>>();
-        settings_files.sort();
-        for settings_file in &settings_files {
-            let output_file = &settings_outputs[settings_file];
-            changes.transaction_writes.insert(
-                output_file.clone(),
-                settings_document_bytes(&documents[settings_file], output_file)?,
-            );
-            if exact_path_key(output_file) != exact_path_key(settings_file) {
-                changes.transaction_removals.push(settings_file.clone());
-            }
-        }
+        stage_settings_document_writes(
+            &documents,
+            &settings_outputs,
+            &mut changes.transaction_writes,
+            &mut changes.transaction_removals,
+        )?;
         lock.version = LINK_MANIFEST_VERSION;
-        changes.transaction_writes.insert(
-            link_lock_path(&project_root),
-            (serde_json::to_string_pretty(&lock)? + "\n").into_bytes(),
-        );
+        changes
+            .transaction_writes
+            .insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
         if changes.manifest_changed {
             changes.transaction_writes.insert(
                 manifest_path.clone(),
@@ -707,11 +706,8 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
 }
 
 pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_link_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let manifest_path = link_manifest_path(&project_root, &args.manifest);
-    let mut manifest = read_link_manifest(&manifest_path)?;
+    let (project_root, src_root, manifest_path, mut manifest) =
+        load_link_project(&mut args.project, &args.manifest)?;
 
     let known_target_keys: HashSet<String> = manifest
         .links
@@ -731,21 +727,13 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
             })?;
         to_break.extend(link.targets.iter().cloned());
     } else if let (Some(service), Some(path_json)) = (&args.service, &args.path_segments_json) {
-        let path: Vec<String> =
-            serde_json::from_str(path_json).context("Failed to parse --path JSON array")?;
-        let ords: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
-            .context("Failed to parse --ords JSON array")?;
-        let target = LinkTargetRef {
-            service: service.clone(),
-            path,
-            ords,
-        };
+        let target = parse_link_target(service, path_json, &args.path_ordinals_json)?;
         validate_link_target_ref(&target)?;
         if !known_target_keys.contains(&link_target_ref_key(&target)) {
             bail!(
                 "{}.{} is not a renium-link target; nothing to break.",
                 target.service,
-                target.path.last().cloned().unwrap_or_default()
+                target.path.last().map_or("", String::as_str)
             );
         }
         to_break.push(target);
@@ -813,11 +801,8 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
 }
 
 pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_link_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let manifest_path = link_manifest_path(&project_root, &args.manifest);
-    let manifest = read_link_manifest(&manifest_path)?;
+    let (project_root, src_root, manifest_path, manifest) =
+        load_link_project(&mut args.project, &args.manifest)?;
     let options = LinkResolveOptions {
         cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
         ..LinkResolveOptions::default()
@@ -957,10 +942,10 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             "files": target.files.len(),
             "mirrors": mirrors,
             "reason": target.unresolved_reason,
-            "isPackage": meta.map(|meta| meta.is_package).unwrap_or(false),
+            "isPackage": meta.is_some_and(|meta| meta.is_package),
             "rootClass": meta.and_then(|meta| meta.root_class.clone()),
             "rootName": meta.and_then(|meta| meta.root_name.clone()),
-            "sourceInstances": meta.map(|meta| meta.instances).unwrap_or(0),
+            "sourceInstances": meta.map_or(0, |meta| meta.instances),
             "updatedUnixMs": meta.and_then(|meta| meta.updated_unix_ms).map(|value| value as u64),
         }));
     }
@@ -975,12 +960,12 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
                 "readOnly": link.read_only,
                 "sourceKind": link.source.kind(),
                 "source": link.source.summary(),
-                "sourcePath": source_path_by_link.get(&link.id).map(|path| path.to_string_lossy().to_string()),
+                "sourcePath": source_path_by_link.get(&link.id).map(|path| path.to_string_lossy().into_owned()),
                 "targetCount": active_target_count_by_link.get(&link.id).copied().unwrap_or(0),
-                "isPackage": meta.map(|meta| meta.is_package).unwrap_or(false),
+                "isPackage": meta.is_some_and(|meta| meta.is_package),
                 "rootClass": meta.and_then(|meta| meta.root_class.clone()),
                 "rootName": meta.and_then(|meta| meta.root_name.clone()),
-                "instances": meta.map(|meta| meta.instances).unwrap_or(0),
+                "instances": meta.map_or(0, |meta| meta.instances),
                 "updatedUnixMs": meta.and_then(|meta| meta.updated_unix_ms).map(|value| value as u64),
             })
         })
@@ -1006,24 +991,16 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
     let manifest_path = link_manifest_path(&project_root, &args.manifest);
     let mut manifest = read_link_manifest(&manifest_path)?;
 
-    let path: Vec<String> = serde_json::from_str(&args.path_segments_json)
-        .context("Failed to parse --path JSON array")?;
-    let ords: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
-        .context("Failed to parse --ords JSON array")?;
-    if path.is_empty() {
-        bail!("--path must contain at least the leaf instance name");
-    }
-    let target = LinkTargetRef {
-        service: args.service.clone(),
-        path: path.clone(),
-        ords,
-    };
-    validate_link_target_ref(&target)?;
+    let target = parse_link_target(
+        &args.target.service,
+        &args.target.path_segments_json,
+        &args.target.path_ordinals_json,
+    )?;
+    let path = &target.path;
     let target_key = link_target_ref_key(&target);
     let id = args
         .id
-        .clone()
-        .unwrap_or_else(|| link_slug(path.last().map(String::as_str).unwrap_or("link")));
+        .unwrap_or_else(|| link_slug(path.last().map_or("link", String::as_str)));
     validate_filesystem_instance_name(&id, "link id")?;
     if let Some(existing_link) = manifest.links.iter().find(|link| {
         link.id != id
@@ -1049,7 +1026,7 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
             link.targets.push(target);
         }
     } else {
-        let source_value = args.source.clone().ok_or_else(|| {
+        let source_value = args.source.ok_or_else(|| {
             anyhow::anyhow!(
                 "--source is required when creating a new link (id {id} does not exist yet)"
             )
@@ -1058,18 +1035,18 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
             "local" => LinkSource::Local { path: source_value },
             "git" => LinkSource::Git {
                 url: source_value,
-                git_ref: args.source_ref.clone(),
-                subpath: args.source_subpath.clone(),
+                git_ref: args.source_ref,
+                subpath: args.source_subpath,
             },
             "wally" => LinkSource::Wally {
                 package: source_value,
-                version: args.source_ref.clone(),
+                version: args.source_ref,
             },
             other => bail!("Unknown --source-type {other}. Use local, git, or wally."),
         };
         manifest.links.push(LinkEntry {
             id: id.clone(),
-            read_only: !args.writable,
+            read_only: !args.target.writable,
             source,
             targets: vec![target],
         });
@@ -1095,26 +1072,16 @@ pub(crate) fn link_move_target(args: LinkMoveTargetArgs) -> Result<()> {
     let manifest_path = link_manifest_path(&project_root, &args.manifest);
     let mut manifest = read_link_manifest(&manifest_path)?;
 
-    let old_path: Vec<String> = serde_json::from_str(&args.old_path_segments_json)
-        .context("Failed to parse --old-path JSON array")?;
-    let new_path: Vec<String> = serde_json::from_str(&args.new_path_segments_json)
-        .context("Failed to parse --new-path JSON array")?;
-    let old_ordinals: Vec<usize> = serde_json::from_str(&args.old_path_ordinals_json)
-        .context("Failed to parse --old-ords JSON array")?;
-    let new_ordinals: Vec<usize> = serde_json::from_str(&args.new_path_ordinals_json)
-        .context("Failed to parse --new-ords JSON array")?;
-    let old_target = LinkTargetRef {
-        service: args.old_service.clone(),
-        path: old_path,
-        ords: old_ordinals,
-    };
-    let new_target = LinkTargetRef {
-        service: args.new_service.clone(),
-        path: new_path,
-        ords: new_ordinals,
-    };
-    validate_link_target_ref(&old_target)?;
-    validate_link_target_ref(&new_target)?;
+    let old_target = parse_link_target(
+        &args.old_service,
+        &args.old_path_segments_json,
+        &args.old_path_ordinals_json,
+    )?;
+    let new_target = parse_link_target(
+        &args.new_service,
+        &args.new_path_segments_json,
+        &args.new_path_ordinals_json,
+    )?;
     let old_key = link_target_ref_key(&old_target);
     let new_key = link_target_ref_key(&new_target);
     if old_key != new_key
@@ -1187,10 +1154,7 @@ pub(crate) fn link_move_target(args: LinkMoveTargetArgs) -> Result<()> {
         serialize_link_manifest(&manifest)?.into_bytes(),
     )]);
     if lock_changed {
-        writes.insert(
-            link_lock_path(&project_root),
-            (serde_json::to_string_pretty(&lock)? + "\n").into_bytes(),
-        );
+        writes.insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
     }
     apply_file_mutations(&writes, &[])?;
 
@@ -1325,8 +1289,7 @@ pub(super) fn pack_subtree_to_bytecode(
         .instances
         .iter()
         .find(|instance| instance.parent_index.is_none())
-        .map(|instance| instance.name.as_str())
-        .unwrap_or("");
+        .map_or("", |instance| instance.name.as_str());
     let (source_path_segments, source_path_ordinals) =
         build_editor_instance_path_parts(document, service);
     let mut subtree = Vec::new();
@@ -1447,37 +1410,22 @@ fn inline_editor_source_files_for_indexes(
         instance
             .properties
             .insert("Source".to_string(), Value::String(source.clone()));
-        inlined_paths.push(source_path.to_string_lossy().to_string());
+        inlined_paths.push(source_path.to_string_lossy().into_owned());
     }
     Ok(inlined_paths)
 }
 
 pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_link_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let manifest_path = link_manifest_path(&project_root, &args.manifest);
-    let mut manifest = read_link_manifest(&manifest_path)?;
+    let (project_root, src_root, manifest_path, mut manifest) =
+        load_link_project(&mut args.project, &args.manifest)?;
 
-    let path: Vec<String> = serde_json::from_str(&args.path_segments_json)
-        .context("Failed to parse --path JSON array")?;
-    let ords: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
-        .context("Failed to parse --ords JSON array")?;
-    if path.is_empty() {
-        bail!("--path must contain at least the instance name");
-    }
-    let segments_after_service = if path.first().map(String::as_str) == Some(args.service.as_str())
-    {
-        path[1..].to_vec()
-    } else {
-        path.clone()
-    };
-    let target = LinkTargetRef {
-        service: args.service.clone(),
-        path: path.clone(),
-        ords,
-    };
-    validate_link_target_ref(&target)?;
+    let target = parse_link_target(
+        &args.target.service,
+        &args.target.path_segments_json,
+        &args.target.path_ordinals_json,
+    )?;
+    let path = target.path.clone();
+    let segments_after_service = link_target_segments(&target);
     let target_ordinals = link_target_ordinals(&target);
     if let Some(id) = &args.id {
         validate_filesystem_instance_name(id, "link id")?;
@@ -1485,7 +1433,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
 
     for link in &manifest.links {
         for existing in &link.targets {
-            if existing.service != args.service {
+            if existing.service != args.target.service {
                 continue;
             }
             let existing_segments = link_target_segments(existing);
@@ -1503,7 +1451,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             if inside_existing {
                 bail!(
                     "{}.{} is inside the existing link \"{}\" ({}). Break that link first, or pack its root instead.",
-                    args.service,
+                    args.target.service,
                     segments_after_service.join("."),
                     link.id,
                     existing_segments.join(".")
@@ -1519,7 +1467,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             if contains_existing {
                 bail!(
                     "{}.{} contains the existing link \"{}\" ({}). Break that link first.",
-                    args.service,
+                    args.target.service,
                     segments_after_service.join("."),
                     link.id,
                     existing_segments.join(".")
@@ -1553,7 +1501,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         &document_segments,
         &document_ordinals,
     )
-    .ok_or_else(|| anyhow::anyhow!("Instance not found: {}", path.join(".")))?;
+    .ok_or_else(|| anyhow::anyhow!("Instance not found: {}", target.path.join(".")))?;
 
     let leaf_name = document.instances[root_index].name.clone();
     let service_dir = storage.source_root.clone();
@@ -1576,7 +1524,8 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         })
         .map(|link| link.id.clone());
 
-    let id = if let Some(explicit) = args.id.clone() {
+    let explicit_id = args.id.is_some();
+    let id = if let Some(explicit) = args.id {
         explicit
     } else {
         let base = link_slug(&leaf_name);
@@ -1613,7 +1562,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         );
     }
     let existing_link = manifest.links.iter().find(|link| link.id == id);
-    if args.id.is_some()
+    if explicit_id
         && let Some(link) = existing_link
         && !link
             .targets
@@ -1649,7 +1598,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             format!("{GLOBAL_LINK_PREFIX}{id}.{RENIUM_STORE_EXTENSION}"),
         )
     };
-    let package_bytes = settings_document_bytes(&package, &package_file)?;
+    let package_bytes = encode_settings_bytecode(&package)?;
     let mut lock = read_link_lock(&project_root)?;
     lock.version = LINK_MANIFEST_VERSION;
     let default_ordinals = vec![1; segments_after_service.len()];
@@ -1659,7 +1608,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         .find(|link| link.id == id)
         .is_some_and(|link| {
             link.targets.iter().any(|existing| {
-                existing.service == args.service
+                existing.service == args.target.service
                     && link_target_segments(existing) == segments_after_service
                     && link_target_ordinals(existing) == default_ordinals
             })
@@ -1668,13 +1617,13 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     if target_ordinals != default_ordinals && !default_target_exists {
         files.remove(&package_lock_key(
             "package",
-            &args.service,
+            &args.target.service,
             &segments_after_service,
             &default_ordinals,
         ));
         files.remove(&package_lock_key(
             "package-target",
-            &args.service,
+            &args.target.service,
             &segments_after_service,
             &default_ordinals,
         ));
@@ -1682,7 +1631,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     files.insert(
         package_lock_key(
             "package",
-            &args.service,
+            &args.target.service,
             &segments_after_service,
             &target_ordinals,
         ),
@@ -1691,7 +1640,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     files.insert(
         package_lock_key(
             "package-target",
-            &args.service,
+            &args.target.service,
             &segments_after_service,
             &target_ordinals,
         ),
@@ -1709,7 +1658,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     } else {
         manifest.links.push(LinkEntry {
             id: id.clone(),
-            read_only: !args.writable,
+            read_only: !args.target.writable,
             source: LinkSource::Local {
                 path: source_rel.clone(),
             },
@@ -1730,14 +1679,11 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         plan_editor_source_file_removals(&service_dir, &source_paths, &subtree)?;
     let removed_source_paths = source_removals
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let mut transaction_writes = BTreeMap::new();
     transaction_writes.insert(package_file.clone(), package_bytes);
-    transaction_writes.insert(
-        link_lock_path(&project_root),
-        (serde_json::to_string_pretty(&lock)? + "\n").into_bytes(),
-    );
+    transaction_writes.insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
     transaction_writes.insert(
         manifest_path.clone(),
         serialize_link_manifest(&manifest)?.into_bytes(),
@@ -1745,7 +1691,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     if !inlined_source_paths.is_empty() {
         transaction_writes.insert(
             settings_output_file.clone(),
-            settings_document_bytes(&document, settings_output_file)?,
+            encode_settings_bytecode(&document)?,
         );
         if exact_path_key(settings_output_file) != exact_path_key(settings_file) {
             source_removals.push(settings_file.clone());
@@ -1756,15 +1702,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         transaction_writes.insert(gitignore, RENIUM_DIR_GITIGNORE.as_bytes().to_vec());
     }
     apply_file_mutations(&transaction_writes, &source_removals)?;
-    let mut directories = source_removals
-        .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    directories.dedup();
-    for directory in directories {
-        let _ = prune_empty_source_dirs(&service_dir, &directory);
-    }
+    prune_removed_source_dirs(&service_dir, &source_removals);
 
     print_json_output(
         &json!({
@@ -1774,7 +1712,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             "package": package_file,
             "source": source_rel,
             "instances": package.instances.len(),
-            "service": args.service,
+            "service": args.target.service,
             "path": path,
             "inlinedSourcePaths": inlined_source_paths,
             "removedSourcePaths": removed_source_paths,
@@ -1783,7 +1721,6 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinkDeletePackageAction {
     DeleteUnused,
     DeleteUses,
@@ -1843,7 +1780,7 @@ fn plan_externalize_editor_source_files_for_indexes(
             "Source".to_string(),
             Value::String("__SOURCE_EXTERNAL__".to_string()),
         );
-        written_paths.push(source_path.to_string_lossy().to_string());
+        written_paths.push(source_path.to_string_lossy().into_owned());
     }
     Ok(written_paths)
 }
@@ -1939,7 +1876,7 @@ fn plan_delete_link_target_instance(
     )?;
     let removed_source_paths = source_removals
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().into_owned())
         .collect();
     removals.extend(source_removals);
     Ok((true, removed_source_paths))
@@ -2004,27 +1941,29 @@ fn local_package_source_path(project_root: &Path, link: &LinkEntry) -> Result<Pa
 }
 
 pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_link_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
-    let manifest_path = link_manifest_path(&project_root, &args.manifest);
-    let mut manifest = read_link_manifest(&manifest_path)?;
+    let (project_root, src_root, manifest_path, mut manifest) =
+        load_link_project(&mut args.project, &args.manifest)?;
     let action = parse_link_delete_package_action(&args.action)?;
     let link_index = manifest
         .links
         .iter()
         .position(|link| link.id == args.id)
         .ok_or_else(|| anyhow::anyhow!("No link package with id {}.", args.id))?;
-    let link = manifest.links[link_index].clone();
-    let package_path = local_package_source_path(&project_root, &link)?;
-    let active_targets = active_link_targets(&manifest, &link);
-    if !active_targets.is_empty() && action == LinkDeletePackageAction::DeleteUnused {
+    let (package_path, active_targets) = {
+        let link = &manifest.links[link_index];
+        (
+            local_package_source_path(&project_root, link)?,
+            active_link_targets(&manifest, link),
+        )
+    };
+    if !active_targets.is_empty() && matches!(&action, LinkDeletePackageAction::DeleteUnused) {
         bail!(
             "Package {} has {} active use(s). Choose delete-uses or unlink-uses.",
-            link.id,
+            args.id,
             active_targets.len()
         );
     }
+    let link = manifest.links.remove(link_index);
 
     let mut touched_services = HashSet::new();
     let mut documents = HashMap::<PathBuf, SettingsBytecode>::new();
@@ -2088,30 +2027,22 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
         .iter()
         .map(link_target_ref_key)
         .collect::<HashSet<_>>();
-    manifest.links.remove(link_index);
     manifest
         .broken
         .retain(|target| !target_keys.contains(&link_target_ref_key(target)));
     let mut lock = read_link_lock(&project_root)?;
     lock.entries.remove(&link.id);
-    for (settings_file, document) in &documents {
-        let output_file = &settings_outputs[settings_file];
-        transaction_writes.insert(
-            output_file.clone(),
-            settings_document_bytes(document, output_file)?,
-        );
-        if exact_path_key(output_file) != exact_path_key(settings_file) {
-            transaction_removals.push(settings_file.clone());
-        }
-    }
+    stage_settings_document_writes(
+        &documents,
+        &settings_outputs,
+        &mut transaction_writes,
+        &mut transaction_removals,
+    )?;
     transaction_writes.insert(
         manifest_path.clone(),
         serialize_link_manifest(&manifest)?.into_bytes(),
     );
-    transaction_writes.insert(
-        link_lock_path(&project_root),
-        (serde_json::to_string_pretty(&lock)? + "\n").into_bytes(),
-    );
+    transaction_writes.insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
     let deleted_package_path = package_path.is_file().then(|| package_path.clone());
     if deleted_package_path.is_some() {
         transaction_removals.push(package_path);
@@ -2131,20 +2062,10 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
     }
     apply_file_mutations(&transaction_writes, &transaction_removals)?;
     drop(guards);
-    let mut directories = transaction_removals
-        .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    directories.dedup();
-    for directory in directories {
-        if directory.starts_with(&src_root) {
-            let _ = prune_empty_source_dirs(&src_root, &directory);
-        }
-    }
+    prune_removed_source_dirs(&src_root, &transaction_removals);
     let mut changed_paths = documents
         .keys()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     changed_paths.extend(externalized_source_paths.iter().cloned());
     changed_paths.extend(removed_source_paths.iter().cloned());

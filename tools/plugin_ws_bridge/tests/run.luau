@@ -77,11 +77,7 @@ equal(
 	true,
 	"Vector3 epsilon"
 )
-equal(
-	ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)),
-	true,
-	"CFrame epsilon"
-)
+equal(ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)), true, "CFrame epsilon")
 equal(
 	ValueEquality.valuesEqual(roblox.Color3.new(0.5, 0.25, 0.75), roblox.Color3.new(0.50001, 0.25, 0.75)),
 	true,
@@ -155,17 +151,11 @@ local oversizedCandidates = {}
 for index = 1, 33 do
 	oversizedCandidates[index] = { Value = index }
 end
-local cappedCandidate = CandidateMatch.choose(
-	oversizedCandidates,
-	{ Value = 33 },
-	{},
-	function(candidate, name, value)
-		return candidate[name] == value
-	end,
-	function(candidate, name, value)
-		return candidate[name] == value
-	end
-)
+local cappedCandidate = CandidateMatch.choose(oversizedCandidates, { Value = 33 }, {}, function(candidate, name, value)
+	return candidate[name] == value
+end, function(candidate, name, value)
+	return candidate[name] == value
+end)
 equal(cappedCandidate, oversizedCandidates[1], "candidate scoring cap")
 
 local FakeInstance = {}

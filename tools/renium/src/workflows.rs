@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use crate::command_line::SyncWallyPackagesArgs;
+use crate::command_line::{ProjectSourceArgs, SyncWallyPackagesArgs};
 use crate::file_io::{
     absolutize_for_daemon as absolute_path, atomic_write_file, exact_path_key as path_text,
 };
@@ -30,17 +30,17 @@ const CLI_DOCS: &str = include_str!("../README.md");
 const AGENT_INSTRUCTIONS: &str = include_str!("../../renium-vscode-extension/resources/AGENTS.md");
 const CLAUDE_INSTRUCTIONS: &str = include_str!("../../renium-vscode-extension/resources/CLAUDE.md");
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct InitArgs {
-    #[arg(value_name = "PATH", default_value = ".")]
+    #[arg(default_value = ".")]
     pub path: PathBuf,
     #[arg(long, value_delimiter = ',', value_name = "FEATURE")]
     pub with: Vec<InitFeature>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub preview: bool,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
 pub enum InitFeature {
     Git,
     Wally,
@@ -49,17 +49,17 @@ pub enum InitFeature {
     RobloxTs,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Clone, Args)]
 pub struct BuildArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub watch: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub sourcemap: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub plugin: bool,
     #[arg(long, value_name = "SERVICE.INSTANCE")]
     pub target: Option<String>,
@@ -69,41 +69,41 @@ pub struct BuildArgs {
     pub typescript: ToolPolicy,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
 pub enum ToolPolicy {
     Auto,
     Always,
     Never,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct DoctorArgs {
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub json: bool,
     #[arg(long, value_name = "PATH")]
     pub bundle: Option<PathBuf>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct DocsArgs {
     pub topic: Option<String>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub serve: bool,
     #[arg(long, default_value_t = 0)]
     pub port: u16,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct DaemonArgs {
     #[command(subcommand)]
     pub command: DaemonCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 pub enum DaemonCommand {
     List,
     Status(DaemonTargetArgs),
@@ -111,27 +111,26 @@ pub enum DaemonCommand {
     Clean,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct DaemonTargetArgs {
     #[arg(default_value = "default")]
     pub name: String,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub all: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub force: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct StudioArgs {
-    #[arg(value_name = "FILE")]
     pub file: Option<PathBuf>,
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub check: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct UploadArgs {
     #[arg(short, long, value_name = "PATH")]
     pub input: Option<PathBuf>,
@@ -141,20 +140,18 @@ pub struct UploadArgs {
     pub universe_id: Option<u64>,
     #[arg(long, default_value = "ROBLOX_API_KEY")]
     pub api_key_env: String,
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long)]
     pub project: Option<PathBuf>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct InitPlan {
     root: PathBuf,
     create: Vec<String>,
     keep: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct DoctorCheck {
     name: String,
     status: &'static str,
@@ -162,11 +159,9 @@ struct DoctorCheck {
     action: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DaemonDiscovery {
-    #[serde(default = "default_daemon_schema")]
-    schema_version: u32,
     #[serde(default = "default_daemon_name")]
     name: String,
     host: String,
@@ -174,11 +169,6 @@ struct DaemonDiscovery {
     #[serde(default)]
     bridge_ports: Vec<u16>,
     pid: u32,
-    updated_unix_ms: u128,
-}
-
-fn default_daemon_schema() -> u32 {
-    1
 }
 
 fn default_daemon_name() -> String {
@@ -253,11 +243,9 @@ pub fn run_init(args: InitArgs) -> Result<()> {
             atomic_write_file(&path, &bytes)?;
             created_files.push(path);
         }
-        for directory in init_directories(&root, &source_root) {
-            if directory.exists() {
-                continue;
-            }
-            create_directories_tracked(&directory, &mut created_directories)?;
+        let source_directory = root.join(&source_root);
+        if !source_directory.exists() {
+            create_directories_tracked(&source_directory, &mut created_directories)?;
         }
         if args.with.contains(&InitFeature::Git) && !root.join(".git").exists() {
             run_checked(
@@ -1025,10 +1013,6 @@ fn init_files(
     Ok(files)
 }
 
-fn init_directories(root: &Path, source_root: &Path) -> Vec<PathBuf> {
-    vec![root.join(source_root)]
-}
-
 fn build_once(
     loaded: &LoadedProject,
     args: &BuildArgs,
@@ -1113,7 +1097,7 @@ fn build_project_file(
         vec![segments[0].clone()]
     } else {
         fs::read_dir(src_root)?
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
             .filter(|name| !name.starts_with('.'))
@@ -1181,8 +1165,10 @@ fn run_optional_toolchains(loaded: &LoadedProject, args: &BuildArgs) -> Result<(
             bail!("--wally always requires {}", wally_manifest.display());
         }
         crate::package_links::sync_wally_packages_result(SyncWallyPackagesArgs {
-            project_root: loaded.root.clone(),
-            src_root: loaded.project.source_root.clone(),
+            project: ProjectSourceArgs {
+                project_root: loaded.root.clone(),
+                src_root: loaded.project.source_root.clone(),
+            },
             manifest: PathBuf::from("wally.toml"),
             wally_path: "wally".to_string(),
             packages_dir: PathBuf::from("Packages"),
@@ -1273,8 +1259,7 @@ fn docs_topic(topic: Option<&str>) -> Result<String> {
             let next_level = line.chars().take_while(|ch| *ch == '#').count();
             next_level > 0 && next_level <= level
         })
-        .map(|(index, _)| index)
-        .unwrap_or(lines.len());
+        .map_or(lines.len(), |(index, _)| index);
     Ok(lines[start..end].join("\n") + "\n")
 }
 
@@ -1504,9 +1489,9 @@ fn resolve_studio_file(
                 Some(".git" | ".renium" | "node_modules" | "snapshots")
             )
         })
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .filter(|path| {
             matches!(
                 path.extension()
@@ -1561,7 +1546,7 @@ fn studio_executable() -> Result<PathBuf> {
         let versions = PathBuf::from(local).join("Roblox/Versions");
         let mut candidates = fs::read_dir(&versions)
             .with_context(|| format!("Failed to inspect {}", versions.display()))?
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .map(|entry| entry.path().join("RobloxStudioBeta.exe"))
             .filter(|path| path.is_file())
             .collect::<Vec<_>>();

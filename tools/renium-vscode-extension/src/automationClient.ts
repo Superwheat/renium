@@ -27,7 +27,7 @@ type AutomationError = {
   c: string;
   m: string;
   rt: 0 | 1;
-  n?: string;
+  n: string;
   d?: unknown;
 };
 
@@ -96,9 +96,9 @@ export class AutomationClient {
     label: string,
     op: number,
     parameters: Record<string, unknown>,
-    options: { serve?: boolean; quietWait?: boolean; timeoutMs?: number } = {},
+    options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    await this.ensure(command, config, { serve: options.serve });
+    await this.ensure(command, config);
     const contextId = await this.ensureContext(config);
     return this.send(config, label, op, contextId, parameters, options);
   }
@@ -109,9 +109,9 @@ export class AutomationClient {
     label: string,
     op: number,
     parameters: Record<string, unknown>,
-    options: { serve?: boolean; quietWait?: boolean; timeoutMs?: number } = {},
+    options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    await this.ensure(command, config, { serve: options.serve });
+    await this.ensure(command, config);
     const contextId = await this.ensureContext(config);
     const prepared = await this.send(
       config,
@@ -142,12 +142,11 @@ export class AutomationClient {
   public async ensure(
     command: string,
     config: AutomationClientConfig,
-    options: { serve?: boolean } = {},
   ): Promise<void> {
     if (!fs.existsSync(command)) {
       throw new Error(`Required file not found: ${command}`);
     }
-    const key = this.daemonKey(command, config, options.serve === true);
+    const key = this.daemonKey(command, config);
     if (this.isRunning() && this.processKey === key) {
       await this.awaitReady(config);
       return;
@@ -211,7 +210,7 @@ export class AutomationClient {
     return tracked;
   }
 
-  private daemonKey(command: string, config: AutomationClientConfig, serve: boolean): string {
+  private daemonKey(command: string, config: AutomationClientConfig): string {
     let binaryMtimeMs = 0;
     try {
       binaryMtimeMs = Math.floor(fs.statSync(command).mtimeMs);
@@ -223,7 +222,6 @@ export class AutomationClient {
       projectRoot: config.projectRoot,
       bridgePorts: config.bridgePorts,
       bridgeWaitSeconds: Math.max(1, config.bridgeWaitSeconds),
-      serve,
     });
   }
 

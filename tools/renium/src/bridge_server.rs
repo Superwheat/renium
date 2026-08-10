@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_with_config};
 
-#[cfg(any(windows, target_os = "macos"))]
-use crate::local_transport::local_tcp_ports_owned_by_pid;
 use crate::local_transport::normalize_loopback_host;
+#[cfg(any(windows, target_os = "macos"))]
+use crate::local_transport::{local_tcp_ports_owned_by_pid, pid_for_local_tcp_port};
 use crate::place_target::{place_filter, place_matches};
 use crate::snapshot_export::{parse_bridge_chunk, validate_bridge_chunk, validate_bridge_info};
 use crate::studio_automation::TestLaunch;
@@ -56,7 +56,6 @@ fn bridge_response_timeout(method: &str) -> Duration {
         | "awaitEditorBinaryExport"
         | "getInstanceBatchCompactChunk"
         | "getEditorBinaryOverlayChunk"
-        | "getEditorBinaryDebugIds"
         | "getSourceBatchChunk"
         | "getSourceRangeBatchCompactChunk" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
         _ => BRIDGE_DEFAULT_RESPONSE_TIMEOUT,
@@ -70,25 +69,20 @@ fn bridge_channel_lock_timeout(method: &str) -> Duration {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct BridgeChunk {
-    #[serde(default)]
     pub(super) start: usize,
-    #[serde(default, rename = "nextStart")]
     pub(super) next_start: usize,
-    #[serde(default)]
     pub(super) total: usize,
-    #[serde(default)]
     pub(super) chunk: String,
-    #[serde(default, rename = "pluginServerMs")]
     pub(super) plugin_server_ms: Option<f64>,
-    #[serde(default, rename = "pluginEncodeMs")]
     pub(super) plugin_encode_ms: Option<f64>,
-    #[serde(default, rename = "serializationComplete")]
+    #[serde(default)]
     pub(super) serialization_complete: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct ChunkFetchMetrics {
     pub(super) bytes: usize,
     pub(super) chunks: usize,
@@ -122,88 +116,46 @@ impl std::fmt::Display for BridgeApplicationError {
 
 impl std::error::Error for BridgeApplicationError {}
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
 pub(super) struct BridgeInfoPayload {
-    #[serde(default, rename = "runtimeId")]
     pub(super) runtime_id: String,
-    #[serde(default, rename = "launchNonce")]
     pub(super) launch_nonce: String,
-    #[serde(default, rename = "launchEditRuntimeId")]
     pub(super) launch_edit_runtime_id: String,
-    #[serde(default)]
     pub(super) bridge_version: String,
-    #[serde(default)]
     pub(super) bridge_build_unix: i64,
-    #[serde(default, rename = "bridgeRole")]
     pub(super) bridge_role: String,
-    #[serde(default, rename = "playerName")]
     pub(super) player_name: String,
-    #[serde(default, rename = "playerUserId")]
     pub(super) player_user_id: Option<i64>,
-    #[serde(default, rename = "placeId")]
     pub(super) place_id: Option<i64>,
-    #[serde(default, rename = "gameId")]
     pub(super) game_id: Option<i64>,
-    #[serde(default, rename = "placeName")]
     pub(super) place_name: String,
-    #[serde(default)]
     pub(super) protocol_version: String,
-    #[serde(default)]
     pub(super) codec_version: String,
-    #[serde(default)]
-    pub(super) supported_instance_protocols: Vec<String>,
-    #[serde(default)]
     pub(super) chunk_frame_protocol_version: String,
-    #[serde(default)]
     pub(super) compact_value_protocol_version: String,
-    #[serde(default)]
-    pub(super) large_service_warm_mode: String,
-    #[serde(default)]
-    pub(super) serializer_worker_mode: String,
-    #[serde(default)]
     pub(super) performance_mode: String,
-    #[serde(default)]
     pub(super) export_all_properties: bool,
-    #[serde(default)]
     pub(super) modified_default_bypass: bool,
-    #[serde(default)]
-    pub(super) pre_serialize_on_prepare: bool,
-    #[serde(default)]
-    pub(super) pre_serialize_large_service_warm: bool,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct BridgePerformanceStats {
-    #[serde(default, rename = "frameMs")]
     pub(super) frame_ms: Option<f64>,
-    #[serde(default, rename = "lastFrameMs")]
     pub(super) last_frame_ms: Option<f64>,
-    #[serde(default, rename = "maxFrameMs")]
     pub(super) max_frame_ms: Option<f64>,
-    #[serde(default, rename = "stallCountOver33Ms")]
     pub(super) stall_count_over_33_ms: Option<u64>,
-    #[serde(default, rename = "stallCountOver50Ms")]
     pub(super) stall_count_over_50_ms: Option<u64>,
-    #[serde(default, rename = "stallCountOver100Ms")]
     pub(super) stall_count_over_100_ms: Option<u64>,
-    #[serde(default, rename = "modifiedDefaultChecks")]
     pub(super) modified_default_checks: Option<u64>,
-    #[serde(default, rename = "modifiedDefaultElided")]
     pub(super) modified_default_elided: Option<u64>,
-    #[serde(default, rename = "modifiedDefaultValidationReads")]
     pub(super) modified_default_validation_reads: Option<u64>,
-    #[serde(default, rename = "modifiedDefaultRuntimeDenylistCount")]
     pub(super) modified_default_runtime_denylist_count: Option<u64>,
-    #[serde(default, rename = "propertiesRead")]
     pub(super) properties_read: Option<u64>,
-    #[serde(default, rename = "propertiesEncoded")]
     pub(super) properties_encoded: Option<u64>,
-    #[serde(default, rename = "propertiesDefaultSkipped")]
     pub(super) properties_default_skipped: Option<u64>,
-    #[serde(default, rename = "safeReadClassFallbackCount")]
     pub(super) safe_read_class_fallback_count: Option<u64>,
-    #[serde(default, rename = "safeReadPropertyFallbackCount")]
     pub(super) safe_read_property_fallback_count: Option<u64>,
 }
 
@@ -218,7 +170,6 @@ pub(super) struct BridgeSocket {
     pub(super) peer: String,
     pub(super) role: String,
     pub(super) last_focused_at: Instant,
-    pub(super) hello_build_unix: Option<i64>,
     pub(super) bridge_info: BridgeInfoPayload,
     pub(super) request_session_id: String,
     pub(super) pending_final_console_snapshots: Vec<Value>,
@@ -247,26 +198,42 @@ pub(super) struct FinalConsoleSnapshot {
     pub(super) payload: Value,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct BridgeListenMetrics {
     pub(super) bind_ms: f64,
     pub(super) wait_for_channels_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum BridgeTarget {
     Edit,
     Main,
     Client,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl BridgeTarget {
+    pub(super) const fn main_or_client(client: bool) -> Self {
+        if client { Self::Client } else { Self::Main }
+    }
+
+    fn preferred_roles(self) -> &'static [&'static str] {
+        match self {
+            Self::Edit => &[BRIDGE_ROLE_EDIT],
+            Self::Main => &[
+                BRIDGE_ROLE_PLAY_SERVER,
+                BRIDGE_ROLE_EDIT,
+                BRIDGE_ROLE_UNKNOWN,
+            ],
+            Self::Client => &[BRIDGE_ROLE_PLAY_CLIENT],
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct RuntimePinKey {
     pub(super) target: BridgeTarget,
     pub(super) player: Option<String>,
 }
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct RuntimePin {
     pub(super) runtime_id: String,
 }
@@ -337,8 +304,7 @@ impl BridgeServer {
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |duration| duration.as_nanos())
         );
 
         for port in ports {
@@ -406,7 +372,7 @@ impl BridgeServer {
 
             let ready_channels = server.max_runtime_channel_coverage(BridgeTarget::Main, None);
             if ready_channels < required_channels {
-                let missing_ports = server.missing_ports();
+                let missing_ports = server.missing_ports_for_target(BridgeTarget::Main);
                 bail!(
                     "Only {}/{} plugin bridge channels connected within {:.1}s; all {} are required for stable full-speed export. Missing ports: {:?}",
                     ready_channels,
@@ -453,10 +419,10 @@ impl BridgeServer {
                             &request_session_id,
                         ) {
                             Ok(socket) => {
-                                let mut guard = match channel.sockets.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
+                                let mut guard = channel
+                                    .sockets
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
                                 let role = socket.role.clone();
                                 let socket_key =
                                     Self::bridge_socket_key(&guard, &role, &socket.peer);
@@ -467,7 +433,7 @@ impl BridgeServer {
                                         port,
                                         socket.role,
                                         socket.peer,
-                                        socket.hello_build_unix.unwrap_or(0)
+                                        socket.bridge_info.bridge_build_unix
                                     );
                                 }
                                 guard.insert(socket_key, socket);
@@ -508,10 +474,10 @@ impl BridgeServer {
                 thread::sleep(Duration::from_millis(300));
 
                 let multiple_plugins = channels.iter().any(|channel| {
-                    let guard = match channel.sockets.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
+                    let guard = channel
+                        .sockets
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     guard.len() > 1
                 });
                 if !multiple_plugins {
@@ -551,10 +517,10 @@ impl BridgeServer {
 
                 let now = Instant::now();
                 for channel in &channels {
-                    let mut guard = match channel.sockets.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
+                    let mut guard = channel
+                        .sockets
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     for socket in guard.values_mut() {
                         let peer_port = socket
                             .peer
@@ -599,16 +565,14 @@ impl BridgeServer {
             peer,
             role: BRIDGE_ROLE_UNKNOWN.to_string(),
             last_focused_at: accepted_at,
-            hello_build_unix: None,
             bridge_info: BridgeInfoPayload::default(),
             request_session_id: request_session_id.to_string(),
             pending_final_console_snapshots: Vec::new(),
             socket,
         };
 
-        let bridge_info = Self::probe_bridge_info_on_socket(&mut bridge_socket)
+        let bridge_info = Self::probe_bridge_info_on_socket_with_id(&mut bridge_socket, 1)
             .with_context(|| format!("readiness getBridgeInfo failed on {bind_host}:{port}"))?;
-        bridge_socket.hello_build_unix = Some(bridge_info.bridge_build_unix);
         bridge_socket.role = normalize_bridge_role(&bridge_info.bridge_role).to_string();
         bridge_socket.bridge_info = bridge_info;
 
@@ -624,17 +588,17 @@ impl BridgeServer {
         Ok(bridge_socket)
     }
 
-    pub(super) fn probe_bridge_info_on_socket(
-        bridge_socket: &mut BridgeSocket,
-    ) -> Result<BridgeInfoPayload> {
-        Self::probe_bridge_info_on_socket_with_id(bridge_socket, 1)
-    }
-
     pub(super) fn probe_bridge_info_on_socket_with_id(
         bridge_socket: &mut BridgeSocket,
         id: u64,
     ) -> Result<BridgeInfoPayload> {
-        let value = Self::call_on_socket(bridge_socket, id, "getBridgeInfo", &json!({}))?;
+        let value = Self::call_on_socket_with_timeout(
+            bridge_socket,
+            id,
+            "getBridgeInfo",
+            &json!({}),
+            None,
+        )?;
         let info: BridgeInfoPayload =
             serde_json::from_value(value).context("Invalid getBridgeInfo response from plugin")?;
         validate_bridge_info(&info)?;
@@ -644,8 +608,7 @@ impl BridgeServer {
     pub(super) fn bridge_role_key_base(role_key: &str) -> &str {
         role_key
             .split_once(BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR)
-            .map(|(base, _)| base)
-            .unwrap_or(role_key)
+            .map_or(role_key, |(base, _)| base)
     }
 
     pub(super) fn bridge_socket_key(
@@ -659,8 +622,7 @@ impl BridgeServer {
 
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |duration| duration.as_nanos());
         let peer_key = peer.replace(BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR, "_");
         let mut suffix = 0usize;
         loop {
@@ -826,7 +788,7 @@ impl BridgeServer {
     pub(super) fn clear_runtime_pins(&self) {
         self.runtime_pins
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
 
@@ -842,7 +804,7 @@ impl BridgeServer {
             let mut guard = channel
                 .sockets
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::ensure_place_unambiguous(&mut guard, target, player)?;
             for (role_key, socket) in guard.iter() {
                 if !Self::socket_matches_selector(role_key, socket, target, player) {
@@ -895,20 +857,20 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Result<RuntimePin> {
         let key = Self::runtime_pin_key(target, player);
-        if let Some(pin) = self
+        let existing = self
             .runtime_pins
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .cloned()
-        {
+            .cloned();
+        if let Some(pin) = existing {
             return Ok(pin);
         }
         let pin = self.choose_runtime_pin(target, player)?;
         let mut pins = self
             .runtime_pins
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(pins.entry(key).or_insert(pin).clone())
     }
 
@@ -922,22 +884,25 @@ impl BridgeServer {
         player: Option<&str>,
         pin: &RuntimePin,
     ) -> Option<String> {
-        let preferred: &[&str] = match target {
-            BridgeTarget::Edit => &[BRIDGE_ROLE_EDIT],
-            BridgeTarget::Main => &[
-                BRIDGE_ROLE_PLAY_SERVER,
-                BRIDGE_ROLE_EDIT,
-                BRIDGE_ROLE_UNKNOWN,
-            ],
-            BridgeTarget::Client => &[BRIDGE_ROLE_PLAY_CLIENT],
+        Self::select_role_for_selector_inner(sockets, target, player, Some(pin))
+    }
+
+    fn select_role_for_selector_inner(
+        sockets: &HashMap<String, BridgeSocket>,
+        target: BridgeTarget,
+        player: Option<&str>,
+        pin: Option<&RuntimePin>,
+    ) -> Option<String> {
+        let matches = |key: &str, socket: &BridgeSocket| {
+            Self::socket_matches_selector(key, socket, target, player)
+                && pin.is_none_or(|pin| Self::socket_matches_runtime_pin(socket, pin))
         };
-        for role in preferred {
+        for role in target.preferred_roles() {
             if let Some(key) = sockets
                 .iter()
                 .filter(|(key, socket)| {
                     Self::bridge_role_key_base(key.as_str()) == *role
-                        && Self::socket_matches_selector(key.as_str(), socket, target, player)
-                        && Self::socket_matches_runtime_pin(socket, pin)
+                        && matches(key.as_str(), socket)
                 })
                 .max_by_key(|(_, socket)| socket.last_focused_at)
                 .map(|(key, _)| key.clone())
@@ -947,55 +912,9 @@ impl BridgeServer {
         }
         sockets
             .iter()
-            .filter(|(key, socket)| {
-                Self::socket_matches_selector(key.as_str(), socket, target, player)
-                    && Self::socket_matches_runtime_pin(socket, pin)
-            })
+            .filter(|(key, socket)| matches(key.as_str(), socket))
             .max_by_key(|(_, socket)| socket.last_focused_at)
             .map(|(key, _)| key.clone())
-    }
-
-    pub(super) fn select_role_for_target(
-        sockets: &HashMap<String, BridgeSocket>,
-        target: BridgeTarget,
-    ) -> Option<String> {
-        Self::select_role_for_selector(sockets, target, None)
-    }
-
-    pub(super) fn select_role_for_selector(
-        sockets: &HashMap<String, BridgeSocket>,
-        target: BridgeTarget,
-        player: Option<&str>,
-    ) -> Option<String> {
-        let preferred: &[&str] = match target {
-            BridgeTarget::Edit => &[BRIDGE_ROLE_EDIT],
-            BridgeTarget::Main => &[
-                BRIDGE_ROLE_PLAY_SERVER,
-                BRIDGE_ROLE_EDIT,
-                BRIDGE_ROLE_UNKNOWN,
-            ],
-            BridgeTarget::Client => &[BRIDGE_ROLE_PLAY_CLIENT],
-        };
-        for role in preferred {
-            let newest = sockets
-                .iter()
-                .filter(|(key, socket)| {
-                    Self::bridge_role_key_base(key.as_str()) == *role
-                        && Self::socket_matches_selector(key.as_str(), socket, target, player)
-                })
-                .max_by_key(|(_, socket)| socket.last_focused_at)
-                .map(|(key, _)| key.clone());
-            if newest.is_some() {
-                return newest;
-            }
-        }
-        sockets
-            .iter()
-            .filter(|(role, socket)| {
-                Self::socket_matches_selector(role.as_str(), socket, target, player)
-            })
-            .max_by_key(|(_, socket)| socket.last_focused_at)
-            .map(|(role, _)| role.clone())
     }
 
     pub(super) fn wait_for_ready_channels_for_target(
@@ -1010,7 +929,7 @@ impl BridgeServer {
             let already_pinned = self
                 .runtime_pins
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&key);
             let coverage = self.max_runtime_channel_coverage(target, None);
             let ready_channels = if already_pinned || coverage >= required_channels {
@@ -1101,10 +1020,6 @@ impl BridgeServer {
         );
     }
 
-    pub(super) fn cached_bridge_info(&self) -> Result<BridgeInfoPayload> {
-        self.cached_bridge_info_for_target(BridgeTarget::Main)
-    }
-
     pub(super) fn cache_export_options_for_target(
         &self,
         target: BridgeTarget,
@@ -1119,7 +1034,7 @@ impl BridgeServer {
             let mut guard = channel
                 .sockets
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (role_key, socket) in guard.iter_mut() {
                 if Self::socket_matches_selector(role_key, socket, target, None)
                     && Self::socket_matches_runtime_pin(socket, &runtime_pin)
@@ -1127,8 +1042,6 @@ impl BridgeServer {
                     socket.bridge_info.performance_mode = performance_mode.to_string();
                     socket.bridge_info.modified_default_bypass = modified_default_bypass;
                     socket.bridge_info.export_all_properties = export_all_properties;
-                    socket.bridge_info.pre_serialize_on_prepare = false;
-                    socket.bridge_info.pre_serialize_large_service_warm = false;
                 }
             }
         }
@@ -1147,17 +1060,13 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => return None,
                 };
-                if Self::select_role_for_target(&guard, target).is_some() {
+                if Self::select_role_for_selector_inner(&guard, target, None, None).is_some() {
                     None
                 } else {
                     Some(channel.port)
                 }
             })
             .collect()
-    }
-
-    pub(super) fn missing_ports(&self) -> Vec<u16> {
-        self.missing_ports_for_target(BridgeTarget::Main)
     }
 
     pub(super) fn close_socket(socket: &mut BridgeSocket) {
@@ -1263,6 +1172,53 @@ impl BridgeServer {
         Ok((None, attempted_socket))
     }
 
+    fn call_pinned_socket<T>(
+        &self,
+        context: &BridgeCallContext<'_>,
+        validate_place: bool,
+        call: fn(&mut BridgeSocket, u64, &str, &Value, Option<Duration>) -> Result<T>,
+        label: &str,
+    ) -> Result<T> {
+        let mut last_error = None;
+        for _ in 0..64 {
+            let (result, _) =
+                self.try_call_pinned_socket(context, validate_place, &mut last_error, call)?;
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            thread::yield_now();
+        }
+
+        let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(context.method);
+        if let Some(response_deadline) = context.response_deadline {
+            lock_deadline = lock_deadline.min(response_deadline);
+        }
+        while Instant::now() < lock_deadline {
+            let (result, attempted_socket) =
+                self.try_call_pinned_socket(context, false, &mut last_error, call)?;
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            if !attempted_socket && last_error.is_none() {
+                last_error = Some("all compatible bridge channels are busy".to_string());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        bail!(
+            "{label} failed for {} on {} target{}: {}",
+            context.method,
+            Self::target_label(context.target),
+            context
+                .player
+                .map(|selector| format!(" (player {selector})"))
+                .unwrap_or_default(),
+            last_error.unwrap_or_else(|| {
+                "the pinned Studio runtime disconnected or has no available channel".to_string()
+            })
+        )
+    }
+
     pub(super) fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.call_for_target(method, params, BridgeTarget::Main)
     }
@@ -1331,10 +1287,6 @@ impl BridgeServer {
         runtime_id: Option<&str>,
         response_timeout: Option<Duration>,
     ) -> Result<Value> {
-        if self.channels.is_empty() {
-            bail!("No active bridge sockets");
-        }
-
         let runtime_pin = if let Some(runtime_id) = runtime_id {
             RuntimePin {
                 runtime_id: runtime_id.to_string(),
@@ -1342,14 +1294,7 @@ impl BridgeServer {
         } else {
             self.runtime_pin_for_selector(target, player)?
         };
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let total = self.channels.len();
-        let start = self
-            .preferred_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % total;
+        let (id, start) = self.next_call()?;
         let response_deadline = response_timeout.map(|timeout| Instant::now() + timeout);
         let call_context = BridgeCallContext {
             id,
@@ -1362,49 +1307,11 @@ impl BridgeServer {
             response_deadline,
         };
 
-        let mut last_error: Option<String> = None;
-        for _ in 0..64 {
-            let (result, _) = self.try_call_pinned_socket(
-                &call_context,
-                runtime_id.is_none(),
-                &mut last_error,
-                Self::call_on_socket_with_timeout,
-            )?;
-            if let Some(result) = result {
-                return Ok(result);
-            }
-            thread::yield_now();
-        }
-
-        let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(method);
-        if let Some(response_deadline) = response_deadline {
-            lock_deadline = lock_deadline.min(response_deadline);
-        }
-        while Instant::now() < lock_deadline {
-            let (result, attempted_socket) = self.try_call_pinned_socket(
-                &call_context,
-                false,
-                &mut last_error,
-                Self::call_on_socket_with_timeout,
-            )?;
-            if let Some(result) = result {
-                return Ok(result);
-            }
-            if !attempted_socket && last_error.is_none() {
-                last_error = Some("all compatible bridge channels are busy".to_string());
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        bail!(
-            "Bridge call failed for {method} on {} target{}: {}",
-            Self::target_label(target),
-            player
-                .map(|selector| format!(" (player {selector})"))
-                .unwrap_or_default(),
-            last_error.unwrap_or_else(|| {
-                "the pinned Studio runtime disconnected or has no available channel".to_string()
-            })
+        self.call_pinned_socket(
+            &call_context,
+            runtime_id.is_none(),
+            Self::call_on_socket_with_timeout,
+            "Bridge call",
         )
     }
 
@@ -1500,10 +1407,10 @@ impl BridgeServer {
         if socket.pending_final_console_snapshots.is_empty() {
             return;
         }
-        let mut snapshots = match self.final_console_snapshots.lock() {
-            Ok(snapshots) => snapshots,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut snapshots = self
+            .final_console_snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         snapshots.retain(|_, snapshot| snapshot.received_at.elapsed() < Duration::from_secs(300));
         for payload in socket.pending_final_console_snapshots.drain(..) {
             let runtime_id = payload
@@ -1561,10 +1468,10 @@ impl BridgeServer {
     }
 
     pub(super) fn take_final_console_snapshots(&self, launch: &TestLaunch) -> Vec<Value> {
-        let mut snapshots = match self.final_console_snapshots.lock() {
-            Ok(snapshots) => snapshots,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut snapshots = self
+            .final_console_snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         snapshots.retain(|_, snapshot| snapshot.received_at.elapsed() < Duration::from_secs(300));
         snapshots
             .extract_if(|_, snapshot| {
@@ -1743,19 +1650,8 @@ impl BridgeServer {
         params: Value,
         target: BridgeTarget,
     ) -> Result<BridgeChunk> {
-        if self.channels.is_empty() {
-            bail!("No active bridge sockets");
-        }
         let runtime_pin = self.runtime_pin_for_selector(target, None)?;
-
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let total = self.channels.len();
-        let start = self
-            .preferred_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % total;
+        let (id, start) = self.next_call()?;
         let call_context = BridgeCallContext {
             id,
             method,
@@ -1767,53 +1663,39 @@ impl BridgeServer {
             response_deadline: None,
         };
 
-        let mut last_error: Option<String> = None;
-        for _ in 0..64 {
-            let (result, _) = self.try_call_pinned_socket(
-                &call_context,
-                false,
-                &mut last_error,
-                Self::call_on_socket_chunk_with_timeout,
-            )?;
-            if let Some(result) = result {
-                return Ok(result);
-            }
-            thread::yield_now();
-        }
-
-        let lock_deadline = Instant::now() + bridge_channel_lock_timeout(method);
-        while Instant::now() < lock_deadline {
-            let (result, attempted_socket) = self.try_call_pinned_socket(
-                &call_context,
-                false,
-                &mut last_error,
-                Self::call_on_socket_chunk_with_timeout,
-            )?;
-            if let Some(result) = result {
-                return Ok(result);
-            }
-            if !attempted_socket && last_error.is_none() {
-                last_error = Some("all compatible bridge channels are busy".to_string());
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        bail!(
-            "Bridge chunk call failed for {method} on {} target: {}",
-            Self::target_label(target),
-            last_error.unwrap_or_else(|| {
-                "the pinned Studio runtime disconnected or has no available channel".to_string()
-            })
+        self.call_pinned_socket(
+            &call_context,
+            false,
+            Self::call_on_socket_chunk,
+            "Bridge chunk call",
         )
     }
 
-    pub(super) fn call_on_socket(
-        bridge_socket: &mut BridgeSocket,
-        id: u64,
-        method: &str,
-        params: &Value,
-    ) -> Result<Value> {
-        Self::call_on_socket_with_timeout(bridge_socket, id, method, params, None)
+    fn next_call(&self) -> Result<(u64, usize)> {
+        let total = self.channels.len();
+        if total == 0 {
+            bail!("No active bridge sockets");
+        }
+        Ok((
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            self.preferred_index.fetch_add(1, Ordering::Relaxed) % total,
+        ))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(super) fn studio_pid_for_selector(
+        &self,
+        target: BridgeTarget,
+        player: Option<&str>,
+    ) -> Result<u32> {
+        let peer = self.peer_for_selector(target, player)?;
+        let port = peer
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
+        pid_for_local_tcp_port(port)
+            .with_context(|| format!("Could not map bridge connection {peer} to Studio"))
     }
 
     pub(super) fn call_on_socket_with_timeout(
@@ -1835,11 +1717,12 @@ impl BridgeServer {
         }
     }
 
-    pub(super) fn call_on_socket_chunk(
+    fn call_on_socket_chunk(
         bridge_socket: &mut BridgeSocket,
         id: u64,
         method: &str,
         params: &Value,
+        _response_timeout: Option<Duration>,
     ) -> Result<BridgeChunk> {
         Self::configure_request_timeout(bridge_socket, bridge_response_timeout(method));
         Self::send_request(bridge_socket, id, method, params)?;
@@ -1848,16 +1731,6 @@ impl BridgeServer {
             BridgeResponse::Chunk(chunk) => Ok(chunk),
             BridgeResponse::Json(result) => parse_bridge_chunk(result),
         }
-    }
-
-    fn call_on_socket_chunk_with_timeout(
-        bridge_socket: &mut BridgeSocket,
-        id: u64,
-        method: &str,
-        params: &Value,
-        _response_timeout: Option<Duration>,
-    ) -> Result<BridgeChunk> {
-        Self::call_on_socket_chunk(bridge_socket, id, method, params)
     }
 
     pub(super) fn configure_request_timeout(bridge_socket: &mut BridgeSocket, timeout: Duration) {
@@ -1999,10 +1872,10 @@ impl Drop for BridgeServer {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
         for channel in &self.channels {
-            let mut guard = match channel.sockets.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut guard = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for (_, mut socket) in guard.drain() {
                 BridgeServer::close_socket(&mut socket);
             }

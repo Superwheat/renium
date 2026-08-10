@@ -8,7 +8,7 @@ use crate::settings_bytecode::{
     settings_reference_index,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) enum PropertyScope {
     Auto,
     Metadata,
@@ -16,7 +16,7 @@ pub(crate) enum PropertyScope {
     Attribute,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) enum InstanceSelector<'a> {
     Index(usize),
     SettingsId(&'a str),
@@ -24,7 +24,7 @@ pub(crate) enum InstanceSelector<'a> {
     ClassName(&'a str),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(crate) struct InstanceQuery {
     pub(crate) name: Option<String>,
     pub(crate) class_name: Option<String>,
@@ -34,13 +34,11 @@ pub(crate) struct InstanceQuery {
     pub(crate) attributes: Vec<PropertyPredicate>,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct PropertyPredicate {
     pub(crate) name: String,
     pub(crate) value: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct AddInstanceSpec {
     pub(crate) settings_id: Option<String>,
     pub(crate) name: String,
@@ -50,7 +48,24 @@ pub(crate) struct AddInstanceSpec {
     pub(crate) attributes: Map<String, Value>,
 }
 
-#[derive(Debug, Clone)]
+impl AddInstanceSpec {
+    pub(crate) fn new(
+        settings_id: Option<String>,
+        name: String,
+        class_name: String,
+        parent_index: Option<usize>,
+    ) -> Self {
+        Self {
+            settings_id,
+            name,
+            class_name,
+            parent_index,
+            properties: Map::new(),
+            attributes: Map::new(),
+        }
+    }
+}
+
 pub(crate) struct AddedInstance {
     pub(crate) index: usize,
     pub(crate) settings_id: String,
@@ -171,8 +186,7 @@ pub(crate) fn remove_instances_at_indices(
     while let Some(parent_index) = stack.pop() {
         for child_index in children_by_parent
             .get(parent_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[][..], Vec::as_slice)
         {
             if !recursive {
                 bail!("Instance has descendants; pass recursive removal");
@@ -211,10 +225,7 @@ pub(crate) fn remove_instances_at_indices(
     Ok(removed)
 }
 
-pub(crate) fn remap_ref_indices(
-    document: &mut SettingsBytecode,
-    old_to_new: &[Option<usize>],
-) -> usize {
+fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize>]) -> usize {
     let mut changed = 0usize;
     for instance in &mut document.instances {
         for value in instance.properties.values_mut() {
@@ -259,25 +270,21 @@ fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<
         return false;
     };
 
-    match old_to_new.get(old_index).copied().flatten() {
-        Some(new_index) => {
-            if old_index == new_index {
-                return false;
-            }
-            object.insert(
-                "instanceIndex".to_string(),
-                Value::Number(Number::from((new_index + 1) as u64)),
-            );
-            true
+    if let Some(new_index) = old_to_new.get(old_index).copied().flatten() {
+        if old_index == new_index {
+            return false;
         }
-        None => {
-            let mut removed = false;
-            for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
-                removed = object.remove(selector).is_some() || removed;
-            }
-            removed
-        }
+        object.insert(
+            "instanceIndex".to_string(),
+            Value::Number(Number::from((new_index + 1) as u64)),
+        );
+        return true;
     }
+    let mut removed = false;
+    for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
+        removed = object.remove(selector).is_some() || removed;
+    }
+    removed
 }
 
 pub(crate) fn find_unique_instance_index(
@@ -390,7 +397,7 @@ pub(crate) fn set_instance_property(
             Ok(())
         }
         PropertyScope::Auto => {
-            if is_metadata_property(property_name) {
+            if matches!(property_name, "Name" | "ClassName" | "Parent") {
                 return set_metadata_value(instance, property_name, value, resolved_parent_index);
             }
             if instance.attributes.contains_key(property_name) {
@@ -501,10 +508,6 @@ fn set_map_value(map: &mut serde_json::Map<String, Value>, property_name: &str, 
     } else {
         map.insert(property_name.to_string(), value);
     }
-}
-
-fn is_metadata_property(property_name: &str) -> bool {
-    matches!(property_name, "Name" | "ClassName" | "Parent")
 }
 
 fn value_string(value: Value, label: &str) -> Result<String> {
@@ -687,14 +690,7 @@ mod tests {
         let mut document = sample_document();
         let added = add_instance(
             &mut document,
-            AddInstanceSpec {
-                settings_id: None,
-                name: "Child".to_string(),
-                class_name: "Folder".to_string(),
-                parent_index: Some(0),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(None, "Child".to_string(), "Folder".to_string(), Some(0)),
         )
         .unwrap();
 
@@ -708,26 +704,22 @@ mod tests {
         let mut document = sample_document();
         add_instance(
             &mut document,
-            AddInstanceSpec {
-                settings_id: Some("grandchild".to_string()),
-                name: "Grandchild".to_string(),
-                class_name: "Folder".to_string(),
-                parent_index: Some(1),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(
+                Some("grandchild".to_string()),
+                "Grandchild".to_string(),
+                "Folder".to_string(),
+                Some(1),
+            ),
         )
         .unwrap();
         add_instance(
             &mut document,
-            AddInstanceSpec {
-                settings_id: Some("sibling".to_string()),
-                name: "Sibling".to_string(),
-                class_name: "Folder".to_string(),
-                parent_index: Some(0),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(
+                Some("sibling".to_string()),
+                "Sibling".to_string(),
+                "Folder".to_string(),
+                Some(0),
+            ),
         )
         .unwrap();
 
@@ -767,22 +759,18 @@ mod tests {
                     ]),
                     attributes: Map::new(),
                 },
-                SettingsBytecodeInstance {
-                    settings_id: "remove".to_string(),
-                    name: "Remove".to_string(),
-                    class_name: "Folder".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "keep".to_string(),
-                    name: "Keep".to_string(),
-                    class_name: "Part".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
+                SettingsBytecodeInstance::new(
+                    "remove".to_string(),
+                    "Remove".to_string(),
+                    "Folder".to_string(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "keep".to_string(),
+                    "Keep".to_string(),
+                    "Part".to_string(),
+                    Some(0),
+                ),
             ],
         };
 
@@ -815,14 +803,12 @@ mod tests {
         let mut document = sample_document();
         add_instance(
             &mut document,
-            AddInstanceSpec {
-                settings_id: Some("grandchild".to_string()),
-                name: "Grandchild".to_string(),
-                class_name: "Folder".to_string(),
-                parent_index: Some(1),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(
+                Some("grandchild".to_string()),
+                "Grandchild".to_string(),
+                "Folder".to_string(),
+                Some(1),
+            ),
         )
         .unwrap();
         let before = document.instances.clone();
@@ -831,17 +817,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Instance has descendants"));
-        assert_eq!(
-            document
-                .instances
-                .iter()
-                .map(|instance| (&instance.settings_id, instance.parent_index))
-                .collect::<Vec<_>>(),
-            before
-                .iter()
-                .map(|instance| (&instance.settings_id, instance.parent_index))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(document.instances, before);
     }
 
     #[test]
@@ -853,17 +829,7 @@ mod tests {
             remove_instance(&mut document, InstanceSelector::SettingsId("root"), true).unwrap_err();
 
         assert!(err.to_string().contains("Refusing to remove root"));
-        assert_eq!(
-            document
-                .instances
-                .iter()
-                .map(|instance| (&instance.settings_id, instance.parent_index))
-                .collect::<Vec<_>>(),
-            before
-                .iter()
-                .map(|instance| (&instance.settings_id, instance.parent_index))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(document.instances, before);
     }
 
     #[test]
@@ -871,54 +837,42 @@ mod tests {
         let mut document = SettingsBytecode {
             version: 2,
             instances: vec![
-                SettingsBytecodeInstance {
-                    settings_id: "root".to_string(),
-                    name: "Workspace".to_string(),
-                    class_name: "Workspace".to_string(),
-                    parent_index: None,
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "leaf".to_string(),
-                    name: "Leaf".to_string(),
-                    class_name: "Part".to_string(),
-                    parent_index: Some(2),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "child".to_string(),
-                    name: "Child".to_string(),
-                    class_name: "Folder".to_string(),
-                    parent_index: Some(3),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "target".to_string(),
-                    name: "Target".to_string(),
-                    class_name: "Folder".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "sibling".to_string(),
-                    name: "Sibling".to_string(),
-                    class_name: "Folder".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "sibling_child".to_string(),
-                    name: "SiblingChild".to_string(),
-                    class_name: "Part".to_string(),
-                    parent_index: Some(4),
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "Workspace".to_string(),
+                    "Workspace".to_string(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "leaf".to_string(),
+                    "Leaf".to_string(),
+                    "Part".to_string(),
+                    Some(2),
+                ),
+                SettingsBytecodeInstance::new(
+                    "child".to_string(),
+                    "Child".to_string(),
+                    "Folder".to_string(),
+                    Some(3),
+                ),
+                SettingsBytecodeInstance::new(
+                    "target".to_string(),
+                    "Target".to_string(),
+                    "Folder".to_string(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "sibling".to_string(),
+                    "Sibling".to_string(),
+                    "Folder".to_string(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "sibling_child".to_string(),
+                    "SiblingChild".to_string(),
+                    "Part".to_string(),
+                    Some(4),
+                ),
             ],
         };
 

@@ -11,10 +11,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
+use crate::file_io::fnv1a;
 use crate::native_snapshot::{
-    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, now_millis,
-    temporary_output_path,
+    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
+use crate::timing::current_millis;
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
@@ -36,15 +37,12 @@ struct SerializerTrace {
     factory_rva: u64,
     execute_rva: u64,
 }
-
-#[derive(Clone)]
 struct CachedTrace {
     len: u64,
     modified: Option<SystemTime>,
     trace: SerializerTrace,
 }
 
-#[derive(Clone, Copy)]
 struct MachSection {
     address: u64,
     size: u64,
@@ -527,7 +525,6 @@ fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result
     }
     let started = Instant::now();
     let executable = process_executable_path(pid)?;
-    let setup_ms = started.elapsed().as_secs_f64() * 1000.0;
     let trace_started = Instant::now();
     let trace = trace_studio(&executable)?;
     let trace_ms = trace_started.elapsed().as_secs_f64() * 1000.0;
@@ -545,7 +542,6 @@ fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result
         Ok(NativeSnapshot {
             instance_count,
             output_size: reported_size,
-            setup_ms,
             trace_ms,
             discover_ms: 0.0,
             helper_ms: 0.0,
@@ -575,12 +571,6 @@ pub fn write_live_service(
     output: &Path,
 ) -> Result<NativeSnapshot> {
     write_live_snapshot(pid, output, Some(service))
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-    })
 }
 
 fn hash_file(path: &Path) -> Result<u64> {
@@ -678,8 +668,8 @@ fn source_signature(source: &Path) -> Result<String> {
         hash_file(&executable)?,
         hash_file(&info)?,
         hash_file(&resources)?,
-        hash_bytes(HELPER_BYTES),
-        hash_bytes(LAUNCHER_BYTES)
+        fnv1a(HELPER_BYTES),
+        fnv1a(LAUNCHER_BYTES)
     ))
 }
 
@@ -798,7 +788,7 @@ fn create_managed_studio_transaction(parent: &Path) -> Result<PathBuf> {
         let transaction = parent.join(format!(
             ".Renium Studio.transaction-{}-{}-{attempt}",
             std::process::id(),
-            now_millis()
+            current_millis()
         ));
         match fs::create_dir(&transaction) {
             Ok(()) => return Ok(transaction),

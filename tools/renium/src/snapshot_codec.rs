@@ -118,12 +118,6 @@ fn string_from_table(strings: &[String], string_id: usize, label: &str) -> Resul
         .with_context(|| format!("Unknown {label} string id {string_id}"))
 }
 
-fn compact_class_name_for_id(class_id: usize, class_names: &[String]) -> Option<RbxUstr> {
-    class_names
-        .get(class_id)
-        .map(|class_name| RbxUstr::from(class_name.as_str()))
-}
-
 fn compact_class_name_from_value(value: Value, class_names: &[String]) -> Result<RbxUstr> {
     match value {
         Value::String(class_name) if !class_name.is_empty() => Ok(class_name.into()),
@@ -132,7 +126,9 @@ fn compact_class_name_from_value(value: Value, class_names: &[String]) -> Result
                 .as_u64()
                 .with_context(|| "Compact class id must be a non-negative integer")?
                 as usize;
-            compact_class_name_for_id(class_id, class_names)
+            class_names
+                .get(class_id)
+                .map(|class_name| RbxUstr::from(class_name.as_str()))
                 .with_context(|| format!("Unknown compact class id {class_id}"))
         }
         _ => bail!("Compact class entry must be a string or class id"),
@@ -221,39 +217,24 @@ fn decode_compact_v5_ref(raw: Value, strings: &[String]) -> Result<Value> {
                     "external ref debug id",
                 )?),
             };
-            let path_ordinals = match iter.next() {
-                Some(Value::Array(values)) => Some(Value::Array(values)),
-                Some(value) => {
-                    let mut values = Vec::new();
-                    values.push(Value::String(decode_compact_v5_string(
-                        value,
-                        strings,
-                        "external ref path segment",
-                    )?));
-                    for value in iter {
-                        values.push(Value::String(decode_compact_v5_string(
-                            value,
-                            strings,
-                            "external ref path segment",
-                        )?));
-                    }
-                    let mut out = compact_v5_typed_object("Ref", 2);
-                    if let Some(debug_id) = debug_id {
-                        out.insert("debugId".to_string(), Value::String(debug_id));
-                    }
-                    out.insert("pathSegments".to_string(), Value::Array(values));
-                    return Ok(Value::Object(out));
-                }
-                None => None,
+            let decode_path_segment = |value| {
+                decode_compact_v5_string(value, strings, "external ref path segment")
+                    .map(Value::String)
             };
-            let mut path_segments = Vec::new();
-            for value in iter {
-                path_segments.push(Value::String(decode_compact_v5_string(
-                    value,
-                    strings,
-                    "external ref path segment",
-                )?));
-            }
+            let (path_ordinals, path_segments) = match iter.next() {
+                Some(Value::Array(values)) => (
+                    Some(Value::Array(values)),
+                    iter.map(decode_path_segment).collect::<Result<Vec<_>>>()?,
+                ),
+                Some(value) => (
+                    None,
+                    std::iter::once(value)
+                        .chain(iter)
+                        .map(decode_path_segment)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None => (None, Vec::new()),
+            };
             let mut out = compact_v5_typed_object("Ref", 2);
             if let Some(debug_id) = debug_id {
                 out.insert("debugId".to_string(), Value::String(debug_id));
@@ -728,7 +709,7 @@ fn compact_v5_shape_id(raw: Value) -> Result<usize> {
 
 pub(super) fn parse_compact_v5_shape_instance_items(
     raw_items: Value,
-    strings: Vec<String>,
+    strings: &[String],
     raw_shapes: Vec<Value>,
     batch_start: usize,
     property_schema_by_class: &PropertySchemaMap,
@@ -748,7 +729,7 @@ pub(super) fn parse_compact_v5_shape_instance_items(
         };
         let name = decode_compact_v5_string(
             fields.next().unwrap_or(Value::Null),
-            &strings,
+            strings,
             "instance name",
         )?;
         let parent_index = compact_parent_index(fields.next().unwrap_or(Value::Null))?;
@@ -785,14 +766,14 @@ pub(super) fn parse_compact_v5_shape_instance_items(
             }
         };
 
-        let attributes = decode_compact_v5_attributes(attributes_raw, &strings)?;
+        let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
         let property_schema = property_schema_by_class.get(shape.class_name.as_str());
         let mut properties = compact_properties_mask_take_v5_with_schema(
             shape.mask.clone(),
             values_raw,
             shape.class_name.as_str(),
             property_schema.map(Vec::as_slice),
-            &strings,
+            strings,
             enum_value_names_by_type,
         )?;
         let instance_index = batch_start + row_offset;
@@ -804,20 +785,13 @@ pub(super) fn parse_compact_v5_shape_instance_items(
         }
 
         out.push(SnapshotInstance {
-            path: String::new(),
-            path_segments: Vec::new(),
             name,
             class_name: shape.class_name,
             properties,
-            source_key: None,
-            parent_path: None,
             attributes,
-            debug_id: None,
-            parent_debug_id: None,
-            instance_id: None,
-            parent_instance_id: None,
             instance_index: Some(instance_index),
             parent_index,
+            ..Default::default()
         });
     }
 
@@ -826,7 +800,7 @@ pub(super) fn parse_compact_v5_shape_instance_items(
 
 pub(super) fn parse_native_overlay_class_groups(
     raw_groups: Value,
-    strings: Vec<String>,
+    strings: &[String],
     batch_start: usize,
     batch_count: usize,
     property_schema_by_class: &PropertySchemaMap,
@@ -875,14 +849,14 @@ pub(super) fn parse_native_overlay_class_groups(
             if std::mem::replace(&mut seen_offsets[offset - 1], true) {
                 bail!("Native overlay item offset {offset} is duplicated");
             }
-            let attributes = decode_compact_v5_attributes(fields[1].clone(), &strings)?;
+            let attributes = decode_compact_v5_attributes(fields[1].clone(), strings)?;
             let properties = if fields.len() == 4 {
                 compact_properties_mask_take_v5_with_schema(
                     fields[2].clone(),
                     fields[3].clone(),
                     class_name,
                     property_schema.map(Vec::as_slice),
-                    &strings,
+                    strings,
                     enum_value_names_by_type,
                 )?
             } else {
@@ -901,7 +875,7 @@ pub(super) fn parse_native_overlay_class_groups(
 
 pub(super) fn parse_compact_v5_instance_items(
     raw_items: Value,
-    strings: Vec<String>,
+    strings: &[String],
     batch_start: usize,
     property_schema_by_class: &PropertySchemaMap,
     enum_value_names_by_type: &EnumValueNameMap,
@@ -923,7 +897,7 @@ pub(super) fn parse_compact_v5_instance_items(
                     .as_u64()
                     .with_context(|| "Compact-v5 instance name id must be a non-negative integer")?
                     as usize;
-                string_from_table(&strings, name_id, "instance name")?
+                string_from_table(strings, name_id, "instance name")?
             }
             _ => bail!("Compact-v5 instance name must be a string or string id"),
         };
@@ -948,13 +922,13 @@ pub(super) fn parse_compact_v5_instance_items(
             }
             _ => bail!("Compact-v5 instance row has missing intermediate fields"),
         };
-        let attributes = decode_compact_v5_attributes(attributes_raw, &strings)?;
+        let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
         let properties = compact_properties_mask_take_v5_with_schema(
             mask_raw,
             values_raw,
             class_name.as_str(),
             property_schema.map(Vec::as_slice),
-            &strings,
+            strings,
             enum_value_names_by_type,
         )?;
         let instance_index = batch_start + row_offset;
@@ -966,20 +940,13 @@ pub(super) fn parse_compact_v5_instance_items(
             );
         }
         out.push(SnapshotInstance {
-            path: String::new(),
-            path_segments: Vec::new(),
             name,
             class_name,
             properties,
-            source_key: None,
-            parent_path: None,
             attributes,
-            debug_id: None,
-            parent_debug_id: None,
-            instance_id: None,
-            parent_instance_id: None,
             instance_index: Some(instance_index),
             parent_index,
+            ..Default::default()
         });
     }
     Ok(out)

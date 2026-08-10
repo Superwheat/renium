@@ -56,7 +56,9 @@ local function isSerializingAliasCanonicalProperty(propertyData)
 	local kind = propertyData and propertyData.Kind
 	local canonical = type(kind) == "table" and kind.Canonical or nil
 	local serialization = type(canonical) == "table" and canonical.Serialization or nil
-	return type(serialization) == "table" and type(serialization.SerializesAs) == "string" and serialization.SerializesAs ~= ""
+	return type(serialization) == "table"
+		and type(serialization.SerializesAs) == "string"
+		and serialization.SerializesAs ~= ""
 end
 
 local function hasBlockedStudioPropertyTag(propertyData)
@@ -294,10 +296,7 @@ local function mergeGeneratedStudioApiSchema(byClass, generatedSchema, compactTy
 end
 
 schemaPropertyNameForClass = function(className, propertyName)
-	if
-		(className == "Model" or className == "WorldModel")
-		and propertyName == "WorldPivotData"
-	then
+	if (className == "Model" or className == "WorldModel") and propertyName == "WorldPivotData" then
 		return "WorldPivot"
 	end
 	return propertyName
@@ -377,7 +376,6 @@ function BridgePropertySchema.buildSchemasFromRbxDom(database, compactTypeIds, g
 			end
 
 			addSupplementalReadableTransportProperties(classes, className, names, seen, compactTypeIds)
-
 		end
 
 		table.sort(names, function(a, b)
