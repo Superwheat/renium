@@ -34,7 +34,6 @@ pub(super) fn normalize_stage_references(stage: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
 struct ProjectionReferenceTarget {
     settings_id: String,
     path_segments: Vec<String>,

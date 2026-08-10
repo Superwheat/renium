@@ -4,7 +4,6 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Cursor};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bridge_server::{
     BridgeInfoPayload, BridgeServer, BridgeTarget, MAX_BRIDGE_REASSEMBLY_BYTES, RuntimePinKey,
@@ -15,17 +14,16 @@ use crate::bytecode_api::{
     lock_existing_service_store, resolve_bytecode_settings_file,
 };
 use crate::bytecode_edit::{
-    bytecode_clone_instance, bytecode_desync_package_link, bytecode_move_instance,
-    bytecode_remove_instance,
+    bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
 };
 use crate::bytecode_explorer::editor_target_settings_ids;
 use crate::command_args::VcInitArgs;
 use crate::command_line::{
     ApplyEditorDeleteArgs, BridgeConnectionArgs, BytecodeCloneInstanceArgs,
     BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
-    BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs, BytecodeMoveInstanceArgs,
-    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs,
-    EditorReviewDecisionArgs, PlaceDesyncPackageLinkArgs, PushEditorChangesArgs,
+    BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
+    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, EditorMutationArgs,
+    EditorReviewDecisionArgs, PlaceDesyncPackageLinkArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
 use crate::editor_diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
@@ -53,10 +51,10 @@ use crate::editor_types::{
     EditorPropertyFilter,
 };
 use crate::file_io::{
-    SERVICE_SETTINGS_FILE_NAME, current_unix_ts, ensure_existing_ancestor_inside, fnv1a_hex,
-    normalized_child_stem_key, sanitize_name, service_settings_path, set_path_readonly,
-    strip_extended_prefix, unique_child_stem, validate_filesystem_instance_name,
-    write_bytes_if_changed, write_json_streaming,
+    SERVICE_SETTINGS_FILE_NAME, ensure_existing_ancestor_inside, normalized_child_stem_key,
+    sanitize_name, service_settings_path, set_path_readonly, strip_extended_prefix,
+    unique_child_stem, validate_filesystem_instance_name, write_bytes_if_changed,
+    write_json_streaming,
 };
 use crate::local_transport::{BoundedLineRead, normalize_loopback_host, read_bounded_line};
 use crate::native_editor::{
@@ -86,20 +84,17 @@ use crate::settings_bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
     write_service_settings_binary_file, write_var_u64,
 };
-use crate::setup::plugin_release_url;
 use crate::snapshot_codec::{
     decode_compact_v5_value, parse_compact_v5_instance_items, parse_source_range_batch,
 };
 use crate::snapshot_export::{parse_bridge_chunk, parse_place_guard_config};
 use crate::snapshot_import::{
-    quarantine_stale_import_paths, snapshot_chunk_path,
-    state_with_preserved_material_service_settings,
+    quarantine_stale_import_paths, state_with_preserved_material_service_settings,
 };
 use crate::snapshot_types::{ServiceState, SnapshotInstance};
 use crate::sourcemap::path_to_sourcemap_relative;
 use crate::studio_automation::{studio_device_resolution, validate_luau_syntax};
 use crate::test_support::{settings_document, settings_instance, temp_dir};
-use crate::timing::current_millis;
 use crate::version_control::{
     merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
 };
@@ -119,6 +114,39 @@ fn apply_editor_settings_writes(changes: &EditorChangeSet) -> Result<()> {
     Ok(())
 }
 
+fn collect_and_apply_editor_changes(
+    project_root: &Path,
+    changed_paths: Vec<PathBuf>,
+    bridge: BridgeConnectionArgs,
+) -> EditorChangeSet {
+    let changes = collect_editor_changes(&PushEditorChangesArgs {
+        changed_paths,
+        ..PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: project_root.to_path_buf(),
+                src_root: PathBuf::from("src"),
+            },
+            bridge,
+        )
+    })
+    .unwrap();
+    apply_editor_settings_writes(&changes).unwrap();
+    changes
+}
+
+fn get_source_property_args(settings_file: &Path) -> BytecodeGetPropertyArgs {
+    BytecodeGetPropertyArgs::try_parse_from([
+        "bytecode-get-property",
+        "-f",
+        settings_file.to_string_lossy().as_ref(),
+        "-n",
+        "Mod",
+        "-p",
+        "Source",
+    ])
+    .unwrap()
+}
+
 fn synthesized_mesh_initial_size_for_rbx_export(
     document: &SettingsBytecode,
     index: usize,
@@ -130,6 +158,15 @@ fn synthesized_mesh_initial_size_for_rbx_export(
         index,
         rbx_class_is_a(database, &instance.class_name, TRIANGLE_MESH_PART_CLASS),
     )
+}
+
+fn single_mesh_document(class_name: &str, properties: Map<String, Value>) -> SettingsBytecode {
+    let mut mesh = settings_instance("mesh", class_name, class_name, Some(0));
+    mesh.properties = properties;
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        mesh,
+    ])
 }
 
 fn rbx_class_is_a(
@@ -156,25 +193,19 @@ fn bridge_info_reads_runtime_identity() {
 }
 
 #[test]
-fn plugin_download_matches_the_cli_version() {
-    assert_eq!(
-        plugin_release_url("0.1.2"),
-        "https://github.com/Superwheat/renium/releases/download/v0.1.2/Renium.rbxm"
-    );
-}
-
-#[test]
 fn place_guard_rejects_typos_and_empty_allowlists() {
     let path = Path::new("renium.config.json");
     assert!(
         parse_place_guard_config(r#"{"allowedPlaceId":[123]}"#, path)
-            .unwrap_err()
+            .err()
+            .expect("unknown fields should be rejected")
             .to_string()
             .contains("Invalid place guard JSON")
     );
     assert!(
         parse_place_guard_config(r#"{"allowedPlaceIds":[],"allowedGameIds":[]}"#, path)
-            .unwrap_err()
+            .err()
+            .expect("empty allowlists should be rejected")
             .to_string()
             .contains("must contain at least one")
     );
@@ -409,32 +440,10 @@ fn get_property_source_falls_back_to_externalized_mirror() {
     .write_file(&settings_file)
     .unwrap();
     fs::write(service_dir.join("Mod.luau"), "return 123\n").unwrap();
-    let settings_arg = settings_file.to_string_lossy().to_string();
-
-    let args = BytecodeGetPropertyArgs::try_parse_from([
-        "bytecode-get-property",
-        "-f",
-        &settings_arg,
-        "-n",
-        "Mod",
-        "-p",
-        "Source",
-    ])
-    .unwrap();
-    assert!(bytecode_get_property(args).is_ok());
+    assert!(bytecode_get_property(get_source_property_args(&settings_file)).is_ok());
 
     fs::remove_file(service_dir.join("Mod.luau")).unwrap();
-    let args = BytecodeGetPropertyArgs::try_parse_from([
-        "bytecode-get-property",
-        "-f",
-        &settings_arg,
-        "-n",
-        "Mod",
-        "-p",
-        "Source",
-    ])
-    .unwrap();
-    let err = bytecode_get_property(args).unwrap_err();
+    let err = bytecode_get_property(get_source_property_args(&settings_file)).unwrap_err();
     assert!(err.to_string().contains("Property not found"), "{err}");
     fs::remove_dir_all(dir).unwrap();
 }
@@ -453,8 +462,8 @@ fn set_source_reads_from_source_file() {
     .unwrap();
     let src_file = dir.join("payload.luau");
     fs::write(&src_file, "return 999\n").unwrap();
-    let settings_arg = settings_file.to_string_lossy().to_string();
-    let src_arg = src_file.to_string_lossy().to_string();
+    let settings_arg = settings_file.to_string_lossy().into_owned();
+    let src_arg = src_file.to_string_lossy().into_owned();
 
     let args = BytecodeSetSourceArgs::try_parse_from([
         "bytecode-set-source",
@@ -608,27 +617,6 @@ fn parse_source_range_batch_reads_numeric_index_pairs() {
 }
 
 #[test]
-fn snapshot_chunk_path_stays_inside_snapshot_dir() {
-    let base_dir = Path::new("snapshots");
-    assert_eq!(
-        snapshot_chunk_path(base_dir, "chunks/Workspace.1.json", "Workspace").unwrap(),
-        base_dir.join("chunks").join("Workspace.1.json")
-    );
-
-    let parent_escape = PathBuf::from("..")
-        .join("outside.json")
-        .to_string_lossy()
-        .to_string();
-    assert!(snapshot_chunk_path(base_dir, &parent_escape, "Workspace").is_err());
-
-    let absolute_escape = std::env::temp_dir()
-        .join("outside.json")
-        .to_string_lossy()
-        .to_string();
-    assert!(snapshot_chunk_path(base_dir, &absolute_escape, "Workspace").is_err());
-}
-
-#[test]
 fn write_var_u64_matches_expected_bytes() {
     let cases = [
         (0_u64, vec![0x00]),
@@ -712,15 +700,8 @@ fn sample_service_state(service: &str, properties: Map<String, Value>) -> Servic
             name: service.to_string(),
             class_name: service.into(),
             properties,
-            source_key: None,
-            parent_path: None,
-            attributes: Map::new(),
-            debug_id: None,
-            parent_debug_id: None,
-            instance_id: None,
-            parent_instance_id: None,
             instance_index: Some(1),
-            parent_index: None,
+            ..Default::default()
         }],
         native_properties_by_instance: None,
         children_by_index: vec![Vec::new()],
@@ -761,9 +742,7 @@ fn rbxlx_export_skips_lighting_clock_time_but_keeps_time_of_day() {
 
 #[test]
 fn material_service_settings_preserve_use_2022_materials_when_bridge_omits_it() {
-    let unique = current_unix_ts();
-    let project_root =
-        std::env::temp_dir().join(format!("renium-preserve-use-2022-materials-{unique}"));
+    let project_root = temp_dir("preserve-use-2022-materials");
     let service_dir = project_root.join("MaterialService");
     fs::create_dir_all(&service_dir).unwrap();
     let settings_path = service_settings_path(&service_dir);
@@ -879,8 +858,7 @@ fn rbx_dom_schema_keeps_serializing_read_only_package_id() {
 
 #[test]
 fn service_settings_preserve_package_link_instances_and_package_id() {
-    let unique = format!("{}-{}", std::process::id(), current_unix_ts());
-    let project_root = std::env::temp_dir().join(format!("renium-package-link-{unique}"));
+    let project_root = temp_dir("package-link");
     let settings_path = project_root
         .join("Workspace")
         .join(SERVICE_SETTINGS_FILE_NAME);
@@ -892,32 +870,18 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
                 path_segments: vec!["Workspace".to_string()],
                 name: "Workspace".to_string(),
                 class_name: "Workspace".into(),
-                properties: Map::new(),
-                source_key: None,
-                parent_path: None,
-                attributes: Map::new(),
-                debug_id: None,
-                parent_debug_id: None,
-                instance_id: None,
-                parent_instance_id: None,
                 instance_index: Some(1),
-                parent_index: None,
+                ..Default::default()
             },
             SnapshotInstance {
                 path: "Workspace.PackagedModel".to_string(),
                 path_segments: vec!["Workspace".to_string(), "PackagedModel".to_string()],
                 name: "PackagedModel".to_string(),
                 class_name: "Model".into(),
-                properties: Map::new(),
-                source_key: None,
                 parent_path: Some("Workspace".to_string()),
-                attributes: Map::new(),
-                debug_id: None,
-                parent_debug_id: None,
-                instance_id: None,
-                parent_instance_id: None,
                 instance_index: Some(2),
                 parent_index: Some(1),
+                ..Default::default()
             },
             SnapshotInstance {
                 path: "Workspace.PackagedModel.PackageLink".to_string(),
@@ -932,15 +896,10 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
                     "PackageId".to_string(),
                     json!("rbxassetid://123456789"),
                 )]),
-                source_key: None,
                 parent_path: Some("Workspace.PackagedModel".to_string()),
-                attributes: Map::new(),
-                debug_id: None,
-                parent_debug_id: None,
-                instance_id: None,
-                parent_instance_id: None,
                 instance_index: Some(3),
                 parent_index: Some(2),
+                ..Default::default()
             },
         ],
         native_properties_by_instance: None,
@@ -974,8 +933,7 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
 
 #[test]
 fn bytecode_desync_package_link_removes_direct_package_link_child() {
-    let unique = format!("{}-{}", std::process::id(), current_unix_ts());
-    let project_root = std::env::temp_dir().join(format!("renium-desync-package-link-{unique}"));
+    let project_root = temp_dir("desync-package-link");
     let service_dir = project_root.join("src").join("Workspace");
     fs::create_dir_all(&service_dir).unwrap();
     let settings_path = service_settings_path(&service_dir);
@@ -999,8 +957,7 @@ fn bytecode_desync_package_link_removes_direct_package_link_child() {
     .unwrap();
 
     bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
-        service_or_file: None,
-        settings_file: Some(settings_path.clone()),
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
         service: "Workspace".to_string(),
         selector: BytecodeInstanceSelectorArgs {
             path_segments_json: Some("Workspace.Garage".to_string()),
@@ -1029,9 +986,7 @@ fn bytecode_desync_package_link_removes_direct_package_link_child() {
 
 #[test]
 fn place_desync_package_link_writes_copy_without_package_link() {
-    let unique = format!("{}-{}", std::process::id(), current_unix_ts());
-    let project_root =
-        std::env::temp_dir().join(format!("renium-place-desync-package-link-{unique}"));
+    let project_root = temp_dir("place-desync-package-link");
     fs::create_dir_all(&project_root).unwrap();
     let input_path = project_root.join("input.rbxlx");
     let output_path = project_root.join("output.rbxlx");
@@ -1275,17 +1230,7 @@ fn synthesized_mesh_initial_size_repairs_zero_initial_size_from_mesh_size() {
         vector3_json(3.0, 6.0, 9.0),
     );
 
-    let document = settings_document(vec![
-        settings_instance("root", "Workspace", "Workspace", None),
-        SettingsBytecodeInstance {
-            settings_id: "partop".to_string(),
-            name: "PartOperation".to_string(),
-            class_name: "PartOperation".to_string(),
-            parent_index: Some(0),
-            properties: mesh_properties,
-            attributes: Map::new(),
-        },
-    ]);
+    let document = single_mesh_document("PartOperation", mesh_properties);
     let database = rbx_reflection_database::get().unwrap();
 
     let initial_size =
@@ -1306,17 +1251,7 @@ fn synthesized_mesh_initial_size_preserves_nonzero_initial_size() {
         vector3_json(7.0, 8.0, 9.0),
     );
 
-    let document = settings_document(vec![
-        settings_instance("root", "Workspace", "Workspace", None),
-        SettingsBytecodeInstance {
-            settings_id: "mesh".to_string(),
-            name: "Mesh".to_string(),
-            class_name: "MeshPart".to_string(),
-            parent_index: Some(0),
-            properties: mesh_properties,
-            attributes: Map::new(),
-        },
-    ]);
+    let document = single_mesh_document("MeshPart", mesh_properties);
     let database = rbx_reflection_database::get().unwrap();
 
     assert!(
@@ -1330,17 +1265,7 @@ fn synthesized_mesh_initial_size_uses_size_without_studio_mesh_size() {
     let mut mesh_properties = Map::new();
     mesh_properties.insert("Size".to_string(), vector3_json(4.0, 5.0, 6.0));
 
-    let document = settings_document(vec![
-        settings_instance("root", "Workspace", "Workspace", None),
-        SettingsBytecodeInstance {
-            settings_id: "mesh".to_string(),
-            name: "FileCreatedMesh".to_string(),
-            class_name: "MeshPart".to_string(),
-            parent_index: Some(0),
-            properties: mesh_properties,
-            attributes: Map::new(),
-        },
-    ]);
+    let document = single_mesh_document("MeshPart", mesh_properties);
     let database = rbx_reflection_database::get().unwrap();
 
     let initial_size =
@@ -1390,13 +1315,9 @@ fn assert_mesh_exports(project_root: &Path, settings_path: &Path, expected: (f32
     for format in ["rbxmx", "rbxm"] {
         let output_path = project_root.join(format!("mesh-model.{format}"));
         bytecode_export_model(BytecodeExportModelArgs {
-            service_or_file: None,
-            settings_file: Some(settings_path.to_path_buf()),
+            input: BytecodeFileArgs::settings_file(settings_path.to_path_buf()),
             service: "Workspace".to_string(),
-            settings_id: Some("model".to_string()),
-            index: None,
-            name: None,
-            class_name: None,
+            selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("model".to_string())),
             output: output_path.clone(),
             format: Some(format.to_string()),
             pretty: false,
@@ -1410,8 +1331,10 @@ fn assert_mesh_exports(project_root: &Path, settings_path: &Path, expected: (f32
     for format in ["rbxlx", "rbxl"] {
         let output_path = project_root.join(format!("mesh-place.{format}"));
         bytecode_export_place(BytecodeExportPlaceArgs {
-            project_root: project_root.to_path_buf(),
-            src_root: PathBuf::from("src"),
+            project: ProjectSourceArgs {
+                project_root: project_root.to_path_buf(),
+                src_root: PathBuf::from("src"),
+            },
             services: "Workspace".to_string(),
             output: output_path.clone(),
             format: Some(format.to_string()),
@@ -1612,15 +1535,19 @@ fn targeted_inline_source_changes_include_selected_package_scripts() {
 #[test]
 fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
     let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
-        project_root: PathBuf::from("."),
-        src_dir: PathBuf::from("src"),
-        bridge: BridgeConnectionArgs::local(1.0),
-        service: "Workspace".to_string(),
-        settings_id: Some("already-removed".to_string()),
-        class_name: "Folder".to_string(),
-        path_segments_json: serde_json::to_string(&vec!["Workspace", "DeletedFolder"]).unwrap(),
-        path_ordinals_json: serde_json::to_string(&vec![1_usize, 1_usize]).unwrap(),
-        override_packages: false,
+        target: EditorMutationArgs {
+            project: ProjectSourceArgs {
+                project_root: PathBuf::from("."),
+                src_root: PathBuf::from("src"),
+            },
+            bridge: BridgeConnectionArgs::local(1.0),
+            service: "Workspace".to_string(),
+            settings_id: Some("already-removed".to_string()),
+            class_name: "Folder".to_string(),
+            path_segments_json: serde_json::to_string(&vec!["Workspace", "DeletedFolder"]).unwrap(),
+            path_ordinals_json: serde_json::to_string(&vec![1_usize, 1_usize]).unwrap(),
+            override_packages: false,
+        },
     })
     .unwrap();
 
@@ -1640,11 +1567,7 @@ fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
 
 #[test]
 fn clone_instance_rebinds_internal_ref_properties() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_root = std::env::temp_dir().join(format!("renium-clone-ref-{unique}"));
+    let project_root = temp_dir("clone-ref");
     let service_dir = project_root.join("src").join("Workspace");
     fs::create_dir_all(&service_dir).unwrap();
     let settings_path = service_settings_path(&service_dir);
@@ -1693,13 +1616,9 @@ fn clone_instance_rebinds_internal_ref_properties() {
     document.write_file(&settings_path).unwrap();
 
     bytecode_clone_instance(BytecodeCloneInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(settings_path.clone()),
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
         service: "Workspace".to_string(),
-        settings_id: Some("model".to_string()),
-        index: None,
-        name: None,
-        class_name: None,
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("model".to_string())),
         parent_index: Some(0),
         parent_settings_id: None,
         parent_name: None,
@@ -1756,62 +1675,6 @@ fn clone_instance_rebinds_internal_ref_properties() {
         cloned.instances[cloned_weld_index].properties.get("Part1"),
         cloned_part_b_index + 1,
     );
-
-    let _ = fs::remove_dir_all(project_root);
-}
-
-#[test]
-fn bytecode_move_instance_rejects_cross_service_moves() {
-    let project_root = temp_dir("move-cross-service");
-    let src_root = project_root.join("src");
-    let source_dir = src_root.join("ServerStorage");
-    let target_dir = src_root.join("ReplicatedStorage");
-    fs::create_dir_all(&source_dir).unwrap();
-    fs::create_dir_all(&target_dir).unwrap();
-    let source_settings = service_settings_path(&source_dir);
-    let target_settings = service_settings_path(&target_dir);
-    let mut source_properties = Map::new();
-    source_properties.insert("Source".to_string(), json!("return 42"));
-    settings_document(vec![
-        settings_instance("source-root", "ServerStorage", "ServerStorage", None),
-        SettingsBytecodeInstance {
-            settings_id: "script".into(),
-            name: "LinkedScript".into(),
-            class_name: "ModuleScript".into(),
-            parent_index: Some(0),
-            properties: source_properties,
-            attributes: Map::new(),
-        },
-    ])
-    .write_file(&source_settings)
-    .unwrap();
-    settings_document(vec![settings_instance(
-        "target-root",
-        "ReplicatedStorage",
-        "ReplicatedStorage",
-        None,
-    )])
-    .write_file(&target_settings)
-    .unwrap();
-
-    let error = bytecode_move_instance(BytecodeMoveInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(source_settings),
-        service: "ServerStorage".into(),
-        settings_id: Some("script".into()),
-        index: None,
-        name: None,
-        class_name: None,
-        target_settings_file: target_settings,
-        target_service: "ReplicatedStorage".into(),
-        parent_index: None,
-        parent_settings_id: Some("target-root".into()),
-        parent_name: None,
-        parent_class_name: None,
-        pretty: false,
-    })
-    .unwrap_err();
-    assert!(error.to_string().contains("cannot apply them atomically"));
 
     let _ = fs::remove_dir_all(project_root);
 }
@@ -2086,28 +1949,14 @@ fn collect_editor_changes_imports_orphan_source_script() {
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
     fs::write(&source_path, "print('orphan')").unwrap();
 
-    let changes = collect_editor_changes(&PushEditorChangesArgs {
-        project_root: root.clone(),
-        src_dir: PathBuf::from("src"),
-        bridge: BridgeConnectionArgs {
+    let changes = collect_and_apply_editor_changes(
+        &root,
+        vec![source_path],
+        BridgeConnectionArgs {
             ports: "8781".to_string(),
             ..BridgeConnectionArgs::local(0.0)
         },
-        changed_paths: vec![source_path],
-        changed_paths_files: Vec::new(),
-        target_settings_ids: Vec::new(),
-        target_settings_id_files: Vec::new(),
-        target_properties: Vec::new(),
-        upsert_instances_only: false,
-        probe_events: false,
-        verify_sources: false,
-        no_review: false,
-        yes: false,
-        link_cache_dir: None,
-        override_packages: false,
-    })
-    .unwrap();
-    apply_editor_settings_writes(&changes).unwrap();
+    );
 
     assert!(changes.instance_changes.iter().any(|change| {
         change.mode == "upsertInstances"
@@ -2193,11 +2042,7 @@ fn starter_player_script_containers_keep_real_classes() {
 
 #[test]
 fn deleted_source_file_demotes_script_to_folder_without_deleting_subtree() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_root = std::env::temp_dir().join(format!("renium-deleted-source-{unique}"));
+    let project_root = temp_dir("deleted-source");
     let service_dir = project_root.join("src").join("ReplicatedFirst");
     fs::create_dir_all(service_dir.join("LoadingScreen")).unwrap();
 
@@ -2219,27 +2064,13 @@ fn deleted_source_file_demotes_script_to_folder_without_deleting_subtree() {
     ]);
     let settings_path = service_settings_path(&service_dir);
     document.write_file(&settings_path).unwrap();
-    let changes = collect_editor_changes(&PushEditorChangesArgs {
-        project_root: project_root.clone(),
-        src_dir: PathBuf::from("src"),
-        bridge: BridgeConnectionArgs::local(1.0),
-        changed_paths: vec![PathBuf::from(
+    let changes = collect_and_apply_editor_changes(
+        &project_root,
+        vec![PathBuf::from(
             "src/ReplicatedFirst/LoadingScreen/init.client.luau",
         )],
-        changed_paths_files: Vec::new(),
-        target_settings_ids: Vec::new(),
-        target_settings_id_files: Vec::new(),
-        target_properties: Vec::new(),
-        upsert_instances_only: false,
-        probe_events: false,
-        verify_sources: false,
-        no_review: false,
-        yes: false,
-        link_cache_dir: None,
-        override_packages: false,
-    })
-    .unwrap();
-    apply_editor_settings_writes(&changes).unwrap();
+        BridgeConnectionArgs::local(1.0),
+    );
 
     assert_eq!(changes.instance_changes.len(), 1);
     assert_eq!(changes.instance_changes[0].mode, "replaceInstances");
@@ -2282,11 +2113,7 @@ fn deleted_source_file_demotes_script_to_folder_without_deleting_subtree() {
 
 #[test]
 fn restored_init_source_reclasses_folder_back_to_script() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_root = std::env::temp_dir().join(format!("renium-restored-source-{unique}"));
+    let project_root = temp_dir("restored-source");
     let service_dir = project_root.join("src").join("ReplicatedFirst");
     fs::create_dir_all(service_dir.join("LoadingScreen")).unwrap();
     fs::write(
@@ -2303,27 +2130,13 @@ fn restored_init_source_reclasses_folder_back_to_script() {
     let settings_path = service_settings_path(&service_dir);
     document.write_file(&settings_path).unwrap();
 
-    let changes = collect_editor_changes(&PushEditorChangesArgs {
-        project_root: project_root.clone(),
-        src_dir: PathBuf::from("src"),
-        bridge: BridgeConnectionArgs::local(1.0),
-        changed_paths: vec![PathBuf::from(
+    let changes = collect_and_apply_editor_changes(
+        &project_root,
+        vec![PathBuf::from(
             "src/ReplicatedFirst/LoadingScreen/init.client.luau",
         )],
-        changed_paths_files: Vec::new(),
-        target_settings_ids: Vec::new(),
-        target_settings_id_files: Vec::new(),
-        target_properties: Vec::new(),
-        upsert_instances_only: false,
-        probe_events: false,
-        verify_sources: false,
-        no_review: false,
-        yes: false,
-        link_cache_dir: None,
-        override_packages: false,
-    })
-    .unwrap();
-    apply_editor_settings_writes(&changes).unwrap();
+        BridgeConnectionArgs::local(1.0),
+    );
 
     assert_eq!(changes.instance_changes.len(), 1);
     assert_eq!(changes.instance_changes[0].mode, "replaceInstances");
@@ -2351,7 +2164,7 @@ fn parse_compact_v5_instance_items_accept_rows_without_properties() {
 
     let parsed = parse_compact_v5_instance_items(
         json!([[1, 0, false], [2, 0, false, [3, TYPE_ID_NUMBER, 42]]]),
-        strings,
+        &strings,
         1,
         &property_schema_by_class,
         &HashMap::new(),
@@ -2447,7 +2260,7 @@ fn parse_compact_v5_instance_items_expand_schema_driven_values() {
             [3],
             [[1.0, 2.0, 3.0], 256]
         ]]),
-        strings,
+        &strings,
         1,
         &property_schema_by_class,
         &enum_value_names_by_type,
@@ -2506,7 +2319,7 @@ fn parse_compact_v5_instance_items_expand_numeric_enum_values() {
 
     let parsed = parse_compact_v5_instance_items(
         json!([[1, 0, false, 1, [256]]]),
-        strings,
+        &strings,
         1,
         &property_schema_by_class,
         &enum_value_names_by_type,
@@ -2540,7 +2353,7 @@ fn parse_compact_v5_instance_items_accept_single_mask_word_number() {
 
     let parsed = parse_compact_v5_instance_items(
         json!([[1, 0, false, 1, [[1.0, 2.0, 3.0]]]]),
-        strings,
+        &strings,
         1,
         &property_schema_by_class,
         &HashMap::new(),
@@ -2594,7 +2407,7 @@ fn parse_compact_v5_instance_items_expand_number_range_and_physical_properties()
             7,
             [[0.5, 1.5], false, [1.0, 0.3, 0.5, 1.0, 1.0, 0.25]]
         ]]),
-        strings,
+        &strings,
         1,
         &property_schema_by_class,
         &HashMap::new(),
@@ -2686,7 +2499,7 @@ fn vc_merge_merges_disjoint_property_edits() {
         ),
     ]);
     let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
-    assert!(conflicts.is_empty(), "conflicts: {conflicts:?}");
+    assert!(conflicts.is_empty());
     let child = merged
         .instances
         .iter()
@@ -2736,7 +2549,7 @@ fn vc_merge_keeps_parallel_additions_with_colliding_ids() {
         vc_test_instance("editor:1", "TheirsChild", "Folder", Some(0), &[]),
     ]);
     let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
-    assert!(conflicts.is_empty(), "conflicts: {conflicts:?}");
+    assert!(conflicts.is_empty());
     assert_eq!(merged.instances.len(), 3);
     let names: Vec<&str> = merged
         .instances
@@ -2927,12 +2740,8 @@ fn bytecode_remove_instance_removes_source_files_and_empty_dirs() {
     assert!(source_path.exists());
 
     bytecode_remove_instance(BytecodeRemoveInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(settings_path.clone()),
-        settings_id: Some("pkg".into()),
-        index: None,
-        name: None,
-        class_name: None,
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("pkg".into())),
         no_recursive: false,
         pretty: false,
     })
@@ -2970,11 +2779,7 @@ fn bytecode_service_resolution_rejects_parent_directory() {
 #[test]
 fn existing_target_ancestor_must_stay_inside_root() {
     let root = temp_dir("ancestor");
-    let outside = root
-        .parent()
-        .unwrap()
-        .join(format!("renium-link-outside-{}", current_millis()));
-    fs::create_dir_all(&outside).unwrap();
+    let outside = temp_dir("ancestor-outside");
 
     assert!(
         ensure_existing_ancestor_inside(&root, &root.join("missing").join("file"), "target")
@@ -3000,13 +2805,6 @@ fn bounded_line_reader_drains_oversized_requests() {
         BoundedLineRead::Line
     );
     assert_eq!(line, "valid\n");
-}
-
-#[test]
-fn fnv1a_hex_is_stable() {
-    assert_eq!(fnv1a_hex(b"renium"), fnv1a_hex(b"renium"));
-    assert_ne!(fnv1a_hex(b"a"), fnv1a_hex(b"b"));
-    assert_eq!(fnv1a_hex(b"renium").len(), 16);
 }
 
 #[test]
@@ -3121,11 +2919,8 @@ fn empty_full_reconcile_is_not_discarded() {
 
 #[test]
 fn protected_place_writes_patch_binary_properties_and_attributes() {
-    let path = std::env::temp_dir().join(format!(
-        "renium-protected-place-writes-{}-{}.rbxl",
-        std::process::id(),
-        current_millis()
-    ));
+    let dir = temp_dir("protected-place-writes");
+    let path = dir.join("place.rbxl");
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let mut builder = RbxInstanceBuilder::new("MaterialService").with_name("MaterialService");
     builder.add_property("Use2022Materials", RbxVariant::Bool(false));
@@ -3171,16 +2966,13 @@ fn protected_place_writes_patch_binary_properties_and_attributes() {
         attributes.get("ReniumTest"),
         Some(&RbxVariant::Float64(4.0))
     );
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
 fn protected_review_reads_migrated_mesh_id_value() {
-    let path = std::env::temp_dir().join(format!(
-        "renium-protected-mesh-review-{}-{}.rbxl",
-        std::process::id(),
-        current_millis()
-    ));
+    let dir = temp_dir("protected-mesh-review");
+    let path = dir.join("place.rbxl");
     let mesh = RbxInstanceBuilder::new("MeshPart")
         .with_name("Mesh")
         .with_property(
@@ -3209,7 +3001,7 @@ fn protected_review_reads_migrated_mesh_id_value() {
         patched_rows[0].get("oldValue"),
         Some(&json!("rbxassetid://131536866771677"))
     );
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -3249,15 +3041,7 @@ fn live_snapshot_preserves_unrelated_service_root_properties() {
     );
     assert!(!values["Players"].contains_key("MaxPlayersInternal"));
     assert!(!values["Players"].contains_key("PreferredPlayersInternal"));
-    let refs = BytecodeModelExportRefs {
-        by_index: HashMap::new(),
-        by_settings_id: HashMap::new(),
-        global_by_settings_id: None,
-        by_path_key: HashMap::new(),
-        global_by_path_key: None,
-        by_path_segments_key: HashMap::new(),
-        global_by_path_segments_key: None,
-    };
+    let refs = BytecodeModelExportRefs::default();
     let encoded =
         encode_service_root_property_values("Players", &values["Players"], database, &refs);
     assert_eq!(

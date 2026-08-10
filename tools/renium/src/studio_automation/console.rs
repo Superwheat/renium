@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::wait_for_player_bridge;
+use super::{console_entry_level, wait_for_player_bridge};
 use crate::bridge_server::{BridgeServer, BridgeTarget};
 use crate::command_line::PluginConsoleOutputArgs;
 use crate::daemon_control::{get_console_output_daemon_args, try_daemon_control_request};
@@ -29,17 +29,10 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    get_console_output_with_warm_bridge(args, &bridge)
-}
-
-fn get_console_output_with_warm_bridge(
-    args: PluginConsoleOutputArgs,
-    bridge: &BridgeServer,
-) -> Result<()> {
     if args.follow {
-        return follow_console_with_bridge(&args, bridge);
+        return follow_console_with_bridge(&args, &bridge);
     }
-    let result = get_console_output_result(&args, bridge)?;
+    let result = get_console_output_result(&args, &bridge)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&filtered_console_result(&args, result))?
@@ -52,11 +45,7 @@ pub(crate) fn get_console_output_result(
     bridge: &BridgeServer,
 ) -> Result<Value> {
     let client = args.client || args.player.is_some();
-    let target = if client {
-        BridgeTarget::Client
-    } else {
-        BridgeTarget::Main
-    };
+    let target = BridgeTarget::main_or_client(client);
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
@@ -114,29 +103,18 @@ fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<bool> {
         let result = match try_daemon_control_request("co", request) {
             Ok(Some(result)) => result,
             Ok(None) if connected => {
-                thread::sleep(Duration::from_millis(args.interval_ms.clamp(25, 10_000)));
+                thread::sleep(console_follow_interval(args));
                 continue;
             }
             Ok(None) => return Ok(false),
             Err(error) if connected && is_transient_console_follow_error(&error) => {
-                thread::sleep(Duration::from_millis(args.interval_ms.clamp(25, 10_000)));
+                thread::sleep(console_follow_interval(args));
                 continue;
             }
             Err(error) => return Err(error),
         };
         connected = true;
-        if update_console_follow_epoch(&result, &mut epoch, &mut since_seq, &mut from_oldest) {
-            continue;
-        }
-        print_followed_console_entries(args, &result)?;
-        from_oldest = false;
-        since_seq = result
-            .get("nextSeq")
-            .and_then(Value::as_u64)
-            .unwrap_or(since_seq);
-        if result.get("hasMore").and_then(Value::as_bool) != Some(true) {
-            thread::sleep(Duration::from_millis(args.interval_ms.clamp(25, 10_000)));
-        }
+        handle_console_follow_result(args, &result, &mut epoch, &mut since_seq, &mut from_oldest)?;
     }
 }
 
@@ -162,25 +140,40 @@ fn follow_console_with_bridge(args: &PluginConsoleOutputArgs, bridge: &BridgeSer
         let result = match get_console_output_result(&request, bridge) {
             Ok(result) => result,
             Err(error) if is_transient_console_follow_error(&error) => {
-                thread::sleep(Duration::from_millis(args.interval_ms.clamp(25, 10_000)));
+                thread::sleep(console_follow_interval(args));
                 continue;
             }
             Err(error) => return Err(error),
         };
         clear_pending = false;
-        if update_console_follow_epoch(&result, &mut epoch, &mut since_seq, &mut from_oldest) {
-            continue;
-        }
-        print_followed_console_entries(args, &result)?;
-        from_oldest = false;
-        since_seq = result
-            .get("nextSeq")
-            .and_then(Value::as_u64)
-            .unwrap_or(since_seq);
-        if result.get("hasMore").and_then(Value::as_bool) != Some(true) {
-            thread::sleep(Duration::from_millis(args.interval_ms.clamp(25, 10_000)));
-        }
+        handle_console_follow_result(args, &result, &mut epoch, &mut since_seq, &mut from_oldest)?;
     }
+}
+
+fn console_follow_interval(args: &PluginConsoleOutputArgs) -> Duration {
+    Duration::from_millis(args.interval_ms.clamp(25, 10_000))
+}
+
+fn handle_console_follow_result(
+    args: &PluginConsoleOutputArgs,
+    result: &Value,
+    epoch: &mut Option<String>,
+    since_seq: &mut u64,
+    from_oldest: &mut bool,
+) -> Result<()> {
+    if update_console_follow_epoch(result, epoch, since_seq, from_oldest) {
+        return Ok(());
+    }
+    print_followed_console_entries(args, result)?;
+    *from_oldest = false;
+    *since_seq = result
+        .get("nextSeq")
+        .and_then(Value::as_u64)
+        .unwrap_or(*since_seq);
+    if result.get("hasMore").and_then(Value::as_bool) != Some(true) {
+        thread::sleep(console_follow_interval(args));
+    }
+    Ok(())
 }
 
 fn is_transient_console_follow_error(error: &anyhow::Error) -> bool {
@@ -189,7 +182,7 @@ fn is_transient_console_follow_error(error: &anyhow::Error) -> bool {
     }
     let message = error
         .chain()
-        .map(|cause| cause.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
         .to_ascii_lowercase();
@@ -241,11 +234,7 @@ fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value
             .iter()
             .filter(|entry| console_entry_matches(args, entry))
         {
-            let level = entry
-                .get("type")
-                .or_else(|| entry.get("level"))
-                .and_then(Value::as_str)
-                .unwrap_or("output");
+            let level = console_entry_level(entry);
             let message = entry
                 .get("message")
                 .and_then(Value::as_str)

@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Number, Value, json};
 use walkdir::WalkDir;
 
+use super::bytecode_api::parse_bracket_path_segments;
 use super::bytecode_api::{apply_file_mutations, bytecode_set_property};
 use super::bytecode_edit::{
     bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
@@ -13,11 +14,13 @@ use super::bytecode_edit::{
 };
 use super::command_line::{
     BridgeConnectionArgs, BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs,
-    BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeImportModelArgs,
-    BytecodeInstanceSelectorArgs, BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs,
-    CloneInstanceCommandArgs, CreateInstanceArgs, DesyncPackageLinkCommandArgs,
-    ExportModelCommandArgs, ImportModelCommandArgs, ImportPathArgs, MoveInstanceArgs,
-    PushEditorChangesArgs, RemoveInstanceCommandArgs, RenameInstanceArgs, SyncbackArgs,
+    BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeFileArgs,
+    BytecodeImportModelArgs, BytecodeInstanceSelectorArgs, BytecodeParentArgs,
+    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, CloneInstanceCommandArgs,
+    CreateInstanceArgs, DesyncPackageLinkCommandArgs, ExportModelCommandArgs,
+    ImportModelCommandArgs, ImportPathArgs, MoveInstanceArgs, ProjectInstanceArgs,
+    ProjectSourceArgs, PushEditorChangesArgs, RemoveInstanceCommandArgs, RenameInstanceArgs,
+    SyncbackArgs,
 };
 use super::editor_paths::{build_editor_instance_paths, infer_source_script};
 use super::editor_sync::push_editor_changes;
@@ -26,7 +29,6 @@ use super::file_io::{
 };
 use super::output::{global_yes, print_json_output};
 use super::package_links::build_loaded_project_link_enforcement;
-use super::place_packages::parse_bracket_path_segments;
 use super::project_config;
 use super::project_layout::configured_project_layout;
 use super::rbx_model::{bytecode_export_model, bytecode_import_model};
@@ -182,6 +184,44 @@ fn projected_structural_store(
     Ok((store, target, canonical_id))
 }
 
+fn projected_instance_store(
+    project: Option<&Path>,
+    target: &ProjectInstanceArgs,
+    override_packages: bool,
+) -> Result<(PathBuf, Option<String>)> {
+    let loaded = load_structural_project(project, &target.project_root)?;
+    let stage = project_config::stage_project(&loaded)?;
+    let (settings_file, _, settings_id) = projected_structural_store(
+        &loaded,
+        &stage,
+        &target.service,
+        Some(&target.settings_id),
+        true,
+        override_packages,
+    )?;
+    Ok((settings_file, settings_id))
+}
+
+fn metadata_property_change(
+    settings_file: PathBuf,
+    settings_id: Option<String>,
+    property: &str,
+    value: Option<String>,
+) -> BytecodeSetPropertyArgs {
+    BytecodeSetPropertyArgs {
+        input: BytecodeFileArgs::settings_file(settings_file),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
+        property: property.to_string(),
+        value_json: None,
+        value_str: value,
+        value_num: None,
+        value_bool: None,
+        value_null: false,
+        scope: "metadata".to_string(),
+        pretty: true,
+    }
+}
+
 pub(super) fn create_instance_command(
     args: CreateInstanceArgs,
     project: Option<&Path>,
@@ -198,16 +238,14 @@ pub(super) fn create_instance_command(
             args.override_packages,
         )?;
         return bytecode_add_instance(BytecodeAddInstanceArgs {
-            service_or_file: None,
-            settings_file: Some(settings_file),
+            input: BytecodeFileArgs::settings_file(settings_file),
             name: args.name,
             class_name: args.class_name,
             settings_id: None,
-            parent_index: None,
-            parent_settings_id,
-            parent_name: None,
-            parent_class_name: None,
-            no_parent: false,
+            parent: BytecodeParentArgs {
+                parent_settings_id,
+                ..Default::default()
+            },
             properties: args.properties,
             attributes: args.attributes,
             pretty: true,
@@ -225,16 +263,14 @@ pub(super) fn create_instance_command(
         );
     }
     bytecode_add_instance(BytecodeAddInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
+        input: BytecodeFileArgs::settings_file(settings_file),
         name: args.name,
         class_name: args.class_name,
         settings_id: None,
-        parent_index: None,
-        parent_settings_id: args.parent_settings_id,
-        parent_name: None,
-        parent_class_name: None,
-        no_parent: false,
+        parent: BytecodeParentArgs {
+            parent_settings_id: args.parent_settings_id,
+            ..Default::default()
+        },
         properties: args.properties,
         attributes: args.attributes,
         pretty: true,
@@ -245,20 +281,21 @@ pub(super) fn clone_instance_command(
     args: CloneInstanceCommandArgs,
     project: Option<&Path>,
 ) -> Result<()> {
-    let loaded = load_structural_project(project, &args.project_root)?;
+    let target = args.target;
+    let loaded = load_structural_project(project, &target.project_root)?;
     let stage = project_config::stage_project(&loaded)?;
     let (source_file, source_target, source_id) = projected_structural_store(
         &loaded,
         &stage,
-        &args.service,
-        Some(&args.settings_id),
+        &target.service,
+        Some(&target.settings_id),
         true,
         args.override_packages,
     )?;
     let (parent_file, parent_target, parent_id) = projected_structural_store(
         &loaded,
         &stage,
-        &args.service,
+        &target.service,
         Some(&args.parent_settings_id),
         false,
         args.override_packages,
@@ -271,13 +308,9 @@ pub(super) fn clone_instance_command(
         );
     }
     bytecode_clone_instance(BytecodeCloneInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(source_file),
-        service: args.service,
-        settings_id: source_id,
-        index: None,
-        name: None,
-        class_name: None,
+        input: BytecodeFileArgs::settings_file(source_file),
+        service: target.service,
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(source_id),
         parent_index: None,
         parent_settings_id: parent_id,
         parent_name: None,
@@ -287,18 +320,20 @@ pub(super) fn clone_instance_command(
 }
 
 pub(super) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Path>) -> Result<()> {
+    let target = args.target;
     let target_service = args
         .target_service
         .clone()
-        .unwrap_or_else(|| args.service.clone());
-    let loaded_project = structural_project(project, &args.project_root, args.src_root.as_deref())?;
+        .unwrap_or_else(|| target.service.clone());
+    let loaded_project =
+        structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let (source_file, target_file) = if let Some(loaded) = loaded_project.as_ref() {
         let stage = project_config::stage_project(loaded)?;
         let (source_file, source_target, source_id) = projected_structural_store(
             loaded,
             &stage,
-            &args.service,
-            Some(&args.settings_id),
+            &target.service,
+            Some(&target.settings_id),
             true,
             args.override_packages,
         )?;
@@ -317,50 +352,30 @@ pub(super) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
                 target_parent.join(".")
             );
         }
-        return bytecode_set_property(BytecodeSetPropertyArgs {
-            service_or_file: None,
-            settings_file: Some(source_file),
-            selector: BytecodeInstanceSelectorArgs {
-                settings_id: source_id,
-                ..Default::default()
-            },
-            property: "Parent".to_string(),
-            value_json: None,
-            value_str: parent_id,
-            value_num: None,
-            value_bool: None,
-            value_null: false,
-            scope: "metadata".to_string(),
-            pretty: true,
-        });
+        return bytecode_set_property(metadata_property_change(
+            source_file,
+            source_id,
+            "Parent",
+            parent_id,
+        ));
     } else {
         let src_root =
-            structural_source_root(project, &args.project_root, args.src_root.as_deref())?;
+            structural_source_root(project, &target.project_root, args.src_root.as_deref())?;
         (
-            service_settings_path(&src_root.join(&args.service)),
+            service_settings_path(&src_root.join(&target.service)),
             service_settings_path(&src_root.join(&target_service)),
         )
     };
     if !source_file.is_file() {
-        bail!("Source service '{}' has no Renium store", args.service);
+        bail!("Source service '{}' has no Renium store", target.service);
     }
-    if target_service == args.service {
-        return bytecode_set_property(BytecodeSetPropertyArgs {
-            service_or_file: None,
-            settings_file: Some(source_file),
-            selector: BytecodeInstanceSelectorArgs {
-                settings_id: Some(args.settings_id),
-                ..Default::default()
-            },
-            property: "Parent".to_string(),
-            value_json: None,
-            value_str: Some(args.parent_settings_id),
-            value_num: None,
-            value_bool: None,
-            value_null: false,
-            scope: "metadata".to_string(),
-            pretty: true,
-        });
+    if target_service == target.service {
+        return bytecode_set_property(metadata_property_change(
+            source_file,
+            Some(target.settings_id),
+            "Parent",
+            Some(args.parent_settings_id),
+        ));
     }
     if !target_file.is_file() {
         bail!("Target service '{target_service}' has no Renium store");
@@ -372,80 +387,51 @@ pub(super) fn rename_instance_command(
     args: RenameInstanceArgs,
     project: Option<&Path>,
 ) -> Result<()> {
-    let loaded_project = structural_project(project, &args.project_root, args.src_root.as_deref())?;
+    let target = args.target;
+    let loaded_project =
+        structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let settings_file = if let Some(loaded) = loaded_project.as_ref() {
         let stage = project_config::stage_project(loaded)?;
         let (settings_file, _, settings_id) = projected_structural_store(
             loaded,
             &stage,
-            &args.service,
-            Some(&args.settings_id),
+            &target.service,
+            Some(&target.settings_id),
             true,
             args.override_packages,
         )?;
-        return bytecode_set_property(BytecodeSetPropertyArgs {
-            service_or_file: None,
-            settings_file: Some(settings_file),
-            selector: BytecodeInstanceSelectorArgs {
-                settings_id,
-                ..Default::default()
-            },
-            property: "Name".to_string(),
-            value_json: None,
-            value_str: Some(args.name),
-            value_num: None,
-            value_bool: None,
-            value_null: false,
-            scope: "metadata".to_string(),
-            pretty: true,
-        });
+        return bytecode_set_property(metadata_property_change(
+            settings_file,
+            settings_id,
+            "Name",
+            Some(args.name),
+        ));
     } else {
         let src_root =
-            structural_source_root(project, &args.project_root, args.src_root.as_deref())?;
-        service_settings_path(&src_root.join(&args.service))
+            structural_source_root(project, &target.project_root, args.src_root.as_deref())?;
+        service_settings_path(&src_root.join(&target.service))
     };
     if !settings_file.is_file() {
-        bail!("Service '{}' has no Renium store", args.service);
+        bail!("Service '{}' has no Renium store", target.service);
     }
-    bytecode_set_property(BytecodeSetPropertyArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
-        selector: BytecodeInstanceSelectorArgs {
-            settings_id: Some(args.settings_id),
-            ..Default::default()
-        },
-        property: "Name".to_string(),
-        value_json: None,
-        value_str: Some(args.name),
-        value_num: None,
-        value_bool: None,
-        value_null: false,
-        scope: "metadata".to_string(),
-        pretty: true,
-    })
+    bytecode_set_property(metadata_property_change(
+        settings_file,
+        Some(target.settings_id),
+        "Name",
+        Some(args.name),
+    ))
 }
 
 pub(super) fn remove_instance_command(
     args: RemoveInstanceCommandArgs,
     project: Option<&Path>,
 ) -> Result<()> {
-    let loaded = load_structural_project(project, &args.project_root)?;
-    let stage = project_config::stage_project(&loaded)?;
-    let (settings_file, _, settings_id) = projected_structural_store(
-        &loaded,
-        &stage,
-        &args.service,
-        Some(&args.settings_id),
-        true,
-        args.override_packages,
-    )?;
+    let target = args.target;
+    let (settings_file, settings_id) =
+        projected_instance_store(project, &target, args.override_packages)?;
     bytecode_remove_instance(BytecodeRemoveInstanceArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
-        settings_id,
-        index: None,
-        name: None,
-        class_name: None,
+        input: BytecodeFileArgs::settings_file(settings_file),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         no_recursive: args.no_recursive,
         pretty: true,
     })
@@ -455,24 +441,13 @@ pub(super) fn desync_package_link_command(
     args: DesyncPackageLinkCommandArgs,
     project: Option<&Path>,
 ) -> Result<()> {
-    let loaded = load_structural_project(project, &args.project_root)?;
-    let stage = project_config::stage_project(&loaded)?;
-    let (settings_file, _, settings_id) = projected_structural_store(
-        &loaded,
-        &stage,
-        &args.service,
-        Some(&args.settings_id),
-        true,
-        args.override_packages,
-    )?;
+    let target = args.target;
+    let (settings_file, settings_id) =
+        projected_instance_store(project, &target, args.override_packages)?;
     bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
-        service: args.service,
-        selector: BytecodeInstanceSelectorArgs {
-            settings_id,
-            ..Default::default()
-        },
+        input: BytecodeFileArgs::settings_file(settings_file),
+        service: target.service,
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         pretty: true,
     })
 }
@@ -492,15 +467,13 @@ pub(super) fn import_model_command(
         args.override_packages,
     )?;
     bytecode_import_model(BytecodeImportModelArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
+        input: BytecodeFileArgs::settings_file(settings_file),
         service: args.service,
         model: args.model,
-        parent_index: None,
-        parent_settings_id,
-        parent_name: None,
-        parent_class_name: None,
-        no_parent: false,
+        parent: BytecodeParentArgs {
+            parent_settings_id,
+            ..Default::default()
+        },
         pretty: true,
     })
 }
@@ -509,20 +482,17 @@ pub(super) fn export_model_command(
     args: ExportModelCommandArgs,
     project: Option<&Path>,
 ) -> Result<()> {
-    let loaded = load_structural_project(project, &args.project_root)?;
+    let target = args.target;
+    let loaded = load_structural_project(project, &target.project_root)?;
     let stage = project_config::stage_project(&loaded)?;
-    let settings_file = service_settings_path(&stage.root().join(&args.service));
+    let settings_file = service_settings_path(&stage.root().join(&target.service));
     if !settings_file.is_file() {
-        bail!("Projected service '{}' has no Renium store", args.service);
+        bail!("Projected service '{}' has no Renium store", target.service);
     }
     bytecode_export_model(BytecodeExportModelArgs {
-        service_or_file: None,
-        settings_file: Some(settings_file),
-        service: args.service,
-        settings_id: Some(args.settings_id),
-        index: None,
-        name: None,
-        class_name: None,
+        input: BytecodeFileArgs::settings_file(settings_file),
+        service: target.service,
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(target.settings_id)),
         output: args.output,
         format: args.format,
         pretty: true,
@@ -549,10 +519,10 @@ pub(super) fn import_path_command(
     if args.path_json.is_some() && loaded.is_none() {
         loaded = Some(project_config::load_project(None, Some(&root))?);
     }
-    let configured_src_dir = loaded
-        .as_ref()
-        .map(|project| project.project.source_root.clone())
-        .unwrap_or_else(|| PathBuf::from("src"));
+    let configured_src_dir = loaded.as_ref().map_or_else(
+        || PathBuf::from("src"),
+        |project| project.project.source_root.clone(),
+    );
     let (destination, src_dir) = if let Some(path_json) = args.path_json.as_deref() {
         let loaded = loaded.as_ref().context("No Renium project was found")?;
         let destination = import_path_json_destination(&source, loaded, path_json)?;
@@ -592,21 +562,15 @@ pub(super) fn import_path_command(
     changed_paths.extend(files.into_iter().map(|(_, to)| to));
     if args.push && !changed_paths.is_empty() {
         push_editor_changes(PushEditorChangesArgs {
-            project_root: root,
-            src_dir,
-            bridge: BridgeConnectionArgs::local(8.0),
             changed_paths,
-            changed_paths_files: Vec::new(),
-            target_settings_ids: Vec::new(),
-            target_settings_id_files: Vec::new(),
-            target_properties: Vec::new(),
-            upsert_instances_only: false,
-            probe_events: false,
-            verify_sources: false,
-            no_review: false,
             yes: true,
-            link_cache_dir: None,
-            override_packages: false,
+            ..PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root,
+                    src_root: src_dir,
+                },
+                BridgeConnectionArgs::local(8.0),
+            )
         })?;
     }
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -634,8 +598,9 @@ fn validate_import_destination_ownership(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if let Some(file_name) = target.last().cloned()
-            && let Some((_, leaf, _)) = infer_source_script(&file_name, &naming)
+        if let Some((_, leaf, _)) = target
+            .last()
+            .and_then(|file_name| infer_source_script(file_name, &naming))
         {
             target.pop();
             if let Some(leaf) = leaf {
@@ -749,7 +714,7 @@ fn import_source_suffix(
     if let Some(naming) = naming
         && let Some((_, stem, _)) = infer_source_script(name, naming)
     {
-        let prefix_len = stem.as_deref().map(str::len).unwrap_or(4);
+        let prefix_len = stem.as_deref().map_or(4, str::len);
         return Ok(name[prefix_len..].to_string());
     }
     for suffix in [
@@ -824,15 +789,12 @@ pub(super) fn syncback_command(args: SyncbackArgs, global_project: Option<&Path>
             let fields =
                 project_config::filter_candidate_fields(&instance.properties, &instance.attributes);
             let settings_id = instance_settings_id(index, instance);
-            let candidate = project_config::FilterCandidate {
-                id: &settings_id,
-                path: &instance.path,
-                name: &instance.name,
-                class: &instance.class_name,
-                tags: &fields.tags,
-                attributes: &fields.attributes,
-                properties: &fields.properties,
-            };
+            let candidate = fields.candidate(
+                &settings_id,
+                &instance.path,
+                &instance.name,
+                &instance.class_name,
+            );
             let entry = json!({
                 "service": service,
                 "path": instance.path,
@@ -928,8 +890,9 @@ fn import_filtered_syncback(
         let node = import_service_state_with_sourcemap(&state, project_root, source_root, service)?;
         sourcemap_nodes.insert(service.clone(), node);
     }
-    write_project_sourcemap_with_updates(project_root, &sourcemap_nodes)?;
-    Ok(sourcemap_nodes.len())
+    let updated = sourcemap_nodes.len();
+    write_project_sourcemap_with_updates(project_root, sourcemap_nodes)?;
+    Ok(updated)
 }
 
 fn merge_filtered_syncback_state(
@@ -1085,13 +1048,13 @@ fn merge_filtered_syncback_state(
         let mut deferred = Vec::new();
         for (id, parent_id, choice) in choices {
             let parent_index = match parent_id.as_ref() {
-                Some(parent_key) => match output_by_id.get(parent_key).copied() {
-                    Some(index) => Some(index),
-                    None => {
+                Some(parent_key) => {
+                    let Some(index) = output_by_id.get(parent_key).copied() else {
                         deferred.push((id, parent_id, choice));
                         continue;
-                    }
-                },
+                    };
+                    Some(index)
+                }
                 None => None,
             };
             let source = match choice.source {
@@ -1113,11 +1076,7 @@ fn merge_filtered_syncback_state(
             instance.parent_instance_id = parent_id;
             instance.debug_id = None;
             instance.parent_debug_id = None;
-            instance.instance_index = if parent_index.is_none() {
-                Some(1)
-            } else {
-                None
-            };
+            instance.instance_index = parent_index.is_none().then_some(1);
             instance.parent_index = None;
             instance.source_key = None;
             let output_index = merged.len();
@@ -1134,7 +1093,7 @@ fn merge_filtered_syncback_state(
     }
     build_service_state_from_instances(
         service,
-        Some(service.to_string()),
+        Some(service),
         merged,
         incoming.class_defaults_by_class,
         false,

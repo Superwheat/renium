@@ -202,7 +202,6 @@ mod platform {
     const MK_LBUTTON: WPARAM = 0x0001;
     const MK_RBUTTON: WPARAM = 0x0002;
 
-    #[derive(Clone)]
     pub struct WindowHandle {
         viewport: isize,
         capture: isize,
@@ -262,17 +261,25 @@ mod platform {
         })
     }
 
+    fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        (unsafe { GetClientRect(hwnd, &mut rect) } != 0)
+            .then_some((rect.right - rect.left, rect.bottom - rect.top))
+    }
+
+    fn visible_client_size(hwnd: HWND) -> Option<(i32, i32)> {
+        if unsafe { IsWindowVisible(hwnd) } == 0 {
+            None
+        } else {
+            client_size(hwnd)
+        }
+    }
+
     unsafe extern "system" fn enum_child_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
         let state = unsafe { &mut *(lparam as *mut EnumChildState) };
-        if unsafe { IsWindowVisible(hwnd) } == 0 {
+        let Some((width, height)) = visible_client_size(hwnd) else {
             return 1;
-        }
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-            return 1;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
+        };
         if width == state.viewport_width && height == state.viewport_height {
             state.exact = hwnd as isize;
         }
@@ -350,15 +357,9 @@ mod platform {
 
     unsafe extern "system" fn enum_capture_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
         let state = unsafe { &mut *(lparam as *mut EnumCaptureState) };
-        if unsafe { IsWindowVisible(hwnd) } == 0 {
+        let Some((width, height)) = visible_client_size(hwnd) else {
             return 1;
-        }
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-            return 1;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
+        };
         if width >= 96 && height >= 96 {
             state.candidates.push(CaptureCandidate {
                 hwnd: hwnd as isize,
@@ -374,17 +375,15 @@ mod platform {
             candidates: Vec::new(),
         };
         let _dpi = ThreadDpiAwareness::per_monitor_v2();
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(top as HWND, &mut rect) } != 0 {
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
-            if width >= 96 && height >= 96 {
-                state.candidates.push(CaptureCandidate {
-                    hwnd: top,
-                    width,
-                    height,
-                });
-            }
+        if let Some((width, height)) = client_size(top as HWND)
+            && width >= 96
+            && height >= 96
+        {
+            state.candidates.push(CaptureCandidate {
+                hwnd: top,
+                width,
+                height,
+            });
         }
         unsafe {
             EnumChildWindows(
@@ -592,7 +591,7 @@ mod platform {
         different * 10_000 <= a.len() / 4
     }
 
-    fn windows_for_pid(pid: u32) -> Vec<(isize, String)> {
+    fn windows_for_pid(pid: u32) -> Vec<(isize, u32, String)> {
         let mut state = EnumTopState {
             pids: vec![pid],
             windows: Vec::new(),
@@ -603,11 +602,7 @@ mod platform {
                 &mut state as *mut EnumTopState as LPARAM,
             );
         }
-        state
-            .windows
-            .into_iter()
-            .map(|(hwnd, _, title)| (hwnd, title))
-            .collect()
+        state.windows
     }
 
     fn window_class(hwnd: isize) -> String {
@@ -641,15 +636,15 @@ mod platform {
         let windows = windows_for_pid(pid);
         windows
             .iter()
-            .find(|(hwnd, title)| {
+            .find(|(hwnd, _, title)| {
                 window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
             })
             .or_else(|| {
                 windows
                     .iter()
-                    .find(|(hwnd, _)| window_class(*hwnd).starts_with("Qt"))
+                    .find(|(hwnd, _, _)| window_class(*hwnd).starts_with("Qt"))
             })
-            .map(|(_, title)| title.clone())
+            .map(|(_, _, title)| title.clone())
             .with_context(|| format!("No Studio window found for process {pid}"))
     }
 
@@ -707,18 +702,7 @@ mod platform {
     }
 
     pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
-        let mut state = EnumTopState {
-            pids: vec![pid],
-            windows: Vec::new(),
-        };
-        unsafe {
-            EnumWindows(
-                Some(enum_top_proc),
-                &mut state as *mut EnumTopState as LPARAM,
-            );
-        }
-        let (hwnd, pid, title) = state
-            .windows
+        let (hwnd, pid, title) = windows_for_pid(pid)
             .into_iter()
             .next()
             .with_context(|| format!("No visible window found for Studio process {pid}"))?;
@@ -751,18 +735,7 @@ mod platform {
     where
         F: FnMut(u8, &[u32]) -> Result<()>,
     {
-        let mut state = EnumTopState {
-            pids: vec![pid],
-            windows: Vec::new(),
-        };
-        unsafe {
-            EnumWindows(
-                Some(enum_top_proc),
-                &mut state as *mut EnumTopState as LPARAM,
-            );
-        }
-        let (hwnd, pid, title) = state
-            .windows
+        let (hwnd, pid, title) = windows_for_pid(pid)
             .into_iter()
             .find(|(hwnd, _, title)| {
                 window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
@@ -971,21 +944,21 @@ mod platform {
     type CGEventRef = *mut c_void;
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+
     struct CGPoint {
         x: f64,
         y: f64,
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+
     struct CGSize {
         width: f64,
         height: f64,
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+
     struct CGRect {
         origin: CGPoint,
         size: CGSize,
@@ -1075,7 +1048,6 @@ mod platform {
         fn CFRelease(value: CFTypeRef);
     }
 
-    #[derive(Clone)]
     pub struct WindowHandle {
         pid: i32,
         window_number: u32,
@@ -1409,7 +1381,6 @@ mod platform {
     use super::StudioWindow;
     use anyhow::{Result, bail};
 
-    #[derive(Clone)]
     pub struct WindowHandle;
 
     pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {

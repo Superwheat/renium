@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Map;
 
 use super::editor_diff::{editor_instance_descriptor_from_path, editor_sibling_group_counts};
 use super::editor_paths::{editor_run_context_value, run_context_name};
@@ -77,14 +76,12 @@ pub(super) fn ensure_editor_source_target_in_bytecode(
     let root_index = if let Some(index) = editor_service_root_index(document, &spec.service) {
         index
     } else {
-        document.instances.push(SettingsBytecodeInstance {
-            settings_id: "editor:0".to_string(),
-            name: spec.service.clone(),
-            class_name: spec.service.clone(),
-            parent_index: None,
-            properties: Map::new(),
-            attributes: Map::new(),
-        });
+        document.instances.push(SettingsBytecodeInstance::new(
+            "editor:0".to_string(),
+            spec.service.clone(),
+            spec.service.clone(),
+            None,
+        ));
         changed = true;
         document.instances.len() - 1
     };
@@ -110,14 +107,12 @@ pub(super) fn ensure_editor_source_target_in_bytecode(
             editor_container_class_for_component(&spec.service, &path_segments, component);
         let added = instance_api::add_instance(
             document,
-            AddInstanceSpec {
-                settings_id: None,
-                name: component.clone(),
-                class_name: component_class.to_string(),
-                parent_index: Some(current_index),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(
+                None,
+                component.clone(),
+                component_class.to_string(),
+                Some(current_index),
+            ),
         )?;
         current_index = added.index;
         path_segments.push(component.clone());
@@ -137,7 +132,9 @@ pub(super) fn ensure_editor_source_target_in_bytecode(
         editor_child_by_stem(document, current_index, &spec.instance_stem)
     {
         if document.instances[child_index].class_name != spec.class_name {
-            document.instances[child_index].class_name = spec.class_name.clone();
+            document.instances[child_index]
+                .class_name
+                .clone_from(&spec.class_name);
             changed = true;
             target_class_replaced = true;
         }
@@ -145,14 +142,12 @@ pub(super) fn ensure_editor_source_target_in_bytecode(
     } else {
         let added = instance_api::add_instance(
             document,
-            AddInstanceSpec {
-                settings_id: None,
-                name: spec.instance_name.clone(),
-                class_name: spec.class_name.clone(),
-                parent_index: Some(current_index),
-                properties: Map::new(),
-                attributes: Map::new(),
-            },
+            AddInstanceSpec::new(
+                None,
+                spec.instance_name.clone(),
+                spec.class_name.clone(),
+                Some(current_index),
+            ),
         )?;
         changed = true;
         added.index
@@ -299,7 +294,7 @@ fn editor_child_name_ordinal(
         if instance.parent_index == Some(parent_index) && instance.name == child.name {
             ordinal += 1;
             if index == child_index {
-                return ordinal.max(1);
+                return ordinal;
             }
         }
     }

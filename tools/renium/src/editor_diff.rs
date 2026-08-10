@@ -197,12 +197,7 @@ fn editor_instance_descriptor(
     sibling_counts: &EditorSiblingGroupCounts<'_>,
 ) -> Option<EditorInstanceDescriptor> {
     let path_info = paths_by_index.get(index)?.clone()?;
-    if path_info.path_segments.len() <= 1
-        || path_info
-            .path_segments
-            .first()
-            .is_none_or(|segment| segment != service)
-    {
+    if !path_info.is_descendant_of(service) {
         return None;
     }
     editor_instance_descriptor_from_path(
@@ -319,15 +314,10 @@ pub(super) fn append_editor_target_inline_source_changes(
         if source == "__SOURCE_EXTERNAL__" {
             continue;
         }
-        let Some(path_info) = paths_by_index.get(index).and_then(|path| path.clone()) else {
+        let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
             continue;
         };
-        if path_info.path_segments.len() <= 1
-            || path_info
-                .path_segments
-                .first()
-                .is_none_or(|segment| segment != service)
-        {
+        if !path_info.is_descendant_of(service) {
             continue;
         }
         changes.source_changes.push(EditorSourceChange {
@@ -351,16 +341,12 @@ pub(super) fn append_editor_property_changes(
     database: &ReflectionDatabase<'_>,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
-    let settings_ids_by_index = document
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.as_str())
-        .collect::<Vec<_>>();
+    let settings_ids_by_index = editor_settings_ids(document);
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
             continue;
         }
-        let Some(path_info) = paths_by_index.get(index).and_then(|path| path.clone()) else {
+        let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
             continue;
         };
         let path_segments = path_info.path_segments.clone();
@@ -400,38 +386,19 @@ pub(super) fn append_editor_property_changes(
             );
         }
 
-        let mut attributes = Map::new();
-        if !filter.is_active() {
-            for (name, value) in &instance.attributes {
-                attributes.insert(
-                    name.clone(),
-                    normalize_editor_bridge_value(
-                        value,
-                        None,
-                        &paths_by_index,
-                        &settings_ids_by_index,
-                    ),
-                );
-            }
-        }
+        let attributes = if filter.is_active() {
+            Map::new()
+        } else {
+            normalized_editor_attributes(instance, &paths_by_index, &settings_ids_by_index)
+        };
 
-        if properties.is_empty() && attributes.is_empty() {
-            continue;
-        }
-
-        changes.property_changes.push(EditorPropertyChange {
-            service: service.to_string(),
-            settings_id: Some(instance.settings_id.clone()),
-            path_segments,
-            path_ordinals: path_info.path_ordinals,
-            class_name: instance.class_name.clone(),
-            properties,
-            attributes,
-            deleted_attributes: Vec::new(),
-        });
+        append_editor_property_change(
+            changes, service, instance, path_info, properties, attributes,
+        );
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct NativeEditorPropertyRules<'a, 'db> {
     pub property_schema_by_class: &'a PropertySchemaMap,
     pub post_apply_properties_by_class: &'a HashMap<String, HashSet<String>>,
@@ -447,11 +414,7 @@ pub(super) fn append_native_editor_full_property_changes(
     rules: NativeEditorPropertyRules<'_, '_>,
 ) {
     let root_index = editor_service_root_index(document, service);
-    let settings_ids_by_index = document
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.as_str())
-        .collect::<Vec<_>>();
+    let settings_ids_by_index = editor_settings_ids(document);
     for (index, instance) in document.instances.iter().enumerate() {
         let direct_service_child = instance.parent_index == root_index;
         if service == "Workspace"
@@ -476,7 +439,7 @@ pub(super) fn append_native_editor_full_property_changes(
         {
             continue;
         }
-        let Some(path_info) = paths_by_index.get(index).and_then(|path| path.clone()) else {
+        let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
             continue;
         };
         let path_segments = path_info.path_segments.clone();
@@ -525,36 +488,60 @@ pub(super) fn append_native_editor_full_property_changes(
         }
 
         let attributes = if send_all {
-            instance
-                .attributes
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        normalize_editor_bridge_value(
-                            value,
-                            None,
-                            paths_by_index,
-                            &settings_ids_by_index,
-                        ),
-                    )
-                })
-                .collect()
+            normalized_editor_attributes(instance, paths_by_index, &settings_ids_by_index)
         } else {
             Map::new()
         };
-        if properties.is_empty() && attributes.is_empty() {
-            continue;
-        }
-        changes.property_changes.push(EditorPropertyChange {
-            service: service.to_string(),
-            settings_id: Some(instance.settings_id.clone()),
-            path_segments,
-            path_ordinals: path_info.path_ordinals,
-            class_name: instance.class_name.clone(),
-            properties,
-            attributes,
-            deleted_attributes: Vec::new(),
-        });
+        append_editor_property_change(
+            changes, service, instance, path_info, properties, attributes,
+        );
     }
+}
+
+fn editor_settings_ids(document: &SettingsBytecode) -> Vec<&str> {
+    document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect()
+}
+
+fn normalized_editor_attributes(
+    instance: &SettingsBytecodeInstance,
+    paths_by_index: &[Option<EditorInstancePath>],
+    settings_ids_by_index: &[&str],
+) -> Map<String, Value> {
+    instance
+        .attributes
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                normalize_editor_bridge_value(value, None, paths_by_index, settings_ids_by_index),
+            )
+        })
+        .collect()
+}
+
+fn append_editor_property_change(
+    changes: &mut EditorChangeSet,
+    service: &str,
+    instance: &SettingsBytecodeInstance,
+    path: EditorInstancePath,
+    properties: Map<String, Value>,
+    attributes: Map<String, Value>,
+) {
+    if properties.is_empty() && attributes.is_empty() {
+        return;
+    }
+    changes.property_changes.push(EditorPropertyChange {
+        service: service.to_string(),
+        settings_id: Some(instance.settings_id.clone()),
+        path_segments: path.path_segments,
+        path_ordinals: path.path_ordinals,
+        class_name: instance.class_name.clone(),
+        properties,
+        attributes,
+        deleted_attributes: Vec::new(),
+    });
 }

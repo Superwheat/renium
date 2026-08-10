@@ -506,12 +506,12 @@ fn resolve_tsconfig_specifier(
 
 fn roblox_ts_config_graph(root: &Path) -> Result<RobloxTsConfigGraph> {
     fn visit(
-        path: PathBuf,
+        path: &Path,
         graph: &mut RobloxTsConfigGraph,
         visiting: &mut BTreeSet<PathBuf>,
         outputs: &mut BTreeMap<PathBuf, Option<PathBuf>>,
     ) -> Result<Option<PathBuf>> {
-        let path = absolute_path(&path);
+        let path = absolute_path(path);
         if let Some(output) = outputs.get(&path) {
             return Ok(output.clone());
         }
@@ -531,7 +531,7 @@ fn roblox_ts_config_graph(root: &Path) -> Result<RobloxTsConfigGraph> {
         };
         for specifier in extends {
             let dependency = resolve_tsconfig_specifier(&path, specifier, &mut graph.files)?;
-            if let Some(inherited) = visit(dependency, graph, visiting, outputs)? {
+            if let Some(inherited) = visit(&dependency, graph, visiting, outputs)? {
                 output = Some(inherited);
             }
         }
@@ -564,7 +564,7 @@ fn roblox_ts_config_graph(root: &Path) -> Result<RobloxTsConfigGraph> {
                         path.display()
                     )
                 })?;
-                if let Some(reference_output) = visit(dependency, graph, visiting, outputs)? {
+                if let Some(reference_output) = visit(&dependency, graph, visiting, outputs)? {
                     graph.output_roots.insert(reference_output);
                 }
             }
@@ -584,7 +584,7 @@ fn roblox_ts_config_graph(root: &Path) -> Result<RobloxTsConfigGraph> {
     let root_config = root.join("tsconfig.json");
     if root_config.is_file() {
         visit(
-            root_config,
+            &root_config,
             &mut graph,
             &mut BTreeSet::new(),
             &mut BTreeMap::new(),
@@ -673,6 +673,15 @@ struct ProjectWatchInputs {
     ignored: BTreeSet<PathBuf>,
 }
 
+fn record_watch_input(inputs: &mut ProjectWatchInputs, nested: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() || (!path.exists() && path.extension().is_none()) {
+        inputs.directories.insert(path);
+    } else {
+        inputs.files.insert(path.clone());
+        nested.push(path);
+    }
+}
+
 fn project_watch_inputs(loaded: &LoadedProject) -> Result<ProjectWatchInputs> {
     let mut inputs = ProjectWatchInputs::default();
     let mut visited = BTreeSet::new();
@@ -696,23 +705,15 @@ fn project_watch_inputs_into(
     let mut nested = Vec::new();
     for (_, node) in project_config::project_tree_nodes(&loaded.project.tree) {
         if let Some(path) = node.path {
-            let path = absolute_path(&loaded.root.join(path));
-            if path.is_dir() || (!path.exists() && path.extension().is_none()) {
-                inputs.directories.insert(path);
-            } else {
-                inputs.files.insert(path.clone());
-                nested.push(path);
-            }
+            record_watch_input(inputs, &mut nested, absolute_path(&loaded.root.join(path)));
         }
     }
     for mount in &loaded.project.mounts {
-        let path = absolute_path(&loaded.root.join(&mount.source));
-        if path.is_dir() || (!path.exists() && path.extension().is_none()) {
-            inputs.directories.insert(path);
-        } else {
-            inputs.files.insert(path.clone());
-            nested.push(path);
-        }
+        record_watch_input(
+            inputs,
+            &mut nested,
+            absolute_path(&loaded.root.join(&mount.source)),
+        );
     }
     for adapter in &loaded.project.adapters {
         let source = absolute_path(&loaded.root.join(&adapter.source));
@@ -1137,8 +1138,7 @@ pub(super) fn watch_build(
                     }
                     Err(error) => {
                         typescript.desired = true;
-                        typescript.restart_failures =
-                            typescript.restart_failures.saturating_add(1).max(1);
+                        typescript.restart_failures = typescript.restart_failures.saturating_add(1);
                         typescript.retry_at =
                             Instant::now() + roblox_ts_retry_delay(typescript.restart_failures);
                         crate::log_global(

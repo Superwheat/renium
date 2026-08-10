@@ -81,11 +81,8 @@ import {
 } from "./fileExplorer";
 import { GitController } from "./gitController";
 import { renderCommandArgs } from "./gitSync";
-import type { GitViewActions } from "./gitView";
 import {
   PackageSyncController,
-  type CliLinkApplyResult,
-  type CliLinkStatusResult,
   type PendingPackageSource,
 } from "./packageSyncController";
 import {
@@ -100,6 +97,7 @@ import {
   normalizeReportedServices,
   normalizeServices,
   pickWorkspaceRoot,
+  recordValue,
   resolveConfigPath,
   robloxPlaceFormatFromPath,
   safeFileComponent,
@@ -118,9 +116,7 @@ import {
   packageScriptUriInfo,
   type CliLinkStatusLink,
   type LinkedPackageScriptPreviewRequest,
-  type LinkFileInfo,
   type OpenPackageScriptTab,
-  type PackagePreviewData,
   type PackageTreeElement,
 } from "./packagesView";
 import {
@@ -347,8 +343,8 @@ class RobloxSyncController {
   private conflictMarkerWarnedKeys = new Set<string>();
   private readonly automationClient: AutomationClient;
   private readonly configResolver: SyncConfigResolver;
-  private readonly gitController: GitController<SyncConfig>;
-  private readonly packageSyncController: PackageSyncController<SyncConfig>;
+  public readonly git: GitController<SyncConfig>;
+  public readonly packages: PackageSyncController<SyncConfig>;
   private publishedPlaceNames = new Map<number, string>();
   private publishedRootPlaceIds = new Map<number, number>();
   private bridgeServeRequested = false;
@@ -395,7 +391,7 @@ class RobloxSyncController {
       output,
       () => this.configuredProjectRoot ?? this.context.extensionPath,
     );
-    this.gitController = new GitController<SyncConfig>({
+    this.git = new GitController<SyncConfig>({
       context: this.context,
       output: this.output,
       getConfig: () => this.getConfig(),
@@ -421,7 +417,7 @@ class RobloxSyncController {
         });
       },
     });
-    this.packageSyncController = new PackageSyncController<SyncConfig>({
+    this.packages = new PackageSyncController<SyncConfig>({
       output: this.output,
       getConfig: () => this.getConfig(),
       tryGetConfig: () => this.tryGetConfig(),
@@ -728,7 +724,7 @@ class RobloxSyncController {
       pendingEditorServicesByPath: [...this.pendingEditorServicesByPath]
         .map(([filePath, services]) => [filePath, [...services]]),
       studioSnapshotFingerprintByService: [...this.studioSnapshotFingerprintByService],
-      pendingLinkPackageSourcePaths: this.packageSyncController.pendingSourceEntries(),
+      pendingLinkPackageSourcePaths: this.packages.pendingSourceEntries(),
     };
   }
 
@@ -740,7 +736,7 @@ class RobloxSyncController {
       snapshot.pendingEditorServicesByPath.map(([filePath, services]) => [filePath, new Set(services)]),
     );
     this.studioSnapshotFingerprintByService = new Map(snapshot.studioSnapshotFingerprintByService);
-    this.packageSyncController.restorePendingSources(
+    this.packages.restorePendingSources(
       snapshot.pendingLinkPackageSourcePaths,
       snapshot.projectRoot,
       this.experienceGeneration,
@@ -749,7 +745,7 @@ class RobloxSyncController {
     this.sourcemapCache = undefined;
     this.studioRuntimeSettings = undefined;
     this.studioConflictPolicyOverride = undefined;
-    this.packageSyncController.resetStatusCache();
+    this.packages.resetStatusCache();
   }
 
   private resetProjectScopedCaches(): void {
@@ -760,7 +756,7 @@ class RobloxSyncController {
     this.conflictMarkerWarnedKeys.clear();
     this.recentDirectSaveAtByPath.clear();
     this.editorPushFailureStreak = 0;
-    this.packageSyncController.resetStatusCache();
+    this.packages.resetStatusCache();
   }
 
   private async rollbackExperienceChange(
@@ -776,7 +772,7 @@ class RobloxSyncController {
     } finally {
       this.experienceChangeInProgress = false;
     }
-    this.packageSyncController.notifyLinksChanged();
+    this.packages.notifyLinksChanged();
     this.updateStatusBar();
     if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
       await this.serve({ silent: true, bestEffort: true });
@@ -785,7 +781,7 @@ class RobloxSyncController {
       await this.startLiveSync({ silent: true, bestEffort: true });
     }
     if (snapshot.projectRoot) {
-      this.packageSyncController.resumePendingSources(
+      this.packages.resumePendingSources(
         snapshot.projectRoot,
         this.experienceGeneration,
       );
@@ -823,7 +819,7 @@ class RobloxSyncController {
         clearTimeout(this.autoSyncTimer);
         this.autoSyncTimer = undefined;
       }
-      this.packageSyncController.pausePendingSources();
+      this.packages.pausePendingSources();
       this.pendingAutoServices.clear();
       await this.stopConsoleFollow();
       if (previousProjectRoot) {
@@ -849,14 +845,14 @@ class RobloxSyncController {
     await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
     await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
     this.ensureAgentInstructions(experienceRoot);
-    this.packageSyncController.notifyLinksChanged();
+    this.packages.notifyLinksChanged();
     this.updateStatusBar();
     if (this.bridgeServeRequested && !this.isBridgeDaemonRunning()) {
       await this.serve({ silent: true, bestEffort: true });
     }
     await this.persistActiveExperiencePlace(experienceRoot, alias);
     this.experienceChangeInProgress = false;
-    this.packageSyncController.resumePendingSources(
+    this.packages.resumePendingSources(
       active.projectRoot,
       this.experienceGeneration,
     );
@@ -924,20 +920,12 @@ class RobloxSyncController {
     return rank[level] <= rank[minimum];
   }
 
-  public gitViewActions(): GitViewActions {
-    return this.gitController.actions();
-  }
-
-  public get onLinksChanged(): vscode.Event<void> {
-    return this.packageSyncController.onLinksChanged;
-  }
-
   public dispose(): void {
     if (this.autoSyncTimer) {
       clearTimeout(this.autoSyncTimer);
       this.autoSyncTimer = undefined;
     }
-    this.packageSyncController.dispose();
+    this.packages.dispose();
     this.disposeLiveSyncRuntime();
     this.stopStudioActionPolling();
     void this.stopConsoleFollow({ releaseServe: false });
@@ -1082,19 +1070,19 @@ class RobloxSyncController {
         await this.stopLiveSync();
         return;
       case "gitSync":
-        await this.openGitSync();
+        await this.git.openGitSync();
         return;
       case "projectTools":
         await this.openProjectTools();
         return;
       case "wallyPackages":
-        await this.syncWallyPackages();
+        await this.packages.syncWallyPackages();
         return;
       case "linkApply":
-        await this.linkApply();
+        await this.packages.linkApply();
         return;
       case "linkAdd":
-        await this.addLinkInteractive();
+        await this.packages.addLinkInteractive();
         return;
       case "serve":
         await this.serve();
@@ -1132,10 +1120,10 @@ class RobloxSyncController {
     const payload = result.result as { studios?: unknown } | undefined;
     const clients = (Array.isArray(payload?.studios) ? payload.studios : [])
       .map((value): ConnectedStudioPlace | undefined => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) {
+        const client = recordValue(value) as BridgeClientInfo | undefined;
+        if (!client) {
           return undefined;
         }
-        const client = value as BridgeClientInfo;
         const placeId = Number(client.placeId);
         const gameId = Number(client.gameId);
         const placeName = typeof client.placeName === "string" ? client.placeName.trim() : "";
@@ -1229,10 +1217,10 @@ class RobloxSyncController {
       `https://economy.roblox.com/v2/assets/${placeId}/details`,
       `Place name lookup for ${placeId}`,
     );
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    const details = recordValue(raw);
+    if (!details) {
       return undefined;
     }
-    const details = raw as { AssetId?: unknown; AssetTypeId?: unknown; Name?: unknown };
     if (
       Number(details.AssetId) !== placeId ||
       Number(details.AssetTypeId) !== 9 ||
@@ -1260,22 +1248,15 @@ class RobloxSyncController {
       `https://games.roblox.com/v1/games?universeIds=${gameId}`,
       `Starting place lookup for ${gameId}`,
     );
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return undefined;
-    }
-    const data = (raw as { data?: unknown }).data;
+    const data = recordValue(raw)?.data;
     if (!Array.isArray(data)) {
       return undefined;
     }
-    const gameDetails = data.find((value) =>
-      !!value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      Number((value as { id?: unknown }).id) === gameId);
+    const gameDetails = data.map(recordValue).find((value) => Number(value?.id) === gameId);
     if (!gameDetails) {
       return undefined;
     }
-    const rootPlaceId = Number((gameDetails as { rootPlaceId?: unknown }).rootPlaceId);
+    const rootPlaceId = Number(gameDetails.rootPlaceId);
     if (!Number.isSafeInteger(rootPlaceId) || rootPlaceId <= 0) {
       return undefined;
     }
@@ -2055,7 +2036,7 @@ class RobloxSyncController {
     this.bridgeServeRequested = true;
     this.consoleFollowOwnsServe = startedServe;
     try {
-      await this.ensureBridgeDaemon(command, cfg, { serve: true });
+      await this.automationClient.ensure(command, cfg);
     } catch (error) {
       if (startedServe) {
         this.bridgeServeRequested = false;
@@ -2107,37 +2088,35 @@ class RobloxSyncController {
       if (result.code !== 0) {
         throw new Error(`Console request exited with code ${result.code}`);
       }
-      const value = result.result && typeof result.result === "object" && !Array.isArray(result.result)
-        ? result.result as Record<string, unknown>
-        : parseCliJsonObject<Record<string, unknown>>(result.output);
-      if (value) {
-        const epoch = typeof value.epoch === "string" ? value.epoch : undefined;
-        if (this.consoleFollowEpoch && epoch !== this.consoleFollowEpoch) {
-          this.consoleFollowSeq = 0;
-          this.consoleFollowFromOldest = true;
-          this.consoleOutput.appendLine("[Studio console restarted]");
-          drainImmediately = true;
-        } else {
-          const entries = Array.isArray(value.entries) ? value.entries : [];
-          for (const entry of entries) {
-            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-              continue;
-            }
-            const row = entry as Record<string, unknown>;
+      const value = recordValue(result.result);
+      if (!value) {
+        throw new Error("Console request returned an invalid result.");
+      }
+      const epoch = typeof value.epoch === "string" ? value.epoch : undefined;
+      if (this.consoleFollowEpoch && epoch !== this.consoleFollowEpoch) {
+        this.consoleFollowSeq = 0;
+        this.consoleFollowFromOldest = true;
+        this.consoleOutput.appendLine("[Studio console restarted]");
+        drainImmediately = true;
+      } else {
+        const entries = Array.isArray(value.entries) ? value.entries : [];
+        for (const entry of entries) {
+          const row = recordValue(entry);
+          if (row) {
             this.consoleOutput.appendLine(`[${String(row.type ?? row.level ?? "output")}] ${String(row.message ?? "")}`);
           }
-          const nextSeq = Number(value.nextSeq);
-          if (Number.isFinite(nextSeq) && nextSeq >= 0) {
-            this.consoleFollowSeq = Math.floor(nextSeq);
-          }
-          this.consoleFollowFromOldest = false;
-          drainImmediately = value.hasMore === true;
-          if (value.truncated === true) {
-            this.consoleOutput.appendLine("[Studio console output was truncated before Renium could read it]");
-          }
         }
-        this.consoleFollowEpoch = epoch;
+        const nextSeq = Number(value.nextSeq);
+        if (Number.isFinite(nextSeq) && nextSeq >= 0) {
+          this.consoleFollowSeq = Math.floor(nextSeq);
+        }
+        this.consoleFollowFromOldest = false;
+        drainImmediately = value.hasMore === true;
+        if (value.truncated === true) {
+          this.consoleOutput.appendLine("[Studio console output was truncated before Renium could read it]");
+        }
       }
+      this.consoleFollowEpoch = epoch;
     } catch (error) {
       if (this.consoleFollowRunning && generation === this.consoleFollowGeneration) {
         this.consoleOutput.appendLine(`[Renium console error] ${error instanceof Error ? error.message : String(error)}`);
@@ -2312,188 +2291,13 @@ class RobloxSyncController {
     });
   }
 
-  public syncWallyPackages(): Promise<void> {
-    return this.packageSyncController.syncWallyPackages();
-  }
-
-  public linkApply(options: {
-    silent?: boolean;
-    refreshExplorer?: boolean;
-    forceStudio?: boolean;
-    forceTargets?: boolean;
-    forceTargetPaths?: string[][];
-    taskName?: string;
-    linkId?: string;
-    skipStudio?: boolean;
-    expectedProjectRoot?: string;
-    expectedGeneration?: number;
-  } = {}): Promise<CliLinkApplyResult | undefined> {
-    return this.packageSyncController.linkApply(options);
-  }
-
-  public breakLink(
-    service: string,
-    pathSegments: string[],
-    options: { silent?: boolean; refreshExplorer?: boolean } = {},
-  ): Promise<void> {
-    return this.packageSyncController.breakLink(service, pathSegments, options);
-  }
-
-  public addLinkInteractive(seed?: { service?: string; pathSegments?: string[] }): Promise<void> {
-    return this.packageSyncController.addLinkInteractive(seed);
-  }
-
-  public invalidateLinkStatusCache(): void {
-    this.packageSyncController.invalidateLinkStatusCache();
-  }
-
-  public pushLinkStateToExplorer(): Promise<void> {
-    return this.packageSyncController.pushLinkStateToExplorer();
-  }
-
-  public normalizeLinkPathKey(filePath: string): string {
-    return this.packageSyncController.normalizeLinkPathKey(filePath);
-  }
-
-  public onLinkPackageSourceChanged(uri: vscode.Uri): void {
-    this.packageSyncController.onLinkPackageSourceChanged(uri);
-  }
-
-  public refreshLinkPackageSourceWatchers(): Promise<void> {
-    return this.packageSyncController.refreshLinkPackageSourceWatchers();
-  }
-
-  public scheduleStartupLinkRefresh(): void {
-    this.packageSyncController.scheduleStartupLinkRefresh();
-  }
-
-  public getLinkFileIndex(force = false): Promise<Map<string, LinkFileInfo>> {
-    return this.packageSyncController.getLinkFileIndex(force);
-  }
-
-  public addLinkFromFile(uri: vscode.Uri | undefined): Promise<void> {
-    return this.packageSyncController.addLinkFromFile(uri);
-  }
-
-  public packInstanceLink(request: {
-    service?: string;
-    pathSegments?: string[];
-    id?: string;
-    resave?: boolean;
-  }): Promise<void> {
-    return this.packageSyncController.packInstanceLink(request);
-  }
-
-  public resavePackageLink(request: {
-    service?: string;
-    pathSegments?: string[];
-  }): Promise<void> {
-    return this.packageSyncController.resavePackageLink(request);
-  }
-
-  public relinkPackageTarget(request: {
-    service?: string;
-    pathSegments?: string[];
-  }): Promise<void> {
-    return this.packageSyncController.relinkPackageTarget(request);
-  }
-
-  public breakInstanceLink(request: {
-    service?: string;
-    pathSegments?: string[];
-    silent?: boolean;
-    refreshExplorer?: boolean;
-  }): Promise<void> {
-    return this.packageSyncController.breakInstanceLink(request);
-  }
-
-  public breakLinkForFile(uri: vscode.Uri | undefined): Promise<void> {
-    return this.packageSyncController.breakLinkForFile(uri);
-  }
-
-  public revealLinkSourceForFile(uri: vscode.Uri | undefined): Promise<void> {
-    return this.packageSyncController.revealLinkSourceForFile(uri);
-  }
-
-  public showLinkStatus(): Promise<void> {
-    return this.packageSyncController.showLinkStatus();
-  }
-
-  public getLinkPackages(force = false): Promise<CliLinkStatusLink[]> {
-    return this.packageSyncController.getLinkPackages(force);
-  }
-
-  public insertPackageAtPath(request: {
-    linkId?: string;
-    service?: string;
-    pathSegments?: string[];
-  }): Promise<void> {
-    return this.packageSyncController.insertPackageAtPath(request);
-  }
-
-  public deletePackage(link: CliLinkStatusLink | string | undefined): Promise<void> {
-    return this.packageSyncController.deletePackage(link);
-  }
-
-  public viewPackageUses(link: CliLinkStatusLink | string | undefined): Promise<void> {
-    return this.packageSyncController.viewPackageUses(link);
-  }
-
-  public loadPackagePreview(link: CliLinkStatusLink): Promise<PackagePreviewData> {
-    return this.packageSyncController.loadPackagePreview(link);
-  }
-
-  public getLinkStatus(force = false): Promise<CliLinkStatusResult | undefined> {
-    return this.packageSyncController.getLinkStatus(force);
-  }
-
-  public openGitSync(): Promise<void> {
-    return this.gitController.openGitSync();
-  }
-
-  public gitStatus(): Promise<void> {
-    return this.gitController.gitStatus();
-  }
-
-  public gitFetch(): Promise<void> {
-    return this.gitController.gitFetch();
-  }
-
-  public gitPull(): Promise<void> {
-    return this.gitController.gitPull();
-  }
-
-  public gitCommitAndPush(options: { pullFromStudioFirst?: boolean } = {}): Promise<void> {
-    return this.gitController.gitCommitAndPush(options);
-  }
-
-  public gitPublishBranch(): Promise<void> {
-    return this.gitController.gitPublishBranch();
-  }
-
-  public gitCreateBranch(): Promise<void> {
-    return this.gitController.gitCreateBranch();
-  }
-
-  public gitCheckoutBranch(): Promise<void> {
-    return this.gitController.gitCheckoutBranch();
-  }
-
-  public gitConnectRepo(): Promise<void> {
-    return this.gitController.gitConnectRepo();
-  }
-
-  public gitOpenRemote(): Promise<void> {
-    return this.gitController.gitOpenRemote();
-  }
-
   public async serve(options: { silent?: boolean; bestEffort?: boolean } = {}): Promise<void> {
     const cfg = this.getConfig();
     this.bridgeServeRequested = true;
     this.liveSyncOwnsServe = false;
     this.consoleFollowOwnsServe = false;
     try {
-      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: true });
+      await this.automationClient.ensure(cfg.cliPath, cfg);
     } catch (err) {
       this.bridgeServeRequested = false;
       this.updateStatusBar();
@@ -2754,7 +2558,7 @@ class RobloxSyncController {
       this.liveSyncOwnsServe = true;
     }
     try {
-      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: true });
+      await this.automationClient.ensure(cfg.cliPath, cfg);
       const result = await this.runAutomationOperation(
         cfg.cliPath,
         cfg,
@@ -2932,10 +2736,6 @@ class RobloxSyncController {
     this.pendingStudioReviewKey = undefined;
     this.forcedStudioReviewKey = undefined;
     return this.waitForStudioImportTasks(stoppedGeneration);
-  }
-
-  public activeLinkManifest(): { filePath: string; autoApply: boolean; projectRoot: string; generation: number } {
-    return this.packageSyncController.activeLinkManifest(this.experienceGeneration);
   }
 
   private trackStudioImport<T>(generation: number | undefined, task: Promise<T>): Promise<T> {
@@ -4578,8 +4378,8 @@ class RobloxSyncController {
         return this.sourcemapCache.root;
       }
 
-      const parsed = JSON.parse(fs.readFileSync(sourcemapPath, "utf8")) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const parsed = recordValue(JSON.parse(fs.readFileSync(sourcemapPath, "utf8")));
+      if (!parsed) {
         return undefined;
       }
       const root = parsed as SourcemapNode;
@@ -4602,9 +4402,7 @@ class RobloxSyncController {
     if (!parent || !Array.isArray(parent.children)) {
       return undefined;
     }
-    const children = parent.children.filter((child): child is SourcemapNode => (
-      !!child && typeof child === "object" && !Array.isArray(child)
-    ));
+    const children = parent.children.filter((child): child is SourcemapNode => !!recordValue(child));
     const matches = children.filter((child) => child.name === segment);
     if (matches.length === 0) {
       return undefined;
@@ -5634,7 +5432,7 @@ class RobloxSyncController {
           await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
           explorerPrepared = false;
           this.ensureAgentInstructions(cfg.experienceRoot);
-          this.packageSyncController.resumePendingSources(
+          this.packages.resumePendingSources(
             cfg.projectRoot,
             this.experienceGeneration,
             1000,
@@ -5659,7 +5457,7 @@ class RobloxSyncController {
             await this.startLiveSync({ silent: true, bestEffort: true });
           }
           if (previousRoot) {
-            this.packageSyncController.resumePendingSources(
+            this.packages.resumePendingSources(
               previousRoot,
               this.experienceGeneration,
             );
@@ -5712,14 +5510,14 @@ class RobloxSyncController {
       }
     }
     if (!event || event.affectsConfiguration("renium.gitSync") || event.affectsConfiguration("renium.projectRoot")) {
-      void this.gitController.refreshView();
+      void this.git.refreshView();
     }
     if (
       !event
       || event.affectsConfiguration("renium.link")
       || event.affectsConfiguration("renium.projectRoot")
     ) {
-      this.invalidateLinkStatusCache();
+      this.packages.invalidateLinkStatusCache();
     }
     this.updateStatusBar();
   }
@@ -5737,7 +5535,7 @@ class RobloxSyncController {
     }
 
     try {
-      await this.ensureBridgeDaemon(cfg.cliPath, cfg, { serve: this.bridgeServeRequested });
+      await this.automationClient.ensure(cfg.cliPath, cfg);
       this.output.appendLine(`[renium] bridge daemon prewarm ready (${reason})`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -5824,7 +5622,6 @@ class RobloxSyncController {
       instanceWorkers: Math.max(0, cfg.instanceWorkers),
       importWorkers: Math.max(0, cfg.importWorkers),
       adaptiveThrottle: cfg.adaptiveThrottle,
-      noUpdateEditorIcons: cfg.noUpdateEditorIcons,
       destructive: options.destructive === true,
     };
     const result = options.destructive === true
@@ -5866,10 +5663,7 @@ class RobloxSyncController {
     parameters: Record<string, unknown>,
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    return this.automationClient.runOperation(command, cfg, label, op, parameters, {
-      ...options,
-      serve: this.bridgeServeRequested,
-    });
+    return this.automationClient.runOperation(command, cfg, label, op, parameters, options);
   }
 
   private runReviewedAutomationOperation(
@@ -5880,22 +5674,11 @@ class RobloxSyncController {
     parameters: Record<string, unknown>,
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
-    return this.automationClient.runReviewedOperation(command, cfg, label, op, parameters, {
-      ...options,
-      serve: this.bridgeServeRequested,
-    });
+    return this.automationClient.runReviewedOperation(command, cfg, label, op, parameters, options);
   }
 
   private isBridgeDaemonRunning(): boolean {
     return this.automationClient.isRunning();
-  }
-
-  private ensureBridgeDaemon(
-    command: string,
-    cfg: SyncConfig,
-    options: { serve?: boolean } = {},
-  ): Promise<void> {
-    return this.automationClient.ensure(command, cfg, options);
   }
 
   private stopBridgeDaemon(reason?: Error): Promise<void> {
@@ -6354,11 +6137,10 @@ class RobloxSyncController {
     const stored = this.context.workspaceState.get<unknown>(
       this.pendingEditorPathsStorageKey(resolvedRoot),
     );
+    const storedRecord = recordValue(stored);
     const paths = Array.isArray(stored)
       ? stored
-      : stored && typeof stored === "object" && !Array.isArray(stored)
-        ? (stored as { paths?: unknown }).paths
-        : undefined;
+      : storedRecord?.paths;
     if (!Array.isArray(paths)) {
       return;
     }
@@ -6367,10 +6149,8 @@ class RobloxSyncController {
         this.pendingEditorPaths.add(value);
       }
     }
-    const pathServices = stored && typeof stored === "object" && !Array.isArray(stored)
-      ? (stored as { pathServices?: unknown }).pathServices
-      : undefined;
-    if (pathServices && typeof pathServices === "object" && !Array.isArray(pathServices)) {
+    const pathServices = recordValue(storedRecord?.pathServices);
+    if (pathServices) {
       for (const [filePath, rawServices] of Object.entries(pathServices)) {
         if (!Array.isArray(rawServices)) {
           continue;
@@ -6386,9 +6166,7 @@ class RobloxSyncController {
         }
       }
     }
-    const blockedServices = stored && typeof stored === "object" && !Array.isArray(stored)
-      ? (stored as { blockedServices?: unknown }).blockedServices
-      : undefined;
+    const blockedServices = storedRecord?.blockedServices;
     const cfg = this.tryGetConfig();
     for (const filePath of this.pendingEditorPaths) {
       const key = filesystemPathKey(filePath);
@@ -6463,7 +6241,7 @@ class RobloxSyncController {
     }
     this.recomputeBlockedStudioImportServices(cfg);
     void this.persistPendingEditorPaths(projectRoot);
-    this.invalidateLinkStatusCache();
+    this.packages.invalidateLinkStatusCache();
     if (this.liveSyncWatcher && !this.liveSyncGraphRefreshRunning) {
       this.scheduleLiveSyncGraphRefresh(projectRoot);
     }
@@ -6499,18 +6277,12 @@ class RobloxSyncController {
       .filter((service) => service.length > 0);
     const update = async (): Promise<void> => {
       const stored = this.context.workspaceState.get<unknown>(key);
-      const storedRecord = stored && typeof stored === "object" && !Array.isArray(stored)
-        ? stored as { paths?: unknown; blockedServices?: unknown; pathServices?: unknown }
-        : {};
+      const storedRecord = recordValue(stored) ?? {};
       const storedPaths = Array.isArray(storedRecord.paths)
         ? storedRecord.paths.filter((value): value is string => typeof value === "string" && value.length > 0)
         : [];
       const mergedPaths = Array.from(new Set([...storedPaths, ...uniquePaths]));
-      const pathServices = storedRecord.pathServices
-        && typeof storedRecord.pathServices === "object"
-        && !Array.isArray(storedRecord.pathServices)
-        ? { ...storedRecord.pathServices as Record<string, unknown> }
-        : {};
+      const pathServices = { ...recordValue(storedRecord.pathServices) };
       for (const filePath of uniquePaths) {
         const existing = Array.isArray(pathServices[filePath])
           ? (pathServices[filePath] as unknown[])
@@ -6642,16 +6414,16 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
   })().catch(() => undefined);
-  const fileExplorerController = new FileExplorerController(context, controller.gitViewActions());
+  const fileExplorerController = new FileExplorerController(context, controller.git.actions());
   activeFileExplorerController = fileExplorerController;
-  const linkDecorationProvider = new LinkDecorationProvider(controller);
+  const linkDecorationProvider = new LinkDecorationProvider(controller.packages);
   let packagesProvider: PackagesTreeProvider;
   const packageScriptProvider = new PackageScriptContentProvider((linkId, nodeKey) =>
     packagesProvider.packageScriptSourceFor(linkId, nodeKey),
   );
   const packageScriptDecorationProvider = new PackageScriptDecorationProvider();
   packagesProvider = new PackagesTreeProvider(
-    controller,
+    controller.packages,
     context.extensionUri,
     packageScriptProvider,
     (link) => fileExplorerController.setExternalPackageDrag(link),
@@ -6762,39 +6534,39 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("renium.addCurrentPlace", () => controller.addCurrentPlace()),
     vscode.commands.registerCommand("renium.switchPlace", () => controller.switchPlace()),
     vscode.commands.registerCommand("renium.renamePlace", () => controller.renamePlace()),
-    vscode.commands.registerCommand("renium.gitSync", () => controller.openGitSync()),
-    vscode.commands.registerCommand("renium.gitSync.status", () => controller.gitStatus()),
-    vscode.commands.registerCommand("renium.gitSync.fetch", () => controller.gitFetch()),
-    vscode.commands.registerCommand("renium.gitSync.pull", () => controller.gitPull()),
-    vscode.commands.registerCommand("renium.gitSync.commitAndPush", () => controller.gitCommitAndPush()),
-    vscode.commands.registerCommand("renium.gitSync.pullFromStudioAndPush", () => controller.gitCommitAndPush({ pullFromStudioFirst: true })),
-    vscode.commands.registerCommand("renium.gitSync.connectRepo", () => controller.gitConnectRepo()),
-    vscode.commands.registerCommand("renium.gitSync.publishBranch", () => controller.gitPublishBranch()),
-    vscode.commands.registerCommand("renium.gitSync.createBranch", () => controller.gitCreateBranch()),
-    vscode.commands.registerCommand("renium.gitSync.checkoutBranch", () => controller.gitCheckoutBranch()),
-    vscode.commands.registerCommand("renium.gitSync.openRemote", () => controller.gitOpenRemote()),
+    vscode.commands.registerCommand("renium.gitSync", () => controller.git.openGitSync()),
+    vscode.commands.registerCommand("renium.gitSync.status", () => controller.git.gitStatus()),
+    vscode.commands.registerCommand("renium.gitSync.fetch", () => controller.git.gitFetch()),
+    vscode.commands.registerCommand("renium.gitSync.pull", () => controller.git.gitPull()),
+    vscode.commands.registerCommand("renium.gitSync.commitAndPush", () => controller.git.gitCommitAndPush()),
+    vscode.commands.registerCommand("renium.gitSync.pullFromStudioAndPush", () => controller.git.gitCommitAndPush({ pullFromStudioFirst: true })),
+    vscode.commands.registerCommand("renium.gitSync.connectRepo", () => controller.git.gitConnectRepo()),
+    vscode.commands.registerCommand("renium.gitSync.publishBranch", () => controller.git.gitPublishBranch()),
+    vscode.commands.registerCommand("renium.gitSync.createBranch", () => controller.git.gitCreateBranch()),
+    vscode.commands.registerCommand("renium.gitSync.checkoutBranch", () => controller.git.gitCheckoutBranch()),
+    vscode.commands.registerCommand("renium.gitSync.openRemote", () => controller.git.gitOpenRemote()),
     vscode.commands.registerCommand("renium.pullFromStudio", () => controller.pullFromStudio()),
     vscode.commands.registerCommand("renium.pushToStudio", () => controller.pushToStudio()),
     vscode.commands.registerCommand("renium.exportSnapshots", () => controller.exportSnapshotsOnly()),
     vscode.commands.registerCommand("renium.exportGameFile", () => controller.exportGameFile()),
-    vscode.commands.registerCommand("renium.syncWallyPackages", () => controller.syncWallyPackages()),
-    vscode.commands.registerCommand("renium.link.apply", () => controller.linkApply()),
-    vscode.commands.registerCommand("renium.link.add", () => controller.addLinkInteractive()),
-    vscode.commands.registerCommand("renium.link.status", () => controller.showLinkStatus()),
-    vscode.commands.registerCommand("renium.link.break", (uri?: vscode.Uri) => controller.breakLinkForFile(uri)),
-    vscode.commands.registerCommand("renium.link.revealSource", (uri?: vscode.Uri) => controller.revealLinkSourceForFile(uri)),
-    vscode.commands.registerCommand("renium.link.addFromFile", (uri?: vscode.Uri) => controller.addLinkFromFile(uri)),
+    vscode.commands.registerCommand("renium.syncWallyPackages", () => controller.packages.syncWallyPackages()),
+    vscode.commands.registerCommand("renium.link.apply", () => controller.packages.linkApply()),
+    vscode.commands.registerCommand("renium.link.add", () => controller.packages.addLinkInteractive()),
+    vscode.commands.registerCommand("renium.link.status", () => controller.packages.showLinkStatus()),
+    vscode.commands.registerCommand("renium.link.break", (uri?: vscode.Uri) => controller.packages.breakLinkForFile(uri)),
+    vscode.commands.registerCommand("renium.link.revealSource", (uri?: vscode.Uri) => controller.packages.revealLinkSourceForFile(uri)),
+    vscode.commands.registerCommand("renium.link.addFromFile", (uri?: vscode.Uri) => controller.packages.addLinkFromFile(uri)),
     vscode.commands.registerCommand("renium.link.packInstance", (request: { service?: string; pathSegments?: string[]; id?: string; resave?: boolean }) =>
-      controller.packInstanceLink(request),
+      controller.packages.packInstanceLink(request),
     ),
     vscode.commands.registerCommand("renium.link.resavePackage", (request: { service?: string; pathSegments?: string[] }) =>
-      controller.resavePackageLink(request),
+      controller.packages.resavePackageLink(request),
     ),
     vscode.commands.registerCommand("renium.link.relinkPackage", (request: { service?: string; pathSegments?: string[] }) =>
-      controller.relinkPackageTarget(request),
+      controller.packages.relinkPackageTarget(request),
     ),
     vscode.commands.registerCommand("renium.link.breakInstance", (request: { service?: string; pathSegments?: string[]; silent?: boolean; refreshExplorer?: boolean }) =>
-      controller.breakInstanceLink(request),
+      controller.packages.breakInstanceLink(request),
     ),
     vscode.window.registerFileDecorationProvider(linkDecorationProvider),
     vscode.window.registerFileDecorationProvider(packageScriptDecorationProvider),
@@ -6835,13 +6607,13 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.commands.executeCommand("workbench.view.extension.reniumContainer");
     }),
     vscode.commands.registerCommand("renium.packages.insertAtPath", (request?: { linkId?: string; service?: string; pathSegments?: string[] }) =>
-      controller.insertPackageAtPath(request ?? {}),
+      controller.packages.insertPackageAtPath(request ?? {}),
     ),
     vscode.commands.registerCommand("renium.packages.viewUses", (link?: PackageTreeElement | CliLinkStatusLink | string) =>
-      controller.viewPackageUses(packagesProvider.linkFromElement(link)),
+      controller.packages.viewPackageUses(packagesProvider.linkFromElement(link)),
     ),
     vscode.commands.registerCommand("renium.packages.delete", (link?: PackageTreeElement | CliLinkStatusLink | string) =>
-      controller.deletePackage(packagesProvider.linkFromElement(link)),
+      controller.packages.deletePackage(packagesProvider.linkFromElement(link)),
     ),
     vscode.commands.registerCommand("renium.packages.openLinkedScriptPreview", (request?: LinkedPackageScriptPreviewRequest) =>
       packagesProvider.openLinkedScriptPreview(request),
@@ -6849,11 +6621,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.tabGroups.onDidChangeTabs(() => {
       persistOpenPackageScriptTabs();
     }),
-    controller.onLinksChanged(() => {
+    controller.packages.onLinksChanged(() => {
       refreshLinkManifestWatcher();
-      void controller.refreshLinkPackageSourceWatchers().catch(() => undefined);
+      void controller.packages.refreshLinkPackageSourceWatchers().catch(() => undefined);
       void linkDecorationProvider.refresh();
-      void controller.pushLinkStateToExplorer();
+      void controller.packages.pushLinkStateToExplorer();
       packagesProvider.refresh();
     }),
     vscode.commands.registerCommand("renium.startLiveSync", () => controller.startLiveSync()),
@@ -6895,14 +6667,14 @@ export function activate(context: vscode.ExtensionContext): void {
   const onLinkManifestChanged = (uri: vscode.Uri): void => {
     let active: { filePath: string; autoApply: boolean; projectRoot: string; generation: number };
     try {
-      active = controller.activeLinkManifest();
+      active = controller.packages.activeLinkManifest();
     } catch {
       return;
     }
     if (uri.scheme !== "file" || !sameLinkManifestPath(uri.fsPath, active.filePath)) {
       return;
     }
-    controller.invalidateLinkStatusCache();
+    controller.packages.invalidateLinkStatusCache();
     if (active.autoApply) {
       if (linkApplyTimer) {
         clearTimeout(linkApplyTimer);
@@ -6910,7 +6682,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const captured = active;
       linkApplyTimer = setTimeout(() => {
         linkApplyTimer = undefined;
-        void controller.linkApply({
+        void controller.packages.linkApply({
           silent: true,
           expectedProjectRoot: captured.projectRoot,
           expectedGeneration: captured.generation,
@@ -6921,7 +6693,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const refreshLinkManifestWatcher = (): void => {
     let active: { filePath: string; autoApply: boolean; projectRoot: string; generation: number };
     try {
-      active = controller.activeLinkManifest();
+      active = controller.packages.activeLinkManifest();
     } catch {
       return;
     }
@@ -6966,9 +6738,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void linkDecorationProvider.refresh();
-  void controller.pushLinkStateToExplorer();
-  void controller.refreshLinkPackageSourceWatchers().catch(() => undefined);
-  controller.scheduleStartupLinkRefresh();
+  void controller.packages.pushLinkStateToExplorer();
+  void controller.packages.refreshLinkPackageSourceWatchers().catch(() => undefined);
+  controller.packages.scheduleStartupLinkRefresh();
   setTimeout(() => {
     void restoreOpenPackageScriptTabs().catch(() => undefined);
   }, 500);

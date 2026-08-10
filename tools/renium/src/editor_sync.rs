@@ -10,7 +10,10 @@ use walkdir::WalkDir;
 
 use super::bridge_server::{BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE};
 use super::bytecode_api::acquire_settings_file_lock;
-use super::command_line::{ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, PushEditorChangesArgs};
+use super::command_line::{
+    ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs,
+    PushEditorChangesArgs,
+};
 use super::daemon_control::{
     apply_editor_delete_daemon_args, apply_editor_property_daemon_args, bridge_fetch_source,
     push_editor_changes_daemon_args, try_daemon_control_request,
@@ -45,7 +48,7 @@ use super::file_io::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix,
 };
-use super::native_editor::send_editor_change_batches;
+use super::native_editor::{property_change_needs_post_native_apply, send_editor_change_batches};
 use super::native_import::{build_editor_binary_import, prepare_native_editor_full_push};
 use super::output::{global_json_output, global_pretty_output, global_yes, print_json_output};
 use super::package_links::LinkEnforcement;
@@ -73,23 +76,7 @@ impl<'a> EditorTransaction<'a> {
         changes: &EditorChangeSet,
         native_import: bool,
     ) -> Result<Option<Self>> {
-        let mut services = changes
-            .instance_changes
-            .iter()
-            .map(|change| change.service.clone())
-            .chain(
-                changes
-                    .source_changes
-                    .iter()
-                    .map(|change| change.service.clone()),
-            )
-            .chain(
-                changes
-                    .property_changes
-                    .iter()
-                    .map(|change| change.service.clone()),
-            )
-            .collect::<Vec<_>>();
+        let mut services = changes.services().map(str::to_string).collect::<Vec<_>>();
         services.sort();
         services.dedup();
         if services.is_empty() {
@@ -118,17 +105,7 @@ impl<'a> EditorTransaction<'a> {
         let property_changes = changes
             .property_changes
             .iter()
-            .filter(|change| {
-                !native_import
-                    || change.path_segments.as_slice() == [change.service.as_str()]
-                    || (change.path_segments.len() == 2
-                        && ((change.service == "Workspace" && change.class_name == "Terrain")
-                            || (change.service == "StarterPlayer"
-                                && matches!(
-                                    change.class_name.as_str(),
-                                    "StarterPlayerScripts" | "StarterCharacterScripts"
-                                ))))
-            })
+            .filter(|change| !native_import || property_change_needs_post_native_apply(change))
             .collect::<Vec<_>>();
         bridge.call(
             "beginEditorTransaction",
@@ -215,8 +192,21 @@ fn skipped_editor_summary(changes: &EditorChangeSet) -> Map<String, Value> {
     summary
 }
 
+fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer> {
+    let ports = parse_bridge_ports(&args.ports)?;
+    let (bridge, metrics) = BridgeServer::listen(&args.host, &ports, args.wait_seconds)?;
+    println!(
+        "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
+        bridge.channel_count(),
+        bridge.expected_channel_count(),
+        metrics.bind_ms,
+        metrics.wait_for_channels_ms
+    );
+    Ok(bridge)
+}
+
 pub(super) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
+    apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     if let Some(result) =
         try_daemon_control_request("push", push_editor_changes_daemon_args(&args))?
     {
@@ -224,16 +214,7 @@ pub(super) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
     }
     let started = Instant::now();
     if native_editor_full_push_eligible(&args)? {
-        let ports = parse_bridge_ports(&args.bridge.ports)?;
-        let (bridge, listen_metrics) =
-            BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-        println!(
-            "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-            bridge.channel_count(),
-            bridge.expected_channel_count(),
-            listen_metrics.bind_ms,
-            listen_metrics.wait_for_channels_ms
-        );
+        let bridge = listen_editor_push_bridge(&args.bridge)?;
         let (changes, binary_import) = prepare_native_editor_full_push(&args, &bridge)?;
         return push_editor_changes_with_collected(
             args,
@@ -246,16 +227,7 @@ pub(super) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
         .map(|_| ());
     }
     let (changes, projection) = collect_project_editor_changes(&args)?;
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    println!(
-        "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-        bridge.channel_count(),
-        bridge.expected_channel_count(),
-        listen_metrics.bind_ms,
-        listen_metrics.wait_for_channels_ms
-    );
+    let bridge = listen_editor_push_bridge(&args.bridge)?;
     push_editor_changes_with_collected(args, &bridge, changes, started, projection.as_ref(), None)
         .map(|_| ())
 }
@@ -293,10 +265,10 @@ fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool
     {
         return Ok(false);
     }
-    if project_config::try_load_project(None, Some(&args.project_root))?.is_some() {
+    if project_config::try_load_project(None, Some(&args.project.project_root))?.is_some() {
         return Ok(false);
     }
-    if !args.override_packages && args.project_root.join("renium-link.json").exists() {
+    if !args.override_packages && args.project.project_root.join("renium-link.json").exists() {
         return Ok(false);
     }
     Ok(true)
@@ -305,7 +277,8 @@ fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool
 fn collect_project_editor_changes(
     args: &PushEditorChangesArgs,
 ) -> Result<(EditorChangeSet, Option<project_config::ProjectionStage>)> {
-    let Some(loaded) = project_config::try_load_project(None, Some(&args.project_root))? else {
+    let Some(loaded) = project_config::try_load_project(None, Some(&args.project.project_root))?
+    else {
         return Ok((collect_editor_changes(args)?, None));
     };
     let link_enforcement = build_loaded_project_link_enforcement(&loaded, args.override_packages)?;
@@ -355,8 +328,8 @@ fn collect_project_editor_changes(
     projected_paths.sort();
     projected_paths.dedup();
     let mut projected_args = args.clone();
-    projected_args.project_root = projection.root().to_path_buf();
-    projected_args.src_dir = PathBuf::from(".");
+    projected_args.project.project_root = projection.root().to_path_buf();
+    projected_args.project.src_root = PathBuf::from(".");
     projected_args.changed_paths = projected_paths;
     projected_args.changed_paths_files.clear();
     projected_args.link_cache_dir = None;
@@ -370,7 +343,6 @@ fn collect_project_editor_changes(
     Ok((changes, Some(projection)))
 }
 
-#[derive(Clone)]
 struct OwnedEditorFilterCandidate {
     id: String,
     path: String,
@@ -435,31 +407,25 @@ impl OwnedEditorFilterCandidate {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditorFilterCandidatePage {
-    #[serde(default)]
     items: Vec<EditorFilterCandidateRow>,
     next_index: Option<usize>,
     snapshot_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditorFilterCandidateRow {
     path_segments: Vec<String>,
-    #[serde(default)]
     path_ordinals: Vec<usize>,
     name: String,
     class_name: String,
     #[serde(default)]
     settings_id: String,
-    #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
     attributes: Vec<String>,
-    #[serde(default)]
-    properties: Vec<String>,
 }
 
 fn editor_filter_path_key(path_segments: &[String], path_ordinals: &[usize]) -> String {
@@ -473,8 +439,10 @@ fn canonical_filter_settings_id(
 ) -> String {
     projection
         .and_then(|stage| stage.canonical_identity(settings_id))
-        .map(|(_, canonical_id)| canonical_id.to_string())
-        .unwrap_or_else(|| settings_id.to_string())
+        .map_or_else(
+            || settings_id.to_string(),
+            |(_, canonical_id)| canonical_id.to_string(),
+        )
 }
 
 fn files_to_studio_filter_rules(
@@ -516,6 +484,16 @@ fn files_to_studio_ignore_unknown_targets(
     Ok(output)
 }
 
+fn sort_editor_preserves(preserves: &mut Vec<EditorPreserveDescriptor>) {
+    preserves.sort_by(|left, right| {
+        (&left.path_segments, &left.path_ordinals)
+            .cmp(&(&right.path_segments, &right.path_ordinals))
+    });
+    preserves.dedup_by(|left, right| {
+        left.path_segments == right.path_segments && left.path_ordinals == right.path_ordinals
+    });
+}
+
 fn attach_ignore_unknown_preserves(
     args: &PushEditorChangesArgs,
     bridge: &BridgeServer,
@@ -528,7 +506,8 @@ fn attach_ignore_unknown_preserves(
         .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
         .map(|change| change.service.clone())
         .collect::<BTreeSet<_>>();
-    let targets = files_to_studio_ignore_unknown_targets(&args.project_root, &reconciled_services)?;
+    let targets =
+        files_to_studio_ignore_unknown_targets(&args.project.project_root, &reconciled_services)?;
     if targets.is_empty() {
         return Ok(());
     }
@@ -556,7 +535,7 @@ fn attach_ignore_unknown_preserves(
             )?)
             .context("Studio returned invalid ignore-unknown candidates")?;
             if snapshot_id.is_none() {
-                snapshot_id = page.snapshot_id.clone();
+                snapshot_id.clone_from(&page.snapshot_id);
             }
             for row in page.items {
                 if !service_targets
@@ -589,16 +568,23 @@ fn attach_ignore_unknown_preserves(
             }
             start_index = next_index;
         }
-        preserves.sort_by(|left, right| {
-            (&left.path_segments, &left.path_ordinals)
-                .cmp(&(&right.path_segments, &right.path_ordinals))
-        });
-        preserves.dedup_by(|left, right| {
-            left.path_segments == right.path_segments && left.path_ordinals == right.path_ordinals
-        });
+        sort_editor_preserves(&mut preserves);
         change.preserve_instances = preserves;
     }
     Ok(())
+}
+
+fn editor_change_services(changes: &EditorChangeSet) -> BTreeSet<String> {
+    changes
+        .services()
+        .chain(
+            changes
+                .history_entries
+                .iter()
+                .map(|entry| entry.service.as_str()),
+        )
+        .map(str::to_string)
+        .collect()
 }
 
 fn build_editor_filter_candidates(
@@ -606,10 +592,10 @@ fn build_editor_filter_candidates(
     changes: &EditorChangeSet,
     projection: Option<&project_config::ProjectionStage>,
 ) -> Result<EditorFilterCandidateIndex> {
-    let src_root = projection
-        .filter(|stage| stage.is_temporary())
-        .map(|stage| stage.root().to_path_buf())
-        .unwrap_or_else(|| args.project_root.join(&args.src_dir));
+    let src_root = projection.filter(|stage| stage.is_temporary()).map_or_else(
+        || args.project.project_root.join(&args.project.src_root),
+        |stage| stage.root().to_path_buf(),
+    );
     let document_overrides = changes
         .settings_writes
         .iter()
@@ -618,33 +604,11 @@ fn build_editor_filter_candidates(
             Some((service, &write.document))
         })
         .collect::<HashMap<_, _>>();
-    let services = changes
-        .instance_changes
-        .iter()
-        .map(|change| change.service.clone())
-        .chain(
-            changes
-                .source_changes
-                .iter()
-                .map(|change| change.service.clone()),
-        )
-        .chain(
-            changes
-                .property_changes
-                .iter()
-                .map(|change| change.service.clone()),
-        )
-        .chain(
-            changes
-                .history_entries
-                .iter()
-                .map(|entry| entry.service.clone()),
-        )
-        .collect::<BTreeSet<_>>();
     let mut candidates = Vec::new();
     let mut by_id = HashMap::new();
     let mut by_path = HashMap::new();
     let mut ambiguous_paths = HashSet::new();
+    let services = editor_change_services(changes);
     for service in services {
         let stored;
         let document = if let Some(document) = document_overrides.get(&service) {
@@ -740,6 +704,38 @@ fn fallback_editor_filter_candidate(
     }
 }
 
+fn editor_change_filter_candidates<'a>(
+    desired: &'a EditorFilterCandidateIndex,
+    live: &'a EditorFilterCandidateIndex,
+    projection: Option<&project_config::ProjectionStage>,
+    service: &str,
+    settings_id: Option<&str>,
+    path_segments: &[String],
+    path_ordinals: &[usize],
+) -> (
+    Option<&'a OwnedEditorFilterCandidate>,
+    Option<&'a OwnedEditorFilterCandidate>,
+) {
+    (
+        editor_change_filter_candidate(
+            desired,
+            projection,
+            service,
+            settings_id,
+            path_segments,
+            path_ordinals,
+        ),
+        editor_change_filter_candidate(
+            live,
+            projection,
+            service,
+            settings_id,
+            path_segments,
+            path_ordinals,
+        ),
+    )
+}
+
 fn attach_live_filter_preserves(
     bridge: &BridgeServer,
     rules: &[project_config::FilterRule],
@@ -753,29 +749,7 @@ fn attach_live_filter_preserves(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let services = changes
-        .instance_changes
-        .iter()
-        .map(|change| change.service.clone())
-        .chain(
-            changes
-                .source_changes
-                .iter()
-                .map(|change| change.service.clone()),
-        )
-        .chain(
-            changes
-                .property_changes
-                .iter()
-                .map(|change| change.service.clone()),
-        )
-        .chain(
-            changes
-                .history_entries
-                .iter()
-                .map(|entry| entry.service.clone()),
-        )
-        .collect::<BTreeSet<_>>();
+    let services = editor_change_services(changes);
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let mut candidates = Vec::new();
     let mut by_id = HashMap::new();
@@ -807,20 +781,18 @@ fn attach_live_filter_preserves(
             )?)
             .context("Studio returned invalid filter candidates")?;
             if snapshot_id.is_none() {
-                snapshot_id = page.snapshot_id.clone();
+                snapshot_id.clone_from(&page.snapshot_id);
             }
             for row in page.items {
                 let exact_key = editor_filter_path_key(&row.path_segments, &row.path_ordinals);
                 let path_only_key = editor_filter_path_key(&row.path_segments, &[]);
-                let mut properties = row.properties.into_iter().collect::<BTreeSet<_>>();
-                properties.extend(
-                    property_names
-                        .iter()
-                        .filter(|name| {
-                            rbx_model_property_descriptor(database, &row.class_name, name).is_some()
-                        })
-                        .cloned(),
-                );
+                let properties = property_names
+                    .iter()
+                    .filter(|name| {
+                        rbx_model_property_descriptor(database, &row.class_name, name).is_some()
+                    })
+                    .cloned()
+                    .collect();
                 let canonical_id = canonical_filter_settings_id(projection, &row.settings_id);
                 let candidate = OwnedEditorFilterCandidate {
                     id: canonical_id.clone(),
@@ -860,13 +832,7 @@ fn attach_live_filter_preserves(
             }
             start_index = next_index;
         }
-        preserves.sort_by(|left, right| {
-            (&left.path_segments, &left.path_ordinals)
-                .cmp(&(&right.path_segments, &right.path_ordinals))
-        });
-        preserves.dedup_by(|left, right| {
-            left.path_segments == right.path_segments && left.path_ordinals == right.path_ordinals
-        });
+        sort_editor_preserves(&mut preserves);
         for change in &mut changes.instance_changes {
             if change.service == service
                 && change.mode == "reconcileService"
@@ -891,7 +857,7 @@ fn apply_files_to_studio_filters(
     projection: Option<&project_config::ProjectionStage>,
 ) -> Result<()> {
     attach_ignore_unknown_preserves(args, bridge, changes, projection)?;
-    let Some(rules) = files_to_studio_filter_rules(&args.project_root)? else {
+    let Some(rules) = files_to_studio_filter_rules(&args.project.project_root)? else {
         return Ok(());
     };
     changes.files_to_studio_filters_active = true;
@@ -909,16 +875,8 @@ fn apply_files_to_studio_filters(
                     &instance.match_properties,
                     &instance.match_attributes,
                 );
-                let candidate = editor_change_filter_candidate(
+                let (candidate, current) = editor_change_filter_candidates(
                     &candidate_index,
-                    projection,
-                    &change.service,
-                    Some(&instance.settings_id),
-                    &instance.path_segments,
-                    &instance.path_ordinals,
-                )
-                .unwrap_or(&fallback);
-                let current = editor_change_filter_candidate(
                     &live_index,
                     projection,
                     &change.service,
@@ -926,6 +884,7 @@ fn apply_files_to_studio_filters(
                     &instance.path_segments,
                     &instance.path_ordinals,
                 );
+                let candidate = candidate.unwrap_or(&fallback);
                 Ok(candidate.allows_instance(&rules)?
                     && current
                         .map(|candidate| candidate.allows_instance(&rules))
@@ -972,16 +931,8 @@ fn apply_files_to_studio_filters(
             &Map::from_iter([("Source".to_string(), Value::Null)]),
             &Map::new(),
         );
-        let candidate = editor_change_filter_candidate(
+        let (candidate, current) = editor_change_filter_candidates(
             &candidate_index,
-            projection,
-            &change.service,
-            change.settings_id.as_deref(),
-            &change.path_segments,
-            &change.path_ordinals,
-        )
-        .unwrap_or(&fallback);
-        let current = editor_change_filter_candidate(
             &live_index,
             projection,
             &change.service,
@@ -989,6 +940,7 @@ fn apply_files_to_studio_filters(
             &change.path_segments,
             &change.path_ordinals,
         );
+        let candidate = candidate.unwrap_or(&fallback);
         if candidate.allows_property(&rules, "Source")?
             && current
                 .map(|candidate| candidate.allows_property(&rules, "Source"))
@@ -1008,16 +960,8 @@ fn apply_files_to_studio_filters(
             &change.properties,
             &change.attributes,
         );
-        let candidate = editor_change_filter_candidate(
+        let (candidate, current) = editor_change_filter_candidates(
             &candidate_index,
-            projection,
-            &change.service,
-            change.settings_id.as_deref(),
-            &change.path_segments,
-            &change.path_ordinals,
-        )
-        .unwrap_or(&fallback);
-        let current = editor_change_filter_candidate(
             &live_index,
             projection,
             &change.service,
@@ -1025,6 +969,7 @@ fn apply_files_to_studio_filters(
             &change.path_segments,
             &change.path_ordinals,
         );
+        let candidate = candidate.unwrap_or(&fallback);
         if !candidate.allows_instance(&rules)?
             || !current
                 .map(|candidate| candidate.allows_instance(&rules))
@@ -1086,16 +1031,8 @@ fn apply_files_to_studio_filters(
             &Map::new(),
             &Map::new(),
         );
-        let candidate = editor_change_filter_candidate(
+        let (candidate, current) = editor_change_filter_candidates(
             &candidate_index,
-            projection,
-            &entry.service,
-            entry.settings_id.as_deref(),
-            &entry.path_segments,
-            &[],
-        )
-        .unwrap_or(&fallback);
-        let current = editor_change_filter_candidate(
             &live_index,
             projection,
             &entry.service,
@@ -1103,6 +1040,7 @@ fn apply_files_to_studio_filters(
             &entry.path_segments,
             &[],
         );
+        let candidate = candidate.unwrap_or(&fallback);
         if candidate.allows_instance(&rules)?
             && current
                 .map(|candidate| candidate.allows_instance(&rules))
@@ -1145,7 +1083,7 @@ fn push_editor_changes_with_collected(
     let mut history_transaction = if review_skipped || binary_import.is_some() {
         None
     } else {
-        save_editor_history_entries(bridge, &args.project_root, &changes)?
+        save_editor_history_entries(bridge, &args.project.project_root, &changes)?
     };
     let phase_started = Instant::now();
     let mut transaction = if review_skipped {
@@ -1391,7 +1329,10 @@ fn emit_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<
 }
 
 pub(super) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
+    apply_configured_project_layout(
+        &mut args.target.project.project_root,
+        &mut args.target.project.src_root,
+    )?;
     if let Some(result) =
         try_daemon_control_request("prop", apply_editor_property_daemon_args(&args))?
     {
@@ -1400,9 +1341,9 @@ pub(super) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
     }
     let bridge = listen_editor_oneshot_bridge(
         "property",
-        &args.bridge.host,
-        &args.bridge.ports,
-        args.bridge.wait_seconds,
+        &args.target.bridge.host,
+        &args.target.bridge.ports,
+        args.target.bridge.wait_seconds,
     )?;
     apply_editor_property_with_warm_bridge(args, &bridge).map(|_| ())
 }
@@ -1415,21 +1356,10 @@ pub(super) fn apply_editor_property_with_warm_bridge(
     let changes = collect_direct_editor_property_change(&args)?;
     push_editor_changes_with_collected(
         PushEditorChangesArgs {
-            project_root: args.project_root,
-            src_dir: args.src_dir,
-            bridge: args.bridge,
-            changed_paths: Vec::new(),
-            changed_paths_files: Vec::new(),
-            target_settings_ids: Vec::new(),
-            target_settings_id_files: Vec::new(),
-            target_properties: Vec::new(),
-            upsert_instances_only: false,
-            probe_events: false,
-            verify_sources: false,
             no_review: args.no_review,
             yes: args.yes || global_yes(),
-            link_cache_dir: None,
-            override_packages: args.override_packages,
+            override_packages: args.target.override_packages,
+            ..PushEditorChangesArgs::new(args.target.project, args.target.bridge)
         },
         bridge,
         changes,
@@ -1442,31 +1372,25 @@ pub(super) fn apply_editor_property_with_warm_bridge(
 fn collect_direct_editor_property_change(
     args: &ApplyEditorPropertyArgs,
 ) -> Result<EditorChangeSet> {
-    let service = args.service.trim().to_string();
-    if service.is_empty() {
-        bail!("--service is required");
-    }
+    let target = parse_direct_editor_target(&args.target)?;
     let property = args.property.trim().to_string();
     if property.is_empty() {
         bail!("--property is required");
     }
-    let path_segments: Vec<String> = serde_json::from_str(&args.path_segments_json)
-        .context("Failed to parse --path-segments-json")?;
-    if path_segments.is_empty() {
+    if target.path_segments.is_empty() {
         bail!("--path-segments-json must contain at least one segment");
     }
-    let path_ordinals: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
-        .context("Failed to parse --path-ordinals-json")?;
-    reject_direct_read_only_package_change(
-        &args.project_root,
-        args.override_packages,
-        &service,
-        &path_segments,
-        &path_ordinals,
-    )?;
-    if is_externally_managed_editor_property(&service, &args.class_name, &path_segments, &property)
-    {
-        bail!("{service}.{property} is managed through Roblox Game Settings")
+    if is_externally_managed_editor_property(
+        &target.service,
+        &target.class_name,
+        &target.path_segments,
+        &property,
+    ) {
+        bail!(
+            "{}.{} is managed through Roblox Game Settings",
+            target.service,
+            property
+        )
     }
     let value: Value =
         serde_json::from_str(&args.value_json).context("Failed to parse --value-json")?;
@@ -1486,16 +1410,11 @@ fn collect_direct_editor_property_change(
 
     let mut changes = EditorChangeSet::default();
     changes.property_changes.push(EditorPropertyChange {
-        service,
-        settings_id: args
-            .settings_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        path_segments,
-        path_ordinals,
-        class_name: args.class_name.clone(),
+        service: target.service,
+        settings_id: target.settings_id,
+        path_segments: target.path_segments,
+        path_ordinals: target.path_ordinals,
+        class_name: target.class_name,
         properties,
         attributes,
         deleted_attributes,
@@ -1511,9 +1430,9 @@ pub(super) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
     }
     let bridge = listen_editor_oneshot_bridge(
         "delete",
-        &args.bridge.host,
-        &args.bridge.ports,
-        args.bridge.wait_seconds,
+        &args.target.bridge.host,
+        &args.target.bridge.ports,
+        args.target.bridge.wait_seconds,
     )?;
     apply_editor_delete_with_warm_bridge(args, &bridge).map(|_| ())
 }
@@ -1530,46 +1449,64 @@ pub(super) fn apply_editor_delete_with_warm_bridge(
 pub(super) fn collect_direct_editor_delete_change(
     args: ApplyEditorDeleteArgs,
 ) -> Result<EditorChangeSet> {
-    let service = args.service.trim().to_string();
-    if service.is_empty() {
-        bail!("--service is required");
-    }
-    let path_segments: Vec<String> = serde_json::from_str(&args.path_segments_json)
-        .context("Failed to parse --path-segments-json")?;
-    if path_segments.len() <= 1 {
+    let target = parse_direct_editor_target(&args.target)?;
+    if target.path_segments.len() <= 1 {
         bail!("Refusing to delete a service root");
     }
-    let path_ordinals: Vec<usize> = serde_json::from_str(&args.path_ordinals_json)
-        .context("Failed to parse --path-ordinals-json")?;
-    reject_direct_read_only_package_change(
-        &args.project_root,
-        args.override_packages,
-        &service,
-        &path_segments,
-        &path_ordinals,
-    )?;
-    let settings_id = args
-        .settings_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
 
     let mut changes = EditorChangeSet::default();
     changes.instance_changes.push(EditorInstanceChange {
         mode: "deleteInstances".to_string(),
-        service,
+        service: target.service,
         allow_deletes: false,
         instances: vec![EditorInstanceDescriptor {
-            settings_id: settings_id.to_string(),
-            path_segments,
-            path_ordinals,
-            class_name: args.class_name,
+            settings_id: target.settings_id.unwrap_or_default(),
+            path_segments: target.path_segments,
+            path_ordinals: target.path_ordinals,
+            class_name: target.class_name,
             ..EditorInstanceDescriptor::default()
         }],
         preserve_instances: Vec::new(),
     });
     Ok(changes)
+}
+
+struct DirectEditorTarget {
+    service: String,
+    settings_id: Option<String>,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+    class_name: String,
+}
+
+fn parse_direct_editor_target(target: &EditorMutationArgs) -> Result<DirectEditorTarget> {
+    let service = target.service.trim().to_string();
+    if service.is_empty() {
+        bail!("--service is required");
+    }
+    let path_segments: Vec<String> = serde_json::from_str(&target.path_segments_json)
+        .context("Failed to parse --path-segments-json")?;
+    let path_ordinals: Vec<usize> = serde_json::from_str(&target.path_ordinals_json)
+        .context("Failed to parse --path-ordinals-json")?;
+    reject_direct_read_only_package_change(
+        &target.project.project_root,
+        target.override_packages,
+        &service,
+        &path_segments,
+        &path_ordinals,
+    )?;
+    Ok(DirectEditorTarget {
+        service,
+        settings_id: target
+            .settings_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        path_segments,
+        path_ordinals,
+        class_name: target.class_name.clone(),
+    })
 }
 
 fn reject_direct_read_only_package_change(
@@ -1592,7 +1529,7 @@ fn reject_direct_read_only_package_change(
     )
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct EditorSourceVerification {
     verified: usize,
     failed: Vec<String>,
@@ -1809,17 +1746,17 @@ impl Drop for EditorSettingsTransaction {
 }
 
 fn editor_project_roots(args: &PushEditorChangesArgs) -> Result<(PathBuf, PathBuf)> {
-    let project_root = if args.project_root.exists() {
-        strip_extended_prefix(canonical_path(&args.project_root).with_context(|| {
+    let project_root = if args.project.project_root.exists() {
+        strip_extended_prefix(canonical_path(&args.project.project_root).with_context(|| {
             format!(
                 "Failed to resolve project root: {}",
-                args.project_root.display()
+                args.project.project_root.display()
             )
         })?)
     } else {
-        args.project_root.clone()
+        args.project.project_root.clone()
     };
-    let src_root = absolutize_under(&project_root, &args.src_dir);
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
     Ok((project_root, src_root))
 }
 
@@ -2029,7 +1966,7 @@ fn collect_editor_changes_with_link_enforcement(
                 changed_services.settings.insert(service.clone());
                 if !property_filter.is_active() {
                     changed_services.reconcile.insert(service.clone());
-                } else if property_filter.has_settings_targets() {
+                } else if !property_filter.settings_ids.is_empty() {
                     changed_services.target_upsert.insert(service.clone());
                 }
             }
@@ -2053,7 +1990,7 @@ fn collect_editor_changes_with_link_enforcement(
             .cloned();
 
         let metadata = fs::metadata(&absolute_path).ok();
-        let exists_as_file = metadata.as_ref().is_some_and(|meta| meta.is_file());
+        let exists_as_file = metadata.as_ref().is_some_and(std::fs::Metadata::is_file);
         let inferred_spec = infer_editor_source_path_spec(src_root, &service, &absolute_path);
         let protected_path = mapped_target
             .as_ref()

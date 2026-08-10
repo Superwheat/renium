@@ -162,11 +162,6 @@ fn run_cli() -> Result<()> {
     }
     output::validate_options(&cli)?;
     output::configure(&cli);
-    if cli.backtrace {
-        unsafe {
-            std::env::set_var("RUST_BACKTRACE", "1");
-        }
-    }
     set_place_filter(
         cli.place
             .clone()

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -10,7 +9,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::bridge_server::BridgeServer;
-use super::command_line::{EditorRevertArgs, PushEditorChangesArgs};
+use super::command_line::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
 use super::editor_sync::push_editor_changes_with_warm_bridge;
 use super::editor_types::{EditorChangeSet, EditorHistoryEntry, EditorRevertManifest};
 use super::file_io::{
@@ -57,7 +56,7 @@ impl EditorHistoryTransaction {
         let mut entries = fs::read_dir(&self.stage_root)
             .with_context(|| format!("Failed to read {}", self.stage_root.display()))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let source = entry.path();
             let destination = self.history_root.join(entry.file_name());
@@ -121,13 +120,11 @@ impl Drop for EditorHistoryTransaction {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct EditorHistorySourceBatch {
     rows: Vec<EditorHistorySourceRow>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct EditorHistorySourceRow {
     index: usize,
     source: Option<String>,
@@ -253,10 +250,7 @@ pub(super) fn save_editor_history_entries(
             continue;
         }
 
-        let created_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let created_unix_ms = current_millis();
         let safe_name = sanitize_history_component(
             entry
                 .settings_id
@@ -327,7 +321,7 @@ pub(super) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
     if history_root.exists() {
         for entry in WalkDir::new(&history_root)
             .into_iter()
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_type().is_file())
             .filter(|entry| entry.file_name().to_string_lossy() == "manifest.json")
         {
@@ -418,21 +412,15 @@ pub(super) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
             BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
         push_editor_changes_with_warm_bridge(
             PushEditorChangesArgs {
-                project_root,
-                src_dir: args.src_dir,
-                bridge: args.bridge,
                 changed_paths,
-                changed_paths_files: Vec::new(),
-                target_settings_ids: Vec::new(),
-                target_settings_id_files: Vec::new(),
-                target_properties: Vec::new(),
-                upsert_instances_only: false,
-                probe_events: false,
                 verify_sources: true,
-                no_review: false,
-                yes: false,
-                link_cache_dir: None,
-                override_packages: false,
+                ..PushEditorChangesArgs::new(
+                    ProjectSourceArgs {
+                        project_root,
+                        src_root: args.src_dir,
+                    },
+                    args.bridge,
+                )
             },
             &bridge,
         )?;

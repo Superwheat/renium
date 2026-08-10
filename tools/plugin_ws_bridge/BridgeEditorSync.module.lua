@@ -63,6 +63,43 @@ local NATIVE_SERIALIZATION_SERVICE_LIMIT = 4096
 local NATIVE_SERIALIZATION_BATCH_LIMIT = 8192
 local MESH_PART_APPLY_YIELD_INTERVAL = 4
 
+local function binaryReadRange(params: { [string]: any }, totalBytes: number, label: string): (number, number)
+	local offset = tonumber(params.offset)
+	local length = tonumber(params.length)
+	if not offset or offset < 0 or offset % 1 ~= 0 then
+		error(`Invalid {label} offset`)
+	end
+	if not length or length < 1 or length > 8388608 or length % 1 ~= 0 then
+		error(`Invalid {label} length`)
+	end
+	if params.clampLength == true then
+		length = math.min(length, totalBytes - offset)
+	end
+	if length < 1 or offset + length > totalBytes then
+		error(`{label} range exceeds its payload`)
+	end
+	return offset, length
+end
+
+local function encodeBinaryChunk(
+	chunk: buffer,
+	offset: number,
+	length: number,
+	totalBytes: number,
+	serializationComplete: boolean
+): { [string]: any }
+	local encodeStarted = os.clock()
+	local encoded = buffer.tostring(EncodingService:Base64Encode(chunk))
+	return {
+		start = offset + 1,
+		nextStart = offset + length + 1,
+		total = totalBytes,
+		chunk = encoded,
+		pluginEncodeMs = (os.clock() - encodeStarted) * 1000,
+		serializationComplete = serializationComplete,
+	}
+end
+
 local function countEntries(values: { [any]: any }): number
 	local count = 0
 	for _ in pairs(values) do
@@ -179,10 +216,7 @@ local function armSessionExpiry(values: { [any]: any }, key: any, session: { [an
 end
 
 local function beginHistoryRecording(label: string): any?
-	return ChangeHistoryService:TryBeginRecording(
-		`Renium:{label}:{os.clock()}`,
-		"Renium: " .. label
-	)
+	return ChangeHistoryService:TryBeginRecording(`Renium:{label}:{os.clock()}`, "Renium: " .. label)
 end
 
 local function finishHistoryRecording(recording: any?, operation: any?)
@@ -218,10 +252,7 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 	if instance.Parent == parent then
 		return
 	end
-	local token = nil
-	if ctx ~= nil then
-		token = ctx.expectParentChange(instance, parent)
-	end
+	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent) else nil
 	local ok, result = pcall(function()
 		instance.Parent = parent
 	end)
@@ -235,10 +266,9 @@ local function setNameForSync(instance: Instance, name: string, ctx: { [string]:
 	if instance.Name == name then
 		return
 	end
-	local token = nil
-	if instance:IsDescendantOf(game) and ctx ~= nil then
-		token = ctx.expectPropertyEvent(instance, "Name", name)
-	end
+	local token = if instance:IsDescendantOf(game) and ctx ~= nil
+		then ctx.expectPropertyEvent(instance, "Name", name)
+		else nil
 	local ok, result = pcall(function()
 		instance.Name = name
 	end)
@@ -252,10 +282,7 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 	if Workspace.CurrentCamera == camera then
 		return
 	end
-	local token = nil
-	if ctx ~= nil then
-		token = ctx.expectPropertyEvent(Workspace, "CurrentCamera", camera)
-	end
+	local token = if ctx ~= nil then ctx.expectPropertyEvent(Workspace, "CurrentCamera", camera) else nil
 	local ok, result = pcall(function()
 		Workspace.CurrentCamera = camera
 	end)
@@ -715,11 +742,10 @@ local function shouldKeepInstanceByDesiredEntry(
 		return true
 	end
 	local key = pathSegments and pathCacheKey(pathSegments, pathOrdinals) or ""
-	local legacyKey = pathSegments and pathKey(pathSegments) or ""
 	if key ~= "" and desiredStableKeys[key] then
 		return false
 	end
-	return key ~= "" and (desiredKeys[key] or desiredKeys[legacyKey]) or false
+	return key ~= "" and desiredKeys[key] or false
 end
 
 local function assertAllowedService(serviceName: string, ctx: { [string]: any }): Instance
@@ -803,10 +829,9 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 	end
 	local settingsInstance: Instance? = nil
 	if ctx ~= nil and type(targetServiceName) == "string" and targetServiceName ~= "" then
-		local settingsId = raw.settingsId or raw.instanceId
-		if settingsId == nil and type(raw.debugId) == "string" and raw.debugId ~= "" then
-			settingsId = "debug:" .. raw.debugId
-		end
+		local settingsId = raw.settingsId
+			or raw.instanceId
+			or (if type(raw.debugId) == "string" and raw.debugId ~= "" then "debug:" .. raw.debugId else nil)
 		local persistent = matchedSettingsInstance(targetServiceName, settingsId, ctx)
 		if persistent ~= nil then
 			return persistent
@@ -1094,10 +1119,9 @@ local function writePropertyForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
-	local token = nil
-	if instance:IsDescendantOf(game) and ctx ~= nil then
-		token = ctx.expectPropertyEvent(instance, propertyName, value)
-	end
+	local token = if instance:IsDescendantOf(game) and ctx ~= nil
+		then ctx.expectPropertyEvent(instance, propertyName, value)
+		else nil
 	local ok, result = writeProperty(instance, propertyName, value)
 	if not ok then
 		cancelExpectedEvent(ctx, token)
@@ -1111,10 +1135,9 @@ local function setAttributeForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
-	local token = nil
-	if instance:IsDescendantOf(game) and ctx ~= nil then
-		token = ctx.expectAttributeEvent(instance, attributeName, value)
-	end
+	local token = if instance:IsDescendantOf(game) and ctx ~= nil
+		then ctx.expectAttributeEvent(instance, attributeName, value)
+		else nil
 	local ok, result = pcall(instance.SetAttribute, instance, attributeName, value)
 	if not ok then
 		cancelExpectedEvent(ctx, token)
@@ -1239,7 +1262,7 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [stri
 			destroySource = true
 			sourceReady = true
 		elseif ctx.readyMeshPartSources ~= nil then
-			sourceReady = ctx.readyMeshPartSources[sourceMeshPart] == true
+			sourceReady = ctx.readyMeshPartSources[sourceMeshPart]
 		end
 	end
 
@@ -1305,10 +1328,7 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [stri
 end
 
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
-	local token = nil
-	if instance:IsDescendantOf(game) then
-		token = ctx.expectTagChange(instance, tag, added)
-	end
+	local token = if instance:IsDescendantOf(game) then ctx.expectTagChange(instance, tag, added) else nil
 	local ok, result = pcall(function()
 		if added then
 			CollectionService:AddTag(instance, tag)
@@ -1529,10 +1549,7 @@ local function applySourceChange(
 			stats.noops += 1
 			return
 		end
-		local parent = resolveParent(change, ctx.resolveCache)
-		if parent == nil then
-			parent = ensureSourceParentPath(change, service, stats, ctx)
-		end
+		local parent = resolveParent(change, ctx.resolveCache) or ensureSourceParentPath(change, service, stats, ctx)
 		if parent == nil then
 			error("Cannot create source instance; parent path was not found")
 		end
@@ -1858,15 +1875,8 @@ local function applyInstanceReconcileChunk(
 	session.entryCount += newEntries
 	for _, entry in ipairs(entries) do
 		session.desiredKeys[entry.key] = true
-		local instance = syncDesiredEntry(
-			entry,
-			service.Name,
-			ctx,
-			stats,
-			session.resolvedEntries,
-			session.claimedInstances,
-			true
-		)
+		local instance =
+			syncDesiredEntry(entry, service.Name, ctx, stats, session.resolvedEntries, session.claimedInstances, true)
 		if instance ~= nil then
 			recordDesiredStableEntry(
 				entry,
@@ -1943,10 +1953,10 @@ local function applyInstanceDeletes(
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
-		local instance = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
-		if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
-			instance = nil
-		end
+		local resolved = resolveInstanceBySettingsId(service.Name, entry.settingsId, ctx)
+		local instance = if resolved == nil or instanceMatchesExpectedClass(resolved, entry.className)
+			then resolved
+			else nil
 		if instance == nil then
 			instance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
 			if instance ~= nil and not instanceMatchesExpectedClass(instance, entry.className) then
@@ -2765,10 +2775,9 @@ local function restoreMutationSnapshot(
 	mutationReplacements: { [Instance]: Instance }?,
 	beforeReplace: (() -> ())?
 ): { [Instance]: Instance }
-	local roots = {}
-	if snapshot.payload ~= nil then
-		roots = SerializationService:DeserializeInstancesAsync(snapshot.payload)
-	end
+	local roots = if snapshot.payload ~= nil
+		then SerializationService:DeserializeInstancesAsync(snapshot.payload)
+		else {}
 	if #roots ~= snapshot.rootCount then
 		error("Editor rollback snapshot returned an unexpected root count")
 	end
@@ -4165,7 +4174,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			local propertySchemaByClass = {}
 			local enumValueNamesByType = {}
-			local instanceCount = 0
 			for _, serviceName in ipairs(serviceNames) do
 				local state = session.nativeStates[serviceName]
 				if state == nil then
@@ -4188,7 +4196,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				group.instanceCount = #instances
 				group.classNames = state.classNames or {}
-				instanceCount += #instances
 				for _, className in ipairs(state.classNames or {}) do
 					if propertySchemaByClass[className] == nil then
 						local schema = ctx.getPropertySchema(className)
@@ -4218,7 +4225,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				exportId = exportId,
 				groups = groups,
 				serializationBatches = session.serializationBatches,
-				instanceCount = instanceCount,
 				propertySchemaByClass = propertySchemaByClass,
 				enumValueNamesByType = enumValueNamesByType,
 				pending = session.status == "pending",
@@ -4257,7 +4263,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local exportId = tostring(params.exportId or "")
 		local session = binaryExports[exportId]
 		if type(session) ~= "table" or requirePartitioned and not session.partitioned then
-			error(if requirePartitioned then "Partitioned native export session was not found" else "Native export session was not found")
+			error(
+				if requirePartitioned
+					then "Partitioned native export session was not found"
+					else "Native export session was not found"
+			)
 		end
 		armSessionExpiry(binaryExports, exportId, session)
 		return exportId, tostring(params.service or ""), session
@@ -4365,35 +4375,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if not payload or not totalBytes then
 				error("Native export serialization is not ready")
 			end
-			local offset = tonumber(params.offset)
-			local length = tonumber(params.length)
-			if not offset or offset < 0 or offset % 1 ~= 0 then
-				error("Invalid native export offset")
-			end
-			if not length or length < 1 or length > 8388608 or length % 1 ~= 0 then
-				error("Invalid native export length")
-			end
-			if params.clampLength == true then
-				length = math.min(length, totalBytes - offset)
-			end
-			if length < 1 or offset + length > totalBytes then
-				error("Native export range exceeds its payload")
-			end
+			local offset, length = binaryReadRange(params, totalBytes, "Native export")
 			local chunk = if offset == 0 and length == totalBytes then payload else buffer.create(length)
 			if chunk ~= payload then
 				buffer.copy(chunk, 0, payload, offset, length)
 			end
 			if params.rawBase64 == true then
-				local encodeStarted = os.clock()
-				local encoded = buffer.tostring(EncodingService:Base64Encode(chunk))
-				return {
-					start = offset + 1,
-					nextStart = offset + length + 1,
-					total = totalBytes,
-					chunk = encoded,
-					pluginEncodeMs = (os.clock() - encodeStarted) * 1000,
-					serializationComplete = session.status == "ready",
-				}
+				return encodeBinaryChunk(chunk, offset, length, totalBytes, session.status == "ready")
 			end
 			return {
 				ok = true,
@@ -4501,20 +4489,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 			local totalBytes = batch.totalBytes
-			local offset = tonumber(params.offset)
-			local length = tonumber(params.length)
-			if not offset or offset < 0 or offset % 1 ~= 0 then
-				error("Invalid native export batch offset")
-			end
-			if not length or length < 1 or length > 8388608 or length % 1 ~= 0 then
-				error("Invalid native export batch length")
-			end
-			if params.clampLength == true then
-				length = math.min(length, totalBytes - offset)
-			end
-			if length < 1 or offset + length > totalBytes then
-				error("Native export batch range exceeds its payload")
-			end
+			local offset, length = binaryReadRange(params, totalBytes, "Native export batch")
 			local chunk = buffer.create(length)
 			local chunkOffset = 0
 			local logicalOffset = offset
@@ -4548,17 +4523,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if remaining ~= 0 then
 				error("Native export batch payload is incomplete")
 			end
-			local encodeStarted = os.clock()
-			local encoded = buffer.tostring(EncodingService:Base64Encode(chunk))
 			session.updatedAt = os.clock()
-			return {
-				start = offset + 1,
-				nextStart = offset + length + 1,
-				total = totalBytes,
-				chunk = encoded,
-				pluginEncodeMs = (os.clock() - encodeStarted) * 1000,
-				serializationComplete = session.status == "ready",
-			}
+			return encodeBinaryChunk(chunk, offset, length, totalBytes, session.status == "ready")
 		end)
 	end
 
@@ -4686,31 +4652,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				}
 			end
 			local payloadRootName = rawGroup.payloadRootName
-			if payloadRootName ~= nil and (type(payloadRootName) ~= "string" or payloadRootName == "") then
+			if type(payloadRootName) ~= "string" or payloadRootName == "" then
 				error("Invalid native import payload root")
 			end
-			if payloadRootName ~= nil then
-				if payloadRootNames[payloadRootName] then
-					error("Duplicate native import payload root")
-				end
-				payloadRootNames[payloadRootName] = true
+			if payloadRootNames[payloadRootName] then
+				error("Duplicate native import payload root")
 			end
-			local payloadRootNameList = rawGroup.payloadRootNames
-			if payloadRootNameList ~= nil then
-				local namesAreArray, nameCount = denseArrayLength(payloadRootNameList)
-				if not namesAreArray or nameCount ~= count then
-					error("Invalid native import payload roots")
-				end
-				for _, name in ipairs(payloadRootNameList) do
-					if type(name) ~= "string" or name == "" or payloadRootNames[name] then
-						error("Invalid native import payload root")
-					end
-					payloadRootNames[name] = true
-				end
-			end
-			if payloadRootName ~= nil and payloadRootNameList ~= nil then
-				error("Native import group has conflicting payload roots")
-			end
+			payloadRootNames[payloadRootName] = true
 			local retainedRoots = {}
 			local retainedPayloadIndexes = {}
 			if rawGroup.retainedRoots ~= nil then
@@ -4790,11 +4738,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local changeGeneration = tonumber(rawGroup.changeGeneration)
 			if
 				(#retainedRoots > 0 or #packageRoots > 0)
-				and (
-					not changeGeneration
-					or changeGeneration < 0
-					or changeGeneration % 1 ~= 0
-				)
+				and (not changeGeneration or changeGeneration < 0 or changeGeneration % 1 ~= 0)
 			then
 				error("Native import retained roots require a Studio change generation")
 			end
@@ -4805,7 +4749,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				targetPath = table.clone(targetPath),
 				count = count,
 				payloadRootName = payloadRootName,
-				payloadRootNames = payloadRootNameList,
 				rootPaths = rootPaths,
 				retainedRoots = retainedRoots,
 				packageRoots = packageRoots,
@@ -4946,78 +4889,36 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error(`Studio changed {serviceName} while native import was preparing; retry the sync`)
 				end
 			end
-			local rootFormat = if session.groups[1].payloadRootNames ~= nil
-				then "perRoot"
-				elseif session.groups[1].payloadRootName ~= nil then "group"
-				else "plain"
-			local expectedRoots = 0
-			for _, group in ipairs(session.groups) do
-				local groupFormat = if group.payloadRootNames ~= nil
-					then "perRoot"
-					elseif group.payloadRootName ~= nil then "group"
-					else "plain"
-				if groupFormat ~= rootFormat then
-					error("Native import mixed payload root formats")
-				end
-				if rootFormat == "group" then
-					expectedRoots += 1
-				else
-					expectedRoots += group.count
-				end
-			end
-			if #roots ~= expectedRoots then
+			if #roots ~= #session.groups then
 				error("Native import returned an unexpected root count")
 			end
 			local wrappedRootsByName = {}
-			if rootFormat ~= "plain" then
-				for _, root in ipairs(roots) do
-					if root.Parent ~= nil or not root:IsA("Folder") or wrappedRootsByName[root.Name] ~= nil then
-						error("Native import returned an invalid payload root")
-					end
-					wrappedRootsByName[root.Name] = root
+			for _, root in ipairs(roots) do
+				if root.Parent ~= nil or not root:IsA("Folder") or wrappedRootsByName[root.Name] ~= nil then
+					error("Native import returned an invalid payload root")
 				end
+				wrappedRootsByName[root.Name] = root
 			end
 			local prepared = {}
-			local rootIndex = 1
 			local skippedIncomingInstanceCount = 0
 			for groupIndex, group in ipairs(session.groups) do
-				local groupPayloadRoot = if rootFormat == "group"
-					then wrappedRootsByName[group.payloadRootName]
-					else nil
-				if rootFormat == "group" and groupPayloadRoot == nil then
+				local groupPayloadRoot = wrappedRootsByName[group.payloadRootName]
+				if groupPayloadRoot == nil then
 					error("Native import payload group was not found")
 				end
-				local groupRoots = if groupPayloadRoot then groupPayloadRoot:GetChildren() else roots
-				if groupPayloadRoot and #groupRoots ~= group.count then
+				local groupRoots = groupPayloadRoot:GetChildren()
+				if #groupRoots ~= group.count then
 					error("Native import payload group has the wrong root count")
 				end
 				local incoming = table.create(group.count)
 				local incomingByPayloadIndex = table.create(group.count)
 				for index = 1, group.count do
-					local payloadRoot = groupPayloadRoot
-					if rootFormat == "perRoot" then
-						payloadRoot = wrappedRootsByName[group.payloadRootNames[index]]
-						if payloadRoot == nil then
-							error("Native import payload root was not found")
-						end
-						groupRoots = payloadRoot:GetChildren()
-						if #groupRoots ~= 1 then
-							error("Native import payload root has the wrong child count")
-						end
-					end
-					local instance = if payloadRoot
-						then groupRoots[if rootFormat == "perRoot" then 1 else index]
-						else roots[rootIndex]
-					if rootFormat == "plain" then
-						rootIndex += 1
-					end
-					if instance == nil or instance.Parent ~= payloadRoot or instance:IsA("Terrain") then
+					local instance = groupRoots[index]
+					if instance == nil or instance.Parent ~= groupPayloadRoot or instance:IsA("Terrain") then
 						error("Native import returned an invalid root")
 					end
 					incomingByPayloadIndex[index] = instance
-					if payloadRoot then
-						instance.Parent = nil
-					end
+					instance.Parent = nil
 					local protectedCamera = group.target == Workspace
 						and instance:IsA("Camera")
 						and (
@@ -5033,9 +4934,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						incoming[#incoming + 1] = instance
 						detachedRoots[#detachedRoots + 1] = instance
 					end
-					if rootFormat == "perRoot" then
-						payloadRoot:Destroy()
-					end
 				end
 				for _, payloadIndex in ipairs(group.stripPackagePayloads) do
 					local root = incomingByPayloadIndex[payloadIndex]
@@ -5044,9 +4942,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					skippedIncomingInstanceCount += ReferenceOverlay.stripIncomingPackages(root)
 				end
-				if groupPayloadRoot then
-					groupPayloadRoot:Destroy()
-				end
+				groupPayloadRoot:Destroy()
 				prepared[#prepared + 1] = {
 					serviceName = group.serviceName,
 					service = group.service,

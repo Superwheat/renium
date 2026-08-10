@@ -316,6 +316,10 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private refreshPackages(): void {
+    void vscode.commands.executeCommand("renium.packages.refresh").then(undefined, () => undefined);
+  }
+
   public constructor(
     private readonly model: FileExplorerModel,
     private readonly extensionUri: vscode.Uri,
@@ -729,9 +733,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!this.webviewView || !this.webviewReady || response.type !== "rowsWindow") {
       return;
     }
-    for (const row of response.rows ?? []) {
-      this.model.rememberNode(this.nodeFromBackend(row));
-    }
+    this.rememberRows(response);
     this.lastErrorMessage = undefined;
     this.webviewView.webview.postMessage({
       ...response,
@@ -749,9 +751,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     if (!this.webviewView || !this.webviewReady || response.type !== "rowsWindow") {
       return;
     }
-    for (const row of response.rows ?? []) {
-      this.model.rememberNode(this.nodeFromBackend(row));
-    }
+    this.rememberRows(response);
     this.webviewView.webview.postMessage({
       ...response,
       type: "rowsPrefetch",
@@ -762,6 +762,12 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
 
   private hasClipboardInstance(): boolean {
     return !!this.clipboardNodeId && !!this.model.getNode(this.clipboardNodeId);
+  }
+
+  private rememberRows(response: ExplorerBackendResponse): void {
+    for (const row of response.rows ?? []) {
+      this.model.rememberNode(this.nodeFromBackend(row));
+    }
   }
 
   private postClipboardState(): void {
@@ -801,9 +807,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       ) {
         return;
       }
-      for (const row of response.rows ?? []) {
-        this.model.rememberNode(this.nodeFromBackend(row));
-      }
+      this.rememberRows(response);
       this.webviewView.webview.postMessage({
         ...response,
         type: "rowsPrefetch",
@@ -1387,13 +1391,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private async createInstance(parent: FileExplorerNode, className: string, name: string): Promise<void> {
     try {
       const created = await this.model.addInstance(parent, className, name);
-      if (created) {
-        this.referencePreviewId = undefined;
-        this.selectedId = created.treeId;
-        await this.propertiesProvider.show(created);
-      }
-      await this.backend.reloadServices([parent.service]);
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      await this.refreshAfterMutation(created, [parent.service]);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1427,18 +1425,9 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           }
           throw error;
         }
-        void vscode.commands.executeCommand("renium.packages.refresh").then(
-          () => undefined,
-          () => undefined,
-        );
+        this.refreshPackages();
       }
-      if (renamed) {
-        this.referencePreviewId = undefined;
-        this.selectedId = renamed.treeId;
-        await this.propertiesProvider.show(renamed);
-      }
-      await this.backend.reloadServices([loaded.service]);
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      await this.refreshAfterMutation(renamed, [loaded.service]);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to rename instance. ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1470,18 +1459,9 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           }
           throw error;
         }
-        void vscode.commands.executeCommand("renium.packages.refresh").then(
-          () => undefined,
-          () => undefined,
-        );
+        this.refreshPackages();
       }
-      if (moved) {
-        this.referencePreviewId = undefined;
-        this.selectedId = moved.treeId;
-        await this.propertiesProvider.show(moved);
-      }
-      await this.backend.reloadServices(Array.from(new Set([loaded.service, loadedTarget.service])));
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      await this.refreshAfterMutation(moved, [loaded.service, loadedTarget.service]);
       return moved;
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to move instance. ${error instanceof Error ? error.message : String(error)}`);
@@ -1510,13 +1490,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
     try {
       const created = await this.model.cloneInstance(source, parent);
-      if (created) {
-        this.referencePreviewId = undefined;
-        this.selectedId = created.treeId;
-        await this.propertiesProvider.show(created);
-      }
-      await this.backend.reloadServices([parent.service]);
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      await this.refreshAfterMutation(created, [parent.service]);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to paste instance. ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1532,16 +1506,23 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
     try {
       const created = await this.model.cloneInstance(node, parent);
-      if (created) {
-        this.referencePreviewId = undefined;
-        this.selectedId = created.treeId;
-        await this.propertiesProvider.show(created);
-      }
-      await this.backend.reloadServices([node.service]);
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      await this.refreshAfterMutation(created, [node.service]);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to duplicate instance. ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private async refreshAfterMutation(
+    selected: FileExplorerNode | undefined,
+    services: string[],
+  ): Promise<void> {
+    if (selected) {
+      this.referencePreviewId = undefined;
+      this.selectedId = selected.treeId;
+      await this.propertiesProvider.show(selected);
+    }
+    await this.backend.reloadServices(Array.from(new Set(services)));
+    await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
   }
 
   private readHistoryEntries(limit = 5000): ExplorerHistoryEntry[] {

@@ -16,7 +16,7 @@ pub(super) const DAEMON_CONTROL_QUEUE_TIMEOUT: Duration = Duration::from_secs(10
 pub(super) const DAEMON_DISCOVERY_MAX_AGE_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(super) const DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS: u128 = 5 * 60 * 1000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(super) enum BoundedLineRead {
     Eof,
     Line,

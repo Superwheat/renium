@@ -20,7 +20,8 @@ use super::bytecode_query::{
 };
 use super::command_line::{
     BytecodeApplyPropertyBatchArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
-    BytecodeSetPropertyArgs, BytecodeSetSourceArgs, FindArgs, InspectArgs, TreeArgs,
+    BytecodeSetPropertyArgs, BytecodeSetSourceArgs, FindArgs, HighLevelTargetArgs, InspectArgs,
+    TreeArgs,
 };
 use super::daemon_control::is_process_alive;
 use super::editor_document::is_protected_starter_player_container;
@@ -31,19 +32,19 @@ use super::editor_paths::{
 };
 use super::editor_sync::is_lua_source_class;
 use super::file_io::{
-    absolutize_under, case_folded_path_key, exact_path_key, service_settings_path,
-    set_path_readonly, validate_filesystem_instance_name, write_bytes_if_changed, write_utf8_file,
+    absolutize_under, case_folded_path_key, exact_path_key, read_file_if_present,
+    service_settings_path, set_path_readonly, validate_filesystem_instance_name,
+    write_bytes_if_changed, write_utf8_file,
 };
 use super::instance_api::{self, InstanceQuery, PropertyScope};
 use super::output::{OutputMode, print_json_output};
 use super::package_links::{LinkEnforcement, build_loaded_project_link_enforcement};
-use super::place_packages::parse_bracket_path_segments;
 use super::project_commands::load_structural_project;
 use super::project_config;
 use super::project_layout::configured_project_layout;
 use super::rbx_model::canonicalize_settings_reference_documents;
 use super::settings_bytecode::{
-    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
 };
 use super::settings_tree::{editor_service_root_index, settings_children_by_parent};
 use super::snapshot_export::ExportProjectStage;
@@ -53,7 +54,6 @@ use super::timing::current_millis;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BytecodePropertyBatchEntry {
     service: String,
-    #[serde(default)]
     settings_id: Option<String>,
     #[serde(default)]
     class_name: String,
@@ -216,9 +216,9 @@ fn high_level_context(
 }
 
 fn high_level_service_and_value(
-    explicit_service: Option<String>,
-    first: Option<String>,
-    second: Option<String>,
+    explicit_service: Option<&str>,
+    first: Option<&str>,
+    second: Option<&str>,
     command: &str,
 ) -> Result<(String, Option<String>)> {
     if let Some(service) = explicit_service.filter(|value| !value.trim().is_empty()) {
@@ -228,18 +228,20 @@ fn high_level_service_and_value(
             {
                 Some(format!("{} {}", first.trim(), second.trim()))
             }
-            (Some(first), _) if !first.trim().is_empty() => Some(first),
-            (_, Some(second)) if !second.trim().is_empty() => Some(second),
+            (Some(first), _) if !first.trim().is_empty() => Some(first.to_string()),
+            (_, Some(second)) if !second.trim().is_empty() => Some(second.to_string()),
             _ => None,
         };
-        return Ok((service, value));
+        return Ok((service.to_string(), value));
     }
 
     let service = first
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("Provide a service: {command} <SERVICE> [TARGET_OR_QUERY]"))?;
-    let value = second.filter(|value| !value.trim().is_empty());
-    Ok((service, value))
+    let value = second
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    Ok((service.to_string(), value))
 }
 
 pub(super) fn high_level_split_path(raw: &str) -> Vec<String> {
@@ -250,13 +252,13 @@ pub(super) fn high_level_split_path(raw: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn high_level_path_segments(raw: &str, service: &str) -> Result<Vec<String>> {
+pub(super) fn parse_path_segments(raw: &str) -> Result<Vec<String>> {
     let raw = raw.trim();
     if raw.is_empty() {
         bail!("Path target cannot be empty");
     }
 
-    let mut segments = if raw.starts_with('[') {
+    let segments = if raw.starts_with('[') {
         parse_bracket_path_segments(raw).with_context(|| format!("Invalid path JSON: {raw}"))?
     } else {
         high_level_split_path(raw)
@@ -264,6 +266,32 @@ pub(super) fn high_level_path_segments(raw: &str, service: &str) -> Result<Vec<S
     if segments.is_empty() {
         bail!("Path target cannot be empty");
     }
+    Ok(segments)
+}
+
+pub(super) fn parse_bracket_path_segments(raw: &str) -> Result<Vec<String>> {
+    if let Ok(segments) = serde_json::from_str::<Vec<String>>(raw) {
+        return Ok(segments);
+    }
+    let inner = raw
+        .trim()
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .context("Path must start with '[' and end with ']'")?;
+    let segments = inner
+        .split(',')
+        .map(|segment| segment.trim().trim_matches(['"', '\'']))
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        bail!("Path cannot be empty");
+    }
+    Ok(segments)
+}
+
+pub(super) fn high_level_path_segments(raw: &str, service: &str) -> Result<Vec<String>> {
+    let mut segments = parse_path_segments(raw)?;
     if segments
         .first()
         .is_none_or(|segment| segment.as_str() != service)
@@ -379,14 +407,6 @@ pub(super) fn resolve_bytecode_cli_settings_file(
     )
 }
 
-pub(super) fn resolve_bytecode_write_settings_file(
-    settings_file: Option<&Path>,
-    service_or_file: Option<&str>,
-    explicit_service: Option<&str>,
-) -> Result<(PathBuf, String)> {
-    resolve_bytecode_cli_settings_file(settings_file, service_or_file, explicit_service)
-}
-
 pub(super) fn resolve_bytecode_read_input(
     settings_file: Option<&Path>,
     service_or_file: Option<&str>,
@@ -424,14 +444,6 @@ pub(super) fn parse_bytecode_path_segments(
     }
 }
 
-pub(super) fn parse_bytecode_path_ordinals(raw: &str, has_path: bool) -> Result<Vec<usize>> {
-    if has_path {
-        high_level_path_ordinals(Some(raw))
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 pub(super) struct ResolvedBytecodeSelector {
     pub index: usize,
     pub path_segments: Option<Vec<String>>,
@@ -445,8 +457,11 @@ pub(super) fn resolve_bytecode_selector(
 ) -> Result<ResolvedBytecodeSelector> {
     let path_segments =
         parse_bytecode_path_segments(selector.path_segments_json.as_deref(), service)?;
-    let path_ordinals =
-        parse_bytecode_path_ordinals(&selector.path_ordinals_json, path_segments.is_some())?;
+    let path_ordinals = if path_segments.is_some() {
+        high_level_path_ordinals(Some(&selector.path_ordinals_json))?
+    } else {
+        Vec::new()
+    };
     let index = resolve_bytecode_instance_index(
         document,
         BytecodeInstanceTarget {
@@ -480,10 +495,6 @@ pub(super) fn ensure_bytecode_service_path_segments(
         out.extend(path_segments.iter().cloned());
         out
     }
-}
-
-fn high_level_path_like(raw: &str) -> bool {
-    raw.starts_with('[') || raw.chars().any(|ch| matches!(ch, '/' | '\\' | '.'))
 }
 
 fn high_level_match_path_candidates(
@@ -521,6 +532,14 @@ fn high_level_match_class_candidates(
         .enumerate()
         .filter_map(|(index, instance)| (instance.class_name == class_name).then_some(index))
         .collect()
+}
+
+fn high_level_candidate_resolution(candidates: Vec<usize>) -> Result<HighLevelTargetResolution> {
+    match candidates.len() {
+        0 => bail!("No matching instance"),
+        1 => Ok(HighLevelTargetResolution::Found(candidates[0])),
+        _ => Ok(HighLevelTargetResolution::Ambiguous(candidates)),
+    }
 }
 
 fn high_level_ambiguity_nodes(
@@ -619,6 +638,7 @@ fn high_level_resolve_simple_target(
     }
 }
 
+#[derive(Clone, Copy)]
 struct HighLevelTarget<'a> {
     index: Option<usize>,
     settings_id: Option<&'a str>,
@@ -628,6 +648,22 @@ struct HighLevelTarget<'a> {
     ordinals: Option<&'a str>,
     positional: Option<&'a str>,
     default_to_root: bool,
+}
+
+fn high_level_target<'a>(
+    args: &'a HighLevelTargetArgs,
+    positional: Option<&'a str>,
+) -> HighLevelTarget<'a> {
+    HighLevelTarget {
+        index: args.index,
+        settings_id: args.settings_id.as_deref(),
+        name: args.name.as_deref(),
+        class_name: args.class_name.as_deref(),
+        path: args.path.as_deref(),
+        ordinals: args.ords.as_deref(),
+        positional,
+        default_to_root: true,
+    }
 }
 
 impl HighLevelTarget<'_> {
@@ -656,7 +692,11 @@ fn high_level_target_resolution(
             bail!("Path target cannot be combined with another selector");
         }
         let ordinals = high_level_path_ordinals(target.ordinals)?;
-        if path.is_some() || !ordinals.is_empty() || high_level_path_like(raw_target) {
+        if path.is_some()
+            || !ordinals.is_empty()
+            || raw_target.starts_with('[')
+            || raw_target.chars().any(|ch| matches!(ch, '/' | '\\' | '.'))
+        {
             let segments = high_level_path_segments(raw_target, &ctx.service)?;
             return high_level_resolve_path_candidates(ctx, &segments, &ordinals);
         }
@@ -697,21 +737,11 @@ fn high_level_target_resolution(
     }
 
     if let Some(name) = target.name.filter(|value| !value.is_empty()) {
-        let candidates = high_level_match_name_candidates(ctx, name);
-        return match candidates.len() {
-            0 => Err(anyhow::anyhow!("No matching instance")),
-            1 => Ok(HighLevelTargetResolution::Found(candidates[0])),
-            _ => Ok(HighLevelTargetResolution::Ambiguous(candidates)),
-        };
+        return high_level_candidate_resolution(high_level_match_name_candidates(ctx, name));
     }
 
     if let Some(class_name) = target.class_name.filter(|value| !value.is_empty()) {
-        let candidates = high_level_match_class_candidates(ctx, class_name);
-        return match candidates.len() {
-            0 => Err(anyhow::anyhow!("No matching instance")),
-            1 => Ok(HighLevelTargetResolution::Found(candidates[0])),
-            _ => Ok(HighLevelTargetResolution::Ambiguous(candidates)),
-        };
+        return high_level_candidate_resolution(high_level_match_class_candidates(ctx, class_name));
     }
 
     bail!("Provide a target, --path, --index, --settings-id, --name, or --class-name");
@@ -737,10 +767,26 @@ fn high_level_visible_tree(
     visible
 }
 
+fn high_level_response(ctx: HighLevelBytecodeContext, mode: OutputMode) -> Map<String, Value> {
+    let mut response = Map::new();
+    insert_top_field(
+        &mut response,
+        mode,
+        "settingsFile",
+        json!(ctx.settings_file),
+    );
+    insert_top_field(&mut response, mode, "service", Value::String(ctx.service));
+    response
+}
+
 pub(super) fn find_command(args: FindArgs) -> Result<()> {
-    let (service, query_text) =
-        high_level_service_and_value(args.service, args.query_or_service, args.query, "find")?;
-    let ctx = high_level_context(&args.project_root, &args.src_root, &service)?;
+    let (service, query_text) = high_level_service_and_value(
+        args.service.as_deref(),
+        args.query_or_service.as_deref(),
+        args.query.as_deref(),
+        "find",
+    )?;
+    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let properties = parse_property_predicates(&args.properties)?;
@@ -767,7 +813,7 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         bail!("Provide a query or filter: find <SERVICE> <QUERY> or find <SERVICE> --class Script");
     }
 
-    let structured_matches = if has_structured_filters {
+    let structured_matches = has_structured_filters.then(|| {
         let query = InstanceQuery {
             name: args.name,
             class_name: args.class_name,
@@ -776,14 +822,10 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
             properties,
             attributes,
         };
-        Some(
-            instance_api::find_instances(&ctx.document, &query)
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        )
-    } else {
-        None
-    };
+        instance_api::find_instances(&ctx.document, &query)
+            .into_iter()
+            .collect::<HashSet<_>>()
+    });
 
     let limit = if args.all { 0 } else { args.limit };
     let mut match_indices = Vec::new();
@@ -819,36 +861,24 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         return print_json_output(&Value::Array(matches), args.pretty);
     }
 
-    let mut response = Map::new();
-    insert_top_field(
-        &mut response,
-        mode,
-        "settingsFile",
-        json!(ctx.settings_file),
-    );
-    insert_top_field(&mut response, mode, "service", Value::String(ctx.service));
+    let mut response = high_level_response(ctx, mode);
     insert_top_field(&mut response, mode, "matches", Value::Array(matches));
     print_json_output(&Value::Object(response), args.pretty)
 }
 
 pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
-    let (service, target) =
-        high_level_service_and_value(args.service, args.service_or_target, args.target, "tree")?;
-    let ctx = high_level_context(&args.project_root, &args.src_root, &service)?;
+    let (service, positional) = high_level_service_and_value(
+        args.target.service.as_deref(),
+        args.target.service_or_target.as_deref(),
+        args.target.target.as_deref(),
+        "tree",
+    )?;
+    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let root_index = match high_level_target_resolution(
         &ctx,
-        HighLevelTarget {
-            index: args.index,
-            settings_id: args.settings_id.as_deref(),
-            name: args.name.as_deref(),
-            class_name: args.class_name.as_deref(),
-            path: args.path.as_deref(),
-            ordinals: args.ords.as_deref(),
-            positional: target.as_deref(),
-            default_to_root: true,
-        },
+        high_level_target(&args.target, positional.as_deref()),
     )? {
         HighLevelTargetResolution::Found(index) => index,
         HighLevelTargetResolution::Ambiguous(indices) => {
@@ -856,9 +886,14 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         }
     };
     let visible_indices = high_level_visible_tree(&ctx.children_by_parent, root_index, args.depth);
-    let projection = ctx.projection(mode, fields.as_ref());
-    let nodes = (0..ctx.document.instances.len())
+    let node_indices = (0..ctx.document.instances.len())
         .filter(|index| visible_indices.contains(index))
+        .take(args.limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
+    let visible_indices = node_indices.iter().copied().collect::<HashSet<_>>();
+    let projection = ctx.projection(mode, fields.as_ref());
+    let nodes = node_indices
+        .into_iter()
         .map(|index| projection.search_node(index, &visible_indices))
         .collect::<Vec<_>>();
     if mode.uses_short_keys() {
@@ -872,37 +907,25 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         .map(|instance| vec![Value::String(instance.settings_id.clone())])
         .unwrap_or_default();
 
-    let mut response = Map::new();
-    insert_top_field(
-        &mut response,
-        mode,
-        "settingsFile",
-        json!(ctx.settings_file),
-    );
-    insert_top_field(&mut response, mode, "service", Value::String(ctx.service));
+    let mut response = high_level_response(ctx, mode);
     insert_top_field(&mut response, mode, "rootIds", Value::Array(root_ids));
     insert_top_field(&mut response, mode, "nodes", Value::Array(nodes));
     print_json_output(&Value::Object(response), args.pretty)
 }
 
 pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
-    let (service, target) =
-        high_level_service_and_value(args.service, args.service_or_target, args.target, "inspect")?;
-    let ctx = high_level_context(&args.project_root, &args.src_root, &service)?;
+    let (service, positional) = high_level_service_and_value(
+        args.target.service.as_deref(),
+        args.target.service_or_target.as_deref(),
+        args.target.target.as_deref(),
+        "inspect",
+    )?;
+    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let index = match high_level_target_resolution(
         &ctx,
-        HighLevelTarget {
-            index: args.index,
-            settings_id: args.settings_id.as_deref(),
-            name: args.name.as_deref(),
-            class_name: args.class_name.as_deref(),
-            path: args.path.as_deref(),
-            ordinals: args.ords.as_deref(),
-            positional: target.as_deref(),
-            default_to_root: true,
-        },
+        high_level_target(&args.target, positional.as_deref()),
     )? {
         HighLevelTargetResolution::Found(index) => index,
         HighLevelTargetResolution::Ambiguous(indices) => {
@@ -915,8 +938,8 @@ pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
 
 pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()> {
     let (settings_file, document, service) = resolve_bytecode_read_input(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         None,
     )?;
     let scope = parse_property_scope(&args.scope)?;
@@ -948,9 +971,9 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     if args.property.eq_ignore_ascii_case("classname") {
         bail!("ClassName is read-only");
     }
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         None,
     )?;
     let scope = parse_property_scope(&args.scope)?;
@@ -1007,27 +1030,17 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     if let (Some(before_document), Some(source_paths_before)) =
         (before_document.as_ref(), source_paths_before.as_ref())
     {
-        let mut source_paths_after =
-            build_editor_source_paths_by_index(&document, &service, service_dir);
-        preserve_source_extensions(
+        collect_source_path_updates(
             before_document,
             source_paths_before,
             &document,
-            &mut source_paths_after,
-        );
-        collect_source_path_moves_by_settings_id(
-            before_document,
-            source_paths_before,
-            &document,
-            &source_paths_after,
+            &service,
+            service_dir,
             &mut writes,
             &mut removals,
         )?;
     }
-    writes.insert(
-        settings_file.clone(),
-        settings_document_bytes(&document, &settings_file)?,
-    );
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
     if structural_reference_update {
         let mut reference_documents = BTreeMap::new();
         let mut reference_files = BTreeMap::new();
@@ -1035,7 +1048,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             let service_name = path
                 .parent()
                 .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().to_string())
+                .map(|name| name.to_string_lossy().into_owned())
                 .context("Service settings path has no service directory")?;
             let value = if *path == settings_file {
                 document.clone()
@@ -1050,7 +1063,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             let path = &reference_files[&changed_service];
             writes.insert(
                 path.clone(),
-                settings_document_bytes(&reference_documents[&changed_service], path)?,
+                encode_settings_bytecode(&reference_documents[&changed_service])?,
             );
         }
     }
@@ -1292,15 +1305,12 @@ fn evaluate_property_batch_filters(
     let path = project_config::filter_path_segments(path_segments);
     let fields =
         project_config::filter_candidate_fields(&instance.properties, &instance.attributes);
-    let candidate = project_config::FilterCandidate {
-        id: &instance.settings_id,
-        path: &path,
-        name: &instance.name,
-        class: &instance.class_name,
-        tags: &fields.tags,
-        attributes: &fields.attributes,
-        properties: &fields.properties,
-    };
+    let candidate = fields.candidate(
+        &instance.settings_id,
+        &path,
+        &instance.name,
+        &instance.class_name,
+    );
     let instance_allowed = project_config::filter_allows_instance(
         &loaded.project.filters,
         filter_direction,
@@ -1602,7 +1612,7 @@ fn property_batch_file_mutations(
         if state.settings_changed {
             writes.insert(
                 state.settings_file.clone(),
-                settings_document_bytes(&state.document, &state.settings_file)?,
+                encode_settings_bytecode(&state.document)?,
             );
         }
     }
@@ -1631,7 +1641,7 @@ fn apply_property_batch_to_root(
         for entry in fs::read_dir(root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() && service_settings_path(&entry.path()).is_file() {
-                loaded_services.insert(entry.file_name().to_string_lossy().to_string());
+                loaded_services.insert(entry.file_name().to_string_lossy().into_owned());
             }
         }
     }
@@ -1674,11 +1684,7 @@ fn apply_property_batch_to_root(
     let (writes, removals, source_paths) =
         property_batch_file_mutations(&documents, &allowed_entries)?;
     apply_file_mutations(&writes, &removals)?;
-    let changed_paths = writes
-        .keys()
-        .chain(removals.iter())
-        .cloned()
-        .collect::<Vec<_>>();
+    let changed_paths = file_mutation_paths(&writes, &removals);
     Ok(BytecodePropertyBatchResult {
         applied: allowed_entries.len(),
         filtered,
@@ -1688,9 +1694,9 @@ fn apply_property_batch_to_root(
 }
 
 pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         args.service.as_deref(),
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
@@ -1737,7 +1743,7 @@ pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
     let source_paths = build_editor_source_paths_by_index(&document, &service, service_dir);
     let source_path = source_paths
         .get(index)
-        .and_then(|path| path.clone())
+        .and_then(std::clone::Clone::clone)
         .ok_or_else(|| {
             anyhow::anyhow!("Could not resolve source file path for {}", instance.name)
         })?;
@@ -1754,44 +1760,36 @@ pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
     )
 }
 
-pub(super) fn settings_document_bytes(
-    document: &SettingsBytecode,
-    settings_file: &Path,
-) -> Result<Vec<u8>> {
-    let temporary = settings_file.with_file_name(format!(
-        ".{}.{}-{}.renium-encode",
-        settings_file
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("settings"),
-        std::process::id(),
-        current_millis()
-    ));
-    document.write_file(&temporary)?;
-    let result =
-        fs::read(&temporary).with_context(|| format!("Failed to read {}", temporary.display()));
-    let _ = fs::remove_file(&temporary);
-    result
-}
-
 fn collect_source_path_moves(
     before: &[Option<PathBuf>],
     after: &[Option<PathBuf>],
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     removals: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for (from, to) in before.iter().zip(after) {
-        let (Some(from), Some(to)) = (from, to) else {
-            continue;
-        };
+    collect_source_path_move_pairs(
+        before
+            .iter()
+            .zip(after)
+            .filter_map(|(from, to)| Some((from.as_deref()?, to.as_deref()?))),
+        writes,
+        removals,
+    )
+}
+
+fn collect_source_path_move_pairs<'a>(
+    pairs: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    removals: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for (from, to) in pairs {
         if exact_path_key(from) == exact_path_key(to) || !from.is_file() {
             continue;
         }
         writes.insert(
-            to.clone(),
+            to.to_path_buf(),
             fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?,
         );
-        removals.push(from.clone());
+        removals.push(from.to_path_buf());
     }
     removals.retain(|path| {
         !writes
@@ -1821,27 +1819,59 @@ fn preserve_source_extensions_by_index(before: &[Option<PathBuf>], after: &mut [
     }
 }
 
+fn source_paths_by_settings_id<'a>(
+    document: &'a SettingsBytecode,
+    paths: &'a [Option<PathBuf>],
+) -> HashMap<&'a str, &'a Path> {
+    document
+        .instances
+        .iter()
+        .zip(paths)
+        .filter_map(|(instance, path)| {
+            path.as_deref()
+                .map(|path| (instance.settings_id.as_str(), path))
+        })
+        .collect()
+}
+
 pub(super) fn preserve_source_extensions(
     before_document: &SettingsBytecode,
     before: &[Option<PathBuf>],
     after_document: &SettingsBytecode,
     after: &mut [Option<PathBuf>],
 ) {
-    let before_by_id = before_document
-        .instances
-        .iter()
-        .zip(before)
-        .filter_map(|(instance, path)| {
-            path.as_ref()
-                .map(|path| (instance.settings_id.as_str(), path))
-        })
-        .collect::<HashMap<_, _>>();
+    let before_by_id = source_paths_by_settings_id(before_document, before);
     for (instance, path) in after_document.instances.iter().zip(after) {
-        let (Some(from), Some(to)) = (before_by_id.get(instance.settings_id.as_str()), path) else {
+        let (Some(from), Some(to)) = (
+            before_by_id.get(instance.settings_id.as_str()).copied(),
+            path,
+        ) else {
             continue;
         };
         preserve_source_path_extension(from, to);
     }
+}
+
+pub(super) fn collect_source_path_updates(
+    before_document: &SettingsBytecode,
+    before: &[Option<PathBuf>],
+    after_document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    removals: &mut Vec<PathBuf>,
+) -> Result<Vec<Option<PathBuf>>> {
+    let mut after = build_editor_source_paths_by_index(after_document, service, service_dir);
+    preserve_source_extensions(before_document, before, after_document, &mut after);
+    collect_source_path_moves_by_settings_id(
+        before_document,
+        before,
+        after_document,
+        &after,
+        writes,
+        removals,
+    )?;
+    Ok(after)
 }
 
 pub(super) fn collect_source_path_moves_by_settings_id(
@@ -1852,36 +1882,21 @@ pub(super) fn collect_source_path_moves_by_settings_id(
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     removals: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let before_by_id = before_document
-        .instances
-        .iter()
-        .zip(before)
-        .filter_map(|(instance, path)| {
-            path.as_ref()
-                .map(|path| (instance.settings_id.as_str(), path))
-        })
-        .collect::<HashMap<_, _>>();
-    for (instance, to) in after_document.instances.iter().zip(after) {
-        let (Some(from), Some(to)) = (before_by_id.get(instance.settings_id.as_str()), to) else {
-            continue;
-        };
-        if exact_path_key(from) == exact_path_key(to) || !from.is_file() {
-            continue;
-        }
-        writes.insert(
-            to.clone(),
-            fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?,
-        );
-        removals.push((*from).clone());
-    }
-    removals.retain(|path| {
-        !writes
-            .keys()
-            .any(|write| exact_path_key(write) == exact_path_key(path))
-    });
-    removals.sort_by_key(|path| exact_path_key(path));
-    removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
-    Ok(())
+    let before_by_id = source_paths_by_settings_id(before_document, before);
+    collect_source_path_move_pairs(
+        after_document
+            .instances
+            .iter()
+            .zip(after)
+            .filter_map(|(instance, to)| {
+                Some((
+                    before_by_id.get(instance.settings_id.as_str()).copied()?,
+                    to.as_deref()?,
+                ))
+            }),
+        writes,
+        removals,
+    )
 }
 
 pub(super) fn apply_file_mutations(
@@ -1889,6 +1904,13 @@ pub(super) fn apply_file_mutations(
     removals: &[PathBuf],
 ) -> Result<()> {
     apply_file_mutations_with_permissions(writes, removals, &BTreeMap::new())
+}
+
+pub(super) fn file_mutation_paths(
+    writes: &BTreeMap<PathBuf, Vec<u8>>,
+    removals: &[PathBuf],
+) -> Vec<PathBuf> {
+    writes.keys().chain(removals).cloned().collect()
 }
 
 pub(super) fn apply_file_mutations_with_permissions(
@@ -1938,13 +1960,7 @@ pub(super) fn apply_file_mutations_with_permissions(
     paths.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     let originals = paths
         .iter()
-        .map(|path| {
-            if path.is_file() {
-                fs::read(path).map(Some)
-            } else {
-                Ok(None)
-            }
-        })
+        .map(|path| read_file_if_present(path))
         .collect::<io::Result<Vec<_>>>()?;
     let mut permission_paths = paths.clone();
     for (from, to, _, _) in &case_moves {
@@ -2096,9 +2112,8 @@ pub(super) struct SettingsFileLock {
 
 impl Drop for SettingsFileLock {
     fn drop(&mut self) {
-        let still_ours = fs::read_to_string(&self.path)
-            .map(|content| content.trim() == self.token)
-            .unwrap_or(false);
+        let still_ours =
+            fs::read_to_string(&self.path).is_ok_and(|content| content.trim() == self.token);
         if still_ours {
             let _ = fs::remove_file(&self.path);
         }
@@ -2109,7 +2124,7 @@ pub(super) fn missing_service_store_error(settings_file: &Path) -> anyhow::Error
     let service = settings_file
         .parent()
         .and_then(Path::file_name)
-        .map(|name| name.to_string_lossy().to_string())
+        .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty());
     match service {
         Some(service) => anyhow::anyhow!(
@@ -2135,14 +2150,12 @@ pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &s
     };
     let service = service_hint.trim();
     if !service.is_empty() {
-        document.instances.push(SettingsBytecodeInstance {
-            settings_id: "editor:0".to_string(),
-            name: service.to_string(),
-            class_name: service.to_string(),
-            parent_index: None,
-            properties: Map::new(),
-            attributes: Map::new(),
-        });
+        document.instances.push(SettingsBytecodeInstance::new(
+            "editor:0".to_string(),
+            service.to_string(),
+            service.to_string(),
+            None,
+        ));
     }
     document
         .write_file(settings_file)
@@ -2185,8 +2198,7 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
                         .modified()
                         .ok()
                         .and_then(|modified| modified.elapsed().ok())
-                        .map(|age| age > Duration::from_secs(30))
-                        .unwrap_or(false)
+                        .is_some_and(|age| age > Duration::from_secs(30))
                 {
                     let owner_alive = fs::read_to_string(&lock_path)
                         .ok()
@@ -2196,8 +2208,7 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
                                 .next()
                                 .and_then(|pid| pid.parse::<u32>().ok())
                         })
-                        .map(is_process_alive)
-                        .unwrap_or(false);
+                        .is_some_and(is_process_alive);
                     if !owner_alive {
                         let _ = fs::remove_file(&lock_path);
                     }

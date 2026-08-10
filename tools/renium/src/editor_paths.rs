@@ -21,7 +21,6 @@ pub(super) fn script_file_names(class_name: &str) -> Option<(&'static str, &'sta
 }
 
 pub(super) fn project_script_file_names(
-    _project_root: &Path,
     parent_dir: &Path,
     fs_stem: &str,
     has_children: bool,
@@ -71,6 +70,22 @@ pub(super) fn project_script_file_names(
     ))
 }
 
+fn project_script_path(
+    parent_dir: &Path,
+    fs_stem: &str,
+    has_children: bool,
+    class_name: &str,
+    properties: &Map<String, Value>,
+) -> Option<PathBuf> {
+    let (source_file_name, leaf_suffix) =
+        project_script_file_names(parent_dir, fs_stem, has_children, class_name, properties)?;
+    Some(if has_children {
+        parent_dir.join(fs_stem).join(source_file_name)
+    } else {
+        parent_dir.join(format!("{fs_stem}{leaf_suffix}"))
+    })
+}
+
 pub(super) fn script_file_names_for_run_context(
     class_name: &str,
     run_context: Option<&str>,
@@ -118,12 +133,10 @@ pub(super) fn build_editor_source_path_map(
         return HashMap::new();
     };
     let mut map = HashMap::new();
-    let naming_root = service_dir.parent().unwrap_or(service_dir);
     let mut walk = EditorSourceMapWalk {
         document,
         children_by_parent: &children_by_parent,
         service,
-        naming_root,
         map: &mut map,
         path_segments: vec![document.instances[root_index].name.clone()],
         path_ordinals: vec![1],
@@ -232,11 +245,9 @@ pub(super) fn build_editor_source_paths_by_index_with_children(
     let Some(root_index) = editor_service_root_index(document, service) else {
         return out;
     };
-    let naming_root = service_dir.parent().unwrap_or(service_dir);
     let mut walk = EditorSourcePathWalk {
         document,
         children_by_parent,
-        naming_root,
         contains_source: &contains_source,
         out: &mut out,
     };
@@ -247,7 +258,6 @@ pub(super) fn build_editor_source_paths_by_index_with_children(
 struct EditorSourcePathWalk<'a> {
     document: &'a SettingsBytecode,
     children_by_parent: &'a [Vec<usize>],
-    naming_root: &'a Path,
     contains_source: &'a [bool],
     out: &'a mut [Option<PathBuf>],
 }
@@ -271,24 +281,16 @@ impl EditorSourcePathWalk<'_> {
         let child_indices = self
             .children_by_parent
             .get(index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
         let has_children = !child_indices.is_empty();
-
-        let source_file = project_script_file_names(
-            self.naming_root,
+        let source_path = project_script_path(
             parent_dir,
             fs_stem,
             has_children,
             &instance.class_name,
             &instance.properties,
         );
-        if let Some((source_file_name, leaf_suffix)) = source_file {
-            let source_path = if has_children {
-                parent_dir.join(fs_stem).join(source_file_name)
-            } else {
-                parent_dir.join(format!("{fs_stem}{leaf_suffix}"))
-            };
+        if let Some(source_path) = source_path {
             if let Some(slot) = self.out.get_mut(index) {
                 *slot = Some(source_path);
             }
@@ -305,7 +307,6 @@ struct EditorSourceMapWalk<'a> {
     document: &'a SettingsBytecode,
     children_by_parent: &'a [Vec<usize>],
     service: &'a str,
-    naming_root: &'a Path,
     map: &'a mut HashMap<String, EditorSourceTarget>,
     path_segments: Vec<String>,
     path_ordinals: Vec<usize>,
@@ -333,25 +334,17 @@ impl EditorSourceMapWalk<'_> {
         let child_indices = self
             .children_by_parent
             .get(index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[][..], Vec::as_slice);
         let has_children = !child_indices.is_empty();
-
-        let source_file = project_script_file_names(
-            self.naming_root,
+        let source_path = project_script_path(
             parent_dir,
             fs_stem,
             has_children,
             &instance.class_name,
             &instance.properties,
         );
-        let is_source = source_file.is_some();
-        if let Some((source_file_name, leaf_suffix)) = source_file {
-            let source_path = if has_children {
-                parent_dir.join(fs_stem).join(source_file_name)
-            } else {
-                parent_dir.join(format!("{fs_stem}{leaf_suffix}"))
-            };
+        let is_source = source_path.is_some();
+        if let Some(source_path) = source_path {
             self.map.insert(
                 path_key(&source_path),
                 EditorSourceTarget {
@@ -369,16 +362,6 @@ impl EditorSourceMapWalk<'_> {
         self.path_segments.pop();
         self.path_ordinals.pop();
     }
-}
-
-pub(super) fn build_editor_instance_path_segments(
-    document: &SettingsBytecode,
-    service: &str,
-) -> Vec<Option<Vec<String>>> {
-    build_editor_instance_paths(document, service)
-        .into_iter()
-        .map(|path| path.map(|path| path.path_segments))
-        .collect()
 }
 
 pub(super) type EditorPathSegments = Vec<Option<Vec<String>>>;
@@ -515,7 +498,7 @@ pub(super) fn infer_editor_source_path_spec_in_service(
     let mut components = relative
         .components()
         .filter_map(|component| match component {
-            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -545,13 +528,6 @@ pub(super) fn infer_editor_source_path_spec_in_service(
         parent_components,
         path_segments,
     })
-}
-
-pub(crate) fn infer_source_class_and_leaf_name(
-    file_name: &str,
-) -> Option<(&'static str, Option<String>)> {
-    infer_source_script(file_name, &project_config::ProjectScriptNaming::default())
-        .map(|(class_name, leaf, _)| (class_name, leaf))
 }
 
 pub(crate) fn infer_source_script(
@@ -605,7 +581,7 @@ pub(super) fn service_from_changed_path(src_root: &Path, changed_path: &Path) ->
     if let Ok(relative) = changed_norm.strip_prefix(&src_norm) {
         let mut components = relative.components();
         return match components.next()? {
-            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
             _ => None,
         };
     }

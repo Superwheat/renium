@@ -546,11 +546,8 @@ local function buildReviewTree(summaryRows, groups, helpers)
 	for _, row in ipairs(summaryRows) do
 		local serviceName = tostring(row.service or "")
 		local count = tonumber(row.count) or 0
-		local note = string.format(
-			"%d instances%s",
-			count,
-			row.allowDeletes == true and " · may remove instances" or ""
-		)
+		local note =
+			string.format("%d instances%s", count, row.allowDeletes == true and " · may remove instances" or "")
 		local node = newReviewNode("Reconcile " .. serviceName, serviceName, nil)
 		node.summary = true
 		node.note = note
@@ -602,17 +599,14 @@ local function buildReviewTree(summaryRows, groups, helpers)
 		local desiredParentNode = node
 		for i = 2, #segments do
 			local name = tostring(segments[i])
-			local ordinal = if type(group.pathOrdinals) == "table"
-				then tonumber(group.pathOrdinals[i]) or 1
-				else 1
+			local ordinal = if type(group.pathOrdinals) == "table" then tonumber(group.pathOrdinals[i]) or 1 else 1
 			local key = name .. "\1" .. tostring(ordinal)
 			local child = node.childByKey[key]
 			if not child then
 				local liveChild = i == #segments and resolvedInstance or findOrdinalChild(node.instance, name, ordinal)
 				local className = if liveChild
 					then liveChild.ClassName
-					elseif i == #segments
-					then tostring(group.className or "Folder")
+					elseif i == #segments then tostring(group.className or "Folder")
 					else "Folder"
 				child = newReviewNode(name, className, liveChild, ordinal)
 				node.childByKey[key] = child
@@ -673,11 +667,13 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				table.insert(node.props, {
 					name = "Parent",
 					typeName = "Instance",
-					oldText = resolvedInstance.Parent ~= nil and formatInstancePath(resolvedInstance.Parent) or "Not set",
+					oldText = resolvedInstance.Parent ~= nil and formatInstancePath(resolvedInstance.Parent)
+						or "Not set",
 					newText = formatInstancePath(desiredParent),
 				})
 			elseif desiredParent == nil and #segments > 1 then
-				local currentParentPath = resolvedInstance.Parent ~= nil and formatInstancePath(resolvedInstance.Parent) or "Not set"
+				local currentParentPath = resolvedInstance.Parent ~= nil and formatInstancePath(resolvedInstance.Parent)
+					or "Not set"
 				local desiredParentPath = formatStructuredPath(segments, group.pathOrdinals, #segments - 1)
 				if currentParentPath ~= desiredParentPath then
 					table.insert(node.props, {
@@ -733,7 +729,8 @@ local function buildReviewTree(summaryRows, groups, helpers)
 					if oldValueMissing then
 						haveOld = true
 					else
-						local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.oldValue, name, group.service)
+						local okCall, okDecode, decoded =
+							pcall(helpers.decodeValue, entry.oldValue, name, group.service)
 						if okCall and okDecode then
 							haveOld = true
 							oldValue = decoded
@@ -767,26 +764,14 @@ local function buildReviewTree(summaryRows, groups, helpers)
 						newValue = decoded
 					end
 				end
-				local isNoop = false
-				if haveOld and haveNew then
-					isNoop = helpers.valuesEqual(oldValue, newValue)
-				end
-				if
-					not isNoop
-					and oldValue == nil
-					and type(newValue) == "table"
-					and newValue.customPhysics == false
-				then
-					isNoop = true
-				end
+				local isNoop = haveOld and haveNew and helpers.valuesEqual(oldValue, newValue)
+					or oldValue == nil and type(newValue) == "table" and newValue.customPhysics == false
 				if not isNoop then
 					local oldText = haveOld and (oldValueMissing and "Not set" or formatLiveValue(oldValue)) or nil
 					local newText = if deleting
 						then "Not set"
-						elseif haveNew
-						then formatLiveValue(newValue) or "Default"
-						elseif truncated
-						then tostring(entry.value.summary or "Structured value")
+						elseif haveNew then formatLiveValue(newValue) or "Default"
+						elseif truncated then tostring(entry.value.summary or "Structured value")
 						else formatPushValue(entry.value)
 					local componentOldValue = haveOld and not oldValueMissing and oldValue or nil
 					local componentNewValue = if deleting then nil elseif haveNew then newValue else entry.value

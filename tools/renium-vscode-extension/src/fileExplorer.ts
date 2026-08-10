@@ -42,8 +42,6 @@ export {
   loadAssetIconNames,
   logPackageDragDebug,
 } from "./fileExplorerCore";
-export type { ExplorerConfig, FileExplorerNode } from "./fileExplorerCore";
-
 const RENIUM_ACTIVITY_VISIBLE_STATE_KEY = "renium.activityVisible";
 
 export class FileExplorerController implements vscode.Disposable {
@@ -595,7 +593,7 @@ export class FileExplorerController implements vscode.Disposable {
           className: loaded.className,
           name: loaded.name,
         });
-        if (opened === true) {
+        if (opened) {
           return;
         }
       } catch {

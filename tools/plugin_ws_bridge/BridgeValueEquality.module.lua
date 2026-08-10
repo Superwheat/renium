@@ -85,7 +85,7 @@ local function keypointsEqual(a: { any }, b: { any }, color: boolean): boolean
 	return true
 end
 
-valuesEqual = function(a: any, b: any, seen: { [any]: any}?): boolean
+valuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 	if a == b then
 		return true
 	end

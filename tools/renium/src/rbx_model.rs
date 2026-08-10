@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,9 +16,8 @@ use walkdir::WalkDir;
 
 use crate::bytecode_api::{
     acquire_settings_file_lock, apply_file_mutations, bytecode_input_looks_like_settings_file,
-    collect_source_path_moves_by_settings_id, ensure_service_store_exists,
-    preserve_source_extensions, resolve_bytecode_cli_settings_file,
-    resolve_bytecode_write_settings_file, settings_document_bytes,
+    collect_source_path_updates, ensure_service_store_exists, file_mutation_paths,
+    resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::bytecode_edit::{
     bytecode_service_name, collect_settings_subtree_preorder, insert_unique_rbx_path,
@@ -26,7 +25,7 @@ use crate::bytecode_edit::{
     path_ordinals_from_value, path_segments_from_value, unique_editor_child_name,
 };
 use crate::bytecode_explorer::explorer_daemon_services;
-use crate::bytecode_query::{bytecode_parent_index, bytecode_selector};
+use crate::bytecode_query::bytecode_parent_index;
 use crate::command_line::{
     BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeImportModelArgs, BytecodeRepackArgs,
 };
@@ -38,10 +37,11 @@ use crate::editor_paths::{
 };
 use crate::editor_types::{EditorInstancePath, EditorSettingsWrite};
 use crate::file_io::{
-    absolutize_under, exact_path_key, is_service_settings_file_name, resolve_existing_project_root,
-    service_settings_path, validate_filesystem_instance_name,
+    absolutize_under, create_output_writer, exact_path_key, is_service_settings_file_name,
+    resolve_existing_project_root, service_settings_path, validate_filesystem_instance_name,
 };
 use crate::output::print_json_output;
+use crate::project_config;
 use crate::project_layout::apply_configured_project_layout;
 use crate::rbx_decode::rbx_instance_to_settings_records;
 use crate::rbx_encode::{
@@ -50,11 +50,11 @@ use crate::rbx_encode::{
 };
 use crate::services::DEFAULT_SYNC_SERVICES;
 use crate::settings_bytecode::{
-    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, settings_reference_index,
+    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+    settings_reference_index,
 };
 use crate::settings_tree::{editor_service_root_index, settings_children_by_parent};
 use crate::timing::log_timing;
-use crate::{instance_api, project_config};
 
 enum RbxModelFormat {
     Binary,
@@ -133,23 +133,21 @@ pub(super) fn rbx_dom_instance_by_path_unique(
     }
     current.sort_by_key(ToString::to_string);
     current.dedup();
-    match current.as_slice() {
-        [referent] => Ok(*referent),
-        _ => {
-            let candidates = current
-                .iter()
-                .take(8)
-                .map(|referent| rbx_dom_instance_path_segments(dom, *referent).join("."))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "Ambiguous place path: {} matched {} instances [{}]. Use --ords.",
-                path_segments.join("."),
-                current.len(),
-                candidates
-            );
-        }
-    }
+    let [referent] = current.as_slice() else {
+        let candidates = current
+            .iter()
+            .take(8)
+            .map(|referent| rbx_dom_instance_path_segments(dom, *referent).join("."))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "Ambiguous place path: {} matched {} instances [{}]. Use --ords.",
+            path_segments.join("."),
+            current.len(),
+            candidates
+        );
+    };
+    Ok(*referent)
 }
 
 pub(super) fn rbx_dom_instance_path_segments(dom: &RbxWeakDom, referent: RbxRef) -> Vec<String> {
@@ -167,21 +165,18 @@ pub(super) fn rbx_dom_instance_path_parts(
         let parent = instance.parent();
         if current != dom.root_ref() || instance.class.as_str() != "DataModel" {
             segments.push(instance.name.clone());
-            let ordinal = dom
-                .get_by_ref(parent)
-                .map(|parent| {
-                    parent
-                        .children()
-                        .iter()
-                        .take_while(|sibling_ref| **sibling_ref != current)
-                        .filter(|sibling_ref| {
-                            dom.get_by_ref(**sibling_ref)
-                                .is_some_and(|sibling| sibling.name == instance.name)
-                        })
-                        .count()
-                        + 1
-                })
-                .unwrap_or(1);
+            let ordinal = dom.get_by_ref(parent).map_or(1, |parent| {
+                parent
+                    .children()
+                    .iter()
+                    .take_while(|sibling_ref| **sibling_ref != current)
+                    .filter(|sibling_ref| {
+                        dom.get_by_ref(**sibling_ref)
+                            .is_some_and(|sibling| sibling.name == instance.name)
+                    })
+                    .count()
+                    + 1
+            });
             ordinals.push(ordinal);
         }
         if parent.is_none() {
@@ -194,7 +189,7 @@ pub(super) fn rbx_dom_instance_path_parts(
     (segments, ordinals)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(super) enum RbxPlaceFormat {
     Binary,
     Xml,
@@ -228,8 +223,31 @@ impl RbxPlaceFormat {
             Self::Xml => "rbxlx",
         }
     }
+
+    pub(super) fn read(self, path: &Path) -> Result<RbxWeakDom> {
+        let input =
+            File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let reader = BufReader::new(input);
+        match self {
+            Self::Binary => rbx_binary::from_reader(reader)
+                .with_context(|| format!("Failed to read {}", path.display())),
+            Self::Xml => rbx_xml::from_reader_default(reader)
+                .with_context(|| format!("Failed to read {}", path.display())),
+        }
+    }
+
+    pub(super) fn write(self, path: &Path, dom: &RbxWeakDom, roots: &[RbxRef]) -> Result<()> {
+        let writer = create_output_writer(path)?;
+        match self {
+            Self::Binary => rbx_binary::to_writer(writer, dom, roots)
+                .with_context(|| format!("Failed to write {}", path.display())),
+            Self::Xml => rbx_xml::to_writer_default(writer, dom, roots)
+                .with_context(|| format!("Failed to write {}", path.display())),
+        }
+    }
 }
 
+#[derive(Default)]
 pub(super) struct BytecodeModelExportRefs {
     pub(super) by_index: HashMap<usize, RbxRef>,
     pub(super) by_settings_id: HashMap<String, RbxRef>,
@@ -257,6 +275,7 @@ pub(super) struct BytecodeExportClassMetadata<'db> {
 
 pub(super) type BytecodeExportMetadata<'db> = HashMap<String, BytecodeExportClassMetadata<'db>>;
 
+#[derive(Default)]
 pub(super) struct BytecodeModelImportRefs {
     pub(super) new_index_by_ref: HashMap<RbxRef, usize>,
     pub(super) new_index_by_dense_ref: Option<Vec<usize>>,
@@ -301,11 +320,10 @@ pub(super) fn rbx_dom_path_import_refs(
     };
     BytecodeModelImportRefs {
         new_index_by_ref,
-        new_index_by_dense_ref: None,
-        settings_id_by_ref: HashMap::new(),
         path_segments_by_index,
         path_segments_by_ref: Arc::new(path_segments_by_ref),
         path_ordinals_by_ref: Arc::new(path_ordinals_by_ref),
+        ..Default::default()
     }
 }
 
@@ -618,10 +636,7 @@ pub(super) fn canonicalize_settings_reference_stores(src_root: &Path) -> Result<
     let mut writes = BTreeMap::new();
     for service in &changed {
         let path = &files[service];
-        writes.insert(
-            path.clone(),
-            settings_document_bytes(&documents[service], path)?,
-        );
+        writes.insert(path.clone(), encode_settings_bytecode(&documents[service])?);
     }
     apply_file_mutations(&writes, &[])?;
     Ok(changed.len())
@@ -692,14 +707,12 @@ fn source_settings_document(
     };
     let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
-        instances: vec![SettingsBytecodeInstance {
-            settings_id: source_projection_settings_id(service, service, "service"),
-            name: service.to_string(),
-            class_name: root_class.to_string(),
-            parent_index: None,
-            properties: Map::new(),
-            attributes: Map::new(),
-        }],
+        instances: vec![SettingsBytecodeInstance::new(
+            source_projection_settings_id(service, service, "service"),
+            service.to_string(),
+            root_class.to_string(),
+            None,
+        )],
     };
     let options = SourceSettingsOptions {
         naming,
@@ -755,7 +768,7 @@ fn append_source_only_children(
         }) {
             continue;
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
         if is_service_settings_file_name(&file_name) {
             continue;
         }
@@ -768,9 +781,9 @@ fn append_source_only_children(
         }
         if file_type.is_dir() {
             let mut init_sources = fs::read_dir(&path)?
-                .filter_map(|entry| entry.ok())
+                .filter_map(std::result::Result::ok)
                 .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
+                    let name = entry.file_name().to_string_lossy().into_owned();
                     infer_source_script(&name, &resolved_naming).and_then(
                         |(class_name, leaf, run_context)| {
                             leaf.is_none()
@@ -871,20 +884,19 @@ fn source_projection_settings_id(service: &str, path: &str, class_name: &str) ->
 
 pub(super) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()> {
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         Some(args.service.as_str()),
     )?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let selector = bytecode_selector(
-        args.index,
-        args.settings_id.as_deref(),
-        args.name.as_deref(),
-        args.class_name.as_deref(),
-    )?;
-    let root_index = instance_api::find_unique_instance_index(&document, selector)?
-        .ok_or_else(|| anyhow::anyhow!("Export instance was not found"))?;
+    let root_index = resolve_bytecode_selector(
+        &document,
+        &service,
+        &args.selector,
+        "Export instance was not found",
+    )?
+    .index;
     let format = match args.format.as_deref() {
         Some(raw) => RbxModelFormat::parse(raw)?,
         None => RbxModelFormat::from_path(&args.output)?,
@@ -892,8 +904,7 @@ pub(super) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let service_dir = settings_file
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let source_paths = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let instance_paths_by_index = build_editor_instance_paths(&document, &service);
 
@@ -904,11 +915,9 @@ pub(super) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
     let mut export_refs = BytecodeModelExportRefs {
         by_index: HashMap::with_capacity(subtree.len()),
         by_settings_id: HashMap::with_capacity(subtree.len()),
-        global_by_settings_id: None,
         by_path_key: HashMap::with_capacity(subtree.len()),
-        global_by_path_key: None,
         by_path_segments_key: HashMap::with_capacity(subtree.len()),
-        global_by_path_segments_key: None,
+        ..Default::default()
     };
     for index in subtree.iter().copied() {
         let referent = RbxRef::new();
@@ -956,15 +965,7 @@ pub(super) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
         dom.insert(parent_ref, builder);
     }
 
-    if let Some(parent) = args.output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let output = File::create(&args.output)
-        .with_context(|| format!("Failed to write {}", args.output.display()))?;
-    let writer = BufWriter::new(output);
+    let writer = create_output_writer(&args.output)?;
     let root_ref = *export_refs
         .by_index
         .get(&root_index)
@@ -1001,11 +1002,9 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
     let mut refs = BytecodeModelExportRefs {
         by_index: HashMap::with_capacity(document.instances.len()),
         by_settings_id: HashMap::with_capacity(document.instances.len()),
-        global_by_settings_id: None,
         by_path_key: HashMap::with_capacity(document.instances.len()),
-        global_by_path_key: None,
         by_path_segments_key: HashMap::with_capacity(document.instances.len()),
-        global_by_path_segments_key: None,
+        ..Default::default()
     };
     for (index, instance) in document.instances.iter().enumerate() {
         let digest = Sha256::digest(instance.settings_id.as_bytes());
@@ -1218,10 +1217,9 @@ pub(super) fn build_rbx_place(
                     by_index: by_index.clone(),
                     by_settings_id: per_service_settings_refs[service_index].clone(),
                     global_by_settings_id: Some(global_unique_settings_refs.clone()),
-                    by_path_key: HashMap::new(),
                     global_by_path_key: Some(global_path_refs.clone()),
-                    by_path_segments_key: HashMap::new(),
                     global_by_path_segments_key: Some(global_path_segment_refs.clone()),
+                    ..Default::default()
                 };
                 let mut instances = Vec::with_capacity(subtree.len());
                 let mut omitted_properties_by_class = HashMap::new();
@@ -1331,35 +1329,21 @@ pub(super) fn build_rbx_place(
 }
 
 pub(super) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
-    let project_root = resolve_existing_project_root(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_root);
+    apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
+    let project_root = resolve_existing_project_root(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
     let format = match args.format.as_deref() {
         Some(raw) => RbxPlaceFormat::parse(raw)?,
         None => RbxPlaceFormat::from_path(&args.output)?,
     };
     let services = explorer_daemon_services(&src_root, &args.services)?;
     let build = build_rbx_place(&src_root, services, None, false, false, false)?;
-    if let Some(parent) = args.output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let output = File::create(&args.output)
-        .with_context(|| format!("Failed to write {}", args.output.display()))?;
-    let writer = BufWriter::new(output);
     let top_level_refs = build
         .service_roots
         .iter()
         .map(|(_, referent)| *referent)
         .collect::<Vec<_>>();
-    match format {
-        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &build.dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", args.output.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &build.dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", args.output.display()))?,
-    }
+    format.write(&args.output, &build.dom, &top_level_refs)?;
     let exported_services = build
         .service_roots
         .iter()
@@ -1379,9 +1363,9 @@ pub(super) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
 }
 
 pub(super) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()> {
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         Some(args.service.as_str()),
     )?;
     ensure_service_store_exists(&settings_file, &service_hint)?;
@@ -1391,16 +1375,15 @@ pub(super) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_dir = settings_file
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let target_parent_index = bytecode_parent_index(
         &document,
-        args.no_parent,
-        args.parent_index,
-        args.parent_settings_id.as_deref(),
-        args.parent_name.as_deref(),
-        args.parent_class_name.as_deref(),
+        args.parent.no_parent,
+        args.parent.parent_index,
+        args.parent.parent_settings_id.as_deref(),
+        args.parent.parent_name.as_deref(),
+        args.parent.parent_class_name.as_deref(),
     )?;
     let outcome = import_rbx_model_into_document(
         &mut document,
@@ -1410,33 +1393,19 @@ pub(super) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         target_parent_index,
     )?;
 
-    let mut source_paths_after =
-        build_editor_source_paths_by_index(&document, &service, &service_dir);
-    preserve_source_extensions(
-        &before_document,
-        &source_paths_before,
-        &document,
-        &mut source_paths_after,
-    );
     let mut writes = outcome.source_files.clone();
     let mut removals = Vec::new();
-    collect_source_path_moves_by_settings_id(
+    collect_source_path_updates(
         &before_document,
         &source_paths_before,
         &document,
-        &source_paths_after,
+        &service,
+        &service_dir,
         &mut writes,
         &mut removals,
     )?;
-    writes.insert(
-        settings_file.clone(),
-        settings_document_bytes(&document, &settings_file)?,
-    );
-    let changed_paths = writes
-        .keys()
-        .chain(removals.iter())
-        .cloned()
-        .collect::<Vec<_>>();
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
     print_json_output(
         &json!({
@@ -1523,14 +1492,12 @@ pub(super) fn import_rbx_model_into_document(
         let settings_id =
             next_editor_settings_id_fast(&mut existing_settings_ids, &mut next_settings_id_seed);
         let new_index = document.instances.len();
-        document.instances.push(SettingsBytecodeInstance {
-            settings_id: settings_id.clone(),
+        document.instances.push(SettingsBytecodeInstance::new(
+            settings_id.clone(),
             name,
-            class_name: rbx_instance.class.to_string(),
+            rbx_instance.class.to_string(),
             parent_index,
-            properties: Map::new(),
-            attributes: Map::new(),
-        });
+        ));
         if is_root {
             target_child_indices.push(new_index);
             root_settings_ids.push(settings_id.clone());
@@ -1552,7 +1519,7 @@ pub(super) fn import_rbx_model_into_document(
                 .filter_map(|(referent, index)| {
                     path_segments_by_index
                         .get(*index)
-                        .and_then(|path| path.clone())
+                        .and_then(std::clone::Clone::clone)
                         .map(|path| (*referent, path))
                 })
                 .collect(),
@@ -1569,9 +1536,9 @@ pub(super) fn import_rbx_model_into_document(
                 .collect(),
         ),
         new_index_by_ref,
-        new_index_by_dense_ref: None,
         settings_id_by_ref,
         path_segments_by_index,
+        ..Default::default()
     };
     let mut source_by_index = HashMap::<usize, String>::new();
     for referent in refs_preorder.iter().copied() {
@@ -1595,8 +1562,7 @@ pub(super) fn import_rbx_model_into_document(
 
     let service_dir = settings_file
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let source_paths = build_editor_source_paths_by_index(document, service, &service_dir);
     let mut source_writes = Vec::new();
     let mut source_files = BTreeMap::new();
@@ -1642,7 +1608,7 @@ pub(crate) fn read_settings_model_document(path: &Path) -> Result<SettingsByteco
 }
 
 pub(super) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
-    apply_configured_project_layout(&mut args.project_root, &mut args.src_root)?;
+    apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let settings_files = bytecode_repack_settings_files(&args)?;
     let mut rewritten = Vec::with_capacity(settings_files.len());
     let mut total_before = 0_u64;
@@ -1681,14 +1647,14 @@ pub(super) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
 }
 
 fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathBuf>> {
-    let project_root = resolve_existing_project_root(&args.project_root)?;
+    let project_root = resolve_existing_project_root(&args.project.project_root)?;
 
     let mut settings_files = Vec::new();
     if args.paths.is_empty() {
-        let src_root = absolutize_under(&project_root, &args.src_root);
+        let src_root = absolutize_under(&project_root, &args.project.src_root);
         for entry in WalkDir::new(&src_root)
             .into_iter()
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
         {
             if entry.file_type().is_file()
                 && entry
@@ -1706,7 +1672,7 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
             let settings_file = if path.is_dir() {
                 service_settings_path(&path)
             } else if !path.exists() && !bytecode_input_looks_like_settings_file(&raw) {
-                let src_root = absolutize_under(&project_root, &args.src_root);
+                let src_root = absolutize_under(&project_root, &args.project.src_root);
                 let service = validate_filesystem_instance_name(raw.trim(), "service")?;
                 service_settings_path(&src_root.join(service))
             } else {

@@ -504,12 +504,6 @@
           "maximum": 8388608,
           "description": "Chunk size used for exporter RPC payload paging. Default is 4 MiB to reduce round trips on large service exports; maximum is 8 MiB."
         },
-        "renium.snapshotInstanceChunkSize": {
-          "type": "number",
-          "default": 5000,
-          "minimum": 0,
-          "description": "Instance count per snapshot chunk file (0 disables chunk splitting)."
-        },
         "renium.bridgeWaitSeconds": {
           "type": "number",
           "default": 8,
@@ -530,11 +524,6 @@
           "type": "boolean",
           "default": true,
           "description": "Adaptive Studio FPS throttle for export RPCs."
-        },
-        "renium.noUpdateEditorIcons": {
-          "type": "boolean",
-          "default": true,
-          "description": "Skip editor icon settings updates during export."
         },
         "renium.autoSyncOnSave": {
           "type": "boolean",
@@ -647,12 +636,6 @@
           "type": "boolean",
           "default": false,
           "description": "Compact-v5 fast path that adaptively uses IsPropertyModified to avoid reading defaulted properties after guarded validation. Disabled by default."
-        },
-        "renium.wsWaitSeconds": {
-          "type": "number",
-          "default": 20,
-          "minimum": 1,
-          "description": "Studio connection wait timeout in seconds"
         },
         "renium.progressHeartbeatSeconds": {
           "type": "number",

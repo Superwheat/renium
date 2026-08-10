@@ -21,12 +21,12 @@ use super::file_io::{
 use super::project_config;
 use super::services::explorer_service_order;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct SourcemapNode {
     pub(super) name: String,
-    #[serde(rename = "className")]
     pub(super) class_name: String,
-    #[serde(default, rename = "filePaths", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) file_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) children: Vec<SourcemapNode>,
@@ -132,7 +132,7 @@ pub(super) fn finalize_project_sourcemap_temp(
 
 pub(super) fn write_project_sourcemap_with_updates(
     project_root: &Path,
-    updated_nodes: &HashMap<String, SourcemapNode>,
+    updated_nodes: HashMap<String, SourcemapNode>,
 ) -> Result<()> {
     let mut root = load_existing_sourcemap_root(project_root)?
         .unwrap_or_else(|| make_sourcemap_root(project_root));
@@ -143,14 +143,13 @@ pub(super) fn write_project_sourcemap_with_updates(
         .collect();
 
     for (service_name, node) in updated_nodes {
-        children_by_name.insert(service_name.clone(), node.clone());
+        children_by_name.insert(service_name, node);
     }
 
     root.children = children_by_name.into_values().collect();
     write_sourcemap_root(project_root, root)
 }
 
-#[derive(Debug, Clone)]
 struct SourcemapBuildNode {
     name: String,
     class_name: String,
@@ -218,7 +217,7 @@ fn insert_script_path_into_service_tree(
     })?;
     let mut components: Vec<String> = relative_path
         .iter()
-        .map(|component| component.to_string_lossy().to_string())
+        .map(|component| component.to_string_lossy().into_owned())
         .collect();
     if components.is_empty() {
         return Ok(());
@@ -280,7 +279,9 @@ fn build_service_sourcemap_node_from_paths(
 }
 
 pub(super) fn generate_project_sourcemap(project_root: &Path) -> Result<()> {
-    let root = build_project_sourcemap(project_root)?;
+    let loaded = project_config::try_load_project(None, Some(project_root))?
+        .filter(|loaded| loaded.root == project_root);
+    let root = build_project_sourcemap_with_loaded(project_root, loaded.as_ref())?;
     write_sourcemap_root(project_root, root)
 }
 
@@ -296,21 +297,15 @@ pub(crate) fn generate_project_sourcemap_for_projection(
     write_sourcemap_root(&loaded.root, root)
 }
 
-fn build_project_sourcemap(project_root: &Path) -> Result<SourcemapNode> {
-    let loaded = project_config::try_load_project(None, Some(project_root))?
-        .filter(|loaded| loaded.root == project_root);
-    build_project_sourcemap_with_loaded(project_root, loaded.as_ref())
-}
-
 pub(super) fn build_project_sourcemap_with_loaded(
     project_root: &Path,
     loaded: Option<&project_config::LoadedProject>,
 ) -> Result<SourcemapNode> {
     let projection = loaded.map(project_config::stage_project).transpose()?;
-    let src_root = projection
-        .as_ref()
-        .map(|projection| projection.root().to_path_buf())
-        .unwrap_or_else(|| project_root.join("src"));
+    let src_root = projection.as_ref().map_or_else(
+        || project_root.join("src"),
+        |projection| projection.root().to_path_buf(),
+    );
     let projected = loaded
         .zip(projection.as_ref())
         .filter(|(_, projection)| projection.is_temporary());
@@ -373,7 +368,7 @@ fn build_project_sourcemap_from_source(
                 return Ok(None);
             }
 
-            let service_name = entry.file_name().to_string_lossy().to_string();
+            let service_name = entry.file_name().to_string_lossy().into_owned();
             let node = build_service_sourcemap_node_from_paths(
                 &service_name,
                 &entry.path(),

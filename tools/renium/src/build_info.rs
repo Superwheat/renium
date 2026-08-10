@@ -7,7 +7,3 @@ pub(super) const TIMESTAMP_UNIX: &str = match option_env!("BUILD_TIMESTAMP_UNIX"
     Some(value) => value,
     None => "0",
 };
-pub(super) const FEATURES: &str = match option_env!("BUILD_FEATURES") {
-    Some(value) => value,
-    None => "none",
-};

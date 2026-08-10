@@ -1,15 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(windows, target_os = "macos"))]
-use std::fs::{self, File};
-#[cfg(any(windows, target_os = "macos"))]
-use std::io::BufReader;
-#[cfg(windows)]
-use std::io::BufWriter;
+use std::fs;
 use std::io::{self, Write};
 #[cfg(any(windows, target_os = "macos"))]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,15 +29,15 @@ use super::editor_review::is_externally_managed_editor_property;
 use super::editor_review::request_editor_push_review;
 #[cfg(any(windows, target_os = "macos"))]
 use super::editor_review::{studio_pid_for_bridge, studio_title_for_bridge};
-use super::editor_sync::is_lua_source_class;
 use super::editor_types::{
-    EditorBinaryImport, EditorBinarySerializationBatch, EditorBinaryServiceGroup, EditorChangeSet,
+    EditorBinaryExport, EditorBinaryExportGroup, EditorBinaryImport,
+    EditorBinarySerializationBatch, EditorChangeSet, EditorPropertyChange,
 };
+use super::file_io::fnv1a_hex;
 #[cfg(any(windows, target_os = "macos"))]
 use super::file_io::sanitize_name;
 #[cfg(windows)]
 use super::file_io::{absolutize_under, resolve_project_root_if_present, service_settings_path};
-use super::file_io::{current_unix_ts, fnv1a_hex};
 use super::property_schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
@@ -79,6 +75,7 @@ use super::snapshot_types::{
     NativeServiceFinishInput, NativeSettingsProperty, NativeSettingsValue, ServiceExecutionSpan,
     ServiceExportOutput, SnapshotInstance,
 };
+
 #[cfg(any(windows, target_os = "macos"))]
 use super::studio_native_serializer;
 use super::timing::{current_millis, elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
@@ -86,32 +83,29 @@ use super::timing::{current_millis, elapsed_ms, log_timing, log_timing_ms, verbo
 const NATIVE_SERIALIZATION_SERVICE_LIMIT: usize = 4_096;
 const NATIVE_SERIALIZATION_BATCH_LIMIT: usize = 8_192;
 
+pub(super) fn property_change_needs_post_native_apply(change: &EditorPropertyChange) -> bool {
+    change.path_segments.as_slice() == [change.service.as_str()]
+        || change.path_segments.len() == 2
+            && (change.service == "Workspace" && change.class_name == "Terrain"
+                || change.service == "StarterPlayer"
+                    && matches!(
+                        change.class_name.as_str(),
+                        "StarterPlayerScripts" | "StarterCharacterScripts"
+                    ))
+}
+
 #[cfg(windows)]
 fn write_rbx_place_build(
     output_path: &Path,
     build: &RbxPlaceBuild,
     format: RbxPlaceFormat,
 ) -> Result<()> {
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let output = File::create(output_path)
-        .with_context(|| format!("Failed to write {}", output_path.display()))?;
-    let writer = BufWriter::new(output);
     let top_level_refs = build
         .service_roots
         .iter()
         .map(|(_, referent)| *referent)
         .collect::<Vec<_>>();
-    match format {
-        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &build.dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", output_path.display())),
-        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &build.dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", output_path.display())),
-    }
+    format.write(output_path, &build.dom, &top_level_refs)
 }
 
 pub(super) fn begin_editor_binary_export(
@@ -119,17 +113,15 @@ pub(super) fn begin_editor_binary_export(
     partitioned: bool,
     service_order: Option<&[String]>,
     metadata_only: bool,
-) -> Result<EditorBinaryImport> {
+) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
     #[cfg(any(windows, target_os = "macos"))]
     let needs_material_access = !metadata_only
-        && service_order
-            .map(|services| {
-                services
-                    .iter()
-                    .any(|service| service == MATERIAL_SERVICE_CLASS)
-            })
-            .unwrap_or(true);
+        && service_order.is_none_or(|services| {
+            services
+                .iter()
+                .any(|service| service == MATERIAL_SERVICE_CLASS)
+        });
     let begin_request = || {
         bridge.call(
             "beginEditorBinaryExport",
@@ -157,7 +149,7 @@ pub(super) fn begin_editor_binary_export(
     };
     #[cfg(not(any(windows, target_os = "macos")))]
     let begin = begin_request()?;
-    let result = (|| -> Result<EditorBinaryImport> {
+    let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
                 .get("reason")
@@ -165,12 +157,7 @@ pub(super) fn begin_editor_binary_export(
                 .unwrap_or("Studio cannot represent this place with native serialization");
             bail!("{reason}");
         }
-        let instance_count = begin
-            .get("instanceCount")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(0);
-        let groups = serde_json::from_value::<Vec<EditorBinaryServiceGroup>>(
+        let groups = serde_json::from_value::<Vec<EditorBinaryExportGroup>>(
             begin
                 .get("groups")
                 .cloned()
@@ -270,17 +257,13 @@ pub(super) fn begin_editor_binary_export(
         if property_schema_by_class.is_empty() {
             bail!("Studio native export omitted its property schema");
         }
-        Ok(EditorBinaryImport {
+        Ok(EditorBinaryExport {
             bytes: Vec::new(),
             groups,
             serialization_batches,
-            instance_count,
             export_id: Some(export_id.clone()),
             property_schema_by_class,
             enum_value_names_by_type,
-            post_apply_properties_by_class: HashMap::new(),
-            post_apply_properties_by_path: HashMap::new(),
-            external_references_post_applied: false,
         })
     })();
     if result.is_err() {
@@ -439,7 +422,7 @@ fn receive_editor_binary_export_bytes(
 }
 
 struct NativeBinaryBatchPart {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<[u8]>,
     start: usize,
     end: usize,
 }
@@ -552,7 +535,7 @@ fn receive_editor_binary_export_batches(
         if header_bytes > bytes.len() {
             bail!("Studio native export batch has a truncated header");
         }
-        let bytes = Arc::new(bytes);
+        let bytes = Arc::<[u8]>::from(bytes);
         let mut byte_offset = header_bytes;
         for (index, service) in remaining.iter().take(batch_count).enumerate() {
             let length_offset = 4 + index * 4;
@@ -631,7 +614,7 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
 }
 
 #[cfg(windows)]
-fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryImport> {
+fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExport> {
     let mut export = begin_editor_binary_export(bridge, false, None, false)?;
     let _finish_guard = EditorBinaryExportFinishGuard {
         bridge,
@@ -687,23 +670,17 @@ impl NativePriorityWorkerGate {
     }
 
     fn wait(&self) {
-        let mut released = match self.released.lock() {
-            Ok(lock) => lock,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
         while !*released {
-            released = match self.ready.wait(released) {
-                Ok(lock) => lock,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            released = self
+                .ready
+                .wait(released)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     fn release(&self) {
-        let mut released = match self.released.lock() {
-            Ok(lock) => lock,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
         if *released {
             return;
         }
@@ -735,7 +712,7 @@ impl Drop for NativePriorityWorkerRelease<'_> {
 
 fn decode_native_service_dom(
     bytes: &[u8],
-    group: &EditorBinaryServiceGroup,
+    group: &EditorBinaryExportGroup,
     property_filter: Arc<HashMap<String, HashSet<String>>>,
 ) -> Result<NativeServiceDom> {
     let decode_started = Instant::now();
@@ -766,7 +743,7 @@ fn decode_native_service_dom(
         bail!("Studio native {} marker is out of order", group.service);
     }
     flat.instances[marker_index].class = group.service.as_str().into();
-    flat.instances[marker_index].name = group.service.clone();
+    flat.instances[marker_index].name.clone_from(&group.service);
     for root_index in flat.root_indices.iter().skip(1) {
         flat.instances[*root_index].parent_index = Some(marker_index);
     }
@@ -789,7 +766,7 @@ fn decode_native_service_dom(
 fn decode_native_serialization_batch(
     bytes: &[u8],
     batch: &EditorBinarySerializationBatch,
-    service_groups: &[EditorBinaryServiceGroup],
+    service_groups: &[EditorBinaryExportGroup],
     property_filter: Arc<HashMap<String, HashSet<String>>>,
 ) -> Result<HashMap<String, NativeServiceDom>> {
     let groups = batch
@@ -894,9 +871,7 @@ fn decode_native_serialization_batch(
     let total_instances = flat.instances.len();
     let mut global_index_by_dense_ref = vec![usize::MAX; total_instances];
     let mut owner_by_dense_ref = vec![usize::MAX; total_instances];
-    let mut local_index_by_dense_ref = (0..groups.len())
-        .map(|_| vec![usize::MAX; total_instances])
-        .collect::<Vec<_>>();
+    let mut local_index_by_dense_ref = vec![vec![usize::MAX; total_instances]; groups.len()];
     for (group_index, (start, end, _, _)) in spans.iter().copied().enumerate() {
         for (local_index, global_index) in (start..end).enumerate() {
             let dense_index = flat.instances[global_index]
@@ -930,7 +905,7 @@ fn decode_native_serialization_batch(
         for instance in &flat.instances[start..end] {
             for (_, value) in &instance.properties {
                 let Some(dense_index) = rbx_variant_referent(value)
-                    .and_then(|referent| referent.as_u128())
+                    .and_then(RbxRef::as_u128)
                     .and_then(|value| usize::try_from(value).ok())
                     .and_then(|value| value.checked_sub(1))
                     .filter(|value| *value < total_instances)
@@ -994,7 +969,7 @@ fn decode_native_serialization_batch(
             }
         }
         instances[0].class = group.service.as_str().into();
-        instances[0].name = group.service.clone();
+        instances[0].name.clone_from(&group.service);
         for root_index in &root_indices[root_start + 1..root_end] {
             instances[*root_index - start].parent_index = Some(0);
         }
@@ -1072,7 +1047,7 @@ fn normalize_native_overlay_internal_references(
 
 fn convert_native_service_output(
     dependencies: &NativeServiceFinishDependencies<'_, '_>,
-    group: &EditorBinaryServiceGroup,
+    group: &EditorBinaryExportGroup,
     native: NativeServiceDom,
     mut overlay_instances: Vec<NativeOverlayItem>,
     debug_ids: Vec<Option<String>>,
@@ -1179,7 +1154,7 @@ fn convert_native_service_output(
                 if index == 0 {
                     native_properties.clear();
                     let tags = properties.remove("Tags");
-                    properties = group.root_properties.clone();
+                    properties.clone_from(&group.root_properties);
                     if let Some(tags) = tags {
                         properties.insert("Tags".to_string(), tags);
                     }
@@ -1213,20 +1188,14 @@ fn convert_native_service_output(
                 }
                 Ok((
                     SnapshotInstance {
-                        path: String::new(),
-                        path_segments: Vec::new(),
                         name: rbx_instance.name,
                         class_name: rbx_instance.class,
                         properties,
-                        source_key: None,
-                        parent_path: None,
                         attributes,
                         debug_id: debug_id.filter(|value| !value.is_empty()),
-                        parent_debug_id: None,
-                        instance_id: None,
-                        parent_instance_id: None,
                         instance_index: Some(index + 1),
                         parent_index,
+                        ..Default::default()
                     },
                     native_properties,
                 ))
@@ -1241,28 +1210,17 @@ fn convert_native_service_output(
         &format!("{}: native instance conversion", group.service),
         conversion_started,
     );
-    let script_count = instances
-        .par_iter()
-        .filter(|instance| is_lua_source_class(&instance.class_name))
-        .count();
     let export_end_ms = elapsed_ms(dependencies.run_started);
     Ok(ServiceExportOutput {
         parts: ExportedSnapshotParts {
-            service_name: group.service.clone(),
-            service_class: group.service.clone(),
-            service_path: format!("game.{}", group.service),
-            generated_at: current_unix_ts(),
-            script_count,
             class_defaults: Value::Object(Map::new()),
             instances,
             native_properties_by_instance: Some(native_properties_by_instance),
-            adaptive_tune: None,
         },
         span: ServiceExecutionSpan {
             service: group.service.clone(),
             export_start_ms: export_started_ms,
             export_end_ms,
-            export_duration_ms: export_end_ms - export_started_ms,
         },
         tune: None,
     })
@@ -1278,7 +1236,7 @@ pub(super) fn editor_binary_export_parts<'a>(
     let export_started_ms = elapsed_ms(run_started);
     let begin_started = Instant::now();
     let export = begin_editor_binary_export(bridge, true, Some(requested_services), false)?;
-    let _finish_guard = EditorBinaryExportFinishGuard {
+    let finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
     };
@@ -1452,9 +1410,11 @@ pub(super) fn editor_binary_export_parts<'a>(
                     };
                     let mut priority_service = priority_groups.get(worker_index).copied();
                     loop {
-                        let service = priority_service.take().or_else(|| match service_queue.lock() {
-                            Ok(mut queue) => queue.pop_front(),
-                            Err(poisoned) => poisoned.into_inner().pop_front(),
+                        let service = priority_service.take().or_else(|| {
+                            service_queue
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .pop_front()
                         });
                         let Some(group) = service else {
                             break;
@@ -1506,12 +1466,10 @@ pub(super) fn editor_binary_export_parts<'a>(
                                         Ok(batch_doms) => batch_doms,
                                         Err(error) => bail!("{error}"),
                                     };
-                                    let native = match batch_doms.lock() {
-                                        Ok(mut doms) => doms.remove(&group.service),
-                                        Err(poisoned) => {
-                                            poisoned.into_inner().remove(&group.service)
-                                        }
-                                    }
+                                    let native = batch_doms
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .remove(&group.service)
                                     .with_context(|| {
                                         format!(
                                             "Native serialization batch {} omitted {}",
@@ -1684,7 +1642,7 @@ pub(super) fn editor_binary_export_parts<'a>(
     log_chunk_fetch_metrics("native editor overlay payloads", metrics);
     log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
     log_timing("native editor streaming export", stream_started);
-    Ok(_finish_guard)
+    Ok(finish_guard)
 }
 
 #[cfg(windows)]
@@ -1705,13 +1663,9 @@ fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs {
         by_path_key.insert(instance_path_parts_key(&segments, &ordinals), referent);
     }
     BytecodeModelExportRefs {
-        by_index: HashMap::new(),
-        by_settings_id: HashMap::new(),
-        global_by_settings_id: None,
         by_path_key,
-        global_by_path_key: None,
         by_path_segments_key,
-        global_by_path_segments_key: None,
+        ..Default::default()
     }
 }
 
@@ -1753,7 +1707,7 @@ pub(super) fn rbx_dom_service_root_property_values(
 fn fetch_native_conditional_overlay(
     bridge: &BridgeServer,
     export_id: &str,
-    group: &EditorBinaryServiceGroup,
+    group: &EditorBinaryExportGroup,
     enum_value_names_by_type: &EnumValueNameMap,
     request: NativeConditionalOverlayRequest,
 ) -> Result<Option<NativeConditionalOverlayFetch>> {
@@ -1785,7 +1739,7 @@ fn fetch_native_conditional_overlay(
 
 fn finish_native_service_export(
     dependencies: &NativeServiceFinishDependencies<'_, '_>,
-    group: &EditorBinaryServiceGroup,
+    group: &EditorBinaryExportGroup,
     input: NativeServiceFinishInput,
 ) -> Result<NativeServiceExportResult> {
     let NativeServiceFinishInput {
@@ -1862,14 +1816,7 @@ pub(super) fn read_place_service_root_property_values(
     service_names: &HashSet<String>,
     database: &ReflectionDatabase<'_>,
 ) -> Result<HashMap<String, Map<String, Value>>> {
-    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let reader = BufReader::new(input);
-    let dom = match RbxPlaceFormat::from_path(path)? {
-        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-    };
+    let dom = RbxPlaceFormat::from_path(path)?.read(path)?;
     Ok(rbx_dom_service_root_property_values(
         &dom,
         service_names,
@@ -2009,8 +1956,8 @@ pub(super) fn write_live_editor_place_snapshot(
     if roots.len() != expected_roots {
         bail!("Studio native place snapshot has the wrong root count");
     }
-    let project_root = resolve_project_root_if_present(&args.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.src_dir);
+    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_names = export
         .groups
         .iter()
@@ -2053,7 +2000,7 @@ pub(super) fn write_live_editor_place_snapshot(
         let live_attributes = marker.properties.get(&attributes_key).cloned();
         let live_tags = marker.properties.get(&tags_key).cloned();
         marker.class = group.service.as_str().into();
-        marker.name = group.service.clone();
+        marker.name.clone_from(&group.service);
         for child_ref in child_refs {
             dom.transfer_within(child_ref, marker_ref);
         }
@@ -2457,15 +2404,7 @@ pub(super) fn send_editor_change_batches(
         }) {
             continue;
         }
-        let send_all = binary_import.is_none()
-            || change.path_segments.as_slice() == [change.service.as_str()]
-            || (change.path_segments.len() == 2
-                && ((change.service == "Workspace" && change.class_name == "Terrain")
-                    || (change.service == "StarterPlayer"
-                        && matches!(
-                            change.class_name.as_str(),
-                            "StarterPlayerScripts" | "StarterCharacterScripts"
-                        ))));
+        let send_all = binary_import.is_none() || property_change_needs_post_native_apply(change);
         if send_all {
             property_changes.push(change.clone());
             continue;

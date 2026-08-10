@@ -11,7 +11,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const REGISTRY_JSON: &str = include_str!("../protocol/opcodes.json");
 static REGISTRY: OnceLock<std::result::Result<Vec<Opcode>, String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Deserialize)]
 pub struct Opcode {
     pub id: u16,
     pub name: String,
@@ -21,7 +21,7 @@ pub struct Opcode {
     pub review: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Registry {
     version: u8,
     operations: Vec<Opcode>,
@@ -74,15 +74,14 @@ pub fn opcode_by_name(name: &str) -> Result<&'static Opcode> {
         .with_context(|| format!("Unknown operation {name}"))
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub v: u8,
     pub id: u64,
     pub op: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cx: Option<u64>,
-    #[serde(alias = "requestArgs")]
     pub p: Value,
 }
 
@@ -119,18 +118,16 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ProtocolError {
     pub c: String,
     pub m: String,
     pub rt: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<String>,
+    pub n: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub d: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
 pub struct Failure(pub ProtocolError);
 
 impl Failure {
@@ -144,7 +141,7 @@ impl Failure {
             c: code.into(),
             m: message.into(),
             rt: u8::from(retry),
-            n: Some(next.into()),
+            n: next.into(),
             d: None,
         })
     }
@@ -155,7 +152,7 @@ impl Failure {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Response {
     pub v: u8,
     pub id: u64,
@@ -191,7 +188,7 @@ impl Response {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BoundContext {
     pub id: u64,
@@ -212,7 +209,6 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone)]
 pub struct Review {
     pub context_id: u64,
     pub runtime_id: Option<String>,
@@ -349,7 +345,10 @@ mod tests {
             cx: None,
             p: json!({}),
         };
-        assert_eq!(request.validate().unwrap_err().0.c, "bad_req");
+        assert!(matches!(
+            request.validate(),
+            Err(Failure(ProtocolError { c, .. })) if c == "bad_req"
+        ));
         assert!(
             serde_json::from_str::<Request>(r#"{"v":1,"id":1,"op":0,"p":{},"command":"find"}"#)
                 .is_err()

@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Map;
-
 use crate::settings_bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
 };
@@ -22,14 +20,12 @@ pub(crate) fn settings_instance(
     class_name: impl Into<String>,
     parent_index: Option<usize>,
 ) -> SettingsBytecodeInstance {
-    SettingsBytecodeInstance {
-        settings_id: settings_id.into(),
-        name: name.into(),
-        class_name: class_name.into(),
+    SettingsBytecodeInstance::new(
+        settings_id.into(),
+        name.into(),
+        class_name.into(),
         parent_index,
-        properties: Map::new(),
-        attributes: Map::new(),
-    }
+    )
 }
 
 pub(crate) fn temp_dir(tag: &str) -> PathBuf {

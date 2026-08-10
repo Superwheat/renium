@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -18,12 +18,11 @@ use super::automation_runtime::{
 use super::bridge_server::{BridgeServer, clamp_bridge_chunk_size};
 use super::bytecode_explorer::watch_parent_and_exit;
 use super::command_args::CursorPollArgs;
-#[cfg(any(windows, target_os = "macos"))]
-use super::command_line::NativeSnapshotArgs;
 use super::command_line::{
-    ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeDaemonArgs, BridgeGetSourceArgs,
-    ExecuteLuauArgs, ExportSnapshotsArgs, PluginConsoleOutputArgs, PushEditorChangesArgs,
-    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs,
+    ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, BridgeDaemonArgs,
+    BridgeGetSourceArgs, EditorMutationArgs, ExecuteLuauArgs, ExportSnapshotsArgs,
+    PluginConsoleOutputArgs, PushEditorChangesArgs, StartStopPlayArgs, StudioChangeStateArgs,
+    StudioDeviceArgs,
 };
 use super::file_io::{absolutize_for_daemon, canonical_path, fnv1a_hex};
 use super::local_transport::{
@@ -32,59 +31,11 @@ use super::local_transport::{
     MAX_DAEMON_CONTROL_CONNECTIONS, MAX_DAEMON_LINE_BYTES, host_port, is_loopback_endpoint,
     normalize_loopback_host, read_bounded_line,
 };
-#[cfg(any(windows, target_os = "macos"))]
-use super::native_editor::read_place_service_root_property_values;
 use super::output::global_yes;
 use super::place_target::place_filter;
 use super::snapshot_export::{fetch_text_chunks, parse_bridge_ports};
-#[cfg(any(windows, target_os = "macos"))]
-use super::studio_native_serializer;
 use super::timing::current_millis;
 use super::{automation, lifecycle};
-
-#[cfg(any(windows, target_os = "macos"))]
-pub(super) fn native_snapshot_command(args: NativeSnapshotArgs) -> Result<()> {
-    let result = if let Some(service) = args.service.as_deref() {
-        studio_native_serializer::write_live_service(args.pid, &args.title, service, &args.output)?
-    } else {
-        studio_native_serializer::write_live_place(args.pid, &args.title, &args.output)?
-    };
-    let root_properties = if let Some(service) = args.service.as_deref() {
-        let database =
-            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-        read_place_service_root_property_values(
-            &args.output,
-            &HashSet::from([service.to_string()]),
-            database,
-        )?
-        .remove(service)
-    } else {
-        None
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "ok": true,
-            "instances": result.instance_count,
-            "bytes": result.output_size,
-            "elapsedMs": result.elapsed_ms,
-            "setupMs": result.setup_ms,
-            "traceMs": result.trace_ms,
-            "discoverMs": result.discover_ms,
-            "helperMs": result.helper_ms,
-            "invokeMs": result.invoke_ms,
-            "validateMs": result.validate_ms,
-            "contextMs": result.context_ms,
-            "collectMs": result.collect_ms,
-            "serializeMs": result.serialize_ms,
-            "writeMs": result.write_ms,
-            "service": args.service,
-            "rootProperties": root_properties,
-            "output": args.output,
-        }))?
-    );
-    Ok(())
-}
 
 #[cfg(windows)]
 pub(super) fn cursor_poll(args: CursorPollArgs) -> Result<()> {
@@ -122,7 +73,7 @@ pub(super) fn cursor_poll(args: CursorPollArgs) -> Result<()> {
                 rect.top,
                 rect.right,
                 rect.bottom,
-                if left_down { 1 } else { 0 }
+                i32::from(left_down)
             )
             .is_err()
             {
@@ -167,9 +118,9 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     let automation_state = Arc::new(automation::State::default());
     if !editor_stdio {
         spawn_daemon_control_server(
-            bridge_host.clone(),
+            &bridge_host,
             args.control_port,
-            name.clone(),
+            &name,
             bridge.clone(),
             automation_state.clone(),
             args.bridge.wait_seconds,
@@ -199,16 +150,16 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
 }
 
 fn spawn_daemon_control_server(
-    host: String,
+    host: &str,
     port: u16,
-    name: String,
+    name: &str,
     bridge: Arc<BridgeServer>,
     state: Arc<automation::State>,
     bridge_wait_seconds: f64,
 ) -> Result<()> {
-    let bind_host = normalize_loopback_host(&host)?;
+    let bind_host = normalize_loopback_host(host)?;
     let listener = TcpListener::bind((bind_host.as_str(), port)).with_context(|| {
-        let discoveries = daemon_discovery_write_paths(&name)
+        let discoveries = daemon_discovery_write_paths(name)
         .into_iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
@@ -408,8 +359,11 @@ fn daemon_discovery_write_paths(name: &str) -> Vec<PathBuf> {
     if name == "default" {
         return vec![default];
     }
-    let safe_name = name
-        .chars()
+    vec![default.with_file_name(format!("daemon-{}.json", safe_daemon_name(name)))]
+}
+
+fn safe_daemon_name(name: &str) -> String {
+    name.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
                 ch
@@ -417,8 +371,7 @@ fn daemon_discovery_write_paths(name: &str) -> Vec<PathBuf> {
                 '_'
             }
         })
-        .collect::<String>();
-    vec![default.with_file_name(format!("daemon-{safe_name}.json"))]
+        .collect()
 }
 
 pub(super) fn daemon_control_endpoints() -> Vec<std::net::SocketAddr> {
@@ -468,17 +421,7 @@ pub(super) fn daemon_discovery_paths() -> Vec<PathBuf> {
         if let Ok(name) = std::env::var("RENIUM_DAEMON_NAME") {
             let name = name.trim();
             if !name.is_empty() && name != "default" {
-                let safe_name = name
-                    .chars()
-                    .map(|ch| {
-                        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                            ch
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>();
-                paths.push(path.with_file_name(format!("daemon-{safe_name}.json")));
+                paths.push(path.with_file_name(format!("daemon-{}.json", safe_daemon_name(name))));
                 return paths;
             }
         }
@@ -657,13 +600,13 @@ pub(super) fn try_daemon_control_request(
         .and_then(|arguments| {
             arguments.iter().enumerate().find_map(|(index, argument)| {
                 matches!(argument.as_str(), Some("-r" | "--root" | "--project-root"))
-                    .then(|| {
+                    .then_some(index)
+                    .and_then(|index| {
                         arguments
                             .get(index + 1)
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     })
-                    .flatten()
             })
         })
         .unwrap_or_else(|| {
@@ -900,8 +843,6 @@ pub(super) fn export_snapshots_daemon_args(args: &ExportSnapshotsArgs) -> Vec<St
         args.chunk_size.to_string(),
         "-a".to_string(),
         args.adaptive_seed_batch.to_string(),
-        "--ic".to_string(),
-        args.snapshot_instance_chunk_size.to_string(),
         "-w".to_string(),
         args.bridge.wait_seconds.to_string(),
         "-H".to_string(),
@@ -910,14 +851,6 @@ pub(super) fn export_snapshots_daemon_args(args: &ExportSnapshotsArgs) -> Vec<St
         args.bridge.ports.clone(),
         "-m".to_string(),
         args.import_mode.clone(),
-        "-W".to_string(),
-        args.ws_wait_seconds.to_string(),
-        "-t".to_string(),
-        args.transport.clone(),
-        "-S".to_string(),
-        args.server.clone(),
-        "-C".to_string(),
-        args.config.clone(),
         "--sw".to_string(),
         args.source_workers.to_string(),
         "--iw".to_string(),
@@ -933,17 +866,11 @@ pub(super) fn export_snapshots_daemon_args(args: &ExportSnapshotsArgs) -> Vec<St
     if args.no_run_import {
         out.push("--no-import".to_string());
     }
-    if args.no_update_editor_icons {
-        out.push("--no-icons".to_string());
-    }
     if args.modified_default_bypass {
         out.push("--mdb".to_string());
     }
     if args.no_modified_default_bypass {
         out.push("--no-mdb".to_string());
-    }
-    if args.adaptive_throttle {
-        out.push("--adaptive-throttle".to_string());
     }
     if args.no_adaptive_throttle {
         out.push("--no-adaptive-throttle".to_string());
@@ -957,28 +884,34 @@ pub(super) fn export_snapshots_daemon_args(args: &ExportSnapshotsArgs) -> Vec<St
     if args.quiet_timings {
         out.push("-q".to_string());
     }
-    if !args.import_cli.trim().is_empty() {
-        out.push("--icli".to_string());
-        out.push(args.import_cli.clone());
-    }
     out
 }
 
-pub(super) fn push_editor_changes_daemon_args(args: &PushEditorChangesArgs) -> Vec<String> {
-    let mut out = vec![
+fn editor_daemon_args(
+    project_root: &Path,
+    src_dir: &Path,
+    bridge: &BridgeConnectionArgs,
+) -> Vec<String> {
+    vec![
         "-r".to_string(),
-        absolutize_for_daemon(&args.project_root)
-            .display()
-            .to_string(),
+        absolutize_for_daemon(project_root).display().to_string(),
         "-d".to_string(),
-        args.src_dir.display().to_string(),
+        src_dir.display().to_string(),
         "-w".to_string(),
-        args.bridge.wait_seconds.to_string(),
+        bridge.wait_seconds.to_string(),
         "-H".to_string(),
-        args.bridge.host.clone(),
+        bridge.host.clone(),
         "-P".to_string(),
-        args.bridge.ports.clone(),
-    ];
+        bridge.ports.clone(),
+    ]
+}
+
+pub(super) fn push_editor_changes_daemon_args(args: &PushEditorChangesArgs) -> Vec<String> {
+    let mut out = editor_daemon_args(
+        &args.project.project_root,
+        &args.project.src_root,
+        &args.bridge,
+    );
     for path in &args.changed_paths {
         out.push("-p".to_string());
         out.push(path.display().to_string());
@@ -1025,77 +958,48 @@ pub(super) fn push_editor_changes_daemon_args(args: &PushEditorChangesArgs) -> V
 }
 
 pub(super) fn apply_editor_property_daemon_args(args: &ApplyEditorPropertyArgs) -> Vec<String> {
-    let mut out = vec![
-        "-r".to_string(),
-        absolutize_for_daemon(&args.project_root)
-            .display()
-            .to_string(),
-        "-d".to_string(),
-        args.src_dir.display().to_string(),
-        "-w".to_string(),
-        args.bridge.wait_seconds.to_string(),
-        "-H".to_string(),
-        args.bridge.host.clone(),
-        "-P".to_string(),
-        args.bridge.ports.clone(),
-        "-s".to_string(),
-        args.service.clone(),
-        "-c".to_string(),
-        args.class_name.clone(),
-        "-p".to_string(),
-        args.path_segments_json.clone(),
-        "-o".to_string(),
-        args.path_ordinals_json.clone(),
+    let mut out = editor_mutation_daemon_args(&args.target);
+    out.extend([
         "-S".to_string(),
         args.scope.clone(),
         "-n".to_string(),
         args.property.clone(),
         format!("--value-json={}", args.value_json),
-    ];
-    if let Some(settings_id) = args.settings_id.as_ref() {
-        out.push("-i".to_string());
-        out.push(settings_id.clone());
-    }
+    ]);
     if args.no_review {
         out.push("--no-review".to_string());
     }
     if args.yes || global_yes() {
         out.push("--yes".to_string());
     }
-    if args.override_packages {
-        out.push("--override-packages".to_string());
-    }
     out
 }
 
 pub(super) fn apply_editor_delete_daemon_args(args: &ApplyEditorDeleteArgs) -> Vec<String> {
-    let mut out = vec![
-        "-r".to_string(),
-        absolutize_for_daemon(&args.project_root)
-            .display()
-            .to_string(),
-        "-d".to_string(),
-        args.src_dir.display().to_string(),
-        "-w".to_string(),
-        args.bridge.wait_seconds.to_string(),
-        "-H".to_string(),
-        args.bridge.host.clone(),
-        "-P".to_string(),
-        args.bridge.ports.clone(),
+    editor_mutation_daemon_args(&args.target)
+}
+
+fn editor_mutation_daemon_args(target: &EditorMutationArgs) -> Vec<String> {
+    let mut out = editor_daemon_args(
+        &target.project.project_root,
+        &target.project.src_root,
+        &target.bridge,
+    );
+    out.extend([
         "-s".to_string(),
-        args.service.clone(),
+        target.service.clone(),
         "-c".to_string(),
-        args.class_name.clone(),
+        target.class_name.clone(),
         "-p".to_string(),
-        args.path_segments_json.clone(),
+        target.path_segments_json.clone(),
         "-o".to_string(),
-        args.path_ordinals_json.clone(),
-    ];
-    if let Some(settings_id) = args.settings_id.as_ref() {
+        target.path_ordinals_json.clone(),
+    ]);
+    if let Some(settings_id) = target.settings_id.as_ref() {
         out.push("-i".to_string());
         out.push(settings_id.clone());
     }
-    if args.override_packages {
+    if target.override_packages {
         out.push("--override-packages".to_string());
     }
     out

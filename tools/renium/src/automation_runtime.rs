@@ -15,8 +15,9 @@ use crate::bridge_server::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer, Br
 use crate::bytecode_explorer::bytecode_explorer_batch_result;
 use crate::command_line::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, AutomationArgs, BridgeConnectionArgs,
-    BytecodeExplorerBatchArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, ExportSnapshotsArgs,
-    PluginConsoleOutputArgs, PushEditorChangesArgs, ShotArgs, WaitUntilArgs,
+    BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, EditorReviewDecisionArgs,
+    ExecuteLuauArgs, ExportSnapshotsArgs, PluginConsoleOutputArgs, ProjectSourceArgs,
+    PushEditorChangesArgs, ShotArgs, WaitUntilArgs,
 };
 use crate::daemon_control::daemon_control_endpoints;
 #[cfg(any(windows, target_os = "macos"))]
@@ -60,7 +61,15 @@ fn parse_daemon_request_args<T: Parser>(command: &str, request_args: &[String]) 
     })
 }
 
-pub(super) fn automation_command(args: AutomationArgs) -> Result<()> {
+fn automation_transport_failure(id: u64, error: anyhow::Error) -> automation::Response {
+    automation::Response::failure(
+        id,
+        Instant::now(),
+        automation::Failure::new("bridge_off", format!("{error:#}"), true, "bind"),
+    )
+}
+
+pub(super) fn automation_command(args: AutomationArgs) {
     let operation = match automation::opcode_by_name(args.operation.trim()) {
         Ok(operation) => operation,
         Err(error) => automation_cli_failure("bad_op", format!("{error:#}"), "cap"),
@@ -87,36 +96,21 @@ pub(super) fn automation_command(args: AutomationArgs) -> Result<()> {
     } else {
         send_automation_control_request(&request)
     }
-    .unwrap_or_else(|error| {
-        automation::Response::failure(
-            request.id,
-            Instant::now(),
-            automation::Failure::new("bridge_off", format!("{error:#}"), true, "bind"),
-        )
-    });
+    .unwrap_or_else(|error| automation_transport_failure(request.id, error));
     if !reviewed
         && operation.review
-        && response.e.as_ref().is_some_and(|error| {
-            error.c == "rejected" && error.n.as_deref() == Some("review-prepare")
-        })
+        && response
+            .e
+            .as_ref()
+            .is_some_and(|error| error.c == "rejected" && error.n == "review-prepare")
     {
-        response = send_reviewed_automation_request(&request).unwrap_or_else(|error| {
-            automation::Response::failure(
-                request.id,
-                Instant::now(),
-                automation::Failure::new("bridge_off", format!("{error:#}"), true, "bind"),
-            )
-        });
+        response = send_reviewed_automation_request(&request)
+            .unwrap_or_else(|error| automation_transport_failure(request.id, error));
     }
-    std::println!(
-        "{}",
-        serde_json::to_string(&response)
-            .unwrap_or_else(|_| "{\"v\":1,\"id\":0,\"ok\":0}".to_string())
-    );
+    print_automation_response(&response);
     if response.ok == 0 {
         std::process::exit(1);
     }
-    Ok(())
 }
 
 fn send_reviewed_automation_request(request: &automation::Request) -> Result<automation::Response> {
@@ -151,12 +145,27 @@ fn automation_cli_failure(code: &str, message: String, next: &str) -> ! {
         Instant::now(),
         automation::Failure::new(code, message, false, next),
     );
+    print_automation_response(&response);
+    std::process::exit(1);
+}
+
+fn print_automation_response(response: &automation::Response) {
     std::println!(
         "{}",
-        serde_json::to_string(&response)
+        serde_json::to_string(response)
             .unwrap_or_else(|_| "{\"v\":1,\"id\":0,\"ok\":0}".to_string())
     );
-    std::process::exit(1);
+}
+
+fn read_automation_json(source: &str) -> Result<Value> {
+    let text = if source == "-" {
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        fs::read_to_string(source).with_context(|| format!("Failed to read {source}"))?
+    };
+    serde_json::from_str(&text).with_context(|| format!("Invalid JSON in {source}"))
 }
 
 fn normalize_automation_bind_payload(mut payload: Value) -> Result<Value> {
@@ -189,20 +198,10 @@ fn automation_cli_parameters(
             if args.len() != 2 {
                 bail!("Expected: rbx a bind -J FILE");
             }
-            let source = &args[1];
-            let text = if source == "-" {
-                let mut text = String::new();
-                io::stdin().read_to_string(&mut text)?;
-                text
-            } else {
-                fs::read_to_string(source).with_context(|| format!("Failed to read {source}"))?
-            };
-            let payload: Value =
-                serde_json::from_str(&text).with_context(|| format!("Invalid JSON in {source}"))?;
-            if !payload.is_object() {
-                bail!("bind payload must be a JSON object");
-            }
-            return Ok((None, normalize_automation_bind_payload(payload)?));
+            return Ok((
+                None,
+                normalize_automation_bind_payload(read_automation_json(&args[1])?)?,
+            ));
         }
         if args.len() > 2 {
             bail!("Expected: rbx a bind [project] [place]");
@@ -210,7 +209,7 @@ fn automation_cli_parameters(
         return Ok((
             None,
             normalize_automation_bind_payload(json!({
-                "root": args.first().map(String::as_str).unwrap_or("."),
+                "root": args.first().map_or(".", String::as_str),
                 "place": args.get(1),
             }))?,
         ));
@@ -231,43 +230,26 @@ fn automation_cli_parameters(
             },
         ));
     }
-
-    let payload_index = remaining
-        .iter()
-        .position(|value| value == "-J" || value == "--json-file");
-    let mut payload = if let Some(index) = payload_index {
-        let source = remaining
-            .get(index + 1)
-            .with_context(|| format!("Expected a file after {}", remaining[index]))?;
-        let text = if source == "-" {
-            let mut text = String::new();
-            io::stdin().read_to_string(&mut text)?;
-            text
-        } else {
-            fs::read_to_string(source).with_context(|| format!("Failed to read {source}"))?
-        };
-        let value: Value =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON in {source}"))?;
-        match value {
-            Value::Object(object) => Value::Object(object),
-            Value::Array(values) if operation.id == 23 => json!({ "ops": values }),
-            _ => bail!("{} payload must be a JSON object", operation.name),
+    let (service, source) = match remaining {
+        [flag, source] if flag == "-J" || flag == "--json-file" => (None, source),
+        [service, flag, source]
+            if operation.id == 23 && (flag == "-J" || flag == "--json-file") =>
+        {
+            (Some(service), source)
         }
-    } else {
-        json!({ "a": remaining })
+        _ if operation.id == 23 => bail!("Expected: rbx a bb CX [SERVICE] -J FILE"),
+        _ => bail!("Expected: rbx a {} CX -J FILE", operation.name),
     };
-
-    if operation.id == 23 {
-        let before_payload = payload_index.unwrap_or(remaining.len());
-        if before_payload > 1 {
-            bail!("Expected: rbx a bb CX SERVICE -J FILE");
-        }
-        if let Some(service) = remaining.first().filter(|_| before_payload == 1) {
-            payload
-                .as_object_mut()
-                .context("Batch payload must be an object")?
-                .insert("service".to_string(), Value::String(service.clone()));
-        }
+    let mut payload = match read_automation_json(source)? {
+        Value::Object(object) => Value::Object(object),
+        Value::Array(values) if operation.id == 23 => json!({ "ops": values }),
+        _ => bail!("{} payload must be a JSON object", operation.name),
+    };
+    if let Some(service) = service {
+        payload
+            .as_object_mut()
+            .context("Batch payload must be an object")?
+            .insert("service".to_string(), Value::String(service.clone()));
     }
     if matches!(operation.id, 10 | 11) {
         payload
@@ -381,39 +363,66 @@ fn automation_manifest_identity(
     (game_id, None, None)
 }
 
-fn automation_studio_candidates(bridge: &BridgeServer, selector: &str) -> Vec<Value> {
+fn automation_client_matches(entry: &Value, selector: &str) -> bool {
+    if selector.trim().is_empty() {
+        return true;
+    }
+    place_matches(
+        &BridgeInfoPayload {
+            runtime_id: entry
+                .get("runtimeId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            place_id: entry.get("placeId").and_then(Value::as_i64),
+            game_id: entry.get("gameId").and_then(Value::as_i64),
+            place_name: entry
+                .get("placeName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            ..BridgeInfoPayload::default()
+        },
+        selector,
+    )
+}
+
+fn automation_studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
     let mut seen = HashSet::new();
-    bridge
-        .list_bridge_clients()
-        .into_iter()
+    clients
+        .iter()
         .filter(|entry| entry.get("role").and_then(Value::as_str) == Some(BRIDGE_ROLE_EDIT))
-        .filter(|entry| {
-            if selector.trim().is_empty() {
-                return true;
-            }
-            let info = BridgeInfoPayload {
-                runtime_id: entry
-                    .get("runtimeId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                place_id: entry.get("placeId").and_then(Value::as_i64),
-                game_id: entry.get("gameId").and_then(Value::as_i64),
-                place_name: entry
-                    .get("placeName")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                ..BridgeInfoPayload::default()
-            };
-            place_matches(&info, selector)
-        })
+        .filter(|entry| automation_client_matches(entry, selector))
         .filter(|entry| {
             let id = entry
                 .get("runtimeId")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             !id.is_empty() && seen.insert(id.to_string())
+        })
+        .cloned()
+        .collect()
+}
+
+fn automation_studio_candidates(bridge: &BridgeServer, selector: &str) -> Vec<Value> {
+    automation_studio_candidates_from(&bridge.list_bridge_clients(), selector)
+}
+
+fn automation_context_clients(
+    clients: Vec<Value>,
+    context: &automation::BoundContext,
+) -> Vec<Value> {
+    clients
+        .into_iter()
+        .filter(|entry| {
+            context.runtime_id.as_deref().map_or_else(
+                || automation_client_matches(entry, &context.selector),
+                |runtime_id| {
+                    entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id)
+                        || entry.get("launchEditRuntimeId").and_then(Value::as_str)
+                            == Some(runtime_id)
+                },
+            )
         })
         .collect()
 }
@@ -555,8 +564,7 @@ fn automation_bind(
         .and_then(|value| {
             value
                 .rsplit_once(':')
-                .map(|(_, id)| id)
-                .unwrap_or(value)
+                .map_or(value, |(_, id)| id)
                 .parse::<i64>()
                 .ok()
         })
@@ -714,19 +722,6 @@ fn automation_failure(error: anyhow::Error) -> automation::Failure {
 
 fn automation_payload_args(parameters: &Value) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
-    if let Some(arguments) = object.get("a") {
-        return arguments
-            .as_array()
-            .context("p.a must be an array")?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_string)
-                    .context("p.a values must be strings")
-            })
-            .collect();
-    }
     let mut arguments = Vec::new();
     for (key, value) in object {
         if matches!(key.as_str(), "reviewId" | "op" | "p" | "service") {
@@ -750,8 +745,7 @@ fn automation_payload_args(parameters: &Value) -> Result<Vec<String>> {
                     arguments.push(
                         value
                             .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| value.to_string()),
+                            .map_or_else(|| value.to_string(), str::to_string),
                     );
                 }
             }
@@ -846,36 +840,6 @@ fn automation_spawn_cli(
 
 fn automation_local_cli_args(operation: u16, parameters: &Value) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
-    if object.contains_key("a") {
-        let arguments = automation_payload_args(parameters)?;
-        let overrides_context = arguments.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "-r" | "--root"
-                    | "--project"
-                    | "--project-root"
-                    | "-d"
-                    | "--src"
-                    | "--src-dir"
-                    | "--src-root"
-            ) || [
-                "--root=",
-                "--project=",
-                "--project-root=",
-                "--src=",
-                "--src-dir=",
-                "--src-root=",
-            ]
-            .iter()
-            .any(|prefix| argument.starts_with(prefix))
-                || (argument.starts_with("-r") && !argument.starts_with("--"))
-                || (argument.starts_with("-d") && !argument.starts_with("--"))
-        });
-        if overrides_context {
-            bail!("p.a must not override the bound project or source root");
-        }
-        return Ok(arguments);
-    }
     let mut flags = object.clone();
     for key in [
         "service",
@@ -928,16 +892,7 @@ fn automation_local_cli_args(operation: u16, parameters: &Value) -> Result<Vec<S
             arguments.extend(["--snapshot-dir".to_string(), snapshot_dir]);
         }
         if let Some(services) = flags.remove("services") {
-            let services = services
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .or_else(|| services.as_str().map(str::to_string))
+            let services = automation_string_list(&services)
                 .context("import-snapshots p.services must be a string or string array")?;
             arguments.extend(["--services".to_string(), services]);
         }
@@ -965,6 +920,19 @@ fn automation_context_path(context: &automation::BoundContext, path: PathBuf) ->
     }
 }
 
+fn automation_string_list(value: &Value) -> Option<String> {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .or_else(|| value.as_str().map(str::to_string))
+}
+
 fn automation_pull_args(
     context: &automation::BoundContext,
     parameters: &Value,
@@ -972,18 +940,6 @@ fn automation_pull_args(
 ) -> Result<ExportSnapshotsArgs> {
     let object = parameters.as_object().context("p must be an object")?;
     let source_dir = automation_source_dir(context)?;
-    if object.contains_key("a") {
-        let mut args = parse_daemon_request_args::<ExportSnapshotsArgs>(
-            "export-snapshots",
-            &automation_payload_args(parameters)?,
-        )?;
-        args.project_root = PathBuf::from(&context.root);
-        args.src_dir = source_dir;
-        args.snapshot_dir = automation_context_path(context, args.snapshot_dir);
-        args.run_import = import;
-        args.no_run_import = !import;
-        return Ok(args);
-    }
     let mut arguments = vec![
         "-r".to_string(),
         context.root.clone(),
@@ -1011,17 +967,7 @@ fn automation_pull_args(
         arguments.push("--no-import".to_string());
     }
     if let Some(services) = object.get("services") {
-        let services = services
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .or_else(|| services.as_str().map(str::to_string))
-            .unwrap_or_default();
+        let services = automation_string_list(services).unwrap_or_default();
         arguments.extend(["-s".to_string(), services]);
     }
     for (key, flag) in [
@@ -1038,13 +984,14 @@ fn automation_pull_args(
     }
     for (key, flag) in [
         ("modifiedDefaultBypass", "--mdb"),
-        ("adaptiveThrottle", "--adaptive-throttle"),
         ("exportAllProperties", "--all-props"),
-        ("noUpdateEditorIcons", "--no-icons"),
     ] {
         if object.get(key).and_then(Value::as_bool) == Some(true) {
             arguments.push(flag.to_string());
         }
+    }
+    if object.get("adaptiveThrottle").and_then(Value::as_bool) == Some(false) {
+        arguments.push("--no-adaptive-throttle".to_string());
     }
     parse_daemon_request_args("export-snapshots", &arguments)
 }
@@ -1056,26 +1003,6 @@ fn automation_push_args(
 ) -> Result<PushEditorChangesArgs> {
     let object = parameters.as_object().context("p must be an object")?;
     let source_dir = automation_source_dir(context)?;
-    if object.contains_key("a") {
-        let mut args = parse_daemon_request_args::<PushEditorChangesArgs>(
-            "push-editor-changes",
-            &automation_payload_args(parameters)?,
-        )?;
-        args.project_root = PathBuf::from(&context.root);
-        args.src_dir = source_dir;
-        for path in &mut args.changed_paths_files {
-            *path = automation_context_path(context, std::mem::take(path));
-        }
-        for path in &mut args.target_settings_id_files {
-            *path = automation_context_path(context, std::mem::take(path));
-        }
-        if let Some(path) = args.link_cache_dir.take() {
-            args.link_cache_dir = Some(automation_context_path(context, path));
-        }
-        args.no_review = !reviewed;
-        args.yes = reviewed;
-        return Ok(args);
-    }
     let mut arguments = vec![
         "-r".to_string(),
         context.root.clone(),
@@ -1128,48 +1055,14 @@ fn automation_editor_property_args(
 ) -> Result<ApplyEditorPropertyArgs> {
     let object = parameters.as_object().context("p must be an object")?;
     let source_dir = automation_source_dir(context)?;
-    if object.contains_key("a") {
-        let mut args = parse_daemon_request_args::<ApplyEditorPropertyArgs>(
-            "apply-editor-property",
-            &automation_payload_args(parameters)?,
-        )?;
-        args.project_root = PathBuf::from(&context.root);
-        args.src_dir = source_dir;
-        args.no_review = !reviewed;
-        args.yes = reviewed;
-        return Ok(args);
-    }
-    let mut bridge = BridgeConnectionArgs::local(
-        automation_string(object, "bridgeWaitSeconds")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(2.0),
-    );
-    if let Some(ports) = automation_string(object, "bridgePorts") {
-        bridge.ports = ports;
-    }
     Ok(ApplyEditorPropertyArgs {
-        project_root: PathBuf::from(&context.root),
-        src_dir: source_dir,
-        bridge,
-        service: automation_string(object, "service").context("set-property requires p.service")?,
-        settings_id: automation_string(object, "settingsId"),
-        class_name: automation_string(object, "className").unwrap_or_default(),
-        path_segments_json: serde_json::to_string(
-            object.get("pathSegments").unwrap_or(&json!([])),
-        )?,
-        path_ordinals_json: serde_json::to_string(
-            object.get("pathOrdinals").unwrap_or(&json!([])),
-        )?,
+        target: automation_editor_mutation_args(context, source_dir, object, "set-property")?,
         scope: automation_string(object, "scope").unwrap_or_else(|| "property".to_string()),
         property: automation_string(object, "property")
             .context("set-property requires p.property")?,
         value_json: serde_json::to_string(object.get("value").unwrap_or(&Value::Null))?,
         no_review: !reviewed,
         yes: reviewed,
-        override_packages: object
-            .get("overridePackages")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
     })
 }
 
@@ -1179,15 +1072,17 @@ fn automation_editor_delete_args(
 ) -> Result<ApplyEditorDeleteArgs> {
     let object = parameters.as_object().context("p must be an object")?;
     let source_dir = automation_source_dir(context)?;
-    if object.contains_key("a") {
-        let mut args = parse_daemon_request_args::<ApplyEditorDeleteArgs>(
-            "apply-editor-delete",
-            &automation_payload_args(parameters)?,
-        )?;
-        args.project_root = PathBuf::from(&context.root);
-        args.src_dir = source_dir;
-        return Ok(args);
-    }
+    Ok(ApplyEditorDeleteArgs {
+        target: automation_editor_mutation_args(context, source_dir, object, "remove")?,
+    })
+}
+
+fn automation_editor_mutation_args(
+    context: &automation::BoundContext,
+    source_dir: PathBuf,
+    object: &Map<String, Value>,
+    operation: &str,
+) -> Result<EditorMutationArgs> {
     let mut bridge = BridgeConnectionArgs::local(
         automation_string(object, "bridgeWaitSeconds")
             .and_then(|value| value.parse().ok())
@@ -1196,11 +1091,14 @@ fn automation_editor_delete_args(
     if let Some(ports) = automation_string(object, "bridgePorts") {
         bridge.ports = ports;
     }
-    Ok(ApplyEditorDeleteArgs {
-        project_root: PathBuf::from(&context.root),
-        src_dir: source_dir,
+    Ok(EditorMutationArgs {
+        project: ProjectSourceArgs {
+            project_root: PathBuf::from(&context.root),
+            src_root: source_dir,
+        },
         bridge,
-        service: automation_string(object, "service").context("remove requires p.service")?,
+        service: automation_string(object, "service")
+            .with_context(|| format!("{operation} requires p.service"))?,
         settings_id: automation_string(object, "settingsId"),
         class_name: automation_string(object, "className").unwrap_or_default(),
         path_segments_json: serde_json::to_string(
@@ -1226,8 +1124,7 @@ fn automation_batch(context: &automation::BoundContext, parameters: &Value) -> R
         ops
     };
     bytecode_explorer_batch_result(BytecodeExplorerBatchArgs {
-        service_or_file: None,
-        settings_file: None,
+        input: BytecodeFileArgs::default(),
         service,
         project_root: Some(PathBuf::from(&context.root)),
         ops_json: Some(serde_json::to_string(&ops)?),
@@ -1240,9 +1137,6 @@ fn automation_batch(context: &automation::BoundContext, parameters: &Value) -> R
 
 fn automation_bridge_args(parameters: &Value, positional: &[&str]) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
-    if object.contains_key("a") {
-        return automation_payload_args(parameters);
-    }
     let mut arguments = positional
         .iter()
         .filter_map(|key| automation_string(object, key))
@@ -1606,13 +1500,17 @@ fn automation_dispatch_operation(
             bail!("Studio close is unsupported on this platform")
         }
         23 => automation_batch(context, parameters),
-        50 | 51 => Ok(json!({
-            "studios": automation_studio_candidates(
-                bridge,
-                if parameters.get("all").and_then(Value::as_bool) == Some(true) { "" } else { &context.selector },
-            ),
-            "selected": context.runtime_id,
-        })),
+        50 | 51 => {
+            let clients = bridge.list_bridge_clients();
+            Ok(json!({
+                "studios": automation_studio_candidates_from(
+                    &clients,
+                    if parameters.get("all").and_then(Value::as_bool) == Some(true) { "" } else { &context.selector },
+                ),
+                "clients": automation_context_clients(clients, context),
+                "selected": context.runtime_id,
+            }))
+        }
         54 => {
             let arguments = automation_bridge_args(parameters, &[])?;
             let mut parsed: ExecuteLuauArgs =
@@ -1620,11 +1518,7 @@ fn automation_dispatch_operation(
             if let Some(file) = parsed.file.take() {
                 parsed.file = Some(automation_context_path(context, file));
             }
-            let target = if parsed.client || parsed.player.is_some() {
-                BridgeTarget::Client
-            } else {
-                BridgeTarget::Main
-            };
+            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             execute_luau_result(parsed, bridge)
         }
@@ -1632,11 +1526,7 @@ fn automation_dispatch_operation(
             let arguments = automation_bridge_args(parameters, &[])?;
             let parsed: PluginConsoleOutputArgs =
                 parse_daemon_request_args("get-console-output", &arguments)?;
-            let target = if parsed.client || parsed.player.is_some() {
-                BridgeTarget::Client
-            } else {
-                BridgeTarget::Main
-            };
+            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             get_console_output_result(&parsed, bridge)
         }
@@ -1662,10 +1552,8 @@ fn automation_dispatch_operation(
             parsed.output = automation_context_path(context, parsed.output);
             let target = if parsed.studio {
                 BridgeTarget::Edit
-            } else if parsed.client || parsed.player.is_some() {
-                BridgeTarget::Client
             } else {
-                BridgeTarget::Main
+                BridgeTarget::main_or_client(parsed.client || parsed.player.is_some())
             };
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             shot_result(&parsed, bridge)
@@ -1706,11 +1594,7 @@ fn automation_dispatch_operation(
         65 => {
             let arguments = automation_bridge_args(parameters, &["condition"])?;
             let parsed: WaitUntilArgs = parse_daemon_request_args("wait-until", &arguments)?;
-            let target = if parsed.client || parsed.player.is_some() {
-                BridgeTarget::Client
-            } else {
-                BridgeTarget::Main
-            };
+            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             wait_until_result(&parsed, bridge)
         }

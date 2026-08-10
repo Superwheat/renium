@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -128,12 +129,12 @@ fn markdown_to_roblox_rich_text(markdown: &str) -> String {
     let mut lists = Vec::<Option<u64>>::new();
     for event in Parser::new_ext(markdown, options) {
         match event {
-            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::BlockQuote(_)) => {
+            Event::End(TagEnd::Paragraph | TagEnd::BlockQuote(_)) => {
                 block_break(&mut output, 2);
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 block_break(&mut output, 1);
-                output.push_str(&format!("<font size=\"{}\"><b>", heading_size(level)));
+                let _ = write!(&mut output, "<font size=\"{}\"><b>", heading_size(level));
             }
             Event::End(TagEnd::Heading(_)) => {
                 output.push_str("</b></font>");
@@ -178,25 +179,20 @@ fn markdown_to_roblox_rich_text(markdown: &str) -> String {
                     output.push_str("  ");
                 }
                 if let Some(Some(next)) = lists.last_mut() {
-                    output.push_str(&format!("{next}. "));
+                    let _ = write!(&mut output, "{next}. ");
                     *next += 1;
                 } else {
                     output.push_str("• ");
                 }
             }
-            Event::Start(Tag::Paragraph)
-            | Event::End(TagEnd::Item)
-            | Event::Start(Tag::Table(_))
-            | Event::Start(Tag::TableHead)
-            | Event::Start(Tag::TableRow)
-            | Event::End(TagEnd::Table)
-            | Event::End(TagEnd::TableHead)
-            | Event::End(TagEnd::TableRow) => block_break(&mut output, 1),
-            Event::Start(Tag::Link { dest_url, .. })
-            | Event::Start(Tag::Image { dest_url, .. }) => {
+            Event::Start(Tag::Paragraph | Tag::Table(_) | Tag::TableHead | Tag::TableRow)
+            | Event::End(TagEnd::Item | TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow) => {
+                block_break(&mut output, 1)
+            }
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
                 links.push(dest_url.into_string());
             }
-            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
+            Event::End(TagEnd::Link | TagEnd::Image) => {
                 if let Some(url) = links.pop() {
                     output.push_str(" (");
                     escape(&mut output, &url);
@@ -445,7 +441,7 @@ pub(super) fn localization_csv_to_json(text: &str) -> Result<String> {
         let mut entry = Map::new();
         let mut values = Map::new();
         for (index, header) in headers.iter().enumerate() {
-            let value = row.get(index).map(String::as_str).unwrap_or("");
+            let value = row.get(index).map_or("", String::as_str);
             if header.is_empty() || value.is_empty() {
                 continue;
             }

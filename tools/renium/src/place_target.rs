@@ -7,14 +7,14 @@ static PLACE_FILTER: Mutex<Option<String>> = Mutex::new(None);
 pub(super) fn set_place_filter(value: Option<String>) {
     let mut guard = PLACE_FILTER
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = value.filter(|text| !text.trim().is_empty());
 }
 
 pub(super) fn place_filter() -> Option<String> {
     PLACE_FILTER
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 

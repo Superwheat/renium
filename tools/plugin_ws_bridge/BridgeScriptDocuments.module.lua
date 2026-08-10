@@ -41,8 +41,7 @@ local function clampDocumentPosition(document: any, line: any, character: any): 
 end
 
 local function getDocumentSelection(document: any): { number }?
-	local okSelection, cursorLine, cursorCharacter, anchorLine, anchorCharacter =
-		pcall(document.GetSelection, document)
+	local okSelection, cursorLine, cursorCharacter, anchorLine, anchorCharacter = pcall(document.GetSelection, document)
 	if not okSelection or type(cursorLine) ~= "number" or type(cursorCharacter) ~= "number" then
 		return nil
 	end
@@ -57,14 +56,8 @@ local function restoreDocumentSelection(document: any, selection: { number }?)
 	end
 	local cursorLine, cursorCharacter = clampDocumentPosition(document, selection[1], selection[2])
 	local anchorLine, anchorCharacter = clampDocumentPosition(document, selection[3], selection[4])
-	local okRequest, success = pcall(
-		document.RequestSetSelectionAsync,
-		document,
-		cursorLine,
-		cursorCharacter,
-		anchorLine,
-		anchorCharacter
-	)
+	local okRequest, success =
+		pcall(document.RequestSetSelectionAsync, document, cursorLine, cursorCharacter, anchorLine, anchorCharacter)
 	if okRequest and success ~= false then
 		return
 	end
@@ -101,10 +94,9 @@ function BridgeScriptDocuments.setSource(
 	ctx: { [string]: any }?
 ): (boolean, any, string)
 	local document = findScriptDocument(instance)
-	local token = nil
-	if instance:IsDescendantOf(game) and ctx ~= nil then
-		token = ctx.expectPropertyEvent(instance, "Source", source)
-	end
+	local token = if instance:IsDescendantOf(game) and ctx ~= nil
+		then ctx.expectPropertyEvent(instance, "Source", source)
+		else nil
 	if document ~= nil then
 		local documentOk = setOpenDocumentSource(document, source)
 		if documentOk then
@@ -151,7 +143,7 @@ function BridgeScriptDocuments.capture(serviceNames: { string }, includedKeys: {
 			if
 				pathSegments ~= nil
 				and includedServices[pathSegments[1]]
-				and (includedKeys == nil or includedKeys[key] == true)
+				and (includedKeys == nil or includedKeys[key])
 			then
 				local source = document:GetText()
 				local okStored, storedSource = pcall(function()
@@ -211,11 +203,9 @@ function BridgeScriptDocuments.apply(
 		if target == nil or not target:IsA("LuaSourceContainer") then
 			error("Could not restore open script document " .. table.concat(entry.pathSegments, "."))
 		end
-		local sourceChanged = allSourcesChanged or (changedSourceKeys ~= nil and changedSourceKeys[entry.key] == true)
+		local sourceChanged = allSourcesChanged or (changedSourceKeys ~= nil and changedSourceKeys[entry.key])
 		if changedSourceInstances ~= nil then
-			sourceChanged = sourceChanged
-				or changedSourceInstances[entry.instance] == true
-				or changedSourceInstances[target] == true
+			sourceChanged = sourceChanged or changedSourceInstances[entry.instance] or changedSourceInstances[target]
 		end
 		local source = entry.source
 		local selection = entry.selection

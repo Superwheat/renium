@@ -7,19 +7,18 @@ use rbx_dom_weak::types::Ref as RbxRef;
 use serde_json::{Map, Value, json};
 
 use super::bytecode_api::{
-    acquire_settings_file_lock, apply_file_mutations, collect_source_path_moves_by_settings_id,
-    ensure_service_store_exists, lock_existing_service_store, preserve_source_extensions,
-    preserve_source_path_extension, resolve_bytecode_selector,
-    resolve_bytecode_write_settings_file, settings_document_bytes,
+    acquire_settings_file_lock, apply_file_mutations, collect_source_path_updates,
+    ensure_service_store_exists, file_mutation_paths, lock_existing_service_store,
+    preserve_source_path_extension, resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
-use super::bytecode_query::{bytecode_parent_index, bytecode_selector, parse_property_assignments};
+use super::bytecode_query::{bytecode_parent_index, parse_property_assignments};
 use super::command_line::{
     BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
-    BytecodeMoveInstanceArgs, BytecodeRemoveInstanceArgs, BytecodeRepairRemovedRefsArgs,
+    BytecodeRemoveInstanceArgs,
 };
 use super::editor_document::is_protected_starter_player_container;
 use super::editor_paths::{
-    build_editor_instance_path_parts, build_editor_instance_path_segments,
+    build_editor_instance_path_parts, build_editor_instance_paths,
     build_editor_source_paths_by_index, script_file_names,
 };
 use super::editor_sync::is_lua_source_class;
@@ -28,14 +27,14 @@ use super::instance_api::{self, AddInstanceSpec};
 use super::output::print_json_output;
 use super::settings_bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
-    settings_reference_index,
+    encode_settings_bytecode, settings_reference_index, strict_reference_path,
 };
 use super::settings_tree::settings_children_by_parent;
 
 pub(super) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         None,
     )?;
     ensure_service_store_exists(&settings_file, &service_hint)?;
@@ -47,11 +46,11 @@ pub(super) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
     let parent_index = bytecode_parent_index(
         &document,
-        args.no_parent,
-        args.parent_index,
-        args.parent_settings_id.as_deref(),
-        args.parent_name.as_deref(),
-        args.parent_class_name.as_deref(),
+        args.parent.no_parent,
+        args.parent.parent_index,
+        args.parent.parent_settings_id.as_deref(),
+        args.parent.parent_name.as_deref(),
+        args.parent.parent_class_name.as_deref(),
     )?;
     let class_name = args.class_name.clone();
     let mut properties = parse_property_assignments(&args.properties)?;
@@ -81,37 +80,24 @@ pub(super) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             attributes: parse_property_assignments(&args.attributes)?,
         },
     )?;
-    let mut source_paths = build_editor_source_paths_by_index(&document, &service, service_dir);
-    preserve_source_extensions(
-        &before_document,
-        &source_paths_before,
-        &document,
-        &mut source_paths,
-    );
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
-    collect_source_path_moves_by_settings_id(
+    let source_paths = collect_source_path_updates(
         &before_document,
         &source_paths_before,
         &document,
-        &source_paths,
+        &service,
+        service_dir,
         &mut writes,
         &mut removals,
     )?;
-    writes.insert(
-        settings_file.clone(),
-        settings_document_bytes(&document, &settings_file)?,
-    );
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
     if is_lua_source_class(&document.instances[added.index].class_name)
         && let Some(Some(source_path)) = source_paths.get(added.index)
     {
         writes.insert(source_path.clone(), source.into_bytes());
     }
-    let changed_paths = writes
-        .keys()
-        .chain(removals.iter())
-        .cloned()
-        .collect::<Vec<_>>();
+    let changed_paths = file_mutation_paths(&writes, &removals);
     let source_writes = changed_paths
         .iter()
         .filter(|path| *path != &settings_file)
@@ -126,8 +112,8 @@ pub(super) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             "settingsFile": settings_file,
             "index": added.index,
             "settingsId": added.settings_id,
-            "pathSegments": path_segments_by_index.get(added.index).and_then(|segments| segments.clone()),
-            "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(|ordinals| ordinals.clone()),
+            "pathSegments": path_segments_by_index.get(added.index).and_then(std::clone::Clone::clone),
+            "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(std::clone::Clone::clone),
             "changedPaths": changed_paths,
             "sourceWrites": source_writes,
         }),
@@ -136,22 +122,22 @@ pub(super) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
 }
 
 pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         Some(args.service.as_str()),
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
-    let selector = bytecode_selector(
-        args.index,
-        args.settings_id.as_deref(),
-        args.name.as_deref(),
-        args.class_name.as_deref(),
-    )?;
-    let source_index = instance_api::find_unique_instance_index(&document, selector)?
-        .ok_or_else(|| anyhow::anyhow!("Source instance was not found"))?;
+    let service = bytecode_service_name(&document, &settings_file, &service_hint);
+    let source_index = resolve_bytecode_selector(
+        &document,
+        &service,
+        &args.selector,
+        "Source instance was not found",
+    )?
+    .index;
     if document.instances[source_index].parent_index.is_none() {
         bail!("Service roots cannot be copied");
     }
@@ -193,11 +179,9 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         bail!("Cannot copy an instance into itself or one of its descendants");
     }
 
-    let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_dir = settings_file
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let (path_segments_before, path_ordinals_before) =
         build_editor_instance_path_parts(&document, &service);
@@ -205,8 +189,7 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         &document,
         children_before
             .get(target_parent_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
+            .map_or(&[][..], Vec::as_slice),
         &document.instances[source_index].name,
     );
 
@@ -234,23 +217,23 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
                     })?,
             )
         };
-        let settings_id = if existing_settings_ids.insert(old_instance.settings_id.clone()) {
-            old_instance.settings_id.clone()
-        } else {
-            next_editor_settings_id_fast(&mut existing_settings_ids, &mut next_settings_id_seed)
-        };
+        let settings_id =
+            next_editor_settings_id_fast(&mut existing_settings_ids, &mut next_settings_id_seed);
         let new_index = document.instances.len();
         let name = if old_index == source_index {
             root_name.clone()
         } else {
             old_instance.name
         };
+        let mut properties = old_instance.properties;
+        properties.remove("Source");
+        properties.remove("LinkedSource");
         document.instances.push(SettingsBytecodeInstance {
             settings_id: settings_id.clone(),
             name,
             class_name: old_instance.class_name,
             parent_index,
-            properties: clone_duplicate_properties(&old_instance.properties),
+            properties,
             attributes: old_instance.attributes,
         });
         old_to_new_index.insert(old_index, new_index);
@@ -274,25 +257,18 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         }
     }
 
-    let mut source_paths_after =
-        build_editor_source_paths_by_index(&document, &service, &service_dir);
-    preserve_source_extensions(
-        &before_document,
-        &source_paths_before,
-        &document,
-        &mut source_paths_after,
-    );
-    let mut source_copies = Vec::new();
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
-    collect_source_path_moves_by_settings_id(
+    let mut source_paths_after = collect_source_path_updates(
         &before_document,
         &source_paths_before,
         &document,
-        &source_paths_after,
+        &service,
+        &service_dir,
         &mut writes,
         &mut removals,
     )?;
+    let mut source_copies = Vec::new();
     for old_index in source_subtree.iter().copied() {
         let Some(new_index) = old_to_new_index.get(&old_index).copied() else {
             continue;
@@ -322,15 +298,8 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
             "to": to,
         }));
     }
-    writes.insert(
-        settings_file.clone(),
-        settings_document_bytes(&document, &settings_file)?,
-    );
-    let changed_paths = writes
-        .keys()
-        .chain(removals.iter())
-        .cloned()
-        .collect::<Vec<_>>();
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
 
     let root_settings_id = old_to_new_settings_id
@@ -349,19 +318,6 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         }),
         args.pretty,
     )
-}
-
-pub(super) fn bytecode_move_instance(args: BytecodeMoveInstanceArgs) -> Result<()> {
-    let (source_settings_file, _) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
-    let target_settings_file = args.target_settings_file;
-    if path_key(&source_settings_file) == path_key(&target_settings_file) {
-        bail!("Use bytecode-set-property for same-service moves");
-    }
-    bail!("Cross-service moves are unavailable because Studio cannot apply them atomically")
 }
 
 pub(super) struct BytecodeCloneRefMap {
@@ -407,7 +363,7 @@ pub(super) fn bytecode_service_name(
             settings_file
                 .parent()
                 .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().to_string())
+                .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_default()
 }
@@ -452,13 +408,7 @@ pub(super) fn next_editor_settings_id_fast(
     }
 }
 
-fn clone_duplicate_properties(properties: &Map<String, Value>) -> Map<String, Value> {
-    let mut out = properties.clone();
-    out.remove("Source");
-    out.remove("LinkedSource");
-    out
-}
-
+#[derive(Clone, Copy)]
 pub(super) struct CloneRefMapInput<'a> {
     pub(super) source_subtree: &'a [usize],
     pub(super) old_to_new_index: &'a HashMap<usize, usize>,
@@ -633,24 +583,8 @@ pub(super) fn strict_ref_old_index(
         let debug_id = value.as_str().context("Ref debugId must be a string")?;
         accept("debugId", refs.old_index_by_debug_id.get(debug_id).copied())?;
     }
-    if let Some(value) = object.get("pathSegments") {
-        let segments = value
-            .as_array()
-            .context("Ref pathSegments must be an array")?
-            .iter()
-            .map(|segment| {
-                segment
-                    .as_str()
-                    .map(ToString::to_string)
-                    .context("Ref pathSegments must contain strings")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let candidate = if let Some(value) = object.get("pathOrdinals") {
-            let ordinals =
-                path_ordinals_from_value(value).context("Ref pathOrdinals are invalid")?;
-            if ordinals.len() != segments.len() {
-                bail!("Ref pathOrdinals must match pathSegments length");
-            }
+    if let Some((segments, ordinals)) = strict_reference_path(object)? {
+        let candidate = if let Some(ordinals) = ordinals {
             refs.old_index_by_path_parts_key
                 .get(&instance_path_parts_key(&segments, &ordinals))
                 .copied()
@@ -661,8 +595,6 @@ pub(super) fn strict_ref_old_index(
                 .flatten()
         };
         accept("pathSegments", candidate)?;
-    } else if object.contains_key("pathOrdinals") {
-        bail!("Ref pathOrdinals require pathSegments");
     }
     if object.contains_key("path") {
         bail!("Ref path is unsupported; use pathSegments and pathOrdinals");
@@ -713,8 +645,7 @@ pub(crate) fn validate_settings_model_internal_references(
         .instances
         .iter()
         .find(|instance| instance.parent_index.is_none())
-        .map(|instance| instance.name.as_str())
-        .unwrap_or("");
+        .map_or("", |instance| instance.name.as_str());
     let (path_segments, path_ordinals) = build_editor_instance_path_parts(document, service);
     let indexes = (0..document.instances.len()).collect::<Vec<_>>();
     let identity = indexes
@@ -840,6 +771,18 @@ pub(super) fn prune_empty_source_dirs(service_dir: &Path, start: &Path) -> Resul
     Ok(())
 }
 
+pub(super) fn prune_removed_source_dirs(root: &Path, removals: &[PathBuf]) {
+    let mut directories = removals
+        .iter()
+        .filter_map(|path| path.parent().filter(|path| path.starts_with(root)))
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    directories.dedup();
+    for directory in directories {
+        let _ = prune_empty_source_dirs(root, directory);
+    }
+}
+
 pub(super) fn plan_editor_source_file_removals(
     service_dir: &Path,
     source_paths_by_index: &[Option<PathBuf>],
@@ -861,31 +804,27 @@ pub(super) fn plan_editor_source_file_removals(
 }
 
 pub(super) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Result<()> {
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         None,
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let source_paths_by_index = settings_file
-        .parent()
-        .map(|service_dir| build_editor_source_paths_by_index(&document, &service, service_dir))
-        .unwrap_or_else(|| vec![None; document.instances.len()]);
-    let selector = bytecode_selector(
-        args.index,
-        args.settings_id.as_deref(),
-        args.name.as_deref(),
-        args.class_name.as_deref(),
-    )?;
-    if let Some(index) = instance_api::find_unique_instance_index(&document, selector)?
-        && is_protected_starter_player_container(&document, index)
-    {
+    let source_paths_by_index = settings_file.parent().map_or_else(
+        || vec![None; document.instances.len()],
+        |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
+    );
+    let index =
+        resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
+            .index;
+    if is_protected_starter_player_container(&document, index) {
         bail!("{} cannot be removed", document.instances[index].name);
     }
-    let removed = instance_api::remove_instance(&mut document, selector, !args.no_recursive)?;
+    let removed =
+        instance_api::remove_instances_at_indices(&mut document, &[index], !args.no_recursive)?;
     let removed_paths = removed
         .iter()
         .filter_map(|index| source_paths_by_index.get(*index).and_then(Option::as_ref))
@@ -893,21 +832,14 @@ pub(super) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
         .cloned()
         .collect::<Vec<_>>();
     let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
-    let mut source_paths_after =
-        build_editor_source_paths_by_index(&document, &service, service_dir);
-    preserve_source_extensions(
-        &before_document,
-        &source_paths_by_index,
-        &document,
-        &mut source_paths_after,
-    );
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
-    collect_source_path_moves_by_settings_id(
+    collect_source_path_updates(
         &before_document,
         &source_paths_by_index,
         &document,
-        &source_paths_after,
+        &service,
+        service_dir,
         &mut writes,
         &mut removals,
     )?;
@@ -915,30 +847,15 @@ pub(super) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
     removals.sort_by_key(|path| path_key(path));
     removals.dedup_by(|left, right| path_key(left) == path_key(right));
-    writes.insert(
-        settings_file.clone(),
-        settings_document_bytes(&document, &settings_file)?,
-    );
-    let changed_paths = writes
-        .keys()
-        .cloned()
-        .chain(removals.iter().cloned())
-        .collect::<Vec<_>>();
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
     let removed_source_paths = removals
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     if let Some(service_dir) = settings_file.parent() {
-        let mut directories = removals
-            .iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect::<Vec<_>>();
-        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        directories.dedup();
-        for directory in directories {
-            let _ = prune_empty_source_dirs(service_dir, &directory);
-        }
+        prune_removed_source_dirs(service_dir, &removals);
     }
     print_json_output(
         &json!({
@@ -954,9 +871,9 @@ pub(super) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
 
 pub(super) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) -> Result<()> {
     let explicit_service = (!args.service.trim().is_empty()).then_some(args.service.as_str());
-    let (settings_file, service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
         explicit_service,
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
@@ -965,7 +882,10 @@ pub(super) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) 
     let target_index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
             .index;
-    let path_segments_by_index = build_editor_instance_path_segments(&document, &service);
+    let path_segments_by_index = build_editor_instance_paths(&document, &service)
+        .into_iter()
+        .map(|path| path.map(|path| path.path_segments))
+        .collect::<Vec<_>>();
     let children_by_parent = settings_children_by_parent(&document);
     let package_link_indices =
         package_link_indices_for_desync(&document, &children_by_parent, target_index)?;
@@ -978,13 +898,13 @@ pub(super) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) 
                 "settingsId": instance.settings_id.clone(),
                 "name": instance.name.clone(),
                 "className": instance.class_name.clone(),
-                "pathSegments": path_segments_by_index.get(*index).and_then(|segments| segments.clone()),
+                "pathSegments": path_segments_by_index.get(*index).and_then(std::clone::Clone::clone),
             })
         })
         .collect::<Vec<_>>();
     let target_path = path_segments_by_index
         .get(target_index)
-        .and_then(|segments| segments.clone());
+        .and_then(std::clone::Clone::clone);
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &package_link_indices, true)?;
     document.write_file(&settings_file)?;
@@ -1016,8 +936,7 @@ fn package_link_indices_for_desync(
     }
     let links = children_by_parent
         .get(target_index)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[][..], Vec::as_slice)
         .iter()
         .copied()
         .filter(|index| {
@@ -1043,8 +962,7 @@ pub(super) fn has_direct_package_link_child(
 ) -> bool {
     children_by_parent
         .get(target_index)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[][..], Vec::as_slice)
         .iter()
         .any(|index| {
             document
@@ -1069,67 +987,4 @@ fn path_segments_for_error(document: &SettingsBytecode, index: usize) -> String 
     }
     names.reverse();
     names.join(".")
-}
-
-pub(super) fn bytecode_repair_removed_refs(args: BytecodeRepairRemovedRefsArgs) -> Result<()> {
-    let (settings_file, _service_hint) = resolve_bytecode_write_settings_file(
-        args.settings_file.as_deref(),
-        args.service_or_file.as_deref(),
-        None,
-    )?;
-    let _lock = lock_existing_service_store(&settings_file)?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
-    let old_to_new =
-        old_to_new_after_removed_indices(document.instances.len(), &args.removed_indices)?;
-    let remapped_refs = instance_api::remap_ref_indices(&mut document, &old_to_new);
-    document.write_file(&settings_file)?;
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "removedIndexes": args.removed_indices,
-            "remappedRefs": remapped_refs,
-        }),
-        args.pretty,
-    )
-}
-
-fn old_to_new_after_removed_indices(
-    current_len: usize,
-    removed_indices: &[usize],
-) -> Result<Vec<Option<usize>>> {
-    let mut removed = removed_indices.to_vec();
-    removed.sort_unstable();
-    removed.dedup();
-    if removed.len() != removed_indices.len() {
-        bail!("removed-index values must be unique");
-    }
-
-    let old_len = current_len
-        .checked_add(removed.len())
-        .context("Instance count overflow")?;
-    for index in &removed {
-        if *index >= old_len {
-            bail!("removed index {index} is out of range for old length {old_len}");
-        }
-    }
-
-    let mut old_to_new = vec![None; old_len];
-    let mut next_new = 0usize;
-    let mut removed_iter = removed.iter().copied().peekable();
-    for (old_index, mapped_index) in old_to_new.iter_mut().enumerate() {
-        if removed_iter.peek().copied() == Some(old_index) {
-            removed_iter.next();
-            continue;
-        }
-        if next_new >= current_len {
-            bail!("Removed-index mapping exceeds current instance count");
-        }
-        *mapped_index = Some(next_new);
-        next_new += 1;
-    }
-    if next_new != current_len {
-        bail!("Removed-index mapping produced {next_new} instances, expected {current_len}");
-    }
-    Ok(old_to_new)
 }

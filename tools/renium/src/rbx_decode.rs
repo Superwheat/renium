@@ -388,7 +388,7 @@ pub(super) fn conditional_ref_overlay_request(
                 .find(|(name, _)| name.as_str() == entry.name)
                 .map(|(_, value)| value)
                 .and_then(rbx_variant_referent)
-                .and_then(|referent| referent.as_u128())
+                .and_then(RbxRef::as_u128)
                 .is_some();
             if !has_native_ref {
                 candidates
@@ -439,6 +439,7 @@ pub(super) fn conditional_ref_overlay_request(
     )
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct NativeOverlayRequest<'a> {
     pub service: &'a str,
     pub start_index: usize,
@@ -545,7 +546,7 @@ fn fetch_native_overlay_batch_once(
     };
     let items = parse_native_overlay_class_groups(
         Value::Array(batch.items),
-        batch.strings,
+        &batch.strings,
         start_index,
         take_count,
         request.overlay_schema,
@@ -629,8 +630,8 @@ fn native_settings_enum_name(
         .unwrap_or_else(|| enum_value.to_string())
 }
 
-fn rbx_cframe_to_native_settings(value: RbxCFrame) -> NativeSettingsValue {
-    NativeSettingsValue::CFrame([
+fn rbx_cframe_components(value: RbxCFrame) -> [f32; 12] {
+    [
         value.position.x,
         value.position.y,
         value.position.z,
@@ -643,7 +644,7 @@ fn rbx_cframe_to_native_settings(value: RbxCFrame) -> NativeSettingsValue {
         value.orientation.z.x,
         value.orientation.z.y,
         value.orientation.z.z,
-    ])
+    ]
 }
 
 fn rbx_variant_to_native_settings_value(
@@ -697,7 +698,7 @@ fn rbx_variant_to_native_settings_value(
             Some(NativeSettingsValue::Color3([value.r, value.g, value.b]))
         }
         RbxVariant::CFrame(value) | RbxVariant::OptionalCFrame(Some(value)) => {
-            Some(rbx_cframe_to_native_settings(*value))
+            Some(NativeSettingsValue::CFrame(rbx_cframe_components(*value)))
         }
         RbxVariant::Rect(value) => Some(NativeSettingsValue::Rect([
             value.min.x,
@@ -732,6 +733,21 @@ type NativeSettingsRecords = (
     Option<String>,
 );
 
+fn enum_property_descriptor<'db>(
+    value: &RbxVariant,
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+    property_name: &str,
+) -> Option<&'db RbxPropertyDescriptor<'db>> {
+    if matches!(value, RbxVariant::Enum(_)) {
+        rbx_model_property_descriptor(database, class_name, property_name)
+            .or_else(|| rbx_property_descriptor(database, class_name, property_name))
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct RbxSettingsConversionOptions<'a> {
     pub(super) elide_defaults: bool,
     pub(super) defaults_already_elided: bool,
@@ -777,16 +793,10 @@ pub(super) fn rbx_properties_to_native_settings_records<'a>(
         if matches!(variant, RbxVariant::OptionalCFrame(None)) {
             continue;
         }
-        let descriptor = matches!(variant, RbxVariant::Enum(_))
-            .then(|| {
-                rbx_model_property_descriptor(database, class_name, property_name)
-                    .or_else(|| rbx_property_descriptor(database, class_name, property_name))
-            })
-            .flatten();
+        let descriptor = enum_property_descriptor(variant, database, class_name, property_name);
         let output_name = native_filter
             .and_then(|filter| filter.renamed.get(property_name))
-            .map(String::as_str)
-            .unwrap_or(property_name);
+            .map_or(property_name, String::as_str);
         let keep_json = class_name == "Script" && output_name == "RunContext"
             || native_filter.is_some_and(|filter| {
                 filter.reconstruct_decal_color_map && output_name == "TextureContent"
@@ -861,12 +871,7 @@ pub(super) fn rbx_properties_to_settings_records<'a>(
         {
             continue;
         }
-        let descriptor = matches!(variant, RbxVariant::Enum(_))
-            .then(|| {
-                rbx_model_property_descriptor(database, class_name, property_name)
-                    .or_else(|| rbx_property_descriptor(database, class_name, property_name))
-            })
-            .flatten();
+        let descriptor = enum_property_descriptor(variant, database, class_name, property_name);
         if options.elide_defaults && !options.defaults_already_elided {
             let default = database
                 .classes
@@ -874,14 +879,8 @@ pub(super) fn rbx_properties_to_settings_records<'a>(
                 .and_then(|class| database.find_default_property(class, property_name));
             let matches_default = default == Some(variant)
                 || default.is_some_and(|default| {
-                    let default_descriptor = matches!(default, RbxVariant::Enum(_))
-                        .then(|| {
-                            rbx_model_property_descriptor(database, class_name, property_name)
-                                .or_else(|| {
-                                    rbx_property_descriptor(database, class_name, property_name)
-                                })
-                        })
-                        .flatten();
+                    let default_descriptor =
+                        enum_property_descriptor(default, database, class_name, property_name);
                     match (
                         rbx_variant_to_settings_json(default, default_descriptor, database, refs),
                         rbx_variant_to_settings_json(variant, descriptor, database, refs),
@@ -898,8 +897,7 @@ pub(super) fn rbx_properties_to_settings_records<'a>(
             let output_name = options
                 .native_filter
                 .and_then(|filter| filter.renamed.get(property_name))
-                .map(String::as_str)
-                .unwrap_or(property_name);
+                .map_or(property_name, String::as_str);
             properties.insert(output_name.to_string(), value);
         }
     }
@@ -1120,20 +1118,7 @@ pub(super) fn canonicalize_nonfinite_float_json(value: Value) -> Value {
 fn rbx_cframe_to_settings_json(value: RbxCFrame) -> Value {
     json!({
         "_type": "CFrame",
-        "components": [
-            value.position.x,
-            value.position.y,
-            value.position.z,
-            value.orientation.x.x,
-            value.orientation.x.y,
-            value.orientation.x.z,
-            value.orientation.y.x,
-            value.orientation.y.y,
-            value.orientation.y.z,
-            value.orientation.z.x,
-            value.orientation.z.y,
-            value.orientation.z.z,
-        ]
+        "components": rbx_cframe_components(value),
     })
 }
 

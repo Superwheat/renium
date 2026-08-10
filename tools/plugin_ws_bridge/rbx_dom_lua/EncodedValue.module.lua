@@ -11,7 +11,6 @@ local function unpackDecoder(f)
 end
 
 local function serializeFloat(value)
-
 	if value == math.huge or value == -math.huge then
 		return 999999999 * math.sign(value)
 	end
@@ -118,10 +117,18 @@ types = {
 			local orient = pod.orientation
 
 			return CFrame.new(
-				pos[1], pos[2], pos[3],
-				orient[1][1], orient[1][2], orient[1][3],
-				orient[2][1], orient[2][2], orient[2][3],
-				orient[3][1], orient[3][2], orient[3][3]
+				pos[1],
+				pos[2],
+				pos[3],
+				orient[1][1],
+				orient[1][2],
+				orient[1][3],
+				orient[2][1],
+				orient[2][2],
+				orient[2][3],
+				orient[3][1],
+				orient[3][2],
+				orient[3][3]
 			)
 		end,
 
@@ -227,7 +234,6 @@ types = {
 		fromPod = identity,
 
 		toPod = function(roblox)
-
 			if typeof(roblox) == "number" then
 				return roblox
 			else
@@ -349,7 +355,6 @@ types = {
 			local keypoints = {}
 
 			for index, keypoint in ipairs(pod.keypoints) do
-
 				local value = keypoint.value or 0
 				local envelope = keypoint.envelope or 0
 				keypoints[index] = NumberSequenceKeypoint.new(keypoint.time, value, envelope)
@@ -380,7 +385,6 @@ types = {
 			if pod == "Default" then
 				return nil
 			else
-
 				if pod.acousticAbsorption then
 					return (PhysicalProperties.new :: any)(
 						pod.density,
@@ -580,7 +584,6 @@ function EncodedValue.decode(encodedValue)
 	local ty, value = next(encodedValue)
 
 	if ty == nil then
-
 		return true, nil
 	end
 
@@ -612,10 +615,8 @@ local propertyTypeRenames = {
 }
 
 encodeNaive = function(rbxValue)
-	local propertyType = typeof(rbxValue)
-	if propertyTypeRenames[propertyType] ~= nil then
-		propertyType = propertyTypeRenames[propertyType]
-	end
+	local rawPropertyType = typeof(rbxValue)
+	local propertyType = propertyTypeRenames[rawPropertyType] or rawPropertyType
 
 	return EncodedValue.encode(rbxValue, propertyType)
 end

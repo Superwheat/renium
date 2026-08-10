@@ -21,37 +21,37 @@ use crate::timing::current_millis;
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct UpdateArgs {
     #[command(subcommand)]
     pub command: UpdateCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 pub enum UpdateCommand {
     Check(UpdateCheckArgs),
     Apply(UpdateApplyArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct UpdateCheckArgs {
     #[arg(long, default_value = DEFAULT_UPDATE_MANIFEST)]
     pub manifest: String,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct UpdateApplyArgs {
     #[arg(long, default_value = DEFAULT_UPDATE_MANIFEST)]
     pub manifest: String,
     #[arg(long, value_delimiter = ',')]
     pub component: Vec<String>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub dry_run: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long)]
     pub force: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct UpdateHelperArgs {
     #[arg(long)]
     pub parent_pid: u32,
@@ -65,98 +65,77 @@ pub struct UpdateHelperArgs {
     pub transaction_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Deserialize)]
 struct SignedUpdateManifest {
     payload: UpdatePayload,
     signature: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdatePayload {
     schema_version: u32,
     version: String,
-    #[serde(default)]
     components: BTreeMap<String, UpdateComponents>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize)]
 struct UpdateComponents {
-    #[serde(default)]
     cli: Option<UpdateArtifact>,
-    #[serde(default)]
     plugin: Option<UpdateArtifact>,
-    #[serde(default)]
     extension: Option<UpdateArtifact>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct UpdateArtifact {
     url: String,
     sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize)]
 struct DeferredUpdateResult {
-    #[serde(default)]
-    transaction_id: String,
     ok: bool,
     version: String,
     target: PathBuf,
     error: Option<String>,
     helper: PathBuf,
-    completed_unix_ms: u128,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeferredUpdatePlan {
-    #[serde(default)]
     transaction_id: String,
-    #[serde(default)]
     phase: String,
-    #[serde(default)]
     originals: Option<DeferredUpdateOriginals>,
     version: String,
     target: PathBuf,
     stage: PathBuf,
-    #[serde(default)]
     core_stage: Option<PathBuf>,
-    #[serde(default)]
     managed_studio_core_stage: Option<PathBuf>,
-    #[serde(default)]
     plugin: Option<DeferredFileInstall>,
-    #[serde(default)]
-    extension: Option<PathBuf>,
-    #[serde(default)]
-    editor_installs: Vec<EditorExtensionInstall>,
-    #[serde(default)]
     extension_installs: Vec<DeferredExtensionInstall>,
     components: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct EditorExtensionInstall {
     cli: PathBuf,
     root: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DeferredExtensionInstall {
     source: PathBuf,
     editors: Vec<EditorExtensionInstall>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DeferredFileInstall {
     source: PathBuf,
     target: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateHelperReservation {
     transaction_id: String,
@@ -168,7 +147,7 @@ struct UpdateHelperReservation {
     phase: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DeferredUpdateOriginals {
     file_backups: Vec<PathBackup>,
     extension_backups: Vec<ExtensionRootBackup>,
@@ -176,7 +155,7 @@ struct DeferredUpdateOriginals {
     managed_studio_backup: Option<ManagedStudioBackup>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PathBackup {
     target: PathBuf,
     backup: PathBuf,
@@ -960,8 +939,6 @@ fn apply_update(
             source: stage.join("Renium.rbxm"),
             target: target.clone(),
         }),
-        extension: None,
-        editor_installs: Vec::new(),
         extension_installs: staged_extensions,
         components: requested.clone(),
     };
@@ -1057,7 +1034,7 @@ fn apply_update(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ExtensionRootBackup {
     root: PathBuf,
     backup: PathBuf,
@@ -1067,7 +1044,7 @@ struct ExtensionRootBackup {
     existed: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ManagedStudioBackup {
     target: PathBuf,
     backup: PathBuf,
@@ -1141,14 +1118,9 @@ fn default_update_components(components: &UpdateComponents) -> Result<Vec<String
 }
 
 fn renium_extension_is_installed() -> bool {
-    extension_roots().into_iter().any(|root| {
-        fs::read_dir(root).is_ok_and(|entries| {
-            entries.filter_map(std::result::Result::ok).any(|entry| {
-                entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    && is_renium_extension_dir(&entry.path())
-            })
-        })
-    })
+    extension_roots()
+        .into_iter()
+        .any(|root| has_renium_extension(&root))
 }
 
 fn fresh_temp_dir(prefix: &str) -> Result<PathBuf> {
@@ -1204,13 +1176,21 @@ fn is_renium_extension_dir(path: &Path) -> bool {
         })
 }
 
+fn has_renium_extension(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries.filter_map(std::result::Result::ok).any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && is_renium_extension_dir(&entry.path())
+        })
+    })
+}
+
 fn plan_editor_installs(plan: &DeferredUpdatePlan) -> Vec<EditorExtensionInstall> {
-    let mut editors = plan.editor_installs.clone();
-    editors.extend(
-        plan.extension_installs
-            .iter()
-            .flat_map(|install| install.editors.iter().cloned()),
-    );
+    let mut editors = plan
+        .extension_installs
+        .iter()
+        .flat_map(|install| install.editors.iter().cloned())
+        .collect::<Vec<_>>();
     editors.sort_by(|left, right| left.root.cmp(&right.root));
     editors.dedup_by(|left, right| paths_equal(&left.root, &right.root));
     editors
@@ -1238,7 +1218,7 @@ fn snapshot_extension_installation(
                 if !entry.file_type()?.is_dir() || !is_renium_extension_dir(&entry.path()) {
                     continue;
                 }
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = entry.file_name().to_string_lossy().into_owned();
                 let destination = backup.join(&name);
                 copy_directory(&entry.path(), &destination)?;
                 hashes.insert(name.clone(), directory_sha256(&destination)?);
@@ -1627,7 +1607,7 @@ fn extract_core_bundle(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
         .into_iter()
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file() && entry.file_name() == executable_name)
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .collect::<Vec<_>>();
     executables.sort();
     if executables.len() != 1 {
@@ -1640,6 +1620,7 @@ fn extract_core_bundle(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
         .parent()
         .context("Core executable has no parent")?
         .to_path_buf();
+    #[cfg(unix)]
     ensure_core_permissions(&root)?;
     Ok(root)
 }
@@ -1654,11 +1635,6 @@ fn ensure_core_permissions(root: &Path) -> Result<()> {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         }
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_core_permissions(_root: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1838,9 +1814,10 @@ fn prepare_core_directory(source: &Path, target_root: &Path) -> Result<PathBuf> 
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => {
-                if let Err(error) = copy_directory(source, &candidate)
-                    .and_then(|()| ensure_core_permissions(&candidate))
-                {
+                let result = copy_directory(source, &candidate);
+                #[cfg(unix)]
+                let result = result.and_then(|()| ensure_core_permissions(&candidate));
+                if let Err(error) = result {
                     let _ = fs::remove_dir_all(&candidate);
                     return Err(error);
                 }
@@ -1868,12 +1845,10 @@ fn replace_core_directory(target_root: &Path, prepared: &Path) -> Result<()> {
         let restore = fs::rename(&backup, target_root);
         return Err(error)
             .with_context(|| format!("Failed to install {}", target_root.display()))
-            .context(
-                restore
-                    .err()
-                    .map(|error| format!("Core rollback failed: {error}"))
-                    .unwrap_or_else(|| "The previous core was restored".to_string()),
-            );
+            .context(restore.err().map_or_else(
+                || "The previous core was restored".to_string(),
+                |error| format!("Core rollback failed: {error}"),
+            ));
     }
     if let Err(error) = fs::remove_dir_all(&backup) {
         eprintln!(
@@ -1943,12 +1918,10 @@ fn install_shared_core_files(target: &Path, core_root: &Path) -> Result<()> {
                 .map(|(_, destination)| destination.clone())
                 .collect::<Vec<_>>();
             let rollback = restore_installed_files(&rollback_paths, &originals[..=index]);
-            return Err(error).context(
-                rollback
-                    .err()
-                    .map(|error| format!("Shared core rollback failed: {error:#}"))
-                    .unwrap_or_else(|| "The previous shared core files were restored".to_string()),
-            );
+            return Err(error).context(rollback.err().map_or_else(
+                || "The previous shared core files were restored".to_string(),
+                |error| format!("Shared core rollback failed: {error:#}"),
+            ));
         }
     }
     Ok(())
@@ -1987,24 +1960,6 @@ fn apply_staged_update_plan(
                 .context("Failed to start the updated Renium managed Studio setup")?;
             if !status.success() {
                 bail!("Updated Renium managed Studio setup exited with {status}");
-            }
-        }
-    }
-    if let Some(vsix) = plan.extension.as_ref() {
-        for editor in &plan.editor_installs {
-            let status = Command::new(&editor.cli)
-                .arg("--extensions-dir")
-                .arg(&editor.root)
-                .arg("--install-extension")
-                .arg(vsix)
-                .arg("--force")
-                .status()
-                .with_context(|| format!("Failed to start {}", editor.cli.display()))?;
-            if !status.success() {
-                bail!(
-                    "Extension installer {} exited with {status}",
-                    editor.cli.display()
-                );
             }
         }
     }
@@ -2072,10 +2027,6 @@ fn recover_pending_update_transaction(lifecycle_lock: &LifecycleLock) -> Result<
         &fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?,
     )
     .with_context(|| format!("Invalid update transaction journal {}", path.display()))?;
-    if plan.transaction_id.is_empty() {
-        plan.transaction_id = format!("recovery-{}-{}", std::process::id(), current_millis());
-        write_pending_update_transaction(&plan)?;
-    }
     let originals = plan
         .originals
         .as_ref()
@@ -2138,9 +2089,7 @@ fn schedule_windows_update(plan: &DeferredUpdatePlan, core_root: Option<&Path>) 
     let plan_path = plan.stage.join("update-plan.json");
     fs::write(&plan_path, serde_json::to_vec(plan)?)
         .with_context(|| format!("Failed to write {}", plan_path.display()))?;
-    let helper_source = core_root
-        .map(|root| root.join("renium.exe"))
-        .unwrap_or(env::current_exe()?);
+    let helper_source = core_root.map_or(env::current_exe()?, |root| root.join("renium.exe"));
     let helper = env::temp_dir().join(format!(
         "renium-update-helper-{}-{}.exe",
         std::process::id(),
@@ -2335,13 +2284,11 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
         );
     }
     let record = DeferredUpdateResult {
-        transaction_id: plan.transaction_id.clone(),
         ok: errors.is_empty(),
         version: plan.version,
         target: plan.target,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
         helper,
-        completed_unix_ms: current_millis(),
     };
     let result_written = match write_deferred_update_result(&args.result, &record) {
         Ok(()) => true,
@@ -2415,6 +2362,7 @@ pub(crate) fn install_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
+    #[cfg(unix)]
     preserve_executable_permissions(target, &temporary)?;
     let had_target = target.exists();
     if had_target {
@@ -2437,12 +2385,10 @@ pub(crate) fn install_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error)
             .with_context(|| format!("Failed to install {}", target.display()))
-            .context(
-                rollback
-                    .and_then(Result::err)
-                    .map(|error| format!("Rollback failed: {error:#}"))
-                    .unwrap_or_else(|| "The previous file was restored".to_string()),
-            );
+            .context(rollback.and_then(Result::err).map_or_else(
+                || "The previous file was restored".to_string(),
+                |error| format!("Rollback failed: {error:#}"),
+            ));
     }
     if backup.exists()
         && let Err(error) = fs::remove_file(&backup)
@@ -2503,11 +2449,6 @@ fn preserve_executable_permissions(target: &Path, temporary: &Path) -> Result<()
         .unwrap_or(0o755);
     fs::set_permissions(temporary, fs::Permissions::from_mode(mode))
         .with_context(|| format!("Failed to set permissions on {}", temporary.display()))
-}
-
-#[cfg(not(unix))]
-fn preserve_executable_permissions(_target: &Path, _temporary: &Path) -> Result<()> {
-    Ok(())
 }
 
 fn platform_key() -> String {
@@ -2802,14 +2743,7 @@ fn find_editor_clis() -> Vec<PathBuf> {
 fn find_installed_extension_editors() -> Result<Vec<EditorExtensionInstall>> {
     let installed = extension_roots()
         .into_iter()
-        .filter(|root| {
-            fs::read_dir(root).is_ok_and(|entries| {
-                entries.filter_map(std::result::Result::ok).any(|entry| {
-                    entry.file_type().is_ok_and(|kind| kind.is_dir())
-                        && is_renium_extension_dir(&entry.path())
-                })
-            })
-        })
+        .filter(|root| has_renium_extension(root))
         .collect::<Vec<_>>();
     if installed.is_empty() {
         bail!("No installed Renium editor extension was found");

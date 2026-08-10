@@ -90,18 +90,8 @@ fn emit_build_metadata() {
             |duration| duration.as_secs().to_string(),
         )
     });
-    let mut enabled_features = env::vars()
-        .filter_map(|(key, _)| key.strip_prefix("CARGO_FEATURE_").map(str::to_string))
-        .collect::<Vec<_>>();
-    enabled_features.sort();
-    let build_features = if enabled_features.is_empty() {
-        "none".to_string()
-    } else {
-        enabled_features.join(",")
-    };
     println!("cargo:rustc-env=BUILD_GIT_HASH={git_hash}");
     println!("cargo:rustc-env=BUILD_TIMESTAMP_UNIX={build_timestamp}");
-    println!("cargo:rustc-env=BUILD_FEATURES={build_features}");
 }
 
 fn embed_windows_manifest(out_dir: &Path) {
@@ -126,7 +116,6 @@ fn embed_windows_manifest(out_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
-    println!("cargo:rerun-if-env-changed=RENIUM_UPDATE_PUBLIC_KEY");
     emit_build_metadata();
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is missing");
     let host = env::var("HOST").expect("HOST is missing");

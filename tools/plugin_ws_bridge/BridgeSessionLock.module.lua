@@ -185,7 +185,7 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> ())
 	end
 
 	function api.acquire(takeover: boolean?): (boolean, { [string]: any })
-		if takeover == true then
+		if takeover then
 			for _, lock in locks() do
 				if not owns(lock) then
 					lock:Destroy()

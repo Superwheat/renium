@@ -28,8 +28,7 @@ pub(crate) fn run_git_checked(git_path: &str, args: &[String], cwd: &Path) -> Re
             output
                 .status
                 .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
             tail_text(&String::from_utf8_lossy(&output.stderr), 2000)
         );
     }
@@ -63,9 +62,7 @@ fn run_checked_external_tool_strings(
     if !output.status.success() {
         bail!(
             "{label} failed with exit code {}.\nstdout:\n{}\nstderr:\n{}",
-            status
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+            status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
             tail_text(&stdout, 4000),
             tail_text(&stderr, 4000)
         );

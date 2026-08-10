@@ -1364,10 +1364,9 @@ updateMouse()
 	end
 
 	function api.getConsoleOutput(params)
-		local limit = math.clamp(tonumber(params.limit) or 200, 1, CONSOLE_BUFFER_LIMIT)
-		if params.clear == true then
-			limit = CONSOLE_BUFFER_LIMIT
-		end
+		local limit = if params.clear == true
+			then CONSOLE_BUFFER_LIMIT
+			else math.clamp(tonumber(params.limit) or 200, 1, CONSOLE_BUFFER_LIMIT)
 		local sinceSeq = tonumber(params.sinceSeq) or tonumber(params.since) or tonumber(params.cursorSeq) or 0
 		local entries = {}
 		local truncated = false
@@ -1850,9 +1849,9 @@ updateMouse()
 		end
 		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 20)
 		local backgroundLifetimeSeconds = BridgeValueCodec.decodeNumber(params.backgroundLifetimeSeconds)
-		if backgroundLifetimeSeconds then
-			backgroundLifetimeSeconds = math.clamp(backgroundLifetimeSeconds, 0.1, 610)
-		end
+		backgroundLifetimeSeconds = if backgroundLifetimeSeconds
+			then math.clamp(backgroundLifetimeSeconds, 0.1, 610)
+			else nil
 
 		local context = string.lower(tostring(params.context or "plugin"))
 		if context == "client" then
@@ -2316,10 +2315,7 @@ updateMouse()
 	end
 
 	function api.cleanup(ownerGeneration)
-		local cleanupGeneration = ownerGeneration
-		if cleanupGeneration == nil then
-			cleanupGeneration = api.requestCancellation()
-		end
+		local cleanupGeneration = ownerGeneration or api.requestCancellation()
 		if captureProbeGui ~= nil then
 			captureProbeGui:Destroy()
 		end

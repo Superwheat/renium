@@ -7,16 +7,16 @@ use serde_json::{Map, Value, json};
 
 use crate::file_io::service_settings_path;
 use crate::settings_bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
+    SettingsBytecode, SettingsBytecodeInstance, is_reference_object, reindex_reference_indices,
 };
+use crate::snapshot_refs::remap_record_reference_ids;
 
 use super::parse_jsonc_value;
 use super::projection::{
     clear_stage_target_children, find_document_target, projection_settings_id,
-    remap_settings_references,
 };
 
-fn validate_model_json_hierarchy(instances: &[Value]) -> Result<(Vec<String>, Vec<Option<usize>>)> {
+fn validate_model_json_hierarchy(instances: &[Value]) -> Result<Vec<String>> {
     let mut ids = Vec::with_capacity(instances.len());
     let mut indices = HashMap::with_capacity(instances.len());
     for (index, value) in instances.iter().enumerate() {
@@ -78,7 +78,7 @@ fn validate_model_json_hierarchy(instances: &[Value]) -> Result<(Vec<String>, Ve
             states[index] = 2;
         }
     }
-    Ok((ids, parents))
+    Ok(ids)
 }
 
 pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -> Result<()> {
@@ -91,26 +91,25 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         .as_object()
         .context("Model JSON root must be an object")?;
     let hierarchical_instances;
-    let root_input_id;
-    let instances = match object.get("instances") {
-        Some(value) => {
-            root_input_id = None;
+    let (root_input_id, instances): (Option<String>, &[Value]) = match object.get("instances") {
+        Some(value) => (
+            None,
             value
                 .as_array()
-                .context("Model JSON instances must be an array")?
-        }
+                .context("Model JSON instances must be an array")?,
+        ),
         None => {
             hierarchical_instances = flatten_rojo_model_json(object, target)?;
-            root_input_id = hierarchical_instances
+            let root_id = hierarchical_instances
                 .first()
                 .and_then(Value::as_object)
                 .and_then(|instance| instance.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            &hierarchical_instances
+            (root_id, &hierarchical_instances)
         }
     };
-    let (input_ids, _) = validate_model_json_hierarchy(instances)?;
+    let input_ids = validate_model_json_hierarchy(instances)?;
     clear_stage_target_children(stage, target)?;
     let service = target
         .first()
@@ -136,8 +135,8 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         if previous != root_id {
             let remap = HashMap::from([(previous, root_id.to_string())]);
             for instance in &mut document.instances {
-                remap_settings_references(&mut instance.properties, &remap);
-                remap_settings_references(&mut instance.attributes, &remap);
+                remap_record_reference_ids(&mut instance.properties, &remap);
+                remap_record_reference_ids(&mut instance.attributes, &remap);
             }
         }
     }
@@ -197,8 +196,8 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         };
         stabilize_model_json_reference_indices(&mut properties, &input_ids)?;
         stabilize_model_json_reference_indices(&mut attributes, &input_ids)?;
-        remap_settings_references(&mut properties, &output_ids);
-        remap_settings_references(&mut attributes, &output_ids);
+        remap_record_reference_ids(&mut properties, &output_ids);
+        remap_record_reference_ids(&mut attributes, &output_ids);
         let mut properties = normalize_model_property_map(Some(class_name), &properties)
             .with_context(|| format!("Invalid properties on model JSON instance '{id}'"))?;
         let attributes = normalize_model_property_map(None, &attributes)
@@ -235,8 +234,7 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         let parent_index = instance
             .get("parentId")
             .and_then(Value::as_str)
-            .map(|parent| output_indices[parent])
-            .unwrap_or(target_index);
+            .map_or(target_index, |parent| output_indices[parent]);
         if root_input_id.as_deref() == Some(id.as_str()) {
             let root = &mut document.instances[target_index];
             root.class_name = class_name.to_string();
@@ -291,7 +289,7 @@ fn flatten_rojo_model_json(root: &Map<String, Value>, target: &[String]) -> Resu
 
     fn visit(
         object: &Map<String, Value>,
-        name: String,
+        name: &str,
         parent_id: Option<&str>,
         path: &str,
         output: &mut Vec<Value>,
@@ -376,7 +374,7 @@ fn flatten_rojo_model_json(root: &Map<String, Value>, target: &[String]) -> Resu
                     })?;
                 visit(
                     child,
-                    child_name.to_string(),
+                    child_name,
                     Some(&id),
                     &format!("{path}/{index}:{child_name}"),
                     output,
@@ -386,10 +384,7 @@ fn flatten_rojo_model_json(root: &Map<String, Value>, target: &[String]) -> Resu
         Ok(())
     }
 
-    let name = target
-        .last()
-        .cloned()
-        .context("Model JSON target has no name")?;
+    let name = target.last().context("Model JSON target has no name")?;
     let mut output = Vec::new();
     visit(root, name, None, &target.join("/"), &mut output)?;
     Ok(output)
@@ -420,11 +415,7 @@ fn stabilize_model_json_reference_indices(
                 }
             }
             Value::Object(object) => {
-                let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
-                    || object.contains_key("settingsId")
-                    || object.contains_key("instanceId")
-                    || object.contains_key("instanceIndex");
-                if is_reference {
+                if is_reference_object(object) {
                     let mut resolved = selector(object, "settingsId")?;
                     if let Some(instance_id) = selector(object, "instanceId")? {
                         if resolved.as_ref().is_some_and(|id| id != &instance_id) {
@@ -488,11 +479,7 @@ pub(super) fn contains_reference_value(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(contains_reference_value),
         Value::Object(object) => {
-            object.get("_type").and_then(Value::as_str) == Some("Ref")
-                || object.contains_key("instanceIndex")
-                || object.contains_key("settingsId")
-                || object.contains_key("instanceId")
-                || object.values().any(contains_reference_value)
+            is_reference_object(object) || object.values().any(contains_reference_value)
         }
         _ => false,
     }

@@ -18,8 +18,7 @@ use super::bridge_server::{
     SourceBatchMap, clamp_bridge_chunk_size,
 };
 use super::build_info::{
-    FEATURES as BUILD_FEATURES, GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX,
-    VERSION as BUILD_VERSION,
+    GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
 };
 use super::command_args::ImportSnapshotsArgs;
 use super::command_line::ExportSnapshotsArgs;
@@ -79,7 +78,7 @@ const ADAPTIVE_WORKER_GROWTH_WAVE_INTERVAL: usize = 2;
 const DYNAMIC_RANGES_PER_WORKER: usize = 2;
 const DYNAMIC_RANGE_MIN_INSTANCES: usize = 512;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum PerformanceMode {
     Throughput,
     Balanced,
@@ -113,14 +112,14 @@ impl PerformanceMode {
                 if instance_count < LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES {
                     return instance_count.max(1);
                 }
-                let target_ranges = bridge_concurrency.max(1).min(instance_count.max(1));
-                instance_count.div_ceil(target_ranges).max(1)
+                let target_ranges = bridge_concurrency.max(1).min(instance_count);
+                instance_count.div_ceil(target_ranges)
             }
             Self::Balanced => {
                 if instance_count < LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES {
                     return 0;
                 }
-                instance_count.div_ceil(8).max(1)
+                instance_count.div_ceil(8)
             }
             Self::Smooth => 0,
         }
@@ -133,21 +132,6 @@ impl PerformanceMode {
         match self {
             Self::Throughput | Self::Balanced => bridge_concurrency.max(1),
             Self::Smooth => 0,
-        }
-    }
-
-    fn cached_tune_max_frame_cap_ms(self) -> f64 {
-        match self {
-            Self::Throughput => 100.0,
-            Self::Balanced => 50.0,
-            Self::Smooth => 33.0,
-        }
-    }
-
-    fn cached_tune_stall_cap(self) -> u64 {
-        match self {
-            Self::Throughput => 1,
-            Self::Balanced | Self::Smooth => 0,
         }
     }
 }
@@ -215,12 +199,7 @@ fn load_adaptive_tune_cache(project_root: &Path, expected_cache_key: &str) -> Ad
 
 fn write_adaptive_tune_cache(project_root: &Path, cache: &AdaptiveTuneCache) {
     let path = adaptive_tune_cache_path(project_root);
-    let cache_to_write = AdaptiveTuneCache {
-        version: ADAPTIVE_TUNE_CACHE_VERSION,
-        cache_key: cache.cache_key.clone(),
-        services: cache.services.clone(),
-    };
-    if let Err(err) = write_json_file(&path, &cache_to_write, true) {
+    if let Err(err) = write_json_file(&path, cache, true) {
         println!(
             "[renium] warning: failed to write adaptive tuning cache {}: {err:#}",
             path.display()
@@ -247,7 +226,7 @@ fn record_bridge_sync_completion(bridge: &BridgeServer) {
 pub(super) fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
     let message = err
         .chain()
-        .map(|cause| cause.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ");
     [
@@ -264,12 +243,10 @@ pub(super) fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct PlaceGuardConfig {
-    #[serde(default, rename = "allowedPlaceIds")]
     pub(super) allowed_place_ids: Vec<i64>,
-    #[serde(default, rename = "allowedGameIds")]
     allowed_game_ids: Vec<i64>,
 }
 
@@ -288,8 +265,7 @@ pub(super) fn parse_place_guard_config(text: &str, path: &Path) -> Result<PlaceG
 fn place_guard_config_path() -> PathBuf {
     std::env::var_os("RENIUM_CONFIG")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("renium.config.json"))
+        .map_or_else(|| PathBuf::from("renium.config.json"), PathBuf::from)
 }
 
 fn active_place_guard() -> Result<Option<PlaceGuardConfig>> {
@@ -349,15 +325,6 @@ pub(super) fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
             SUPPORTED_BRIDGE_CODEC_VERSIONS.join(", ")
         );
     }
-    if !info
-        .supported_instance_protocols
-        .iter()
-        .any(|value| value == BRIDGE_PROTOCOL_VERSION)
-    {
-        bail!(
-            "Plugin does not advertise support for required instance protocol {BRIDGE_PROTOCOL_VERSION}"
-        );
-    }
     if info.chunk_frame_protocol_version != BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION {
         bail!(
             "Unsupported plugin chunk frame protocol {} (expected {})",
@@ -396,24 +363,20 @@ impl ServiceExportContext<'_> {
     fn export_with_span(
         &self,
         service: &str,
-        cached_tune: Option<AdaptiveTuneEntry>,
+        cached_tune: Option<&AdaptiveTuneEntry>,
     ) -> Result<ServiceExportOutput> {
         if verbose_timing_logs() {
             println!("[renium] exporting {service}");
         }
         let service_export_started_ms = elapsed_ms(self.run_started);
-        let service_export_started = Instant::now();
-        let parts = self.export_parts(service, cached_tune)?;
-        let service_export_duration_ms = elapsed_ms(service_export_started);
+        let (parts, tune) = self.export_parts(service, cached_tune)?;
         let service_export_end_ms = elapsed_ms(self.run_started);
-        let tune = parts.adaptive_tune.clone();
         Ok(ServiceExportOutput {
             parts,
             span: ServiceExecutionSpan {
                 service: service.to_string(),
                 export_start_ms: service_export_started_ms,
                 export_end_ms: service_export_end_ms,
-                export_duration_ms: service_export_duration_ms,
             },
             tune,
         })
@@ -430,8 +393,8 @@ fn finish_service_export_output(
     cumulative_service_latency_ms: &mut f64,
 ) -> Result<()> {
     let service = output.span.service.clone();
-    *cumulative_service_latency_ms += output.span.export_duration_ms;
-    if let Some(tune) = output.tune.clone() {
+    *cumulative_service_latency_ms += output.span.export_end_ms - output.span.export_start_ms;
+    if let Some(tune) = output.tune {
         tune_updates.push((service.clone(), tune));
     }
     if direct_import_mode {
@@ -440,8 +403,16 @@ fn finish_service_export_output(
         dispatcher.check_error()?;
         dispatcher.enqueue_parts(&service, output.parts)?;
     } else {
-        let snapshot = exported_parts_to_snapshot(output.parts);
-        write_snapshot_file(snapshot_dir, &service, &snapshot)?;
+        let path = snapshot_dir.join(format!("{service}.json"));
+        write_json_file(
+            &path,
+            &json!({
+                "classDefaults": output.parts.class_defaults,
+                "instances": output.parts.instances,
+            }),
+            true,
+        )?;
+        println!("[renium] wrote {}", path.display());
     }
     service_export_spans.push(output.span);
     Ok(())
@@ -623,11 +594,10 @@ impl ExportProjectStage {
             project_config::syncback_project_projection(loaded, projection.root(), false)?;
         }
         if let Some(loaded) = &self.loaded {
-            let adapter_root = self
-                .projection
-                .as_ref()
-                .map(|projection| projection.root().to_path_buf())
-                .unwrap_or_else(|| loaded.root.join(&loaded.project.source_root));
+            let adapter_root = self.projection.as_ref().map_or_else(
+                || loaded.root.join(&loaded.project.source_root),
+                |projection| projection.root().to_path_buf(),
+            );
             project_config::syncback_project_adapters_from_root(loaded, &adapter_root, false)?;
         }
         generate_project_sourcemap(&self.project_root)
@@ -657,10 +627,10 @@ impl ExportProjectStage {
         let paths = publish_operation_paths(&current, &staged);
         let mut operations = Vec::new();
         for relative in paths {
-            let action = if !staged.contains_key(&relative) {
-                "delete"
-            } else {
+            let action = if staged.contains_key(&relative) {
                 "write"
+            } else {
+                "delete"
             };
             let kind = if adapter_paths
                 .iter()
@@ -900,7 +870,7 @@ fn collect_nested_project_paths(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(PartialEq)]
 pub(super) enum PublishEntryState {
     Directory,
     File(String),
@@ -1054,9 +1024,6 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
     set_quiet_timings(args.quiet_timings);
 
     let total_started = Instant::now();
-    if args.transport != "ws" {
-        bail!("Only --transport ws is supported in rust exporter");
-    }
     let performance_mode = PerformanceMode::parse(&args.performance_mode);
     let modified_default_bypass = if args.no_modified_default_bypass {
         false
@@ -1075,11 +1042,10 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
 
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     println!(
-        "[renium] export start: version={}, git={}, build_ts={}, features={}, protocol={}, services={}, chunk_size={}, import_mode={}, performance_mode={}, modified_default_bypass={}",
+        "[renium] export start: version={}, git={}, build_ts={}, protocol={}, services={}, chunk_size={}, import_mode={}, performance_mode={}, modified_default_bypass={}",
         BUILD_VERSION,
         BUILD_GIT_HASH,
         BUILD_TIMESTAMP_UNIX,
-        BUILD_FEATURES,
         BRIDGE_PROTOCOL_VERSION,
         services.len(),
         args.chunk_size,
@@ -1132,10 +1098,12 @@ pub(super) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
         };
 
         let bridge_info_started = Instant::now();
-        match candidate_bridge.cached_bridge_info().and_then(|info| {
-            validate_bridge_info(&info)?;
-            Ok(info)
-        }) {
+        match candidate_bridge
+            .cached_bridge_info_for_target(BridgeTarget::Main)
+            .and_then(|info| {
+                validate_bridge_info(&info)?;
+                Ok(info)
+            }) {
             Ok(info) => {
                 break (
                     candidate_bridge,
@@ -1210,15 +1178,13 @@ fn log_export_bridge_connection(
     log_timing_ms("bridge bind/listen setup", metrics.bind_ms);
     log_timing_ms("all channels connected to bridge info", bridge_info_ms);
     println!(
-        "[renium] bridge info: version={}, build_unix={}, protocol={}, codec={}, chunk_frame={}, compact_value={}, warm_mode={}, serializer_mode={}",
+        "[renium] bridge info: version={}, build_unix={}, protocol={}, codec={}, chunk_frame={}, compact_value={}",
         bridge_info.bridge_version,
         bridge_info.bridge_build_unix,
         bridge_info.protocol_version,
         bridge_info.codec_version,
         bridge_info.chunk_frame_protocol_version,
-        bridge_info.compact_value_protocol_version,
-        bridge_info.large_service_warm_mode,
-        bridge_info.serializer_worker_mode
+        bridge_info.compact_value_protocol_version
     );
     (cli_to_listen_ms, channel_wait_ms)
 }
@@ -1244,9 +1210,7 @@ fn prepare_export_bridge(
     }
     let bridge_options_match = bridge_info.performance_mode == performance_mode.as_str()
         && bridge_info.modified_default_bypass == modified_default_bypass
-        && bridge_info.export_all_properties == export_all_properties
-        && !bridge_info.pre_serialize_on_prepare
-        && !bridge_info.pre_serialize_large_service_warm;
+        && bridge_info.export_all_properties == export_all_properties;
     if bridge_options_match {
         println!("[renium] plugin export options already match requested configuration");
     } else {
@@ -1255,8 +1219,6 @@ fn prepare_export_bridge(
                 "setExportOptions",
                 json!({
                     "exportAllProperties": export_all_properties,
-                    "preSerializeOnPrepare": false,
-                    "preSerializeLargeServiceWarm": false,
                     "performanceMode": performance_mode.as_str(),
                     "modifiedDefaultBypass": modified_default_bypass,
                 }),
@@ -1357,8 +1319,7 @@ fn run_service_exports<'a>(
         run.native_finish_guard = Some(guard);
     } else {
         for service in services {
-            let output =
-                context.export_with_span(service, tune_cache.services.get(service).cloned())?;
+            let output = context.export_with_span(service, tune_cache.services.get(service))?;
             run.finish_output(output, None, false, snapshot_dir)?;
         }
     }
@@ -1495,14 +1456,14 @@ fn prepare_export_execution(
     let project_stage = run_import
         .then(|| ExportProjectStage::create(project_root, &args.src_dir, services))
         .transpose()?;
-    let import_project_root = project_stage
-        .as_ref()
-        .map(|stage| stage.import_project_root.clone())
-        .unwrap_or_else(|| project_root.to_path_buf());
-    let import_src_dir = project_stage
-        .as_ref()
-        .map(|stage| stage.import_src_dir.clone())
-        .unwrap_or_else(|| args.src_dir.clone());
+    let import_project_root = project_stage.as_ref().map_or_else(
+        || project_root.to_path_buf(),
+        |stage| stage.import_project_root.clone(),
+    );
+    let import_src_dir = project_stage.as_ref().map_or_else(
+        || args.src_dir.clone(),
+        |stage| stage.import_src_dir.clone(),
+    );
     let adaptive_instance_batches = !args.no_adaptive_throttle;
     println!(
         "[renium] adaptive instance batching: {}",
@@ -1594,7 +1555,7 @@ fn export_snapshots_core(
         project_root,
         services,
         snapshot_dir,
-        ports: _,
+        ..
     } = prelude;
     let (cli_start_to_bridge_listen_ms, bridge_listen_to_all_channels_connected_ms) =
         log_export_bridge_connection(
@@ -1667,12 +1628,10 @@ fn export_snapshots_core(
     }
     let first_service_export_ms = service_export_spans
         .first()
-        .map(|span| span.export_start_ms)
-        .unwrap_or(property_schema_ready_ms);
+        .map_or(property_schema_ready_ms, |span| span.export_start_ms);
     let last_service_export_ms = service_export_spans
         .last()
-        .map(|span| span.export_end_ms)
-        .unwrap_or(property_schema_ready_ms);
+        .map_or(property_schema_ready_ms, |span| span.export_end_ms);
     let property_schema_ready_to_first_service_export_ms =
         (first_service_export_ms - property_schema_ready_ms).max(0.0);
     let first_service_export_to_last_service_export_ms =
@@ -1734,7 +1693,10 @@ fn export_snapshots_core(
         for span in &service_export_spans {
             println!(
                 "[renium] service export span: service={}, start_ms={:.1}, end_ms={:.1}, duration_ms={:.1}",
-                span.service, span.export_start_ms, span.export_end_ms, span.export_duration_ms
+                span.service,
+                span.export_start_ms,
+                span.export_end_ms,
+                span.export_end_ms - span.export_start_ms
             );
         }
     }
@@ -1793,8 +1755,8 @@ impl ServiceExportContext<'_> {
     fn export_parts(
         &self,
         service: &str,
-        cached_tune: Option<AdaptiveTuneEntry>,
-    ) -> Result<ExportedSnapshotParts> {
+        cached_tune: Option<&AdaptiveTuneEntry>,
+    ) -> Result<(ExportedSnapshotParts, Option<AdaptiveTuneEntry>)> {
         let bridge = self.bridge;
         let chunk_size = self.chunk_size;
         let adaptive_instance_batches = self.adaptive_instance_batches;
@@ -1816,41 +1778,11 @@ impl ServiceExportContext<'_> {
             .get("scriptCount")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize;
-        let pre_serialized_mode = prepare
-            .get("preSerializedMode")
-            .and_then(Value::as_str)
-            .unwrap_or("off");
-        let bridge_protocol = prepare
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .context("prepare.protocolVersion must be a string")?;
-        let bridge_version = prepare
-            .get("bridgeVersion")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let bridge_build_unix = prepare
-            .get("bridgeBuildUnix")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let codec_version = prepare
-            .get("codecVersion")
-            .and_then(Value::as_str)
-            .context("prepare.codecVersion must be a string")?;
         let prepare_class_names = parse_string_list(prepare.get("classNames"))
             .context("prepare.classNames must be an array of strings")?;
-        if bridge_protocol != BRIDGE_PROTOCOL_VERSION {
-            bail!(
-                "Prepare returned unsupported protocol {bridge_protocol} for {service} (expected {BRIDGE_PROTOCOL_VERSION})"
-            );
-        }
-        if !is_supported_bridge_codec(codec_version) {
-            bail!(
-                "Prepare returned unsupported codec {codec_version} for {service} (expected {BRIDGE_CODEC_VERSION} or {BRIDGE_CODEC_VERSION_SCHEMA8})"
-            );
-        }
         if verbose_timing_logs() {
             println!(
-                "[renium] {service}: prepared bridge_version={bridge_version}, bridge_build_unix={bridge_build_unix}, protocol={bridge_protocol}, codec={codec_version}, instances={instance_count}, scripts={script_count}, pre_serialized={pre_serialized_mode}"
+                "[renium] {service}: prepared instances={instance_count}, scripts={script_count}"
             );
         }
         let mut service_property_schema_by_class =
@@ -1940,13 +1872,14 @@ impl ServiceExportContext<'_> {
                     instance_workers,
                     adaptive_seed_batch,
                     performance_mode,
-                    cached_tune.clone(),
+                    cached_tune,
                 )?
             } else {
                 let fixed_batch_floor = performance_mode
                     .min_large_service_batch_size(instance_count, bridge.channel_count());
-                let base_batch_size =
-                    initial_instance_batch_size(instance_count).max(fixed_batch_floor);
+                let base_batch_size = instance_batch_defaults(instance_count)
+                    .fixed
+                    .max(fixed_batch_floor);
                 let instance_worker_count = resolve_instance_worker_count(
                     instance_workers,
                     bridge.channel_count(),
@@ -1954,7 +1887,7 @@ impl ServiceExportContext<'_> {
                     base_batch_size,
                 );
                 let instance_batch_size = if instance_workers > 0 {
-                    instance_count.div_ceil(instance_worker_count.max(1)).max(1)
+                    instance_count.div_ceil(instance_worker_count).max(1)
                 } else {
                     base_batch_size
                 };
@@ -2014,29 +1947,6 @@ impl ServiceExportContext<'_> {
         merge_script_sources(&mut instance_fetch.instances, &source_by_key);
         log_timing(&format!("{service}: merge script sources"), merge_started);
 
-        let service_path = prepare
-            .get("rootPath")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&format!("game.{service}"))
-            .to_string();
-        let service_class = prepare
-            .get("rootClassName")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(service)
-            .to_string();
-        let service_name = prepare
-            .get("rootName")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(service)
-            .to_string();
-        let generated_at = prepare
-            .get("generatedAtUnix")
-            .and_then(Value::as_i64)
-            .unwrap_or_else(current_unix_ts);
-
         let release_started = Instant::now();
         let _ = bridge.call("release", json!({ "service": service }));
         log_timing(&format!("{service}: release"), release_started);
@@ -2044,45 +1954,15 @@ impl ServiceExportContext<'_> {
             &format!("{service}: export assembly total"),
             service_started,
         );
-        Ok(ExportedSnapshotParts {
-            service_name,
-            service_class,
-            service_path,
-            generated_at,
-            script_count,
-            class_defaults,
-            instances: instance_fetch.instances,
-            native_properties_by_instance: None,
-            adaptive_tune: instance_fetch.tune,
-        })
+        Ok((
+            ExportedSnapshotParts {
+                class_defaults,
+                instances: instance_fetch.instances,
+                native_properties_by_instance: None,
+            },
+            instance_fetch.tune,
+        ))
     }
-}
-
-fn exported_parts_to_snapshot(parts: ExportedSnapshotParts) -> Value {
-    let mut metadata = Map::with_capacity(5);
-    metadata.insert("generatedAtUnix".to_string(), json!(parts.generated_at));
-    metadata.insert(
-        "serviceName".to_string(),
-        Value::String(parts.service_name.clone()),
-    );
-    metadata.insert("instanceCount".to_string(), json!(parts.instances.len()));
-    metadata.insert("scriptCount".to_string(), json!(parts.script_count));
-    metadata.insert("sourceChunked".to_string(), Value::Bool(true));
-
-    let mut service = Map::with_capacity(3);
-    service.insert("name".to_string(), Value::String(parts.service_name));
-    service.insert("className".to_string(), Value::String(parts.service_class));
-    service.insert("path".to_string(), Value::String(parts.service_path));
-
-    let mut snapshot = Map::with_capacity(4);
-    snapshot.insert("metadata".to_string(), Value::Object(metadata));
-    snapshot.insert("classDefaults".to_string(), parts.class_defaults);
-    snapshot.insert(
-        "services".to_string(),
-        Value::Array(vec![Value::Object(service)]),
-    );
-    snapshot.insert("instances".to_string(), json!(parts.instances));
-    Value::Object(snapshot)
 }
 
 pub(super) fn exported_parts_to_service_state(
@@ -2093,7 +1973,7 @@ pub(super) fn exported_parts_to_service_state(
     let class_defaults_by_class = normalize_class_defaults(parts.class_defaults);
     let mut state = build_service_state_from_instances(
         service,
-        Some(parts.service_path),
+        None,
         parts.instances,
         class_defaults_by_class,
         true,
@@ -2165,32 +2045,24 @@ pub(super) fn validate_bridge_chunk(chunk: &BridgeChunk) -> Result<()> {
     Ok(())
 }
 
-fn initial_instance_batch_size(instance_count: usize) -> usize {
-    if instance_count >= 150_000 {
-        1800
-    } else if instance_count >= 100_000 {
-        1400
-    } else if instance_count >= 50_000 {
-        1000
-    } else if instance_count >= 20_000 {
-        800
-    } else {
-        500
-    }
+struct InstanceBatchDefaults {
+    fixed: usize,
+    adaptive: usize,
 }
 
-fn adaptive_instance_batch_size(instance_count: usize) -> usize {
-    if instance_count >= 150_000 {
-        1800
+fn instance_batch_defaults(instance_count: usize) -> InstanceBatchDefaults {
+    let (fixed, adaptive) = if instance_count >= 150_000 {
+        (1800, 1800)
     } else if instance_count >= 100_000 {
-        1600
+        (1400, 1600)
     } else if instance_count >= 50_000 {
-        1400
+        (1000, 1400)
     } else if instance_count >= 20_000 {
-        1100
+        (800, 1100)
     } else {
-        800
-    }
+        (500, 800)
+    };
+    InstanceBatchDefaults { fixed, adaptive }
 }
 
 fn auto_instance_worker_target(instance_count: usize, concurrency_cap: usize) -> usize {
@@ -2204,7 +2076,7 @@ fn auto_instance_worker_target(instance_count: usize, concurrency_cap: usize) ->
     } else {
         1
     };
-    desired.clamp(1, concurrency_cap)
+    desired.min(concurrency_cap)
 }
 
 fn resolve_instance_worker_count(
@@ -2222,38 +2094,31 @@ fn resolve_instance_worker_count(
     let channel_count = channel_count.max(1);
     let mut soft_target = auto_instance_worker_target(instance_count, channel_count);
     if instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES {
-        soft_target = soft_target.max(channel_count.clamp(1, 4));
+        soft_target = soft_target.max(channel_count.min(4));
     }
-    let hard_cap = channel_count.saturating_mul(2).clamp(2, 64);
+    let hard_cap = channel_count.saturating_mul(2).min(64);
     let cpu_cap = std::thread::available_parallelism()
-        .map(|v| v.get().saturating_mul(2))
-        .unwrap_or(8)
+        .map_or(8, |v| v.get().saturating_mul(2))
         .max(4);
     let effective_cap = hard_cap.min(cpu_cap);
 
     if requested_instance_workers > 0 {
         return requested_instance_workers
-            .clamp(1, effective_cap.max(1))
-            .min(batch_count.max(1));
+            .min(effective_cap)
+            .min(batch_count);
     }
 
-    soft_target
-        .clamp(1, effective_cap.max(1))
-        .min(batch_count.max(1))
+    soft_target.min(effective_cap).min(batch_count)
 }
 
-fn adaptive_tune_items_fetched(tune: &AdaptiveTuneEntry) -> usize {
-    if tune.items_fetched > 0 {
+pub(super) fn adaptive_tune_estimated_total_ms(tune: &AdaptiveTuneEntry) -> Option<f64> {
+    let items_fetched = if tune.items_fetched > 0 {
         tune.items_fetched
     } else {
         tune.batch_size
             .saturating_mul(tune.request_count.max(1))
             .min(tune.instance_count.max(1))
-    }
-}
-
-pub(super) fn adaptive_tune_estimated_total_ms(tune: &AdaptiveTuneEntry) -> Option<f64> {
-    let items_fetched = adaptive_tune_items_fetched(tune);
+    };
     let wave_ms = tune.wave_ms?;
     if items_fetched == 0 || wave_ms <= 0.0 || tune.instance_count == 0 {
         return None;
@@ -2309,11 +2174,15 @@ fn adaptive_tune_is_better(
 }
 
 fn adaptive_tune_is_safe(tune: &AdaptiveTuneEntry, performance_mode: PerformanceMode) -> bool {
+    let (max_frame_ms, max_stall_count) = match performance_mode {
+        PerformanceMode::Throughput => (100.0, 1),
+        PerformanceMode::Balanced => (50.0, 0),
+        PerformanceMode::Smooth => (33.0, 0),
+    };
     tune.frame_ms
         .is_some_and(|value| value < SAFE_CACHED_TUNE_FRAME_MS)
-        && tune.max_frame_ms.unwrap_or(SAFE_CACHED_TUNE_FRAME_MS - 0.1)
-            < performance_mode.cached_tune_max_frame_cap_ms()
-        && tune.stall_count_over_50_ms <= performance_mode.cached_tune_stall_cap()
+        && tune.max_frame_ms.unwrap_or(SAFE_CACHED_TUNE_FRAME_MS - 0.1) < max_frame_ms
+        && tune.stall_count_over_50_ms <= max_stall_count
 }
 
 #[derive(Clone, Copy)]
@@ -2357,7 +2226,7 @@ fn adaptive_cached_seed_is_trusted(
     config.requested_batch == 0
         && config.cached_tune.is_some_and(|tune| {
             tune.batch_size > 0
-                && tune.batch_size >= min_batch_size.max(1)
+                && tune.batch_size >= min_batch_size
                 && adaptive_tune_is_safe(tune, config.performance_mode)
                 && now_unix.saturating_sub(tune.updated_at_unix) <= STALE_CACHED_TUNE_MAX_AGE_SECS
         })
@@ -2367,7 +2236,7 @@ fn log_adaptive_seed(config: AdaptiveFetchConfig<'_>, seed: &AdaptiveSeed) {
     if !verbose_timing_logs() {
         return;
     }
-    let default_batch_size = adaptive_instance_batch_size(config.instance_count).max(1);
+    let default_batch_size = instance_batch_defaults(config.instance_count).adaptive;
     let cached_batch_size = config
         .cached_tune
         .map(|tune| tune.batch_size)
@@ -2401,12 +2270,8 @@ fn log_adaptive_seed(config: AdaptiveFetchConfig<'_>, seed: &AdaptiveSeed) {
         "[renium] {}: adaptive seed source={} cached_batch={} cached_workers={} default_batch={} auto_workers={} final_batch={} final_workers={} min_batch_floor={} reason={} lag_frame_ms={:.1}",
         config.service,
         source,
-        cached_batch_size
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "n/a".to_string()),
-        cached_workers
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "n/a".to_string()),
+        cached_batch_size.map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+        cached_workers.map_or_else(|| "n/a".to_string(), |value| value.to_string()),
         default_batch_size,
         adaptive_default_workers(config),
         seed.batch_size,
@@ -2442,7 +2307,7 @@ fn adaptive_fetch_seed(config: AdaptiveFetchConfig<'_>) -> AdaptiveSeed {
     } = config;
     let now_unix = current_unix_ts();
     let manual_batch = requested_batch > 0;
-    let default_batch_size = adaptive_instance_batch_size(instance_count).max(1);
+    let default_batch_size = instance_batch_defaults(instance_count).adaptive;
     let cached_batch_size = cached_tune
         .map(|tune| tune.batch_size)
         .filter(|value| *value > 0);
@@ -2460,7 +2325,7 @@ fn adaptive_fetch_seed(config: AdaptiveFetchConfig<'_>) -> AdaptiveSeed {
     } else {
         default_workers
     }
-    .clamp(1, bridge_concurrency);
+    .min(bridge_concurrency);
     let mut batch_size = if manual_batch {
         requested_batch
     } else {
@@ -2483,12 +2348,12 @@ fn adaptive_fetch_seed(config: AdaptiveFetchConfig<'_>) -> AdaptiveSeed {
     {
         let max_total_chunks = bridge_concurrency
             .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MAX)
-            .clamp(1, 16);
+            .min(16);
         let min_total_chunks = bridge_concurrency
             .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MIN)
-            .clamp(1, 12);
-        let min_seed_batch = instance_count.div_ceil(max_total_chunks).max(1);
-        let max_seed_batch = instance_count.div_ceil(min_total_chunks).max(1);
+            .min(12);
+        let min_seed_batch = instance_count.div_ceil(max_total_chunks);
+        let max_seed_batch = instance_count.div_ceil(min_total_chunks);
         batch_size = batch_size.clamp(min_seed_batch, max_seed_batch);
         if batch_size != cached_or_default_batch_size {
             seed_reason = "bridge seed window";
@@ -2538,23 +2403,21 @@ fn plan_adaptive_wave(
         && config.requested_workers == 0
         && config.instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
         && remaining >= seed.bridge_concurrency;
-    let mut wave_batch_size = batch_size.min(remaining.max(1));
+    let mut wave_batch_size = batch_size.min(remaining);
     if enforce_full_channel_use {
         let target_ranges = remaining.min(seed.bridge_concurrency);
-        wave_batch_size = wave_batch_size.min(remaining.div_ceil(target_ranges).max(1));
+        wave_batch_size = wave_batch_size.min(remaining.div_ceil(target_ranges));
     }
     let logical_batch_size = wave_batch_size;
-    let max_wave_workers = remaining.div_ceil(wave_batch_size).max(1);
-    let mut workers = worker_target.max(1).min(max_wave_workers);
+    let max_wave_workers = remaining.div_ceil(wave_batch_size);
+    let mut workers = worker_target.min(max_wave_workers);
     if enforce_full_channel_use {
         workers = workers.max(seed.bridge_concurrency.min(max_wave_workers));
     }
     let dynamic_ranges = config.instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
         && workers > 1
         && remaining > wave_batch_size;
-    let mut item_budget = remaining
-        .min(wave_batch_size.saturating_mul(workers))
-        .max(1);
+    let mut item_budget = remaining.min(wave_batch_size.saturating_mul(workers));
     if remaining > item_budget {
         let leftover = remaining - item_budget;
         let fold_tail_threshold = (wave_batch_size / 2).max(256).min(wave_batch_size);
@@ -2568,11 +2431,10 @@ fn plan_adaptive_wave(
             .clamp(workers, item_budget);
         wave_batch_size = item_budget
             .div_ceil(target_ranges)
-            .max(1)
             .max(DYNAMIC_RANGE_MIN_INSTANCES.min(item_budget));
     }
-    let range_count = item_budget.div_ceil(wave_batch_size).max(1);
-    workers = workers.min(range_count).max(1);
+    let range_count = item_budget.div_ceil(wave_batch_size);
+    workers = workers.min(range_count);
     let mut ranges = Vec::with_capacity(range_count);
     let mut scheduled_items = 0;
     while scheduled_items < item_budget && *next_start <= total_hint {
@@ -2797,15 +2659,13 @@ impl InstanceBatchContext<'_> {
         let service = self.service;
         let instance_count = self.instance_count;
         let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-        if instance_count > 0 {
-            let mut range_index = 0usize;
-            let mut start = 1usize;
-            while start <= instance_count {
-                let take = (instance_count - start + 1).min(instance_batch_size.max(1));
-                ranges.push((range_index, start, take));
-                range_index += 1;
-                start += take;
-            }
+        let mut range_index = 0usize;
+        let mut start = 1usize;
+        while start <= instance_count {
+            let take = (instance_count - start + 1).min(instance_batch_size);
+            ranges.push((range_index, start, take));
+            range_index += 1;
+            start += take;
         }
 
         let mut instances: Vec<SnapshotInstance> = Vec::with_capacity(instance_count);
@@ -2813,10 +2673,13 @@ impl InstanceBatchContext<'_> {
             if verbose_timing_logs() {
                 println!("[renium] {service}: instances 0/0");
             }
-        } else if instance_worker_count <= 1 || ranges.len() <= 1 {
-            let mut total_hint = instance_count;
-            let mut chunk_metrics = ChunkFetchMetrics::default();
-            let mut compact_expand_ms = 0.0;
+            return Ok(instances);
+        }
+
+        let mut total_hint = instance_count;
+        let mut chunk_metrics = ChunkFetchMetrics::default();
+        let mut compact_expand_ms = 0.0;
+        if instance_worker_count <= 1 || ranges.len() <= 1 {
             for (range_idx, start_index, take_count) in ranges {
                 let batch = self.fetch(start_index, take_count)?;
                 total_hint = total_hint.max(batch.total_hint);
@@ -2825,8 +2688,8 @@ impl InstanceBatchContext<'_> {
                 let mut items = batch.items;
                 instances.append(&mut items);
 
-                if ((range_idx + 1) % 4 == 0
-                    || range_idx + 1 == total_hint.div_ceil(instance_batch_size.max(1)))
+                if (range_idx + 1) % 4 == 0
+                    && range_idx + 1 < total_hint.div_ceil(instance_batch_size)
                     && verbose_timing_logs()
                 {
                     println!(
@@ -2836,18 +2699,6 @@ impl InstanceBatchContext<'_> {
                     );
                 }
             }
-            if verbose_timing_logs() {
-                println!(
-                    "[renium] {service}: instances {}/{}",
-                    instances.len(),
-                    total_hint
-                );
-            }
-            log_chunk_fetch_metrics(&format!("{service}: instance payloads"), chunk_metrics);
-            log_timing_ms(
-                &format!("{service}: compact instance expansion"),
-                compact_expand_ms,
-            );
         } else {
             let total_ranges = ranges.len();
             let progress_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -2892,9 +2743,6 @@ impl InstanceBatchContext<'_> {
                 fetched.windows(2).all(|items| items[0].0 <= items[1].0),
                 "parallel fixed instance batches must preserve range order"
             );
-            let mut total_hint = instance_count;
-            let mut chunk_metrics = ChunkFetchMetrics::default();
-            let mut compact_expand_ms = 0.0;
             for (_, batch) in fetched {
                 total_hint = total_hint.max(batch.total_hint);
                 compact_expand_ms += batch.compact_expand_ms;
@@ -2902,19 +2750,20 @@ impl InstanceBatchContext<'_> {
                 let mut items = batch.items;
                 instances.append(&mut items);
             }
-            if verbose_timing_logs() {
-                println!(
-                    "[renium] {service}: instances {}/{}",
-                    instances.len(),
-                    total_hint
-                );
-            }
-            log_chunk_fetch_metrics(&format!("{service}: instance payloads"), chunk_metrics);
-            log_timing_ms(
-                &format!("{service}: compact instance expansion"),
-                compact_expand_ms,
+        }
+
+        if verbose_timing_logs() {
+            println!(
+                "[renium] {service}: instances {}/{}",
+                instances.len(),
+                total_hint
             );
         }
+        log_chunk_fetch_metrics(&format!("{service}: instance payloads"), chunk_metrics);
+        log_timing_ms(
+            &format!("{service}: compact instance expansion"),
+            compact_expand_ms,
+        );
 
         Ok(instances)
     }
@@ -2951,7 +2800,7 @@ impl InstanceBatchContext<'_> {
         requested_instance_workers: usize,
         adaptive_seed_batch: usize,
         performance_mode: PerformanceMode,
-        cached_tune: Option<AdaptiveTuneEntry>,
+        cached_tune: Option<&AdaptiveTuneEntry>,
     ) -> Result<InstanceFetchResult> {
         let bridge = self.bridge;
         let service = self.service;
@@ -2972,7 +2821,7 @@ impl InstanceBatchContext<'_> {
             requested_workers: requested_instance_workers,
             requested_batch: adaptive_seed_batch,
             performance_mode,
-            cached_tune: cached_tune.as_ref(),
+            cached_tune,
             bridge_concurrency: bridge.channel_count().max(1),
         };
         let seed = adaptive_fetch_seed(fetch_config);
@@ -2987,7 +2836,6 @@ impl InstanceBatchContext<'_> {
         let mut instances = Vec::with_capacity(instance_count);
         let mut last_perf_stats: Option<BridgePerformanceStats> = None;
         let mut best_measured_tune: Option<AdaptiveTuneEntry> = None;
-        let mut last_measured_tune: Option<AdaptiveTuneEntry> = None;
         let skip_tune_cache = manual_seed_batch || requested_instance_workers > 0;
         let collect_wave_perf_stats = performance_mode != PerformanceMode::Throughput;
         let adaptive_pool = if bridge_concurrency > 1 {
@@ -3031,7 +2879,6 @@ impl InstanceBatchContext<'_> {
             let stall_count_over_50_ms = perf_stats
                 .as_ref()
                 .and_then(|stats| stats.stall_count_over_50_ms);
-            last_perf_stats = perf_stats.clone();
             let lagging = perf_stats.as_ref().is_some_and(|stats| {
                 stats
                     .max_frame_ms
@@ -3054,12 +2901,7 @@ impl InstanceBatchContext<'_> {
                 frame_ms,
                 max_frame_ms,
                 wave_ms: Some(wave_ms),
-                avg_req_ms: Some(wave_metrics.avg_request_ms),
-                max_req_ms: Some(wave_metrics.max_request_ms),
-                avg_req_bytes: wave_metrics.avg_request_bytes.round() as usize,
-                max_req_bytes: wave_metrics.max_request_bytes,
                 payload_bytes: wave_metrics.chunks.bytes,
-                chunk_count: wave_metrics.chunks.chunks,
                 request_count: wave_metrics.requests,
                 items_fetched: wave_metrics.items_fetched,
                 stall_count_over_50_ms: stall_count_over_50_ms.unwrap_or(0),
@@ -3068,9 +2910,8 @@ impl InstanceBatchContext<'_> {
             if best_measured_tune.as_ref().is_none_or(|current| {
                 adaptive_tune_is_better(&measured_tune, current, performance_mode)
             }) {
-                best_measured_tune = Some(measured_tune.clone());
+                best_measured_tune = Some(measured_tune);
             }
-            last_measured_tune = Some(measured_tune);
 
             let underused_bridge = !manual_seed_batch
                 && requested_instance_workers == 0
@@ -3081,10 +2922,10 @@ impl InstanceBatchContext<'_> {
                 && wave_metrics.max_request_bytes as f64 > wave_metrics.avg_request_bytes * 1.35;
             let slow_requests = !lagging && wave_metrics.max_request_ms >= 1000.0;
             if lagging {
-                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4).max(1);
-                worker_target = worker_target.saturating_mul(3).div_ceil(4).max(1);
+                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4);
+                worker_target = worker_target.saturating_mul(3).div_ceil(4);
             } else if underused_bridge || imbalanced_requests || slow_requests {
-                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4).max(1);
+                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4);
                 if requested_instance_workers == 0 {
                     worker_target = worker_target.max(bridge_concurrency);
                 }
@@ -3097,10 +2938,7 @@ impl InstanceBatchContext<'_> {
                 );
             } else {
                 let batch_step = (plan.batch_size / ADAPTIVE_BATCH_GROWTH_DIVISOR).max(1);
-                batch_size = plan
-                    .batch_size
-                    .saturating_add(batch_step)
-                    .min(total_hint.max(1));
+                batch_size = plan.batch_size.saturating_add(batch_step).min(total_hint);
                 if wave_index.is_multiple_of(ADAPTIVE_WORKER_GROWTH_WAVE_INTERVAL) {
                     worker_target = worker_target.saturating_add(1);
                 }
@@ -3108,7 +2946,8 @@ impl InstanceBatchContext<'_> {
             if min_large_service_batch_size > 0 {
                 batch_size = batch_size.max(min_large_service_batch_size);
             }
-            worker_target = worker_target.clamp(1, bridge_concurrency);
+            worker_target = worker_target.min(bridge_concurrency);
+            last_perf_stats = perf_stats;
         }
 
         if verbose_timing_logs() {
@@ -3123,7 +2962,7 @@ impl InstanceBatchContext<'_> {
             tune: if skip_tune_cache {
                 None
             } else {
-                best_measured_tune.or(last_measured_tune).map(|mut tune| {
+                best_measured_tune.map(|mut tune| {
                     tune.instance_count = total_hint;
                     if let Some(perf_stats) = last_perf_stats.as_ref() {
                         tune.frame_ms = perf_stats.frame_ms.or(tune.frame_ms);
@@ -3184,8 +3023,6 @@ impl InstanceBatchContext<'_> {
                         "maxCount": take_count,
                         "chunkStart": chunk_start,
                         "maxLen": max_len,
-                        "supportsShapeBatches": true,
-                        "supportsStableInstanceIds": true,
                     }),
                 )
             },
@@ -3222,7 +3059,7 @@ impl InstanceBatchContext<'_> {
         let mut out = if shape_batch {
             parse_compact_v5_shape_instance_items(
                 raw_items,
-                batch.strings,
+                &batch.strings,
                 batch.shapes,
                 start_index,
                 self.property_schema_by_class,
@@ -3235,7 +3072,7 @@ impl InstanceBatchContext<'_> {
         } else {
             parse_compact_v5_instance_items(
                 raw_items,
-                batch.strings,
+                &batch.strings,
                 start_index,
                 self.property_schema_by_class,
                 self.enum_value_names_by_type,
@@ -3267,15 +3104,11 @@ fn read_bridge_performance_stats(bridge: &BridgeServer) -> Option<BridgePerforma
 }
 
 fn format_frame_ms(frame_ms: Option<f64>) -> String {
-    frame_ms
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "n/a".to_string())
+    frame_ms.map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}"))
 }
 
 fn format_stall_count(stall_count: Option<u64>) -> String {
-    stall_count
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "n/a".to_string())
+    stall_count.map_or_else(|| "n/a".to_string(), |value| value.to_string())
 }
 
 pub(super) fn merge_chunk_fetch_metrics(
@@ -3485,11 +3318,4 @@ fn merge_script_sources(instances: &mut [SnapshotInstance], source_map: &SourceB
         }
         instance.source_key = None;
     }
-}
-
-fn write_snapshot_file(snapshot_dir: &Path, service: &str, snapshot: &Value) -> Result<()> {
-    let path = snapshot_dir.join(format!("{service}.json"));
-    write_json_file(&path, snapshot, true)?;
-    println!("[renium] wrote {}", path.display());
-    Ok(())
 }

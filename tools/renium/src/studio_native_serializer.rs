@@ -26,10 +26,11 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_VM_WRITE, WaitForSingleObject,
 };
 
+use crate::file_io::fnv1a;
 use crate::native_snapshot::{
-    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, now_millis,
-    temporary_output_path,
+    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
+use crate::timing::current_millis;
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
 const PARAM_SIZE: usize = 5792;
@@ -54,22 +55,17 @@ const REMOTE_TIMEOUT: u32 = 30_000;
 static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
 static LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, CachedLayout>>> = OnceLock::new();
 static DATA_MODELS: OnceLock<Mutex<HashMap<u32, CachedDataModel>>> = OnceLock::new();
-
-#[derive(Clone)]
 struct CachedTrace {
     len: u64,
     modified: Option<SystemTime>,
     trace: SerializerTrace,
 }
-
-#[derive(Clone)]
 struct CachedLayout {
     len: u64,
     modified: Option<SystemTime>,
     data: PeSection,
     trace: SerializerTrace,
 }
-
 #[derive(Clone)]
 struct CachedDataModel {
     title: String,
@@ -278,8 +274,6 @@ impl Drop for RemoteAllocation<'_> {
         }
     }
 }
-
-#[derive(Clone)]
 struct ModuleEntry {
     base: usize,
     size: usize,
@@ -447,12 +441,12 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     let cache = TRACES.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
-        .cloned();
-    if let Some(cached) = cached {
-        return Ok(cached.trace);
+        .map(|cached| cached.trace);
+    if let Some(trace) = cached {
+        return Ok(trace);
     }
 
     let image = PeImage::parse(bytes)?;
@@ -551,7 +545,7 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     };
     cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
             path.to_path_buf(),
             CachedTrace {
@@ -570,12 +564,12 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
     let cache = LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
-        .cloned();
-    if let Some(cached) = cached {
-        return Ok((cached.data, cached.trace));
+        .map(|cached| (cached.data, cached.trace));
+    if let Some(layout) = cached {
+        return Ok(layout);
     }
     let executable =
         fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
@@ -584,7 +578,7 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
     let trace = trace_serializer(path, &executable)?;
     cache
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
             path.to_path_buf(),
             CachedLayout {
@@ -793,6 +787,22 @@ fn expected_data_model_names(title: &str) -> Vec<String> {
     values
 }
 
+fn has_required_data_model_roots(memory: &ProcessMemory, roots: &[SharedEntry]) -> bool {
+    let mut found = 0u8;
+    for root in roots {
+        found |= match read_instance_class(memory, root.instance).as_deref() {
+            Some("Workspace") => 1,
+            Some("Players") => 2,
+            Some("MaterialService") => 4,
+            _ => 0,
+        };
+        if found == 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_active_data_model(
     memory: &ProcessMemory,
     module: &ModuleEntry,
@@ -818,7 +828,6 @@ fn find_active_data_model(
         }
     }
     let expected_names = expected_data_model_names(title);
-    let required_classes = ["Workspace", "Players", "MaterialService"];
     let mut candidates = Vec::new();
     for (outer, offsets) in references
         .into_iter()
@@ -848,14 +857,7 @@ fn find_active_data_model(
         if roots.is_empty() || roots.len() > MAX_ROOTS {
             continue;
         }
-        let classes = roots
-            .iter()
-            .filter_map(|entry| read_instance_class(memory, entry.instance))
-            .collect::<Vec<_>>();
-        if !required_classes
-            .iter()
-            .all(|required| classes.iter().any(|class| class == required))
-        {
+        if !has_required_data_model_roots(memory, &roots) {
             continue;
         }
         let owner = offsets
@@ -944,15 +946,7 @@ fn refresh_active_data_model(
     {
         return None;
     }
-    let required_classes = ["Workspace", "Players", "MaterialService"];
-    let classes = roots
-        .iter()
-        .filter_map(|entry| read_instance_class(memory, entry.instance))
-        .collect::<Vec<_>>();
-    if !required_classes
-        .iter()
-        .all(|required| classes.iter().any(|class| class == required))
-    {
+    if !has_required_data_model_roots(memory, &roots) {
         return None;
     }
     Some(ActiveDataModel {
@@ -972,7 +966,7 @@ fn active_data_model(
     let cache = DATA_MODELS.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&pid)
         .cloned();
     if let Some(data_model) = cached
@@ -984,7 +978,7 @@ fn active_data_model(
     let data_model = find_active_data_model(memory, module, data, title)?;
     cache
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
             pid,
             CachedDataModel {
@@ -1021,11 +1015,7 @@ fn select_service_root(
 }
 
 fn helper_path() -> Result<PathBuf> {
-    let hash = HELPER_BYTES
-        .iter()
-        .fold(0xcbf29ce484222325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
+    let hash = fnv1a(HELPER_BYTES);
     let directory = std::env::temp_dir().join("renium-native");
     fs::create_dir_all(&directory)
         .with_context(|| format!("Could not create {}", directory.display()))?;
@@ -1034,7 +1024,7 @@ fn helper_path() -> Result<PathBuf> {
         let temporary = directory.join(format!(
             ".renium-studio-helper-{}-{}.tmp",
             std::process::id(),
-            now_millis()
+            current_millis()
         ));
         fs::write(&temporary, HELPER_BYTES)
             .with_context(|| format!("Could not write {}", temporary.display()))?;
@@ -1064,13 +1054,13 @@ fn ensure_helper_loaded(
     pid: u32,
     memory: &ProcessMemory,
     current_modules: &[ModuleEntry],
-) -> Result<(ModuleEntry, PathBuf)> {
+) -> Result<usize> {
     let path = helper_path()?;
     if let Some(module) = current_modules
         .iter()
         .find(|module| module_path_matches(module, &path))
     {
-        return Ok((module.clone(), path));
+        return Ok(module.base);
     }
     let kernel32 = current_modules
         .iter()
@@ -1107,7 +1097,7 @@ fn ensure_helper_loaded(
         .into_iter()
         .find(|module| module_path_matches(module, &path))
         .with_context(|| format!("Studio did not load {}", path.display()))?;
-    Ok((loaded, path))
+    Ok(loaded.base)
 }
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -1220,23 +1210,20 @@ fn write_live_snapshot(
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()
-        .cloned()
         .context("Studio process has no main module")?;
-    let setup_ms = started.elapsed().as_secs_f64() * 1000.0;
     let trace_started = Instant::now();
     let (data, trace) = studio_layout(&studio.path)?;
     let trace_ms = trace_started.elapsed().as_secs_f64() * 1000.0;
     let memory = ProcessMemory::open(pid)?;
     let discover_started = Instant::now();
-    let mut data_model = active_data_model(pid, &memory, &studio, data, studio_title)?;
+    let mut data_model = active_data_model(pid, &memory, studio, data, studio_title)?;
     if let Some(service) = service {
         select_service_root(&memory, &mut data_model, service)?;
     }
     let discover_ms = discover_started.elapsed().as_secs_f64() * 1000.0;
     let helper_started = Instant::now();
-    let (helper, _) = ensure_helper_loaded(pid, &memory, &current_modules)?;
+    let helper = ensure_helper_loaded(pid, &memory, &current_modules)?;
     let helper_run = helper
-        .base
         .checked_add(helper_export_rva()?)
         .context("Studio helper address overflowed")?;
     let helper_ms = helper_started.elapsed().as_secs_f64() * 1000.0;
@@ -1272,7 +1259,6 @@ fn write_live_snapshot(
         Ok(NativeSnapshot {
             instance_count,
             output_size,
-            setup_ms,
             trace_ms,
             discover_ms,
             helper_ms,

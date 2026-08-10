@@ -409,7 +409,7 @@ no Studio connection needed:
 ```powershell
 rbx find Workspace VipMan              # locate instances by name
 rbx find Workspace --class Script      # ...or class, tags, properties
-rbx tree Workspace VipMan --depth 2    # browse children
+rbx tree Workspace VipMan --depth 2 --limit 100    # browse children
 rbx inspect Workspace VipMan           # one instance in detail
 ```
 

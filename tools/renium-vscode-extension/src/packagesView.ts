@@ -589,24 +589,22 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
   }
 
   private async elementForNodeKey(linkId: string, nodeKey: string): Promise<PackageNodeElement | undefined> {
+    const tree = await this.previewTreeForLinkId(linkId);
+    return tree?.elementsByKey.get(nodeKey);
+  }
+
+  private async previewTreeForLinkId(linkId: string): Promise<PackagePreviewTree | undefined> {
     const linkElement = await this.elementForLinkId(linkId);
     if (!linkElement) {
       return undefined;
     }
     const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
-      return undefined;
-    }
-    return tree.elementsByKey.get(nodeKey);
+    return tree.generation === this.selectionGeneration ? tree : undefined;
   }
 
   public async packageScriptSourceFor(linkId: string, nodeKey: string): Promise<string | undefined> {
-    const linkElement = await this.elementForLinkId(linkId);
-    if (!linkElement) {
-      return undefined;
-    }
-    const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
+    const tree = await this.previewTreeForLinkId(linkId);
+    if (!tree) {
       return undefined;
     }
     const node = tree.nodesByKey.get(nodeKey);
@@ -621,12 +619,8 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
     nodeKey: string,
     options: { preview?: boolean; preserveFocus?: boolean } = {},
   ): Promise<boolean> {
-    const linkElement = await this.elementForLinkId(linkId);
-    if (!linkElement) {
-      return false;
-    }
-    const tree = await this.previewTree(linkElement.link);
-    if (tree.generation !== this.selectionGeneration) {
+    const tree = await this.previewTreeForLinkId(linkId);
+    if (!tree) {
       return false;
     }
     const node = tree.nodesByKey.get(nodeKey);
@@ -691,25 +685,14 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
   }
 
   public async openItem(element: PackageTreeElement | undefined): Promise<void> {
-    if (!this.isCurrentElement(element)) {
+    const selected = await this.currentPackageNode(element);
+    if (!selected) {
       return;
     }
-    if (element.kind === "link") {
-      const tree = await this.previewTree(element.link);
-      if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
-        return;
-      }
-      const root = tree.roots[0];
-      const generation = this.selectionGeneration;
-      await this.showPackageProperties(tree.preview, root?.node, generation);
-      if (root && tree.roots.length === 1) {
-        await this.openPackageScript(tree.preview, root.node, {}, generation);
-      }
-      return;
+    await this.showPackageProperties(selected.preview, selected.node, selected.generation);
+    if (selected.openScript && selected.node) {
+      await this.openPackageScript(selected.preview, selected.node, {}, selected.generation);
     }
-    const generation = this.selectionGeneration;
-    await this.showPackageProperties(element.preview, element.node, generation);
-    await this.openPackageScript(element.preview, element.node, {}, generation);
   }
 
   private normalizedTargetPath(target: CliLinkStatusTarget): string[] {
@@ -808,18 +791,40 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
   }
 
   public async showSelection(element: PackageTreeElement | undefined): Promise<void> {
-    if (!this.isCurrentElement(element)) {
+    const selected = await this.currentPackageNode(element);
+    if (!selected) {
       return;
+    }
+    await this.showPackageProperties(selected.preview, selected.node, selected.generation);
+  }
+
+  private async currentPackageNode(element: PackageTreeElement | undefined): Promise<{
+    preview: PackagePreviewData;
+    node: PackagePreviewNode | undefined;
+    generation: number;
+    openScript: boolean;
+  } | undefined> {
+    if (!this.isCurrentElement(element)) {
+      return undefined;
     }
     if (element.kind === "link") {
       const tree = await this.previewTree(element.link);
       if (!this.isCurrentElement(element) || tree.generation !== this.selectionGeneration) {
-        return;
+        return undefined;
       }
-      await this.showPackageProperties(tree.preview, tree.roots[0]?.node, this.selectionGeneration);
-      return;
+      return {
+        preview: tree.preview,
+        node: tree.roots[0]?.node,
+        generation: this.selectionGeneration,
+        openScript: tree.roots.length === 1,
+      };
     }
-    await this.showPackageProperties(element.preview, element.node, this.selectionGeneration);
+    return {
+      preview: element.preview,
+      node: element.node,
+      generation: this.selectionGeneration,
+      openScript: true,
+    };
   }
 
   private async showPackageProperties(

@@ -1,12 +1,8 @@
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::fs;
-use std::fs::File;
 #[cfg(windows)]
 use std::io;
-use std::io::BufReader;
-#[cfg(any(windows, test))]
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
@@ -28,8 +24,6 @@ use super::command_line::PushEditorChangesArgs;
 use super::editor_types::{EditorChangeSet, EditorInstancePath};
 #[cfg(windows)]
 use super::input_inject;
-#[cfg(any(windows, target_os = "macos"))]
-use super::local_transport::pid_for_local_tcp_port;
 use super::native_editor::wait_for_editor_review_decision;
 #[cfg(windows)]
 use super::native_editor::write_live_editor_place_snapshot;
@@ -51,6 +45,26 @@ use super::rbx_encode::{rbx_model_property_descriptor, rbx_property_descriptor};
 use super::rbx_model::BytecodeModelExportRefs;
 use super::rbx_model::{RbxPlaceFormat, rbx_dom_instance_by_path_unique, rbx_dom_path_import_refs};
 use super::timing::current_millis;
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn json_usize_array(value: Option<&Value>) -> Vec<usize> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .map(|value| value as usize)
+        .collect()
+}
 
 pub(super) fn is_workspace_camera_sync_target(
     service: &str,
@@ -117,17 +131,7 @@ pub(super) fn is_externally_managed_protected_write(row: &Value) -> bool {
     let service = row.get("service").and_then(Value::as_str).unwrap_or("");
     let class_name = row.get("className").and_then(Value::as_str).unwrap_or("");
     let property_name = row.get("name").and_then(Value::as_str).unwrap_or("");
-    let path_segments = row
-        .get("pathSegments")
-        .and_then(Value::as_array)
-        .map(|segments| {
-            segments
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let path_segments = json_string_array(row.get("pathSegments"));
     is_externally_managed_editor_property(service, class_name, &path_segments, property_name)
 }
 
@@ -311,8 +315,7 @@ fn normalize_editor_sequence_value(value: &Value, type_name: &str) -> Value {
                 .or_else(|| object.get("Keypoints"))
                 .and_then(Value::as_array)
         })
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+        .map_or(&[][..], Vec::as_slice);
     let mut out_keypoints = Vec::with_capacity(keypoints.len());
     for raw_keypoint in keypoints {
         let Some(keypoint) = raw_keypoint.as_object() else {
@@ -437,6 +440,7 @@ fn editor_review_value(value: &Value) -> Value {
     json!({ "_reviewTruncated": true, "summary": summary })
 }
 
+#[derive(Clone, Copy)]
 struct EditorReviewTarget<'a> {
     service: &'a str,
     settings_id: Option<&'a str>,
@@ -460,9 +464,7 @@ fn append_editor_review_entry(
         },
         |settings_id| format!("{}\0{settings_id}", target.service),
     );
-    let row_index = if let Some(index) = row_index_by_key.get(&key) {
-        *index
-    } else {
+    let row_index = *row_index_by_key.entry(key).or_insert_with(|| {
         let index = rows.len();
         rows.push(json!({
             "service": target.service,
@@ -472,9 +474,8 @@ fn append_editor_review_entry(
             "className": target.class_name,
             "entries": [],
         }));
-        row_index_by_key.insert(key, index);
         index
-    };
+    });
     if let Some(entries) = rows[row_index]
         .as_object_mut()
         .and_then(|row| row.get_mut("entries"))
@@ -527,6 +528,13 @@ pub(super) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
         );
     }
     for change in &changes.property_changes {
+        let target = || EditorReviewTarget {
+            service: &change.service,
+            settings_id: change.settings_id.as_deref(),
+            path_segments: &change.path_segments,
+            path_ordinals: &change.path_ordinals,
+            class_name: &change.class_name,
+        };
         for (kind, values) in [
             ("property", &change.properties),
             ("attribute", &change.attributes),
@@ -536,13 +544,7 @@ pub(super) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
                 append_editor_review_entry(
                     &mut rows,
                     &mut row_index_by_key,
-                    EditorReviewTarget {
-                        service: &change.service,
-                        settings_id: change.settings_id.as_deref(),
-                        path_segments: &change.path_segments,
-                        path_ordinals: &change.path_ordinals,
-                        class_name: &change.class_name,
-                    },
+                    target(),
                     json!({
                         "kind": kind,
                         "name": name,
@@ -556,13 +558,7 @@ pub(super) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             append_editor_review_entry(
                 &mut rows,
                 &mut row_index_by_key,
-                EditorReviewTarget {
-                    service: &change.service,
-                    settings_id: change.settings_id.as_deref(),
-                    path_segments: &change.path_segments,
-                    path_ordinals: &change.path_ordinals,
-                    class_name: &change.class_name,
-                },
+                target(),
                 json!({
                     "kind": "attribute",
                     "name": name,
@@ -737,15 +733,7 @@ pub(super) fn protected_write_rows_with_previous_values(
     path: &Path,
     rows: &[Value],
 ) -> Result<Vec<Value>> {
-    let format = RbxPlaceFormat::from_path(path)?;
-    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let reader = BufReader::new(input);
-    let dom = match format {
-        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-    };
+    let dom = RbxPlaceFormat::from_path(path)?.read(path)?;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let refs = rbx_dom_path_import_refs(&dom, true);
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
@@ -756,28 +744,8 @@ pub(super) fn protected_write_rows_with_previous_values(
             out.push(row);
             continue;
         };
-        let path_segments = object
-            .get("pathSegments")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let path_ordinals = object
-            .get("pathOrdinals")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_u64)
-                    .map(|value| value as usize)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let path_segments = json_string_array(object.get("pathSegments"));
+        let path_ordinals = json_usize_array(object.get("pathOrdinals"));
         let Some(name) = object
             .get("name")
             .and_then(Value::as_str)
@@ -811,7 +779,7 @@ pub(super) fn protected_write_rows_with_previous_values(
         } else {
             let class_name = instance.class.as_str();
             let descriptor = rbx_model_property_descriptor(database, class_name, &name);
-            let serialized_name = descriptor.map(|value| value.name).unwrap_or(name.as_str());
+            let serialized_name = descriptor.map_or(name.as_str(), |value| value.name);
             let find_value = |property_name: &str| {
                 instance
                     .properties
@@ -913,14 +881,7 @@ pub(super) fn studio_pid_for_bridge(bridge: &BridgeServer) -> Result<u32> {
     let target = BridgeTarget::Main;
     #[cfg(target_os = "macos")]
     let target = BridgeTarget::Edit;
-    let peer = bridge.peer_for_selector(target, None)?;
-    let port = peer
-        .rsplit(':')
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
-    pid_for_local_tcp_port(port)
-        .with_context(|| format!("Could not map bridge connection {peer} to Studio"))
+    bridge.studio_pid_for_selector(target, None)
 }
 
 #[cfg(windows)]
@@ -962,48 +923,13 @@ pub(super) fn local_place_path_for_bridge(_bridge: &BridgeServer) -> Option<Path
 #[cfg(any(windows, test))]
 pub(super) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
     let format = RbxPlaceFormat::from_path(path)?;
-    let input = File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let reader = BufReader::new(input);
-    let mut dom = match format {
-        RbxPlaceFormat::Binary => rbx_binary::from_reader(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::from_reader_default(reader)
-            .with_context(|| format!("Failed to read {}", path.display()))?,
-    };
+    let mut dom = format.read(path)?;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let refs = BytecodeModelExportRefs {
-        by_index: HashMap::new(),
-        by_settings_id: HashMap::new(),
-        global_by_settings_id: None,
-        by_path_key: HashMap::new(),
-        global_by_path_key: None,
-        by_path_segments_key: HashMap::new(),
-        global_by_path_segments_key: None,
-    };
+    let refs = BytecodeModelExportRefs::default();
     let mut applied = 0usize;
     for row in rows {
-        let path_segments = row
-            .get("pathSegments")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let path_ordinals = row
-            .get("pathOrdinals")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_u64)
-                    .map(|value| value as usize)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let path_segments = json_string_array(row.get("pathSegments"));
+        let path_ordinals = json_usize_array(row.get("pathOrdinals"));
         let name = row
             .get("name")
             .and_then(Value::as_str)
@@ -1058,7 +984,7 @@ pub(super) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Resul
                 &refs,
             )
             .with_context(|| format!("Could not encode protected property {name}"))?;
-            let mut serialized_name = descriptor.map(|value| value.name).unwrap_or(name);
+            let mut serialized_name = descriptor.map_or(name, |value| value.name);
             let mut variant = legacy_variant;
             if let Some(RbxPropertyDescriptor {
                 kind:
@@ -1085,15 +1011,7 @@ pub(super) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Resul
         applied += 1;
     }
     let top_level_refs = rbx_model_top_level_refs(&dom);
-    let output =
-        File::create(path).with_context(|| format!("Failed to write {}", path.display()))?;
-    let writer = BufWriter::new(output);
-    match format {
-        RbxPlaceFormat::Binary => rbx_binary::to_writer(writer, &dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", path.display()))?,
-        RbxPlaceFormat::Xml => rbx_xml::to_writer_default(writer, &dom, &top_level_refs)
-            .with_context(|| format!("Failed to write {}", path.display()))?,
-    }
+    format.write(path, &dom, &top_level_refs)?;
     Ok(applied)
 }
 
@@ -1123,8 +1041,10 @@ pub(super) fn apply_protected_writes_offline(
         .as_ref()
         .and_then(|path| path.parent())
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| parent.join(&snapshot_name))
-        .unwrap_or_else(|| std::env::temp_dir().join(&snapshot_name));
+        .map_or_else(
+            || std::env::temp_dir().join(&snapshot_name),
+            |parent| parent.join(&snapshot_name),
+        );
     let local_file = original_path.is_some();
     let exported_instances =
         match write_live_editor_place_snapshot(bridge, args, &snapshot, original_path.as_deref()) {
@@ -1195,13 +1115,9 @@ pub(super) fn apply_protected_writes_offline(
                 format!(
                     "Failed to reopen Studio; replacement preservation: {}; original restoration: {}; backup: {}",
                     preserve
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|value| value.to_string()),
+                        .as_ref().map_or_else(std::string::ToString::to_string, |_| "ok".to_string()),
                     restore
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|value| value.to_string()),
+                        .as_ref().map_or_else(std::string::ToString::to_string, |_| "ok".to_string()),
                     backup.display()
                 )
             });

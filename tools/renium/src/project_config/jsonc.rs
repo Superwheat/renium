@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum TokenKind {
     Open,
     Close,
@@ -99,8 +99,22 @@ pub(super) fn format_jsonc(text: &str) -> Result<String> {
 }
 
 pub(crate) fn parse_jsonc_value(text: &str) -> Result<Value> {
-    let stripped = strip_comments(text)?;
-    serde_json::from_str(&strip_trailing_commas(&stripped)).context("Invalid JSON")
+    let mut json = String::with_capacity(text.len());
+    let mut tokens = tokenize(text)?
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::LineComment | TokenKind::BlockComment))
+        .peekable();
+    while let Some(token) = tokens.next() {
+        if token.kind == TokenKind::Comma
+            && tokens
+                .peek()
+                .is_some_and(|next| next.kind == TokenKind::Close)
+        {
+            continue;
+        }
+        json.push_str(&token.text);
+    }
+    serde_json::from_str(&json).context("Invalid JSON")
 }
 
 fn write_indent(output: &mut String, depth: usize, line_start: &mut bool) {
@@ -195,114 +209,4 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
         });
     }
     Ok(tokens)
-}
-
-fn strip_comments(text: &str) -> Result<String> {
-    let bytes = text.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let current = bytes[index];
-        if in_string {
-            output.push(current);
-            if escaped {
-                escaped = false;
-            } else if current == b'\\' {
-                escaped = true;
-            } else if current == b'"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if current == b'"' {
-            in_string = true;
-            output.push(current);
-            index += 1;
-            continue;
-        }
-        if current == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            output.extend_from_slice(b"  ");
-            index += 2;
-            while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
-                output.push(b' ');
-                index += 1;
-            }
-            continue;
-        }
-        if current == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            output.extend_from_slice(b"  ");
-            index += 2;
-            let mut closed = false;
-            while index < bytes.len() {
-                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    output.extend_from_slice(b"  ");
-                    index += 2;
-                    closed = true;
-                    break;
-                }
-                output.push(if matches!(bytes[index], b'\r' | b'\n') {
-                    bytes[index]
-                } else {
-                    b' '
-                });
-                index += 1;
-            }
-            if !closed {
-                bail!("Unterminated block comment");
-            }
-            continue;
-        }
-        output.push(current);
-        index += 1;
-    }
-    if in_string {
-        bail!("Unterminated JSON string");
-    }
-    String::from_utf8(output).context("JSONC is not UTF-8")
-}
-
-fn strip_trailing_commas(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let current = bytes[index];
-        if in_string {
-            output.push(current);
-            if escaped {
-                escaped = false;
-            } else if current == b'\\' {
-                escaped = true;
-            } else if current == b'"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if current == b'"' {
-            in_string = true;
-            output.push(current);
-            index += 1;
-            continue;
-        }
-        if current == b',' {
-            let mut next = index + 1;
-            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
-                next += 1;
-            }
-            if next < bytes.len() && matches!(bytes[next], b'}' | b']') {
-                output.push(b' ');
-                index += 1;
-                continue;
-            }
-        }
-        output.push(current);
-        index += 1;
-    }
-    String::from_utf8(output).unwrap_or_else(|_| text.to_string())
 }

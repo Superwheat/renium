@@ -20,21 +20,20 @@ const PROPERTY_SCHEMA_CACHE_VERSION: u32 = 7;
 pub(super) type PropertySchemaMap = HashMap<String, Vec<PropertySchemaEntry>>;
 pub(super) type EnumValueNameMap = HashMap<String, HashMap<i64, String>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct PropertySchemaEntry {
     pub(super) name: String,
-    #[serde(rename = "typeId")]
     pub(super) type_id: u8,
-    #[serde(default, rename = "enumType", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) enum_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PropertySchemaCacheFile {
     version: u32,
-    #[serde(rename = "sourceLen")]
     source_len: u64,
-    #[serde(rename = "sourceMtimeMs")]
     source_mtime_ms: u64,
     classes: PropertySchemaMap,
 }
@@ -505,7 +504,9 @@ pub(super) fn collect_rbx_dom_properties_for_class(
                 if is_engine_managed_studio_property(classes, class_name, property_value) {
                     continue;
                 }
-                if !is_studio_editable_property(property_value) {
+                if has_blocked_studio_property_tag(property_value)
+                    || !is_serialized_property(property_value)
+                {
                     continue;
                 }
                 if !is_supported_property_data_type(property_value) {
@@ -580,10 +581,6 @@ fn is_serialized_property(property_value: &Value) -> bool {
     };
 
     !matches!(serialization, Value::String(mode) if mode == "DoesNotSerialize")
-}
-
-fn is_studio_editable_property(property_value: &Value) -> bool {
-    !has_blocked_studio_property_tag(property_value) && is_serialized_property(property_value)
 }
 
 fn rbx_dom_property_value_type(property_value: &Value) -> Option<&str> {

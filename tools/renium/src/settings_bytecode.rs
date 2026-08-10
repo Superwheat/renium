@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 use crate::file_io::write_bytes_if_changed;
 use crate::property_schema::MESH_SIZE_TRANSPORT_PROPERTY;
-use crate::rbx_decode::nonfinite_float_from_json;
+use crate::rbx_decode::{json_number_f64, nonfinite_float_from_json};
 use crate::snapshot_types::{NativeSettingsValue, ServiceState, SnapshotInstance};
 use crate::timing::log_timing;
 
@@ -38,38 +38,78 @@ const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SettingsBytecode {
     pub(crate) version: u8,
     pub(crate) instances: Vec<SettingsBytecodeInstance>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsBytecodeInstance {
-    #[serde(rename = "settingsId")]
     pub(crate) settings_id: String,
     pub(crate) name: String,
-    #[serde(rename = "className")]
     pub(crate) class_name: String,
-    #[serde(
-        default,
-        rename = "parentIndex",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_index: Option<usize>,
-    #[serde(default)]
     pub(crate) properties: Map<String, Value>,
-    #[serde(default)]
     pub(crate) attributes: Map<String, Value>,
+}
+
+impl SettingsBytecodeInstance {
+    pub(crate) fn new(
+        settings_id: String,
+        name: String,
+        class_name: String,
+        parent_index: Option<usize>,
+    ) -> Self {
+        Self {
+            settings_id,
+            name,
+            class_name,
+            parent_index,
+            properties: Map::new(),
+            attributes: Map::new(),
+        }
+    }
 }
 
 impl SettingsBytecode {
     pub(crate) fn read_file(path: &Path) -> Result<Self> {
-        read_settings_bytecode_file(path)
+        for attempt in 0..6 {
+            let file_len = fs::metadata(path)
+                .with_context(|| format!("Failed to stat {}", path.display()))?
+                .len();
+            if file_len > MAX_SETTINGS_BYTECODE_BYTES as u64 {
+                bail!(
+                    "Settings bytecode file exceeds safe size limit of {} bytes: {}",
+                    MAX_SETTINGS_BYTECODE_BYTES,
+                    path.display()
+                );
+            }
+            let bytes =
+                fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+            match decode_settings_bytecode(&bytes) {
+                Ok(document) => return Ok(document),
+                Err(_) if attempt < 5 => {
+                    thread::sleep(Duration::from_millis(15 * (attempt + 1) as u64));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to decode {}", path.display()));
+                }
+            }
+        }
+        unreachable!("settings bytecode retry loop always returns")
     }
 
     pub(crate) fn write_file(&self, path: &Path) -> Result<()> {
-        write_settings_bytecode_file(path, self)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        let bytes = encode_settings_bytecode(self)?;
+        write_bytes_if_changed(path, &bytes)
     }
 }
 
@@ -91,6 +131,52 @@ pub(crate) fn settings_reference_index(value: &Value) -> Option<usize> {
             })
         })?;
     usize::try_from(one_based).ok()?.checked_sub(1)
+}
+
+pub(crate) type ReferencePath = (Vec<String>, Option<Vec<usize>>);
+
+pub(crate) fn strict_reference_path(object: &Map<String, Value>) -> Result<Option<ReferencePath>> {
+    let Some(value) = object.get("pathSegments") else {
+        if object.contains_key("pathOrdinals") {
+            bail!("Ref pathOrdinals require pathSegments");
+        }
+        return Ok(None);
+    };
+    let segments = value
+        .as_array()
+        .context("Ref pathSegments must be an array")?
+        .iter()
+        .map(|segment| {
+            segment
+                .as_str()
+                .map(str::to_string)
+                .context("Ref pathSegments must contain strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordinals = object
+        .get("pathOrdinals")
+        .map(|value| {
+            value
+                .as_array()
+                .context("Ref pathOrdinals must be an array")?
+                .iter()
+                .map(|ordinal| {
+                    ordinal
+                        .as_u64()
+                        .filter(|ordinal| *ordinal > 0)
+                        .and_then(|ordinal| usize::try_from(ordinal).ok())
+                        .context("Ref pathOrdinals must contain positive integers")
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    if ordinals
+        .as_ref()
+        .is_some_and(|ordinals| ordinals.len() != segments.len())
+    {
+        bail!("Ref pathOrdinals must match pathSegments length");
+    }
+    Ok(Some((segments, ordinals)))
 }
 
 pub(crate) fn instance_settings_id(index: usize, instance: &SnapshotInstance) -> String {
@@ -121,8 +207,7 @@ pub(crate) fn child_indices_for_instance(state: &ServiceState, parent_index: usi
     state
         .children_by_index
         .get(parent_index)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[][..], Vec::as_slice)
 }
 
 pub(crate) fn should_skip_binary_property(
@@ -159,9 +244,8 @@ pub(crate) fn is_default_property_value(
     }
     if matches!(
         (property_name, property_value),
-        ("Archivable", Value::Bool(true))
+        ("Archivable" | "CharacterAutoLoads", Value::Bool(true))
             | ("Sandboxed", Value::Bool(false))
-            | ("CharacterAutoLoads", Value::Bool(true))
     ) {
         return true;
     }
@@ -170,41 +254,6 @@ pub(crate) fn is_default_property_value(
         .get(class_name)
         .and_then(|properties| properties.get(property_name))
         .is_some_and(|default| default == property_value)
-}
-
-pub(crate) fn read_settings_bytecode_file(path: &Path) -> Result<SettingsBytecode> {
-    for attempt in 0..6 {
-        let file_len = fs::metadata(path)
-            .with_context(|| format!("Failed to stat {}", path.display()))?
-            .len();
-        if file_len > MAX_SETTINGS_BYTECODE_BYTES as u64 {
-            bail!(
-                "Settings bytecode file exceeds safe size limit of {} bytes: {}",
-                MAX_SETTINGS_BYTECODE_BYTES,
-                path.display()
-            );
-        }
-        let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-        match decode_settings_bytecode(&bytes) {
-            Ok(document) => return Ok(document),
-            Err(_) if attempt < 5 => {
-                thread::sleep(Duration::from_millis(15 * (attempt + 1) as u64));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("Failed to decode {}", path.display()));
-            }
-        }
-    }
-    unreachable!("settings bytecode retry loop always returns")
-}
-
-pub(crate) fn write_settings_bytecode_file(path: &Path, document: &SettingsBytecode) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let bytes = encode_settings_bytecode(document)?;
-    write_bytes_if_changed(path, &bytes)
 }
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
@@ -284,14 +333,12 @@ fn decode_settings_bytecode_payload(
             .clone();
         let parent_raw = reader.read_len("parent index")?;
         let parent_index = decode_parent_index(parent_raw, instance_index, instance_count)?;
-        instances.push(SettingsBytecodeInstance {
+        instances.push(SettingsBytecodeInstance::new(
             settings_id,
             name,
             class_name,
             parent_index,
-            properties: Map::new(),
-            attributes: Map::new(),
-        });
+        ));
     }
     validate_settings_hierarchy(&instances)?;
 
@@ -398,7 +445,7 @@ fn decode_property_group_body(
 pub(crate) fn encode_settings_bytecode(document: &SettingsBytecode) -> Result<Vec<u8>> {
     validate_settings_hierarchy(&document.instances)?;
     let payload = encode_settings_bytecode_payload(document)?;
-    wrap_settings_bytecode_payload(payload)
+    wrap_settings_bytecode_payload(&payload)
 }
 
 fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result<()> {
@@ -465,18 +512,23 @@ fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result
 
 fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
     let lookup = build_bytecode_instance_lookup(document);
-    let mut string_counts: SettingsStringCounts<'_> = HashMap::new();
-    let mut class_counts: SettingsStringCounts<'_> = HashMap::new();
-    let mut property_counts: SettingsStringCounts<'_> = HashMap::new();
-    let mut property_groups: SettingsPropertyGroups<'_> = HashMap::new();
+    let mut collected = SettingsBinaryCollection::default();
 
     for (instance_index, instance) in document.instances.iter().enumerate() {
         if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
-            add_count(&mut string_counts, instance.settings_id.as_str(), 1);
+            add_count(
+                &mut collected.string_counts,
+                instance.settings_id.as_str(),
+                1,
+            );
         }
-        add_count(&mut string_counts, instance.name.as_str(), 1);
-        add_count(&mut string_counts, instance.class_name.as_str(), 1);
-        add_count(&mut class_counts, instance.class_name.as_str(), 1);
+        add_count(&mut collected.string_counts, instance.name.as_str(), 1);
+        add_count(
+            &mut collected.string_counts,
+            instance.class_name.as_str(),
+            1,
+        );
+        add_count(&mut collected.class_counts, instance.class_name.as_str(), 1);
 
         for (property_name, raw_value) in &instance.properties {
             let kind = binary_raw_value_kind(raw_value, &lookup)?;
@@ -485,47 +537,39 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
             }
             let property_name = property_name.as_str();
             let source = SettingsBinaryValueSource::Property(raw_value);
-            add_count(&mut string_counts, property_name, 1);
-            add_count(&mut property_counts, property_name, 1);
-            collect_binary_source_strings(&source, &lookup, &mut string_counts)?;
-            property_groups
-                .entry((property_name, kind))
-                .or_default()
-                .push(SettingsBinaryValue {
-                    instance_index,
-                    source,
-                });
+            push_settings_binary_value(
+                &mut collected,
+                &lookup,
+                instance_index,
+                property_name,
+                kind,
+                source,
+            )?;
         }
 
         if has_binary_attributes(&instance.attributes) {
             let property_name = "Attributes";
             let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
             let kind = binary_source_value_kind(&source, &lookup)?;
-            add_count(&mut string_counts, property_name, 1);
-            add_count(&mut property_counts, property_name, 1);
-            collect_binary_source_strings(&source, &lookup, &mut string_counts)?;
-            property_groups
-                .entry((property_name, kind))
-                .or_default()
-                .push(SettingsBinaryValue {
-                    instance_index,
-                    source,
-                });
+            push_settings_binary_value(
+                &mut collected,
+                &lookup,
+                instance_index,
+                property_name,
+                kind,
+                source,
+            )?;
         }
     }
 
-    let strings = sorted_counted_strings(string_counts);
+    let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
-    let classes = sorted_counted_strings(class_counts);
+    let classes = sorted_counted_strings(collected.class_counts);
     let class_ids = build_id_map(&classes);
-    let properties = sorted_counted_strings(property_counts);
+    let properties = sorted_counted_strings(collected.property_counts);
     let property_ids = build_id_map(&properties);
-    let mut property_group_entries = property_groups.into_iter().collect::<Vec<_>>();
-    property_group_entries.sort_by(|a, b| {
-        let a_id = property_ids.get(a.0.0).copied().unwrap_or(u64::MAX);
-        let b_id = property_ids.get(b.0.0).copied().unwrap_or(u64::MAX);
-        a_id.cmp(&b_id).then_with(|| a.0.1.cmp(&b.0.1))
-    });
+    let property_group_entries =
+        sorted_settings_property_groups(collected.property_groups, &property_ids);
 
     let estimated_capacity = document
         .instances
@@ -533,21 +577,14 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
         .saturating_mul(96)
         .clamp(1024, 32 * 1024 * 1024);
     let mut writer = Vec::with_capacity(estimated_capacity);
-    write_var_u64(&mut writer, strings.len() as u64)?;
-    for text in &strings {
-        let bytes = text.as_bytes();
-        write_var_u64(&mut writer, bytes.len() as u64)?;
-        writer.extend_from_slice(bytes);
-    }
-    write_var_u64(&mut writer, classes.len() as u64)?;
-    for class_name in &classes {
-        write_binary_string_id(&mut writer, &string_ids, class_name)?;
-    }
-    write_var_u64(&mut writer, properties.len() as u64)?;
-    for property_name in &properties {
-        write_binary_string_id(&mut writer, &string_ids, property_name)?;
-    }
-    write_var_u64(&mut writer, document.instances.len() as u64)?;
+    write_settings_binary_header(
+        &mut writer,
+        &strings,
+        &string_ids,
+        &classes,
+        &properties,
+        document.instances.len(),
+    )?;
     for (instance_index, instance) in document.instances.iter().enumerate() {
         write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
         write_binary_string_id(&mut writer, &string_ids, instance.name.as_str())?;
@@ -562,35 +599,24 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
             encode_parent_index(instance.parent_index, instance_index)?,
         )?;
     }
-    write_var_u64(&mut writer, property_group_entries.len() as u64)?;
-    let group_bodies = property_group_entries
-        .par_iter()
-        .map(|((_, kind), values)| {
-            let mut body = Vec::new();
-            write_property_group_values(values, *kind, &string_ids, &lookup, &mut body)?;
-            Ok(body)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (((property_name, kind), values), group_body) in
-        property_group_entries.iter().zip(group_bodies)
-    {
-        write_lookup_id(&mut writer, &property_ids, property_name, "property")?;
-        writer.write_all(&[*kind])?;
-        write_var_u64(&mut writer, values.len() as u64)?;
-        write_var_u64(&mut writer, group_body.len() as u64)?;
-        writer.extend_from_slice(&group_body);
-    }
+    write_settings_binary_property_groups(
+        &mut writer,
+        &property_group_entries,
+        &property_ids,
+        &string_ids,
+        &lookup,
+    )?;
 
     Ok(writer)
 }
 
-fn wrap_settings_bytecode_payload(payload: Vec<u8>) -> Result<Vec<u8>> {
+fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
             "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
         );
     }
-    let zstd = zstd::bulk::compress(&payload, 1)?;
+    let zstd = zstd::bulk::compress(payload, 1)?;
     if zstd.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
             "Compressed settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
@@ -622,7 +648,7 @@ fn var_u64_len(mut value: u64) -> usize {
 }
 
 fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup {
-    let mut lookup = empty_settings_binary_lookup();
+    let mut lookup = SettingsBinaryInstanceLookup::default();
     let paths = settings_document_path_parts(document);
     for (index, instance) in document.instances.iter().enumerate() {
         lookup.by_instance_index.entry(index + 1).or_insert(index);
@@ -771,7 +797,7 @@ fn decode_raw_value_payload(
             reader.read_var_u64()?,
         )))),
         4 => Ok(Value::Number(Number::from(reader.read_var_u64()?))),
-        5 => Ok(number_from_f64(read_f64(reader)?)),
+        5 => Ok(json_number_f64(read_f64(reader)?)),
         6 => Ok(Value::String(
             reader.read_string(strings, "value string id")?.to_string(),
         )),
@@ -793,16 +819,16 @@ fn decode_raw_value_payload(
             let len = reader.read_collection_len("numeric array length")?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(number_from_f64(read_f64(reader)?));
+                items.push(json_number_f64(read_f64(reader)?));
             }
             Ok(Value::Array(items))
         }
-        20 => Ok(number_from_f64(read_f32(reader)? as f64)),
+        20 => Ok(json_number_f64(read_f32(reader)? as f64)),
         21 => {
             let len = reader.read_collection_len("f32 numeric array length")?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(number_from_f64(read_f32(reader)? as f64));
+                items.push(json_number_f64(read_f32(reader)? as f64));
             }
             Ok(Value::Array(items))
         }
@@ -987,7 +1013,7 @@ fn decode_fixed_numeric_payload(
     for field in fields {
         out.insert(
             (*field).to_string(),
-            number_from_f64(read_fixed_numeric_component(reader)?),
+            json_number_f64(read_fixed_numeric_component(reader)?),
         );
     }
     Ok(Value::Object(out))
@@ -996,7 +1022,7 @@ fn decode_fixed_numeric_payload(
 fn decode_cframe_payload(reader: &mut BytecodeReader<'_>) -> Result<Value> {
     let mut components = Vec::with_capacity(12);
     for _ in 0..12 {
-        components.push(number_from_f64(read_fixed_numeric_component(reader)?));
+        components.push(json_number_f64(read_fixed_numeric_component(reader)?));
     }
     Ok(typed_object(
         "CFrame",
@@ -1042,14 +1068,14 @@ fn decode_cframe_rotation_table_payload(
 ) -> Result<Value> {
     let mut components = Vec::with_capacity(12);
     for _ in 0..3 {
-        components.push(number_from_f64(read_f32(reader)? as f64));
+        components.push(json_number_f64(read_f32(reader)? as f64));
     }
     let rotation_index = reader.read_len("CFrame rotation index")?;
     let rotation = rotations
         .get(rotation_index)
         .with_context(|| format!("Invalid CFrame rotation index {rotation_index}"))?;
     for component in rotation {
-        components.push(number_from_f64(*component));
+        components.push(json_number_f64(*component));
     }
     Ok(typed_object(
         "CFrame",
@@ -1118,23 +1144,6 @@ fn read_fixed_numeric_component(reader: &mut BytecodeReader<'_>) -> Result<f64> 
     Ok(read_f32(reader)? as f64)
 }
 
-fn number_from_f64(value: f64) -> Value {
-    if let Some(number) = Number::from_f64(value) {
-        return Value::Number(number);
-    }
-    let text = if value.is_nan() {
-        "nan"
-    } else if value > 0.0 {
-        "inf"
-    } else {
-        "-inf"
-    };
-    let mut object = Map::with_capacity(2);
-    object.insert("_type".to_string(), Value::String("Float".to_string()));
-    object.insert("value".to_string(), Value::String(text.to_string()));
-    Value::Object(object)
-}
-
 fn unzigzag_i64(value: u64) -> i64 {
     ((value >> 1) as i64) ^ (-((value & 1) as i64))
 }
@@ -1191,7 +1200,6 @@ struct CFrameRotationTable {
     values: Vec<CFrameTableValue>,
 }
 
-#[derive(Clone, Copy)]
 struct CFrameTableValue {
     position: [u32; 3],
     rotation_index: usize,
@@ -1211,6 +1219,7 @@ enum SettingsBinaryValueSource<'a> {
     Attributes(&'a Map<String, Value>),
 }
 
+#[derive(Default)]
 struct SettingsBinaryInstanceLookup {
     dense_instance_count: usize,
     by_instance_index: SettingsIndexMap<usize>,
@@ -1234,6 +1243,27 @@ enum FixedNumericKind {
     Color3,
     CFrame,
     Rect,
+}
+
+fn push_settings_binary_value<'a>(
+    out: &mut SettingsBinaryCollection<'a>,
+    lookup: &SettingsBinaryInstanceLookup,
+    instance_index: usize,
+    property_name: &'a str,
+    kind: u8,
+    source: SettingsBinaryValueSource<'a>,
+) -> Result<()> {
+    add_count(&mut out.string_counts, property_name, 1);
+    add_count(&mut out.property_counts, property_name, 1);
+    collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
+    out.property_groups
+        .entry((property_name, kind))
+        .or_default()
+        .push(SettingsBinaryValue {
+            instance_index,
+            source,
+        });
+    Ok(())
 }
 
 fn collect_settings_binary_chunk<'a>(
@@ -1268,16 +1298,14 @@ fn collect_settings_binary_chunk<'a>(
                 let property_name = property.name.as_str();
                 let source = SettingsBinaryValueSource::Native(&property.value);
                 let kind = binary_source_value_kind(&source, lookup)?;
-                add_count(&mut out.string_counts, property_name, 1);
-                add_count(&mut out.property_counts, property_name, 1);
-                collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
-                out.property_groups
-                    .entry((property_name, kind))
-                    .or_default()
-                    .push(SettingsBinaryValue {
-                        instance_index,
-                        source,
-                    });
+                push_settings_binary_value(
+                    &mut out,
+                    lookup,
+                    instance_index,
+                    property_name,
+                    kind,
+                    source,
+                )?;
             }
         }
         for (property_name, raw_value) in &instance.properties {
@@ -1290,32 +1318,28 @@ fn collect_settings_binary_chunk<'a>(
             if kind == 0 {
                 continue;
             }
-            add_count(&mut out.string_counts, property_name, 1);
-            add_count(&mut out.property_counts, property_name, 1);
-            collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
-            out.property_groups
-                .entry((property_name, kind))
-                .or_default()
-                .push(SettingsBinaryValue {
-                    instance_index,
-                    source,
-                });
+            push_settings_binary_value(
+                &mut out,
+                lookup,
+                instance_index,
+                property_name,
+                kind,
+                source,
+            )?;
         }
 
         if has_binary_attributes(&instance.attributes) {
             let property_name = "Attributes";
             let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
             let kind = binary_source_value_kind(&source, lookup)?;
-            add_count(&mut out.string_counts, property_name, 1);
-            add_count(&mut out.property_counts, property_name, 1);
-            collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
-            out.property_groups
-                .entry((property_name, kind))
-                .or_default()
-                .push(SettingsBinaryValue {
-                    instance_index,
-                    source,
-                });
+            push_settings_binary_value(
+                &mut out,
+                lookup,
+                instance_index,
+                property_name,
+                kind,
+                source,
+            )?;
         }
     }
 
@@ -1411,32 +1435,21 @@ fn write_service_settings_binary_file_inner(
     let class_ids = build_id_map(&classes);
     let properties = sorted_counted_strings(collected.property_counts);
     let property_ids = build_id_map(&properties);
-    let mut property_group_entries = collected.property_groups.into_iter().collect::<Vec<_>>();
-    property_group_entries.sort_by(|a, b| {
-        let a_id = property_ids.get(a.0.0).copied().unwrap_or(u64::MAX);
-        let b_id = property_ids.get(b.0.0).copied().unwrap_or(u64::MAX);
-        a_id.cmp(&b_id).then_with(|| a.0.1.cmp(&b.0.1))
-    });
+    let property_group_entries =
+        sorted_settings_property_groups(collected.property_groups, &property_ids);
     let estimated_capacity = instances
         .len()
         .saturating_mul(96)
         .clamp(1024 * 1024, 32 * 1024 * 1024);
     let mut payload = Vec::with_capacity(estimated_capacity);
-    write_var_u64(&mut payload, strings.len() as u64)?;
-    for text in &strings {
-        let bytes = text.as_bytes();
-        write_var_u64(&mut payload, bytes.len() as u64)?;
-        payload.extend_from_slice(bytes);
-    }
-    write_var_u64(&mut payload, classes.len() as u64)?;
-    for class_name in &classes {
-        write_binary_string_id(&mut payload, &string_ids, class_name)?;
-    }
-    write_var_u64(&mut payload, properties.len() as u64)?;
-    for property_name in &properties {
-        write_binary_string_id(&mut payload, &string_ids, property_name)?;
-    }
-    write_var_u64(&mut payload, instances.len() as u64)?;
+    write_settings_binary_header(
+        &mut payload,
+        &strings,
+        &string_ids,
+        &classes,
+        &properties,
+        instances.len(),
+    )?;
     if instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES && rayon::current_num_threads() > 1
     {
         let bodies = instances
@@ -1471,26 +1484,15 @@ fn write_service_settings_binary_file_inner(
             )?;
         }
     }
-    write_var_u64(&mut payload, property_group_entries.len() as u64)?;
-    let group_bodies = property_group_entries
-        .par_iter()
-        .map(|((_, kind), values)| {
-            let mut body = Vec::new();
-            write_property_group_values(values, *kind, &string_ids, &lookup, &mut body)?;
-            Ok(body)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (((property_name, kind), values), group_body) in
-        property_group_entries.iter().zip(group_bodies)
-    {
-        write_lookup_id(&mut payload, &property_ids, property_name, "property")?;
-        payload.write_all(&[*kind])?;
-        write_var_u64(&mut payload, values.len() as u64)?;
-        write_var_u64(&mut payload, group_body.len() as u64)?;
-        payload.extend_from_slice(&group_body);
-    }
+    write_settings_binary_property_groups(
+        &mut payload,
+        &property_group_entries,
+        &property_ids,
+        &string_ids,
+        &lookup,
+    )?;
 
-    let writer = wrap_settings_bytecode_payload(payload)?;
+    let writer = wrap_settings_bytecode_payload(&payload)?;
     if fresh {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1509,9 +1511,9 @@ fn write_service_settings_binary_file_inner(
     Ok(())
 }
 
-fn collect_service_settings_binary_instances<'a>(
-    state: &'a ServiceState,
-) -> Vec<SettingsBinaryInstance<'a>> {
+fn collect_service_settings_binary_instances(
+    state: &ServiceState,
+) -> Vec<SettingsBinaryInstance<'_>> {
     if state.properties_default_elided && state.dense_index_topology {
         let mut out = Vec::with_capacity(state.instances.len());
         for (source_index, instance) in state.instances.iter().enumerate() {
@@ -1568,10 +1570,7 @@ fn parse_numeric_debug_settings_id(text: &str) -> Option<u64> {
     parse_numeric_debug_id(text.strip_prefix("debug:")?)
 }
 
-fn settings_binary_id<'a>(
-    source_index: usize,
-    instance: &'a SnapshotInstance,
-) -> SettingsBinaryId<'a> {
+fn settings_binary_id(source_index: usize, instance: &SnapshotInstance) -> SettingsBinaryId<'_> {
     if instance.instance_index == Some(1) && instance.parent_index.is_none() {
         return SettingsBinaryId::Text(Cow::Borrowed("1"));
     }
@@ -1593,7 +1592,7 @@ fn build_settings_binary_instance_lookup(
     if state.dense_index_topology {
         return SettingsBinaryInstanceLookup {
             dense_instance_count: instances.len(),
-            ..empty_settings_binary_lookup()
+            ..Default::default()
         };
     }
     let mut by_instance_index = HashMap::with_capacity(instances.len());
@@ -1786,10 +1785,6 @@ fn add_count<'a>(counts: &mut SettingsStringCounts<'a>, text: &'a str, amount: u
     }
 }
 
-fn add_owned_count<'a>(counts: &mut SettingsStringCounts<'a>, text: String, amount: u64) {
-    add_count_key(counts, Cow::Owned(text), amount);
-}
-
 fn add_count_key<'a>(counts: &mut SettingsStringCounts<'a>, text: SettingsString<'a>, amount: u64) {
     if let Some(count) = counts.get_mut(text.as_ref()) {
         *count += amount;
@@ -1810,6 +1805,70 @@ fn build_id_map<'a>(items: &'a [SettingsString<'_>]) -> SettingsStringIdMap<'a> 
         out.insert(text.as_ref(), index as u64);
     }
     out
+}
+
+fn sorted_settings_property_groups<'a>(
+    groups: SettingsPropertyGroups<'a>,
+    property_ids: &SettingsStringIdMap<'_>,
+) -> Vec<((&'a str, u8), Vec<SettingsBinaryValue<'a>>)> {
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|a, b| {
+        let a_id = property_ids.get(a.0.0).copied().unwrap_or(u64::MAX);
+        let b_id = property_ids.get(b.0.0).copied().unwrap_or(u64::MAX);
+        a_id.cmp(&b_id).then_with(|| a.0.1.cmp(&b.0.1))
+    });
+    groups
+}
+
+fn write_settings_binary_header<W: Write + ?Sized>(
+    writer: &mut W,
+    strings: &[SettingsString<'_>],
+    string_ids: &SettingsStringIdMap<'_>,
+    classes: &[SettingsString<'_>],
+    properties: &[SettingsString<'_>],
+    instance_count: usize,
+) -> Result<()> {
+    write_var_u64(writer, strings.len() as u64)?;
+    for text in strings {
+        let bytes = text.as_bytes();
+        write_var_u64(writer, bytes.len() as u64)?;
+        writer.write_all(bytes)?;
+    }
+    write_var_u64(writer, classes.len() as u64)?;
+    for class_name in classes {
+        write_binary_string_id(writer, string_ids, class_name)?;
+    }
+    write_var_u64(writer, properties.len() as u64)?;
+    for property_name in properties {
+        write_binary_string_id(writer, string_ids, property_name)?;
+    }
+    write_var_u64(writer, instance_count as u64)
+}
+
+fn write_settings_binary_property_groups<W: Write + ?Sized>(
+    writer: &mut W,
+    groups: &[((&str, u8), Vec<SettingsBinaryValue<'_>>)],
+    property_ids: &SettingsStringIdMap<'_>,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup,
+) -> Result<()> {
+    write_var_u64(writer, groups.len() as u64)?;
+    let bodies = groups
+        .par_iter()
+        .map(|((_, kind), values)| {
+            let mut body = Vec::new();
+            write_property_group_values(values, *kind, string_ids, lookup, &mut body)?;
+            Ok(body)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (((property_name, kind), values), body) in groups.iter().zip(bodies) {
+        write_lookup_id(writer, property_ids, property_name, "property")?;
+        writer.write_all(&[*kind])?;
+        write_var_u64(writer, values.len() as u64)?;
+        write_var_u64(writer, body.len() as u64)?;
+        writer.write_all(&body)?;
+    }
+    Ok(())
 }
 
 fn has_binary_attributes(attributes: &Map<String, Value>) -> bool {
@@ -1894,23 +1953,17 @@ fn collect_native_value_strings<'a>(
     value: &'a NativeSettingsValue,
     out: &mut SettingsStringCounts<'a>,
 ) {
-    match value {
-        NativeSettingsValue::String(value) | NativeSettingsValue::Enum(value) => {
-            add_count(out, value, 1);
-        }
-        _ => {}
+    if let NativeSettingsValue::String(value) | NativeSettingsValue::Enum(value) = value {
+        add_count(out, value, 1);
     }
 }
 
 fn native_fixed_components(value: &NativeSettingsValue) -> Option<&[f32]> {
     match value {
-        NativeSettingsValue::Vector2(value) => Some(value),
-        NativeSettingsValue::Vector3(value) => Some(value),
-        NativeSettingsValue::UDim(value) => Some(value),
-        NativeSettingsValue::UDim2(value) => Some(value),
-        NativeSettingsValue::Color3(value) => Some(value),
+        NativeSettingsValue::Vector2(value) | NativeSettingsValue::UDim(value) => Some(value),
+        NativeSettingsValue::Vector3(value) | NativeSettingsValue::Color3(value) => Some(value),
+        NativeSettingsValue::UDim2(value) | NativeSettingsValue::Rect(value) => Some(value),
         NativeSettingsValue::CFrame(value) => Some(value),
-        NativeSettingsValue::Rect(value) => Some(value),
         _ => None,
     }
 }
@@ -2078,14 +2131,11 @@ fn build_cframe_rotation_table(
         let position = [components[0], components[1], components[2]];
         let mut rotation = [0_u32; 9];
         rotation.copy_from_slice(&components[3..]);
-        let rotation_index = if let Some(index) = rotation_ids.get(&rotation) {
-            *index
-        } else {
+        let rotation_index = *rotation_ids.entry(rotation).or_insert_with(|| {
             let index = rotations.len();
             rotations.push(rotation);
-            rotation_ids.insert(rotation, index);
             index
-        };
+        });
         table_values.push(CFrameTableValue {
             position,
             rotation_index,
@@ -2124,7 +2174,7 @@ fn cframe_component_bits(value: &Value) -> Result<[u32; 12]> {
     let mut out = [0_u32; 12];
     for (index, item) in items.iter().enumerate() {
         let number = settings_number(item).context("Expected numeric CFrame component")?;
-        out[index] = fixed_numeric_component_bits(number);
+        out[index] = fixed_numeric_component_f32(number).to_bits();
     }
     Ok(out)
 }
@@ -2152,8 +2202,9 @@ fn binary_raw_value_kind(value: &Value, lookup: &SettingsBinaryInstanceLookup) -
                     10
                 });
             }
-            if let Some(type_name) = obj.get("_type").and_then(Value::as_str) {
-                match type_name {
+            obj.get("_type")
+                .and_then(Value::as_str)
+                .map_or(8, |type_name| match type_name {
                     "Vector2" => 11,
                     "Vector3" => 12,
                     "UDim" => 13,
@@ -2163,10 +2214,7 @@ fn binary_raw_value_kind(value: &Value, lookup: &SettingsBinaryInstanceLookup) -
                     "Rect" => 18,
                     "EnumItem" => 19,
                     _ => 8,
-                }
-            } else {
-                8
-            }
+                })
         }
     })
 }
@@ -2198,11 +2246,7 @@ fn is_numeric_array_f32_exact(items: &[Value]) -> bool {
 
 fn exact_f32(value: f64) -> Option<f32> {
     let value32 = value as f32;
-    if value32.is_finite() && value32 as f64 == value {
-        Some(value32)
-    } else {
-        None
-    }
+    (value32.is_finite() && value32 as f64 == value).then_some(value32)
 }
 
 fn settings_number(value: &Value) -> Option<f64> {
@@ -2264,10 +2308,6 @@ fn fixed_numeric_component_f32(number: f64) -> f32 {
     } else {
         f32::MIN
     }
-}
-
-fn fixed_numeric_component_bits(number: f64) -> u32 {
-    fixed_numeric_component_f32(number).to_bits()
 }
 
 fn write_fixed_numeric_components<W: Write + ?Sized>(
@@ -2451,36 +2491,8 @@ fn resolve_ref_index(
             .context("Ref debugId must be a string")?;
         accept_stable("debugId", lookup.by_debug_id.get(debug_id).copied())?;
     }
-    if let Some(raw_path_segments) = ref_value.get("pathSegments") {
-        let path_segments = raw_path_segments
-            .as_array()
-            .context("Ref pathSegments must be an array")?;
-        let segments: Vec<String> = path_segments
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(ToString::to_string)
-                    .context("Ref pathSegments must contain strings")
-            })
-            .collect::<Result<_>>()?;
-        let candidate = if let Some(raw_path_ordinals) = ref_value.get("pathOrdinals") {
-            let path_ordinals = raw_path_ordinals
-                .as_array()
-                .context("Ref pathOrdinals must be an array")?;
-            let ordinals = path_ordinals
-                .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .filter(|ordinal| *ordinal > 0)
-                        .and_then(|ordinal| usize::try_from(ordinal).ok())
-                        .context("Ref pathOrdinals must contain positive integers")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if ordinals.len() != segments.len() {
-                bail!("Ref pathOrdinals must match pathSegments length");
-            }
+    if let Some((segments, ordinals)) = strict_reference_path(ref_value)? {
+        let candidate = if let Some(ordinals) = ordinals {
             lookup
                 .by_path_parts
                 .get(&path_parts_key(&segments, &ordinals))
@@ -2493,8 +2505,6 @@ fn resolve_ref_index(
             }
         };
         accept_stable("pathSegments", candidate)?;
-    } else if ref_value.contains_key("pathOrdinals") {
-        bail!("Ref pathOrdinals require pathSegments");
     }
     if let Some(raw_path) = ref_value.get("path") {
         let path = raw_path.as_str().context("Ref path must be a string")?;
@@ -2625,7 +2635,7 @@ fn collect_font_strings<'a>(obj: &'a Map<String, Value>, out: &mut SettingsStrin
 fn collect_ref_strings<'a>(ref_value: &'a Map<String, Value>, out: &mut SettingsStringCounts<'a>) {
     if let Some(instance_index) = ref_value.get("instanceIndex").and_then(Value::as_u64) {
         let instance_id = format!("{instance_index:x}");
-        add_owned_count(out, instance_id, 1);
+        add_count_key(out, Cow::Owned(instance_id), 1);
     }
     for key in ["settingsId", "instanceId", "debugId", "path"] {
         if let Some(text) = ref_value.get(key).and_then(Value::as_str) {
@@ -2644,8 +2654,7 @@ fn collect_ref_strings<'a>(ref_value: &'a Map<String, Value>, out: &mut Settings
 fn sequence_keypoint_values(obj: &Map<String, Value>) -> &[Value] {
     obj.get("keypoints")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[][..], Vec::as_slice)
 }
 
 fn raw_string_payload(value: &Value) -> Option<&str> {
@@ -2839,25 +2848,36 @@ fn write_brick_color_payload<W: Write + ?Sized>(
     )
 }
 
+fn write_sequence_payload_header<'a, W: Write + ?Sized>(
+    obj: &'a Map<String, Value>,
+    type_name: &str,
+    string_ids: &SettingsStringIdMap<'_>,
+    writer: &mut W,
+) -> Result<&'a [Value]> {
+    write_var_u64(writer, 1)?;
+    write_binary_string_id(writer, string_ids, type_name)?;
+    writer.write_all(&[8])?;
+    write_var_u64(writer, 1)?;
+    write_binary_string_id(writer, string_ids, "keypoints")?;
+    writer.write_all(&[7])?;
+    let keypoints = sequence_keypoint_values(obj);
+    write_var_u64(
+        writer,
+        keypoints.iter().filter(|value| value.is_object()).count() as u64,
+    )?;
+    Ok(keypoints)
+}
+
 fn write_color_sequence_payload<W: Write + ?Sized>(
     obj: &Map<String, Value>,
     string_ids: &SettingsStringIdMap<'_>,
     lookup: &SettingsBinaryInstanceLookup,
     writer: &mut W,
 ) -> Result<()> {
-    write_var_u64(writer, 1)?;
-    write_binary_string_id(writer, string_ids, "ColorSequence")?;
-    writer.write_all(&[8])?;
-    write_var_u64(writer, 1)?;
-    write_binary_string_id(writer, string_ids, "keypoints")?;
-    writer.write_all(&[7])?;
-    let keypoint_values = sequence_keypoint_values(obj);
-    let keypoint_count = keypoint_values
+    for keypoint_obj in write_sequence_payload_header(obj, "ColorSequence", string_ids, writer)?
         .iter()
-        .filter(|value| value.is_object())
-        .count();
-    write_var_u64(writer, keypoint_count as u64)?;
-    for keypoint_obj in keypoint_values.iter().filter_map(Value::as_object) {
+        .filter_map(Value::as_object)
+    {
         writer.write_all(&[8])?;
         write_var_u64(writer, 2)?;
         write_binary_string_id(writer, string_ids, "time")?;
@@ -2883,19 +2903,10 @@ fn write_number_sequence_payload<W: Write + ?Sized>(
     lookup: &SettingsBinaryInstanceLookup,
     writer: &mut W,
 ) -> Result<()> {
-    write_var_u64(writer, 1)?;
-    write_binary_string_id(writer, string_ids, "NumberSequence")?;
-    writer.write_all(&[8])?;
-    write_var_u64(writer, 1)?;
-    write_binary_string_id(writer, string_ids, "keypoints")?;
-    writer.write_all(&[7])?;
-    let keypoint_values = sequence_keypoint_values(obj);
-    let keypoint_count = keypoint_values
+    for keypoint_obj in write_sequence_payload_header(obj, "NumberSequence", string_ids, writer)?
         .iter()
-        .filter(|value| value.is_object())
-        .count();
-    write_var_u64(writer, keypoint_count as u64)?;
-    for keypoint_obj in keypoint_values.iter().filter_map(Value::as_object) {
+        .filter_map(Value::as_object)
+    {
         writer.write_all(&[8])?;
         write_var_u64(writer, 3)?;
         for key in ["time", "value", "envelope"] {
@@ -3094,7 +3105,7 @@ fn collect_attribute_value_strings<'a>(
         && let Some(key) = attribute_type_key(obj)
     {
         add_count(out, key, 1);
-        let lookup = empty_settings_binary_lookup();
+        let lookup = SettingsBinaryInstanceLookup::default();
         let child = attribute_payload_child(obj, key, value);
         if key == "EnumItem" {
             if let Some((enum_type, name)) = enum_item_attribute_fields(child) {
@@ -3166,7 +3177,7 @@ fn write_attribute_value<W: Write + ?Sized>(
         write_enum_item_attribute_payload(enum_type, name, string_ids, writer)?;
         return Ok(());
     }
-    let lookup = empty_settings_binary_lookup();
+    let lookup = SettingsBinaryInstanceLookup::default();
     write_raw_value(child, string_ids, &lookup, writer)
 }
 
@@ -3184,19 +3195,6 @@ fn write_enum_item_attribute_payload<W: Write + ?Sized>(
     write_binary_string_id(writer, string_ids, "name")?;
     writer.write_all(&[6])?;
     write_binary_string_id(writer, string_ids, name)
-}
-
-fn empty_settings_binary_lookup() -> SettingsBinaryInstanceLookup {
-    SettingsBinaryInstanceLookup {
-        dense_instance_count: 0,
-        by_instance_index: HashMap::new(),
-        by_settings_id: HashMap::new(),
-        by_instance_id: HashMap::new(),
-        by_debug_id: HashMap::new(),
-        by_path: HashMap::new(),
-        by_path_segments: HashMap::new(),
-        by_path_parts: HashMap::new(),
-    }
 }
 
 fn write_lookup_id<W: Write + ?Sized>(
@@ -3298,11 +3296,7 @@ pub(crate) fn visit_reference_objects_mut(
                 }
             }
             Value::Object(object) => {
-                let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
-                    || object.contains_key("settingsId")
-                    || object.contains_key("instanceId")
-                    || object.contains_key("instanceIndex");
-                if is_reference {
+                if is_reference_object(object) {
                     visitor(object);
                 }
                 for value in object.values_mut() {
@@ -3316,6 +3310,32 @@ pub(crate) fn visit_reference_objects_mut(
     for value in record.values_mut() {
         visit(value, &mut visitor);
     }
+}
+
+pub(crate) fn stabilize_reference_objects(
+    record: &mut Map<String, Value>,
+    mut resolve: impl FnMut(&mut Map<String, Value>, usize),
+) {
+    visit_reference_objects_mut(record, |object| {
+        if object.get("settingsId").and_then(Value::as_str).is_none()
+            && object.get("instanceId").and_then(Value::as_str).is_none()
+            && let Some(index) = object
+                .get("instanceIndex")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| index.checked_sub(1))
+        {
+            resolve(object, index);
+        }
+        object.remove("instanceIndex");
+    });
+}
+
+pub(crate) fn is_reference_object(object: &Map<String, Value>) -> bool {
+    object.get("_type").and_then(Value::as_str) == Some("Ref")
+        || object.contains_key("settingsId")
+        || object.contains_key("instanceId")
+        || object.contains_key("instanceIndex")
 }
 
 pub(crate) fn write_var_u64<W: Write + ?Sized>(writer: &mut W, mut value: u64) -> Result<()> {
@@ -3369,14 +3389,12 @@ mod tests {
         let document = SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
             instances: vec![
-                SettingsBytecodeInstance {
-                    settings_id: "root".to_string(),
-                    name: "Workspace".to_string(),
-                    class_name: "Workspace".to_string(),
-                    parent_index: None,
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "Workspace".to_string(),
+                    "Workspace".to_string(),
+                    None,
+                ),
                 SettingsBytecodeInstance {
                     settings_id: "child".to_string(),
                     name: "Target".to_string(),
@@ -3565,14 +3583,12 @@ mod tests {
         settings_id: impl Into<String>,
         parent_index: Option<usize>,
     ) -> SettingsBytecodeInstance {
-        SettingsBytecodeInstance {
-            settings_id: settings_id.into(),
-            name: String::new(),
-            class_name: "Folder".to_string(),
+        SettingsBytecodeInstance::new(
+            settings_id.into(),
+            String::new(),
+            "Folder".to_string(),
             parent_index,
-            properties: Map::new(),
-            attributes: Map::new(),
-        }
+        )
     }
 
     #[test]
@@ -3585,7 +3601,7 @@ mod tests {
             ],
         };
         let payload = encode_settings_bytecode_payload(&document).unwrap();
-        let bytes = wrap_settings_bytecode_payload(payload).unwrap();
+        let bytes = wrap_settings_bytecode_payload(&payload).unwrap();
 
         let error = decode_settings_bytecode(&bytes).unwrap_err().to_string();
         assert!(error.contains("parent cycle"));

@@ -74,7 +74,6 @@ end
 
 local function addStroke(instance, transparency)
 	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 1
 	stroke.Transparency = transparency or 0.4
 	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Parent = instance
@@ -93,7 +92,6 @@ end
 
 local function addVerticalList(parent, gap)
 	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Padding = UDim.new(0, gap)
 	layout.Parent = parent
@@ -185,9 +183,23 @@ local function makeCard(parent, name, refs)
 	return card
 end
 
+local function makeScrollingFrame(parent, name)
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Name = name
+	scroll.Size = UDim2.fromScale(1, 1)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.CanvasSize = UDim2.new()
+	scroll.ScrollBarThickness = 6
+	scroll.ScrollBarImageTransparency = 0.4
+	scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+	scroll.VerticalScrollBarInset = Enum.ScrollBarInset.Always
+	scroll.Parent = parent
+	return scroll
+end
+
 local function styleButton(button, refs, primary)
 	button.BorderSizePixel = 0
-	button.AutoButtonColor = true
 	button.FontFace = FONT_MEDIUM
 	button.TextSize = TEXT_SM
 	addCorner(button)
@@ -197,13 +209,6 @@ local function styleButton(button, refs, primary)
 	else
 		table.insert(refs.secondaryButtons, button)
 	end
-end
-
-local function setButtonEnabled(button, enabled)
-	button.Active = enabled
-	button.AutoButtonColor = enabled
-	button.TextTransparency = enabled and 0 or 0.4
-	button.BackgroundTransparency = enabled and 0 or 0.25
 end
 
 local function createWidget(plugin, id, dockInfo, title)
@@ -353,15 +358,15 @@ local function makeRow(content, name, description, order, refs, isFirst, control
 	left.Parent = inner
 	addVerticalList(left, 4)
 
-	local nameLabel = makeText(left, "Name", name, { font = FONT_REGULAR, size = TEXT_SM, autoHeight = true, wrap = true })
+	local nameLabel =
+		makeText(left, "Name", name, { font = FONT_REGULAR, size = TEXT_SM, autoHeight = true, wrap = true })
 	nameLabel.LayoutOrder = 1
-	local descLabel =
-		makeText(
-			left,
-			"Description",
-			description,
-			{ size = DESCRIPTION_TEXT, autoHeight = true, wrap = true, lineHeight = 1.08 }
-		)
+	local descLabel = makeText(
+		left,
+		"Description",
+		description,
+		{ size = DESCRIPTION_TEXT, autoHeight = true, wrap = true, lineHeight = 1.08 }
+	)
 	descLabel.LayoutOrder = 2
 	table.insert(refs.text, nameLabel)
 	table.insert(refs.dimmed, descLabel)
@@ -669,11 +674,8 @@ local function makeDropdown(controlHost, options, refs, ctx, placeholderText)
 		paint()
 	end
 
-	local function setChevronOpen(open)
-		TweenService:Create(chevron, TWEEN_FAST, { Rotation = open and 180 or 0 }):Play()
-	end
 	menu:GetPropertyChangedSignal("Visible"):Connect(function()
-		setChevronOpen(menu.Visible)
+		TweenService:Create(chevron, TWEEN_FAST, { Rotation = menu.Visible and 180 or 0 }):Play()
 	end)
 
 	button.MouseEnter:Connect(function()
@@ -723,17 +725,7 @@ local function buildSettingsWidget(plugin)
 	root.Parent = widget
 	table.insert(refs.roots, root)
 
-	local scroll = Instance.new("ScrollingFrame")
-	scroll.Name = "Content"
-	scroll.Size = UDim2.fromScale(1, 1)
-	scroll.BackgroundTransparency = 1
-	scroll.BorderSizePixel = 0
-	scroll.CanvasSize = UDim2.new()
-	scroll.ScrollBarThickness = 6
-	scroll.ScrollBarImageTransparency = 0.4
-	scroll.ScrollingDirection = Enum.ScrollingDirection.Y
-	scroll.VerticalScrollBarInset = Enum.ScrollBarInset.Always
-	scroll.Parent = root
+	local scroll = makeScrollingFrame(root, "Content")
 	addPadding(scroll, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING)
 	local scrollLayout = addVerticalList(scroll, WIDGET_PADDING)
 	scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
@@ -757,8 +749,8 @@ local function buildSettingsWidget(plugin)
 		table.insert(controlPainters, paint)
 	end
 
-	local function addToggleRow(section, name, description, order, isFirst, setting)
-		local controlHost = makeRow(section, name, description, order, refs, isFirst, TOGGLE_WIDTH)
+	local function addToggleRow(section, name, description, order, setting)
+		local controlHost = makeRow(section, name, description, order, refs, false, TOGGLE_WIDTH)
 		local toggle = makeToggle(controlHost, refs)
 		settingToggles[setting] = toggle
 		optionSetters[setting] = toggle.set
@@ -766,25 +758,82 @@ local function buildSettingsWidget(plugin)
 	end
 
 	local connection = makeSection(scroll, "Connection", 1, refs, dropdownCtx.closeAll)
-	local hostHost = makeRow(connection, "Server host", "Loopback address of the Renium sync server.", 1, refs, true, 160)
+	local hostHost =
+		makeRow(connection, "Server host", "Loopback address of the Renium sync server.", 1, refs, true, 160)
 	local hostBox = makeInput(hostHost, "127.0.0.1", refs)
 	local portsHost = makeRow(connection, "Server ports", "WebSocket channel ports.", 2, refs, false, 160)
 	local portsBox = makeInput(portsHost, "8781,8782", refs)
-	addToggleRow(connection, "Auto connect", "Connect to the local Renium server when this place opens.", 3, false, "autoConnect")
-	addToggleRow(connection, "Auto reconnect", "Retry after an unexpected bridge disconnect. Manual Disconnect always stays disconnected.", 4, false, "autoReconnect")
+	addToggleRow(
+		connection,
+		"Auto connect",
+		"Connect to the local Renium server when this place opens.",
+		3,
+		"autoConnect"
+	)
+	addToggleRow(
+		connection,
+		"Auto reconnect",
+		"Retry after an unexpected bridge disconnect. Manual Disconnect always stays disconnected.",
+		4,
+		"autoReconnect"
+	)
 
 	local sync = makeSection(scroll, "Sync", 2, refs, dropdownCtx.closeAll)
-	addDropdownRow(sync, "Initial sync priority", "Which side wins when live sync starts.", 1, true, "initialSyncPriority", {
-		{ value = "studio", label = "Studio" },
-		{ value = "editor", label = "Editor" },
-		{ value = "none", label = "None" },
-	})
-	addToggleRow(sync, "Two-way sync", "Import Studio changes back into the editor while live sync is active.", 2, false, "twoWaySync")
-	addToggleRow(sync, "Syncback properties", "Include non-script property and attribute edits from Studio.", 3, false, "syncbackProperties")
-	addToggleRow(sync, "Only code mode", "Track scripts and containers that contain scripts, skipping unrelated property-only changes.", 4, false, "onlyCodeMode")
-	addToggleRow(sync, "Live hydrate", "Create a missing Studio instance when an editor push targets it.", 5, false, "liveHydrate")
-	addToggleRow(sync, "Keep unknowns", "Do not delete Studio instances that are absent from the editor tree during a full reconcile.", 6, false, "keepUnknowns")
-	addToggleRow(sync, "Override packages", "Allow editor pushes to change read-only linked package mirrors.", 7, false, "overridePackages")
+	addDropdownRow(
+		sync,
+		"Initial sync priority",
+		"Which side wins when live sync starts.",
+		1,
+		true,
+		"initialSyncPriority",
+		{
+			{ value = "studio", label = "Studio" },
+			{ value = "editor", label = "Editor" },
+			{ value = "none", label = "None" },
+		}
+	)
+	addToggleRow(
+		sync,
+		"Two-way sync",
+		"Import Studio changes back into the editor while live sync is active.",
+		2,
+		"twoWaySync"
+	)
+	addToggleRow(
+		sync,
+		"Syncback properties",
+		"Include non-script property and attribute edits from Studio.",
+		3,
+		"syncbackProperties"
+	)
+	addToggleRow(
+		sync,
+		"Only code mode",
+		"Track scripts and containers that contain scripts, skipping unrelated property-only changes.",
+		4,
+		"onlyCodeMode"
+	)
+	addToggleRow(
+		sync,
+		"Live hydrate",
+		"Create a missing Studio instance when an editor push targets it.",
+		5,
+		"liveHydrate"
+	)
+	addToggleRow(
+		sync,
+		"Keep unknowns",
+		"Do not delete Studio instances that are absent from the editor tree during a full reconcile.",
+		6,
+		"keepUnknowns"
+	)
+	addToggleRow(
+		sync,
+		"Override packages",
+		"Allow editor pushes to change read-only linked package mirrors.",
+		7,
+		"overridePackages"
+	)
 
 	local conflicts = makeSection(scroll, "Conflicts", 3, refs, dropdownCtx.closeAll)
 	local conflictHost = makeRow(
@@ -803,20 +852,50 @@ local function buildSettingsWidget(plugin)
 	}, refs, dropdownCtx, "Editor setting")
 	table.insert(controlPainters, paintConflictDropdown)
 	setConflictActive(nil)
-	addDropdownRow(conflicts, "Display prompts", "When Renium should interrupt you for a manual live-sync conflict.", 2, false, "displayPrompts", {
-		{ value = "always", label = "Always" },
-		{ value = "initial", label = "Initial" },
-		{ value = "never", label = "Never" },
-	})
-	local diffHost = makeRow(conflicts, "Diff lines limit", "Maximum lines rendered per side in a conflict preview. Full backups are always preserved.", 3, refs, false, 96)
+	addDropdownRow(
+		conflicts,
+		"Display prompts",
+		"When Renium should interrupt you for a manual live-sync conflict.",
+		2,
+		false,
+		"displayPrompts",
+		{
+			{ value = "always", label = "Always" },
+			{ value = "initial", label = "Initial" },
+			{ value = "never", label = "Never" },
+		}
+	)
+	local diffHost = makeRow(
+		conflicts,
+		"Diff lines limit",
+		"Maximum lines rendered per side in a conflict preview. Full backups are always preserved.",
+		3,
+		refs,
+		false,
+		96
+	)
 	local diffLinesLimitBox = makeInput(diffHost, "3000", refs)
 	settingInputs.diffLinesLimit = diffLinesLimitBox
 
 	local advanced = makeSection(scroll, "Advanced", 4, refs, dropdownCtx.closeAll)
-	local changesHost = makeRow(advanced, "Changes threshold", "Maximum Studio changes to take through the granular fast path before Renium uses a protected full import.", 1, refs, true, 96)
+	local changesHost = makeRow(
+		advanced,
+		"Changes threshold",
+		"Maximum Studio changes to take through the granular fast path before Renium uses a protected full import.",
+		1,
+		refs,
+		true,
+		96
+	)
 	local changesThresholdBox = makeInput(changesHost, "5", refs)
 	settingInputs.changesThreshold = changesThresholdBox
-	addToggleRow(advanced, "Notifications", "Show notices for waiting changes, reviews, and component problems.", 2, false, "notifications")
+	addToggleRow(
+		advanced,
+		"Notifications",
+		"Show notices for waiting changes, reviews, and component problems.",
+		2,
+		"notifications"
+	)
 	addDropdownRow(advanced, "Log level", "Amount of bridge diagnostic output shown in Studio.", 3, false, "logLevel", {
 		{ value = "off", label = "Off" },
 		{ value = "error", label = "Error" },
@@ -875,17 +954,7 @@ local function buildStatusWidget(plugin, versionText)
 	root.Parent = widget
 	table.insert(refs.roots, root)
 
-	local content = Instance.new("ScrollingFrame")
-	content.Name = "Content"
-	content.Size = UDim2.fromScale(1, 1)
-	content.BackgroundTransparency = 1
-	content.BorderSizePixel = 0
-	content.CanvasSize = UDim2.new()
-	content.ScrollBarThickness = 6
-	content.ScrollBarImageTransparency = 0.4
-	content.ScrollingDirection = Enum.ScrollingDirection.Y
-	content.VerticalScrollBarInset = Enum.ScrollBarInset.Always
-	content.Parent = root
+	local content = makeScrollingFrame(root, "Content")
 	addPadding(content, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING)
 	local contentLayout = addVerticalList(content, LIST_SPACING)
 	contentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
@@ -1349,17 +1418,7 @@ local function buildReviewWidget(plugin)
 	subtitle:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutListCard)
 	layoutListCard()
 
-	local scroll = Instance.new("ScrollingFrame")
-	scroll.Name = "Rows"
-	scroll.Size = UDim2.fromScale(1, 1)
-	scroll.BackgroundTransparency = 1
-	scroll.BorderSizePixel = 0
-	scroll.CanvasSize = UDim2.new()
-	scroll.ScrollBarThickness = 6
-	scroll.ScrollBarImageTransparency = 0.4
-	scroll.ScrollingDirection = Enum.ScrollingDirection.Y
-	scroll.VerticalScrollBarInset = Enum.ScrollBarInset.Always
-	scroll.Parent = listCard
+	local scroll = makeScrollingFrame(listCard, "Rows")
 	addPadding(scroll, 6, 6, 6, 6)
 
 	local footer = Instance.new("Frame")
@@ -1410,7 +1469,6 @@ local function buildReviewWidget(plugin)
 	applyButton.Size = UDim2.fromOffset(124, CONTROL_HEIGHT)
 	applyButton.Text = "Apply"
 	applyButton.BorderSizePixel = 0
-	applyButton.AutoButtonColor = true
 	applyButton.FontFace = FONT_MEDIUM
 	applyButton.TextSize = TEXT_SM
 	applyButton.BackgroundColor3 = APPLY_GREEN
@@ -1526,12 +1584,48 @@ function BridgeUi.create(plugin, bridgeInfo)
 	local toolbar = plugin:CreateToolbar("Renium")
 	local openButton = toolbar:CreateButton("Renium", "Open or close Renium" .. tooltipVersion, TOOLBAR_ICON)
 	local actions = {
-		connect = plugin:CreatePluginAction("ReniumConnect", "Connect Renium", "Connect Renium to the local sync server", TOOLBAR_ICON, true),
-		disconnect = plugin:CreatePluginAction("ReniumDisconnect", "Disconnect Renium", "Disconnect Renium from the local sync server", TOOLBAR_ICON, true),
-		status = plugin:CreatePluginAction("ReniumStatus", "Show Renium Status", "Open the Renium status panel", TOOLBAR_ICON, true),
-		review = plugin:CreatePluginAction("ReniumReview", "Open Renium Review", "Open the pending Renium change review", TOOLBAR_ICON, true),
-		reveal = plugin:CreatePluginAction("ReniumRevealScript", "Reveal Script in Editor", "Reveal the selected Studio script in the connected editor", TOOLBAR_ICON, true),
-		lock = plugin:CreatePluginAction("ReniumSessionLock", "Inspect Renium Session", "Inspect or take over the active Renium session", TOOLBAR_ICON, true),
+		connect = plugin:CreatePluginAction(
+			"ReniumConnect",
+			"Connect Renium",
+			"Connect Renium to the local sync server",
+			TOOLBAR_ICON,
+			true
+		),
+		disconnect = plugin:CreatePluginAction(
+			"ReniumDisconnect",
+			"Disconnect Renium",
+			"Disconnect Renium from the local sync server",
+			TOOLBAR_ICON,
+			true
+		),
+		status = plugin:CreatePluginAction(
+			"ReniumStatus",
+			"Show Renium Status",
+			"Open the Renium status panel",
+			TOOLBAR_ICON,
+			true
+		),
+		review = plugin:CreatePluginAction(
+			"ReniumReview",
+			"Open Renium Review",
+			"Open the pending Renium change review",
+			TOOLBAR_ICON,
+			true
+		),
+		reveal = plugin:CreatePluginAction(
+			"ReniumRevealScript",
+			"Reveal Script in Editor",
+			"Reveal the selected Studio script in the connected editor",
+			TOOLBAR_ICON,
+			true
+		),
+		lock = plugin:CreatePluginAction(
+			"ReniumSessionLock",
+			"Inspect Renium Session",
+			"Inspect or take over the active Renium session",
+			TOOLBAR_ICON,
+			true
+		),
 	}
 
 	local settingsUi = buildSettingsWidget(plugin)
@@ -1730,7 +1824,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 	end
 
 	function ui.setPlayModeHidden(hidden)
-		ui._playModeHidden = hidden == true
+		ui._playModeHidden = hidden
 		if ui._playModeHidden then
 			ui.hideWidget()
 		end
@@ -1957,17 +2051,10 @@ function BridgeUi.create(plugin, bridgeInfo)
 		pcall(panel.widget.RequestRaise, panel.widget)
 		startReviewCountdown("skip", "Skips")
 		if runtimeSettings.notifications then
-			ui.notify(
-				"pending-review",
-				"Changes are waiting for review",
-				subtitleText,
-				"Review",
-				function()
-					panel.widget.Enabled = true
-					panel.widget:RequestRaise()
-				end,
-				true
-			)
+			ui.notify("pending-review", "Changes are waiting for review", subtitleText, "Review", function()
+				panel.widget.Enabled = true
+				panel.widget:RequestRaise()
+			end, true)
 		end
 		return { required = true, reviewId = reviewId, effectiveCount = tree.effectiveCount }
 	end
@@ -2067,10 +2154,8 @@ function BridgeUi.create(plugin, bridgeInfo)
 		local mode = tostring(view.mode or "disconnected")
 		local color = if mode == "connected"
 			then OK_GREEN
-			elseif mode == "connecting"
-			then WARN_AMBER
-			elseif string.find(tostring(view.connectionStatus or ""), "interrupted", 1, true)
-			then ERROR_RED
+			elseif mode == "connecting" then WARN_AMBER
+			elseif string.find(tostring(view.connectionStatus or ""), "interrupted", 1, true) then ERROR_RED
 			else IDLE_GREY
 
 		statusUi.dot.BackgroundColor3 = color
@@ -2084,17 +2169,14 @@ function BridgeUi.create(plugin, bridgeInfo)
 			statusUi.connectButton.Visible = false
 			statusUi.disconnectButton.Visible = true
 			statusUi.disconnectButton.Text = "Disconnect"
-			setButtonEnabled(statusUi.disconnectButton, true)
 		elseif mode == "connecting" then
 			statusUi.connectButton.Visible = false
 			statusUi.disconnectButton.Visible = true
 			statusUi.disconnectButton.Text = "Cancel"
-			setButtonEnabled(statusUi.disconnectButton, true)
 		else
 			statusUi.connectButton.Visible = true
 			statusUi.connectButton.Text = "Connect"
 			statusUi.disconnectButton.Visible = false
-			setButtonEnabled(statusUi.connectButton, true)
 		end
 	end
 
