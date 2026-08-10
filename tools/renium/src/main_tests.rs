@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Cursor};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 
 use crate::native_snapshot::{
-    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
+    NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, now_millis,
+    temporary_output_path,
 };
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));

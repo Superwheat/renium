@@ -66,12 +66,12 @@ use super::rbx_encode::{rbx_model_property_descriptor, rbx_model_top_level_refs}
 #[cfg(any(windows, test))]
 use super::rbx_model::BytecodeModelExportRefs;
 use super::rbx_model::BytecodeModelImportRefs;
+#[cfg(any(windows, target_os = "macos"))]
+use super::rbx_model::RbxPlaceFormat;
 #[cfg(any(windows, target_os = "macos", test))]
 use super::rbx_model::rbx_dom_path_import_refs;
 #[cfg(windows)]
-use super::rbx_model::{
-    RbxPlaceBuild, RbxPlaceFormat, build_rbx_place, rbx_dom_instance_path_parts,
-};
+use super::rbx_model::{RbxPlaceBuild, build_rbx_place, rbx_dom_instance_path_parts};
 use super::snapshot_export::{log_chunk_fetch_metrics, merge_chunk_fetch_metrics};
 use super::snapshot_types::{
     ExportedSnapshotParts, NativeConditionalOverlayFetch, NativeConditionalOverlayRequest,
