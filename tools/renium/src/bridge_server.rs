@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_with_config};
 
-use crate::local_transport::{local_tcp_ports_owned_by_pid, normalize_loopback_host};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::local_transport::local_tcp_ports_owned_by_pid;
+use crate::local_transport::normalize_loopback_host;
 use crate::place_target::{place_filter, place_matches};
 use crate::snapshot_export::{parse_bridge_chunk, validate_bridge_chunk, validate_bridge_info};
 use crate::studio_automation::TestLaunch;

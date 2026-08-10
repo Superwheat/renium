@@ -17,9 +17,9 @@ use crate::bytecode_explorer::{
     bytecode_explorer_service, bytecode_find_instances, explorer_daemon,
 };
 use crate::command_line::Commands;
-use crate::daemon_control::{
-    bridge_daemon, bridge_get_source, cursor_poll, native_snapshot_command,
-};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::daemon_control::native_snapshot_command;
+use crate::daemon_control::{bridge_daemon, bridge_get_source, cursor_poll};
 use crate::editor_history::editor_revert;
 use crate::editor_sync::{apply_editor_delete, apply_editor_property, push_editor_changes};
 use crate::lifecycle;

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(any(windows, target_os = "macos"))]
 use std::fs::{self, File};
+#[cfg(any(windows, target_os = "macos"))]
 use std::io::BufReader;
 use std::time::Instant;
 
@@ -15,6 +17,7 @@ use super::bytecode_edit::instance_path_parts_key;
 use super::bytecode_explorer::explorer_daemon_services;
 use super::command_line::PushEditorChangesArgs;
 use super::editor_diff::{NativeEditorPropertyRules, append_native_editor_full_property_changes};
+#[cfg(any(windows, target_os = "macos"))]
 use super::editor_review::{studio_pid_for_bridge, studio_title_for_bridge};
 use super::editor_types::{
     EditorBinaryImport, EditorBinaryPackageRoot, EditorBinaryRetainedRoot, EditorBinaryRootPath,
@@ -37,8 +40,11 @@ use super::rbx_model::{
 };
 use super::services::explorer_service_order;
 use super::settings_bytecode::SettingsBytecode;
+#[cfg(any(windows, target_os = "macos"))]
 use super::studio_native_serializer;
-use super::timing::{current_millis, log_timing, verbose_timing_logs};
+#[cfg(any(windows, target_os = "macos"))]
+use super::timing::current_millis;
+use super::timing::{log_timing, verbose_timing_logs};
 
 struct PendingEditorBinaryGroup {
     service: String,

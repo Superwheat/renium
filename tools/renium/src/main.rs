@@ -80,6 +80,7 @@ mod lifecycle;
 mod local_transport;
 mod native_editor;
 mod native_import;
+#[cfg(any(windows, target_os = "macos"))]
 mod native_snapshot;
 mod output;
 pub(crate) use output::{emit_global_output, log_global, set_global_stream_output};

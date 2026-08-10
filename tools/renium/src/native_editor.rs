@@ -1,6 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(any(windows, target_os = "macos"))]
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(any(windows, target_os = "macos"))]
+use std::io::BufReader;
+#[cfg(windows)]
+use std::io::BufWriter;
+use std::io::{self, Write};
+#[cfg(any(windows, target_os = "macos"))]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -9,44 +15,62 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
+#[cfg(any(windows, target_os = "macos", test))]
 use rbx_dom_weak::WeakDom as RbxWeakDom;
 use rbx_dom_weak::types::{ContentType as RbxContentType, Ref as RbxRef, Variant as RbxVariant};
+#[cfg(any(windows, target_os = "macos", test))]
 use rbx_reflection::ReflectionDatabase;
 use serde_json::{Map, Value, json};
 
 use super::bridge_server::{BridgeChunk, BridgeServer, ChunkFetchMetrics, MAX_BRIDGE_CHUNK_BYTES};
-use super::bytecode_edit::{insert_unique_rbx_path, instance_path_key, instance_path_parts_key};
+use super::bytecode_edit::instance_path_parts_key;
+#[cfg(windows)]
+use super::bytecode_edit::{insert_unique_rbx_path, instance_path_key};
+#[cfg(windows)]
 use super::command_line::PushEditorChangesArgs;
-use super::editor_review::{
-    is_externally_managed_editor_property, request_editor_push_review, studio_pid_for_bridge,
-    studio_title_for_bridge,
-};
+#[cfg(any(windows, target_os = "macos", test))]
+use super::editor_review::is_externally_managed_editor_property;
+use super::editor_review::request_editor_push_review;
+#[cfg(any(windows, target_os = "macos"))]
+use super::editor_review::{studio_pid_for_bridge, studio_title_for_bridge};
 use super::editor_sync::is_lua_source_class;
 use super::editor_types::{
     EditorBinaryImport, EditorBinarySerializationBatch, EditorBinaryServiceGroup, EditorChangeSet,
 };
-use super::file_io::{
-    absolutize_under, current_unix_ts, fnv1a_hex, resolve_project_root_if_present, sanitize_name,
-    service_settings_path,
-};
+#[cfg(any(windows, target_os = "macos"))]
+use super::file_io::sanitize_name;
+#[cfg(windows)]
+use super::file_io::{absolutize_under, resolve_project_root_if_present, service_settings_path};
+use super::file_io::{current_unix_ts, fnv1a_hex};
 use super::property_schema::{
-    EnumValueNameMap, MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY,
-    parse_enum_value_name_map, parse_property_schema_map,
+    EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
+#[cfg(any(windows, target_os = "macos"))]
+use super::property_schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
+#[cfg(any(windows, target_os = "macos", test))]
+use super::rbx_decode::rbx_variant_to_settings_json;
 use super::rbx_decode::{
     NativeOverlayRequest, conditional_ref_overlay_request, fetch_native_overlay_batches,
     merge_native_overlay_items, native_overlay_property_schemas, native_property_filter,
     overlay_property_names_value, rbx_properties_to_native_settings_records,
-    rbx_variant_to_settings_json,
 };
-use super::rbx_encode::{
-    collect_rbx_subtree_preorder, json_i64, json_to_rbx_property_variant,
-    rbx_canonical_property_descriptor_for_serialized_name, rbx_model_property_descriptor,
-    rbx_model_top_level_refs,
-};
+#[cfg(windows)]
+use super::rbx_encode::collect_rbx_subtree_preorder;
+use super::rbx_encode::json_i64;
+#[cfg(any(windows, test))]
+use super::rbx_encode::json_to_rbx_property_variant;
+#[cfg(any(windows, target_os = "macos", test))]
+use super::rbx_encode::rbx_canonical_property_descriptor_for_serialized_name;
+#[cfg(any(windows, target_os = "macos", test))]
+use super::rbx_encode::{rbx_model_property_descriptor, rbx_model_top_level_refs};
+#[cfg(any(windows, test))]
+use super::rbx_model::BytecodeModelExportRefs;
+use super::rbx_model::BytecodeModelImportRefs;
+#[cfg(any(windows, target_os = "macos", test))]
+use super::rbx_model::rbx_dom_path_import_refs;
+#[cfg(windows)]
 use super::rbx_model::{
-    BytecodeModelExportRefs, BytecodeModelImportRefs, RbxPlaceBuild, RbxPlaceFormat,
-    build_rbx_place, rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
+    RbxPlaceBuild, RbxPlaceFormat, build_rbx_place, rbx_dom_instance_path_parts,
 };
 use super::snapshot_export::{log_chunk_fetch_metrics, merge_chunk_fetch_metrics};
 use super::snapshot_types::{
