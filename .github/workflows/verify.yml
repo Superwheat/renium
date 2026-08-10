@@ -109,6 +109,7 @@ jobs:
           npm.cmd ci --prefix tools/renium-vscode-extension
           npm.cmd --prefix tools/renium-vscode-extension run verify
           $vsix = Join-Path $env:RUNNER_TEMP "renium-ci.vsix"
+          $env:RENIUM_PLUGIN_BUNDLE = Join-Path $env:RUNNER_TEMP "Renium.rbxm"
           Push-Location tools/renium-vscode-extension
           try {
             npx.cmd --no-install vsce package --out $vsix
