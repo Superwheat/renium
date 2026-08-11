@@ -1378,7 +1378,8 @@ impl BridgeServer {
             if self.channel_count_for_selector(BridgeTarget::Client, Some(player)) >= 1 {
                 return true;
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
             thread::sleep(Duration::from_millis(20));
@@ -1722,12 +1723,13 @@ impl BridgeServer {
         id: u64,
         method: &str,
         params: &Value,
-        _response_timeout: Option<Duration>,
+        response_timeout: Option<Duration>,
     ) -> Result<BridgeChunk> {
-        Self::configure_request_timeout(bridge_socket, bridge_response_timeout(method));
+        let response_timeout = response_timeout.unwrap_or_else(|| bridge_response_timeout(method));
+        Self::configure_request_timeout(bridge_socket, response_timeout);
         Self::send_request(bridge_socket, id, method, params)?;
 
-        match Self::read_response(bridge_socket, id, method, bridge_response_timeout(method))? {
+        match Self::read_response(bridge_socket, id, method, response_timeout)? {
             BridgeResponse::Chunk(chunk) => Ok(chunk),
             BridgeResponse::Json(result) => parse_bridge_chunk(result),
         }
@@ -1792,13 +1794,18 @@ impl BridgeServer {
         let deadline = Instant::now() + timeout;
         let mut unrelated_messages = 0usize;
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 bail!(
                     "Bridge response timed out awaiting {method} on port {} after {:.1}s",
                     bridge_socket.port,
                     timeout.as_secs_f64()
                 );
             }
+            let _ = bridge_socket
+                .socket
+                .get_mut()
+                .set_read_timeout(Some(remaining));
             let message = bridge_socket.socket.read().with_context(|| {
                 format!(
                     "Bridge read failed for method {method} on port {}",

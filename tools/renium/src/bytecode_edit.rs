@@ -200,8 +200,8 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         .collect::<HashSet<_>>();
     let mut next_settings_id_seed = document.instances.len();
     let mut old_to_new_index = HashMap::<usize, usize>::with_capacity(source_subtree.len());
-    let mut old_to_new_settings_id = HashMap::<usize, String>::with_capacity(source_subtree.len());
     let mut cloned_settings_ids = Vec::with_capacity(source_subtree.len());
+    let mut root_settings_id = String::new();
 
     for old_index in source_subtree.iter().copied() {
         let old_instance = document.instances[old_index].clone();
@@ -237,7 +237,9 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
             attributes: old_instance.attributes,
         });
         old_to_new_index.insert(old_index, new_index);
-        old_to_new_settings_id.insert(old_index, settings_id.clone());
+        if old_index == source_index {
+            root_settings_id.clone_from(&settings_id);
+        }
         cloned_settings_ids.push(settings_id);
     }
 
@@ -302,10 +304,6 @@ pub(super) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
 
-    let root_settings_id = old_to_new_settings_id
-        .get(&source_index)
-        .cloned()
-        .unwrap_or_default();
     print_json_output(
         &json!({
             "ok": true,

@@ -17,7 +17,8 @@ use walkdir::WalkDir;
 
 use crate::command_line::{ProjectSourceArgs, SyncWallyPackagesArgs};
 use crate::file_io::{
-    absolutize_for_daemon as absolute_path, atomic_write_file, exact_path_key as path_text,
+    absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
+    exact_path_key as path_text,
 };
 use crate::project_config::{self, LoadedProject, PROJECT_FILE_NAME};
 
@@ -205,26 +206,31 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         );
     }
     let root_existed = root.exists();
-    let git_was_absent = !root.join(".git").exists();
-    let node_modules_was_absent = !root.join("node_modules").exists();
-    let package_locks = [
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "bun.lock",
-        "bun.lockb",
-    ]
-    .into_iter()
-    .map(|name| {
-        let path = root.join(name);
-        let original = if path.is_file() {
-            Some(fs::read(&path)?)
-        } else {
-            None
-        };
-        Ok((path, original))
-    })
-    .collect::<Result<Vec<_>>>()?;
+    let git_was_absent = args.with.contains(&InitFeature::Git) && !root.join(".git").exists();
+    let node_modules_was_absent =
+        args.with.contains(&InitFeature::RobloxTs) && !root.join("node_modules").exists();
+    let package_locks = if args.with.contains(&InitFeature::RobloxTs) {
+        [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+        ]
+        .into_iter()
+        .map(|name| {
+            let path = root.join(name);
+            let original = if path.is_file() {
+                Some(fs::read(&path)?)
+            } else {
+                None
+            };
+            Ok((path, original))
+        })
+        .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let mut created_files = Vec::new();
     let mut created_directories = Vec::new();
     let result = (|| -> Result<()> {
@@ -798,8 +804,8 @@ pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()>
         temporary.clone()
     };
     let content_type = match input.extension().and_then(OsStr::to_str) {
-        Some("rbxl") => "application/octet-stream",
-        Some("rbxlx") => "application/xml",
+        Some(extension) if extension.eq_ignore_ascii_case("rbxl") => "application/octet-stream",
+        Some(extension) if extension.eq_ignore_ascii_case("rbxlx") => "application/xml",
         _ => bail!("Place upload input must end in .rbxl or .rbxlx"),
     };
     let url = format!(
@@ -856,18 +862,19 @@ fn detect_init_source_root(root: &Path) -> Result<PathBuf> {
                 .source_root);
         }
     }
-    let mut rojo_projects = if root.is_dir() {
-        fs::read_dir(root)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.ends_with(".project.json"))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut rojo_projects = Vec::new();
+    if root.is_dir() {
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| ends_with_ignore_ascii_case(name, ".project.json"))
+            {
+                rojo_projects.push(path);
+            }
+        }
+    }
     rojo_projects.sort();
     for project in rojo_projects {
         let value: Value = serde_json::from_slice(&fs::read(&project)?)
@@ -1096,16 +1103,24 @@ fn build_project_file(
     let mut services = if let Some(segments) = target_segments.as_ref() {
         vec![segments[0].clone()]
     } else {
-        fs::read_dir(src_root)?
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .filter(|name| !name.starts_with('.'))
-            .collect::<Vec<_>>()
+        let mut services = Vec::new();
+        for entry in fs::read_dir(src_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
+                services.push(name.to_string());
+            }
+        }
+        services
     };
     services.sort();
     let build = crate::rbx_model::build_rbx_place(src_root, services, None, false, false, false)?;
-    if let Some(parent) = output.parent() {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     let file = fs::File::create(output)?;
@@ -1481,7 +1496,8 @@ fn resolve_studio_file(
     }
     let loaded = project_config::load_project(project, None)?;
     project_config::validate_project(&loaded)?;
-    let mut candidates = WalkDir::new(&loaded.root)
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(&loaded.root)
         .into_iter()
         .filter_entry(|entry| {
             !matches!(
@@ -1489,10 +1505,10 @@ fn resolve_studio_file(
                 Some(".git" | ".renium" | "node_modules" | "snapshots")
             )
         })
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|path| {
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() && {
+            let path = entry.path();
             matches!(
                 path.extension()
                     .and_then(OsStr::to_str)
@@ -1500,8 +1516,10 @@ fn resolve_studio_file(
                     .as_deref(),
                 Some("rbxl" | "rbxlx" | "rbxm" | "rbxmx")
             )
-        })
-        .collect::<Vec<_>>();
+        } {
+            candidates.push(entry.into_path());
+        }
+    }
     candidates.sort();
     if candidates.len() == 1 {
         return Ok(Some(candidates.remove(0)));
@@ -1544,9 +1562,11 @@ fn studio_executable() -> Result<PathBuf> {
     if cfg!(windows) {
         let local = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
         let versions = PathBuf::from(local).join("Roblox/Versions");
-        let mut candidates = fs::read_dir(&versions)
+        let entries = fs::read_dir(&versions)
             .with_context(|| format!("Failed to inspect {}", versions.display()))?
-            .filter_map(std::result::Result::ok)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut candidates = entries
+            .into_iter()
             .map(|entry| entry.path().join("RobloxStudioBeta.exe"))
             .filter(|path| path.is_file())
             .collect::<Vec<_>>();
@@ -1649,13 +1669,13 @@ fn run_checked(command: &mut Command, label: &str) -> Result<()> {
 
 fn find_command(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    let extensions = if cfg!(windows) {
-        vec![".exe", ".cmd", ".bat", ""]
+    let extensions: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ""]
     } else {
-        vec![""]
+        &[""]
     };
     for directory in env::split_paths(&path) {
-        for extension in &extensions {
+        for extension in extensions {
             let candidate = directory.join(format!("{name}{extension}"));
             if candidate.is_file() {
                 return Some(candidate);

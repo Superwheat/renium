@@ -338,28 +338,34 @@ pub(super) fn insert_top_field(
 
 fn requested_field(fields: Option<&HashSet<String>>, key: &str, aliases: &[&str]) -> bool {
     fields.is_some_and(|fields| {
-        fields.contains(&key.to_ascii_lowercase())
+        fields.iter().any(|field| field.eq_ignore_ascii_case(key))
             || aliases.iter().any(|alias| fields.contains(*alias))
     })
 }
 
 fn requested_property_field(fields: Option<&HashSet<String>>, key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
     fields.is_some_and(|fields| {
-        fields.contains(&key)
-            || fields.contains(&format!("p:{key}"))
-            || fields.contains(&format!("prop:{key}"))
-            || fields.contains(&format!("property:{key}"))
+        fields.iter().any(|field| {
+            field.eq_ignore_ascii_case(key)
+                || ["p:", "prop:", "property:"].iter().any(|prefix| {
+                    field
+                        .strip_prefix(prefix)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(key))
+                })
+        })
     })
 }
 
 fn requested_attribute_field(fields: Option<&HashSet<String>>, key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
     fields.is_some_and(|fields| {
-        fields.contains(&key)
-            || fields.contains(&format!("a:{key}"))
-            || fields.contains(&format!("attr:{key}"))
-            || fields.contains(&format!("attribute:{key}"))
+        fields.iter().any(|field| {
+            field.eq_ignore_ascii_case(key)
+                || ["a:", "attr:", "attribute:"].iter().any(|prefix| {
+                    field
+                        .strip_prefix(prefix)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(key))
+                })
+        })
     })
 }
 

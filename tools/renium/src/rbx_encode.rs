@@ -298,12 +298,13 @@ fn rbx_vector3_is_non_zero(value: &RbxVector3) -> bool {
 fn cumulative_ancestor_model_scale(document: &SettingsBytecode, index: usize) -> Option<f32> {
     let mut scale = 1.0_f32;
     let mut parent_index = document.instances.get(index)?.parent_index;
-    let mut visited = HashSet::new();
+    let mut remaining = document.instances.len();
 
     while let Some(parent) = parent_index {
-        if parent >= document.instances.len() || !visited.insert(parent) {
+        if parent >= document.instances.len() || remaining == 0 {
             break;
         }
+        remaining -= 1;
         let instance = &document.instances[parent];
         if matches!(instance.class_name.as_str(), "Model" | "WorldModel")
             && let Some(value) = instance
@@ -349,10 +350,16 @@ pub(super) fn model_property_name_is_skipped(name: &str) -> bool {
     if name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY) {
         return true;
     }
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "name" | "classname" | "parent" | "attributes" | "attributesserialize" | "clocktime"
-    )
+    [
+        "name",
+        "classname",
+        "parent",
+        "attributes",
+        "attributesserialize",
+        "clocktime",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 pub(super) fn rbx_model_property_descriptor<'db>(
@@ -601,11 +608,11 @@ fn json_to_rbx_security_capabilities(value: &Value) -> Option<RbxSecurityCapabil
     if object.get("_type").and_then(Value::as_str) != Some("SecurityCapabilities") {
         return None;
     }
-    let bits = object
-        .get("bits")?
+    let bits = object.get("bits")?;
+    let bits = bits
         .as_str()
         .and_then(|bits| bits.parse::<u64>().ok())
-        .or_else(|| object.get("bits")?.as_u64())?;
+        .or_else(|| bits.as_u64())?;
     Some(RbxSecurityCapabilities::from_bits(bits))
 }
 
@@ -967,10 +974,10 @@ fn json_to_rbx_cframe(value: &Value) -> Option<RbxCFrame> {
     if components.len() != 12 {
         return None;
     }
-    let numbers = components
-        .iter()
-        .map(json_f32)
-        .collect::<Option<Vec<_>>>()?;
+    let mut numbers = [0.0; 12];
+    for (number, value) in numbers.iter_mut().zip(components) {
+        *number = json_f32(value)?;
+    }
     Some(RbxCFrame::new(
         RbxVector3::new(numbers[0], numbers[1], numbers[2]),
         RbxMatrix3::new(

@@ -96,13 +96,12 @@ fn default_property_scope_name() -> String {
 
 fn property_affects_source_path(scope: PropertyScope, property: &str) -> bool {
     match scope {
-        PropertyScope::Auto => matches!(
-            property.to_ascii_lowercase().as_str(),
-            "name" | "parent" | "runcontext"
-        ),
-        PropertyScope::Metadata => {
-            matches!(property.to_ascii_lowercase().as_str(), "name" | "parent")
-        }
+        PropertyScope::Auto => ["name", "parent", "runcontext"]
+            .iter()
+            .any(|candidate| property.eq_ignore_ascii_case(candidate)),
+        PropertyScope::Metadata => ["name", "parent"]
+            .iter()
+            .any(|candidate| property.eq_ignore_ascii_case(candidate)),
         PropertyScope::Property => property.eq_ignore_ascii_case("runcontext"),
         PropertyScope::Attribute => false,
     }
@@ -333,7 +332,11 @@ pub(super) fn high_level_path_ordinals(raw: Option<&str>) -> Result<Vec<usize>> 
 
 pub(super) fn bytecode_input_looks_like_settings_file(raw: &str) -> bool {
     let raw = raw.trim();
-    !raw.is_empty() && (raw.contains(['/', '\\']) || raw.to_ascii_lowercase().ends_with(".renium"))
+    !raw.is_empty()
+        && (raw.contains(['/', '\\'])
+            || raw
+                .get(raw.len().saturating_sub(7)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".renium")))
 }
 
 pub(super) fn resolve_bytecode_settings_file(
@@ -647,7 +650,6 @@ struct HighLevelTarget<'a> {
     path: Option<&'a str>,
     ordinals: Option<&'a str>,
     positional: Option<&'a str>,
-    default_to_root: bool,
 }
 
 fn high_level_target<'a>(
@@ -662,7 +664,6 @@ fn high_level_target<'a>(
         path: args.path.as_deref(),
         ordinals: args.ords.as_deref(),
         positional,
-        default_to_root: true,
     }
 }
 
@@ -711,12 +712,9 @@ fn high_level_target_resolution(
     }
 
     if !has_selector {
-        if target.default_to_root {
-            return editor_service_root_index(&ctx.document, &ctx.service)
-                .map(HighLevelTargetResolution::Found)
-                .ok_or_else(|| anyhow::anyhow!("No service root in settings bytecode"));
-        }
-        bail!("Provide a target, --path, --index, --settings-id, --name, or --class-name");
+        return editor_service_root_index(&ctx.document, &ctx.service)
+            .map(HighLevelTargetResolution::Found)
+            .ok_or_else(|| anyhow::anyhow!("No service root in settings bytecode"));
     }
 
     if let Some(index) = target.index {

@@ -551,28 +551,24 @@ pub(crate) fn infer_source_script(
         (naming.client_suffix.as_str(), "LocalScript", None),
         (naming.module_suffix.as_str(), "ModuleScript", None),
     ];
-    let mut candidates = Vec::new();
+    let mut best: Option<(usize, &'static str, Option<&'static str>, bool)> = None;
     for extension in extensions {
         for &(configured_suffix, class_name, run_context) in &patterns {
             let suffix = format!("{configured_suffix}.{extension}").to_ascii_lowercase();
-            candidates.push((suffix, class_name, run_context));
+            let is_init = lower
+                .strip_prefix("init")
+                .is_some_and(|rest| rest == suffix);
+            if (is_init || lower.ends_with(&suffix) && file_name.len() > suffix.len())
+                && best.is_none_or(|(length, ..)| suffix.len() > length)
+            {
+                best = Some((suffix.len(), class_name, run_context, is_init));
+            }
         }
     }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0.len()));
-    for (suffix, class_name, run_context) in candidates {
-        let init = format!("init{suffix}");
-        if lower == init {
-            return Some((class_name, None, run_context));
-        }
-        if lower.ends_with(&suffix) && file_name.len() > suffix.len() {
-            return Some((
-                class_name,
-                Some(file_name[..file_name.len() - suffix.len()].to_string()),
-                run_context,
-            ));
-        }
-    }
-    None
+    best.map(|(suffix_len, class_name, run_context, is_init)| {
+        let stem = (!is_init).then(|| file_name[..file_name.len() - suffix_len].to_string());
+        (class_name, stem, run_context)
+    })
 }
 
 pub(super) fn service_from_changed_path(src_root: &Path, changed_path: &Path) -> Option<String> {

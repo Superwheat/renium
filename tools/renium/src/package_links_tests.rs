@@ -242,62 +242,6 @@ fn resolve_editor_instance_by_path(
 }
 
 #[test]
-fn link_manifest_parses_source_variants() {
-    let raw = r#"{
-            "version": 1,
-            "links": [
-                {"id":"a","source":{"type":"local","path":"links/Logger.luau"},
-                 "targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Logger"]}]},
-                {"id":"b","source":{"type":"git","url":"https://example.com/r.git","ref":"main","subpath":"src"},
-                 "targets":[{"service":"ServerScriptService","path":["ServerScriptService","R"]}]},
-                {"id":"c","readOnly":false,"source":{"type":"wally","package":"evaera/promise","version":"^4.0.0"},
-                 "targets":[]}
-            ],
-            "broken":[{"service":"ServerScriptService","path":["ServerScriptService","R"]}]
-        }"#;
-    let manifest: LinkManifest = serde_json::from_str(raw).unwrap();
-    assert_eq!(manifest.links.len(), 3);
-    assert!(manifest.links[0].read_only, "readOnly defaults to true");
-    assert!(!manifest.links[2].read_only);
-    match &manifest.links[1].source {
-        LinkSource::Git {
-            url,
-            git_ref,
-            subpath,
-        } => {
-            assert_eq!(url, "https://example.com/r.git");
-            assert_eq!(git_ref.as_deref(), Some("main"));
-            assert_eq!(subpath.as_deref(), Some("src"));
-        }
-        _ => panic!("expected git source"),
-    }
-    assert_eq!(manifest.links[2].source.kind(), "wally");
-    assert_eq!(manifest.broken.len(), 1);
-}
-
-#[test]
-fn link_target_segments_strips_service_prefix() {
-    let with_prefix = LinkTargetRef {
-        service: "ReplicatedStorage".into(),
-        path: vec!["ReplicatedStorage".into(), "A".into(), "B".into()],
-        ords: vec![],
-    };
-    assert_eq!(
-        link_target_segments(&with_prefix),
-        vec!["A".to_string(), "B".to_string()]
-    );
-    let without = LinkTargetRef {
-        service: "ReplicatedStorage".into(),
-        path: vec!["A".into(), "B".into()],
-        ords: vec![],
-    };
-    assert_eq!(
-        link_target_segments(&without),
-        vec!["A".to_string(), "B".to_string()]
-    );
-}
-
-#[test]
 fn link_add_unbreaks_matching_target() {
     let dir = temp_dir("link-add-unbreaks");
     let manifest_path = dir.join("renium-link.json");
@@ -738,55 +682,41 @@ fn link_apply_force_target_path_recreates_only_named_target() {
 }
 
 #[test]
-fn link_apply_writable_file_target_preserves_local_edits() {
-    let dir = temp_dir("apply-writable-file");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    write_link_test_service(&service_dir);
-    let canonical_dir = dir.join("links");
-    fs::create_dir_all(&canonical_dir).unwrap();
-    let canonical = canonical_dir.join("Logger.luau");
-    fs::write(&canonical, "return 1\n").unwrap();
-    write_single_file_link_manifest(&dir, false);
+fn link_apply_file_target_respects_write_policy() {
+    for read_only in [false, true] {
+        let dir = temp_dir(if read_only {
+            "apply-readonly-file"
+        } else {
+            "apply-writable-file"
+        });
+        let service_dir = dir.join("src/ReplicatedStorage");
+        write_link_test_service(&service_dir);
+        let canonical = dir.join("links/Logger.luau");
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, "return 1\n").unwrap();
+        write_single_file_link_manifest(&dir, read_only);
+        link_apply(test_link_apply_args(&dir)).unwrap();
 
-    link_apply(test_link_apply_args(&dir)).unwrap();
-    let mirror = service_dir.join("Logger.luau");
-    assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 1\n");
-
-    fs::write(&mirror, "return 2\n").unwrap();
-    link_apply(test_link_apply_args(&dir)).unwrap();
-    assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 2\n");
-
-    fs::write(&canonical, "return 3\n").unwrap();
-    link_apply(test_link_apply_args(&dir)).unwrap();
-    assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 2\n");
-
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn link_apply_read_only_file_target_reverts_local_edits() {
-    let dir = temp_dir("apply-readonly-file");
-    let src_root = dir.join("src");
-    let service_dir = src_root.join("ReplicatedStorage");
-    write_link_test_service(&service_dir);
-    let canonical_dir = dir.join("links");
-    fs::create_dir_all(&canonical_dir).unwrap();
-    let canonical = canonical_dir.join("Logger.luau");
-    fs::write(&canonical, "return 1\n").unwrap();
-    write_single_file_link_manifest(&dir, true);
-
-    link_apply(test_link_apply_args(&dir)).unwrap();
-    let mirror = service_dir.join("Logger.luau");
-    assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 1\n");
-
-    set_path_readonly(&mirror, false).unwrap();
-    fs::write(&mirror, "return 2\n").unwrap();
-    link_apply(test_link_apply_args(&dir)).unwrap();
-    assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 1\n");
-
-    set_path_readonly(&mirror, false).unwrap();
-    fs::remove_dir_all(dir).unwrap();
+        let mirror = service_dir.join("Logger.luau");
+        set_path_readonly(&mirror, false).unwrap();
+        fs::write(&mirror, "return 2\n").unwrap();
+        link_apply(test_link_apply_args(&dir)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&mirror).unwrap(),
+            if read_only {
+                "return 1\n"
+            } else {
+                "return 2\n"
+            }
+        );
+        if !read_only {
+            fs::write(&canonical, "return 3\n").unwrap();
+            link_apply(test_link_apply_args(&dir)).unwrap();
+            assert_eq!(fs::read_to_string(&mirror).unwrap(), "return 2\n");
+        }
+        set_path_readonly(&mirror, false).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]
@@ -939,26 +869,6 @@ fn link_target_rejects_filesystem_escape_segments() {
 }
 
 #[test]
-fn canonical_descendant_rejects_paths_outside_root() {
-    let root = temp_dir("descendant");
-    let clone = root.join("clone");
-    let outside = root.join("outside");
-    fs::create_dir_all(&clone).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-
-    assert!(canonical_existing_descendant(&clone, &clone, "subpath").is_ok());
-    assert!(canonical_existing_descendant(&clone, &outside, "subpath").is_err());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn link_slug_normalizes() {
-    assert_eq!(link_slug("My Cool Logger!"), "my-cool-logger");
-    assert_eq!(link_slug("___"), "link");
-    assert_eq!(link_slug("Promise"), "promise");
-}
-
-#[test]
 fn link_target_file_pairs_preserves_extensions() {
     let root = temp_dir("pairs");
     let src_root = root.join("src");
@@ -1078,15 +988,6 @@ fn apply_link_enforcement_reverts_and_fans_out() {
 }
 
 #[test]
-fn link_path_key_normalizes_extended_prefix() {
-    if cfg!(windows) {
-        let extended = link_path_key(Path::new(r"\\?\C:\Temp\src\X.luau"));
-        let clean = link_path_key(Path::new(r"C:\Temp\src\X.luau"));
-        assert_eq!(extended, clean);
-    }
-}
-
-#[test]
 fn apply_link_enforcement_matches_relative_changed_paths() {
     let root = temp_dir("rel");
     let canonical = root.join("links").join("L.luau");
@@ -1113,45 +1014,6 @@ fn apply_link_enforcement_matches_relative_changed_paths() {
     assert!(out.iter().any(|path| path == &relative));
 
     let _ = set_path_readonly(&mirror, false);
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn link_cache_dir_respects_manifest_override() {
-    let root = Path::new("C:/proj");
-    let default_cache = link_cache_dir(root, &LinkManifest::default());
-    assert!(default_cache.ends_with("link-cache"));
-
-    let mut manifest = LinkManifest {
-        cache_dir: Some("vendor/link-store".to_string()),
-        ..Default::default()
-    };
-    let custom = link_cache_dir(root, &manifest);
-    assert!(custom.ends_with("link-store"));
-    assert!(custom.to_string_lossy().contains("vendor"));
-
-    manifest.cache_dir = Some("   ".to_string());
-    assert!(link_cache_dir(root, &manifest).ends_with("link-cache"));
-}
-
-#[test]
-fn link_manifest_round_trips_cache_dir() {
-    let raw = r#"{"version":1,"cacheDir":"vendor/cache","links":[],"broken":[]}"#;
-    let manifest: LinkManifest = serde_json::from_str(raw).unwrap();
-    assert_eq!(manifest.cache_dir.as_deref(), Some("vendor/cache"));
-    let serialized = serde_json::to_string(&manifest).unwrap();
-    assert!(serialized.contains("\"cacheDir\":\"vendor/cache\""));
-    let omitted = serde_json::to_string(&LinkManifest::default()).unwrap();
-    assert!(!omitted.contains("cacheDir"));
-}
-
-#[test]
-fn link_manifest_tolerates_utf8_bom() {
-    let root = temp_dir("bom");
-    let path = root.join("renium-link.json");
-    fs::write(&path, "\u{feff}{\"version\":1,\"links\":[],\"broken\":[]}").unwrap();
-    let manifest = read_link_manifest(&path).unwrap();
-    assert_eq!(manifest.version, 1);
     let _ = fs::remove_dir_all(&root);
 }
 

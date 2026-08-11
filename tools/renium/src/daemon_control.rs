@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::automation_runtime::{
     automation_parse_response, oversized_automation_request_response, run_automation_stdio,
-    send_automation_control_request,
+    send_automation_control_request, try_send_automation_control_request,
 };
 use super::bridge_server::{BridgeServer, clamp_bridge_chunk_size};
 use super::bytecode_explorer::watch_parent_and_exit;
@@ -24,10 +24,10 @@ use super::command_line::{
     PluginConsoleOutputArgs, PushEditorChangesArgs, StartStopPlayArgs, StudioChangeStateArgs,
     StudioDeviceArgs,
 };
-use super::file_io::{absolutize_for_daemon, canonical_path, fnv1a_hex};
+use super::file_io::{absolutize_for_daemon, canonical_path, fnv1a_hex, sanitize_ascii_identifier};
 use super::local_transport::{
-    BoundedLineRead, DAEMON_CONTROL_CONNECT_TIMEOUT, DAEMON_CONTROL_IDLE_TIMEOUT,
-    DAEMON_DISCOVERY_MAX_AGE_MS, DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS, DEFAULT_DAEMON_CONTROL_PORT,
+    BoundedLineRead, DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_AGE_MS,
+    DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS, DEFAULT_DAEMON_CONTROL_PORT,
     MAX_DAEMON_CONTROL_CONNECTIONS, MAX_DAEMON_LINE_BYTES, host_port, is_loopback_endpoint,
     normalize_loopback_host, read_bounded_line,
 };
@@ -359,19 +359,7 @@ fn daemon_discovery_write_paths(name: &str) -> Vec<PathBuf> {
     if name == "default" {
         return vec![default];
     }
-    vec![default.with_file_name(format!("daemon-{}.json", safe_daemon_name(name)))]
-}
-
-fn safe_daemon_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    vec![default.with_file_name(format!("daemon-{}.json", sanitize_ascii_identifier(name)))]
 }
 
 pub(super) fn daemon_control_endpoints() -> Vec<std::net::SocketAddr> {
@@ -421,7 +409,9 @@ pub(super) fn daemon_discovery_paths() -> Vec<PathBuf> {
         if let Ok(name) = std::env::var("RENIUM_DAEMON_NAME") {
             let name = name.trim();
             if !name.is_empty() && name != "default" {
-                paths.push(path.with_file_name(format!("daemon-{}.json", safe_daemon_name(name))));
+                paths.push(
+                    path.with_file_name(format!("daemon-{}.json", sanitize_ascii_identifier(name))),
+                );
                 return paths;
             }
         }
@@ -535,11 +525,6 @@ pub(super) fn try_daemon_control_request(
     command: &str,
     args: Vec<String>,
 ) -> Result<Option<Value>> {
-    if daemon_control_endpoints().into_iter().all(|address| {
-        TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).is_err()
-    }) {
-        return Ok(None);
-    }
     let has = |needle: &str| args.iter().any(|argument| argument == needle);
     let explicitly_approved = (has("--yes") || has("--apply")) && !has("--no-review");
     let (operation, mut parameters) = match command {
@@ -615,13 +600,16 @@ pub(super) fn try_daemon_control_request(
                 .display()
                 .to_string()
         });
-    let bind = send_automation_control_request(&automation::Request {
+    let Some(bind) = try_send_automation_control_request(&automation::Request {
         v: automation::PROTOCOL_VERSION,
         id: current_millis().min(u128::from(u64::MAX)) as u64,
         op: 1,
         cx: None,
         p: json!({ "root": root, "place": place_filter() }),
-    })?;
+    })?
+    else {
+        return Ok(None);
+    };
     if bind.ok == 0 {
         let error = bind.e.context("Daemon bind failed without an error")?;
         bail!("{}", error.m);

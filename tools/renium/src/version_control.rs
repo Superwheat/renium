@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +66,14 @@ fn vc_run_git(git_path: &str, args: &[&str], cwd: &Path) -> Result<String> {
     run_git_checked(git_path, &owned, cwd)
 }
 
+fn read_optional_text(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
 pub(super) fn vc_init(args: VcInitArgs) -> Result<()> {
     let project_root = resolve_link_project_root(&args.project_root)?;
 
@@ -78,7 +87,7 @@ pub(super) fn vc_init(args: VcInitArgs) -> Result<()> {
     };
 
     let ignore_path = project_root.join(".gitignore");
-    let existing_ignore = fs::read_to_string(&ignore_path).unwrap_or_default();
+    let existing_ignore = read_optional_text(&ignore_path)?;
     let existing_lines: HashSet<&str> = existing_ignore.lines().map(str::trim).collect();
     let added_ignore_lines: Vec<&str> = VC_GITIGNORE_LINES
         .iter()
@@ -106,7 +115,7 @@ pub(super) fn vc_init(args: VcInitArgs) -> Result<()> {
     fs::create_dir_all(&renium_dir)
         .with_context(|| format!("Failed to create {}", renium_dir.display()))?;
     let renium_ignore_path = renium_dir.join(".gitignore");
-    let current_renium_ignore = fs::read_to_string(&renium_ignore_path).unwrap_or_default();
+    let current_renium_ignore = read_optional_text(&renium_ignore_path)?;
     let renium_ignore_updated = if current_renium_ignore.is_empty() {
         fs::write(&renium_ignore_path, RENIUM_DIR_GITIGNORE)
             .with_context(|| format!("Failed to write {}", renium_ignore_path.display()))?;

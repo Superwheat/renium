@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows_sys::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, OpenProcess, PROCESS_CREATE_THREAD,
@@ -26,11 +26,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_VM_WRITE, WaitForSingleObject,
 };
 
-use crate::file_io::fnv1a;
+use crate::file_io::{atomic_write_file, fnv1a};
 use crate::native_snapshot::{
     NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
-use crate::timing::current_millis;
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
 const PARAM_SIZE: usize = 5792;
@@ -55,6 +54,7 @@ const REMOTE_TIMEOUT: u32 = 30_000;
 static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
 static LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, CachedLayout>>> = OnceLock::new();
 static DATA_MODELS: OnceLock<Mutex<HashMap<u32, CachedDataModel>>> = OnceLock::new();
+static HELPER_EXPORT_RVA: OnceLock<usize> = OnceLock::new();
 struct CachedTrace {
     len: u64,
     modified: Option<SystemTime>,
@@ -180,7 +180,7 @@ impl ProcessMemory {
                 self.handle,
                 null(),
                 size,
-                MEM_COMMIT | 0x2000,
+                MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
         };
@@ -425,13 +425,24 @@ fn slice(bytes: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
         .context("Studio executable structure is truncated")
 }
 
-fn find_all(bytes: &[u8], pattern: &[u8], start: usize, end: usize) -> Vec<usize> {
-    if pattern.is_empty() || end < start || end - start < pattern.len() {
-        return Vec::new();
-    }
-    memmem::find_iter(&bytes[start..end], pattern)
-        .map(|offset| start + offset)
-        .collect()
+fn pattern_matches<'a>(
+    bytes: &'a [u8],
+    pattern: &'a [u8],
+    start: usize,
+    end: usize,
+) -> impl Iterator<Item = usize> + 'a {
+    let range = if pattern.is_empty() || end < start || end - start < pattern.len() {
+        &bytes[0..0]
+    } else {
+        &bytes[start..end]
+    };
+    memmem::find_iter(range, pattern).map(move |offset| start + offset)
+}
+
+fn unique_match(matches: impl Iterator<Item = usize>) -> (Option<usize>, usize) {
+    matches.fold((None, 0), |(first, count), offset| {
+        (first.or(Some(offset)), count + 1)
+    })
 }
 
 fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
@@ -457,10 +468,9 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     let continuation = hex(
         "E800000000488BD3488D8DD0000000E800000000904C897C24384C897C2430488D4588488944242844897C24204C8D8DD00000004D8B06488D55E0488D8D30010000E8",
     )?;
-    let sequences =
-        find_all(bytes, &anchor, start, end)
-            .into_iter()
-            .filter(|sequence| {
+    let (sequence, sequence_count) =
+        unique_match(
+            pattern_matches(bytes, &anchor, start, end).filter(|sequence| {
                 let offset = sequence + anchor.len();
                 let Ok(candidate) = slice(bytes, offset, continuation.len()) else {
                     return false;
@@ -470,48 +480,51 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
                         matches!(index, 1..=4 | 16..=19) || actual == expected
                     },
                 )
-            })
-            .collect::<Vec<_>>();
-    if sequences.len() != 1 {
+            }),
+        );
+    if sequence_count != 1 {
         bail!(
             "Studio serializer signature matched {} locations",
-            sequences.len()
+            sequence_count
         );
     }
-    let sequence = sequences[0];
+    let sequence = sequence.expect("serializer signature count was validated");
     let root_collector = image.call_target(sequence + 11)?;
     let context_builder = image.call_target(sequence + 26)?;
     let wrapper = image.call_target(sequence + 77)?;
     let destroy_pattern = hex("C6853801000000488D8DD0000000E8")?;
-    let destroy_matches = find_all(
+    let (destroy_match, destroy_count) = unique_match(pattern_matches(
         bytes,
         &destroy_pattern,
         sequence,
         (sequence + 0x500).min(bytes.len()),
-    );
-    if destroy_matches.len() != 1 {
+    ));
+    if destroy_count != 1 {
         bail!(
             "Studio context cleanup signature matched {} locations",
-            destroy_matches.len()
+            destroy_count
         );
     }
-    let context_destroy = image.call_target(destroy_matches[0] + 14)?;
+    let destroy_match = destroy_match.expect("cleanup signature count was validated");
+    let context_destroy = image.call_target(destroy_match + 14)?;
     let deallocator_suffix = hex("0F57C0F30F7F4588")?;
-    let deallocator_calls = (destroy_matches[0] + destroy_pattern.len()
-        ..(destroy_matches[0] + destroy_pattern.len() + 0x100).min(bytes.len()))
-        .filter(|offset| {
-            bytes.get(*offset) == Some(&0xE8)
-                && slice(bytes, offset + 5, deallocator_suffix.len())
-                    .is_ok_and(|value| value == deallocator_suffix)
-        })
-        .collect::<Vec<_>>();
-    if deallocator_calls.len() != 1 {
+    let (deallocator_call, deallocator_count) = unique_match(
+        (destroy_match + destroy_pattern.len()
+            ..(destroy_match + destroy_pattern.len() + 0x100).min(bytes.len()))
+            .filter(|offset| {
+                bytes.get(*offset) == Some(&0xE8)
+                    && slice(bytes, offset + 5, deallocator_suffix.len())
+                        .is_ok_and(|value| value == deallocator_suffix)
+            }),
+    );
+    if deallocator_count != 1 {
         bail!(
             "Studio deallocator signature matched {} locations",
-            deallocator_calls.len()
+            deallocator_count
         );
     }
-    let deallocator = image.call_target(deallocator_calls[0])?;
+    let deallocator =
+        image.call_target(deallocator_call.expect("deallocator signature count was validated"))?;
     let wrapper_offset = image.rva_to_offset(wrapper)?;
     let wrapper_prefix = hex("40534883EC6033C0488BD9")?;
     if slice(bytes, wrapper_offset, wrapper_prefix.len())? != wrapper_prefix {
@@ -995,22 +1008,26 @@ fn select_service_root(
     data_model: &mut ActiveDataModel,
     service: &str,
 ) -> Result<()> {
-    let matches = data_model
-        .roots
-        .iter()
-        .copied()
-        .filter(|root| {
-            read_instance_class(memory, root.instance).as_deref() == Some(service)
-                || read_instance_name(memory, root.instance).as_deref() == Some(service)
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
+    let mut selected = None;
+    let mut count = 0;
+    for root in data_model.roots.iter().copied() {
+        if read_instance_class(memory, root.instance).as_deref() == Some(service)
+            || read_instance_name(memory, root.instance).as_deref() == Some(service)
+        {
+            selected = selected.or(Some(root));
+            count += 1;
+        }
+    }
+    if count != 1 {
         bail!(
             "Studio DataModel contains {} roots matching {service}",
-            matches.len()
+            count
         );
     }
-    data_model.roots = matches;
+    data_model.roots.clear();
+    data_model
+        .roots
+        .push(selected.expect("service root count was validated"));
     Ok(())
 }
 
@@ -1021,23 +1038,8 @@ fn helper_path() -> Result<PathBuf> {
         .with_context(|| format!("Could not create {}", directory.display()))?;
     let path = directory.join(format!("renium-studio-helper-{hash:016x}.dll"));
     if fs::read(&path).ok().as_deref() != Some(HELPER_BYTES) {
-        let temporary = directory.join(format!(
-            ".renium-studio-helper-{}-{}.tmp",
-            std::process::id(),
-            current_millis()
-        ));
-        fs::write(&temporary, HELPER_BYTES)
-            .with_context(|| format!("Could not write {}", temporary.display()))?;
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
-        fs::rename(&temporary, &path).with_context(|| {
-            format!(
-                "Could not install Studio helper from {} to {}",
-                temporary.display(),
-                path.display()
-            )
-        })?;
+        atomic_write_file(&path, HELPER_BYTES)
+            .with_context(|| format!("Could not install Studio helper {}", path.display()))?;
     }
     Ok(path)
 }
@@ -1109,6 +1111,9 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 fn helper_export_rva() -> Result<usize> {
+    if let Some(rva) = HELPER_EXPORT_RVA.get() {
+        return Ok(*rva);
+    }
     let image = PeImage::parse(HELPER_BYTES)?;
     let pe_offset = read_u32(HELPER_BYTES, 0x3c)? as usize;
     let optional_offset = pe_offset + 24;
@@ -1133,7 +1138,9 @@ fn helper_export_rva() -> Result<usize> {
         if ordinal >= function_count {
             bail!("Studio helper export ordinal is invalid");
         }
-        return Ok(read_u32(HELPER_BYTES, functions + ordinal * 4)? as usize);
+        let rva = read_u32(HELPER_BYTES, functions + ordinal * 4)? as usize;
+        let _ = HELPER_EXPORT_RVA.set(rva);
+        return Ok(rva);
     }
     bail!("Studio helper is missing ReniumRun")
 }

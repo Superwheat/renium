@@ -9,7 +9,7 @@ use serde_json::{Map, Number, Value, json};
 use walkdir::WalkDir;
 
 use super::bridge_server::{BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE};
-use super::bytecode_api::acquire_settings_file_lock;
+use super::bytecode_api::{SettingsFileLock, acquire_settings_file_lock};
 use super::command_line::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs,
     PushEditorChangesArgs,
@@ -1577,35 +1577,26 @@ fn verify_editor_source_changes(
 }
 
 fn editor_source_key(change: &EditorSourceChange) -> String {
-    if change.path_ordinals.len() == change.path_segments.len() {
-        return format!(
-            "pathord:{}:{}",
-            change
-                .path_ordinals
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-            change.path_segments.join(".")
-        );
-    }
-    format!("path:{}", change.path_segments.join("."))
+    editor_source_key_for_path(&change.path_segments, &change.path_ordinals)
 }
 
 fn editor_source_key_from_target(target: &EditorSourceTarget) -> String {
-    if target.path_ordinals.len() == target.path_segments.len() {
+    editor_source_key_for_path(&target.path_segments, &target.path_ordinals)
+}
+
+fn editor_source_key_for_path(path_segments: &[String], path_ordinals: &[usize]) -> String {
+    if path_ordinals.len() == path_segments.len() {
         return format!(
             "pathord:{}:{}",
-            target
-                .path_ordinals
+            path_ordinals
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-            target.path_segments.join(".")
+            path_segments.join(".")
         );
     }
-    format!("path:{}", target.path_segments.join("."))
+    format!("path:{}", path_segments.join("."))
 }
 
 pub(super) fn is_lua_source_class(class_name: &str) -> bool {
@@ -1650,6 +1641,7 @@ fn collect_editor_full_paths(src_root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub(super) struct EditorSettingsTransaction {
+    _locks: Vec<SettingsFileLock>,
     published: Vec<(PathBuf, Option<PathBuf>)>,
     temporary: Vec<PathBuf>,
     active: bool,
@@ -1658,13 +1650,22 @@ pub(super) struct EditorSettingsTransaction {
 impl EditorSettingsTransaction {
     pub(super) fn apply(changes: &EditorChangeSet) -> Result<Self> {
         let mut transaction = Self {
+            _locks: Vec::with_capacity(changes.settings_writes.len()),
             published: Vec::new(),
             temporary: Vec::new(),
             active: true,
         };
         let result = (|| -> Result<()> {
+            let mut lock_paths = changes
+                .settings_writes
+                .iter()
+                .map(|write| (path_key(&write.path), &write.path))
+                .collect::<Vec<_>>();
+            lock_paths.sort_by(|left, right| left.0.cmp(&right.0));
+            for (_, path) in lock_paths {
+                transaction._locks.push(acquire_settings_file_lock(path)?);
+            }
             for (index, write) in changes.settings_writes.iter().enumerate() {
-                let _lock = acquire_settings_file_lock(&write.path)?;
                 let file_name = write
                     .path
                     .file_name()

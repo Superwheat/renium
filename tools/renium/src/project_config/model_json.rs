@@ -122,7 +122,6 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         .iter()
         .map(|instance| instance.settings_id.clone())
         .collect::<BTreeSet<_>>();
-    let mut output_ids = HashMap::new();
     if let Some(root_id) = root_input_id.as_deref() {
         let previous = document.instances[target_index].settings_id.clone();
         used_ids.remove(&previous);
@@ -142,7 +141,6 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
     }
     for id in &input_ids {
         if root_input_id.as_deref() == Some(id.as_str()) {
-            output_ids.insert(id.clone(), id.clone());
             continue;
         }
         if !used_ids.insert(id.clone()) {
@@ -150,7 +148,6 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
                 "Model JSON instance id '{id}' collides with an instance outside the adapter target"
             );
         }
-        output_ids.insert(id.clone(), id.clone());
     }
     let first_output_index = document.instances.len();
     let mut output_indices = HashMap::new();
@@ -196,8 +193,6 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         };
         stabilize_model_json_reference_indices(&mut properties, &input_ids)?;
         stabilize_model_json_reference_indices(&mut attributes, &input_ids)?;
-        remap_record_reference_ids(&mut properties, &output_ids);
-        remap_record_reference_ids(&mut attributes, &output_ids);
         let mut properties = normalize_model_property_map(Some(class_name), &properties)
             .with_context(|| format!("Invalid properties on model JSON instance '{id}'"))?;
         let attributes = normalize_model_property_map(None, &attributes)
@@ -217,19 +212,13 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
                                 "Model JSON instance '{id}' tag {index} must be a non-empty string"
                             )
                         })
+                        .map(|tag| Value::String(tag.to_string()))
                 })
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
         if !tags.is_empty() {
-            properties.insert(
-                "Tags".to_string(),
-                Value::Array(
-                    tags.into_iter()
-                        .map(|tag| Value::String(tag.to_string()))
-                        .collect(),
-                ),
-            );
+            properties.insert("Tags".to_string(), Value::Array(tags));
         }
         let parent_index = instance
             .get("parentId")
@@ -242,7 +231,7 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
             root.attributes = attributes;
         } else {
             document.instances.push(SettingsBytecodeInstance {
-                settings_id: output_ids[id].clone(),
+                settings_id: id.clone(),
                 name: name.to_string(),
                 class_name: class_name.to_string(),
                 parent_index: Some(parent_index),

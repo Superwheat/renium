@@ -24,8 +24,8 @@ use super::command_args::ImportSnapshotsArgs;
 use super::command_line::ExportSnapshotsArgs;
 use super::daemon_control::{export_snapshots_daemon_args, try_daemon_control_request};
 use super::file_io::{
-    current_unix_ts, read_json_file, resolve_existing_project_root, sanitize_name, sha256_hex,
-    write_json_file,
+    OnDrop, create_unique_directory, current_unix_ts, read_json_file,
+    resolve_existing_project_root, sanitize_name, sha256_hex, write_json_file,
 };
 use super::native_editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use super::project_config;
@@ -53,8 +53,7 @@ use super::snapshot_types::{
 };
 use super::sourcemap::{generate_project_sourcemap, write_project_sourcemap_from_service_nodes};
 use super::timing::{
-    current_millis, elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings,
-    verbose_timing_logs,
+    elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
 
 pub(super) const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
@@ -449,11 +448,10 @@ impl ExportProjectStage {
         let project_name = project_root
             .file_name()
             .context("Project root has no directory name")?;
-        let container = parent.join(format!(
-            ".renium-export-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
+        let container = create_unique_directory(parent, ".renium-export-")?;
+        let mut cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&container);
+        });
         let staged_root = container.join(project_name);
         fs::create_dir_all(&staged_root)
             .with_context(|| format!("Failed to create {}", staged_root.display()))?;
@@ -572,6 +570,8 @@ impl ExportProjectStage {
             ),
             None => (staged_root.clone(), src_dir.to_path_buf()),
         };
+        cleanup.disarm();
+        drop(cleanup);
         let stage = Self {
             project_root: staged_root,
             container,
@@ -1769,6 +1769,12 @@ impl ServiceExportContext<'_> {
         let service_started = Instant::now();
         let prepare_started = Instant::now();
         let mut prepare = bridge.call("prepare", json!({ "service": service }))?;
+        let release = || {
+            OnDrop::new(|| {
+                let _ = bridge.call("release", json!({ "service": service }));
+            })
+        };
+        let mut prepared_service = release();
         log_timing(&format!("{service}: prepare"), prepare_started);
         let instance_count = prepare
             .get("instanceCount")
@@ -1793,11 +1799,12 @@ impl ServiceExportContext<'_> {
             println!(
                 "[renium] {service}: plugin property schema cache is empty; configuring rbx-dom candidates and retrying prepare"
             );
-            let _ = bridge.call("release", json!({ "service": service }));
+            prepared_service.run();
             configure_bridge_property_candidates(bridge, default_property_schema_by_class)
                 .context("Failed to configure plugin property candidates")?;
             let retry_prepare_started = Instant::now();
             prepare = bridge.call("prepare", json!({ "service": service }))?;
+            prepared_service = release();
             log_timing(
                 &format!("{service}: prepare after schema configure"),
                 retry_prepare_started,
@@ -1808,16 +1815,16 @@ impl ServiceExportContext<'_> {
         let enum_value_names_by_type =
             parse_enum_value_name_map(prepare.get("enumValueNamesByType"))?;
         let effective_property_schema_by_class = if service_property_schema_by_class.is_empty() {
-            default_property_schema_by_class.clone()
+            default_property_schema_by_class
         } else {
-            service_property_schema_by_class
+            &service_property_schema_by_class
         };
         let instance_batches = InstanceBatchContext {
             bridge,
             service,
             chunk_size,
             instance_count,
-            property_schema_by_class: &effective_property_schema_by_class,
+            property_schema_by_class: effective_property_schema_by_class,
             enum_value_names_by_type: &enum_value_names_by_type,
             class_names: &prepare_class_names,
         };
@@ -1948,7 +1955,7 @@ impl ServiceExportContext<'_> {
         log_timing(&format!("{service}: merge script sources"), merge_started);
 
         let release_started = Instant::now();
-        let _ = bridge.call("release", json!({ "service": service }));
+        prepared_service.run();
         log_timing(&format!("{service}: release"), release_started);
         log_timing(
             &format!("{service}: export assembly total"),

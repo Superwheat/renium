@@ -13,11 +13,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 
 use super::{BuildArgs, ToolPolicy, build_once, find_command, project_package_manager};
-use crate::file_io::absolutize_for_daemon as absolute_path;
+use crate::file_io::{absolutize_for_daemon as absolute_path, path_extension_is};
+use crate::file_watch::FileWatcher;
 use crate::project_config::{self, LoadedProject};
 
 fn roblox_ts_executable(loaded: &LoadedProject) -> Result<PathBuf> {
@@ -117,7 +117,11 @@ fn spawn_tool_output_reader(
     output_dropped: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else {
+                output_dropped.store(true, Ordering::Release);
+                break;
+            };
             crate::log_global(3, format_args!("{line}"));
             match sender.try_send(line) {
                 Ok(()) => {}
@@ -132,18 +136,13 @@ fn spawn_tool_output_reader(
 
 fn roblox_ts_error_count(line: &str) -> Option<usize> {
     let found = line.find("found ")? + "found ".len();
-    let digits = line[found..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    if digits.is_empty()
-        || !line[found + digits.len()..]
-            .trim_start()
-            .starts_with("error")
-    {
+    let length = line[found..]
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(line.len() - found);
+    if length == 0 || !line[found + length..].trim_start().starts_with("error") {
         return None;
     }
-    digits.parse().ok()
+    line[found..found + length].parse().ok()
 }
 
 fn roblox_ts_error_line(line: &str) -> bool {
@@ -397,6 +396,20 @@ fn roblox_ts_watch_desired(loaded: &LoadedProject, args: &BuildArgs) -> Result<b
         args.typescript,
         package_uses_roblox_ts(&loaded.root.join("package.json"))?,
     ))
+}
+
+fn roblox_ts_watch_graph(loaded: &LoadedProject, args: &BuildArgs) -> Result<RobloxTsConfigGraph> {
+    if roblox_ts_watch_desired(loaded, args)? {
+        return roblox_ts_config_graph(&loaded.root);
+    }
+    let mut files = BTreeSet::new();
+    if args.typescript == ToolPolicy::Auto {
+        files.insert(absolute_path(&loaded.root.join("package.json")));
+    }
+    Ok(RobloxTsConfigGraph {
+        files,
+        output_roots: BTreeSet::new(),
+    })
 }
 
 fn start_ready_roblox_ts_watch(
@@ -682,15 +695,16 @@ fn record_watch_input(inputs: &mut ProjectWatchInputs, nested: &mut Vec<PathBuf>
     }
 }
 
-fn project_watch_inputs(loaded: &LoadedProject) -> Result<ProjectWatchInputs> {
+fn project_watch_inputs(loaded: &LoadedProject, args: &BuildArgs) -> Result<ProjectWatchInputs> {
     let mut inputs = ProjectWatchInputs::default();
     let mut visited = BTreeSet::new();
-    project_watch_inputs_into(loaded, &mut inputs, &mut visited)?;
+    project_watch_inputs_into(loaded, args, &mut inputs, &mut visited)?;
     Ok(inputs)
 }
 
 fn project_watch_inputs_into(
     loaded: &LoadedProject,
+    args: &BuildArgs,
     inputs: &mut ProjectWatchInputs,
     visited: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
@@ -725,14 +739,14 @@ fn project_watch_inputs_into(
                 .insert(absolute_path(&loaded.root.join(output)));
         }
     }
-    inputs.files.extend(
-        ["wally.toml", "wally.lock"]
-            .into_iter()
-            .map(|path| absolute_path(&loaded.root.join(path))),
-    );
+    if args.wally != ToolPolicy::Never {
+        inputs.files.extend(
+            ["wally.toml", "wally.lock"].map(|path| absolute_path(&loaded.root.join(path))),
+        );
+    }
     inputs
         .files
-        .extend(roblox_ts_config_graph(&loaded.root)?.files);
+        .extend(roblox_ts_watch_graph(loaded, args)?.files);
     inputs
         .ignored
         .insert(absolute_path(&loaded.root.join("sourcemap.json")));
@@ -744,61 +758,9 @@ fn project_watch_inputs_into(
             .to_ascii_lowercase();
         if (name.ends_with(".project.json") || name.ends_with(".project.jsonc")) && path.is_file() {
             let nested = project_config::load_project(Some(&path), None)?;
-            project_watch_inputs_into(&nested, inputs, visited)?;
+            project_watch_inputs_into(&nested, args, inputs, visited)?;
         }
     }
-    Ok(())
-}
-
-fn configure_project_watcher(
-    watcher: &mut RecommendedWatcher,
-    previous: &mut BTreeMap<PathBuf, bool>,
-    inputs: &ProjectWatchInputs,
-) -> Result<()> {
-    let mut roots = BTreeMap::new();
-    for (root, recursive) in inputs
-        .files
-        .iter()
-        .map(|path| (path, false))
-        .chain(inputs.directories.iter().map(|path| (path, true)))
-    {
-        let mut watch_root = root.clone();
-        while !watch_root.exists() {
-            let Some(parent) = watch_root.parent() else {
-                break;
-            };
-            watch_root = parent.to_path_buf();
-        }
-        if !watch_root.exists() {
-            continue;
-        }
-        let recursive = recursive || watch_root != *root;
-        roots
-            .entry(watch_root)
-            .and_modify(|existing| *existing |= recursive)
-            .or_insert(recursive);
-    }
-    for (root, recursive) in previous.iter() {
-        if roots.get(root) != Some(recursive) {
-            let _ = watcher.unwatch(root);
-        }
-    }
-    for (root, recursive) in &roots {
-        if previous.get(root) == Some(recursive) {
-            continue;
-        }
-        watcher
-            .watch(
-                root,
-                if *recursive {
-                    RecursiveMode::Recursive
-                } else {
-                    RecursiveMode::NonRecursive
-                },
-            )
-            .with_context(|| format!("Failed to watch {}", root.display()))?;
-    }
-    *previous = roots;
     Ok(())
 }
 
@@ -808,18 +770,23 @@ fn build_watch_event_is_relevant(
     inputs: &ProjectWatchInputs,
 ) -> bool {
     let output = absolute_path(output);
+    let output_stem = output
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("renium-build");
+    let temporary_prefix = format!(".{output_stem}.");
+    let output_name = output
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("renium-build");
+    let backup_prefix = format!(".{output_name}.");
     paths.iter().any(|path| {
-        let path = absolute_path(path);
         let temporary_output = path.parent() == output.parent()
             && path
                 .file_name()
                 .and_then(OsStr::to_str)
                 .is_some_and(|name| {
-                    let stem = output
-                        .file_stem()
-                        .and_then(OsStr::to_str)
-                        .unwrap_or("renium-build");
-                    name.starts_with(&format!(".{stem}."))
+                    name.starts_with(&temporary_prefix)
                         && name.contains(".tmp.")
                         && path.extension() == output.extension()
                 });
@@ -828,19 +795,15 @@ fn build_watch_event_is_relevant(
                 .file_name()
                 .and_then(OsStr::to_str)
                 .is_some_and(|name| {
-                    let output_name = output
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .unwrap_or("renium-build");
-                    name.starts_with(&format!(".{output_name}.")) && name.ends_with(".previous")
+                    name.starts_with(&backup_prefix) && name.ends_with(".previous")
                 });
-        if path == output
+        if path.as_path() == output
             || temporary_output
             || transaction_backup
             || inputs
                 .ignored
                 .iter()
-                .any(|ignored| path == *ignored || path.starts_with(ignored))
+                .any(|ignored| path == ignored || path.starts_with(ignored))
         {
             return false;
         }
@@ -851,11 +814,11 @@ fn build_watch_event_is_relevant(
                 .is_some_and(|name| matches!(name, ".git" | ".renium" | "node_modules"))
         });
         !excluded
-            && (inputs.files.contains(&path)
+            && (inputs.files.contains(path)
                 || inputs
                     .directories
                     .iter()
-                    .any(|directory| path == *directory || path.starts_with(directory)))
+                    .any(|directory| path == directory || path.starts_with(directory)))
     })
 }
 
@@ -865,10 +828,6 @@ fn build_args_for_watch_event(
     paths: &[PathBuf],
     typescript_config_files: &BTreeSet<PathBuf>,
 ) -> BuildArgs {
-    let paths = paths
-        .iter()
-        .map(|path| absolute_path(path))
-        .collect::<Vec<_>>();
     let project_changed = paths.contains(&absolute_path(&loaded.path));
     let wally_changed = project_changed
         || ["wally.toml", "wally.lock"]
@@ -879,13 +838,9 @@ fn build_args_for_watch_event(
         || paths
             .iter()
             .any(|path| typescript_config_files.contains(path))
-        || paths.iter().any(|path| {
-            path.extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|extension| {
-                    matches!(extension.to_ascii_lowercase().as_str(), "ts" | "tsx")
-                })
-        });
+        || paths
+            .iter()
+            .any(|path| path_extension_is(path, &["ts", "tsx"]));
     let mut selected = args.clone();
     if selected.wally == ToolPolicy::Auto && !wally_changed {
         selected.wally = ToolPolicy::Never;
@@ -981,9 +936,9 @@ pub(super) fn watch_build(
     args: &BuildArgs,
     output: &Path,
 ) -> Result<()> {
-    let mut inputs = project_watch_inputs(loaded)?;
+    let mut inputs = project_watch_inputs(loaded, args)?;
     let mut typescript = RobloxTsWatchRuntime::start(loaded, args)?;
-    let initial_typescript_graph = roblox_ts_config_graph(&loaded.root)?;
+    let initial_typescript_graph = roblox_ts_watch_graph(loaded, args)?;
     let mut typescript_output_roots = initial_typescript_graph
         .output_roots
         .iter()
@@ -1000,30 +955,23 @@ pub(super) fn watch_build(
         initial_args.typescript = ToolPolicy::Never;
     }
     build_once(loaded, &initial_args, output, true, None)?;
-    let (sender, receiver) = mpsc::sync_channel(4_096);
-    let watch_overflowed = Arc::new(AtomicBool::new(false));
-    let callback_overflowed = Arc::clone(&watch_overflowed);
-    let mut watcher = notify::recommended_watcher(move |event| match sender.try_send(event) {
-        Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
-        Err(mpsc::TrySendError::Full(_)) => {
-            callback_overflowed.store(true, Ordering::Release);
-        }
-    })?;
-    let mut watched = BTreeMap::new();
-    configure_project_watcher(&mut watcher, &mut watched, &inputs)?;
+    let mut watcher = FileWatcher::new(4_096)?;
+    watcher.set_inputs(&inputs.files, &inputs.directories)?;
     loop {
         let mut rescan_required = false;
         let mut typescript_cycle_completed = false;
         let mut typescript_output_overflowed = false;
         let event = loop {
-            match receiver.recv_timeout(Duration::from_millis(500)) {
+            match watcher.receiver().recv_timeout(Duration::from_millis(500)) {
                 Ok(Ok(event)) => break Some(event),
                 Ok(Err(error)) => {
                     crate::log_global(2, format_args!("Build watcher failed: {error}"));
+                    rescan_required = true;
+                    break None;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     typescript.poll(loaded, args, output)?;
-                    if watch_overflowed.swap(false, Ordering::AcqRel) {
+                    if watcher.take_overflowed() {
                         rescan_required = true;
                         break None;
                     }
@@ -1039,17 +987,20 @@ pub(super) fn watch_build(
         let mut paths = event.map(|event| event.paths).unwrap_or_default();
         let batch_deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < batch_deadline
-            && let Ok(event) = receiver.recv_timeout(
+            && let Ok(event) = watcher.receiver().recv_timeout(
                 Duration::from_millis(100)
                     .min(batch_deadline.saturating_duration_since(Instant::now())),
             )
         {
             match event {
                 Ok(event) => paths.extend(event.paths),
-                Err(error) => crate::log_global(2, format_args!("Build watcher failed: {error}")),
+                Err(error) => {
+                    crate::log_global(2, format_args!("Build watcher failed: {error}"));
+                    rescan_required = true;
+                }
             }
         }
-        rescan_required |= watch_overflowed.swap(false, Ordering::AcqRel);
+        rescan_required |= watcher.take_overflowed();
         let drain = typescript.drain();
         typescript_cycle_completed |= drain.successful_cycle;
         typescript_output_overflowed |= drain.overflowed;
@@ -1057,19 +1008,23 @@ pub(super) fn watch_build(
             typescript.schedule_restart();
             continue;
         }
+        for path in &mut paths {
+            *path = absolute_path(path);
+        }
         paths.sort();
         paths.dedup();
-        configure_project_watcher(&mut watcher, &mut watched, &inputs)?;
+        watcher.set_inputs(&inputs.files, &inputs.directories)?;
         if !rescan_required && !build_watch_event_is_relevant(&paths, output, &inputs) {
             continue;
         }
         let typescript_config_path_changed = paths
             .iter()
             .any(|path| typescript_config_files.contains(path));
-        let current_typescript_graph = roblox_ts_config_graph(&loaded.root);
+        let current_typescript_graph = (typescript_config_path_changed || rescan_required)
+            .then(|| roblox_ts_watch_graph(loaded, args));
         let current_typescript_config_fingerprint = current_typescript_graph
             .as_ref()
-            .ok()
+            .and_then(|graph| graph.as_ref().ok())
             .map(RobloxTsConfigGraph::fingerprint);
         let typescript_configuration_changed = typescript_config_path_changed
             || rescan_required
@@ -1089,8 +1044,8 @@ pub(super) fn watch_build(
             match project_config::load_project(Some(&loaded.path), None) {
                 Ok(current) => {
                     *loaded = current;
-                    inputs = project_watch_inputs(loaded)?;
-                    configure_project_watcher(&mut watcher, &mut watched, &inputs)?;
+                    inputs = project_watch_inputs(loaded, args)?;
+                    watcher.set_inputs(&inputs.files, &inputs.directories)?;
                 }
                 Err(error) => {
                     crate::log_global(2, format_args!("Build configuration failed: {error:#}"));
@@ -1100,7 +1055,9 @@ pub(super) fn watch_build(
         }
         if typescript_configuration_changed {
             drop(typescript.process.take());
-            let current_typescript_graph = match current_typescript_graph {
+            let current_typescript_graph = match current_typescript_graph
+                .context("roblox-ts configuration graph was not refreshed")?
+            {
                 Ok(graph) => graph,
                 Err(error) => {
                     crate::log_global(
@@ -1151,8 +1108,8 @@ pub(super) fn watch_build(
             } else {
                 typescript.desired = false;
             }
-            inputs = project_watch_inputs(loaded)?;
-            configure_project_watcher(&mut watcher, &mut watched, &inputs)?;
+            inputs = project_watch_inputs(loaded, args)?;
+            watcher.set_inputs(&inputs.files, &inputs.directories)?;
             if typescript.process.is_some() {
                 typescript.projection_pending = !build_after_roblox_ts(loaded, args, output);
             } else {

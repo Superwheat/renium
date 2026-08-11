@@ -2,10 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
 use globset::escape as escape_glob;
@@ -13,38 +11,40 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::editor_paths::infer_source_script;
-use crate::file_io::{atomic_write_file, service_settings_path, sha256_hex};
+use crate::file_io::{
+    atomic_write_file, create_unique_directory, path_extension_is, service_settings_path,
+    sha256_hex,
+};
 use crate::settings_bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, is_reference_object,
     reindex_reference_indices,
 };
 use crate::settings_tree::settings_children_by_parent;
-use crate::timing::current_millis;
 
 use super::adapter_format::{
-    adapter_format, is_supported_adapter_format, localization_csv_to_json, render_adapter,
+    AdapterFormat, adapter_format, localization_csv_to_json, render_adapter,
     validate_adapter_source,
 };
 use super::model_json::{contains_reference_value, stage_model_json};
 use super::projection_references::normalize_stage_references;
 use super::syncback::{
     is_nested_project_path, projection_instance_path_parts, stabilize_reference_indices,
-    write_file_transaction,
+    stabilize_reference_indices_with_paths, write_file_transaction,
 };
 use super::validation::{validate_nested_project, validate_project};
 use super::{
     AdapterDirection, AdapterSpec, CachedProjection, CompiledProjection, FilterDirection,
     FilterRule, FilterScope, LoadedProject, MetadataSidecar, MountOwnership, NESTED_STAGE_STACK,
     OwnedFilterCandidate, PROJECT_SCHEMA_VERSION, PROJECTION_CACHE, PROJECTION_IDENTITY_STACK,
-    PROJECTION_STAGE_SEQUENCE, PROJECTION_TRANSFORM_STACK, ProjectMount, ProjectNode,
-    ProjectTarget, ProjectionEntry, ProjectionFieldOwner, ProjectionIdentity, ProjectionStage,
-    ProjectionTransform, ScriptExtensionPolicy, SyncRule, absolute_path, active_target_ordinals,
-    cache_script_naming, compile_glob, filter_allows_scope, filter_path_segments,
-    load_nested_project, parse_jsonc_value, path_slash, project_script_naming,
-    project_source_roots, project_source_to_staged_relative, project_source_to_staged_relatives,
-    project_tree_nodes, projection_path_key, record_projection_identity,
-    relocate_cached_script_naming, remove_cached_script_naming, remove_empty_stage_parents,
-    resolve_project_write_path, validate_instance_target, with_project_target,
+    PROJECTION_TRANSFORM_STACK, ProjectMount, ProjectNode, ProjectTarget, ProjectionEntry,
+    ProjectionFieldOwner, ProjectionIdentity, ProjectionStage, ProjectionTransform,
+    ScriptExtensionPolicy, SyncRule, absolute_path, active_target_ordinals, cache_script_naming,
+    compile_glob, filter_allows_scope, filter_path_segments, load_nested_project,
+    parse_jsonc_value, path_slash, project_script_naming, project_source_roots,
+    project_source_to_staged_relative, project_source_to_staged_relatives, project_tree_nodes,
+    projection_path_key, record_projection_identity, relocate_cached_script_naming,
+    remove_cached_script_naming, remove_empty_stage_parents, resolve_project_write_path,
+    validate_instance_target, with_project_target,
 };
 
 pub(super) fn compile_projection(loaded: &LoadedProject) -> CompiledProjection {
@@ -134,25 +134,7 @@ pub fn project_requires_temporary_stage(loaded: &LoadedProject) -> Result<bool> 
 }
 
 pub(super) fn fresh_projection_stage(parent: &Path, prefix: &str) -> Result<PathBuf> {
-    fs::create_dir_all(parent)?;
-    for _ in 0..1_000 {
-        let sequence = PROJECTION_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = parent.join(format!(
-            "{prefix}{}-{}-{sequence}",
-            std::process::id(),
-            current_millis()
-        ));
-        match fs::create_dir(&root) {
-            Ok(()) => return Ok(root),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to create projection stage {}", root.display())
-                });
-            }
-        }
-    }
-    bail!("Could not allocate a fresh projection stage")
+    create_unique_directory(parent, prefix)
 }
 
 pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
@@ -369,12 +351,7 @@ fn patch_cached_projection_scripts(
 ) -> Result<bool> {
     let mut writes = Vec::new();
     for source in changed_sources {
-        if !source.is_file()
-            || !source
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|extension| matches!(extension, "lua" | "luau"))
-        {
+        if !source.is_file() || !path_extension_is(source, &["lua", "luau"]) {
             return Ok(false);
         }
         let relatives = project_source_to_staged_relatives(loaded, source)?;
@@ -383,11 +360,7 @@ fn patch_cached_projection_scripts(
         }
         let bytes = fs::read(source)?;
         for relative in relatives {
-            if !relative
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|extension| matches!(extension, "lua" | "luau"))
-            {
+            if !path_extension_is(&relative, &["lua", "luau"]) {
                 return Ok(false);
             }
             let destination = cache_root.join(relative);
@@ -743,18 +716,11 @@ fn stage_mount_target(
         stage_nested_project_at_target(&nested, stage, target)?;
         return Ok(());
     }
-    if matches!(
-        source.extension().and_then(OsStr::to_str),
-        Some("rbxm" | "rbxmx")
-    ) {
+    if path_extension_is(&source, &["rbxm", "rbxmx"]) {
         import_model_at_target(stage, target, &source)?;
         return Ok(());
     }
-    if source
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension == "renium")
-    {
+    if path_extension_is(&source, &["renium"]) {
         merge_settings_mount(stage, target, &source)?;
         return Ok(());
     }
@@ -783,17 +749,27 @@ fn stage_adapter_target(
 ) -> Result<()> {
     let source = loaded.root.join(&adapter.source);
     let format = adapter_format(adapter)?;
-    validate_adapter_source(&source, &format)?;
-    match format.as_str() {
-        "txt" => stage_text_value(stage, target, &source),
-        "csv" => stage_localization_table(stage, target, &source),
-        "model-json" => stage_model_json(stage, target, &source),
-        "rbxm" | "rbxmx" => import_model_at_target(stage, target, &source),
-        "nested-project" => {
-            let nested = load_nested_project(&source)?;
+    validate_adapter_source(&source, format)?;
+    stage_adapter_format(loaded, stage, target, &source, format)
+}
+
+fn stage_adapter_format(
+    loaded: &LoadedProject,
+    stage: &Path,
+    target: &[String],
+    source: &Path,
+    format: AdapterFormat,
+) -> Result<()> {
+    match format {
+        AdapterFormat::Text => stage_text_value(stage, target, source),
+        AdapterFormat::Csv => stage_localization_table(stage, target, source),
+        AdapterFormat::ModelJson => stage_model_json(stage, target, source),
+        AdapterFormat::Rbxm | AdapterFormat::Rbxmx => import_model_at_target(stage, target, source),
+        AdapterFormat::NestedProject => {
+            let nested = load_nested_project(source)?;
             stage_nested_project_at_target(&nested, stage, target)
         }
-        _ => stage_module_data(loaded, stage, target, &source, &format),
+        _ => stage_module_data(loaded, stage, target, source, format),
     }
 }
 
@@ -831,7 +807,7 @@ fn stage_module_data(
     stage: &Path,
     target: &[String],
     source: &Path,
-    format: &str,
+    format: AdapterFormat,
 ) -> Result<()> {
     let bytes = render_adapter(source, format)?;
     let output = adapter_target_script_path(loaded, stage, target);
@@ -876,29 +852,25 @@ fn update_stage_instance(
     } else {
         crate::rbx_model::source_only_settings_document(&service_dir, service)?
     };
+    let mut children_by_parent = settings_children_by_parent(&document);
     let mut parent_index = 0usize;
     for (position, name) in target.iter().enumerate().skip(1) {
         let final_node = position + 1 == target.len();
         let expected_class = if final_node { class_name } else { "Folder" };
-        let matches = document
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| {
-                instance.parent_index == Some(parent_index) && instance.name == *name
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let candidates = children_by_parent
+            .get(parent_index)
+            .map_or(&[][..], Vec::as_slice);
         let ordinal = ordinals.get(position).copied();
-        if ordinal.is_none() && matches.len() > 1 {
+        let selected = ordinal.unwrap_or(1);
+        let (matched, match_count) = select_named_child(&document, candidates, name, selected);
+        if ordinal.is_none() && match_count > 1 {
             bail!(
                 "Projection target '{}' is ambiguous because '{}' has duplicate children",
                 target.join("."),
                 name
             );
         }
-        let selected = ordinal.unwrap_or(1);
-        if selected > matches.len() + 1 {
+        if selected > match_count + 1 {
             bail!(
                 "Projection target '{}' cannot create ordinal {} for '{}' before ordinal {} exists",
                 target.join("."),
@@ -907,7 +879,7 @@ fn update_stage_instance(
                 selected - 1
             );
         }
-        let index = if let Some(index) = matches.get(selected - 1).copied() {
+        let index = if let Some(index) = matched {
             if final_node && document.instances[index].class_name != expected_class {
                 if document.instances[index].class_name == "Folder"
                     && matches!(
@@ -955,6 +927,8 @@ fn update_stage_instance(
                 expected_class.to_string(),
                 Some(parent_index),
             ));
+            children_by_parent.push(Vec::new());
+            children_by_parent[parent_index].push(index);
             index
         };
         parent_index = index;
@@ -1585,6 +1559,25 @@ pub(super) fn find_document_target_optional(
     find_document_target_optional_with_ordinals(document, target, &active_target_ordinals(target))
 }
 
+fn select_named_child(
+    document: &SettingsBytecode,
+    candidates: &[usize],
+    name: &str,
+    selected: usize,
+) -> (Option<usize>, usize) {
+    let mut found = None;
+    let mut count = 0;
+    for index in candidates.iter().copied() {
+        if document.instances[index].name == name {
+            count += 1;
+            if count == selected {
+                found = Some(index);
+            }
+        }
+    }
+    (found, count)
+}
+
 pub(super) fn find_document_target_optional_with_ordinals(
     document: &SettingsBytecode,
     target: &[String],
@@ -1593,32 +1586,36 @@ pub(super) fn find_document_target_optional_with_ordinals(
     if !ordinals.is_empty() && ordinals.len() != target.len() {
         bail!("Projection target ordinals must contain one value per segment");
     }
+    let roots = document
+        .instances
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instance)| instance.parent_index.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    let children_by_parent = settings_children_by_parent(document);
     let mut parent = None;
     let mut found = None;
     for (depth, name) in target.iter().enumerate() {
-        let matches = document
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| instance.parent_index == parent && instance.name == *name)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+        let candidates = parent.map_or(roots.as_slice(), |index| {
+            children_by_parent.get(index).map_or(&[][..], Vec::as_slice)
+        });
+        let selected = ordinals.get(depth).copied().unwrap_or(1);
+        let (matched, match_count) = select_named_child(document, candidates, name, selected);
+        found = matched;
+        if match_count == 0 {
             return Ok(None);
         }
         let ordinal = ordinals.get(depth).copied();
-        if ordinal.is_none() && matches.len() > 1 {
+        if ordinal.is_none() && match_count > 1 {
             bail!(
                 "Projection target '{}' is ambiguous at '{}'",
                 target.join("."),
                 name
             );
         }
-        let selected = ordinal.unwrap_or(1);
-        if selected > matches.len() {
+        if selected > match_count {
             return Ok(None);
         }
-        found = matches.get(selected - 1).copied();
         parent = found;
     }
     Ok(found)
@@ -1676,25 +1673,38 @@ pub(super) fn clear_stage_target_children(stage: &Path, target: &[String]) -> Re
     if removed.is_empty() {
         return Ok(());
     }
-    let original_instances = document.instances.clone();
-    let parent_ids = original_instances
+    let paths = projection_instance_path_parts(&document);
+    let settings_ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    let parent_ids = document
+        .instances
         .iter()
         .map(|instance| {
             instance
                 .parent_index
-                .and_then(|parent| original_instances.get(parent))
-                .map(|parent| parent.settings_id.clone())
+                .and_then(|parent| settings_ids.get(parent))
+                .cloned()
         })
         .collect::<Vec<_>>();
     for instance in &mut document.instances {
-        stabilize_reference_indices(&mut instance.properties, &original_instances);
-        stabilize_reference_indices(&mut instance.attributes, &original_instances);
+        stabilize_reference_indices_with_paths(&mut instance.properties, &paths, |index| {
+            settings_ids.get(index).map(String::as_str)
+        });
+        stabilize_reference_indices_with_paths(&mut instance.attributes, &paths, |index| {
+            settings_ids.get(index).map(String::as_str)
+        });
     }
     let mut retained_parent_ids = Vec::new();
     let mut instances = Vec::with_capacity(document.instances.len() - removed.len());
-    for (index, instance) in document.instances.iter().enumerate() {
+    for (index, instance) in std::mem::take(&mut document.instances)
+        .into_iter()
+        .enumerate()
+    {
         if !removed.contains(&index) {
-            instances.push(instance.clone());
+            instances.push(instance);
             retained_parent_ids.push(parent_ids[index].clone());
         }
     }
@@ -1760,7 +1770,7 @@ pub(super) fn validate_sync_middleware(value: &str) -> Result<()> {
     if !matches!(
         normalized.as_str(),
         "ignore" | "modulescript" | "serverscript" | "clientscript" | "pluginscript"
-    ) && !is_supported_adapter_format(&normalized)
+    ) && AdapterFormat::parse(&normalized).is_none()
     {
         bail!("Unsupported sync middleware '{value}'");
     }
@@ -1881,8 +1891,11 @@ pub(super) fn is_metadata_sidecar(path: &Path) -> bool {
 }
 
 fn metadata_sidecar_stem(name: &str) -> Option<&str> {
-    name.strip_suffix(".meta.jsonc")
-        .or_else(|| name.strip_suffix(".meta.json"))
+    [".meta.jsonc", ".meta.json"].iter().find_map(|suffix| {
+        name.get(name.len().checked_sub(suffix.len())?..)
+            .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+            .map(|_| &name[..name.len() - suffix.len()])
+    })
 }
 
 pub(super) fn projection_settings_id(kind: &str, value: &str) -> String {
@@ -1922,17 +1935,20 @@ fn stage_source_directory(
     }
     fs::create_dir_all(destination)?;
     let source = absolute_path(source);
-    let claimed_sources = projection_source_owner_paths(loaded);
+    let source_key = projection_path_key(&source);
+    let claimed_sources = projection_source_owner_paths(loaded)
+        .into_iter()
+        .map(|path| projection_path_key(&path))
+        .collect::<Vec<_>>();
     let mut transformed = Vec::new();
     let mut sidecars = Vec::new();
     let entries = walkdir::WalkDir::new(&source)
         .into_iter()
         .filter_entry(|entry| {
-            !claimed_sources.iter().any(|claim| {
-                projection_path_key(entry.path()) == projection_path_key(claim)
-                    && (!owns_source
-                        || projection_path_key(entry.path()) != projection_path_key(&source))
-            })
+            let entry_key = projection_path_key(entry.path());
+            !claimed_sources
+                .iter()
+                .any(|claim| entry_key == *claim && (!owns_source || entry_key != source_key))
         });
     for entry in entries {
         let entry = entry?;
@@ -2104,15 +2120,14 @@ fn stage_sync_rule(
                 None,
             )
         }
-        "txt" => stage_text_value(stage, &target, source),
-        "csv" => stage_localization_table(stage, &target, source),
-        "model-json" => stage_model_json(stage, &target, source),
-        "rbxm" | "rbxmx" => import_model_at_target(stage, &target, source),
-        "nested-project" => {
-            let nested = load_nested_project(source)?;
-            stage_nested_project_at_target(&nested, stage, &target)
-        }
-        format => stage_module_data(loaded, stage, &target, source, format),
+        format => stage_adapter_format(
+            loaded,
+            stage,
+            &target,
+            source,
+            AdapterFormat::parse(format)
+                .with_context(|| format!("Unsupported sync middleware '{format}'"))?,
+        ),
     }
 }
 
@@ -2265,9 +2280,7 @@ pub(super) fn nested_project_targets(
             continue;
         }
         let source = loaded.root.join(&adapter.source);
-        if source.is_file()
-            && normalize_sync_middleware(&adapter_format(adapter)?) == "nested-project"
-        {
+        if source.is_file() && adapter_format(adapter)? == AdapterFormat::NestedProject {
             let mut nested_target = prefix.to_vec();
             nested_target.extend(target_segments(&adapter.target)?);
             projects.push((nested_target, load_nested_project(&source)?));
@@ -2489,7 +2502,7 @@ pub(super) fn projection_field_owners_with_root(
                 continue;
             }
             let source = loaded.root.join(&adapter.source);
-            if source.is_file() && adapter_format(adapter)? == "nested-project" {
+            if source.is_file() && adapter_format(adapter)? == AdapterFormat::NestedProject {
                 nested.push((target_segments(&adapter.target)?, source));
             }
         }
@@ -2715,8 +2728,7 @@ fn stage_target_class(stage: &Path, target: &[String]) -> Result<Option<String>>
     } else {
         crate::rbx_model::source_only_settings_document(&service_dir, service)?
     };
-    Ok(find_document_target(&document, target)
-        .ok()
+    Ok(find_document_target_optional(&document, target)?
         .map(|index| document.instances[index].class_name.clone()))
 }
 
@@ -2742,7 +2754,7 @@ fn override_stage_identity(
     } else {
         crate::rbx_model::source_only_settings_document(&service_dir, service)?
     };
-    let Ok(index) = find_document_target(&document, target) else {
+    let Some(index) = find_document_target_optional(&document, target)? else {
         return Ok(());
     };
     if let Some(settings_id) = settings_id {
@@ -2763,11 +2775,13 @@ fn override_stage_identity(
 }
 
 pub(super) fn refresh_stage_settings(stage: &Path) -> Result<()> {
-    let mut service_dirs = fs::read_dir(stage)?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
+    let mut service_dirs = Vec::new();
+    for entry in fs::read_dir(stage)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            service_dirs.push(entry.path());
+        }
+    }
     service_dirs.sort();
     for service_dir in service_dirs {
         refresh_stage_service_settings(&service_dir)?;

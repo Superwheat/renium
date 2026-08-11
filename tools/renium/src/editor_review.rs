@@ -92,10 +92,14 @@ pub(super) fn is_externally_managed_editor_property(
         && class_name.eq_ignore_ascii_case("Players")
         && path_segments.len() == 1
         && path_segments[0].eq_ignore_ascii_case("Players")
-        && matches!(
-            property_name.to_ascii_lowercase().as_str(),
-            "maxplayers" | "maxplayersinternal" | "preferredplayers" | "preferredplayersinternal"
-        )
+        && [
+            "maxplayers",
+            "maxplayersinternal",
+            "preferredplayers",
+            "preferredplayersinternal",
+        ]
+        .iter()
+        .any(|candidate| property_name.eq_ignore_ascii_case(candidate))
 }
 
 pub(super) fn is_engine_managed_editor_property(
@@ -725,7 +729,10 @@ fn protected_enum_values_equal(previous: &Value, requested: &Value) -> bool {
         requested.get("name").and_then(Value::as_str),
     ) {
         (Some(previous), Some(requested)) => previous == requested,
-        _ => previous.get("value") == requested.get("value"),
+        _ => previous
+            .get("value")
+            .zip(requested.get("value"))
+            .is_some_and(|(previous, requested)| previous == requested),
     }
 }
 

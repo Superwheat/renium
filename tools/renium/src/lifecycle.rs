@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -187,14 +187,6 @@ impl LifecycleLock {
     }
 }
 
-struct LifecycleCleanupLock(PathBuf);
-
-impl Drop for LifecycleCleanupLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
-    }
-}
-
 struct LifecycleLockOwner {
     pid: u32,
     start: Option<String>,
@@ -202,15 +194,16 @@ struct LifecycleLockOwner {
 
 fn parse_lifecycle_lock_owner(value: &str) -> Option<LifecycleLockOwner> {
     let value = value.trim();
-    let fields = value.split('\t').collect::<Vec<_>>();
-    if fields.len() == 3
-        && !fields[1].is_empty()
-        && !fields[2].is_empty()
-        && let Ok(pid) = fields[0].parse::<u32>()
+    let mut fields = value.split('\t');
+    if let (Some(pid), Some(start), Some(token), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+        && !start.is_empty()
+        && !token.is_empty()
+        && let Ok(pid) = pid.parse::<u32>()
     {
         return Some(LifecycleLockOwner {
             pid,
-            start: Some(fields[1].to_string()),
+            start: Some(start.to_string()),
         });
     }
     let pid = value
@@ -384,7 +377,9 @@ pub(crate) fn acquire_lifecycle_lock() -> Result<LifecycleLock> {
                             .context("Failed to reserve stale lifecycle lock cleanup");
                     }
                 }
-                let cleanup = LifecycleCleanupLock(cleanup_path.clone());
+                let cleanup = crate::file_io::OnDrop::new(|| {
+                    let _ = fs::remove_dir(&cleanup_path);
+                });
                 let current = if path.is_dir() {
                     fs::read_to_string(path.join("owner")).ok()
                 } else {
@@ -1124,24 +1119,10 @@ fn renium_extension_is_installed() -> bool {
 }
 
 fn fresh_temp_dir(prefix: &str) -> Result<PathBuf> {
-    let root = lifecycle_state_dir()?.join("update-stages");
-    fs::create_dir_all(&root)?;
-    for attempt in 0..1_000_u32 {
-        let candidate = root.join(format!(
-            "{prefix}-{}-{}-{attempt}",
-            std::process::id(),
-            current_millis()
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to create {}", candidate.display()));
-            }
-        }
-    }
-    bail!("Could not allocate a fresh update stage")
+    crate::file_io::create_unique_directory(
+        &lifecycle_state_dir()?.join("update-stages"),
+        &format!("{prefix}-"),
+    )
 }
 
 fn cleanup_orphaned_update_stages() -> Result<()> {
@@ -1602,13 +1583,13 @@ fn extract_core_bundle(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
     } else {
         "renium"
     };
-    let mut executables = walkdir::WalkDir::new(destination)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file() && entry.file_name() == executable_name)
-        .map(walkdir::DirEntry::into_path)
-        .collect::<Vec<_>>();
+    let mut executables = Vec::new();
+    for entry in walkdir::WalkDir::new(destination).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() == executable_name {
+            executables.push(entry.into_path());
+        }
+    }
     executables.sort();
     if executables.len() != 1 {
         bail!(
@@ -1666,19 +1647,22 @@ fn recover_core_install(target_root: &Path) -> Result<()> {
     } else {
         "renium"
     };
-    let mut reserved = fs::read_dir(parent)?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| {
-            entry.file_name().to_str().is_some_and(|name| {
-                name.starts_with(".renium-previous-")
-                    || name.starts_with(".renium-core-previous-")
-                    || name.starts_with(".renium-install-")
-                    || name.starts_with(".renium-core-next-")
-            })
-        })
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
+    let mut reserved = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let reserved_name = entry.file_name().to_str().is_some_and(|name| {
+            name.starts_with(".renium-previous-")
+                || name.starts_with(".renium-core-previous-")
+                || name.starts_with(".renium-install-")
+                || name.starts_with(".renium-core-next-")
+        });
+        if reserved_name {
+            reserved.push(entry.path());
+        }
+    }
     reserved.sort();
     let backups = reserved
         .iter()
@@ -1992,7 +1976,7 @@ fn apply_staged_update_plan(
             install_shared_core_files(&plan.target, core_root)?;
         }
         #[cfg(not(windows))]
-        install_cli_update(&plan.target, core_root, &plan.stage, &plan.version)?;
+        install_cli_update(&plan.target, core_root)?;
     }
     Ok(())
 }
@@ -2180,19 +2164,14 @@ fn schedule_windows_update(plan: &DeferredUpdatePlan, core_root: Option<&Path>) 
 }
 
 #[cfg(not(windows))]
-fn install_cli_update(
-    target: &Path,
-    core_root: &Path,
-    _stage: &Path,
-    _version: &str,
-) -> Result<bool> {
+fn install_cli_update(target: &Path, core_root: &Path) -> Result<()> {
     if let Some(target_root) = managed_core_root(target) {
         let prepared = prepare_core_directory(core_root, &target_root)?;
         replace_core_directory(&target_root, &prepared)?;
     } else {
         install_shared_core_files(target, core_root)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
@@ -2426,8 +2405,9 @@ fn recover_file_install(target: &Path) -> Result<()> {
     }
     if parent.is_dir() {
         let prefix = format!(".{name}.");
-        for entry in fs::read_dir(parent)?.filter_map(std::result::Result::ok) {
-            if entry.file_type().is_ok_and(|kind| kind.is_file())
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
                 && entry.file_name().to_str().is_some_and(|entry_name| {
                     entry_name.starts_with(&prefix) && entry_name.ends_with(".new")
                 })
@@ -2792,7 +2772,7 @@ fn editor_platform(editor: &EditorExtensionInstall) -> Result<String> {
             output.status
         );
     }
-    let mut architectures = std::collections::BTreeSet::new();
+    let mut architecture = None;
     for text in [
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -2800,42 +2780,53 @@ fn editor_platform(editor: &EditorExtensionInstall) -> Result<String> {
         for token in
             text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
         {
-            match token.to_ascii_lowercase().as_str() {
-                "x64" | "x86_64" | "amd64" => {
-                    architectures.insert("x86_64");
+            let found = if ["x64", "x86_64", "amd64"]
+                .iter()
+                .any(|value| token.eq_ignore_ascii_case(value))
+            {
+                Some("x86_64")
+            } else if ["arm64", "aarch64"]
+                .iter()
+                .any(|value| token.eq_ignore_ascii_case(value))
+            {
+                Some("aarch64")
+            } else {
+                None
+            };
+            if let Some(found) = found {
+                if architecture.is_some_and(|current| current != found) {
+                    bail!(
+                        "{} reported multiple supported architectures from --version",
+                        editor.cli.display()
+                    );
                 }
-                "arm64" | "aarch64" => {
-                    architectures.insert("aarch64");
-                }
-                _ => {}
+                architecture = Some(found);
             }
         }
     }
-    if architectures.len() != 1 {
-        bail!(
+    let architecture = architecture.with_context(|| {
+        format!(
             "{} did not report one supported architecture from --version",
             editor.cli.display()
-        );
-    }
-    Ok(format!(
-        "{}-{}",
-        env::consts::OS,
-        architectures
-            .into_iter()
-            .next()
-            .expect("architecture count was validated")
-    ))
+        )
+    })?;
+    Ok(format!("{}-{architecture}", env::consts::OS))
 }
 
 fn group_editor_installs_by_platform(
     editors: &[EditorExtensionInstall],
 ) -> Result<BTreeMap<String, Vec<EditorExtensionInstall>>> {
     let mut groups = BTreeMap::<String, Vec<EditorExtensionInstall>>::new();
+    let mut platforms = HashMap::<PathBuf, String>::new();
     for editor in editors {
-        groups
-            .entry(editor_platform(editor)?)
-            .or_default()
-            .push(editor.clone());
+        let platform = if let Some(platform) = platforms.get(&editor.cli) {
+            platform.clone()
+        } else {
+            let platform = editor_platform(editor)?;
+            platforms.insert(editor.cli.clone(), platform.clone());
+            platform
+        };
+        groups.entry(platform).or_default().push(editor.clone());
     }
     Ok(groups)
 }

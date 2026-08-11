@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -13,8 +12,9 @@ use super::command_line::{EditorRevertArgs, ProjectSourceArgs, PushEditorChanges
 use super::editor_sync::push_editor_changes_with_warm_bridge;
 use super::editor_types::{EditorChangeSet, EditorHistoryEntry, EditorRevertManifest};
 use super::file_io::{
-    absolutize_under, path_key, read_json_file, resolve_project_root_if_present,
-    service_settings_path, write_json_file, write_utf8_file,
+    absolutize_under, create_unique_directory, path_key, read_json_file,
+    resolve_project_root_if_present, sanitize_ascii_identifier, service_settings_path,
+    write_json_file, write_utf8_file,
 };
 use super::project_layout::apply_configured_project_layout;
 use super::snapshot_export::parse_bridge_ports;
@@ -30,18 +30,8 @@ pub(super) struct EditorHistoryTransaction {
 
 impl EditorHistoryTransaction {
     fn create(project_root: &Path) -> Result<Self> {
-        static HISTORY_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let renium_root = project_root.join(".renium");
-        fs::create_dir_all(&renium_root)
-            .with_context(|| format!("Failed to create {}", renium_root.display()))?;
-        let stage_root = renium_root.join(format!(
-            ".editor-history-stage-{}-{}-{}",
-            std::process::id(),
-            current_millis(),
-            HISTORY_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&stage_root)
-            .with_context(|| format!("Failed to create {}", stage_root.display()))?;
+        let stage_root = create_unique_directory(&renium_root, ".editor-history-stage-")?;
         Ok(Self {
             stage_root,
             history_root: renium_root.join("editor-history"),
@@ -207,7 +197,7 @@ pub(super) fn save_editor_history_entries(
         return Ok(None);
     }
     let project_root = resolve_project_root_if_present(project_root_arg)?;
-    let transaction = EditorHistoryTransaction::create(&project_root)?;
+    let mut transaction = None;
     let mut seen = HashSet::new();
     let (source_before_by_index, source_errors_by_index) =
         fetch_editor_history_sources(bridge, &changes.history_entries);
@@ -258,6 +248,8 @@ pub(super) fn save_editor_history_entries(
                 .or_else(|| entry.path_segments.last().map(String::as_str))
                 .unwrap_or("item"),
         );
+        let transaction =
+            transaction.get_or_insert(EditorHistoryTransaction::create(&project_root)?);
         let entry_dir = transaction.stage_root.join(format!(
             "{created_unix_ms}-{sequence}-{}-{safe_name}",
             entry.service
@@ -301,7 +293,7 @@ pub(super) fn save_editor_history_entries(
         write_json_file(&entry_dir.join("manifest.json"), &manifest, false)?;
     }
 
-    Ok(Some(transaction))
+    Ok(transaction)
 }
 
 pub(super) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
@@ -319,12 +311,11 @@ pub(super) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
     let history_root = project_root.join(".renium").join("editor-history");
     let mut candidates = Vec::new();
     if history_root.exists() {
-        for entry in WalkDir::new(&history_root)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .filter(|entry| entry.file_name().to_string_lossy() == "manifest.json")
-        {
+        for entry in WalkDir::new(&history_root) {
+            let entry = entry?;
+            if !entry.file_type().is_file() || entry.file_name() != "manifest.json" {
+                continue;
+            }
             let manifest: EditorRevertManifest = read_json_file(entry.path())?;
             if let Some(service) = args.service.as_deref()
                 && manifest.service != service
@@ -430,14 +421,7 @@ pub(super) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
 }
 
 fn sanitize_history_component(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
+    let out = sanitize_ascii_identifier(value);
     if out.is_empty() {
         "item".to_string()
     } else {

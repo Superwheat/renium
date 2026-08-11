@@ -18,6 +18,14 @@ use super::{
 
 type MountTarget<'a> = (&'a ProjectTarget, &'a Path, MountOwnership);
 
+fn invalid_portable_filename_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+        )
+}
+
 pub(crate) fn validate_project(loaded: &LoadedProject) -> Result<()> {
     validate_project_header(loaded)?;
     let mount_targets = validate_mount_targets(loaded)?;
@@ -92,13 +100,7 @@ fn validate_project_header(loaded: &LoadedProject) -> Result<()> {
                 .as_str(),
         ),
     ] {
-        if suffix.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
-                )
-        }) {
+        if suffix.chars().any(invalid_portable_filename_character) {
             bail!("{field} contains characters that are invalid in portable file names");
         }
     }
@@ -269,33 +271,30 @@ fn validate_adapters(
             }
         }
         let format = adapter_format(adapter)?;
-        if adapter.direction != AdapterDirection::ToProject
-            && !matches!(format.as_str(), "txt" | "csv" | "model-json")
-        {
+        if adapter.direction != AdapterDirection::ToProject && !format.is_reversible() {
             bail!(
                 "Adapter {} uses {} in {:?}; this format is not reversible and must use to-project",
                 adapter.source.display(),
-                format,
+                format.as_str(),
                 adapter.direction
             );
         }
-        if format == "model-json" && target_segments(&adapter.target)?.len() < 2 {
+        if format == super::adapter_format::AdapterFormat::ModelJson
+            && target_segments(&adapter.target)?.len() < 2
+        {
             bail!(
                 "Model JSON adapter {} must target a child below a Studio service",
                 adapter.source.display()
             );
         }
         if adapter.direction == AdapterDirection::ToProject
-            && matches!(
-                format.as_str(),
-                "json" | "jsonc" | "toml" | "yaml" | "msgpack" | "markdown"
-            )
+            && format.generates_module()
             && !adapter.generated
         {
             bail!(
                 "Adapter {} uses a generated {} projection; set generated to true",
                 adapter.source.display(),
-                format
+                format.as_str()
             );
         }
         if adapter.direction != AdapterDirection::ToProject
@@ -335,10 +334,7 @@ fn validate_sync_rules_and_filters(loaded: &LoadedProject) -> Result<()> {
         validate_sync_middleware(&rule.middleware)
             .with_context(|| format!("Invalid syncRules[{index}].use"))?;
         if let Some(suffix) = rule.suffix.as_deref()
-            && (suffix.is_empty()
-                || suffix.contains('/')
-                || suffix.contains('\\')
-                || suffix.chars().any(char::is_control))
+            && (suffix.is_empty() || suffix.chars().any(invalid_portable_filename_character))
         {
             bail!("syncRules[{index}].suffix must be a non-empty file-name suffix");
         }

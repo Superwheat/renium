@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -11,11 +11,14 @@ use clap::Parser;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::bridge_server::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer, BridgeTarget};
+use crate::bridge_server::{
+    BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer, BridgeTarget, DEFAULT_EXPORT_CHUNK_SIZE,
+};
 use crate::bytecode_explorer::bytecode_explorer_batch_result;
+use crate::command_dispatch;
 use crate::command_line::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, AutomationArgs, BridgeConnectionArgs,
-    BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, EditorReviewDecisionArgs,
+    BytecodeExplorerBatchArgs, BytecodeFileArgs, Cli, EditorMutationArgs, EditorReviewDecisionArgs,
     ExecuteLuauArgs, ExportSnapshotsArgs, PluginConsoleOutputArgs, ProjectSourceArgs,
     PushEditorChangesArgs, ShotArgs, WaitUntilArgs,
 };
@@ -26,7 +29,7 @@ use crate::editor_sync::{
     apply_editor_delete_with_warm_bridge, apply_editor_property_with_warm_bridge,
     push_editor_changes_with_warm_bridge,
 };
-use crate::file_io::{absolutize_for_daemon, canonical_path, replace_file_with_backup};
+use crate::file_io::{absolutize_for_daemon, atomic_write_file, canonical_path, read_json_file};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::input_inject;
 use crate::local_transport::{
@@ -34,6 +37,7 @@ use crate::local_transport::{
     DAEMON_CONTROL_QUEUE_TIMEOUT, DAEMON_CONTROL_RESPONSE_TIMEOUT, MAX_DAEMON_LINE_BYTES,
     read_bounded_line,
 };
+use crate::output::capture_json_output;
 use crate::place_target::{place_matches, set_place_filter};
 use crate::snapshot_export::export_snapshots_with_warm_bridge;
 use crate::studio_automation::{
@@ -263,12 +267,24 @@ fn automation_cli_parameters(
 pub(super) fn send_automation_control_request(
     request: &automation::Request,
 ) -> Result<automation::Response> {
-    let mut stream = daemon_control_endpoints()
-        .into_iter()
-        .find_map(|address| {
-            TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).ok()
-        })
-        .context("Renium daemon is not running")?;
+    try_send_automation_control_request(request)?.context("Renium daemon is not running")
+}
+
+pub(super) fn try_send_automation_control_request(
+    request: &automation::Request,
+) -> Result<Option<automation::Response>> {
+    let Some(stream) = daemon_control_endpoints().into_iter().find_map(|address| {
+        TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).ok()
+    }) else {
+        return Ok(None);
+    };
+    send_automation_control_request_on_stream(stream, request).map(Some)
+}
+
+fn send_automation_control_request_on_stream(
+    mut stream: TcpStream,
+    request: &automation::Request,
+) -> Result<automation::Response> {
     let _ = stream.set_read_timeout(Some(DAEMON_CONTROL_RESPONSE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
     writeln!(stream, "{}", serde_json::to_string(request)?)?;
@@ -297,6 +313,54 @@ fn automation_string(object: &Map<String, Value>, key: &str) -> Option<String> {
         Value::Number(value) => Some(value.to_string()),
         _ => None,
     })
+}
+
+fn automation_bool(object: &Map<String, Value>, key: &str, default: bool) -> Result<bool> {
+    match object.get(key) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => bail!("p.{key} must be a boolean"),
+    }
+}
+
+fn automation_number<T>(object: &Map<String, Value>, key: &str, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(value) = automation_string(object, key) else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("p.{key} has an invalid numeric value: {error}"))
+}
+
+fn automation_strings(object: &Map<String, Value>, key: &str) -> Vec<String> {
+    match object.get(key) {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(value)) => value.split(',').map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn automation_bridge(
+    object: &Map<String, Value>,
+    default_wait: f64,
+) -> Result<BridgeConnectionArgs> {
+    let mut bridge = BridgeConnectionArgs::local(automation_number(
+        object,
+        "bridgeWaitSeconds",
+        default_wait,
+    )?);
+    if let Some(ports) = automation_string(object, "bridgePorts") {
+        bridge.ports = ports;
+    }
+    Ok(bridge)
 }
 
 fn automation_project_fingerprint(project: &Path, experience: &Path) -> Result<String> {
@@ -334,16 +398,15 @@ fn automation_experience_root(project_root: &Path) -> PathBuf {
 fn automation_manifest_identity(
     experience: &Path,
     project_root: &Path,
-) -> (Option<i64>, Option<i64>, Option<String>) {
-    let Ok(text) = fs::read_to_string(experience.join("renium.experience.json")) else {
-        return (None, None, None);
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return (None, None, None);
-    };
+) -> Result<(Option<i64>, Option<i64>, Option<String>)> {
+    let path = experience.join("renium.experience.json");
+    if !path.is_file() {
+        return Ok((None, None, None));
+    }
+    let value: Value = read_json_file(&path)?;
     let game_id = value.get("gameId").and_then(Value::as_i64);
     let Some(places) = value.get("places").and_then(Value::as_object) else {
-        return (game_id, None, None);
+        return Ok((game_id, None, None));
     };
     let wanted = canonical_path(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     for (alias, place) in places {
@@ -353,14 +416,14 @@ fn automation_manifest_identity(
         let candidate =
             canonical_path(&experience.join(root)).unwrap_or_else(|_| experience.join(root));
         if candidate == wanted {
-            return (
+            return Ok((
                 game_id,
                 place.get("placeId").and_then(Value::as_i64),
                 Some(alias.clone()),
-            );
+            ));
         }
     }
-    (game_id, None, None)
+    Ok((game_id, None, None))
 }
 
 fn automation_client_matches(entry: &Value, selector: &str) -> bool {
@@ -514,7 +577,14 @@ fn automation_bind(
     })?;
     let experience = automation_experience_root(&project_root);
     let (manifest_game_id, manifest_place_id, alias) =
-        automation_manifest_identity(&experience, &project_root);
+        automation_manifest_identity(&experience, &project_root).map_err(|error| {
+            automation::Failure::new(
+                "no_project",
+                format!("{error:#}"),
+                false,
+                "project-validate",
+            )
+        })?;
     let requested_place =
         automation_string(object, "place").filter(|value| !value.trim().is_empty());
     let selector =
@@ -765,7 +835,7 @@ fn automation_payload_args(parameters: &Value) -> Result<Vec<String>> {
     Ok(arguments)
 }
 
-fn automation_spawn_cli(
+fn automation_local_command(
     operation: u16,
     context: &automation::BoundContext,
     parameters: &Value,
@@ -794,15 +864,11 @@ fn automation_spawn_cli(
         71 => "doctor",
         _ => bail!("Unsupported local automation opcode {operation}"),
     };
-    let mut arguments = Vec::new();
+    let mut arguments = vec!["renium".to_string()];
     if operation != 70 {
         arguments.extend(["--project".to_string(), context.project.clone()]);
     }
-    arguments.extend([
-        "--output-mode".to_string(),
-        "json".to_string(),
-        command.to_string(),
-    ]);
+    arguments.push(command.to_string());
     if matches!(
         operation,
         20 | 21 | 22 | 30 | 31 | 32 | 33 | 34 | 35 | 36 | 40 | 41
@@ -820,25 +886,16 @@ fn automation_spawn_cli(
             automation_source_dir(context)?.display().to_string(),
         ]);
     }
-    arguments.extend(automation_local_cli_args(operation, parameters)?);
-    let output = Command::new(std::env::current_exe()?)
-        .args(&arguments)
-        .current_dir(&context.root)
-        .output()
-        .with_context(|| format!("Failed to execute automation operation {operation}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        bail!("{}", if stderr.is_empty() { stdout } else { stderr });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(json!({}));
-    }
-    serde_json::from_str(&stdout).or_else(|_| Ok(json!({ "out": stdout })))
+    arguments.extend(automation_local_cli_args(operation, context, parameters)?);
+    let cli = Cli::try_parse_from(arguments).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    capture_json_output(|| command_dispatch::dispatch(cli.command, cli.project.as_deref()))
 }
 
-fn automation_local_cli_args(operation: u16, parameters: &Value) -> Result<Vec<String>> {
+fn automation_local_cli_args(
+    operation: u16,
+    context: &automation::BoundContext,
+    parameters: &Value,
+) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
     let mut flags = object.clone();
     for key in [
@@ -860,6 +917,29 @@ fn automation_local_cli_args(operation: u16, parameters: &Value) -> Result<Vec<S
         flags.remove("path");
     }
     let mut arguments = Vec::new();
+    let path_fields: &[(&str, &str)] = match operation {
+        30 | 31 => &[("settingsFile", "--settings-file")],
+        32 => &[
+            ("settingsFile", "--settings-file"),
+            ("sourceFile", "--source-file"),
+        ],
+        40 => &[("model", "--model")],
+        41 | 42 | 45 => &[("output", "--output")],
+        _ => &[],
+    };
+    for (key, flag) in path_fields {
+        if let Some(value) = flags.remove(*key) {
+            let path = value
+                .as_str()
+                .with_context(|| format!("p.{key} must be a path string"))?;
+            arguments.extend([
+                (*flag).to_string(),
+                automation_context_path(context, PathBuf::from(path))
+                    .display()
+                    .to_string(),
+            ]);
+        }
+    }
     for (key, flag) in [("pathSegments", "--path"), ("pathOrdinals", "--ords")] {
         if let Some(value) = flags.remove(key) {
             arguments.push(format!("{flag}={}", serde_json::to_string(&value)?));
@@ -889,7 +969,12 @@ fn automation_local_cli_args(operation: u16, parameters: &Value) -> Result<Vec<S
             .remove("snapshotDir")
             .and_then(|value| value.as_str().map(str::to_string))
         {
-            arguments.extend(["--snapshot-dir".to_string(), snapshot_dir]);
+            arguments.extend([
+                "--snapshot-dir".to_string(),
+                automation_context_path(context, PathBuf::from(snapshot_dir))
+                    .display()
+                    .to_string(),
+            ]);
         }
         if let Some(services) = flags.remove("services") {
             let services = automation_string_list(&services)
@@ -939,61 +1024,39 @@ fn automation_pull_args(
     import: bool,
 ) -> Result<ExportSnapshotsArgs> {
     let object = parameters.as_object().context("p must be an object")?;
-    let source_dir = automation_source_dir(context)?;
-    let mut arguments = vec![
-        "-r".to_string(),
-        context.root.clone(),
-        "--src-dir".to_string(),
-        source_dir.display().to_string(),
-        "-d".to_string(),
-        automation_context_path(
+    Ok(ExportSnapshotsArgs {
+        project_root: PathBuf::from(&context.root),
+        src_dir: automation_source_dir(context)?,
+        snapshot_dir: automation_context_path(
             context,
             PathBuf::from(
                 automation_string(object, "snapshotDir")
                     .unwrap_or_else(|| ".renium/snapshots".to_string()),
             ),
-        )
-        .display()
-        .to_string(),
-        "-w".to_string(),
-        automation_string(object, "bridgeWaitSeconds").unwrap_or_else(|| "2".to_string()),
-        "-P".to_string(),
-        automation_string(object, "bridgePorts").unwrap_or_else(|| "8781,8782".to_string()),
-        "-q".to_string(),
-    ];
-    if import {
-        arguments.push("-i".to_string());
-    } else {
-        arguments.push("--no-import".to_string());
-    }
-    if let Some(services) = object.get("services") {
-        let services = automation_string_list(services).unwrap_or_default();
-        arguments.extend(["-s".to_string(), services]);
-    }
-    for (key, flag) in [
-        ("performanceMode", "--perf"),
-        ("chunkSize", "-c"),
-        ("sourceWorkers", "--sw"),
-        ("instanceWorkers", "--iw"),
-        ("importWorkers", "--mw"),
-        ("exportWorkers", "-x"),
-    ] {
-        if let Some(value) = automation_string(object, key) {
-            arguments.extend([flag.to_string(), value]);
-        }
-    }
-    for (key, flag) in [
-        ("modifiedDefaultBypass", "--mdb"),
-        ("exportAllProperties", "--all-props"),
-    ] {
-        if object.get(key).and_then(Value::as_bool) == Some(true) {
-            arguments.push(flag.to_string());
-        }
-    }
-    if object.get("adaptiveThrottle").and_then(Value::as_bool) == Some(false) {
-        arguments.push("--no-adaptive-throttle".to_string());
-    }
-    parse_daemon_request_args("export-snapshots", &arguments)
+        ),
+        services: object
+            .get("services")
+            .and_then(automation_string_list)
+            .unwrap_or_default(),
+        chunk_size: automation_number(object, "chunkSize", DEFAULT_EXPORT_CHUNK_SIZE)?,
+        adaptive_seed_batch: automation_number(object, "adaptiveSeedBatch", 0)?,
+        bridge: automation_bridge(object, 2.0)?,
+        run_import: import,
+        no_run_import: !import,
+        import_mode: automation_string(object, "importMode")
+            .unwrap_or_else(|| "direct".to_string()),
+        source_workers: automation_number(object, "sourceWorkers", 0)?,
+        instance_workers: automation_number(object, "instanceWorkers", 0)?,
+        import_workers: automation_number(object, "importWorkers", 0)?,
+        performance_mode: automation_string(object, "performanceMode")
+            .unwrap_or_else(|| "throughput".to_string()),
+        modified_default_bypass: automation_bool(object, "modifiedDefaultBypass", false)?,
+        no_modified_default_bypass: automation_bool(object, "noModifiedDefaultBypass", false)?,
+        no_adaptive_throttle: !automation_bool(object, "adaptiveThrottle", true)?,
+        export_all_properties: automation_bool(object, "exportAllProperties", false)?,
+        no_export_all_properties: automation_bool(object, "noExportAllProperties", false)?,
+        quiet_timings: true,
+    })
 }
 
 fn automation_push_args(
@@ -1002,50 +1065,28 @@ fn automation_push_args(
     reviewed: bool,
 ) -> Result<PushEditorChangesArgs> {
     let object = parameters.as_object().context("p must be an object")?;
-    let source_dir = automation_source_dir(context)?;
-    let mut arguments = vec![
-        "-r".to_string(),
-        context.root.clone(),
-        "-d".to_string(),
-        source_dir.display().to_string(),
-        "-w".to_string(),
-        automation_string(object, "bridgeWaitSeconds").unwrap_or_else(|| "2".to_string()),
-        "-P".to_string(),
-        automation_string(object, "bridgePorts").unwrap_or_else(|| "8781,8782".to_string()),
-        "--yes".to_string(),
-    ];
-    if !reviewed {
-        arguments.push("--no-review".to_string());
-    }
-    for (key, flag) in [
-        ("changedPaths", "-p"),
-        ("targetSettingsIds", "-i"),
-        ("targetProperties", "-t"),
-    ] {
-        if let Some(values) = object.get(key).and_then(Value::as_array) {
-            for value in values.iter().filter_map(Value::as_str) {
-                arguments.extend([flag.to_string(), value.to_string()]);
-            }
-        }
-    }
-    if object.get("verifySources").and_then(Value::as_bool) == Some(true) {
-        arguments.push("--verify-sources".to_string());
-    }
-    if object.get("upsertInstancesOnly").and_then(Value::as_bool) == Some(true) {
-        arguments.push("-u".to_string());
-    }
-    if object.get("overridePackages").and_then(Value::as_bool) == Some(true) {
-        arguments.push("--override-packages".to_string());
-    }
-    if let Some(cache) = automation_string(object, "linkCacheDir") {
-        arguments.extend([
-            "--link-cache-dir".to_string(),
-            automation_context_path(context, PathBuf::from(cache))
-                .display()
-                .to_string(),
-        ]);
-    }
-    parse_daemon_request_args("push-editor-changes", &arguments)
+    let mut args = PushEditorChangesArgs::new(
+        ProjectSourceArgs {
+            project_root: PathBuf::from(&context.root),
+            src_root: automation_source_dir(context)?,
+        },
+        automation_bridge(object, 2.0)?,
+    );
+    args.changed_paths = automation_strings(object, "changedPaths")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    args.target_settings_ids = automation_strings(object, "targetSettingsIds");
+    args.target_properties = automation_strings(object, "targetProperties");
+    args.verify_sources = automation_bool(object, "verifySources", false)?;
+    args.upsert_instances_only = automation_bool(object, "upsertInstancesOnly", false)?;
+    args.override_packages = automation_bool(object, "overridePackages", false)?;
+    args.link_cache_dir = automation_string(object, "linkCacheDir")
+        .map(PathBuf::from)
+        .map(|path| automation_context_path(context, path));
+    args.no_review = !reviewed;
+    args.yes = true;
+    Ok(args)
 }
 
 fn automation_editor_property_args(
@@ -1083,20 +1124,12 @@ fn automation_editor_mutation_args(
     object: &Map<String, Value>,
     operation: &str,
 ) -> Result<EditorMutationArgs> {
-    let mut bridge = BridgeConnectionArgs::local(
-        automation_string(object, "bridgeWaitSeconds")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(2.0),
-    );
-    if let Some(ports) = automation_string(object, "bridgePorts") {
-        bridge.ports = ports;
-    }
     Ok(EditorMutationArgs {
         project: ProjectSourceArgs {
             project_root: PathBuf::from(&context.root),
             src_root: source_dir,
         },
-        bridge,
+        bridge: automation_bridge(object, 2.0)?,
         service: automation_string(object, "service")
             .with_context(|| format!("{operation} requires p.service"))?,
         settings_id: automation_string(object, "settingsId"),
@@ -1152,12 +1185,12 @@ fn automation_bridge_args(parameters: &Value, positional: &[&str]) -> Result<Vec
 fn automation_place_alias(value: &str, place_id: i64) -> String {
     let mut output = String::new();
     let mut separator = false;
-    for character in value.to_ascii_lowercase().chars() {
+    for character in value.chars() {
         if character.is_ascii_alphanumeric() {
             if separator && !output.is_empty() {
                 output.push('_');
             }
-            output.push(character);
+            output.push(character.to_ascii_lowercase());
             separator = false;
         } else if character.is_ascii_whitespace() || character == '_' {
             separator = !output.is_empty();
@@ -1171,14 +1204,7 @@ fn automation_place_alias(value: &str, place_id: i64) -> String {
 }
 
 fn automation_write_experience(path: &Path, manifest: &Value) -> Result<()> {
-    let temporary = path.with_file_name(format!(
-        ".renium.experience.{}.{}.tmp",
-        std::process::id(),
-        current_millis()
-    ));
-    fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)
-        .with_context(|| format!("Failed to write {}", temporary.display()))?;
-    replace_file_with_backup(&temporary, path, "experience manifest")
+    atomic_write_file(path, &serde_json::to_vec_pretty(manifest)?)
 }
 
 fn automation_read_experience(context: &automation::BoundContext) -> Result<(PathBuf, Value)> {
@@ -1478,7 +1504,7 @@ fn automation_dispatch_operation(
             )?))
         }
         20 | 21 | 22 | 30..=37 | 40..=43 | 45 | 70 | 71 => {
-            automation_spawn_cli(operation, context, parameters)
+            automation_local_command(operation, context, parameters)
         }
         52 => {
             let file = parameters

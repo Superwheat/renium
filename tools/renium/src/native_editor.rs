@@ -33,11 +33,13 @@ use super::editor_types::{
     EditorBinaryExport, EditorBinaryExportGroup, EditorBinaryImport,
     EditorBinarySerializationBatch, EditorChangeSet, EditorPropertyChange,
 };
-use super::file_io::fnv1a_hex;
 #[cfg(any(windows, target_os = "macos"))]
 use super::file_io::sanitize_name;
+use super::file_io::{OnDrop, fnv1a_hex};
 #[cfg(windows)]
-use super::file_io::{absolutize_under, resolve_project_root_if_present, service_settings_path};
+use super::file_io::{
+    absolutize_under, path_extension_is, resolve_project_root_if_present, service_settings_path,
+};
 use super::property_schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
@@ -687,26 +689,6 @@ impl NativePriorityWorkerGate {
         *released = true;
         drop(released);
         self.ready.notify_all();
-    }
-}
-
-struct NativePriorityWorkerRelease<'a> {
-    gate: &'a NativePriorityWorkerGate,
-    armed: bool,
-}
-
-impl NativePriorityWorkerRelease<'_> {
-    fn release(&mut self) {
-        if self.armed {
-            self.gate.release();
-            self.armed = false;
-        }
-    }
-}
-
-impl Drop for NativePriorityWorkerRelease<'_> {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -1404,10 +1386,11 @@ pub(super) fn editor_binary_export_parts<'a>(
                     if worker_index >= priority_worker_count {
                         priority_gate.wait();
                     }
-                    let mut priority_release = NativePriorityWorkerRelease {
-                        gate: priority_gate,
-                        armed: priority_worker_count < worker_count && worker_index == 0,
-                    };
+                    let mut priority_release = OnDrop::new(|| {
+                        if priority_worker_count < worker_count && worker_index == 0 {
+                            priority_gate.release();
+                        }
+                    });
                     let mut priority_service = priority_groups.get(worker_index).copied();
                     loop {
                         let service = priority_service.take().or_else(|| {
@@ -1609,7 +1592,7 @@ pub(super) fn editor_binary_export_parts<'a>(
                         },
                         )
                         });
-                        priority_release.release();
+                        priority_release.run();
                         if sender.send(result).is_err() {
                             break;
                         }
@@ -1912,11 +1895,7 @@ pub(super) fn write_live_editor_place_snapshot(
     existing_place: Option<&Path>,
 ) -> Result<usize> {
     #[cfg(any(windows, target_os = "macos"))]
-    if output_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("rbxl"))
-    {
+    if path_extension_is(output_path, &["rbxl"]) {
         let pid = studio_pid_for_bridge(bridge)?;
         let title = studio_title_for_bridge(bridge, pid)?;
         match studio_native_serializer::write_live_place(pid, &title, output_path) {
@@ -2106,21 +2085,15 @@ fn send_editor_binary_import(
     transaction_id: &str,
 ) -> Result<Value> {
     const RAW_CHUNK_BYTES: usize = 2 * 1024 * 1024;
-    let started = Instant::now();
     let import_id = format!("{}-{}", current_millis(), fnv1a_hex(&binary_import.bytes));
-    let chunks = binary_import
-        .bytes
-        .par_chunks(RAW_CHUNK_BYTES)
-        .map(base64::encode)
-        .collect::<Vec<_>>();
-    log_timing("native editor import base64 encode", started);
+    let total_chunks = binary_import.bytes.len().div_ceil(RAW_CHUNK_BYTES);
     let started = Instant::now();
     bridge.call(
         "beginEditorBinaryImport",
         json!({
             "importId": &import_id,
             "totalBytes": binary_import.bytes.len(),
-            "totalChunks": chunks.len(),
+            "totalChunks": total_chunks,
             "instanceCount": binary_import.instance_count,
             "groups": &binary_import.groups,
             "externalReferencesPostApplied": binary_import.external_references_post_applied,
@@ -2130,16 +2103,18 @@ fn send_editor_binary_import(
     log_timing("native editor import begin", started);
     let import_result = (|| -> Result<Value> {
         let started = Instant::now();
-        let transfer_threads = bridge.channel_count().max(1).min(chunks.len());
+        let transfer_threads = bridge.channel_count().max(1).min(total_chunks.max(1));
         rayon::ThreadPoolBuilder::new()
             .num_threads(transfer_threads)
             .build()
             .context("Failed to initialize native import transfer workers")?
             .install(|| {
-                chunks
-                    .par_iter()
+                binary_import
+                    .bytes
+                    .par_chunks(RAW_CHUNK_BYTES)
                     .enumerate()
-                    .try_for_each(|(index, data)| -> Result<()> {
+                    .try_for_each(|(index, chunk)| -> Result<()> {
+                        let data = base64::encode(chunk);
                         bridge.call(
                             "appendEditorBinaryImport",
                             json!({

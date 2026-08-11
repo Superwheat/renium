@@ -395,7 +395,8 @@ impl MirrorLinkApply<'_> {
                 format!("Failed to read link source {}", pair.canonical.display())
             })?;
             let mirror_current = fs::read_to_string(&pair.mirror).ok();
-            let locally_edited = !target.read_only
+            let locally_edited = !target_forced
+                && !target.read_only
                 && mirror_current.as_ref().is_some_and(|current| {
                     target_lock
                         .files
@@ -452,7 +453,8 @@ impl MirrorLinkApply<'_> {
             .collect::<Vec<_>>();
         for key in stale_keys {
             let mirror = project_root.join(key.replace('/', std::path::MAIN_SEPARATOR_STR));
-            let locally_edited = !target.read_only
+            let locally_edited = !target_forced
+                && !target.read_only
                 && fs::read_to_string(&mirror).ok().is_some_and(|current| {
                     target_lock
                         .files
@@ -811,6 +813,9 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
 
     let mut meta_by_link: HashMap<String, LinkSourceMeta> = HashMap::new();
     let mut source_path_by_link: HashMap<String, PathBuf> = HashMap::new();
+    let mut package_fingerprints = HashMap::<PathBuf, Option<String>>::new();
+    let mut settings_documents = HashMap::<PathBuf, Option<SettingsBytecode>>::new();
+    let mut file_contents = HashMap::<PathBuf, Option<String>>::new();
     for target in &resolved {
         if let Some(source_path) = &target.source_path {
             meta_by_link
@@ -833,17 +838,25 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
         if let Some(package_path) = &target.package_source
             && target.resolved
         {
-            let expected_fingerprint = SettingsBytecode::read_file(package_path)
-                .and_then(|package| package_document_fingerprint(&package))
-                .ok();
+            let expected_fingerprint = package_fingerprints
+                .entry(package_path.clone())
+                .or_insert_with(|| {
+                    SettingsBytecode::read_file(package_path)
+                        .and_then(|package| package_document_fingerprint(&package))
+                        .ok()
+                })
+                .as_deref();
             let mut package_root_found = false;
             if let Some(storage) = target.storage.as_ref()
                 && let Some(settings_file) = storage.settings_file.as_ref()
-                && let Ok(doc) = SettingsBytecode::read_file(settings_file)
+                && let Some(doc) = settings_documents
+                    .entry(settings_file.clone())
+                    .or_insert_with(|| SettingsBytecode::read_file(settings_file).ok())
+                    .as_ref()
                 && let Ok((document_service, document_segments, document_ordinals)) =
-                    link_target_document_selector(target, &doc)
+                    link_target_document_selector(target, doc)
                 && let Some(root_index) = resolve_editor_instance_by_path_ordinals(
-                    &doc,
+                    doc,
                     &document_service,
                     &document_segments,
                     &document_ordinals,
@@ -851,11 +864,11 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             {
                 package_root_found = true;
                 let paths = build_editor_source_paths_by_index(
-                    &doc,
+                    doc,
                     &document_service,
                     &storage.source_root,
                 );
-                let children_by_parent = settings_children_by_parent(&doc);
+                let children_by_parent = settings_children_by_parent(doc);
                 let mut subtree = Vec::new();
                 collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
                 for index in &subtree {
@@ -868,9 +881,9 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
                     }
                 }
                 match (
-                    expected_fingerprint.as_deref(),
+                    expected_fingerprint,
                     package_target_fingerprint(
-                        &doc,
+                        doc,
                         &document_service,
                         &document_segments,
                         &document_ordinals,
@@ -889,7 +902,12 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             }
         }
         for pair in &target.files {
-            let mirror = fs::read_to_string(&pair.mirror).ok();
+            for path in [&pair.mirror, &pair.canonical] {
+                file_contents
+                    .entry(path.clone())
+                    .or_insert_with(|| fs::read_to_string(path).ok());
+            }
+            let mirror = file_contents.get(&pair.mirror).and_then(Option::as_ref);
             let mut file_drift = false;
             let exists = mirror.is_some();
             if target.resolved && !target.broken {
@@ -898,7 +916,7 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
                     drift = true;
                     file_drift = true;
                 } else {
-                    let canonical = fs::read_to_string(&pair.canonical).ok();
+                    let canonical = file_contents.get(&pair.canonical).and_then(Option::as_ref);
                     if mirror != canonical {
                         drift = true;
                         file_drift = true;
@@ -1963,6 +1981,19 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
             active_targets.len()
         );
     }
+    let mut target_settings_files = Vec::new();
+    for target in &active_targets {
+        if let Some(settings_file) =
+            resolve_link_target_storage(&project_root, &src_root, target, true)?.settings_file
+        {
+            target_settings_files.push(settings_file);
+        }
+    }
+    let settings_files = collect_project_settings_files(&src_root, target_settings_files)?;
+    let mut _settings_guards = Vec::with_capacity(settings_files.len());
+    for settings_file in &settings_files {
+        _settings_guards.push(acquire_settings_file_lock(settings_file)?);
+    }
     let link = manifest.links.remove(link_index);
 
     let mut touched_services = HashSet::new();
@@ -2054,14 +2085,7 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
     });
     transaction_removals.sort_by_key(|path| exact_path_key(path));
     transaction_removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
-    let mut settings_files = documents.keys().collect::<Vec<_>>();
-    settings_files.sort();
-    let mut guards = Vec::new();
-    for settings_file in settings_files {
-        guards.push(acquire_settings_file_lock(settings_file)?);
-    }
     apply_file_mutations(&transaction_writes, &transaction_removals)?;
-    drop(guards);
     prune_removed_source_dirs(&src_root, &transaction_removals);
     let mut changed_paths = documents
         .keys()

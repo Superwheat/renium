@@ -20,16 +20,13 @@ pub(super) fn normalize_stage_references(stage: &Path) -> Result<()> {
         }
         let settings_path = service_settings_path(&entry.path());
         if settings_path.is_file() {
-            paths.push(settings_path.clone());
             documents.push(SettingsBytecode::read_file(&settings_path)?);
+            paths.push(settings_path);
         }
     }
-    let originals = documents.clone();
     canonicalize_projection_references(&mut documents)?;
-    for ((settings_path, document), original) in paths.iter().zip(&documents).zip(&originals) {
-        if document != original {
-            document.write_file(settings_path)?;
-        }
+    for (settings_path, document) in paths.iter().zip(&documents) {
+        document.write_file(settings_path)?;
     }
     Ok(())
 }
@@ -116,16 +113,11 @@ fn canonicalize_projection_references(documents: &mut [SettingsBytecode]) -> Res
 pub(super) fn canonicalize_projection_document_map(
     documents: &mut HashMap<String, SettingsBytecode>,
 ) -> Result<()> {
-    let mut keys = documents.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    let mut values = keys
-        .iter()
-        .filter_map(|key| documents.get(key).cloned())
-        .collect::<Vec<_>>();
+    let mut entries = documents.drain().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let (keys, mut values): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
     canonicalize_projection_references(&mut values)?;
-    for (key, value) in keys.into_iter().zip(values) {
-        documents.insert(key, value);
-    }
+    documents.extend(keys.into_iter().zip(values));
     Ok(())
 }
 
@@ -342,11 +334,8 @@ fn canonicalize_record_references(
                         );
                     }
                 }
-                let keys = object.keys().cloned().collect::<Vec<_>>();
-                for key in keys {
-                    if let Some(value) = object.get_mut(&key) {
-                        visit(value, key == "Ref", index)?;
-                    }
+                for (key, value) in object.iter_mut() {
+                    visit(value, key == "Ref", index)?;
                 }
             }
             _ => {}

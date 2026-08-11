@@ -936,10 +936,10 @@ fn run_console_task(
     let outcome = (|| -> Result<ConsoleTaskOutcome> {
         let true_marker = format!("{token}_TRUE");
         let end_marker = format!("{token}_END");
+        let end_prefix = format!("{end_marker} ");
         let started = Instant::now();
         let deadline = started + Duration::from_secs_f64(poll_timeout);
         loop {
-            thread::sleep(Duration::from_millis(250));
             let console = bridge.call_for_selector(
                 "getConsoleOutput",
                 json!({ "limit": 100, "sinceSeq": since_seq }),
@@ -966,7 +966,7 @@ fn run_console_task(
                     if message.trim() == true_marker {
                         return Ok(ConsoleTaskOutcome::True(started.elapsed().as_secs_f64()));
                     }
-                    if let Some(rest) = message.trim().strip_prefix(&format!("{end_marker} ")) {
+                    if let Some(rest) = message.trim().strip_prefix(&end_prefix) {
                         return Ok(ConsoleTaskOutcome::End(rest.trim_end().to_string()));
                     }
                 }
@@ -977,6 +977,9 @@ fn run_console_task(
                      have a syntax error (check the client console)"
                 );
             }
+            thread::sleep(
+                Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     })();
     if let Some(execution_id) = execution_id {
@@ -996,15 +999,18 @@ pub(super) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
     let (x, y, z, label) = if let Some(pos) = args.pos.as_ref() {
-        let parts: Vec<f64> = pos
-            .split(',')
-            .map(|part| part.trim().parse::<f64>())
-            .collect::<Result<Vec<f64>, _>>()
-            .with_context(|| format!("--pos must be X,Y,Z numbers, got '{pos}'"))?;
-        if parts.len() != 3 {
+        let mut parts = pos.split(',');
+        let parse = |part: Option<&str>| {
+            part.and_then(|value| value.trim().parse::<f64>().ok())
+                .with_context(|| format!("--pos must be X,Y,Z numbers, got '{pos}'"))
+        };
+        let x = parse(parts.next())?;
+        let y = parse(parts.next())?;
+        let z = parse(parts.next())?;
+        if parts.next().is_some() {
             bail!("--pos must have exactly three components, got '{pos}'");
         }
-        (parts[0], parts[1], parts[2], pos.clone())
+        (x, y, z, pos.clone())
     } else {
         let path = args
             .target
@@ -1021,16 +1027,24 @@ pub(super) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
             .get("worldPosition")
             .and_then(Value::as_array)
             .context("getWorldPoint returned no worldPosition")?;
-        let coords: Vec<f64> = position.iter().filter_map(Value::as_f64).collect();
-        if coords.len() != 3 {
+        let [x, y, z] = position.as_slice() else {
             bail!("getWorldPoint returned malformed worldPosition");
-        }
+        };
+        let x = x
+            .as_f64()
+            .context("getWorldPoint returned malformed worldPosition")?;
+        let y = y
+            .as_f64()
+            .context("getWorldPoint returned malformed worldPosition")?;
+        let z = z
+            .as_f64()
+            .context("getWorldPoint returned malformed worldPosition")?;
         let label = point
             .get("fullName")
             .and_then(Value::as_str)
             .unwrap_or(path)
             .to_string();
-        (coords[0], coords[1], coords[2], label)
+        (x, y, z, label)
     };
     if !x.is_finite() || !y.is_finite() || !z.is_finite() || !args.timeout.is_finite() {
         bail!("Position coordinates and --timeout must be finite numbers");
@@ -1040,7 +1054,6 @@ pub(super) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
     let movement = if args.tp {
         format!(
             "\tch:PivotTo(CFrame.new(targetPos + Vector3.new(0, 4, 0)))\n\
-             \ttask.wait(0.2)\n\
              \tlocal dist = (ch:GetPivot().Position - targetPos).Magnitude\n\
              \tif dist < 8 then print('{token}_TRUE') return end\n\
              \tprint('{token}_END dist=' .. tostring(math.floor(dist + 0.5)))"
@@ -1655,10 +1668,7 @@ fn ingest_test_console_payload(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             println!("[{label} {level}] {message}");
-            if matches!(
-                level.to_ascii_lowercase().as_str(),
-                "error" | "messageerror"
-            ) {
+            if level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("messageerror") {
                 capture.errors.push(format!("{label}: {message}"));
             }
         }

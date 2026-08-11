@@ -84,10 +84,9 @@ fn editor_match_records(
     for (attribute, records) in [(false, &instance.properties), (true, &instance.attributes)] {
         for (name, value) in records {
             if !attribute
-                && matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "source" | "classname" | "name" | "parent" | "tags" | "meshsize"
-                )
+                && ["source", "classname", "name", "parent", "tags", "meshsize"]
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
             {
                 continue;
             }
