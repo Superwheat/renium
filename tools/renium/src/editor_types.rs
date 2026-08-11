@@ -326,6 +326,7 @@ pub(super) struct EditorBinarySerializationBatch {
 }
 
 pub(super) struct EditorBinaryExport {
+    #[cfg(windows)]
     pub(super) bytes: Vec<u8>,
     pub(super) groups: Vec<EditorBinaryExportGroup>,
     pub(super) serialization_batches: Vec<EditorBinarySerializationBatch>,

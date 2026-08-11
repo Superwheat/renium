@@ -43,6 +43,7 @@ struct CachedTrace {
     trace: SerializerTrace,
 }
 
+#[derive(Clone, Copy)]
 struct MachSection {
     address: u64,
     size: u64,
