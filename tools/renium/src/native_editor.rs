@@ -260,6 +260,7 @@ pub(super) fn begin_editor_binary_export(
             bail!("Studio native export omitted its property schema");
         }
         Ok(EditorBinaryExport {
+            #[cfg(windows)]
             bytes: Vec::new(),
             groups,
             serialization_batches,
