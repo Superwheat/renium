@@ -7,7 +7,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +17,8 @@ use serde_json::{Map, Value, json};
 
 use crate::editor_paths::infer_source_script;
 use crate::file_io::{
-    absolutize_for_daemon as absolute_path, atomic_write_file, exact_path_key as path_slash,
+    absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
+    exact_path_key as path_slash, is_windows_reserved_name, path_extension_is,
     service_settings_path,
 };
 use crate::settings_bytecode::SettingsBytecode;
@@ -31,14 +31,14 @@ mod projection_references;
 mod syncback;
 mod validation;
 
-use adapter_format::adapter_format;
+use adapter_format::{AdapterFormat, adapter_format};
 use jsonc::format_jsonc;
 pub(crate) use jsonc::parse_jsonc_value;
 
 use projection::{
     adapter_target_script_path, compile_projection, file_target_destination, is_metadata_sidecar,
-    metadata_sidecar_target, nested_project_targets, normalize_sync_middleware, path_is_ignored,
-    sync_rule_instance_name, sync_rule_matches, target_segments,
+    metadata_sidecar_target, nested_project_targets, path_is_ignored, sync_rule_instance_name,
+    sync_rule_matches, target_segments,
 };
 pub use projection::{
     compiled_files_to_studio_filters, compiled_files_to_studio_ignore_unknown_targets,
@@ -58,7 +58,6 @@ pub const PROJECT_FILE_NAME: &str = "renium.project.jsonc";
 pub const PROJECT_JSON_FILE_NAME: &str = "renium.project.json";
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const PROJECT_SCHEMA_URL: &str = "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json";
-static PROJECTION_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static SCRIPT_NAMING_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectScriptNaming>>> =
     OnceLock::new();
 static GLOB_MATCHER_CACHE: OnceLock<Mutex<HashMap<String, GlobMatcher>>> = OnceLock::new();
@@ -907,7 +906,7 @@ pub fn project_config_paths(loaded: &LoadedProject) -> Result<Vec<PathBuf>> {
                 continue;
             }
             let path = loaded.root.join(&adapter.source);
-            if path.is_file() && adapter_format(adapter)? == "nested-project" {
+            if path.is_file() && adapter_format(adapter)? == AdapterFormat::NestedProject {
                 collect(&load_nested_project(&path)?, paths, visited)?;
             }
         }
@@ -954,7 +953,7 @@ fn project_source_roots_into(
         }
         let source = loaded.root.join(&adapter.source);
         roots.insert(source.parent().unwrap_or(&loaded.root).to_path_buf());
-        if source.is_file() && adapter_format(adapter)? == "nested-project" {
+        if source.is_file() && adapter_format(adapter)? == AdapterFormat::NestedProject {
             project_source_roots_into(&load_nested_project(&source)?, roots, visited)?;
         }
         if let Some(output) = adapter.output.as_deref() {
@@ -1081,40 +1080,30 @@ fn resolve_project_write_segments_inner(
         }
     }
     let longest = candidates.iter().map(|candidate| candidate.0).max();
-    let selected = longest.and_then(|length| {
+    if let Some(longest) = longest {
         let mut matches = candidates
-            .iter()
-            .filter(|candidate| candidate.0 == length)
-            .collect::<Vec<_>>();
-        matches.sort_by(|left, right| left.1.cmp(right.1).then(left.2.cmp(&right.2)));
-        if matches.len() == 1 {
-            matches.pop()
-        } else {
-            None
+            .into_iter()
+            .filter(|candidate| candidate.0 == longest);
+        let (_, owner, path, source_root, writable) =
+            matches.next().expect("longest owner candidate disappeared");
+        if matches.next().is_some() {
+            bail!(
+                "Projected path '{}' has more than one equally specific owner",
+                segments.join("/")
+            );
         }
-    });
-    if longest.is_some() && selected.is_none() {
-        bail!(
-            "Projected path '{}' has more than one equally specific owner",
-            segments.join("/")
-        );
-    }
-    if let Some((_, owner, path, source_root, writable)) = selected {
         if !writable {
             bail!(
                 "Projected path '{}' is owned by a non-writable {owner}",
                 segments.join("/")
             );
         }
-        if source_root.is_file() && segments.len() > longest.unwrap_or_default() {
-            if is_nested_project_path(source_root) {
-                let nested = load_nested_project(source_root)?;
-                let mut resolved = resolve_project_write_segments_inner(
-                    &nested,
-                    &segments[longest.unwrap_or_default()..],
-                    true,
-                )?;
-                resolved.consumed_segments += longest.unwrap_or_default();
+        if source_root.is_file() && segments.len() > longest {
+            if is_nested_project_path(&source_root) {
+                let nested = load_nested_project(&source_root)?;
+                let mut resolved =
+                    resolve_project_write_segments_inner(&nested, &segments[longest..], true)?;
+                resolved.consumed_segments += longest;
                 return Ok(resolved);
             }
             bail!(
@@ -1124,10 +1113,10 @@ fn resolve_project_write_segments_inner(
             );
         }
         return Ok(ProjectWriteResolution {
-            path: path.clone(),
-            source_root: source_root.clone(),
+            path,
+            source_root,
             owner,
-            consumed_segments: longest.unwrap_or_default(),
+            consumed_segments: longest,
             naming: project_script_naming(&loaded.project),
         });
     }
@@ -1268,12 +1257,7 @@ fn collect_generated_adapter_staged_paths(
         }
         let adapter_source = absolute_path(&loaded.root.join(&adapter.source));
         let format = adapter_format(adapter)?;
-        if adapter_source == source
-            && !matches!(
-                format.as_str(),
-                "txt" | "csv" | "model-json" | "rbxm" | "rbxmx" | "nested-project"
-            )
-        {
+        if adapter_source == source && format.generates_module() {
             let mut target = prefix.to_vec();
             target.extend(target_segments(&adapter.target)?);
             let path = adapter_target_script_path(loaded, stage_root, &target);
@@ -1435,7 +1419,7 @@ fn project_target_source_mappings(
             add(
                 target,
                 source,
-                normalize_sync_middleware(&adapter_format(adapter)?) == "nested-project",
+                adapter_format(adapter)? == AdapterFormat::NestedProject,
             )?;
         }
         visiting.remove(&project_path);
@@ -1880,15 +1864,7 @@ pub fn run_adapters(args: AdaptersArgs, global_project: Option<&Path>) -> Result
 
 pub fn run_import_rojo(args: ImportRojoArgs) -> Result<()> {
     let source = if args.project.is_dir() {
-        let mut candidates = fs::read_dir(&args.project)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.ends_with(".project.json"))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
+        let candidates = rojo_project_files(&args.project)?;
         match candidates.as_slice() {
             [only] => only.clone(),
             [] => bail!(
@@ -2145,17 +2121,20 @@ fn rojo_project_files(directory: &Path) -> Result<Vec<PathBuf>> {
     if !directory.is_dir() {
         return Ok(Vec::new());
     }
-    let mut projects = fs::read_dir(directory)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| {
-                    let name = name.to_ascii_lowercase();
-                    name.ends_with(".project.json") && name != PROJECT_JSON_FILE_NAME
-                })
-        })
-        .collect::<Vec<_>>();
+    let mut projects = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                ends_with_ignore_ascii_case(name, ".project.json")
+                    && !name.eq_ignore_ascii_case(PROJECT_JSON_FILE_NAME)
+            })
+        {
+            projects.push(path);
+        }
+    }
     projects.sort();
     Ok(projects)
 }
@@ -2207,7 +2186,7 @@ fn validate_config_scope_change(
 }
 
 fn validate_merged_config(value: &Value) -> Result<()> {
-    fn require_kind(path: &str, _value: &Value, expected: &str, valid: bool) -> Result<()> {
+    fn require_kind(path: &str, expected: &str, valid: bool) -> Result<()> {
         if !valid {
             bail!("Configuration key '{path}' must be {expected}");
         }
@@ -2226,12 +2205,9 @@ fn validate_merged_config(value: &Value) -> Result<()> {
             };
             match path.as_str() {
                 "gitSync" | "wallySync" | "liveSync" | "link" => visit(&path, value)?,
-                "schemaVersion" => {
-                    require_kind(&path, value, "the integer 1", value.as_u64() == Some(1))?
-                }
+                "schemaVersion" => require_kind(&path, "the integer 1", value.as_u64() == Some(1))?,
                 "services" | "gitSync.stagePaths" => require_kind(
                     &path,
-                    value,
                     "an array of strings",
                     value
                         .as_array()
@@ -2246,12 +2222,11 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "liveSync.changesThreshold"
                 | "liveSync.diffLinesLimit" => require_kind(
                     &path,
-                    value,
                     "an integer",
                     value.as_i64().is_some() || value.as_u64().is_some(),
                 )?,
                 "bridgeWaitSeconds" | "progressHeartbeatSeconds" | "gitSync.timeoutSeconds" => {
-                    require_kind(&path, value, "a number", value.is_number())?
+                    require_kind(&path, "a number", value.is_number())?
                 }
                 "yes"
                 | "backtrace"
@@ -2270,23 +2245,20 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "wallySync.runInstall"
                 | "link.offline"
                 | "link.autoApplyOnManifestChange" => {
-                    require_kind(&path, value, "a boolean", value.is_boolean())?
+                    require_kind(&path, "a boolean", value.is_boolean())?
                 }
                 "importMode" => require_kind(
                     &path,
-                    value,
                     "'direct' or 'snapshot'",
                     matches!(value.as_str(), Some("direct" | "snapshot")),
                 )?,
                 "performanceMode" => require_kind(
                     &path,
-                    value,
                     "'throughput', 'balanced', or 'smooth'",
                     matches!(value.as_str(), Some("throughput" | "balanced" | "smooth")),
                 )?,
                 "logLevel" => require_kind(
                     &path,
-                    value,
                     "off, error, warn, info, debug, or trace",
                     matches!(
                         value.as_str(),
@@ -2295,31 +2267,26 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 )?,
                 "color" => require_kind(
                     &path,
-                    value,
                     "auto, always, or never",
                     matches!(value.as_str(), Some("auto" | "always" | "never")),
                 )?,
                 "outputMode" => require_kind(
                     &path,
-                    value,
                     "text, json, or pretty",
                     matches!(value.as_str(), Some("text" | "json" | "pretty")),
                 )?,
                 "liveSync.initialSyncPriority" => require_kind(
                     &path,
-                    value,
                     "studio, editor, or none",
                     matches!(value.as_str(), Some("studio" | "editor" | "none")),
                 )?,
                 "liveSync.displayPrompts" => require_kind(
                     &path,
-                    value,
                     "always, initial, or never",
                     matches!(value.as_str(), Some("always" | "initial" | "never")),
                 )?,
                 "liveSync.conflictResolution" => require_kind(
                     &path,
-                    value,
                     "prompt, filesystem, or studio",
                     matches!(value.as_str(), Some("prompt" | "filesystem" | "studio")),
                 )?,
@@ -2328,19 +2295,16 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "wallySync.applyToStudio"
                 | "link.applyToStudio" => require_kind(
                     &path,
-                    value,
                     "ask, always, or never",
                     matches!(value.as_str(), Some("ask" | "always" | "never")),
                 )?,
                 "gitSync.stageMode" => require_kind(
                     &path,
-                    value,
                     "tracked or configuredPaths",
                     matches!(value.as_str(), Some("tracked" | "configuredPaths")),
                 )?,
                 "gitSync.outputBehavior" => require_kind(
                     &path,
-                    value,
                     "onStart, onError, or silent",
                     matches!(value.as_str(), Some("onStart" | "onError" | "silent")),
                 )?,
@@ -2368,7 +2332,7 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "link.manifest"
                 | "link.folder"
                 | "link.cacheDir"
-                | "link.gitPath" => require_kind(&path, value, "a string", value.is_string())?,
+                | "link.gitPath" => require_kind(&path, "a string", value.is_string())?,
                 _ => bail!("Unknown Renium configuration key '{path}'"),
             }
         }
@@ -2644,17 +2608,13 @@ fn convert_rojo_node(
     if let Some(path) = node.get("$path").and_then(Value::as_str) {
         let relative = PathBuf::from(path);
         let resolved = root.join(&relative);
-        let lower_name = resolved
+        let name = resolved
             .file_name()
             .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mounted = lower_name.ends_with(".project.json")
-            || lower_name.ends_with(".project.jsonc")
-            || matches!(
-                resolved.extension().and_then(OsStr::to_str),
-                Some("rbxm" | "rbxmx" | "renium")
-            );
+            .unwrap_or_default();
+        let mounted = ends_with_ignore_ascii_case(name, ".project.json")
+            || ends_with_ignore_ascii_case(name, ".project.jsonc")
+            || path_extension_is(&resolved, &["rbxm", "rbxmx", "renium"]);
         if mounted {
             project.mounts.push(ProjectMount {
                 source: relative,
@@ -3039,7 +2999,9 @@ pub fn validate_relative_portable_path(path: &Path, field: &str) -> Result<()> {
         }
     }
     for segment in path.iter().filter_map(OsStr::to_str) {
-        if segment.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        if segment.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        }) {
             bail!("{field} contains a non-portable segment '{segment}'");
         }
         let trimmed = segment.trim_end_matches([' ', '.']);
@@ -3048,17 +3010,6 @@ pub fn validate_relative_portable_path(path: &Path, field: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn is_windows_reserved_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"))
-            .is_some_and(|number| {
-                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            })
 }
 
 fn validate_instance_target(target: &ProjectTarget, field: &str) -> Result<()> {
@@ -3110,18 +3061,10 @@ fn validate_direct_owner_source(source: &Path, field: &str) -> Result<()> {
     let name = source
         .file_name()
         .and_then(OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let extension = source
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        extension.as_str(),
-        "lua" | "luau" | "renium" | "rbxm" | "rbxmx"
-    ) || name.ends_with(".project.json")
-        || name.ends_with(".project.jsonc")
+        .unwrap_or_default();
+    if path_extension_is(source, &["lua", "luau", "renium", "rbxm", "rbxmx"])
+        || ends_with_ignore_ascii_case(name, ".project.json")
+        || ends_with_ignore_ascii_case(name, ".project.jsonc")
     {
         return Ok(());
     }

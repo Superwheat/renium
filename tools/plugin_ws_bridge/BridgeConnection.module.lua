@@ -16,8 +16,10 @@ function BridgeConnection.create(context)
 	local connectChannel
 	local releaseClient
 	local prepareChannelsForNextRun
+	local handleSessionLockUnavailable
 	local pauseWatcherStarted = false
 	local pluginUnloading = false
+	local sessionTakeoverRequested = false
 	local maxConnectionFailures = context.maxConnectionFailures
 	local stableConnectionSeconds = 1
 	local maxRequestBytes = context.maxRequestBytes
@@ -677,7 +679,10 @@ function BridgeConnection.create(context)
 		if not reconnectAllowed(channel) then
 			return
 		end
-		if not context.validateSessionLock(connectionSessionGeneration) then
+		if
+			connectionSessionGeneration ~= nil
+			and not context.validateSessionLock(connectionSessionGeneration)
+		then
 			Config.disconnectAll("Renium session ownership was lost")
 			return
 		end
@@ -732,11 +737,22 @@ function BridgeConnection.create(context)
 				releaseClient(channel, client, true)
 				return
 			end
-			if not context.validateSessionLock(connectionSessionGeneration) then
-				Config.disconnectAll("Renium session ownership was lost")
+			if channel.client ~= client or not Config.bridgeConnectRequested then
+				releaseClient(channel, client, true)
 				return
 			end
-			if channel.client ~= client then
+			if connectionSessionGeneration == nil then
+				local takeover = sessionTakeoverRequested
+				sessionTakeoverRequested = false
+				local acquired, details = context.acquireSessionLock(takeover)
+				if not acquired then
+					handleSessionLockUnavailable(details)
+					return
+				end
+				connectionSessionGeneration = context.captureSessionLock()
+			end
+			if not context.validateSessionLock(connectionSessionGeneration) then
+				Config.disconnectAll("Renium session ownership was lost")
 				return
 			end
 			channel.connecting = false
@@ -864,9 +880,38 @@ function BridgeConnection.create(context)
 
 	local function sessionOwnerText(details)
 		local userId = tonumber(details.userId) or 0
-		local ageSeconds = tonumber(details.ageSeconds) or 0
-		local owner = if userId > 0 then `user {userId}` else "another Studio session"
-		return `{owner}, heartbeat {ageSeconds}s ago`
+		return if userId > 0 then `user {userId}` else "another Studio session"
+	end
+
+	handleSessionLockUnavailable = function(details)
+		Config.disconnectAll("Another Renium session is active")
+		Config.bridgeConnectionStatus = "Another Renium session is active"
+		updateStatusText()
+		local retryAfterSeconds = tonumber(details.retryAfterSeconds)
+		local session = Config.bridgeConnectSession
+		if runtimeSettings.autoConnect and retryAfterSeconds then
+			task.delay(retryAfterSeconds, function()
+				if
+					not pluginUnloading
+					and session == Config.bridgeConnectSession
+					and not Config.bridgeConnectRequested
+				then
+					Config.connectAll()
+				end
+			end)
+		end
+		if runtimeSettings.notifications then
+			ui.notify(
+				"session-lock",
+				"Another Renium session is active",
+				sessionOwnerText(details),
+				"Take over",
+				function()
+					Config.connectAll(true)
+				end,
+				true
+			)
+		end
 	end
 
 	function Config.connectAll(takeover)
@@ -876,51 +921,11 @@ function BridgeConnection.create(context)
 		Config.bridgeConnectRequested = true
 		Config.bridgeConnectedOnce = false
 		Config.bridgeConnectSession += 1
+		sessionTakeoverRequested = takeover == true
 		local session = Config.bridgeConnectSession
 		Config.bridgeConnectionStatus = "Connecting..."
 		updateStatusText()
-		local acquired, details = context.acquireSessionLock(takeover)
-		if session ~= Config.bridgeConnectSession or not Config.bridgeConnectRequested then
-			return
-		end
-		if not acquired then
-			Config.bridgeConnectRequested = false
-			Config.bridgeConnectionStatus = "Another Renium session is active"
-			updateStatusText()
-			local retryAfterSeconds = tonumber(details.retryAfterSeconds)
-			if runtimeSettings.autoConnect and retryAfterSeconds then
-				task.delay(retryAfterSeconds, function()
-					if
-						not pluginUnloading
-						and session == Config.bridgeConnectSession
-						and not Config.bridgeConnectRequested
-					then
-						Config.connectAll()
-					end
-				end)
-			end
-			if runtimeSettings.notifications then
-				ui.notify(
-					"session-lock",
-					"Another Renium session is active",
-					sessionOwnerText(details),
-					"Take over",
-					function()
-						Config.connectAll(true)
-					end,
-					true
-				)
-			end
-			return
-		end
 		ui.dismissNotification("session-lock")
-		connectionSessionGeneration = context.captureSessionLock()
-		if connectionSessionGeneration == nil then
-			Config.bridgeConnectRequested = false
-			Config.bridgeConnectionStatus = "Renium session ownership was lost"
-			updateStatusText()
-			return
-		end
 		Config.bridgeConnectDeadline = os.clock() + context.connectSessionTimeoutSeconds
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = true

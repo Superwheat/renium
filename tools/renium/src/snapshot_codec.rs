@@ -163,12 +163,15 @@ fn compact_parent_index(value: Value) -> Result<Option<usize>> {
     match value {
         Value::Null | Value::Bool(false) => Ok(None),
         Value::String(text) if text.is_empty() => Ok(None),
-        Value::String(text) => Ok(parse_hex_instance_index(&text)),
+        Value::String(text) => parse_hex_instance_index(&text)
+            .map(Some)
+            .with_context(|| format!("Compact parent id '{text}' is not hexadecimal")),
         Value::Number(number) => {
             let index = number
                 .as_u64()
-                .with_context(|| "Compact parent id must be a non-negative integer")?
-                as usize;
+                .with_context(|| "Compact parent id must be a non-negative integer")?;
+            let index =
+                usize::try_from(index).context("Compact parent id does not fit this platform")?;
             Ok(Some(index))
         }
         _ => bail!("Compact parent id must be a string or non-negative integer"),
@@ -580,7 +583,7 @@ fn decode_compact_v5_attributes(raw: Value, strings: &[String]) -> Result<Map<St
 }
 
 fn compact_properties_mask_take_v5_with_schema(
-    mask_value: Value,
+    mask_value: &Value,
     values_value: Value,
     class_name: &str,
     property_schema: Option<&[PropertySchemaEntry]>,
@@ -769,7 +772,7 @@ pub(super) fn parse_compact_v5_shape_instance_items(
         let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
         let property_schema = property_schema_by_class.get(shape.class_name.as_str());
         let mut properties = compact_properties_mask_take_v5_with_schema(
-            shape.mask.clone(),
+            &shape.mask,
             values_raw,
             shape.class_name.as_str(),
             property_schema.map(Vec::as_slice),
@@ -852,7 +855,7 @@ pub(super) fn parse_native_overlay_class_groups(
             let attributes = decode_compact_v5_attributes(fields[1].clone(), strings)?;
             let properties = if fields.len() == 4 {
                 compact_properties_mask_take_v5_with_schema(
-                    fields[2].clone(),
+                    &fields[2],
                     fields[3].clone(),
                     class_name,
                     property_schema.map(Vec::as_slice),
@@ -924,7 +927,7 @@ pub(super) fn parse_compact_v5_instance_items(
         };
         let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
         let properties = compact_properties_mask_take_v5_with_schema(
-            mask_raw,
+            &mask_raw,
             values_raw,
             class_name.as_str(),
             property_schema.map(Vec::as_slice),

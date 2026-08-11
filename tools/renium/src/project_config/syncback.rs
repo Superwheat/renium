@@ -4,12 +4,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use globset::escape as escape_glob;
-use notify::{RecursiveMode, Watcher};
 use serde_json::{Map, Value, json};
 
 use crate::bytecode_api::apply_file_mutations;
@@ -17,9 +15,10 @@ use crate::bytecode_edit::validate_settings_model_internal_references;
 use crate::editor_document::read_editor_service_documents;
 use crate::editor_paths::{infer_source_script, run_context_name};
 use crate::file_io::{
-    atomic_write_file, is_service_settings_file_name, read_file_if_present, service_settings_path,
-    sha256_hex,
+    atomic_write_file, is_service_settings_file_name, path_extension_is, read_file_if_present,
+    service_settings_path, sha256_hex,
 };
+use crate::file_watch::FileWatcher;
 use crate::settings_bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
 };
@@ -27,7 +26,7 @@ use crate::settings_tree::settings_children_by_parent;
 use crate::snapshot_refs::remap_record_reference_ids;
 
 use super::adapter_format::{
-    adapter_format, adapter_output_path, compare_or_write, localization_json_to_csv,
+    AdapterFormat, adapter_format, adapter_output_path, compare_or_write, localization_json_to_csv,
     render_adapter, validate_adapter_source,
 };
 use super::projection::{
@@ -63,15 +62,11 @@ fn adapter_key(adapter: &AdapterSpec) -> String {
     )
 }
 
-fn reversible_adapter_format(format: &str) -> bool {
-    matches!(format, "txt" | "csv" | "model-json")
-}
-
 fn adapter_target_bytes_from_root(
     loaded: &LoadedProject,
     root: &Path,
     adapter: &AdapterSpec,
-    format: &str,
+    format: AdapterFormat,
 ) -> Result<Option<Vec<u8>>> {
     with_project_target(&adapter.target, |target| {
         let service = target
@@ -146,7 +141,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
             active_outputs.insert(key, None);
             continue;
         }
-        let output = adapter_output_path(loaded, adapter, &format)?;
+        let output = adapter_output_path(loaded, adapter, format)?;
         let owned = output.as_deref().is_some_and(|path| {
             baseline.entries.get(&key).is_some_and(|entry| {
                 entry.output_owned
@@ -158,7 +153,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
         if let Some(output) = output.as_ref() {
             transaction_paths.push(output.clone());
         }
-        if reversible_adapter_format(&format) {
+        if format.is_reversible() {
             let target = target_segments(&adapter.target)?;
             let service = target
                 .first()
@@ -244,9 +239,8 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
             .iter()
             .filter_map(|adapter| {
                 let format = adapter_format(adapter).ok()?;
-                (adapter.direction != AdapterDirection::FromProject
-                    && reversible_adapter_format(&format))
-                .then_some((adapter, format))
+                (adapter.direction != AdapterDirection::FromProject && format.is_reversible())
+                    .then_some((adapter, format))
             })
             .collect::<Vec<_>>();
         let mut baseline_updates = BTreeMap::<String, (String, String)>::new();
@@ -261,10 +255,14 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
                 let key = adapter_key(adapter);
                 let source_hash = sha256_hex(&fs::read(loaded.root.join(&adapter.source))?);
                 let current =
-                    adapter_target_bytes_from_root(loaded, &canonical_root, adapter, format)?;
-                let expected =
-                    adapter_target_bytes_from_root(loaded, expected_stage.root(), adapter, format)?
-                        .context("Adapter staging did not create its target")?;
+                    adapter_target_bytes_from_root(loaded, &canonical_root, adapter, *format)?;
+                let expected = adapter_target_bytes_from_root(
+                    loaded,
+                    expected_stage.root(),
+                    adapter,
+                    *format,
+                )?
+                .context("Adapter staging did not create its target")?;
                 let current_hash = current.as_deref().map(sha256_hex);
                 let expected_hash = sha256_hex(&expected);
                 let equal = current.as_deref() == Some(expected.as_slice());
@@ -304,7 +302,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
                     }
                 }
                 if apply_source {
-                    apply.push((*adapter, format.clone()));
+                    apply.push((*adapter, *format));
                     update_baseline = true;
                 }
                 if update_baseline {
@@ -337,9 +335,9 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
             }
             let source = loaded.root.join(&adapter.source);
             let format = adapter_format(adapter)?;
-            validate_adapter_source(&source, &format)?;
-            if let Some(output) = adapter_output_path(loaded, adapter, &format)? {
-                let bytes = render_adapter(&source, &format)?;
+            validate_adapter_source(&source, format)?;
+            if let Some(output) = adapter_output_path(loaded, adapter, format)? {
+                let bytes = render_adapter(&source, format)?;
                 compare_or_write(&output, &bytes, check, &mut changed)?;
             }
         }
@@ -359,7 +357,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
                 let format = adapter_format(adapter)?;
                 let source_bytes = fs::read(loaded.root.join(&adapter.source))?;
                 let key = adapter_key(adapter);
-                let target_hash = if reversible_adapter_format(&format) {
+                let target_hash = if format.is_reversible() {
                     let Some((_, target_hash)) = baseline_updates.get(&key) else {
                         continue;
                     };
@@ -367,7 +365,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
                 } else {
                     String::new()
                 };
-                let output = adapter_output_path(loaded, adapter, &format)?;
+                let output = adapter_output_path(loaded, adapter, format)?;
                 let output_hash = output
                     .as_deref()
                     .map(fs::read)
@@ -378,14 +376,14 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
                     AdapterBaselineEntry {
                         source_hash: sha256_hex(&source_bytes),
                         target_hash,
-                        format: Some(format.clone()),
+                        format: Some(format.as_str().to_string()),
                         output: output
                             .as_deref()
                             .and_then(|path| path.strip_prefix(&loaded.root).ok())
                             .map(path_slash),
                         output_hash,
                         output_owned: active_output_owned.get(&key).copied().unwrap_or(false),
-                        model_json_hierarchical: if format == "model-json" {
+                        model_json_hierarchical: if format == AdapterFormat::ModelJson {
                             Some(model_json_source_is_hierarchical(
                                 &loaded.root.join(&adapter.source),
                             )?)
@@ -526,9 +524,8 @@ fn validate_read_only_reverse_owners(
             .with_context(|| format!("Missing projected service {}", owner.target[0]))?;
         if owner.optional
             && with_target_parts(&owner.target, &owner.ordinals, |target| {
-                find_document_target(imported_document, target).map(drop)
-            })
-            .is_err()
+                Ok(find_document_target_optional(imported_document, target)?.is_none())
+            })?
         {
             continue;
         }
@@ -595,15 +592,17 @@ fn collect_reverse_plan(
     }
     if !check {
         for (path, bytes) in plan.writes {
-            if let Some(previous) = writes.insert(path.clone(), bytes.clone())
-                && previous != bytes
-            {
-                bail!(
-                    "Reverse projection planned conflicting writes to {}",
-                    path.display()
-                );
-            }
             removals.remove(&path);
+            if let Some(previous) = writes.get(&path) {
+                if previous != &bytes {
+                    bail!(
+                        "Reverse projection planned conflicting writes to {}",
+                        path.display()
+                    );
+                }
+            } else {
+                writes.insert(path, bytes);
+            }
         }
         removals.extend(plan.removals);
     }
@@ -802,9 +801,8 @@ fn syncback_project_projection_into(
             .with_context(|| format!("Missing projected service {}", owner.target[0]))?;
         if owner.optional
             && with_target_parts(&owner.target, &owner.ordinals, |target| {
-                find_document_target(document, target).map(drop)
-            })
-            .is_err()
+                Ok(find_document_target_optional(document, target)?.is_none())
+            })?
         {
             continue;
         }
@@ -1030,9 +1028,8 @@ fn syncback_nested_owner(
             .with_prefix(&root_target);
         if owner.optional
             && with_project_target(&target, |target| {
-                find_document_target(document, target).map(drop)
-            })
-            .is_err()
+                Ok(find_document_target_optional(document, target)?.is_none())
+            })?
         {
             continue;
         }
@@ -1325,7 +1322,7 @@ fn projection_identity_set(
     let children = settings_children_by_parent(document);
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
-        let instance = document.instances[index].clone();
+        let instance = &document.instances[index];
         output.insert(instance.settings_id.clone());
         output.insert(projection_path_identity(
             &paths[index],
@@ -1826,14 +1823,19 @@ fn apply_reverse_filters(
     let baseline_by_id = baseline
         .map(|baseline| {
             let paths = projection_instance_paths(baseline);
+            let reference_paths = projection_instance_path_parts(baseline);
             baseline
                 .instances
                 .iter()
                 .enumerate()
                 .map(|(index, instance)| {
                     let mut instance = instance.clone();
-                    stabilize_reference_indices(&mut instance.properties, &baseline.instances);
-                    stabilize_reference_indices(&mut instance.attributes, &baseline.instances);
+                    stabilize_instance_references(&mut instance, &reference_paths, |index| {
+                        baseline
+                            .instances
+                            .get(index)
+                            .map(|instance| instance.settings_id.as_str())
+                    });
                     let parent_id = instance
                         .parent_index
                         .and_then(|parent| baseline.instances.get(parent))
@@ -1854,11 +1856,7 @@ fn apply_reverse_filters(
                 .map(|parent| parent.settings_id.clone())
         })
         .collect::<Vec<_>>();
-    let current_instances = document.instances.clone();
-    for instance in &mut document.instances {
-        stabilize_reference_indices(&mut instance.properties, &current_instances);
-        stabilize_reference_indices(&mut instance.attributes, &current_instances);
-    }
+    stabilize_document_references(document);
     let paths = projection_instance_paths(document);
     let mut allowed = vec![true; document.instances.len()];
     for index in 0..document.instances.len() {
@@ -2019,12 +2017,25 @@ pub(super) fn stabilize_reference_indices(
     instances: &[SettingsBytecodeInstance],
 ) {
     let paths = projection_instance_path_parts_from_instances(instances);
+    stabilize_reference_indices_with_paths(record, &paths, |index| {
+        instances
+            .get(index)
+            .map(|instance| instance.settings_id.as_str())
+    });
+}
+
+pub(super) fn stabilize_reference_indices_with_paths<'a>(
+    record: &mut Map<String, Value>,
+    paths: &[(Vec<String>, Vec<usize>)],
+    settings_id: impl Fn(usize) -> Option<&'a str>,
+) {
     crate::settings_bytecode::stabilize_reference_objects(record, |object, index| {
-        if let Some(instance) = instances.get(index) {
-            let (path_segments, path_ordinals) = &paths[index];
+        if let (Some(settings_id), Some((path_segments, path_ordinals))) =
+            (settings_id(index), paths.get(index))
+        {
             object.insert(
                 "settingsId".to_string(),
-                Value::String(instance.settings_id.clone()),
+                Value::String(settings_id.to_string()),
             );
             object.insert(
                 "pathSegments".to_string(),
@@ -2036,6 +2047,27 @@ pub(super) fn stabilize_reference_indices(
             );
         }
     });
+}
+
+fn stabilize_instance_references<'a>(
+    instance: &mut SettingsBytecodeInstance,
+    paths: &[(Vec<String>, Vec<usize>)],
+    settings_id: impl Copy + Fn(usize) -> Option<&'a str>,
+) {
+    stabilize_reference_indices_with_paths(&mut instance.properties, paths, settings_id);
+    stabilize_reference_indices_with_paths(&mut instance.attributes, paths, settings_id);
+}
+
+fn stabilize_document_references(document: &mut SettingsBytecode) {
+    let paths = projection_instance_path_parts(document);
+    let ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    for instance in &mut document.instances {
+        stabilize_instance_references(instance, &paths, |index| ids.get(index).map(String::as_str));
+    }
 }
 
 fn projection_owner_snapshot(
@@ -2127,11 +2159,7 @@ fn restore_project_owned_fields(
         }
     };
     if let Some(canonical) = canonical.as_mut() {
-        let canonical_instances = canonical.instances.clone();
-        for instance in &mut canonical.instances {
-            stabilize_reference_indices(&mut instance.properties, &canonical_instances);
-            stabilize_reference_indices(&mut instance.attributes, &canonical_instances);
-        }
+        stabilize_document_references(canonical);
     }
     let output_root_name = output
         .instances
@@ -2259,16 +2287,8 @@ fn plan_reverse_owner(
         writes.insert(destination.to_path_buf(), bytes);
         return Ok(ReverseOwnerPlan { writes, removals });
     }
-    if destination.is_file()
-        || destination
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| matches!(extension, "lua" | "luau" | "renium"))
-    {
-        if matches!(
-            destination.extension().and_then(OsStr::to_str),
-            Some("renium")
-        ) {
+    if destination.is_file() || path_extension_is(destination, &["lua", "luau", "renium"]) {
+        if path_extension_is(destination, &["renium"]) {
             writes.insert(
                 destination.to_path_buf(),
                 encode_settings_bytecode(document)?,
@@ -2337,10 +2357,7 @@ fn reverse_model_bytes(
         }
     }
     validate_settings_model_internal_references(&model, &destination.to_string_lossy())?;
-    let binary = destination
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("rbxm"));
+    let binary = path_extension_is(destination, &["rbxm"]);
     crate::rbx_model::encode_settings_model(&model, binary)
 }
 
@@ -2629,16 +2646,19 @@ pub(super) fn plan_adapter_syncback(
             };
             let key = adapter_key(adapter);
             let previous = baseline.entries.get(&key);
-            let model_json_hierarchical = (format == "model-json").then(|| {
-                current
-                    .as_deref()
-                    .and_then(|bytes| model_json_bytes_are_hierarchical(bytes).ok())
-                    .or_else(|| previous.and_then(|entry| entry.model_json_hierarchical))
-                    .unwrap_or(true)
-            });
+            let model_json_hierarchical = if format == AdapterFormat::ModelJson {
+                Some(match current.as_deref() {
+                    Some(bytes) => model_json_bytes_are_hierarchical(bytes)?,
+                    None => previous
+                        .and_then(|entry| entry.model_json_hierarchical)
+                        .unwrap_or(true),
+                })
+            } else {
+                None
+            };
             let bytes = reversible_adapter_target_bytes(
                 adapter,
-                &format,
+                format,
                 &document,
                 target,
                 &source,
@@ -2702,7 +2722,7 @@ pub(super) fn plan_adapter_syncback(
                             source_hash.context("Adapter source disappeared during syncback")?
                         },
                         target_hash,
-                        format: Some(format),
+                        format: Some(format.as_str().to_string()),
                         output: previous.and_then(|entry| entry.output.clone()),
                         output_hash: previous.and_then(|entry| entry.output_hash.clone()),
                         output_owned: previous.is_some_and(|entry| entry.output_owned),
@@ -2714,8 +2734,10 @@ pub(super) fn plan_adapter_syncback(
         })?;
     }
     let baseline_bytes = serde_json::to_vec_pretty(&baseline)?;
-    let baseline_changed =
-        fs::read(&baseline_path).ok().as_deref() != Some(baseline_bytes.as_slice());
+    let baseline_changed = read_file_if_present(&baseline_path)
+        .with_context(|| format!("Failed to read {}", baseline_path.display()))?
+        .as_deref()
+        != Some(baseline_bytes.as_slice());
     Ok(AdapterSyncbackPlan {
         writes,
         baseline_path,
@@ -2726,14 +2748,14 @@ pub(super) fn plan_adapter_syncback(
 
 fn reversible_adapter_target_bytes(
     adapter: &AdapterSpec,
-    format: &str,
+    format: AdapterFormat,
     document: &SettingsBytecode,
     target: &[String],
     source: &Path,
     model_json_hierarchical: Option<bool>,
 ) -> Result<Vec<u8>> {
     match format {
-        "txt" => {
+        AdapterFormat::Text => {
             let index = find_document_target(document, target)?;
             let instance = &document.instances[index];
             if instance.class_name != "StringValue" {
@@ -2751,7 +2773,7 @@ fn reversible_adapter_target_bytes(
                 .as_bytes()
                 .to_vec())
         }
-        "csv" => {
+        AdapterFormat::Csv => {
             let index = find_document_target(document, target)?;
             let instance = &document.instances[index];
             if instance.class_name != "LocalizationTable" {
@@ -2768,10 +2790,12 @@ fn reversible_adapter_target_bytes(
                 .context("LocalizationTable adapter target is missing string Contents")?;
             localization_json_to_csv(contents)
         }
-        "model-json" => {
-            let hierarchical = model_json_hierarchical
-                .or_else(|| model_json_source_is_hierarchical(source).ok())
-                .unwrap_or(true);
+        AdapterFormat::ModelJson => {
+            let hierarchical = match model_json_hierarchical {
+                Some(hierarchical) => hierarchical,
+                None if source.is_file() => model_json_source_is_hierarchical(source)?,
+                None => true,
+            };
             export_model_json(document, target, hierarchical)
         }
         _ => unreachable!("validation rejects non-reversible adapter formats"),
@@ -2821,12 +2845,19 @@ fn model_json_bytes_are_hierarchical(bytes: &[u8]) -> Result<bool> {
 
 fn export_model_instance_values(
     document: &SettingsBytecode,
+    reference_paths: &[(Vec<String>, Vec<usize>)],
     instance: &SettingsBytecodeInstance,
 ) -> (Map<String, Value>, Map<String, Value>, Value) {
     let mut properties = instance.properties.clone();
     let mut attributes = instance.attributes.clone();
-    stabilize_reference_indices(&mut properties, &document.instances);
-    stabilize_reference_indices(&mut attributes, &document.instances);
+    let settings_id = |index: usize| {
+        document
+            .instances
+            .get(index)
+            .map(|instance| instance.settings_id.as_str())
+    };
+    stabilize_reference_indices_with_paths(&mut properties, reference_paths, settings_id);
+    stabilize_reference_indices_with_paths(&mut attributes, reference_paths, settings_id);
     let tags = properties
         .remove("Tags")
         .unwrap_or(Value::Array(Vec::new()));
@@ -2840,15 +2871,13 @@ fn export_model_json(
 ) -> Result<Vec<u8>> {
     let target_index = find_document_target(document, target)?;
     let children = settings_children_by_parent(document);
+    let reference_paths = projection_instance_path_parts(document);
     if hierarchical {
-        let included = projection_subtree_indices(&children, target_index)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
         let root = export_hierarchical_model_json_node(
             document,
             &children,
+            &reference_paths,
             target_index,
-            &included,
             false,
         );
         return Ok((serde_json::to_string_pretty(&root)? + "\n").into_bytes());
@@ -2872,7 +2901,8 @@ fn export_model_json(
         .into_iter()
         .map(|index| {
             let instance = &document.instances[index];
-            let (properties, attributes, tags) = export_model_instance_values(document, instance);
+            let (properties, attributes, tags) =
+                export_model_instance_values(document, &reference_paths, instance);
             json!({
                 "id": instance.settings_id,
                 "name": instance.name,
@@ -2893,33 +2923,22 @@ fn export_model_json(
         .into_bytes())
 }
 
-fn projection_subtree_indices(children: &[Vec<usize>], root: usize) -> Vec<usize> {
-    let mut indices = Vec::new();
-    let mut stack = vec![root];
-    while let Some(index) = stack.pop() {
-        indices.push(index);
-        if let Some(child_indices) = children.get(index) {
-            stack.extend(child_indices.iter().rev().copied());
-        }
-    }
-    indices
-}
-
 fn export_hierarchical_model_json_node(
     document: &SettingsBytecode,
     children: &[Vec<usize>],
+    reference_paths: &[(Vec<String>, Vec<usize>)],
     index: usize,
-    included: &BTreeSet<usize>,
     include_name: bool,
 ) -> Value {
     let instance = &document.instances[index];
-    let (properties, attributes, tags) = export_model_instance_values(document, instance);
+    let (properties, attributes, tags) =
+        export_model_instance_values(document, reference_paths, instance);
     let child_values = children
         .get(index)
         .into_iter()
         .flatten()
         .map(|child| {
-            export_hierarchical_model_json_node(document, children, *child, included, true)
+            export_hierarchical_model_json_node(document, children, reference_paths, *child, true)
         })
         .collect::<Vec<_>>();
     let mut output = Map::from_iter([
@@ -2939,15 +2958,6 @@ fn export_hierarchical_model_json_node(
     if include_name {
         output.insert("name".to_string(), Value::String(instance.name.clone()));
     }
-    if let Some(parent) = instance
-        .parent_index
-        .filter(|parent| included.contains(parent))
-    {
-        output.insert(
-            "parentId".to_string(),
-            Value::String(document.instances[parent].settings_id.clone()),
-        );
-    }
     Value::Object(output)
 }
 
@@ -2963,34 +2973,24 @@ pub(super) fn watch_adapters(loaded: &LoadedProject, interval_ms: u64) -> Result
             println!("Watching {} adapter inputs", inputs.len());
             announced = true;
         }
-        let (sender, receiver) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
-        })?;
-        let mut watched = BTreeSet::new();
+        let mut files = BTreeSet::new();
+        let mut directories = BTreeSet::new();
         for input in &inputs {
-            let (path, mode) = if input.is_dir() {
-                (input.clone(), RecursiveMode::Recursive)
+            if input.is_dir() {
+                directories.insert(input.clone());
             } else {
-                (
-                    input
-                        .parent()
-                        .map_or_else(|| current.root.clone(), Path::to_path_buf),
-                    RecursiveMode::NonRecursive,
-                )
-            };
-            let key = (
-                absolute_path(&path),
-                matches!(mode, RecursiveMode::Recursive),
-            );
-            if watched.insert(key) {
-                watcher.watch(&path, mode)?;
+                files.insert(input.clone());
             }
         }
+        let mut watcher = FileWatcher::new(4_096)?;
+        watcher.set_inputs(&files, &directories)?;
         let debounce = Duration::from_millis(interval_ms.clamp(25, 60_000));
         let mut relevant = false;
         loop {
-            let event = receiver.recv()??;
+            if watcher.take_overflowed() {
+                break;
+            }
+            let event = watcher.receiver().recv()??;
             relevant |= event.paths.iter().any(|path| {
                 let path = absolute_path(path);
                 inputs.iter().any(|input| {
@@ -3001,7 +3001,7 @@ pub(super) fn watch_adapters(loaded: &LoadedProject, interval_ms: u64) -> Result
             if !relevant {
                 continue;
             }
-            while let Ok(event) = receiver.recv_timeout(debounce) {
+            while let Ok(event) = watcher.receiver().recv_timeout(debounce) {
                 event?;
             }
             break;
@@ -3025,7 +3025,7 @@ fn adapter_watch_inputs(loaded: &LoadedProject) -> Result<BTreeSet<PathBuf>> {
         }
         let source = loaded.root.join(&adapter.source);
         inputs.insert(source.clone());
-        if adapter_format(adapter)? == "nested-project" && source.is_file() {
+        if adapter_format(adapter)? == AdapterFormat::NestedProject && source.is_file() {
             let nested = load_nested_project(&source)?;
             inputs.insert(nested.path.clone());
             inputs.extend(project_source_roots(&nested)?);

@@ -356,10 +356,7 @@ impl EditorBinaryImport {
             .flat_map(|group| &group.retained_roots)
             .any(|root| {
                 segments.starts_with(&root.path_segments)
-                    && ordinals
-                        .iter()
-                        .zip(&root.path_ordinals)
-                        .all(|(left, right)| left == right)
+                    && ordinals.starts_with(&root.path_ordinals)
             })
     }
 }

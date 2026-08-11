@@ -16,6 +16,30 @@ use super::timing::current_millis;
 
 pub(super) const SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.renium";
 
+pub(super) struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub(super) fn new(action: F) -> Self {
+        Self(Some(action))
+    }
+
+    pub(super) fn run(&mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 pub(super) fn current_unix_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -28,6 +52,22 @@ pub(super) fn service_settings_path(service_dir: &Path) -> PathBuf {
 
 pub(super) fn is_service_settings_file_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(SERVICE_SETTINGS_FILE_NAME)
+}
+
+pub(super) fn path_extension_is(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| {
+            extensions
+                .iter()
+                .any(|expected| extension.eq_ignore_ascii_case(expected))
+        })
+}
+
+pub(super) fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 pub(super) fn path_key(path: &Path) -> String {
@@ -47,6 +87,27 @@ pub(super) fn path_key(path: &Path) -> String {
 
 pub(super) fn exact_path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+pub(super) fn create_unique_directory(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let stamp = current_millis();
+    for _ in 0..1_000 {
+        let path = parent.join(format!(
+            "{prefix}{}-{stamp}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to create {}", path.display()));
+            }
+        }
+    }
+    bail!("Could not allocate a fresh temporary directory")
 }
 
 pub(super) fn case_folded_path_key(path: &Path) -> String {
@@ -316,6 +377,7 @@ pub(super) fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Resu
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
+    cleanup_stale_sibling_temps(path);
     let temp_path = sibling_temp_path(path);
     let result = (|| -> Result<()> {
         let file = File::create(&temp_path)
@@ -337,7 +399,11 @@ pub(super) fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Resu
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    publish_sibling_temp(&temp_path, path)
+    let published = publish_sibling_temp(&temp_path, path);
+    if published.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    published
 }
 
 pub(super) fn atomic_write_file(path: &Path, content: &[u8]) -> Result<()> {
@@ -438,39 +504,34 @@ pub(super) fn sanitize_name(input: &str) -> String {
         capped.to_string()
     };
 
-    if is_windows_reserved_device_name(&final_name) {
+    if is_windows_reserved_name(&final_name) {
         final_name.insert(0, '_');
     }
     final_name
 }
 
-fn is_windows_reserved_device_name(name: &str) -> bool {
-    let device_stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    matches!(
-        device_stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
+pub(super) fn sanitize_ascii_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(super) fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 pub(super) fn normalized_child_stem_key(value: &str) -> String {
@@ -535,7 +596,7 @@ pub(super) fn absolutize_for_daemon(path: &Path) -> PathBuf {
     std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 }
 
-pub(super) fn validate_filesystem_instance_name(raw: &str, label: &str) -> Result<String> {
+pub(super) fn validate_filesystem_instance_name(raw: &str, label: &str) -> Result<()> {
     if raw.is_empty() {
         bail!("{label} cannot be empty");
     }
@@ -544,7 +605,7 @@ pub(super) fn validate_filesystem_instance_name(raw: &str, label: &str) -> Resul
             "{label} must be one filesystem-safe Roblox instance name, not a path or reserved name: {raw:?}"
         );
     }
-    Ok(raw.to_string())
+    Ok(())
 }
 
 pub(super) fn set_path_readonly(path: &Path, readonly: bool) -> Result<()> {

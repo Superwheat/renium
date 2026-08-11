@@ -74,12 +74,12 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn fixed_name(bytes: &[u8]) -> &str {
+fn fixed_name(bytes: &[u8]) -> Result<&str> {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+    std::str::from_utf8(&bytes[..end]).context("Studio Mach-O contains a non-UTF-8 name")
 }
 
 impl<'a> MachImage<'a> {
@@ -102,27 +102,40 @@ impl<'a> MachImage<'a> {
             let command_size = read_u32(bytes, cursor + 4)
                 .context("Studio Mach-O load command size is truncated")?
                 as usize;
-            if command_size < 8 || cursor + command_size > bytes.len() {
+            let command_end = cursor
+                .checked_add(command_size)
+                .filter(|end| *end <= bytes.len());
+            if command_size < 8 || command_end.is_none() {
                 bail!("Studio Mach-O contains an invalid load command");
             }
             if command == LC_SEGMENT_64 {
                 if command_size < SEGMENT_COMMAND_64_SIZE {
                     bail!("Studio Mach-O contains a truncated segment");
                 }
-                let segment_name = fixed_name(&bytes[cursor + 8..cursor + 24]);
-                let section_count = read_u32(bytes, cursor + 64).unwrap_or(0) as usize;
+                let segment_name = fixed_name(&bytes[cursor + 8..cursor + 24])?;
+                let section_count = read_u32(bytes, cursor + 64)
+                    .context("Studio Mach-O segment section count is truncated")?
+                    as usize;
                 let sections_end = SEGMENT_COMMAND_64_SIZE
-                    .checked_add(section_count.saturating_mul(SECTION_64_SIZE))
+                    .checked_add(
+                        section_count
+                            .checked_mul(SECTION_64_SIZE)
+                            .context("Studio Mach-O section count overflowed")?,
+                    )
                     .context("Studio Mach-O section count overflowed")?;
                 if sections_end > command_size {
                     bail!("Studio Mach-O section table is truncated");
                 }
                 for index in 0..section_count {
                     let section_offset = cursor + SEGMENT_COMMAND_64_SIZE + index * SECTION_64_SIZE;
-                    let section_name = fixed_name(&bytes[section_offset..section_offset + 16]);
-                    let address = read_u64(bytes, section_offset + 32).unwrap_or(0);
-                    let size = read_u64(bytes, section_offset + 40).unwrap_or(0);
-                    let offset = read_u32(bytes, section_offset + 48).unwrap_or(0) as usize;
+                    let section_name = fixed_name(&bytes[section_offset..section_offset + 16])?;
+                    let address = read_u64(bytes, section_offset + 32)
+                        .context("Studio Mach-O section address is truncated")?;
+                    let size = read_u64(bytes, section_offset + 40)
+                        .context("Studio Mach-O section size is truncated")?;
+                    let offset = read_u32(bytes, section_offset + 48)
+                        .context("Studio Mach-O section offset is truncated")?
+                        as usize;
                     let section = MachSection {
                         address,
                         size,
@@ -133,15 +146,16 @@ impl<'a> MachImage<'a> {
                     }
                     if offset > 0
                         && size > 0
-                        && offset
-                            .checked_add(size as usize)
+                        && usize::try_from(size)
+                            .ok()
+                            .and_then(|size| offset.checked_add(size))
                             .is_some_and(|end| end <= bytes.len())
                     {
                         sections.push(section);
                     }
                 }
             }
-            cursor += command_size;
+            cursor = command_end.expect("load command bounds were validated");
         }
         let text = text.context("Studio Mach-O is missing __TEXT,__text")?;
         Ok(Self {
@@ -400,14 +414,13 @@ fn trace_x86(image: &MachImage<'_>, log_xref: u64) -> Result<SerializerTrace> {
 fn trace_studio(path: &Path) -> Result<SerializerTrace> {
     let metadata =
         fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
+    let modified = metadata.modified().ok();
     let cache = TRACES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(trace) = cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(path)
-        .filter(|cached| {
-            cached.len == metadata.len() && cached.modified == metadata.modified().ok()
-        })
+        .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| cached.trace)
     {
         return Ok(trace);
@@ -439,7 +452,7 @@ fn trace_studio(path: &Path) -> Result<SerializerTrace> {
             path.to_path_buf(),
             CachedTrace {
                 len: metadata.len(),
-                modified: metadata.modified().ok(),
+                modified,
                 trace,
             },
         );
@@ -482,6 +495,7 @@ fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64
             "Studio process {pid} is not using the Renium-managed macOS app; open Renium Studio"
         )
     })?;
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut request = Vec::with_capacity(32 + path_bytes.len());
     request.extend_from_slice(&REQUEST_MAGIC.to_le_bytes());
@@ -630,19 +644,22 @@ pub fn source_studio_platform_key() -> Result<String> {
     if !output.status.success() {
         bail!("lipo could not inspect {}", executable.display());
     }
-    let architectures = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .filter_map(|architecture| match architecture {
-            "arm64" => Some("aarch64"),
-            "x86_64" => Some("x86_64"),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let architectures = String::from_utf8_lossy(&output.stdout);
+    let has_architecture = |wanted| {
+        architectures
+            .split_whitespace()
+            .any(|value| value == wanted)
+    };
+    let has_arm64 = has_architecture("arm64");
+    let has_x86_64 = has_architecture("x86_64");
     let current = std::env::consts::ARCH;
-    let architecture = if architectures.contains(&current) {
+    let architecture = if (current == "aarch64" && has_arm64) || (current == "x86_64" && has_x86_64)
+    {
         current
-    } else if architectures.len() == 1 {
-        architectures[0]
+    } else if has_arm64 && !has_x86_64 {
+        "aarch64"
+    } else if has_x86_64 && !has_arm64 {
+        "x86_64"
     } else {
         bail!(
             "{} does not contain the {current} architecture required by this Renium build",
@@ -718,17 +735,18 @@ fn add_entitlement(mut plist: String, key: &str) -> Result<String> {
 }
 
 fn recover_managed_studio_transactions(parent: &Path, target: &Path) -> Result<()> {
-    let mut transactions = fs::read_dir(parent)?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_dir())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(".Renium Studio.transaction-"))
-        })
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
+    let mut transactions = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".Renium Studio.transaction-"))
+        {
+            transactions.push(entry.path());
+        }
+    }
     transactions.sort();
     if target.exists() {
         for transaction in transactions {

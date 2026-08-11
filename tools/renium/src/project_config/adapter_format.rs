@@ -8,79 +8,135 @@ use anyhow::{Context, Result, bail};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_json::{Map, Value};
 
-use crate::file_io::atomic_write_file;
+use crate::file_io::{atomic_write_file, ends_with_ignore_ascii_case};
 
 use super::projection::target_segments;
 use super::{
     AdapterSpec, LoadedProject, ScriptExtensionPolicy, load_nested_project, parse_jsonc_value,
 };
 
-const SUPPORTED_ADAPTER_FORMATS: &[&str] = &[
-    "txt",
-    "csv",
-    "json",
-    "jsonc",
-    "toml",
-    "yaml",
-    "msgpack",
-    "markdown",
-    "model-json",
-    "rbxm",
-    "rbxmx",
-    "nested-project",
-];
-
-pub(super) fn is_supported_adapter_format(format: &str) -> bool {
-    SUPPORTED_ADAPTER_FORMATS.contains(&format)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AdapterFormat {
+    Text,
+    Csv,
+    Json,
+    Jsonc,
+    Toml,
+    Yaml,
+    Msgpack,
+    Markdown,
+    ModelJson,
+    Rbxm,
+    Rbxmx,
+    NestedProject,
 }
 
-pub(super) fn render_adapter(source: &Path, format: &str) -> Result<Vec<u8>> {
+impl AdapterFormat {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "txt" | "text" => Some(Self::Text),
+            "csv" => Some(Self::Csv),
+            "json" => Some(Self::Json),
+            "jsonc" => Some(Self::Jsonc),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "msgpack" | "mpk" | "mpack" => Some(Self::Msgpack),
+            "markdown" | "md" => Some(Self::Markdown),
+            "model-json" | "model_json" | "modeljson" => Some(Self::ModelJson),
+            "rbxm" => Some(Self::Rbxm),
+            "rbxmx" => Some(Self::Rbxmx),
+            "nested-project" | "nested_project" | "nestedproject" | "project" => {
+                Some(Self::NestedProject)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "txt",
+            Self::Csv => "csv",
+            Self::Json => "json",
+            Self::Jsonc => "jsonc",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Msgpack => "msgpack",
+            Self::Markdown => "markdown",
+            Self::ModelJson => "model-json",
+            Self::Rbxm => "rbxm",
+            Self::Rbxmx => "rbxmx",
+            Self::NestedProject => "nested-project",
+        }
+    }
+
+    pub(super) const fn is_reversible(self) -> bool {
+        matches!(self, Self::Text | Self::Csv | Self::ModelJson)
+    }
+
+    pub(super) const fn generates_module(self) -> bool {
+        matches!(
+            self,
+            Self::Json | Self::Jsonc | Self::Toml | Self::Yaml | Self::Msgpack | Self::Markdown
+        )
+    }
+}
+
+pub(super) fn render_adapter(source: &Path, format: AdapterFormat) -> Result<Vec<u8>> {
     let source_bytes =
         fs::read(source).with_context(|| format!("Failed to read {}", source.display()))?;
     let source_text = |bytes| {
         String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", source.display()))
     };
     let value = match format {
-        "txt" => {
+        AdapterFormat::Text => {
             let text = source_text(source_bytes)?;
-            return Ok(format!("return {}\n", luau_string(&text)).into_bytes());
+            let mut rendered = String::from("return ");
+            write_luau_string(&mut rendered, &text);
+            rendered.push('\n');
+            return Ok(rendered.into_bytes());
         }
-        "markdown" => {
+        AdapterFormat::Markdown => {
             let text = source_text(source_bytes)?;
             let rich_text = markdown_to_roblox_rich_text(&text);
-            return Ok(format!("return {}\n", luau_string(&rich_text)).into_bytes());
+            let mut rendered = String::from("return ");
+            write_luau_string(&mut rendered, &rich_text);
+            rendered.push('\n');
+            return Ok(rendered.into_bytes());
         }
-        "csv" => {
+        AdapterFormat::Csv => {
             let text = source_text(source_bytes)?;
             csv_to_value(&text)?
         }
-        "json" => serde_json::from_slice(&source_bytes)
+        AdapterFormat::Json => serde_json::from_slice(&source_bytes)
             .with_context(|| format!("Invalid JSON in {}", source.display()))?,
-        "jsonc" | "model-json" => {
+        AdapterFormat::Jsonc | AdapterFormat::ModelJson => {
             let text = source_text(source_bytes)?;
             parse_jsonc_value(&text)
                 .with_context(|| format!("Invalid JSONC in {}", source.display()))?
         }
-        "toml" => {
+        AdapterFormat::Toml => {
             let text = source_text(source_bytes)?;
             let parsed: toml::Value = toml::from_str(&text)
                 .with_context(|| format!("Invalid TOML in {}", source.display()))?;
             serde_json::to_value(parsed)?
         }
-        "yaml" => serde_yaml::from_slice(&source_bytes)
+        AdapterFormat::Yaml => serde_yaml::from_slice(&source_bytes)
             .with_context(|| format!("Invalid YAML in {}", source.display()))?,
-        "msgpack" => rmp_serde::from_slice(&source_bytes)
+        AdapterFormat::Msgpack => rmp_serde::from_slice(&source_bytes)
             .with_context(|| format!("Invalid MessagePack in {}", source.display()))?,
-        other => bail!("Unsupported adapter format '{other}'"),
+        other => bail!("Unsupported adapter format '{}'", other.as_str()),
     };
-    if format == "model-json" {
+    if format == AdapterFormat::ModelJson {
         return Ok((serde_json::to_string_pretty(&value)? + "\n").into_bytes());
     }
-    let rendered = value_to_luau(&value, 0)?;
+    let mut rendered = String::new();
     if value_contains_null(&value) {
-        return Ok(format!("local null = table.freeze({{}})\nreturn {rendered}\n").into_bytes());
+        rendered.push_str("local null = table.freeze({})\n");
     }
-    Ok(format!("return {rendered}\n").into_bytes())
+    rendered.push_str("return ");
+    write_value_to_luau(&mut rendered, &value, 0)?;
+    rendered.push('\n');
+    Ok(rendered.into_bytes())
 }
 
 fn markdown_to_roblox_rich_text(markdown: &str) -> String {
@@ -231,14 +287,14 @@ fn markdown_to_roblox_rich_text(markdown: &str) -> String {
     output.trim_end_matches('\n').to_string()
 }
 
-pub(super) fn validate_adapter_source(source: &Path, format: &str) -> Result<()> {
+pub(super) fn validate_adapter_source(source: &Path, format: AdapterFormat) -> Result<()> {
     if !source.is_file() {
         bail!("Adapter input does not exist: {}", source.display());
     }
-    if matches!(format, "rbxm" | "rbxmx") {
+    if matches!(format, AdapterFormat::Rbxm | AdapterFormat::Rbxmx) {
         let bytes = fs::read(source)?;
         if !bytes.starts_with(b"<roblox") {
-            let kind = if format == "rbxm" {
+            let kind = if format == AdapterFormat::Rbxm {
                 "a recognized Roblox model"
             } else {
                 "a Roblox XML model"
@@ -246,13 +302,13 @@ pub(super) fn validate_adapter_source(source: &Path, format: &str) -> Result<()>
             bail!("{} is not {kind}", source.display());
         }
     }
-    if format == "nested-project" {
+    if format == AdapterFormat::NestedProject {
         load_nested_project(source)?;
     }
     Ok(())
 }
 
-pub(super) fn adapter_format(adapter: &AdapterSpec) -> Result<String> {
+pub(super) fn adapter_format(adapter: &AdapterSpec) -> Result<AdapterFormat> {
     let format = adapter
         .format
         .as_deref()
@@ -263,11 +319,13 @@ pub(super) fn adapter_format(adapter: &AdapterSpec) -> Result<String> {
                 .file_name()
                 .and_then(OsStr::to_str)
                 .map(|name| {
-                    if name.ends_with(".project.json") || name.ends_with(".project.jsonc") {
+                    if ends_with_ignore_ascii_case(name, ".project.json")
+                        || ends_with_ignore_ascii_case(name, ".project.jsonc")
+                    {
                         "nested-project".to_string()
-                    } else if name.ends_with(".model.json")
-                        || name.ends_with(".model.jsonc")
-                        || name.ends_with(".model.renium.jsonc")
+                    } else if ends_with_ignore_ascii_case(name, ".model.json")
+                        || ends_with_ignore_ascii_case(name, ".model.jsonc")
+                        || ends_with_ignore_ascii_case(name, ".model.renium.jsonc")
                     {
                         "model-json".to_string()
                     } else {
@@ -281,34 +339,23 @@ pub(super) fn adapter_format(adapter: &AdapterSpec) -> Result<String> {
                 })
         })
         .unwrap_or_default();
-    let normalized = match format.as_str() {
-        "md" => "markdown",
-        "yml" => "yaml",
-        "mpk" | "mpack" => "msgpack",
-        other => other,
-    }
-    .to_string();
-    if !is_supported_adapter_format(&normalized) {
-        bail!(
+    AdapterFormat::parse(&format).with_context(|| {
+        format!(
             "Could not infer a supported format for {}; set format explicitly",
             adapter.source.display()
-        );
-    }
-    Ok(normalized)
+        )
+    })
 }
 
 pub(super) fn adapter_output_path(
     loaded: &LoadedProject,
     adapter: &AdapterSpec,
-    format: &str,
+    format: AdapterFormat,
 ) -> Result<Option<PathBuf>> {
     if let Some(output) = adapter.output.as_deref() {
         return Ok(Some(loaded.root.join(output)));
     }
-    if !matches!(
-        format,
-        "json" | "jsonc" | "toml" | "yaml" | "msgpack" | "markdown"
-    ) {
+    if !format.generates_module() {
         return Ok(None);
     }
     let target = target_segments(&adapter.target)?;
@@ -345,13 +392,13 @@ pub(super) fn compare_or_write(
     Ok(())
 }
 
-fn value_to_luau(value: &Value, depth: usize) -> Result<String> {
+fn write_value_to_luau(output: &mut String, value: &Value, depth: usize) -> Result<()> {
     if depth > 128 {
         bail!("Adapter data is nested too deeply");
     }
     match value {
-        Value::Null => Ok("null".to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Number(value) => {
             const MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_992;
             if value
@@ -363,30 +410,34 @@ fn value_to_luau(value: &Value, depth: usize) -> Result<String> {
             {
                 bail!("Adapter integer {value} cannot be represented exactly by Luau");
             }
-            Ok(value.to_string())
+            write!(output, "{value}")?;
         }
-        Value::String(value) => Ok(luau_string(value)),
+        Value::String(value) => write_luau_string(output, value),
         Value::Array(values) => {
-            let items = values
-                .iter()
-                .map(|value| value_to_luau(value, depth + 1))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(format!("{{{}}}", items.join(", ")))
+            output.push('{');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                write_value_to_luau(output, value, depth + 1)?;
+            }
+            output.push('}');
         }
         Value::Object(values) => {
-            let items = values
-                .iter()
-                .map(|(key, value)| {
-                    Ok(format!(
-                        "[{}] = {}",
-                        luau_string(key),
-                        value_to_luau(value, depth + 1)?
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(format!("{{{}}}", items.join(", ")))
+            output.push('{');
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push('[');
+                write_luau_string(output, key);
+                output.push_str("] = ");
+                write_value_to_luau(output, value, depth + 1)?;
+            }
+            output.push('}');
         }
     }
+    Ok(())
 }
 
 fn value_contains_null(value: &Value) -> bool {
@@ -398,12 +449,23 @@ fn value_contains_null(value: &Value) -> bool {
     }
 }
 
-fn luau_string(value: &str) -> String {
-    let mut equals = String::new();
-    while value.contains(&format!("]{equals}]")) {
-        equals.push('=');
+fn write_luau_string(output: &mut String, value: &str) {
+    let bytes = value.as_bytes();
+    let mut equals = 0;
+    while bytes.windows(equals + 2).any(|window| {
+        window[0] == b']'
+            && window[window.len() - 1] == b']'
+            && window[1..window.len() - 1].iter().all(|byte| *byte == b'=')
+    }) {
+        equals += 1;
     }
-    format!("[{equals}[{value}]{equals}]")
+    output.push('[');
+    output.extend(std::iter::repeat_n('=', equals));
+    output.push('[');
+    output.push_str(value);
+    output.push(']');
+    output.extend(std::iter::repeat_n('=', equals));
+    output.push(']');
 }
 
 fn csv_to_value(text: &str) -> Result<Value> {

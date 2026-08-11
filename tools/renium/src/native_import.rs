@@ -85,12 +85,17 @@ fn native_package_preflight_dom(_bridge: &BridgeServer) -> Result<RbxWeakDom> {
 }
 
 fn rbx_subtree_contains_class(dom: &RbxWeakDom, root: RbxRef, class_name: &str) -> bool {
-    let mut subtree = Vec::new();
-    collect_rbx_subtree_preorder(dom, root, &mut subtree);
-    subtree.into_iter().any(|referent| {
-        dom.get_by_ref(referent)
-            .is_some_and(|instance| instance.class.as_str() == class_name)
-    })
+    let mut pending = vec![root];
+    while let Some(referent) = pending.pop() {
+        let Some(instance) = dom.get_by_ref(referent) else {
+            continue;
+        };
+        if instance.class.as_str() == class_name {
+            return true;
+        }
+        pending.extend(instance.children().iter().rev().copied());
+    }
+    false
 }
 
 fn ensure_package_fingerprint_references_resolve<'a>(
@@ -1094,7 +1099,7 @@ pub(super) fn build_editor_binary_import(
         .iter()
         .filter_map(|write| {
             let service = write.path.parent()?.file_name()?.to_str()?.to_string();
-            Some((service, write.document.clone()))
+            Some((service, &write.document))
         })
         .collect::<HashMap<_, _>>();
     Ok(build_editor_binary_import_for_services(
@@ -1110,7 +1115,7 @@ pub(super) fn build_editor_binary_import(
 fn build_editor_binary_import_for_services(
     args: &PushEditorChangesArgs,
     services: HashSet<String>,
-    document_overrides: Option<&HashMap<String, SettingsBytecode>>,
+    document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
     bridge: &BridgeServer,
     merge_source_files: bool,
 ) -> Result<Option<PreparedEditorBinaryImport>> {

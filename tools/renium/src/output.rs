@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
@@ -35,6 +36,10 @@ static YES: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicU8 = AtomicU8::new(0);
 static STREAM: AtomicBool = AtomicBool::new(false);
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static CAPTURED_OUTPUT: RefCell<Result<Option<Value>, ()>> = const { RefCell::new(Err(())) };
+}
 
 pub(crate) fn prime_mode(mode: &str) {
     MODE.store(
@@ -129,7 +134,7 @@ pub(crate) fn set_global_stream_output(enabled: bool) {
 }
 
 pub(crate) fn emit_global_output(value: &Value, text: &str) -> Result<()> {
-    if global_json_output() {
+    if CAPTURED_OUTPUT.with_borrow(Result::is_ok) || global_json_output() {
         print_json_output(value, false)
     } else {
         println!("{text}");
@@ -178,12 +183,31 @@ pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
 }
 
 pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
+    let captured = CAPTURED_OUTPUT.with_borrow_mut(|output| match output {
+        Ok(output) => {
+            *output = Some(value.clone());
+            true
+        }
+        Err(()) => false,
+    });
+    if captured {
+        return Ok(());
+    }
     if global_pretty_output(pretty) && !STREAM.load(Ordering::Relaxed) {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+pub(crate) fn capture_json_output(run: impl FnOnce() -> Result<()>) -> Result<Value> {
+    CAPTURED_OUTPUT.with_borrow_mut(|output| *output = Ok(None));
+    let result = run();
+    let output = CAPTURED_OUTPUT
+        .with_borrow_mut(|output| std::mem::replace(output, Err(())).unwrap_or_default());
+    result?;
+    Ok(output.unwrap_or_else(|| serde_json::json!({})))
 }
 
 pub(crate) fn automation_token(prefix: &str) -> String {

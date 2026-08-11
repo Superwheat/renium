@@ -20,7 +20,7 @@ use super::bytecode_api::acquire_settings_file_lock;
 use super::command_args::{ImportServiceArgs, ImportSnapshotsArgs};
 use super::editor_paths::{project_script_file_names, script_file_names};
 use super::file_io::{
-    canonical_path, path_key, read_json_file, resolve_existing_project_root, sanitize_name,
+    OnDrop, canonical_path, path_key, read_json_file, resolve_existing_project_root, sanitize_name,
     service_settings_path, unique_child_stem, write_bytes_if_changed_in_existing_dir,
 };
 use super::output::emit_global_output;
@@ -381,22 +381,6 @@ pub(super) struct DirectImportDispatcher {
     pending_signal: Arc<(Mutex<()>, Condvar)>,
 }
 
-struct PendingTaskGuard<'a> {
-    pending_tasks: &'a AtomicUsize,
-    pending_signal: &'a (Mutex<()>, Condvar),
-}
-
-impl Drop for PendingTaskGuard<'_> {
-    fn drop(&mut self) {
-        let _guard = self
-            .pending_signal
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
-        self.pending_signal.1.notify_all();
-    }
-}
 #[derive(Clone)]
 struct DirectImportWorker {
     queue: Arc<DirectImportTaskQueue>,
@@ -538,10 +522,15 @@ impl DirectImportWorker {
 
     fn run(self, worker_index: usize) {
         while let Some(task) = self.queue.receive(worker_index) {
-            let _pending_guard = PendingTaskGuard {
-                pending_tasks: &self.pending_tasks,
-                pending_signal: &self.pending_signal,
-            };
+            let _pending_guard = OnDrop::new(|| {
+                let _guard = self
+                    .pending_signal
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
+                self.pending_signal.1.notify_all();
+            });
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_task(task)));
             match result {
@@ -684,13 +673,12 @@ impl DirectImportDispatcher {
         }
         log_timing("direct import worker join", join_started);
         self.check_error()?;
-        let clone_started = Instant::now();
-        let nodes = self
-            .service_nodes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        log_timing("direct import sourcemap clone", clone_started);
+        let nodes = std::mem::take(
+            &mut *self
+                .service_nodes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         Ok(nodes)
     }
 }
@@ -945,14 +933,11 @@ fn finish_import_sourcemap(
     nodes: HashMap<String, SourcemapNode>,
     update_existing: bool,
 ) -> Result<()> {
-    let result = if update_existing {
+    if update_existing {
         write_project_sourcemap_with_updates(project_root, nodes)
     } else {
         write_project_sourcemap_from_service_nodes(project_root, &nodes)
-    };
-    if let Err(error) = result {
-        println!("[renium] warning: {error}");
-    }
+    }?;
     syncback_project_adapters_if_configured(project_root)?;
     Ok(())
 }
@@ -1492,75 +1477,85 @@ fn compute_subtree_metrics(
     instances: &[SnapshotInstance],
     children_by_index: &[Vec<usize>],
 ) -> (Vec<bool>, Vec<usize>, Vec<usize>) {
-    struct Metrics<'a> {
-        instances: &'a [SnapshotInstance],
-        children_by_index: &'a [Vec<usize>],
-        source_flags: Vec<bool>,
-        script_counts: Vec<usize>,
-        subtree_sizes: Vec<usize>,
-        computed: Vec<bool>,
-        visiting: HashSet<usize>,
+    struct Frame {
+        index: usize,
+        next_child: usize,
+        has_source: bool,
+        script_count: usize,
+        subtree_size: usize,
     }
 
-    impl Metrics<'_> {
-        fn visit(&mut self, index: usize) -> (bool, usize, usize) {
-            if index >= self.source_flags.len() {
-                return (false, 0, 0);
+    impl Frame {
+        fn new(index: usize, instances: &[SnapshotInstance]) -> Self {
+            let has_source = script_file_names(&instances[index].class_name).is_some();
+            Self {
+                index,
+                next_child: 0,
+                has_source,
+                script_count: usize::from(has_source),
+                subtree_size: 1,
             }
-            if self.computed[index] {
-                return (
-                    self.source_flags[index],
-                    self.script_counts[index],
-                    self.subtree_sizes[index],
-                );
-            }
-            if !self.visiting.insert(index) {
-                let has_source = script_file_names(&self.instances[index].class_name).is_some();
-                let script_count = usize::from(has_source);
-                return (has_source, script_count, 1);
-            }
+        }
 
-            let mut has_source = script_file_names(&self.instances[index].class_name).is_some();
-            let mut script_count = usize::from(has_source);
-            let mut subtree_size = 1usize;
-            for &child_index in self
-                .children_by_index
-                .get(index)
-                .map_or(&[][..], Vec::as_slice)
-            {
-                let (child_has_source, child_script_count, child_subtree_size) =
-                    self.visit(child_index);
-                has_source |= child_has_source;
-                script_count = script_count.saturating_add(child_script_count);
-                subtree_size = subtree_size.saturating_add(child_subtree_size);
-            }
-
-            self.visiting.remove(&index);
-            self.source_flags[index] = has_source;
-            self.script_counts[index] = script_count;
-            self.subtree_sizes[index] = subtree_size;
-            self.computed[index] = true;
-            (has_source, script_count, subtree_size)
+        fn add(&mut self, has_source: bool, script_count: usize, subtree_size: usize) {
+            self.has_source |= has_source;
+            self.script_count = self.script_count.saturating_add(script_count);
+            self.subtree_size = self.subtree_size.saturating_add(subtree_size);
         }
     }
 
-    let mut metrics = Metrics {
-        instances,
-        children_by_index,
-        source_flags: vec![false; instances.len()],
-        script_counts: vec![0; instances.len()],
-        subtree_sizes: vec![0; instances.len()],
-        computed: vec![false; instances.len()],
-        visiting: HashSet::new(),
-    };
-    for index in 0..instances.len() {
-        metrics.visit(index);
+    let mut source_flags = vec![false; instances.len()];
+    let mut script_counts = vec![0; instances.len()];
+    let mut subtree_sizes = vec![0; instances.len()];
+    let mut states = vec![0u8; instances.len()];
+    let mut stack = Vec::new();
+
+    for root in 0..instances.len() {
+        if states[root] == 2 {
+            continue;
+        }
+        states[root] = 1;
+        stack.push(Frame::new(root, instances));
+
+        while let Some(frame) = stack.last_mut() {
+            let children = children_by_index
+                .get(frame.index)
+                .map_or(&[][..], Vec::as_slice);
+            if let Some(&child) = children.get(frame.next_child) {
+                frame.next_child += 1;
+                if child >= instances.len() {
+                    continue;
+                }
+                match states[child] {
+                    0 => {
+                        states[child] = 1;
+                        stack.push(Frame::new(child, instances));
+                    }
+                    1 => {
+                        let has_source = script_file_names(&instances[child].class_name).is_some();
+                        frame.add(has_source, usize::from(has_source), 1);
+                    }
+                    _ => frame.add(
+                        source_flags[child],
+                        script_counts[child],
+                        subtree_sizes[child],
+                    ),
+                }
+                continue;
+            }
+
+            let frame = stack.pop().expect("metric stack unexpectedly empty");
+            source_flags[frame.index] = frame.has_source;
+            script_counts[frame.index] = frame.script_count;
+            subtree_sizes[frame.index] = frame.subtree_size;
+            states[frame.index] = 2;
+            if let Some(parent) = stack.last_mut() {
+                parent.add(frame.has_source, frame.script_count, frame.subtree_size);
+            }
+        }
     }
-    (
-        metrics.source_flags,
-        metrics.script_counts,
-        metrics.subtree_sizes,
-    )
+
+    (source_flags, script_counts, subtree_sizes)
 }
 
 fn find_service_root_index(
@@ -1639,11 +1634,13 @@ fn rebuild_instance_paths_from_ids(
         instances[root_index].name.clone()
     };
     let mut stack: Vec<(usize, Vec<String>)> = vec![(root_index, vec![root_name])];
+    let mut visited = vec![false; instances.len()];
 
     while let Some((index, proposed_segments)) = stack.pop() {
-        if index >= instances.len() {
+        if index >= instances.len() || visited[index] {
             continue;
         }
+        visited[index] = true;
 
         let effective_segments = if instances[index].path_segments.is_empty() {
             proposed_segments

@@ -22,8 +22,8 @@ use crate::editor_paths::{
 use crate::external_tools::{run_checked_external_tool, run_git_checked};
 use crate::file_io::{
     absolutize_under, canonical_path, ensure_existing_ancestor_inside, exact_path_key, fnv1a_hex,
-    is_service_settings_file_name, path_key, service_settings_path, set_path_readonly,
-    strip_extended_prefix, validate_filesystem_instance_name, write_utf8_file,
+    is_service_settings_file_name, path_extension_is, path_key, service_settings_path,
+    set_path_readonly, strip_extended_prefix, validate_filesystem_instance_name, write_utf8_file,
 };
 use crate::instance_api::{self, AddInstanceSpec, InstanceSelector};
 use crate::project_config;
@@ -272,9 +272,7 @@ fn read_link_source_meta(source_path: &Path) -> LinkSourceMeta {
 }
 
 fn is_package_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(RENIUM_STORE_EXTENSION))
+    path_extension_is(path, &[RENIUM_STORE_EXTENSION])
 }
 
 struct LinkResolveOptions {
@@ -329,17 +327,6 @@ fn resolve_link_cache_dir(
         return absolutize_under(project_root, dir);
     }
     link_cache_dir(project_root, manifest)
-}
-
-fn ensure_renium_gitignore(project_root: &Path) {
-    let dir = project_root.join(".renium");
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        let _ = fs::write(&gitignore, RENIUM_DIR_GITIGNORE);
-    }
 }
 
 fn read_link_manifest(path: &Path) -> Result<LinkManifest> {
@@ -2203,41 +2190,7 @@ fn push_package_fingerprint_json(
     out: &mut String,
 ) -> Result<()> {
     match value {
-        Value::Object(map) => {
-            if map.get("_type").and_then(Value::as_str) == Some("Ref")
-                && let Some(index) = ref_old_index(map, &refs.lookup)
-                && let Some(ordinal) = refs.ordinal_by_index.get(&index)
-            {
-                out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
-                out.push_str(&ordinal.to_string());
-                out.push('}');
-                return Ok(());
-            }
-            out.push('{');
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            for (position, key) in keys.iter().enumerate() {
-                if position > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(key)?);
-                out.push(':');
-                if let Some(child) = map.get(*key) {
-                    if *key == "Ref"
-                        && let Value::Object(reference) = child
-                        && let Some(index) = ref_old_index(reference, &refs.lookup)
-                        && let Some(ordinal) = refs.ordinal_by_index.get(&index)
-                    {
-                        out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
-                        out.push_str(&ordinal.to_string());
-                        out.push('}');
-                    } else {
-                        push_package_fingerprint_json(child, refs, out)?;
-                    }
-                }
-            }
-            out.push('}');
-        }
+        Value::Object(map) => push_package_fingerprint_map(map, refs, out)?,
         Value::Array(items) => {
             out.push('[');
             for (position, item) in items.iter().enumerate() {
@@ -2253,6 +2206,46 @@ fn push_package_fingerprint_json(
     Ok(())
 }
 
+fn push_package_fingerprint_map(
+    map: &Map<String, Value>,
+    refs: &PackageFingerprintRefs,
+    out: &mut String,
+) -> Result<()> {
+    if map.get("_type").and_then(Value::as_str) == Some("Ref")
+        && let Some(index) = ref_old_index(map, &refs.lookup)
+        && let Some(ordinal) = refs.ordinal_by_index.get(&index)
+    {
+        out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
+        out.push_str(&ordinal.to_string());
+        out.push('}');
+        return Ok(());
+    }
+    out.push('{');
+    let mut keys = map.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+    for (position, key) in keys.into_iter().enumerate() {
+        if position > 0 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(key)?);
+        out.push(':');
+        let child = &map[key];
+        if key == "Ref"
+            && let Value::Object(reference) = child
+            && let Some(index) = ref_old_index(reference, &refs.lookup)
+            && let Some(ordinal) = refs.ordinal_by_index.get(&index)
+        {
+            out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
+            out.push_str(&ordinal.to_string());
+            out.push('}');
+        } else {
+            push_package_fingerprint_json(child, refs, out)?;
+        }
+    }
+    out.push('}');
+    Ok(())
+}
+
 fn push_instance_subtree_fingerprint(
     document: &SettingsBytecode,
     children_by_parent: &[Vec<usize>],
@@ -2261,29 +2254,31 @@ fn push_instance_subtree_fingerprint(
     refs: &PackageFingerprintRefs,
     out: &mut String,
 ) -> Result<()> {
-    let mut stack = vec![(root_index, vec![root_marker.to_string()])];
-    while let Some((index, relative_path)) = stack.pop() {
+    let mut relative_path = Vec::new();
+    let mut stack = vec![(root_index, 0usize)];
+    while let Some((index, parent_depth)) = stack.pop() {
         let Some(instance) = document.instances.get(index) else {
             continue;
         };
+        relative_path.truncate(parent_depth);
+        relative_path.push(if index == root_index && parent_depth == 0 {
+            root_marker.to_string()
+        } else {
+            instance.name.clone()
+        });
         out.push_str("path=");
         out.push_str(&serde_json::to_string(&relative_path)?);
         out.push_str(";class=");
         out.push_str(&serde_json::to_string(&instance.class_name)?);
         out.push_str(";properties=");
-        push_package_fingerprint_json(&Value::Object(instance.properties.clone()), refs, out)?;
+        push_package_fingerprint_map(&instance.properties, refs, out)?;
         out.push_str(";attributes=");
-        push_package_fingerprint_json(&Value::Object(instance.attributes.clone()), refs, out)?;
+        push_package_fingerprint_map(&instance.attributes, refs, out)?;
         out.push('\n');
 
         if let Some(children) = children_by_parent.get(index) {
             for child_index in children.iter().rev().copied() {
-                let Some(child) = document.instances.get(child_index) else {
-                    continue;
-                };
-                let mut child_path = relative_path.clone();
-                child_path.push(child.name.clone());
-                stack.push((child_index, child_path));
+                stack.push((child_index, relative_path.len()));
             }
         }
     }

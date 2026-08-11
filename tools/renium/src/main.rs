@@ -74,6 +74,7 @@ mod editor_sync;
 mod editor_types;
 mod external_tools;
 mod file_io;
+mod file_watch;
 mod input_inject;
 mod instance_api;
 mod lifecycle;

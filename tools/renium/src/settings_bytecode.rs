@@ -547,7 +547,7 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
             )?;
         }
 
-        if has_binary_attributes(&instance.attributes) {
+        if !instance.attributes.is_empty() {
             let property_name = "Attributes";
             let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
             let kind = binary_source_value_kind(&source, &lookup)?;
@@ -1328,7 +1328,7 @@ fn collect_settings_binary_chunk<'a>(
             )?;
         }
 
-        if has_binary_attributes(&instance.attributes) {
+        if !instance.attributes.is_empty() {
             let property_name = "Attributes";
             let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
             let kind = binary_source_value_kind(&source, lookup)?;
@@ -1529,10 +1529,12 @@ fn collect_service_settings_binary_instances(
     }
 
     let mut out = Vec::with_capacity(state.instances.len());
-    let mut visited = HashSet::with_capacity(state.instances.len());
+    let mut visited = vec![false; state.instances.len()];
     let mut stack = vec![(state.service_root_index, None)];
     while let Some((source_index, parent_index)) = stack.pop() {
-        if source_index >= state.instances.len() || !visited.insert(source_index) {
+        if source_index >= state.instances.len()
+            || std::mem::replace(&mut visited[source_index], true)
+        {
             continue;
         }
 
@@ -1761,11 +1763,12 @@ fn settings_path_parts(
         let mut segments = Vec::new();
         let mut ordinals = Vec::new();
         let mut current = Some(index);
-        let mut seen = HashSet::new();
+        let mut remaining = names.len();
         while let Some(value) = current {
-            if value >= names.len() || !seen.insert(value) {
+            if value >= names.len() || remaining == 0 {
                 break;
             }
+            remaining -= 1;
             segments.push(names[value].to_string());
             ordinals.push(ordinal_by_index[value]);
             current = parents[value];
@@ -1869,10 +1872,6 @@ fn write_settings_binary_property_groups<W: Write + ?Sized>(
         writer.write_all(&body)?;
     }
     Ok(())
-}
-
-fn has_binary_attributes(attributes: &Map<String, Value>) -> bool {
-    !attributes.is_empty()
 }
 
 fn binary_source_value_kind(

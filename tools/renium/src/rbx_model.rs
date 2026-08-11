@@ -714,9 +714,20 @@ fn source_settings_document(
             None,
         )],
     };
+    let excluded_source_keys = excluded_sources
+        .iter()
+        .map(|path| {
+            let key = exact_path_key(path);
+            if cfg!(windows) || cfg!(target_os = "macos") {
+                key.to_ascii_lowercase()
+            } else {
+                key
+            }
+        })
+        .collect::<Vec<_>>();
     let options = SourceSettingsOptions {
         naming,
-        excluded_sources,
+        excluded_source_keys: &excluded_source_keys,
         include_source,
     };
     append_source_only_children(&mut document, service_dir, service, 0, service, &options)?;
@@ -725,7 +736,7 @@ fn source_settings_document(
 
 struct SourceSettingsOptions<'a> {
     naming: Option<&'a project_config::ProjectScriptNaming>,
-    excluded_sources: &'a [PathBuf],
+    excluded_source_keys: &'a [String],
     include_source: bool,
 }
 
@@ -745,7 +756,7 @@ fn append_source_only_children(
         .cloned()
         .unwrap_or_else(|| project_config::cached_script_naming(directory));
     let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+    entries.sort_by_cached_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
     for entry in entries {
         let path = entry.path();
         let physical_key = exact_path_key(&path);
@@ -754,16 +765,10 @@ fn append_source_only_children(
         } else {
             physical_key
         };
-        if options.excluded_sources.iter().any(|excluded| {
-            let excluded_key = exact_path_key(excluded);
-            let excluded_key = if cfg!(windows) || cfg!(target_os = "macos") {
-                excluded_key.to_ascii_lowercase()
-            } else {
-                excluded_key
-            };
-            physical_key == excluded_key
+        if options.excluded_source_keys.iter().any(|excluded_key| {
+            physical_key == *excluded_key
                 || physical_key
-                    .strip_prefix(&excluded_key)
+                    .strip_prefix(excluded_key)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         }) {
             continue;
@@ -780,18 +785,26 @@ fn append_source_only_children(
             );
         }
         if file_type.is_dir() {
-            let mut init_sources = fs::read_dir(&path)?
-                .filter_map(std::result::Result::ok)
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    infer_source_script(&name, &resolved_naming).and_then(
-                        |(class_name, leaf, run_context)| {
-                            leaf.is_none()
-                                .then_some((entry.path(), name, class_name, run_context))
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut init_sources = Vec::new();
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                let child_type = child.file_type()?;
+                if child_type.is_symlink() {
+                    bail!(
+                        "Source-only projects cannot contain symlinks: {}",
+                        child.path().display()
+                    );
+                }
+                if !child_type.is_file() {
+                    continue;
+                }
+                let name = child.file_name().to_string_lossy().into_owned();
+                if let Some((class_name, None, run_context)) =
+                    infer_source_script(&name, &resolved_naming)
+                {
+                    init_sources.push((child.path(), name, class_name, run_context));
+                }
+            }
             init_sources.sort_by(|left, right| left.1.cmp(&right.1));
             if init_sources.len() > 1 {
                 bail!("{} contains more than one init source file", path.display());
@@ -1056,7 +1069,7 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
 pub(super) fn build_rbx_place(
     src_root: &Path,
     services: Vec<String>,
-    document_overrides: Option<&HashMap<String, SettingsBytecode>>,
+    document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
     allow_unrepresentable_properties: bool,
     capture_logical_properties: bool,
     merge_source_files: bool,
@@ -1073,7 +1086,7 @@ pub(super) fn build_rbx_place(
             }
             let mut document = if let Some(document) = document_overrides
                 .and_then(|documents| documents.get(&service))
-                .cloned()
+                .map(|document| (*document).clone())
             {
                 document
             } else if !settings_file.exists() {
@@ -1652,10 +1665,8 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
     let mut settings_files = Vec::new();
     if args.paths.is_empty() {
         let src_root = absolutize_under(&project_root, &args.project.src_root);
-        for entry in WalkDir::new(&src_root)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
+        for entry in WalkDir::new(&src_root) {
+            let entry = entry?;
             if entry.file_type().is_file()
                 && entry
                     .file_name()
@@ -1673,7 +1684,8 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
                 service_settings_path(&path)
             } else if !path.exists() && !bytecode_input_looks_like_settings_file(&raw) {
                 let src_root = absolutize_under(&project_root, &args.project.src_root);
-                let service = validate_filesystem_instance_name(raw.trim(), "service")?;
+                let service = raw.trim();
+                validate_filesystem_instance_name(service, "service")?;
                 service_settings_path(&src_root.join(service))
             } else {
                 path

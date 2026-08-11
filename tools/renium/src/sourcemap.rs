@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use globset::Glob;
-use notify::{RecursiveMode, Watcher};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -15,9 +14,10 @@ use walkdir::WalkDir;
 use super::command_args::GenerateSourcemapArgs;
 use super::editor_paths::infer_source_script;
 use super::file_io::{
-    absolutize_for_daemon, path_key, read_json_file, replace_file_with_backup,
-    resolve_existing_project_root, strip_extended_prefix, write_json_file, write_utf8_file,
+    absolutize_for_daemon, path_key, read_json_file, resolve_existing_project_root,
+    strip_extended_prefix, write_json_file, write_utf8_file,
 };
+use super::file_watch::FileWatcher;
 use super::project_config;
 use super::services::explorer_service_order;
 
@@ -107,25 +107,15 @@ pub(super) fn write_project_sourcemap_from_service_nodes(
     write_sourcemap_root(project_root, root)
 }
 
-fn write_project_sourcemap_temp_from_service_nodes(
+pub(super) fn finalize_project_sourcemap_temp(
     project_root: &Path,
     service_nodes: &HashMap<String, SourcemapNode>,
 ) -> Result<()> {
     let mut root = make_sourcemap_root(project_root);
     root.children = service_nodes.values().cloned().collect();
     sort_sourcemap_root_children(&mut root);
-    let temp_file = project_root.join("sourcemap.json.tmp");
-    write_json_file(&temp_file, &root, true).context("Failed to serialize sourcemap")
-}
-
-pub(super) fn finalize_project_sourcemap_temp(
-    project_root: &Path,
-    service_nodes: &HashMap<String, SourcemapNode>,
-) -> Result<()> {
-    write_project_sourcemap_temp_from_service_nodes(project_root, service_nodes)?;
-    let temp_file = project_root.join("sourcemap.json.tmp");
     let output_file = project_root.join("sourcemap.json");
-    replace_file_with_backup(&temp_file, &output_file, "sourcemap")?;
+    write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
     println!("[renium] wrote {}", output_file.display());
     Ok(())
 }
@@ -581,44 +571,17 @@ fn wait_for_sourcemap_change(
     debounce_ms: u64,
 ) -> Result<()> {
     let (directories, files) = sourcemap_watch_inputs(project_root, loaded)?;
-    let (sender, receiver) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = sender.send(event);
-    })?;
-    let mut roots = BTreeMap::new();
-    for (input, recursive) in files
-        .iter()
-        .map(|path| (path, false))
-        .chain(directories.iter().map(|path| (path, true)))
-    {
-        let mut root = input.clone();
-        while !root.exists() {
-            let Some(parent) = root.parent() else {
-                break;
-            };
-            root = parent.to_path_buf();
-        }
-        if root.exists() {
-            let recursive = recursive || root != *input;
-            roots
-                .entry(root)
-                .and_modify(|current| *current |= recursive)
-                .or_insert(recursive);
-        }
-    }
-    for (root, recursive) in roots {
-        watcher.watch(
-            &root,
-            if recursive {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            },
-        )?;
-    }
+    let mut watcher = FileWatcher::new(4_096)?;
+    watcher.set_inputs(&files, &directories)?;
     let output = output.map(absolutize_for_daemon);
     loop {
-        let event = receiver.recv().context("Sourcemap watcher stopped")??;
+        if watcher.take_overflowed() {
+            return Ok(());
+        }
+        let event = watcher
+            .receiver()
+            .recv()
+            .context("Sourcemap watcher stopped")??;
         let relevant = event.paths.iter().any(|path| {
             let path = absolutize_for_daemon(path);
             output.as_ref() != Some(&path)
@@ -633,10 +596,22 @@ fn wait_for_sourcemap_change(
         if !relevant {
             continue;
         }
-        while receiver
-            .recv_timeout(Duration::from_millis(debounce_ms))
-            .is_ok()
-        {}
+        loop {
+            if watcher.take_overflowed() {
+                return Ok(());
+            }
+            match watcher
+                .receiver()
+                .recv_timeout(Duration::from_millis(debounce_ms))
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(error).context("Sourcemap watcher failed"),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("Sourcemap watcher stopped")
+                }
+            }
+        }
         return Ok(());
     }
 }

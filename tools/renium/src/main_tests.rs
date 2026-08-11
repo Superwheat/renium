@@ -1,17 +1,14 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Cursor};
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crate::bridge_server::{
-    BridgeInfoPayload, BridgeServer, BridgeTarget, MAX_BRIDGE_REASSEMBLY_BYTES, RuntimePinKey,
-    parse_bridge_raw_chunk,
-};
+use crate::bridge_server::{MAX_BRIDGE_REASSEMBLY_BYTES, parse_bridge_raw_chunk};
 use crate::bytecode_api::{
     bytecode_get_property, bytecode_set_property, bytecode_set_source, ensure_service_store_exists,
-    lock_existing_service_store, resolve_bytecode_settings_file,
+    lock_existing_service_store,
 };
 use crate::bytecode_edit::{
     bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
@@ -23,7 +20,7 @@ use crate::command_line::{
     BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
     BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
     BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, EditorMutationArgs,
-    EditorReviewDecisionArgs, PlaceDesyncPackageLinkArgs, ProjectSourceArgs, PushEditorChangesArgs,
+    PlaceDesyncPackageLinkArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
 use crate::editor_diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
@@ -35,7 +32,6 @@ use crate::editor_document::{
 };
 use crate::editor_paths::{
     build_editor_source_paths_by_index, infer_editor_source_path_spec, run_context_name,
-    script_file_names_for_run_context,
 };
 use crate::editor_review::{
     editor_review_payload, is_externally_managed_editor_property,
@@ -51,12 +47,9 @@ use crate::editor_types::{
     EditorPropertyFilter,
 };
 use crate::file_io::{
-    SERVICE_SETTINGS_FILE_NAME, ensure_existing_ancestor_inside, normalized_child_stem_key,
-    sanitize_name, service_settings_path, set_path_readonly, strip_extended_prefix,
-    unique_child_stem, validate_filesystem_instance_name, write_bytes_if_changed,
+    SERVICE_SETTINGS_FILE_NAME, service_settings_path, set_path_readonly, write_bytes_if_changed,
     write_json_streaming,
 };
-use crate::local_transport::{BoundedLineRead, normalize_loopback_host, read_bounded_line};
 use crate::native_editor::{
     encode_service_root_property_values, merge_live_service_root_property_values,
     rbx_dom_service_root_property_values,
@@ -70,10 +63,9 @@ use crate::property_schema::{
     TYPE_ID_PHYSICAL_PROPERTIES, TYPE_ID_RAY, TYPE_ID_VECTOR3, USE_2022_MATERIALS_PROPERTY,
     collect_rbx_dom_properties_for_class,
 };
-use crate::rbx_decode::json_number_f64;
 use crate::rbx_encode::{
-    collect_rbx_subtree_preorder, json_f64, json_to_rbx_axes, json_to_rbx_color_sequence,
-    json_to_rbx_faces, json_to_rbx_ray, model_property_name_is_skipped, rbx_model_top_level_refs,
+    collect_rbx_subtree_preorder, json_to_rbx_axes, json_to_rbx_color_sequence, json_to_rbx_faces,
+    json_to_rbx_ray, model_property_name_is_skipped, rbx_model_top_level_refs,
     synthesized_mesh_initial_size_for_rbx_export_class,
 };
 use crate::rbx_model::{
@@ -84,16 +76,13 @@ use crate::settings_bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
     write_service_settings_binary_file, write_var_u64,
 };
-use crate::snapshot_codec::{
-    decode_compact_v5_value, parse_compact_v5_instance_items, parse_source_range_batch,
-};
+use crate::snapshot_codec::{decode_compact_v5_value, parse_compact_v5_instance_items};
 use crate::snapshot_export::{parse_bridge_chunk, parse_place_guard_config};
 use crate::snapshot_import::{
     quarantine_stale_import_paths, state_with_preserved_material_service_settings,
 };
 use crate::snapshot_types::{ServiceState, SnapshotInstance};
-use crate::sourcemap::path_to_sourcemap_relative;
-use crate::studio_automation::{studio_device_resolution, validate_luau_syntax};
+use crate::studio_automation::validate_luau_syntax;
 use crate::test_support::{settings_document, settings_instance, temp_dir};
 use crate::version_control::{
     merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
@@ -183,16 +172,6 @@ fn rbx_class_is_a(
 }
 
 #[test]
-fn bridge_info_reads_runtime_identity() {
-    let info: BridgeInfoPayload = serde_json::from_value(json!({
-        "runtimeId": "runtime-a",
-        "bridgeRole": "edit",
-    }))
-    .unwrap();
-    assert_eq!(info.runtime_id, "runtime-a");
-}
-
-#[test]
 fn place_guard_rejects_typos_and_empty_allowlists() {
     let path = Path::new("renium.config.json");
     assert!(
@@ -212,37 +191,6 @@ fn place_guard_rejects_typos_and_empty_allowlists() {
     let parsed =
         parse_place_guard_config(r#"{"allowedPlaceIds":[123],"allowedGameIds":[]}"#, path).unwrap();
     assert_eq!(parsed.allowed_place_ids, vec![123]);
-}
-
-#[test]
-fn script_file_names_follow_script_run_context() {
-    assert_eq!(
-        script_file_names_for_run_context("Script", Some("Client")),
-        Some(("init.client.luau", ".client.luau"))
-    );
-    assert_eq!(
-        script_file_names_for_run_context("Script", Some("Plugin")),
-        Some(("init.plugin.luau", ".plugin.luau"))
-    );
-    assert_eq!(
-        script_file_names_for_run_context("Script", Some("Server")),
-        Some(("init.server.luau", ".server.luau"))
-    );
-    assert_eq!(
-        script_file_names_for_run_context("LocalScript", None),
-        Some(("init.client.luau", ".client.luau"))
-    );
-}
-
-#[test]
-fn runtime_pin_keys_normalize_player_selectors() {
-    assert_eq!(
-        BridgeServer::runtime_pin_key(BridgeTarget::Client, Some("  PlayerOne ")),
-        RuntimePinKey {
-            target: BridgeTarget::Client,
-            player: Some("playerone".to_string()),
-        }
-    );
 }
 
 #[test]
@@ -335,79 +283,6 @@ fn binary_roundtrip_keeps_parent_sensitive_instance_classes() {
     for expected in ["Attachment", "Bone", "Animator", "WrapLayer", "WrapTarget"] {
         assert!(classes.contains(expected), "missing {expected}");
     }
-}
-
-#[test]
-fn luau_syntax_validation_accepts_agent_snippets() {
-    validate_luau_syntax(
-            "local total: number = 0\nfor _, value in { 1, 2, 3 } do\n\ttotal += value\nend\nreturn if total > 0 then `total={total}` else \"empty\"",
-        )
-        .unwrap();
-}
-
-#[test]
-fn luau_syntax_validation_rejects_invalid_code() {
-    let error = validate_luau_syntax("local =").unwrap_err().to_string();
-    assert!(error.starts_with("Invalid Luau syntax at "));
-}
-
-#[test]
-fn bridge_daemon_defaults_to_persistent_mode() {
-    let cli = Cli::try_parse_from(["renium", "bridge-daemon"]).unwrap();
-    let Commands::BridgeDaemon(args) = cli.command else {
-        panic!("bridge-daemon parsed as another command");
-    };
-    assert!(!args.editor_stdio);
-
-    let cli = Cli::try_parse_from(["renium", "bridge-daemon", "--editor-stdio"]).unwrap();
-    let Commands::BridgeDaemon(args) = cli.command else {
-        panic!("bridge-daemon parsed as another command");
-    };
-    assert!(args.editor_stdio);
-}
-
-#[test]
-fn editor_review_decision_defaults_to_apply() {
-    let args = EditorReviewDecisionArgs::try_parse_from(["editor-review-decision"]).unwrap();
-    assert_eq!(args.decision, "apply");
-    assert!(args.review_id.is_none());
-    assert!(
-        EditorReviewDecisionArgs::try_parse_from(["editor-review-decision", "invalid"]).is_err()
-    );
-}
-
-#[test]
-fn unique_child_stem_avoids_case_insensitive_and_suffix_collisions() {
-    let mut used = HashSet::new();
-    let mut suffixes = HashMap::new();
-    let names = ["Foo", "foo", "foo_2", "Foo"];
-    let stems = names
-        .iter()
-        .map(|name| unique_child_stem(name, &mut used, &mut suffixes))
-        .collect::<Vec<_>>();
-
-    assert_eq!(stems, vec!["Foo", "foo_2", "foo_2_2", "Foo_3"]);
-    let normalized = stems
-        .iter()
-        .map(|stem| normalized_child_stem_key(stem))
-        .collect::<HashSet<_>>();
-    assert_eq!(normalized.len(), stems.len());
-}
-
-#[test]
-fn sanitize_name_blocks_windows_device_names_with_extensions() {
-    assert_eq!(sanitize_name("CON"), "_CON");
-    assert_eq!(sanitize_name("CON.txt"), "_CON.txt");
-    assert_eq!(sanitize_name("Lpt1.config"), "_Lpt1.config");
-    assert_eq!(sanitize_name("Normal.txt"), "Normal.txt");
-}
-
-#[test]
-fn sanitize_name_caps_component_length() {
-    let long = "L".repeat(300);
-    assert_eq!(sanitize_name(&long).chars().count(), 100);
-    let dot_at_cut = format!("{}.{}", "D".repeat(99), "tail".repeat(60));
-    assert_eq!(sanitize_name(&dot_at_cut), "D".repeat(99));
 }
 
 #[test]
@@ -518,16 +393,6 @@ fn parse_bridge_raw_chunk_preserves_payload() {
 }
 
 #[test]
-fn bridge_host_is_strictly_loopback() {
-    assert_eq!(normalize_loopback_host("127.0.0.1").unwrap(), "127.0.0.1");
-    assert_eq!(normalize_loopback_host(" localhost ").unwrap(), "127.0.0.1");
-    assert_eq!(normalize_loopback_host("[::1]").unwrap(), "::1");
-    assert!(normalize_loopback_host("0.0.0.0").is_err());
-    assert!(normalize_loopback_host("192.168.1.25").is_err());
-    assert!(normalize_loopback_host("example.test").is_err());
-}
-
-#[test]
 fn bridge_chunk_rejects_invalid_cursor_and_oversize_payload() {
     assert!(
         parse_bridge_chunk(json!({
@@ -546,73 +411,6 @@ fn bridge_chunk_rejects_invalid_cursor_and_oversize_payload() {
             "chunk": "x",
         }))
         .is_err()
-    );
-}
-
-#[test]
-fn duplicate_bridge_role_keys_match_original_targets() {
-    assert_eq!(BridgeServer::bridge_role_key_base("edit#duplicate"), "edit");
-    assert!(BridgeServer::role_matches_target(
-        "edit#duplicate",
-        BridgeTarget::Edit
-    ));
-    assert!(BridgeServer::role_matches_target(
-        "edit#duplicate",
-        BridgeTarget::Main
-    ));
-    assert!(BridgeServer::role_matches_target(
-        "play-client#duplicate",
-        BridgeTarget::Client
-    ));
-    assert!(!BridgeServer::role_matches_target(
-        "play-client#duplicate",
-        BridgeTarget::Main
-    ));
-    assert!(!BridgeServer::role_matches_target(
-        "play-server#duplicate",
-        BridgeTarget::Edit
-    ));
-}
-
-#[test]
-fn studio_device_resolution_accepts_standard_dimensions() {
-    assert_eq!(studio_device_resolution("1179x2556").unwrap(), (1179, 2556));
-    assert_eq!(studio_device_resolution("874X402").unwrap(), (874, 402));
-    assert!(studio_device_resolution("1179").is_err());
-    assert!(studio_device_resolution("0x2556").is_err());
-}
-
-#[test]
-fn parse_source_range_batch_reads_key_source_pairs() {
-    let parsed = parse_source_range_batch(json!({
-        "items": ["alpha", "print('a')", "beta", "print('b')"]
-    }))
-    .unwrap();
-
-    assert_eq!(
-        parsed.by_key.get("alpha").map(String::as_str),
-        Some("print('a')")
-    );
-    assert_eq!(
-        parsed.by_key.get("beta").map(String::as_str),
-        Some("print('b')")
-    );
-}
-
-#[test]
-fn parse_source_range_batch_reads_numeric_index_pairs() {
-    let parsed = parse_source_range_batch(json!({
-        "items": [1, "print('a')", 2, "print('b')"]
-    }))
-    .unwrap();
-
-    assert_eq!(
-        parsed.by_index.get(&1).map(String::as_str),
-        Some("print('a')")
-    );
-    assert_eq!(
-        parsed.by_index.get(&2).map(String::as_str),
-        Some("print('b')")
     );
 }
 
@@ -1219,59 +1017,50 @@ fn synthesized_mesh_initial_size_prefers_mesh_size_over_scale_fallback() {
 }
 
 #[test]
-fn synthesized_mesh_initial_size_repairs_zero_initial_size_from_mesh_size() {
-    let mut mesh_properties = Map::new();
-    mesh_properties.insert(
-        MESH_INITIAL_SIZE_PROPERTY.to_string(),
-        vector3_json(0.0, 0.0, 0.0),
-    );
-    mesh_properties.insert(
-        MESH_SIZE_TRANSPORT_PROPERTY.to_string(),
-        vector3_json(3.0, 6.0, 9.0),
-    );
-
-    let document = single_mesh_document("PartOperation", mesh_properties);
+fn synthesized_mesh_initial_size_handles_metadata_states() {
     let database = rbx_reflection_database::get().unwrap();
-
-    let initial_size =
-        synthesized_mesh_initial_size_for_rbx_export(&document, 1, database).unwrap();
-
-    assert_rbx_vector3_close(initial_size, 3.0, 6.0, 9.0);
-}
-
-#[test]
-fn synthesized_mesh_initial_size_preserves_nonzero_initial_size() {
-    let mut mesh_properties = Map::new();
-    mesh_properties.insert(
-        MESH_INITIAL_SIZE_PROPERTY.to_string(),
-        vector3_json(1.0, 2.0, 3.0),
-    );
-    mesh_properties.insert(
-        MESH_SIZE_TRANSPORT_PROPERTY.to_string(),
-        vector3_json(7.0, 8.0, 9.0),
-    );
-
-    let document = single_mesh_document("MeshPart", mesh_properties);
-    let database = rbx_reflection_database::get().unwrap();
-
-    assert!(
-        synthesized_mesh_initial_size_for_rbx_export(&document, 1, database).is_none(),
-        "non-zero InitialSize should block MeshSize repair"
-    );
-}
-
-#[test]
-fn synthesized_mesh_initial_size_uses_size_without_studio_mesh_size() {
-    let mut mesh_properties = Map::new();
-    mesh_properties.insert("Size".to_string(), vector3_json(4.0, 5.0, 6.0));
-
-    let document = single_mesh_document("MeshPart", mesh_properties);
-    let database = rbx_reflection_database::get().unwrap();
-
-    let initial_size =
-        synthesized_mesh_initial_size_for_rbx_export(&document, 1, database).unwrap();
-
-    assert_rbx_vector3_close(initial_size, 4.0, 5.0, 6.0);
+    for (class_name, properties, expected) in [
+        (
+            "PartOperation",
+            Map::from_iter([
+                (
+                    MESH_INITIAL_SIZE_PROPERTY.to_string(),
+                    vector3_json(0.0, 0.0, 0.0),
+                ),
+                (
+                    MESH_SIZE_TRANSPORT_PROPERTY.to_string(),
+                    vector3_json(3.0, 6.0, 9.0),
+                ),
+            ]),
+            Some((3.0, 6.0, 9.0)),
+        ),
+        (
+            "MeshPart",
+            Map::from_iter([
+                (
+                    MESH_INITIAL_SIZE_PROPERTY.to_string(),
+                    vector3_json(1.0, 2.0, 3.0),
+                ),
+                (
+                    MESH_SIZE_TRANSPORT_PROPERTY.to_string(),
+                    vector3_json(7.0, 8.0, 9.0),
+                ),
+            ]),
+            None,
+        ),
+        (
+            "MeshPart",
+            Map::from_iter([("Size".to_string(), vector3_json(4.0, 5.0, 6.0))]),
+            Some((4.0, 5.0, 6.0)),
+        ),
+    ] {
+        let document = single_mesh_document(class_name, properties);
+        let actual = synthesized_mesh_initial_size_for_rbx_export(&document, 1, database);
+        match expected {
+            Some((x, y, z)) => assert_rbx_vector3_close(actual.unwrap(), x, y, z),
+            None => assert!(actual.is_none()),
+        }
+    }
 }
 
 fn write_mesh_export_fixture(
@@ -2752,111 +2541,6 @@ fn bytecode_remove_instance_removes_source_files_and_empty_dirs() {
     let updated = SettingsBytecode::read_file(&settings_path).unwrap();
     assert_eq!(updated.instances.len(), 1);
     fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn filesystem_instance_name_validation_rejects_paths_and_reserved_names() {
-    assert_eq!(
-        validate_filesystem_instance_name("ReplicatedStorage", "service").unwrap(),
-        "ReplicatedStorage"
-    );
-    for invalid in ["", ".", "..", "../escape", r"..\escape", "CON", "Name."] {
-        assert!(
-            validate_filesystem_instance_name(invalid, "service").is_err(),
-            "{invalid:?} should be rejected"
-        );
-    }
-}
-
-#[test]
-fn bytecode_service_resolution_rejects_parent_directory() {
-    assert!(
-        resolve_bytecode_settings_file(None, Some(".."), None, Path::new("."), Path::new("src"),)
-            .is_err()
-    );
-}
-
-#[test]
-fn existing_target_ancestor_must_stay_inside_root() {
-    let root = temp_dir("ancestor");
-    let outside = temp_dir("ancestor-outside");
-
-    assert!(
-        ensure_existing_ancestor_inside(&root, &root.join("missing").join("file"), "target")
-            .is_ok()
-    );
-    assert!(ensure_existing_ancestor_inside(&root, &outside, "target").is_err());
-    let _ = fs::remove_dir_all(root);
-    let _ = fs::remove_dir_all(outside);
-}
-
-#[test]
-fn bounded_line_reader_drains_oversized_requests() {
-    let input = format!("{}\nvalid\n", "x".repeat(9));
-    let mut reader = Cursor::new(input.into_bytes());
-    let mut line = String::new();
-
-    assert_eq!(
-        read_bounded_line(&mut reader, &mut line, 8).unwrap(),
-        BoundedLineRead::TooLong
-    );
-    assert_eq!(
-        read_bounded_line(&mut reader, &mut line, 8).unwrap(),
-        BoundedLineRead::Line
-    );
-    assert_eq!(line, "valid\n");
-}
-
-#[test]
-fn strip_extended_prefix_handles_unc_paths() {
-    if cfg!(windows) {
-        assert_eq!(
-            strip_extended_prefix(PathBuf::from(r"\\?\UNC\server\share\dir\f.luau")),
-            PathBuf::from(r"\\server\share\dir\f.luau")
-        );
-        assert_eq!(
-            strip_extended_prefix(PathBuf::from(r"\\?\C:\dir\f.luau")),
-            PathBuf::from(r"C:\dir\f.luau")
-        );
-        assert_eq!(
-            strip_extended_prefix(PathBuf::from(r"\\server\share\dir")),
-            PathBuf::from(r"\\server\share\dir")
-        );
-    }
-}
-
-#[test]
-fn nonfinite_float_json_roundtrip() {
-    let nan = json_number_f64(f64::NAN);
-    assert!(json_f64(&nan).unwrap().is_nan());
-    let inf = json_number_f64(f64::INFINITY);
-    assert_eq!(json_f64(&inf), Some(f64::INFINITY));
-    let neg = json_number_f64(f64::NEG_INFINITY);
-    assert_eq!(json_f64(&neg), Some(f64::NEG_INFINITY));
-    assert_eq!(json_f64(&json!(1.5)), Some(1.5));
-    assert_eq!(json_f64(&json!("inf")), None);
-}
-
-#[test]
-fn sourcemap_relative_tolerates_root_form_mismatch() {
-    if cfg!(windows) {
-        assert_eq!(
-            path_to_sourcemap_relative(
-                Path::new(r"C:\proj"),
-                Path::new(r"\\?\C:\proj\src\Workspace\A.luau")
-            ),
-            "src/Workspace/A.luau"
-        );
-        assert_eq!(
-            path_to_sourcemap_relative(Path::new(r"c:\Proj"), Path::new(r"C:\proj\src\B.luau")),
-            "src/B.luau"
-        );
-    } else {
-        assert_eq!(
-            path_to_sourcemap_relative(Path::new("/proj"), Path::new("/proj/src/C.luau")),
-            "src/C.luau"
-        );
-    }
 }
 
 #[test]

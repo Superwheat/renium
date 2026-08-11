@@ -225,66 +225,60 @@ pub(crate) fn remove_instances_at_indices(
     Ok(removed)
 }
 
-fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize>]) -> usize {
-    let mut changed = 0usize;
+fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize>]) {
     for instance in &mut document.instances {
         for value in instance.properties.values_mut() {
-            changed += remap_ref_indices_in_value(value, old_to_new);
+            remap_ref_indices_in_value(value, old_to_new);
         }
         for value in instance.attributes.values_mut() {
-            changed += remap_ref_indices_in_value(value, old_to_new);
+            remap_ref_indices_in_value(value, old_to_new);
         }
     }
-    changed
 }
 
-fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) -> usize {
-    let mut changed = 0usize;
+fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) {
     match value {
         Value::Array(items) => {
             for item in items {
-                changed += remap_ref_indices_in_value(item, old_to_new);
+                remap_ref_indices_in_value(item, old_to_new);
             }
         }
         Value::Object(object) => {
             if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-                changed += remap_ref_object_index(object, old_to_new) as usize;
+                remap_ref_object_index(object, old_to_new);
             }
             if let Some(Value::Object(ref_object)) = object.get_mut("Ref") {
-                changed += remap_ref_object_index(ref_object, old_to_new) as usize;
+                remap_ref_object_index(ref_object, old_to_new);
             }
             for item in object.values_mut() {
-                changed += remap_ref_indices_in_value(item, old_to_new);
+                remap_ref_indices_in_value(item, old_to_new);
             }
         }
         _ => {}
     }
-    changed
 }
 
-fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<usize>]) -> bool {
+fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<usize>]) {
     let Some(old_index) = object
         .get("instanceIndex")
         .and_then(settings_reference_index)
     else {
-        return false;
+        return;
     };
 
     if let Some(new_index) = old_to_new.get(old_index).copied().flatten() {
         if old_index == new_index {
-            return false;
+            return;
         }
         object.insert(
             "instanceIndex".to_string(),
             Value::Number(Number::from((new_index + 1) as u64)),
         );
-        return true;
+        return;
     }
-    let mut removed = false;
     for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
-        removed = object.remove(selector).is_some() || removed;
+        object.remove(selector);
     }
-    removed
 }
 
 pub(crate) fn find_unique_instance_index(

@@ -15,7 +15,7 @@ use crate::editor_document::ensure_editor_source_target_in_bytecode;
 use crate::editor_paths::{build_editor_instance_paths, infer_editor_source_path_spec_in_service};
 use crate::external_tools::run_checked_external_tool;
 use crate::file_io::{
-    absolutize_under, ensure_existing_ancestor_inside, fnv1a_hex, path_key,
+    absolutize_under, ensure_existing_ancestor_inside, fnv1a_hex, path_key, read_file_if_present,
     resolve_existing_project_root, service_settings_path, validate_filesystem_instance_name,
 };
 use crate::instance_api::{self, InstanceSelector};
@@ -25,8 +25,8 @@ use crate::settings_bytecode::SettingsBytecode;
 use crate::settings_tree::{editor_service_root_index, settings_children_by_parent};
 
 use super::{
-    LinkLock, LinkTargetRef, LinkTargetStorage, apply_preserved_subtree_identity,
-    collect_project_settings_files, ensure_editor_container_path, ensure_renium_gitignore,
+    LinkLock, LinkTargetRef, LinkTargetStorage, RENIUM_DIR_GITIGNORE,
+    apply_preserved_subtree_identity, collect_project_settings_files, ensure_editor_container_path,
     link_lock_path, link_manifest_path, link_target_document_selector_parts,
     link_target_file_pairs_at, link_target_ordinals, link_target_ref_key, link_target_segments,
     load_settings_documents, package_target_fingerprint, prepare_package_replacement,
@@ -80,6 +80,12 @@ fn build_wally_realms(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect();
+    if let Some(realm) = wanted
+        .iter()
+        .find(|realm| !matches!(realm.as_str(), "shared" | "server" | "dev"))
+    {
+        bail!("Unknown Wally realm '{realm}'; expected shared, server, or dev");
+    }
     let mut realms = Vec::new();
     if wanted.contains("shared") {
         realms.push(WallyRealm {
@@ -175,15 +181,19 @@ fn validate_wally_target_overlaps(project_root: &Path, realms: &[WallyRealm]) ->
     Ok(())
 }
 
-fn wally_inputs_hash(project_root: &Path, manifest: &Path) -> String {
-    let manifest = fs::read(manifest).unwrap_or_default();
-    let lock = fs::read(project_root.join("wally.lock")).unwrap_or_default();
+fn wally_inputs_hash(project_root: &Path, manifest: &Path) -> Result<String> {
+    let manifest = fs::read(manifest)
+        .with_context(|| format!("Failed to read Wally manifest {}", manifest.display()))?;
+    let lock_path = project_root.join("wally.lock");
+    let lock = read_file_if_present(&lock_path)
+        .with_context(|| format!("Failed to read Wally lockfile {}", lock_path.display()))?
+        .unwrap_or_default();
     let mut content = Vec::with_capacity(manifest.len() + lock.len() + 16);
     content.extend_from_slice(&(manifest.len() as u64).to_le_bytes());
     content.extend_from_slice(&manifest);
     content.extend_from_slice(&(lock.len() as u64).to_le_bytes());
     content.extend_from_slice(&lock);
-    fnv1a_hex(&content)
+    Ok(fnv1a_hex(&content))
 }
 
 struct WallyRealmOutcome {
@@ -624,7 +634,10 @@ fn commit_wally_changes(
     removals: &mut Vec<PathBuf>,
 ) -> Result<()> {
     stage_settings_document_writes(documents, settings_outputs, writes, removals)?;
-    ensure_renium_gitignore(project_root);
+    let gitignore = project_root.join(".renium").join(".gitignore");
+    if !gitignore.exists() {
+        writes.insert(gitignore, RENIUM_DIR_GITIGNORE.as_bytes().to_vec());
+    }
     writes.insert(link_lock_path(project_root), serialize_link_lock(lock)?);
     removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
     removals.sort_by_key(|path| path_key(path));
@@ -683,7 +696,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
         }
     }
 
-    let initial_lock_hash = wally_inputs_hash(&project_root, &manifest);
+    let initial_lock_hash = wally_inputs_hash(&project_root, &manifest)?;
     let (all_realms_fresh, initial_realm_fresh) = initial_wally_realm_freshness(
         args.force,
         &realms,
@@ -699,7 +712,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
         &project_root,
     )?;
 
-    let lock_hash = wally_inputs_hash(&project_root, &manifest);
+    let lock_hash = wally_inputs_hash(&project_root, &manifest)?;
     let mut lock = read_link_lock(&project_root)?;
 
     let mut realm_results: Vec<Value> = Vec::new();
@@ -740,7 +753,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
                     let outcome =
                         import_wally_realm(document, realm, storage, true, &external_references)?;
                     for path in &outcome.changed_paths {
-                        if changed_seen.insert(path.to_ascii_lowercase()) {
+                        if changed_seen.insert(path_key(Path::new(path))) {
                             changed_paths.push(path.clone());
                         }
                     }
@@ -848,7 +861,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
 
         applied += 1;
         for path in &outcome.changed_paths {
-            if changed_seen.insert(path.to_ascii_lowercase()) {
+            if changed_seen.insert(path_key(Path::new(path))) {
                 changed_paths.push(path.clone());
             }
         }
@@ -915,5 +928,6 @@ fn validate_wally_target_name(raw: &str, label: &str) -> Result<String> {
     if value.is_empty() {
         bail!("Wally {label} cannot be empty");
     }
-    validate_filesystem_instance_name(value, &format!("Wally {label}"))
+    validate_filesystem_instance_name(value, &format!("Wally {label}"))?;
+    Ok(value.to_string())
 }
