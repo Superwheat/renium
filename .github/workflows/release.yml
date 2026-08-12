@@ -74,8 +74,7 @@ jobs:
           New-Item -ItemType Directory -Path $stage | Out-Null
           $binary = if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" }
           Copy-Item "tools/renium/target/release/$binary" $stage
-          Copy-Item README.md $stage
-          Copy-Item tools/renium/README.md (Join-Path $stage "CLI-README.md")
+          Copy-Item tools/renium/README.md (Join-Path $stage "README.md")
           Copy-Item LICENSE $stage
           if ("${{ runner.os }}" -eq "Windows") {
             Copy-Item rbx.cmd $stage
@@ -88,26 +87,17 @@ jobs:
           }
           $archive = Join-Path $env:RUNNER_TEMP "renium-$version-$platform.zip"
           Compress-Archive -LiteralPath $stage -DestinationPath $archive
-          $rawName = "renium-cli-$("${{ runner.os }}".ToLowerInvariant())-$("${{ runner.arch }}".ToLowerInvariant())"
-          if ("${{ runner.os }}" -eq "Windows") { $rawName += ".exe" }
-          $raw = Join-Path $env:RUNNER_TEMP $rawName
-          Copy-Item "tools/renium/target/release/$binary" $raw
           "RENIUM_ARCHIVE=$archive" >> $env:GITHUB_ENV
-          "RENIUM_RAW_CLI=$raw" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ runner.os }}-${{ runner.arch }}
-          path: |
-            ${{ env.RENIUM_ARCHIVE }}
-            ${{ env.RENIUM_RAW_CLI }}
+          path: ${{ env.RENIUM_ARCHIVE }}
           if-no-files-found: error
 
       - uses: actions/attest@v4
         with:
-          subject-path: |
-            ${{ env.RENIUM_ARCHIVE }}
-            ${{ env.RENIUM_RAW_CLI }}
+          subject-path: ${{ env.RENIUM_ARCHIVE }}
 
   integration:
     name: Plugin and extension
@@ -144,12 +134,7 @@ jobs:
           New-Item -ItemType Directory -Path $shared | Out-Null
           @(
             "Renium.rbxm",
-            "Renium.rbxmx",
-            "README.md",
-            "CLI-README.md",
-            "LICENSE",
-            "install.ps1",
-            "install.sh"
+            "Renium.rbxmx"
           ) | ForEach-Object {
             $source = Join-Path $release $_
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {

@@ -17,6 +17,9 @@ const logoFiles = [
 const insertableObjectsIconTheme = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_THEME ?? "Dark";
 const insertableObjectsIconSize = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SIZE ?? "Standard";
 const preferredIconScale = process.env.RENIUM_INSERTABLE_OBJECTS_ICON_SCALE ?? "@2x";
+const refreshStudioApi =
+  process.argv.includes("--refresh-studio-api") ||
+  process.env.RENIUM_REFRESH_STUDIO_API === "1";
 
 function syncStudioPluginBundle() {
   const source = process.env.RENIUM_PLUGIN_BUNDLE?.trim() ||
@@ -126,7 +129,6 @@ function syncInsertableObjectIcons() {
 
   const allowedPngNames = new Set([
     ...logoFiles.map((fileName) => path.basename(fileName, ".png")),
-    "sample",
     ...icons.keys(),
   ]);
   for (const entry of fs.readdirSync(extensionAssets, { withFileTypes: true })) {
@@ -155,13 +157,9 @@ for (const fileName of logoFiles) {
   }
 }
 
-generateRobloxPropertiesMetadata({
-  extensionRoot,
-  repoRoot,
-  refreshStudioApi:
-    process.argv.includes("--refresh-studio-api") ||
-    process.env.RENIUM_REFRESH_STUDIO_API === "1",
-});
+if (refreshStudioApi || !fs.existsSync(path.join(extensionResources, "roblox-properties.generated.json"))) {
+  generateRobloxPropertiesMetadata({ extensionRoot, repoRoot, refreshStudioApi });
+}
 syncStudioPluginBundle();
 syncProjectSchema();
 syncInsertableObjectIcons();
