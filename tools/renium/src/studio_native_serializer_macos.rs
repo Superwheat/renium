@@ -20,15 +20,15 @@ use crate::timing::current_millis;
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
-const REQUEST_VERSION: u32 = 1;
+const REQUEST_VERSION: u32 = 2;
 const RESPONSE_SIZE: usize = 536;
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
 const SECTION_64_SIZE: usize = 80;
 const LC_SEGMENT_64: u32 = 0x19;
+const LC_UUID: u32 = 0x1b;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
-const IMAGE_BASE: u64 = 0x1_0000_0000;
 
 static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
 
@@ -36,6 +36,7 @@ static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
 struct SerializerTrace {
     factory_rva: u64,
     execute_rva: u64,
+    image_uuid: [u8; 16],
 }
 struct CachedTrace {
     len: u64,
@@ -53,6 +54,8 @@ struct MachSection {
 struct MachImage<'a> {
     bytes: &'a [u8],
     cpu: u32,
+    image_base: u64,
+    image_uuid: [u8; 16],
     text: MachSection,
     sections: Vec<MachSection>,
 }
@@ -97,6 +100,8 @@ impl<'a> MachImage<'a> {
         let mut cursor = MACH_HEADER_64_SIZE;
         let mut sections = Vec::new();
         let mut text = None;
+        let mut image_base = None;
+        let mut image_uuid = None;
         for _ in 0..command_count {
             let command =
                 read_u32(bytes, cursor).context("Studio Mach-O load command is truncated")?;
@@ -114,6 +119,12 @@ impl<'a> MachImage<'a> {
                     bail!("Studio Mach-O contains a truncated segment");
                 }
                 let segment_name = fixed_name(&bytes[cursor + 8..cursor + 24])?;
+                if segment_name == "__TEXT" {
+                    image_base = Some(
+                        read_u64(bytes, cursor + 24)
+                            .context("Studio __TEXT address is truncated")?,
+                    );
+                }
                 let section_count = read_u32(bytes, cursor + 64)
                     .context("Studio Mach-O segment section count is truncated")?
                     as usize;
@@ -155,13 +166,27 @@ impl<'a> MachImage<'a> {
                         sections.push(section);
                     }
                 }
+            } else if command == LC_UUID {
+                if command_size < 24 {
+                    bail!("Studio Mach-O contains a truncated UUID command");
+                }
+                let uuid: [u8; 16] = bytes[cursor + 8..cursor + 24]
+                    .try_into()
+                    .expect("UUID command bounds were validated");
+                if image_uuid.replace(uuid).is_some() {
+                    bail!("Studio Mach-O contains multiple UUID commands");
+                }
             }
             cursor = command_end.expect("load command bounds were validated");
         }
         let text = text.context("Studio Mach-O is missing __TEXT,__text")?;
+        let image_base = image_base.context("Studio Mach-O is missing __TEXT")?;
+        let image_uuid = image_uuid.context("Studio Mach-O is missing LC_UUID")?;
         Ok(Self {
             bytes,
             cpu,
+            image_base,
+            image_uuid,
             text,
             sections,
         })
@@ -347,8 +372,13 @@ fn trace_arm64(image: &MachImage<'_>, log_xref: u64) -> Result<SerializerTrace> 
         bail!("Studio serializer state factory result shape changed");
     }
     Ok(SerializerTrace {
-        factory_rva: factory - IMAGE_BASE,
-        execute_rva: execute - IMAGE_BASE,
+        factory_rva: factory
+            .checked_sub(image.image_base)
+            .context("Studio serializer state factory precedes __TEXT")?,
+        execute_rva: execute
+            .checked_sub(image.image_base)
+            .context("Studio serializer execution entry precedes __TEXT")?,
+        image_uuid: image.image_uuid,
     })
 }
 
@@ -407,8 +437,13 @@ fn trace_x86(image: &MachImage<'_>, log_xref: u64) -> Result<SerializerTrace> {
     }
     let factory = factories[0];
     Ok(SerializerTrace {
-        factory_rva: factory - IMAGE_BASE,
-        execute_rva: execute - IMAGE_BASE,
+        factory_rva: factory
+            .checked_sub(image.image_base)
+            .context("Studio serializer state factory precedes __TEXT")?,
+        execute_rva: execute
+            .checked_sub(image.image_base)
+            .context("Studio serializer execution entry precedes __TEXT")?,
+        image_uuid: image.image_uuid,
     })
 }
 
@@ -498,13 +533,14 @@ fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64
     })?;
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut request = Vec::with_capacity(32 + path_bytes.len());
+    let mut request = Vec::with_capacity(48 + path_bytes.len());
     request.extend_from_slice(&REQUEST_MAGIC.to_le_bytes());
     request.extend_from_slice(&REQUEST_VERSION.to_le_bytes());
     request.extend_from_slice(&1u32.to_le_bytes());
     request.extend_from_slice(&path_length.to_le_bytes());
     request.extend_from_slice(&trace.factory_rva.to_le_bytes());
     request.extend_from_slice(&trace.execute_rva.to_le_bytes());
+    request.extend_from_slice(&trace.image_uuid);
     request.extend_from_slice(path_bytes);
     socket
         .write_all(&request)
@@ -821,6 +857,24 @@ fn create_managed_studio_transaction(parent: &Path) -> Result<PathBuf> {
     bail!("Could not allocate a managed Studio transaction")
 }
 
+fn ensure_managed_studio_closed(target: &Path) -> Result<()> {
+    let executable = target.join("Contents/MacOS/RobloxStudio.bin");
+    if !executable.is_file() {
+        return Ok(());
+    }
+    let output = command_output(
+        Command::new("lsof").arg("-t").arg(&executable),
+        "Renium Studio process check",
+    )?;
+    if output.status.success() && !output.stdout.is_empty() {
+        bail!("Close Renium Studio before rebuilding or removing it");
+    }
+    if output.status.success() || output.status.code() == Some(1) {
+        return Ok(());
+    }
+    bail!("lsof could not inspect whether Renium Studio is running")
+}
+
 pub struct ManagedStudioRemoval {
     target: PathBuf,
     transaction: PathBuf,
@@ -854,6 +908,7 @@ impl ManagedStudioRemoval {
 
 pub fn begin_managed_studio_removal() -> Result<ManagedStudioRemoval> {
     let target = managed_studio_path()?;
+    ensure_managed_studio_closed(&target)?;
     let parent = target
         .parent()
         .context("Managed Studio path has no parent")?;
@@ -879,6 +934,7 @@ pub fn begin_managed_studio_removal() -> Result<ManagedStudioRemoval> {
 }
 
 fn install_managed_studio(source: &Path, target: &Path, signature: &str) -> Result<()> {
+    ensure_managed_studio_closed(target)?;
     let parent = target
         .parent()
         .context("Managed Studio path has no parent")?;
