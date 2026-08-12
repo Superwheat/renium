@@ -420,33 +420,28 @@ if ((Get-BinaryArchitecture -Path $cliBinary) -ne $releaseTarget.Architecture) {
 $releaseCliBinary = Join-Path $releaseDirectory $binaryName
 Copy-Item -LiteralPath $cliBinary -Destination $releaseCliBinary
 $releaseReadme = Join-Path $releaseDirectory "README.md"
-$releaseCliReadme = Join-Path $releaseDirectory "CLI-README.md"
 $releaseLicense = Join-Path $releaseDirectory "LICENSE"
-Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $releaseReadme
-Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\README.md") -Destination $releaseCliReadme
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\README.md") -Destination $releaseReadme
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
-$releaseInstallPowerShell = Join-Path $releaseDirectory "install.ps1"
-$releaseInstallShell = Join-Path $releaseDirectory "install.sh"
-Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.ps1") -Destination $releaseInstallPowerShell
-Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.sh") -Destination $releaseInstallShell
 $releaseSupportFiles = @(
     $releaseReadme,
-    $releaseCliReadme,
-    $releaseLicense,
-    $releaseInstallPowerShell,
-    $releaseInstallShell
+    $releaseLicense
 )
 if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
     $releaseRbxRunner = Join-Path $releaseDirectory "rbx-run.ps1"
+    $releaseInstaller = Join-Path $releaseDirectory "install.ps1"
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx.cmd") -Destination $releaseRbx
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\rbx-run.ps1") -Destination $releaseRbxRunner
-    $releaseSupportFiles += @($releaseRbx, $releaseRbxRunner)
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.ps1") -Destination $releaseInstaller
+    $releaseSupportFiles += @($releaseRbx, $releaseRbxRunner, $releaseInstaller)
 }
 else {
     $releaseRbx = Join-Path $releaseDirectory "rbx"
+    $releaseInstaller = Join-Path $releaseDirectory "install.sh"
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx") -Destination $releaseRbx
-    $releaseSupportFiles += $releaseRbx
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.sh") -Destination $releaseInstaller
+    $releaseSupportFiles += @($releaseRbx, $releaseInstaller)
 }
 
 $releasePluginXml = Join-Path $releaseDirectory "Renium.rbxmx"

@@ -13,3 +13,4 @@ tsconfig.json
 tsconfig.test.json
 scripts/**
 out/AGENTS.md
+out/__merge_test.mjs
