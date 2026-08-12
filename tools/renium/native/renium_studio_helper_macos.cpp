@@ -39,6 +39,7 @@ struct Request
     std::uint32_t pathLength;
     std::uint64_t factoryRva;
     std::uint64_t executeRva;
+    unsigned char imageUuid[16];
 };
 
 struct Response
@@ -76,7 +77,7 @@ struct DataModelCandidate
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 1;
+static constexpr std::uint32_t Version = 2;
 static constexpr std::size_t DataModelInstanceOffset = 0x1c8;
 static constexpr std::size_t InstanceClassDescriptorOffset = 0x18;
 static constexpr std::size_t InstanceChildrenOffset = 0x70;
@@ -85,7 +86,7 @@ static std::mutex SerializeMutex;
 static char SocketPath[sizeof(((sockaddr_un*)nullptr)->sun_path)]{};
 static void* CachedDataModel = nullptr;
 
-static_assert(sizeof(Request) == 32);
+static_assert(sizeof(Request) == 48);
 static_assert(sizeof(Response) == 536);
 
 static bool ReadMemory(std::uintptr_t address, void* output, std::size_t size)
@@ -343,12 +344,16 @@ static void ReleaseShared(StudioShared& value)
     value.owner = nullptr;
 }
 
-static bool ValidateRva(
+static bool ResolveTrace(
     const mach_header_64* header,
     std::intptr_t slide,
-    std::uint64_t rva,
-    std::uintptr_t& address)
+    const Request& request,
+    std::uintptr_t& factoryAddress,
+    std::uintptr_t& executeAddress,
+    std::string& error)
 {
+    const segment_command_64* text = nullptr;
+    const uuid_command* uuid = nullptr;
     auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
     for (std::uint32_t index = 0; index < header->ncmds; ++index)
     {
@@ -356,19 +361,34 @@ static bool ValidateRva(
         if (load->cmd == LC_SEGMENT_64)
         {
             const auto segment = reinterpret_cast<const segment_command_64*>(load);
-            if (std::strcmp(segment->segname, "__TEXT") == 0 &&
-                rva >= segment->vmaddr - 0x100000000ULL &&
-                rva < segment->vmaddr - 0x100000000ULL + segment->vmsize)
-            {
-                address = static_cast<std::uintptr_t>(0x100000000ULL + rva + slide);
-                return true;
-            }
+            if (std::strcmp(segment->segname, "__TEXT") == 0)
+                text = segment;
         }
+        else if (load->cmd == LC_UUID)
+            uuid = reinterpret_cast<const uuid_command*>(load);
         if (load->cmdsize < sizeof(load_command))
             return false;
         command += load->cmdsize;
     }
-    return false;
+    if (!text || !uuid)
+    {
+        error = "Studio's loaded image has no text identity";
+        return false;
+    }
+    if (std::memcmp(uuid->uuid, request.imageUuid, sizeof(request.imageUuid)) != 0)
+    {
+        error = "Renium Studio changed while it was open; close and reopen it";
+        return false;
+    }
+    if (request.factoryRva >= text->vmsize || request.executeRva >= text->vmsize)
+    {
+        error = "serializer trace points outside Studio's text segment";
+        return false;
+    }
+    const auto runtimeBase = static_cast<std::uintptr_t>(text->vmaddr + slide);
+    factoryAddress = runtimeBase + request.factoryRva;
+    executeAddress = runtimeBase + request.executeRva;
+    return true;
 }
 
 static void SetError(Response& response, const std::string& error)
@@ -385,15 +405,15 @@ static Response Serialize(const Request& request, const std::string& path)
     const auto slide = _dyld_get_image_vmaddr_slide(0);
     std::uintptr_t factoryAddress = 0;
     std::uintptr_t executeAddress = 0;
-    if (!header || !ValidateRva(header, slide, request.factoryRva, factoryAddress) ||
-        !ValidateRva(header, slide, request.executeRva, executeAddress))
+    std::string error;
+    if (!header ||
+        !ResolveTrace(header, slide, request, factoryAddress, executeAddress, error))
     {
         response.status = 2;
-        SetError(response, "serializer trace points outside Studio's text segment");
+        SetError(response, error.empty() ? "Studio main image is unavailable" : error);
         return response;
     }
     void* dataModel = nullptr;
-    std::string error;
     if (!FindDataModel(dataModel, error))
     {
         response.status = 3;
