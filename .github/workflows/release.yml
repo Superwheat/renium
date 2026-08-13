@@ -74,19 +74,40 @@ jobs:
           New-Item -ItemType Directory -Path $stage | Out-Null
           $binary = if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" }
           Copy-Item "tools/renium/target/release/$binary" $stage
-          Copy-Item tools/renium/README.md (Join-Path $stage "README.md")
+          $readme = (Get-Content tools/renium/RELEASE_README.md -Raw).Replace("{{VERSION}}", $version)
+          [IO.File]::WriteAllText(
+            (Join-Path $stage "README.md"),
+            $readme,
+            [Text.UTF8Encoding]::new($false)
+          )
           Copy-Item LICENSE $stage
           if ("${{ runner.os }}" -eq "Windows") {
             Copy-Item rbx.cmd $stage
             Copy-Item tools/renium/rbx-run.ps1 $stage
             Copy-Item install.ps1 $stage
+            ./tools/build-windows-launcher.ps1 `
+              -InstallerScript (Join-Path $stage "install.ps1") `
+              -Version $version `
+              -OutputPath (Join-Path $stage "Install Renium.cmd")
           }
           else {
             Copy-Item rbx $stage
             Copy-Item install.sh $stage
+            chmod +x (Join-Path $stage "renium") (Join-Path $stage "rbx") (Join-Path $stage "install.sh")
+            if ("${{ runner.os }}" -eq "macOS") {
+              Copy-Item tools/renium/install-macos.command (Join-Path $stage "Install Renium.command")
+              chmod +x (Join-Path $stage "Install Renium.command")
+            }
           }
           $archive = Join-Path $env:RUNNER_TEMP "renium-$version-$platform.zip"
-          Compress-Archive -LiteralPath $stage -DestinationPath $archive
+          if ("${{ runner.os }}" -eq "Windows") {
+            Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive
+          }
+          else {
+            Push-Location $stage
+            try { zip -q -r $archive . }
+            finally { Pop-Location }
+          }
           "RENIUM_ARCHIVE=$archive" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
@@ -326,6 +347,7 @@ jobs:
         run: |
           {
             printf "# What's Changed\n"
+            printf "\n## Install\n\nOn Windows, open the platform ZIP and double-click **Install Renium.cmd**; extraction is optional. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.\n\n"
             awk -v heading="## $RENIUM_VERSION" '
               index($0, heading) == 1 { found = 1; next }
               found && /^## / { exit }

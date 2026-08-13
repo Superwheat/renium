@@ -373,13 +373,13 @@ rbx doctor --json
 rbx doctor --bundle .\.renium\diagnostics\release-check
 ```
 
-The editor extension checks the signed GitHub Release manifest when it opens.
-The daemon also checks after the first connection from each Studio process, then
-ignores reconnects from that process for five minutes. The update prompt installs
-the matching extension and Studio plugin together. The
-Studio plugin shows the same update in its notification card and sends the
-install request to the connected editor. Reload the editor and restart Studio
-after installation.
+The editor extension checks for a signed GitHub release when it opens. The Rust
+updater shares that verified result with the daemon for five minutes. After the
+cache expires, it sends the saved ETag so GitHub returns no manifest body when
+the release is unchanged. The update prompt installs the matching extension and
+Studio plugin together. The Studio plugin shows the same update in its
+notification card and sends the install request to the connected editor. Reload
+the editor and restart Studio after installation.
 
 Named daemons are selected with the global `--daemon` flag:
 

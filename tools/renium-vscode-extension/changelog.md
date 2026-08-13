@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.4 - 2026-08-13
+
+- Added normal platform ZIP installers with short installation instructions and direct launchers.
+- Added editor selection to the Windows and macOS installers, with an explicit exit option.
+- Made the Windows launcher install directly from an open ZIP and put `renium` on the user PATH.
+- Centralized signed update checks in Rust with a shared five-minute cache and ETag revalidation.
+- Made every new Studio runtime receive the cached update result without repeating GitHub requests.
+- Removed direct plugin downloads from the editor extension and kept matching CLI, extension, and plugin versions together.
+
 ## 0.1.3 - 2026-08-13
 
 - Added batched Roblox Open Cloud requests with bound universe and place expansion, escaped path parameters, conditional requests, retry metadata, and Data Store support.

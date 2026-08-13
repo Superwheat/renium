@@ -5,6 +5,7 @@ repository="Superwheat/renium"
 install_root="${XDG_DATA_HOME:-$HOME/.local/share}/renium"
 bin_root="$HOME/.local/bin"
 stable_bin_root="$HOME/.renium/bin"
+script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 stop_recorded_daemons() {
   failed=0
@@ -307,6 +308,30 @@ editor_extension_root() {
     windsurf) printf '%s\n' "$HOME/.windsurf/extensions" ;;
     *) return 1 ;;
   esac
+}
+
+editor_cli() {
+  name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return
+  fi
+  [ "${os:-}" = "macos" ] || return 1
+  case "$name" in
+    cursor) app_name="Cursor" ;;
+    code) app_name="Visual Studio Code" ;;
+    code-insiders) app_name="Visual Studio Code - Insiders" ;;
+    windsurf) app_name="Windsurf" ;;
+    *) return 1 ;;
+  esac
+  for applications in "/Applications" "$HOME/Applications"; do
+    candidate="$applications/$app_name.app/Contents/Resources/app/bin/$name"
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  return 1
 }
 
 is_renium_extension_dir() {
@@ -638,7 +663,17 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
+interactive=0
+if [ "${1:-}" = "--interactive" ]; then
+  interactive=1
+  shift
+fi
+local_cli="$script_root/renium"
 version="${1:-}"
+if [ -z "$version" ] && [ -f "$local_cli" ]; then
+  chmod +x "$local_cli"
+  version="$("$local_cli" --version 2>/dev/null | awk '{print $2; exit}')"
+fi
 if [ -z "$version" ]; then
   version="$(curl -fsSL "https://api.github.com/repos/$repository/releases/latest" | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)"
 fi
@@ -687,6 +722,14 @@ fi
 archive_name="renium-$version-$os-$arch.zip"
 studio_archive_name="renium-$version-$os-$studio_arch.zip"
 base_url="https://github.com/$repository/releases/download/v$version"
+use_local_package=0
+if [ -f "$local_cli" ]; then
+  chmod +x "$local_cli"
+  local_version="$("$local_cli" --version 2>/dev/null | awk '{print $2; exit}')"
+  if [ "$local_version" = "$version" ]; then
+    use_local_package=1
+  fi
+fi
 stage="$(mktemp -d "${TMPDIR:-/tmp}/renium-install.XXXXXX")"
 transaction_active=0
 committed=0
@@ -709,23 +752,28 @@ cleanup_install() {
 }
 trap cleanup_install EXIT HUP INT TERM
 
-curl -fsSL "$base_url/$archive_name" -o "$stage/$archive_name"
-curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
-expected="$(grep "$archive_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
-if [ -z "$expected" ]; then
-  printf '%s\n' "$archive_name is missing from SHA256SUMS.txt." >&2
-  exit 1
-fi
-if command -v shasum >/dev/null 2>&1; then
-  actual="$(shasum -a 256 "$stage/$archive_name" | awk '{print $1}')"
-else
-  actual="$(sha256sum "$stage/$archive_name" | awk '{print $1}')"
-fi
-if [ "$actual" != "$expected" ]; then
-  printf '%s\n' "$archive_name failed SHA-256 verification." >&2
-  exit 1
+if [ "$use_local_package" -eq 0 ]; then
+  curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
+  curl -fsSL "$base_url/$archive_name" -o "$stage/$archive_name"
+  expected="$(grep "$archive_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    printf '%s\n' "$archive_name is missing from SHA256SUMS.txt." >&2
+    exit 1
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$stage/$archive_name" | awk '{print $1}')"
+  else
+    actual="$(sha256sum "$stage/$archive_name" | awk '{print $1}')"
+  fi
+  if [ "$actual" != "$expected" ]; then
+    printf '%s\n' "$archive_name failed SHA-256 verification." >&2
+    exit 1
+  fi
 fi
 if [ "$studio_archive_name" != "$archive_name" ]; then
+  if [ ! -f "$stage/SHA256SUMS.txt" ]; then
+    curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
+  fi
   curl -fsSL "$base_url/$studio_archive_name" -o "$stage/$studio_archive_name"
   expected_studio="$(grep "$studio_archive_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
   if [ -z "$expected_studio" ]; then
@@ -771,8 +819,14 @@ editor_architecture() {
 editor_installs="$stage/editor-installs"
 : > "$editor_installs"
 for candidate in cursor code code-insiders windsurf; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    candidate_arch="$(editor_architecture "$candidate")"
+  if candidate_cli="$(editor_cli "$candidate")"; then
+    candidate_dir="$(dirname "$candidate_cli")"
+    case ":$PATH:" in
+      *":$candidate_dir:"*) ;;
+      *) PATH="$candidate_dir:$PATH" ;;
+    esac
+    export PATH
+    candidate_arch="$(editor_architecture "$candidate_cli")"
     printf '%s\t%s\t%s\n' \
       "$candidate" \
       "$(editor_extension_root "$candidate")" \
@@ -794,22 +848,61 @@ if [ -n "${RENIUM_EXTENSION_ROOT:-}" ]; then
       "$custom_arch" >> "$editor_installs"
   fi
 fi
-for candidate in cursor code code-insiders windsurf; do
-  candidate_root="$(editor_extension_root "$candidate")"
-  has_renium=0
-  for extension in "$candidate_root"/local.renium "$candidate_root"/local.renium-*; do
-    if is_renium_extension_dir "$extension"; then
-      has_renium=1
-      break
+if [ "$interactive" -eq 0 ]; then
+  for candidate in cursor code code-insiders windsurf; do
+    candidate_root="$(editor_extension_root "$candidate")"
+    has_renium=0
+    for extension in "$candidate_root"/local.renium "$candidate_root"/local.renium-*; do
+      if is_renium_extension_dir "$extension"; then
+        has_renium=1
+        break
+      fi
+    done
+    if [ "$has_renium" -eq 1 ] &&
+      ! awk -F '	' -v root="$candidate_root" '$2 == root { found=1 } END { exit !found }' "$editor_installs"
+    then
+      printf '%s\n' "Renium is installed in $candidate_root, but its exact editor CLI is unavailable. Set RENIUM_EXTENSION_ROOT to that path and RENIUM_EDITOR_CLI to the matching editor command." >&2
+      exit 1
     fi
   done
-  if [ "$has_renium" -eq 1 ] &&
-    ! awk -F '	' -v root="$candidate_root" '$2 == root { found=1 } END { exit !found }' "$editor_installs"
-  then
-    printf '%s\n' "Renium is installed in $candidate_root, but its exact editor CLI is unavailable. Set RENIUM_EXTENSION_ROOT to that path and RENIUM_EDITOR_CLI to the matching editor command." >&2
-    exit 1
+fi
+if [ "$interactive" -eq 1 ]; then
+  printf '\n%s\n' "Choose where to install the Renium extension:"
+  editor_count="$(awk 'END { print NR }' "$editor_installs")"
+  if [ "$editor_count" -eq 0 ]; then
+    printf '%s\n' "No supported editors were found. Install Cursor, Visual Studio Code, or Windsurf, then run this installer again."
+  else
+    awk -F '\t' '
+      $1 == "cursor" { name = "Cursor" }
+      $1 == "code" { name = "Visual Studio Code" }
+      $1 == "code-insiders" { name = "Visual Studio Code Insiders" }
+      $1 == "windsurf" { name = "Windsurf" }
+      $1 != "cursor" && $1 != "code" && $1 != "code-insiders" && $1 != "windsurf" { name = $1 }
+      { print NR ". " name }
+    ' "$editor_installs"
   fi
-done
+  printf '%s\n' "0. Exit"
+  while :; do
+    printf '%s' "Choose an option: "
+    IFS= read -r choice
+    if [ "$choice" = "0" ]; then
+      printf '%s\n' "Installation cancelled."
+      exit 3
+    fi
+    case "$choice" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "$editor_count" ]; then
+          selected_editor_installs="$stage/selected-editor-install"
+          sed -n "${choice}p" "$editor_installs" > "$selected_editor_installs"
+          editor_installs="$selected_editor_installs"
+          break
+        fi
+        ;;
+    esac
+    printf '%s\n' "Enter a number from 0 to $editor_count."
+  done
+fi
 for extension_arch in x64 arm64; do
   if ! awk -F '	' -v arch="$extension_arch" '$3 == arch { found=1 } END { exit !found }' \
     "$editor_installs"
@@ -817,29 +910,41 @@ for extension_arch in x64 arm64; do
     continue
   fi
   vsix_name="renium-$version-$target_os-$extension_arch.vsix"
-  curl -fsSL "$base_url/$vsix_name" -o "$stage/$vsix_name"
-  expected_vsix="$(grep "$vsix_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
-  if [ -z "$expected_vsix" ]; then
-    printf '%s\n' "$vsix_name is missing from SHA256SUMS.txt." >&2
-    exit 1
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    actual_vsix="$(shasum -a 256 "$stage/$vsix_name" | awk '{print $1}')"
+  if [ -f "$script_root/$vsix_name" ]; then
+    cp "$script_root/$vsix_name" "$stage/$vsix_name"
   else
-    actual_vsix="$(sha256sum "$stage/$vsix_name" | awk '{print $1}')"
-  fi
-  if [ "$actual_vsix" != "$expected_vsix" ]; then
-    printf '%s\n' "$vsix_name failed SHA-256 verification." >&2
-    exit 1
+    if [ ! -f "$stage/SHA256SUMS.txt" ]; then
+      curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
+    fi
+    curl -fsSL "$base_url/$vsix_name" -o "$stage/$vsix_name"
+    expected_vsix="$(grep "$vsix_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
+    if [ -z "$expected_vsix" ]; then
+      printf '%s\n' "$vsix_name is missing from SHA256SUMS.txt." >&2
+      exit 1
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+      actual_vsix="$(shasum -a 256 "$stage/$vsix_name" | awk '{print $1}')"
+    else
+      actual_vsix="$(sha256sum "$stage/$vsix_name" | awk '{print $1}')"
+    fi
+    if [ "$actual_vsix" != "$expected_vsix" ]; then
+      printf '%s\n' "$vsix_name failed SHA-256 verification." >&2
+      exit 1
+    fi
   fi
 done
 
-mkdir -p "$stage/expanded" "$bin_root" "$stable_bin_root"
-unzip -q "$stage/$archive_name" -d "$stage/expanded"
-cli="$(find "$stage/expanded" -type f -name renium | head -n 1)"
-if [ -z "$cli" ]; then
-  printf '%s\n' "$archive_name does not contain renium." >&2
-  exit 1
+mkdir -p "$bin_root" "$stable_bin_root"
+if [ "$use_local_package" -eq 1 ]; then
+  cli="$local_cli"
+else
+  mkdir -p "$stage/expanded"
+  unzip -q "$stage/$archive_name" -d "$stage/expanded"
+  cli="$(find "$stage/expanded" -type f -name renium | head -n 1)"
+  if [ -z "$cli" ]; then
+    printf '%s\n' "$archive_name does not contain renium." >&2
+    exit 1
+  fi
 fi
 studio_cli="$cli"
 if [ "$studio_archive_name" != "$archive_name" ]; then
@@ -858,7 +963,12 @@ staged_install="$install_parent/.renium-install-$transaction_id"
 previous_install="$install_parent/.renium-previous-$transaction_id"
 mkdir -p "$install_parent"
 mkdir "$staged_install"
-find "$(dirname "$cli")" -maxdepth 1 -type f -exec cp {} "$staged_install/" \;
+cp "$cli" "$staged_install/renium"
+for support_file in rbx Renium.rbxm; do
+  if [ -f "$(dirname "$cli")/$support_file" ]; then
+    cp "$(dirname "$cli")/$support_file" "$staged_install/$support_file"
+  fi
+done
 chmod +x "$staged_install/renium"
 if [ -f "$staged_install/rbx" ]; then
   chmod +x "$staged_install/rbx"
