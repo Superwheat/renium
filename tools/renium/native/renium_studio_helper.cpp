@@ -2,11 +2,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <immintrin.h>
 #include <new>
 #include <ostream>
 #include <sstream>
 #include <string>
+
+#if defined(_M_IX86) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 struct SharedInstance
 {
@@ -95,6 +98,24 @@ static void SetError(ReniumSerializerParams* params, const char* message)
     strncpy_s(params->error, message, _TRUNCATE);
 }
 
+static std::uint32_t GetMxcsr()
+{
+#if defined(_M_IX86) || defined(_M_X64)
+    return _mm_getcsr();
+#else
+    return 0;
+#endif
+}
+
+static void SetMxcsr(std::uint32_t value)
+{
+#if defined(_M_IX86) || defined(_M_X64)
+    _mm_setcsr(value);
+#else
+    (void)value;
+#endif
+}
+
 static bool AddOwnerReference(void* owner)
 {
     if (!owner)
@@ -174,7 +195,7 @@ static DWORD RunCore(RunState* state)
     }
 
     if (params->requestedMxcsr)
-        _mm_setcsr(params->requestedMxcsr);
+        SetMxcsr(params->requestedMxcsr);
 
     LARGE_INTEGER frequency{};
     LARGE_INTEGER started{};
@@ -421,7 +442,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
     params->writeMicros = 0;
     params->collectedCount = 0;
     params->collectedCapacityBytes = 0;
-    params->initialMxcsr = _mm_getcsr();
+    params->initialMxcsr = GetMxcsr();
     params->error[0] = '\0';
     if (!params->moduleBase ||
         !params->serializerRva ||
@@ -443,6 +464,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
     state.params = params;
     const auto result = RunCppCaught(&state);
     CleanupCaught(&state);
-    _mm_setcsr(params->initialMxcsr);
+    SetMxcsr(params->initialMxcsr);
     return result;
 }
