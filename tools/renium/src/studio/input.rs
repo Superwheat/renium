@@ -1060,6 +1060,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use super::StudioWindow;
     use anyhow::{Result, bail};
     use std::ffi::c_void;
 
