@@ -107,7 +107,7 @@ import {
   type RobloxPlaceFormat,
 } from "./utils";
 import { SettingsStoreEditorProvider } from "./settingsStoreViewer";
-import { isRobloxModel, reniumPluginReleaseUrl } from "./pluginDistribution";
+import { isRobloxModel } from "./pluginDistribution";
 import {
   LinkDecorationProvider,
   PackageScriptContentProvider,
@@ -1765,8 +1765,6 @@ class RobloxSyncController {
 
   public async installStudioPlugin(): Promise<void> {
     const assetName = "Renium.rbxm";
-    const extensionVersion = String(this.context.extension.packageJSON.version ?? "");
-    const releaseUrl = reniumPluginReleaseUrl(extensionVersion, assetName);
     if (process.platform !== "win32" && process.platform !== "darwin") {
       void vscode.window.showErrorMessage("Roblox Studio is only available on Windows and macOS.");
       return;
@@ -1775,78 +1773,41 @@ class RobloxSyncController {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Installing Studio plugin..." },
       async () => {
-        let bytes: Buffer | undefined;
-        let source = "";
-        let sourcePath = "";
-        let temporarySource = "";
         const workspaceRoot = pickWorkspaceRoot();
         const localBundles = [
           this.context.asAbsolutePath(path.join("assets", assetName)),
           ...(workspaceRoot ? [path.join(workspaceRoot, "tools", "plugin_ws_bridge", assetName)] : []),
         ];
-        for (const localBundle of localBundles) {
+        const sourcePath = localBundles.find((localBundle) => {
           if (!fs.existsSync(localBundle)) {
-            continue;
+            return false;
           }
           const candidateBytes = fs.readFileSync(localBundle);
           if (isRobloxModel(candidateBytes)) {
-            bytes = candidateBytes;
-            source = localBundle;
-            sourcePath = localBundle;
-            break;
+            return true;
           }
           this.output.appendLine(`[plugin-install] ignored invalid bundled model: ${localBundle}`);
-        }
-        if (!bytes) {
-          source = releaseUrl;
-          try {
-            const response = await fetch(releaseUrl);
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status}`);
-            }
-            bytes = Buffer.from(await response.arrayBuffer());
-          } catch (error) {
-            void vscode.window.showErrorMessage(
-              `Downloading the matching Studio plugin failed (${String(error)}). Check your network or download ${assetName} from release v${extensionVersion}.`,
-            );
-            return;
-          }
-        }
-        if (!isRobloxModel(bytes)) {
-          void vscode.window.showErrorMessage("The Studio plugin file is not a valid Roblox model.");
+          return false;
+        });
+        const cfg = this.getConfig();
+        const result = await this.runCommand(
+          cfg.cliPath,
+          sourcePath ? ["setup", "--file", sourcePath] : ["setup"],
+          cfg.projectRoot,
+          "Studio plugin setup",
+          cfg.progressHeartbeatSeconds,
+        );
+        if (result.code !== 0) {
+          void vscode.window.showErrorMessage(
+            `Studio plugin setup failed. ${result.output.trim() || `Exit code ${result.code}`}`,
+          );
           return;
         }
-        if (!sourcePath) {
-          temporarySource = path.join(os.tmpdir(), `renium-plugin-${process.pid}-${Date.now()}.rbxm`);
-          fs.writeFileSync(temporarySource, bytes);
-          sourcePath = temporarySource;
-        }
-        try {
-          const cfg = this.getConfig();
-          const command = cfg.cliPath;
-          const result = await this.runCommand(
-            command,
-            ["setup", "--file", sourcePath],
-            cfg.projectRoot,
-            "Studio plugin setup",
-            cfg.progressHeartbeatSeconds,
-          );
-          if (result.code !== 0) {
-            void vscode.window.showErrorMessage(
-              `Studio plugin setup failed. ${result.output.trim() || `Exit code ${result.code}`}`,
-            );
-            return;
-          }
-          this.output.appendLine(`[plugin-install] ${source} (${bytes.length} bytes)`);
-        } finally {
-          if (temporarySource) {
-            fs.rmSync(temporarySource, { force: true });
-          }
-        }
+        this.output.appendLine(`[plugin-install] ${sourcePath ?? "downloaded by Renium"}`);
         void vscode.window.showInformationMessage(
           process.platform === "darwin"
-            ? `Studio plugin installed (${Math.round(bytes.length / 1024)} KB). Open Renium Studio from Applications.`
-            : `Studio plugin installed (${Math.round(bytes.length / 1024)} KB). Restart Roblox Studio to load it.`,
+            ? "Studio plugin installed. Open Renium Studio from Applications."
+            : "Studio plugin installed. Restart Roblox Studio to load it.",
         );
       },
     );

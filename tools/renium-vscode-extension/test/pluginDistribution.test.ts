@@ -1,15 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isRobloxModel, reniumPluginReleaseUrl } from "../src/pluginDistribution";
-
-test("plugin download URL is pinned to the extension version", () => {
-  assert.equal(
-    reniumPluginReleaseUrl("0.1.3"),
-    "https://github.com/Superwheat/renium/releases/download/v0.1.3/Renium.rbxm",
-  );
-  assert.throws(() => reniumPluginReleaseUrl("latest"), /Invalid Renium extension version/);
-});
+import { isRobloxModel } from "../src/pluginDistribution";
 
 test("Roblox model validation accepts binary and XML headers", () => {
   assert.equal(isRobloxModel(Buffer.from("<roblox!\x89\xff\r\n\x1a\n\x00\x00\x00\x00", "latin1")), true);

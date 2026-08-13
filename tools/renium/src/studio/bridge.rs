@@ -40,9 +40,6 @@ const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
 const BRIDGE_CHANNEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BRIDGE_SLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
-#[cfg(any(windows, target_os = "macos"))]
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
 pub(crate) fn clamp_bridge_chunk_size(size: usize) -> usize {
     size.clamp(MIN_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_CHUNK_BYTES)
 }
@@ -192,7 +189,7 @@ struct BridgeAcceptState {
     #[cfg(any(windows, target_os = "macos"))]
     next_id: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(any(windows, target_os = "macos"))]
-    update_checks: Arc<Mutex<HashMap<u32, Instant>>>,
+    update_checked_runtimes: Arc<Mutex<HashSet<String>>>,
     #[cfg(any(windows, target_os = "macos"))]
     check_updates_on_connect: bool,
 }
@@ -336,7 +333,7 @@ impl BridgeServer {
         let alive = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(21335));
         #[cfg(any(windows, target_os = "macos"))]
-        let update_checks = Arc::new(Mutex::new(HashMap::new()));
+        let update_checked_runtimes = Arc::new(Mutex::new(HashSet::new()));
         let mut channels: Vec<Arc<BridgeChannel>> = Vec::with_capacity(ports.len());
         let request_session_id = format!(
             "{:x}-{:x}",
@@ -351,7 +348,7 @@ impl BridgeServer {
             #[cfg(any(windows, target_os = "macos"))]
             next_id: next_id.clone(),
             #[cfg(any(windows, target_os = "macos"))]
-            update_checks,
+            update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
             check_updates_on_connect,
         };
@@ -459,7 +456,7 @@ impl BridgeServer {
             #[cfg(any(windows, target_os = "macos"))]
             next_id,
             #[cfg(any(windows, target_os = "macos"))]
-            update_checks,
+            update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
             check_updates_on_connect,
         } = state;
@@ -479,15 +476,7 @@ impl BridgeServer {
                                 #[cfg(any(windows, target_os = "macos"))]
                                 let update_target = (check_updates_on_connect
                                     && socket.role == BRIDGE_ROLE_EDIT)
-                                    .then(|| {
-                                        let port = socket
-                                            .peer
-                                            .rsplit_once(':')
-                                            .and_then(|(_, port)| port.parse::<u16>().ok())?;
-                                        let pid = pid_for_local_tcp_port(port).ok()?;
-                                        Some((pid, socket.bridge_info.runtime_id.clone()))
-                                    })
-                                    .flatten();
+                                    .then(|| socket.bridge_info.runtime_id.clone());
                                 let mut guard = channel
                                     .sockets
                                     .lock()
@@ -508,13 +497,12 @@ impl BridgeServer {
                                 guard.insert(socket_key, socket);
                                 drop(guard);
                                 #[cfg(any(windows, target_os = "macos"))]
-                                if let Some((pid, runtime_id)) = update_target {
+                                if let Some(runtime_id) = update_target {
                                     Self::check_for_update(
-                                        pid,
                                         runtime_id,
                                         channel.clone(),
                                         next_id.clone(),
-                                        update_checks.clone(),
+                                        update_checked_runtimes.clone(),
                                     );
                                 }
                             }
@@ -543,26 +531,28 @@ impl BridgeServer {
 
     #[cfg(any(windows, target_os = "macos"))]
     fn check_for_update(
-        pid: u32,
         runtime_id: String,
         channel: Arc<BridgeChannel>,
         next_id: Arc<std::sync::atomic::AtomicU64>,
-        checks: Arc<Mutex<HashMap<u32, Instant>>>,
+        checked_runtimes: Arc<Mutex<HashSet<String>>>,
     ) {
-        let now = Instant::now();
         {
-            let mut checks = checks.lock().unwrap_or_else(PoisonError::into_inner);
-            checks.retain(|_, checked_at| now.duration_since(*checked_at) < UPDATE_CHECK_INTERVAL);
-            if checks.contains_key(&pid) {
+            let mut checked = checked_runtimes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !checked.insert(runtime_id.clone()) {
                 return;
             }
-            checks.insert(pid, now);
         }
 
         thread::spawn(move || {
             let version = match update::latest_release_version() {
                 Ok(version) => version,
                 Err(error) => {
+                    checked_runtimes
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&runtime_id);
                     eprintln!("[renium] update check failed: {error:#}");
                     return;
                 }
@@ -574,6 +564,10 @@ impl BridgeServer {
             let Some(socket) = sockets.values_mut().find(|socket| {
                 socket.role == BRIDGE_ROLE_EDIT && socket.bridge_info.runtime_id == runtime_id
             }) else {
+                checked_runtimes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&runtime_id);
                 return;
             };
             let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -584,6 +578,10 @@ impl BridgeServer {
                 &json!({ "latestVersion": version }),
                 None,
             ) {
+                checked_runtimes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&runtime_id);
                 eprintln!("[renium] failed to send update status to Studio: {error:#}");
             }
         });

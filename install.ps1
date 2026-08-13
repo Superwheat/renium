@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Version,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Interactive
 )
 
 Set-StrictMode -Version Latest
@@ -356,13 +357,42 @@ function Get-EditorExtensionRoot {
     }
 }
 
+function Get-EditorCli {
+    param([string]$EditorName)
+
+    $command = Get-Command $EditorName -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+    $candidates = switch ($EditorName.ToLowerInvariant()) {
+        "cursor" {
+            "${env:LOCALAPPDATA}\Programs\cursor\resources\app\bin\cursor.cmd"
+            "${env:LOCALAPPDATA}\Programs\cursor\Cursor.exe"
+        }
+        "code" {
+            "${env:LOCALAPPDATA}\Programs\Microsoft VS Code\bin\code.cmd"
+            "${env:ProgramFiles}\Microsoft VS Code\bin\code.cmd"
+            "${env:ProgramFiles(x86)}\Microsoft VS Code\bin\code.cmd"
+        }
+        "code-insiders" {
+            "${env:LOCALAPPDATA}\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd"
+            "${env:ProgramFiles}\Microsoft VS Code Insiders\bin\code-insiders.cmd"
+            "${env:ProgramFiles(x86)}\Microsoft VS Code Insiders\bin\code-insiders.cmd"
+        }
+        "windsurf" {
+            "${env:LOCALAPPDATA}\Programs\Windsurf\bin\windsurf.cmd"
+            "${env:LOCALAPPDATA}\Programs\Windsurf\Windsurf.exe"
+        }
+    }
+    return $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+}
+
 function Get-ReniumEditorInstalls {
     $installs = @()
     foreach ($editorName in @("cursor", "code", "code-insiders", "windsurf")) {
-        $editor = Get-Command $editorName -ErrorAction SilentlyContinue
         $installs += [pscustomobject]@{
             Name = $editorName
-            Cli = if ($null -eq $editor) { $null } else { $editor.Source }
+            Cli = Get-EditorCli $editorName
             Root = Get-EditorExtensionRoot $editorName
         }
     }
@@ -414,6 +444,48 @@ function Get-ReniumEditorArchitecture {
         throw "$Cli did not report one supported architecture"
     }
     return $architectures[0]
+}
+
+function Get-EditorDisplayName {
+    param([string]$Name)
+
+    switch ($Name.ToLowerInvariant()) {
+        "cursor" { return "Cursor" }
+        "code" { return "Visual Studio Code" }
+        "code-insiders" { return "Visual Studio Code Insiders" }
+        "windsurf" { return "Windsurf" }
+        default { return $Name }
+    }
+}
+
+function Select-ReniumEditor {
+    param([object[]]$Editors)
+
+    Write-Host ""
+    if ($Editors.Count -eq 0) {
+        Write-Host "No supported editors were found. Install Cursor, Visual Studio Code, or Windsurf, then run this installer again."
+        Write-Host "0. Exit"
+        while ((Read-Host "Choose an option") -ne "0") {
+            Write-Host "Enter 0 to exit."
+        }
+        return @()
+    }
+    Write-Host "Choose where to install the Renium extension:"
+    for ($index = 0; $index -lt $Editors.Count; $index++) {
+        Write-Host "$($index + 1). $(Get-EditorDisplayName $Editors[$index].Name)"
+    }
+    Write-Host "0. Exit"
+    while ($true) {
+        $choice = Read-Host "Choose an option"
+        if ($choice -eq "0") {
+            return @()
+        }
+        $number = 0
+        if ([int]::TryParse($choice, [ref]$number) -and $number -ge 1 -and $number -le $Editors.Count) {
+            return @($Editors[$number - 1])
+        }
+        Write-Host "Enter a number from 0 to $($Editors.Count)."
+    }
 }
 
 function Write-ReniumTransactionJournal {
@@ -712,10 +784,17 @@ try {
     }
     }
 
-    if ([string]::IsNullOrWhiteSpace($Version)) {
-        $release = Invoke-RestMethod "https://api.github.com/repos/$repository/releases/latest"
-        $Version = ([string]$release.tag_name).TrimStart("v")
+$localCli = Join-Path $PSScriptRoot "renium.exe"
+if ([string]::IsNullOrWhiteSpace($Version) -and (Test-Path -LiteralPath $localCli -PathType Leaf)) {
+    $localVersionOutput = @(& $localCli --version 2>&1)
+    if ($LASTEXITCODE -eq 0 -and ($localVersionOutput -join " ") -match '\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b') {
+        $Version = $Matches[1]
     }
+}
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $release = Invoke-RestMethod "https://api.github.com/repos/$repository/releases/latest"
+    $Version = ([string]$release.tag_name).TrimStart("v")
+}
 
 $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
 $releaseArchitecture = switch ($architecture) {
@@ -725,34 +804,8 @@ $releaseArchitecture = switch ($architecture) {
 }
 $archiveName = "renium-$Version-windows-$releaseArchitecture.zip"
 $baseUrl = "https://github.com/$repository/releases/download/v$Version"
-$transactionId = [guid]::NewGuid().ToString("N")
-$stage = Join-Path $env:TEMP "renium-install-$transactionId"
-$installParent = Split-Path -Parent $installRoot
-$stagedInstall = Join-Path $installParent (".renium-install-$transactionId")
-$previousInstall = Join-Path $installParent (".renium-previous-$transactionId")
-
-try {
-    New-Item -ItemType Directory -Path $stage | Out-Null
-    $archive = Join-Path $stage $archiveName
-    $checksums = Join-Path $stage "SHA256SUMS.txt"
-    Invoke-WebRequest "$baseUrl/$archiveName" -OutFile $archive
-    Invoke-WebRequest "$baseUrl/SHA256SUMS.txt" -OutFile $checksums
-    $expectedLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($archiveName) } | Select-Object -First 1
-    if ($null -eq $expectedLine) {
-        throw "$archiveName is missing from SHA256SUMS.txt"
-    }
-    $expected = ($expectedLine -split "\s+")[0].ToLowerInvariant()
-    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $expected) {
-        throw "$archiveName failed SHA-256 verification"
-    }
-    $expanded = Join-Path $stage "expanded"
-    Expand-Archive -LiteralPath $archive -DestinationPath $expanded
-    $cli = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter "renium.exe" | Select-Object -First 1
-    if ($null -eq $cli) {
-        throw "$archiveName does not contain renium.exe"
-    }
-    $editorInstalls = @(Get-ReniumEditorInstalls)
+$editorInstalls = @(Get-ReniumEditorInstalls)
+if (-not $Interactive) {
     foreach ($editor in $editorInstalls) {
         if ($null -ne $editor.Cli -or -not (Test-Path -LiteralPath $editor.Root -PathType Container)) {
             continue
@@ -765,25 +818,80 @@ try {
             throw "Renium is installed in $($editor.Root), but its exact editor CLI is unavailable. Set RENIUM_EXTENSION_ROOT to that path and RENIUM_EDITOR_CLI to the matching editor command."
         }
     }
-    $activeEditors = @($editorInstalls | Where-Object { $null -ne $_.Cli })
-    foreach ($editor in $activeEditors) {
-        $editor | Add-Member -NotePropertyName Architecture `
-            -NotePropertyValue (Get-ReniumEditorArchitecture $editor.Cli) -Force
+}
+$activeEditors = @($editorInstalls | Where-Object { $null -ne $_.Cli })
+if ($Interactive) {
+    $activeEditors = @(Select-ReniumEditor $activeEditors)
+    if ($activeEditors.Count -eq 0) {
+        Write-Host "Installation cancelled."
+        exit 3
+    }
+}
+foreach ($editor in $activeEditors) {
+    $editor | Add-Member -NotePropertyName Architecture `
+        -NotePropertyValue (Get-ReniumEditorArchitecture $editor.Cli) -Force
+}
+$useLocalPackage = $false
+if (Test-Path -LiteralPath $localCli -PathType Leaf) {
+    $localVersionOutput = @(& $localCli --version 2>&1)
+    $useLocalPackage = $LASTEXITCODE -eq 0 -and
+        ($localVersionOutput -join " ") -match ('(?<![0-9A-Za-z.-])' + [regex]::Escape($Version) + '(?![0-9A-Za-z.-])')
+}
+$transactionId = [guid]::NewGuid().ToString("N")
+$stage = Join-Path $env:TEMP "renium-install-$transactionId"
+$installParent = Split-Path -Parent $installRoot
+$stagedInstall = Join-Path $installParent (".renium-install-$transactionId")
+$previousInstall = Join-Path $installParent (".renium-previous-$transactionId")
+
+try {
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    $checksums = Join-Path $stage "SHA256SUMS.txt"
+    if ($useLocalPackage) {
+        $cli = Get-Item -LiteralPath $localCli
+    }
+    else {
+        Invoke-WebRequest "$baseUrl/SHA256SUMS.txt" -OutFile $checksums
+        $archive = Join-Path $stage $archiveName
+        Invoke-WebRequest "$baseUrl/$archiveName" -OutFile $archive
+        $expectedLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($archiveName) } | Select-Object -First 1
+        if ($null -eq $expectedLine) {
+            throw "$archiveName is missing from SHA256SUMS.txt"
+        }
+        $expected = ($expectedLine -split "\s+")[0].ToLowerInvariant()
+        $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "$archiveName failed SHA-256 verification"
+        }
+        $expanded = Join-Path $stage "expanded"
+        Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+        $cli = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter "renium.exe" | Select-Object -First 1
+        if ($null -eq $cli) {
+            throw "$archiveName does not contain renium.exe"
+        }
     }
     $vsixFiles = @{}
     foreach ($editorArchitecture in @($activeEditors.Architecture | Sort-Object -Unique)) {
         $editorTarget = "win32-$editorArchitecture"
         $vsixName = "renium-$Version-$editorTarget.vsix"
-        $vsix = Join-Path $stage $vsixName
-        Invoke-WebRequest "$baseUrl/$vsixName" -OutFile $vsix
-        $expectedVsixLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($vsixName) } | Select-Object -First 1
-        if ($null -eq $expectedVsixLine) {
-            throw "$vsixName is missing from SHA256SUMS.txt"
+        $bundledVsix = Join-Path $PSScriptRoot $vsixName
+        if (Test-Path -LiteralPath $bundledVsix -PathType Leaf) {
+            $vsix = $bundledVsix
         }
-        $expectedVsix = ($expectedVsixLine -split "\s+")[0].ToLowerInvariant()
-        $actualVsix = (Get-FileHash -LiteralPath $vsix -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualVsix -ne $expectedVsix) {
-            throw "$vsixName failed SHA-256 verification"
+        else {
+            $vsix = Join-Path $stage $vsixName
+            if (-not (Test-Path -LiteralPath $checksums -PathType Leaf)) {
+                Invoke-WebRequest "$baseUrl/SHA256SUMS.txt" -OutFile $checksums
+            }
+            Invoke-WebRequest "$baseUrl/$vsixName" -OutFile $vsix
+            $expectedVsixLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($vsixName) } | Select-Object -First 1
+            if ($null -eq $expectedVsixLine) {
+                throw "$vsixName is missing from SHA256SUMS.txt"
+            }
+            $expectedVsix = ($expectedVsixLine -split "\s+")[0].ToLowerInvariant()
+            $actualVsix = (Get-FileHash -LiteralPath $vsix -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualVsix -ne $expectedVsix) {
+                throw "$vsixName failed SHA-256 verification"
+            }
         }
         $vsixFiles[$editorArchitecture] = $vsix
     }
@@ -795,12 +903,18 @@ try {
         Remove-Item -LiteralPath $previousInstall -Recurse -Force
     }
     New-Item -ItemType Directory -Path $stagedInstall | Out-Null
-    Get-ChildItem -LiteralPath $cli.DirectoryName -File | Copy-Item -Destination $stagedInstall
+    Copy-Item -LiteralPath $cli.FullName -Destination (Join-Path $stagedInstall "renium.exe")
+    foreach ($supportFile in @("rbx.cmd", "rbx-run.ps1", "Renium.rbxm")) {
+        $supportPath = Join-Path $cli.DirectoryName $supportFile
+        if (Test-Path -LiteralPath $supportPath -PathType Leaf) {
+            Copy-Item -LiteralPath $supportPath -Destination $stagedInstall
+        }
+    }
     $existingCli = Join-Path $installRoot "renium.exe"
     $stagedCli = Join-Path $stagedInstall "renium.exe"
     Stop-ReniumDaemons $existingCli $stagedCli
     Clear-ReniumUpdaterState
-    Start-ReniumInstallTransaction $editorInstalls
+    Start-ReniumInstallTransaction $activeEditors
     try {
         foreach ($editor in $activeEditors) {
             $vsix = $vsixFiles[$editor.Architecture]
@@ -855,7 +969,7 @@ try {
         }
     }
     Write-Host "Renium $Version was installed in $installRoot."
-    Write-Host "Open a new terminal before using rbx."
+    Write-Host "Open a new terminal before using renium or rbx."
 }
 finally {
     if (Test-Path -LiteralPath $stagedInstall) {

@@ -22,6 +22,9 @@ const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
 const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
 
+#[path = "update/check.rs"]
+mod check;
+
 #[derive(Args)]
 pub struct UpdateArgs {
     #[command(subcommand)]
@@ -70,7 +73,7 @@ pub struct UpdateHelperArgs {
     pub transaction_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SignedUpdateManifest {
     payload: UpdatePayload,
     signature: String,
@@ -485,8 +488,7 @@ fn validate_update_helper_reservation_for_current_process() -> Result<()> {
 pub fn run_update(args: UpdateArgs) -> Result<()> {
     match args.command {
         UpdateCommand::Check(args) => {
-            let manifest = fetch_manifest(&args.manifest)?;
-            let signature = verify_manifest(&manifest);
+            let manifest = check::manifest(&args.manifest)?;
             let current = Version::parse(crate::app::build::VERSION).with_context(|| {
                 format!("Invalid current version {}", crate::app::build::VERSION)
             })?;
@@ -494,7 +496,6 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                 .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
             let platform = platform_key();
             let components = manifest.payload.components.get(&platform);
-            let signature_error = signature.err().map(|error| error.to_string());
             let response = json!({
                 "ok": true,
                 "currentVersion": crate::app::build::VERSION,
@@ -503,12 +504,8 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                 "downgrade": latest < current,
                 "platform": platform,
                 "components": components,
-                "signature": if signature_error.is_none() {
-                    "verified"
-                } else {
-                    "unverified"
-                },
-                "signatureError": signature_error,
+                "signature": "verified",
+                "signatureError": Option::<String>::None,
             });
             let text = match latest.cmp(&current) {
                 std::cmp::Ordering::Greater => format!(
@@ -632,8 +629,12 @@ fn fetch_manifest(source: &str) -> Result<SignedUpdateManifest> {
     } else {
         fs::read(source).with_context(|| format!("Failed to read {source}"))?
     };
+    parse_manifest(&bytes)
+}
+
+fn parse_manifest(bytes: &[u8]) -> Result<SignedUpdateManifest> {
     let manifest: SignedUpdateManifest =
-        serde_json::from_slice(&bytes).context("Invalid update manifest")?;
+        serde_json::from_slice(bytes).context("Invalid update manifest")?;
     if manifest.payload.schema_version != 1 {
         bail!(
             "Unsupported update manifest schema {}",
@@ -645,8 +646,7 @@ fn fetch_manifest(source: &str) -> Result<SignedUpdateManifest> {
 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn latest_release_version() -> Result<String> {
-    let manifest = fetch_manifest(DEFAULT_UPDATE_MANIFEST)?;
-    verify_manifest(&manifest)?;
+    let manifest = check::manifest(DEFAULT_UPDATE_MANIFEST)?;
     Version::parse(&manifest.payload.version)
         .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
     Ok(manifest.payload.version)
