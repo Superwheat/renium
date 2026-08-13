@@ -9,6 +9,7 @@ local Identity = require("../BridgeIdentity.module")
 local InstanceSwap = require("../BridgeInstanceSwap.module")
 local ReferenceRetarget = require("../BridgeReferenceRetarget.module")
 local Settings = require("../BridgeSettings.module")
+local Update = require("../BridgeUpdate.module")
 local ValueEquality = require("../BridgeValueEquality.module")
 
 local function equal(actual, expected, label)
@@ -45,6 +46,9 @@ equal(Settings.normalizeRuntimeSetting("changesThreshold", -3), 0, "number minim
 equal(Settings.normalizeRuntimeSetting("diffLinesLimit", 2000000), 1000000, "number maximum")
 equal(Settings.normalizeRuntimeSetting("initialSyncPriority", " EDITOR "), "editor", "enum normalization")
 equal(Settings.normalizeRuntimeSetting("initialSyncPriority", "bad"), "studio", "enum fallback")
+equal(Update.isNewer("v0.1.4", "0.1.3"), true, "newer release")
+equal(Update.isNewer("0.1.3", "0.1.3"), false, "same release")
+equal(Update.isNewer("invalid", "0.1.3"), false, "invalid release")
 
 local workspace = game:GetService("Workspace")
 local folder = roblox.Instance.new("Folder")

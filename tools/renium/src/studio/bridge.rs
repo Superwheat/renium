@@ -13,6 +13,8 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_with_config};
 
 use crate::app::timing::elapsed_ms;
+#[cfg(any(windows, target_os = "macos"))]
+use crate::app::update;
 use crate::daemon::transport::normalize_loopback_host;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::daemon::transport::{local_tcp_ports_owned_by_pid, pid_for_local_tcp_port};
@@ -38,6 +40,8 @@ const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
 const BRIDGE_CHANNEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BRIDGE_SLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(any(windows, target_os = "macos"))]
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) fn clamp_bridge_chunk_size(size: usize) -> usize {
     size.clamp(MIN_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_CHUNK_BYTES)
@@ -181,10 +185,22 @@ pub(crate) struct BridgeChannel {
     pub(crate) sockets: Mutex<HashMap<String, BridgeSocket>>,
 }
 
+#[derive(Clone)]
+struct BridgeAcceptState {
+    alive: Arc<AtomicBool>,
+    request_session_id: String,
+    #[cfg(any(windows, target_os = "macos"))]
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(any(windows, target_os = "macos"))]
+    update_checks: Arc<Mutex<HashMap<u32, Instant>>>,
+    #[cfg(any(windows, target_os = "macos"))]
+    check_updates_on_connect: bool,
+}
+
 pub(crate) struct BridgeServer {
     pub(crate) channels: Vec<Arc<BridgeChannel>>,
     pub(crate) alive: Arc<AtomicBool>,
-    pub(crate) next_id: std::sync::atomic::AtomicU64,
+    pub(crate) next_id: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) preferred_index: std::sync::atomic::AtomicUsize,
 
     pub(crate) request_gate: Mutex<()>,
@@ -295,9 +311,32 @@ impl BridgeServer {
         wait_seconds: f64,
         wait_for_initial_channels: bool,
     ) -> Result<(Self, BridgeListenMetrics)> {
+        Self::listen_configured(host, ports, wait_seconds, wait_for_initial_channels, false)
+    }
+
+    pub(crate) fn listen_daemon(
+        host: &str,
+        ports: &[u16],
+        wait_seconds: f64,
+    ) -> Result<(Self, BridgeListenMetrics)> {
+        Self::listen_configured(host, ports, wait_seconds, false, true)
+    }
+
+    fn listen_configured(
+        host: &str,
+        ports: &[u16],
+        wait_seconds: f64,
+        wait_for_initial_channels: bool,
+        check_updates_on_connect: bool,
+    ) -> Result<(Self, BridgeListenMetrics)> {
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = check_updates_on_connect;
         let bind_host = normalize_loopback_host(host)?;
         let bind_started = Instant::now();
         let alive = Arc::new(AtomicBool::new(true));
+        let next_id = Arc::new(std::sync::atomic::AtomicU64::new(21335));
+        #[cfg(any(windows, target_os = "macos"))]
+        let update_checks = Arc::new(Mutex::new(HashMap::new()));
         let mut channels: Vec<Arc<BridgeChannel>> = Vec::with_capacity(ports.len());
         let request_session_id = format!(
             "{:x}-{:x}",
@@ -306,6 +345,16 @@ impl BridgeServer {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos())
         );
+        let accept_state = BridgeAcceptState {
+            alive: alive.clone(),
+            request_session_id,
+            #[cfg(any(windows, target_os = "macos"))]
+            next_id: next_id.clone(),
+            #[cfg(any(windows, target_os = "macos"))]
+            update_checks,
+            #[cfg(any(windows, target_os = "macos"))]
+            check_updates_on_connect,
+        };
 
         for port in ports {
             let listener = TcpListener::bind((bind_host.as_str(), *port)).with_context(|| {
@@ -327,8 +376,7 @@ impl BridgeServer {
                 *port,
                 listener,
                 channel.clone(),
-                alive.clone(),
-                request_session_id.clone(),
+                accept_state.clone(),
             );
             channels.push(channel);
         }
@@ -341,7 +389,7 @@ impl BridgeServer {
         let server = Self {
             channels,
             alive,
-            next_id: std::sync::atomic::AtomicU64::new(21335),
+            next_id,
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
             request_gate: Mutex::new(()),
             runtime_pins: Mutex::new(HashMap::new()),
@@ -398,14 +446,23 @@ impl BridgeServer {
         ))
     }
 
-    pub(crate) fn spawn_accept_loop(
+    fn spawn_accept_loop(
         bind_host: String,
         port: u16,
         listener: TcpListener,
         channel: Arc<BridgeChannel>,
-        alive: Arc<AtomicBool>,
-        request_session_id: String,
+        state: BridgeAcceptState,
     ) {
+        let BridgeAcceptState {
+            alive,
+            request_session_id,
+            #[cfg(any(windows, target_os = "macos"))]
+            next_id,
+            #[cfg(any(windows, target_os = "macos"))]
+            update_checks,
+            #[cfg(any(windows, target_os = "macos"))]
+            check_updates_on_connect,
+        } = state;
         thread::spawn(move || {
             while alive.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -419,6 +476,18 @@ impl BridgeServer {
                             &request_session_id,
                         ) {
                             Ok(socket) => {
+                                #[cfg(any(windows, target_os = "macos"))]
+                                let update_target = (check_updates_on_connect
+                                    && socket.role == BRIDGE_ROLE_EDIT)
+                                    .then(|| {
+                                        let port = socket
+                                            .peer
+                                            .rsplit_once(':')
+                                            .and_then(|(_, port)| port.parse::<u16>().ok())?;
+                                        let pid = pid_for_local_tcp_port(port).ok()?;
+                                        Some((pid, socket.bridge_info.runtime_id.clone()))
+                                    })
+                                    .flatten();
                                 let mut guard = channel
                                     .sockets
                                     .lock()
@@ -437,6 +506,17 @@ impl BridgeServer {
                                     );
                                 }
                                 guard.insert(socket_key, socket);
+                                drop(guard);
+                                #[cfg(any(windows, target_os = "macos"))]
+                                if let Some((pid, runtime_id)) = update_target {
+                                    Self::check_for_update(
+                                        pid,
+                                        runtime_id,
+                                        channel.clone(),
+                                        next_id.clone(),
+                                        update_checks.clone(),
+                                    );
+                                }
                             }
                             Err(err) => {
                                 println!(
@@ -457,6 +537,54 @@ impl BridgeServer {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn check_for_update(
+        pid: u32,
+        runtime_id: String,
+        channel: Arc<BridgeChannel>,
+        next_id: Arc<std::sync::atomic::AtomicU64>,
+        checks: Arc<Mutex<HashMap<u32, Instant>>>,
+    ) {
+        let now = Instant::now();
+        {
+            let mut checks = checks.lock().unwrap_or_else(PoisonError::into_inner);
+            checks.retain(|_, checked_at| now.duration_since(*checked_at) < UPDATE_CHECK_INTERVAL);
+            if checks.contains_key(&pid) {
+                return;
+            }
+            checks.insert(pid, now);
+        }
+
+        thread::spawn(move || {
+            let version = match update::latest_release_version() {
+                Ok(version) => version,
+                Err(error) => {
+                    eprintln!("[renium] update check failed: {error:#}");
+                    return;
+                }
+            };
+            let mut sockets = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(socket) = sockets.values_mut().find(|socket| {
+                socket.role == BRIDGE_ROLE_EDIT && socket.bridge_info.runtime_id == runtime_id
+            }) else {
+                return;
+            };
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = Self::call_on_socket_with_timeout(
+                socket,
+                id,
+                "setUpdateStatus",
+                &json!({ "latestVersion": version }),
+                None,
+            ) {
+                eprintln!("[renium] failed to send update status to Studio: {error:#}");
             }
         });
     }

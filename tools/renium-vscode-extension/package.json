@@ -530,6 +530,11 @@
           "default": false,
           "description": "Automatically sync changed service(s) after file save"
         },
+        "renium.automaticUpdateChecks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check GitHub Releases when the editor opens and offer to install matching Renium extension and Studio plugin updates."
+        },
         "renium.autoSyncDebounceMs": {
           "type": "number",
           "default": 800,

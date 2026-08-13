@@ -248,6 +248,7 @@ function BridgePluginRuntime.start(context)
 
 	local SettingsModule = requireChildModule("BridgeSettings")
 	local StatusModule = requireChildModule("BridgeStatus")
+	local UpdateModule = requireChildModule("BridgeUpdate")
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
 	local ContentModule = requireChildModule("BridgeContent")
@@ -486,6 +487,11 @@ function BridgePluginRuntime.start(context)
 	stateByService = {}
 	local editorActions = {}
 	local editorActionCounter = 0
+	local function queueEditorAction(action: { [string]: any })
+		editorActionCounter += 1
+		action.id = tostring(editorActionCounter)
+		editorActions[#editorActions + 1] = action
+	end
 
 	local function selectedScriptAction()
 		local selected = Selection:Get()
@@ -527,15 +533,13 @@ function BridgePluginRuntime.start(context)
 		if state ~= nil then
 			settingsId = IdentityModule.getCachedInstanceId(state, selectedScript)
 		end
-		editorActionCounter += 1
-		editorActions[#editorActions + 1] = {
-			id = tostring(editorActionCounter),
+		queueEditorAction({
 			type = "revealScript",
 			service = serviceName,
 			settingsId = settingsId,
 			pathSegments = pathSegments,
 			pathOrdinals = pathOrdinals,
-		}
+		})
 	end
 
 	local function pendingEditorActions(acknowledged: any, runtimeId: any)
@@ -4473,6 +4477,25 @@ function BridgePluginRuntime.start(context)
 
 	Config.bridgeMethodHandlers.getBridgeInfo = function()
 		return Config.getBridgeInfo()
+	end
+	Config.bridgeMethodHandlers.setUpdateStatus = function(p)
+		local version = p.latestVersion
+		local available = not Config.startedInPlayMode
+			and plugin:GetSetting(SETTINGS_PREFIX .. "notifications") ~= false
+			and UpdateModule.isNewer(version, BRIDGE_VERSION)
+		if available then
+			ui.notify(
+				"update-" .. version,
+				`Renium {version} is available`,
+				"Update the editor extension and Studio plugin together.",
+				"Update",
+				function()
+					queueEditorAction({ type = "installUpdate", version = version })
+				end,
+				true
+			)
+		end
+		return { ok = true, available = available }
 	end
 
 	Config.bridgeMethodHandlers.getPerformanceStats = function()

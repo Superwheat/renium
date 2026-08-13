@@ -33,6 +33,7 @@ export type StudioEditorAction = {
   settingsId?: string;
   pathSegments?: string[];
   pathOrdinals?: number[];
+  version?: string;
 };
 
 export type StudioChangeState = {
@@ -156,6 +157,7 @@ function studioChangeState(record: Record<string, unknown>): StudioChangeState {
       settingsId: typeof value.settingsId === "string" ? value.settingsId : undefined,
       pathSegments: stringArray(value.pathSegments),
       pathOrdinals: Array.isArray(value.pathOrdinals) ? value.pathOrdinals.map(Number) : undefined,
+      version: typeof value.version === "string" ? value.version : undefined,
     })),
     changes: objectArray(record.changes)?.map((value) => ({
       service: typeof value.service === "string" ? value.service : undefined,

@@ -11,6 +11,7 @@
 - Added exact-window Studio and play-client recording as animated WebP clips.
 - Reorganized the Rust crate into feature-focused modules and updated release validation for the new layout.
 - Removed generated Studio plugin bundles from source control; release and extension builds now create them from the Luau source.
+- Added startup update notifications and one-click signed updates for the installed editor extension and Studio plugin.
 
 ## 0.1.2 - 2026-07-10
 

@@ -10,6 +10,9 @@
       "BridgeStatus": {
         "$path": "BridgeStatus.module.lua"
       },
+      "BridgeUpdate": {
+        "$path": "BridgeUpdate.module.lua"
+      },
       "BridgeParallel": {
         "$path": "BridgeParallel.module.lua"
       },

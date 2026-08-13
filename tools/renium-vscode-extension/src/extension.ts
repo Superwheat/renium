@@ -194,6 +194,18 @@ type CliExportGameFileResult = {
   instances?: number;
 };
 
+type ReniumUpdateStatus = {
+  currentVersion?: string;
+  latestVersion?: string;
+  updateAvailable?: boolean;
+  signature?: string;
+};
+
+type HandledStudioActions = {
+  acknowledged: string[];
+  updateVersion?: string;
+};
+
 type EditorPushOptions = {
   force?: boolean;
   fullSync?: boolean;
@@ -372,6 +384,9 @@ class RobloxSyncController {
   private consoleFollowOwnsServe = false;
   private displayedLiveSyncPrompt = false;
   private luauSourcemapQueue: Promise<void> = Promise.resolve();
+  private updateCheckTimer: NodeJS.Timeout | undefined;
+  private updateCheckPromise: Promise<ReniumUpdateStatus> | undefined;
+  private updateInstallPromise: Promise<void> | undefined;
 
   public constructor(private readonly context: vscode.ExtensionContext) {
     const output = vscode.window.createOutputChannel("Renium");
@@ -924,6 +939,10 @@ class RobloxSyncController {
     if (this.autoSyncTimer) {
       clearTimeout(this.autoSyncTimer);
       this.autoSyncTimer = undefined;
+    }
+    if (this.updateCheckTimer) {
+      clearTimeout(this.updateCheckTimer);
+      this.updateCheckTimer = undefined;
     }
     this.packages.dispose();
     this.disposeLiveSyncRuntime();
@@ -2161,8 +2180,216 @@ class RobloxSyncController {
     }
   }
 
+  private updateCli(): string {
+    const bundled = bundledReniumCliPath(this.context.extensionPath);
+    if (fs.existsSync(bundled)) {
+      return bundled;
+    }
+    const configured = this.tryGetConfig()?.cliPath;
+    if (configured && fs.existsSync(configured)) {
+      return configured;
+    }
+    throw new Error("The Renium updater is not installed.");
+  }
+
+  private currentEditorCli(): string {
+    const extensionRoot = path.dirname(this.context.extensionPath);
+    const owner = path.basename(path.dirname(extensionRoot)).toLowerCase();
+    const name = owner === ".cursor"
+      ? "cursor"
+      : owner === ".vscode"
+        ? "code"
+        : owner === ".vscode-insiders"
+          ? "code-insiders"
+          : owner === ".windsurf"
+            ? "windsurf"
+            : "";
+    if (!name) {
+      throw new Error(`Renium cannot identify the editor that owns ${extensionRoot}.`);
+    }
+    const fileNames = process.platform === "win32" ? [`${name}.cmd`, `${name}.exe`] : [name];
+    const candidates = [
+      ...fileNames.map((fileName) => path.join(vscode.env.appRoot, "bin", fileName)),
+      ...(process.env.PATH ?? "")
+        .split(path.delimiter)
+        .filter(Boolean)
+        .flatMap((directory) => fileNames.map((fileName) => path.join(directory, fileName))),
+    ];
+    const found = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!found) {
+      throw new Error(`Renium cannot locate the ${name} command needed to update this extension.`);
+    }
+    return found;
+  }
+
+  private async readUpdateStatus(): Promise<ReniumUpdateStatus> {
+    if (this.updateCheckPromise) {
+      return this.updateCheckPromise;
+    }
+    this.updateCheckPromise = (async () => {
+      const result = await this.runCommand(
+        this.updateCli(),
+        ["--output-mode", "json", "update", "check"],
+        this.context.extensionPath,
+        "update-check",
+        2,
+        { quietLog: true, timeoutMs: 30_000 },
+      );
+      if (result.code !== 0) {
+        throw new Error(`Update check exited with code ${result.code}.`);
+      }
+      const status = parseCliJsonObject<ReniumUpdateStatus>(result.output);
+      if (!status || status.signature !== "verified") {
+        throw new Error("The release manifest signature could not be verified.");
+      }
+      return status;
+    })();
+    try {
+      return await this.updateCheckPromise;
+    } finally {
+      this.updateCheckPromise = undefined;
+    }
+  }
+
+  private async waitForDeferredUpdate(resultPath: string, version: string): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(resultPath)) {
+        const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as {
+          ok?: boolean;
+          version?: string;
+          error?: string;
+          helper?: string;
+        };
+        if (result.version === version) {
+          for (let attempt = 0; attempt < 20; attempt += 1) {
+            try {
+              if (result.helper && fs.existsSync(result.helper)) {
+                fs.rmSync(result.helper);
+              }
+              fs.rmSync(resultPath);
+              break;
+            } catch {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+          }
+          if (!result.ok) {
+            throw new Error(result.error || `Renium ${version} could not be installed.`);
+          }
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`Renium ${version} did not finish installing within 30 seconds.`);
+  }
+
+  private async installUpdate(status: ReniumUpdateStatus, requestedByStudio = false): Promise<void> {
+    if (this.updateInstallPromise) {
+      return this.updateInstallPromise;
+    }
+    const version = status.latestVersion;
+    if (!version || (!status.updateAvailable && !requestedByStudio)) {
+      vscode.window.showInformationMessage("Renium is up to date.");
+      return;
+    }
+    this.updateInstallPromise = Promise.resolve(vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: `Installing Renium ${version}`,
+    }, async () => {
+      await this.stopConsoleFollow();
+      await this.disposeLiveSyncRuntime();
+      this.bridgeServeRequested = false;
+      await this.stopBridgeDaemon();
+      const result = await this.runCommand(
+        this.updateCli(),
+        [
+          "--output-mode", "json",
+          "update", "apply",
+          "--extension-root", path.dirname(this.context.extensionPath),
+          "--editor-cli", this.currentEditorCli(),
+        ],
+        this.context.extensionPath,
+        "update-apply",
+        2,
+        { quietLog: true, timeoutMs: 5 * 60 * 1000 },
+      );
+      if (result.code !== 0) {
+        throw new Error(`Update installation exited with code ${result.code}.`);
+      }
+      const applied = parseCliJsonObject<{ resultPath?: string }>(result.output);
+      if (applied?.resultPath) {
+        await this.waitForDeferredUpdate(applied.resultPath, version);
+      }
+      const choice = await vscode.window.showInformationMessage(
+        `Renium ${version} is installed. Reload the editor and restart Studio to use it.`,
+        "Reload Editor",
+      );
+      if (choice === "Reload Editor") {
+        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    }));
+    try {
+      await this.updateInstallPromise;
+    } finally {
+      this.updateInstallPromise = undefined;
+    }
+  }
+
+  private async offerUpdate(status: ReniumUpdateStatus): Promise<void> {
+    if (!status.updateAvailable || !status.latestVersion) {
+      return;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `Renium ${status.latestVersion} is available.`,
+      "Install Update",
+      "What's Changed",
+    );
+    if (choice === "Install Update") {
+      await this.installUpdate(status);
+    } else if (choice === "What's Changed") {
+      await vscode.env.openExternal(vscode.Uri.parse(
+        `https://github.com/Superwheat/renium/releases/tag/v${encodeURIComponent(status.latestVersion)}`,
+      ));
+    }
+  }
+
+  public scheduleAutomaticUpdateCheck(): void {
+    if (this.updateCheckTimer) {
+      clearTimeout(this.updateCheckTimer);
+      this.updateCheckTimer = undefined;
+    }
+    if (!vscode.workspace.getConfiguration("renium").get<boolean>("automaticUpdateChecks", true)) {
+      return;
+    }
+    this.updateCheckTimer = setTimeout(() => {
+      this.updateCheckTimer = undefined;
+      void (async () => {
+        try {
+          const status = await this.readUpdateStatus();
+          await this.offerUpdate(status);
+        } catch (error) {
+          this.output.appendLine(`[renium] update check skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })();
+    }, 1500);
+  }
+
   public async checkForUpdates(): Promise<void> {
-    await this.runProjectCommand("Update check", "update", ["update", "check"]);
+    if (this.updateCheckTimer) {
+      clearTimeout(this.updateCheckTimer);
+      this.updateCheckTimer = undefined;
+    }
+    try {
+      const status = await this.readUpdateStatus();
+      if (status.updateAvailable) {
+        await this.offerUpdate(status);
+      } else {
+        vscode.window.showInformationMessage(`Renium ${status.currentVersion ?? ""} is up to date.`.trim());
+      }
+    } catch (error) {
+      vscode.window.showErrorMessage(`Could not check for Renium updates. ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   public async repairInstallation(): Promise<void> {
@@ -3023,24 +3250,32 @@ class RobloxSyncController {
     if (state.explicitRuntimeSettings) {
       this.studioRuntimeSettings = state.explicitRuntimeSettings;
     }
-    const acknowledgedActions = await this.handleStudioEditorActions(state.editorActions);
-    if (acknowledgedActions.length > 0) {
+    const handledActions = await this.handleStudioEditorActions(state.editorActions);
+    if (handledActions.acknowledged.length > 0) {
       await this.getStudioChangeState(cfg, services, {
         start: false,
-        ackActionIds: acknowledgedActions,
+        ackActionIds: handledActions.acknowledged,
         runtimeId: state.runtimeId,
       });
+    }
+    if (handledActions.updateVersion) {
+      void this.readUpdateStatus()
+        .then((status) => this.installUpdate(status, true))
+        .catch((error) => vscode.window.showErrorMessage(
+          `Could not install Renium ${handledActions.updateVersion}. ${error instanceof Error ? error.message : String(error)}`,
+        ));
     }
     return state;
   }
 
   private async handleStudioEditorActions(
     actions: StudioEditorAction[] | undefined,
-  ): Promise<string[]> {
+  ): Promise<HandledStudioActions> {
     if (!Array.isArray(actions)) {
-      return [];
+      return { acknowledged: [] };
     }
     const acknowledged: string[] = [];
+    let updateVersion: string | undefined;
     const cfg = this.getConfig();
     for (const action of actions) {
       if (action?.type === "revealScript") {
@@ -3049,8 +3284,12 @@ class RobloxSyncController {
         }
         continue;
       }
+      if (action?.type === "installUpdate" && action.id) {
+        acknowledged.push(action.id);
+        updateVersion = action.version;
+      }
     }
-    return acknowledged;
+    return { acknowledged, updateVersion };
   }
 
   private async revealStudioScript(action: StudioEditorAction, cfg: SyncConfig): Promise<boolean> {
@@ -5373,6 +5612,9 @@ class RobloxSyncController {
   }
 
   public onConfigurationChanged(event?: vscode.ConfigurationChangeEvent): void {
+    if (!event || event.affectsConfiguration("renium.automaticUpdateChecks")) {
+      this.scheduleAutomaticUpdateCheck();
+    }
     const apply = this.configurationChangeQueue.then(() => this.applyConfigurationChanged(event));
     this.configurationChangeQueue = apply.catch(() => undefined);
     void apply.catch((error) => {
@@ -6402,6 +6644,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   const controller = new RobloxSyncController(context);
   activeController = controller;
+  controller.scheduleAutomaticUpdateCheck();
   void (async () => {
     const cli = controller.settingsStoreViewerCli();
     const extensionVersion = String(context.extension.packageJSON.version ?? "");

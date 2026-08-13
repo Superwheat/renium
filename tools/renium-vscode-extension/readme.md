@@ -4,6 +4,11 @@ This extension gives Rojo/Argon-style control from VS Code/Cursor using native R
 
 - `renium.exe` for Studio export/import/serialization
 
+Renium checks its signed GitHub Release manifest when the editor opens. **Install Update**
+downloads and installs the matching editor extension and Studio plugin. Reload
+the editor and restart Studio when it finishes. Automatic checks can be turned
+off with `renium.automaticUpdateChecks`.
+
 ## What it does
 
 - Separate Pull Studio to Files and Push Files to Studio commands
