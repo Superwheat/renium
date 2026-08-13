@@ -16,6 +16,9 @@
     { "id": 21, "name": "tree" },
     { "id": 22, "name": "inspect" },
     { "id": 23, "name": "batch", "aliases": ["bb"] },
+    { "id": 24, "name": "script-search" },
+    { "id": 25, "name": "script-read" },
+    { "id": 26, "name": "script-grep" },
     { "id": 30, "name": "get-property" },
     { "id": 31, "name": "set-property", "review": true },
     { "id": 32, "name": "set-source" },
@@ -24,6 +27,7 @@
     { "id": 35, "name": "move" },
     { "id": 36, "name": "remove" },
     { "id": 37, "name": "revert" },
+    { "id": 38, "name": "multi-edit" },
     { "id": 40, "name": "import-model" },
     { "id": 41, "name": "export-model" },
     { "id": 42, "name": "export-place" },
@@ -47,6 +51,9 @@
     { "id": 64, "name": "type" },
     { "id": 65, "name": "wait" },
     { "id": 66, "name": "goto" },
+    { "id": 67, "name": "input" },
+    { "id": 68, "name": "record-start" },
+    { "id": 69, "name": "record-end" },
     { "id": 70, "name": "project-init" },
     { "id": 71, "name": "project-validate" },
     { "id": 72, "name": "place-add" },
@@ -54,6 +61,14 @@
     { "id": 74, "name": "place-reorder" },
     { "id": 80, "name": "review-prepare" },
     { "id": 81, "name": "review-apply" },
-    { "id": 82, "name": "review-reject" }
+    { "id": 82, "name": "review-reject" },
+    { "id": 90, "name": "cloud", "aliases": ["oc"] },
+    { "id": 91, "name": "asset-search" },
+    { "id": 92, "name": "asset-insert" },
+    { "id": 93, "name": "generate-model" },
+    { "id": 94, "name": "job-status" },
+    { "id": 95, "name": "image-upload" },
+    { "id": 96, "name": "image-store" },
+    { "id": 97, "name": "http-get" }
   ]
 }

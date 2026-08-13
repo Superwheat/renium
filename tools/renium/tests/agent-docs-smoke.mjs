@@ -45,12 +45,26 @@ for (const [name, payload] of Object.entries({
   "client-luau.json": { player: "2", code: "return game.PlaceId" },
   "console.json": { player: "2", limit: 20 },
   "shot.json": { player: "2", output: "shot.png" },
+  "record-start.json": { player: "2", output: "test-clip.webp", fps: 12, maxSeconds: 60, quality: 80 },
+  "record-end.json": { recordingId: "RECORDING_ID_FROM_RECORD_START" },
   "ui.json": { player: "2", limit: 100 },
   "press.json": { player: "2", path: "PlayerGui.Shop.BuyButton" },
   "type.json": { player: "2", path: "PlayerGui.Chat.Box", text: "hello", enter: true },
   "goto.json": { player: "2", target: "Workspace.Shop.Door" },
   "wait.json": { player: "2", condition: "workspace:GetAttribute('Ready') == true", timeout: 1 },
   "device.json": { action: "status" },
+  "input.json": { player: "2", actions: [{ action: "key-press", key: "E" }] },
+  "creator-search.json": {
+    anonymous: true,
+    requests: [{
+      method: "GET",
+      path: "/toolbox-service/v2/assets:search",
+      query: { searchCategoryType: "Model", query: "tree", maxPageSize: 1 },
+    }],
+  },
+  "data-store.json": {
+    requests: [{ method: "GET", path: "/cloud/v2/universes/1/data-stores" }],
+  },
   "set-property.json": {
     editor: true,
     service: "Workspace",

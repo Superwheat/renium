@@ -10,7 +10,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 macro_rules! eprintln {
     ($format:literal $(, $argument:expr)* $(,)?) => {{
         if $format.starts_with("[renium]") {
-            $crate::output::log_global(
+            $crate::app::output::log_global(
                 if $format.starts_with("[renium] warning") {
                     2
                 } else if $format.contains("failed") || $format.contains("error") {
@@ -32,18 +32,18 @@ macro_rules! eprintln {
 macro_rules! println {
     ($format:literal $(, $argument:expr)* $(,)?) => {{
         if $format.starts_with("[renium]") {
-            $crate::output::log_global(
+            $crate::app::output::log_global(
                 if $format.starts_with("[renium] warning") { 2 } else { 3 },
                 format_args!($format $(, $argument)*),
             );
-        } else if $crate::runtime_context::automation_stdio() {
+        } else if $crate::app::context::automation_stdio() {
             std::eprintln!($format $(, $argument)*);
         } else {
             std::println!($format $(, $argument)*);
         }
     }};
     ($($argument:tt)*) => {{
-        if $crate::runtime_context::automation_stdio() {
+        if $crate::app::context::automation_stdio() {
             std::eprintln!($($argument)*);
         } else {
             std::println!($($argument)*);
@@ -51,82 +51,34 @@ macro_rules! println {
     }};
 }
 
+mod app;
 mod automation;
-mod automation_runtime;
-mod bridge_server;
-mod build_info;
-mod bytecode_api;
-mod bytecode_edit;
-mod bytecode_explorer;
-mod bytecode_query;
-mod cli_config;
-mod command_args;
-mod command_dispatch;
-mod command_line;
-mod crash_reporting;
-mod daemon_control;
-mod editor_diff;
-mod editor_document;
-mod editor_history;
-mod editor_paths;
-mod editor_review;
-mod editor_sync;
-mod editor_types;
-mod external_tools;
-mod file_io;
-mod file_watch;
-mod input_inject;
-mod instance_api;
-mod lifecycle;
-mod local_transport;
-mod native_editor;
-mod native_import;
-#[cfg(any(windows, target_os = "macos"))]
-mod native_snapshot;
-mod output;
-pub(crate) use output::{emit_global_output, log_global, set_global_stream_output};
-mod package_links;
-mod place_packages;
-mod place_target;
-mod project_commands;
-mod project_config;
-mod project_layout;
-mod property_schema;
-mod rbx_decode;
-mod rbx_encode;
-mod rbx_model;
-mod runtime_context;
-mod services;
-mod settings_bytecode;
-mod settings_tree;
-mod setup;
-mod snapshot_codec;
-mod snapshot_export;
-mod snapshot_import;
-mod snapshot_refs;
-mod snapshot_types;
-mod sourcemap;
-mod studio_automation;
-#[cfg(windows)]
-mod studio_native_serializer;
-#[cfg(target_os = "macos")]
-mod studio_native_serializer_macos;
+mod bytecode;
+mod cli;
+mod cloud;
+mod daemon;
+mod editor;
+mod project;
+mod rbx;
+mod roblox;
+mod settings;
+mod snapshot;
+mod studio;
+mod system;
 #[cfg(test)]
-mod test_support;
-mod timing;
-mod version_control;
-mod workflows;
-#[cfg(target_os = "macos")]
-use studio_native_serializer_macos as studio_native_serializer;
+mod tests;
 
-use command_line::{Cli, Commands};
-use place_target::set_place_filter;
+pub(crate) use app::output::{emit_global_output, log_global, set_global_stream_output};
+
+use app::{context, update};
+use cli::{Cli, Commands};
+use studio::target::set_place_filter;
 
 fn main() -> ExitCode {
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            if output::global_json_output() {
+            if app::output::global_json_output() {
                 eprintln!(
                     "{}",
                     serde_json::to_string(&json!({
@@ -144,16 +96,16 @@ fn main() -> ExitCode {
 }
 
 fn run_cli() -> Result<()> {
-    crash_reporting::install_hook();
+    app::crash::install_hook();
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
-    output::prime_mode(&cli.output_mode);
+    app::output::prime_mode(&cli.output_mode);
     if cli.backtrace {
         unsafe {
             std::env::set_var("RUST_BACKTRACE", "1");
         }
     }
-    cli_config::apply_merged(&mut cli, &matches)?;
+    cli::config::apply_merged(&mut cli, &matches)?;
     if cli.verbose > 0 {
         cli.log_level = if cli.verbose > 1 {
             "trace".to_string()
@@ -161,8 +113,8 @@ fn run_cli() -> Result<()> {
             "debug".to_string()
         };
     }
-    output::validate_options(&cli)?;
-    output::configure(&cli);
+    app::output::validate_options(&cli)?;
+    app::output::configure(&cli);
     set_place_filter(
         cli.place
             .clone()
@@ -174,13 +126,10 @@ fn run_cli() -> Result<()> {
             std::env::set_var("RENIUM_DAEMON_NAME", name);
         }
     }
-    runtime_context::set_cli_project(cli.project.clone());
+    context::set_cli_project(cli.project.clone());
     if !matches!(&cli.command, Commands::UpdateHelper(_)) {
-        lifecycle::report_pending_update_result();
+        update::report_pending_update_result();
     }
 
-    command_dispatch::dispatch(cli.command, cli.project.as_deref())
+    cli::dispatch::dispatch(cli.command, cli.project.as_deref())
 }
-
-#[cfg(test)]
-mod main_tests;

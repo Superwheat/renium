@@ -1299,7 +1299,7 @@ end)
 			return { ok = false, error = "PlayerScripts is not available" }
 		end
 		local probe = playerScripts:FindFirstChild(MOUSE_PROBE_NAME)
-		if probe and probe:GetAttribute("ProbeVersion") ~= 2 then
+		if probe and probe:GetAttribute("ProbeVersion") ~= 3 then
 			probe:Destroy()
 			probe = nil
 		end
@@ -1311,16 +1311,7 @@ end)
 				[==[
 local probe = script
 local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
-probe:SetAttribute("ProbeVersion", 2)
-UserInputService.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton3 then
-		local inset = GuiService:GetGuiInset()
-		probe:SetAttribute("ProbeX", input.Position.X + inset.X)
-		probe:SetAttribute("ProbeY", input.Position.Y + inset.Y)
-		probe:SetAttribute("ProbeSeq", (probe:GetAttribute("ProbeSeq") or 0) + 1)
-	end
-end)
+probe:SetAttribute("ProbeVersion", 3)
 local function updateMouse()
 	local location = UserInputService:GetMouseLocation()
 	probe:SetAttribute("MouseX", location.X)
@@ -1355,9 +1346,6 @@ updateMouse()
 			ok = true,
 			x = x,
 			y = y,
-			probeSeq = probe:GetAttribute("ProbeSeq") or 0,
-			probeX = probe:GetAttribute("ProbeX"),
-			probeY = probe:GetAttribute("ProbeY"),
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
 		}
