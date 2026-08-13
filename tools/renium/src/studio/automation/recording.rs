@@ -10,11 +10,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use webp_animation::prelude::{Encoder, EncoderOptions, EncodingConfig};
 
+#[cfg(any(windows, target_os = "macos"))]
+use super::client_viewport_size;
 #[cfg(windows)]
 use super::set_capture_probe_phase;
-use super::{
-    BridgeServer, BridgeTarget, client_viewport_size, studio_capture_status, wait_for_player_bridge,
-};
+use super::{BridgeServer, BridgeTarget, studio_capture_status, wait_for_player_bridge};
 use crate::app::output::automation_token;
 use crate::studio::input as input_inject;
 

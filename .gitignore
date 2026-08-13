@@ -42,10 +42,20 @@ tools/**/.renium-extension-stage-*/
 *.ilk
 *.dll
 *.exe
+*.dylib
+*.so
+*.a
+*.wasm
 *.dSYM/
 
 # Packaged artifacts
 *.vsix
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rbxm
+*.rbxmx
 
 # Local/vendor checkouts used as tooling references
 _external/

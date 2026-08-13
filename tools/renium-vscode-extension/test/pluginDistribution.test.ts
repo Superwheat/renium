@@ -5,8 +5,8 @@ import { isRobloxModel, reniumPluginReleaseUrl } from "../src/pluginDistribution
 
 test("plugin download URL is pinned to the extension version", () => {
   assert.equal(
-    reniumPluginReleaseUrl("0.1.2"),
-    "https://github.com/Superwheat/renium/releases/download/v0.1.2/Renium.rbxm",
+    reniumPluginReleaseUrl("0.1.3"),
+    "https://github.com/Superwheat/renium/releases/download/v0.1.3/Renium.rbxm",
   );
   assert.throws(() => reniumPluginReleaseUrl("latest"), /Invalid Renium extension version/);
 });
