@@ -209,6 +209,7 @@ jobs:
           if ($null -eq $plugin) { throw "Integration artifact is missing Renium.rbxm" }
           Copy-Item -LiteralPath $plugin.FullName -Destination tools/plugin_ws_bridge/Renium.rbxm -Force
           Copy-Item -LiteralPath $plugin.FullName -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
+          "RENIUM_PLUGIN_BUNDLE=$($plugin.FullName)" >> $env:GITHUB_ENV
           $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *.zip | Select-Object -First 1
           if ($null -eq $archive) { throw "CLI artifact is missing its archive" }
           $stage = Join-Path $env:RUNNER_TEMP "renium-cli"
