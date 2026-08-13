@@ -20,6 +20,7 @@ use crate::app::timing::current_millis;
 
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
+const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
 
 #[derive(Args)]
 pub struct UpdateArgs {
@@ -49,6 +50,10 @@ pub struct UpdateApplyArgs {
     pub dry_run: bool,
     #[arg(long)]
     pub force: bool,
+    #[arg(long, requires = "editor_cli")]
+    pub extension_root: Option<PathBuf>,
+    #[arg(long, requires = "extension_root")]
+    pub editor_cli: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -549,6 +554,8 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                 &args.component,
                 args.dry_run,
                 args.force,
+                args.extension_root.as_deref(),
+                args.editor_cli.as_deref(),
                 &lifecycle_lock,
             )
         }
@@ -575,6 +582,12 @@ fn delegate_extension_owned_update(args: &UpdateApplyArgs) -> Result<bool> {
     }
     if args.force {
         command.arg("--force");
+    }
+    if let Some(root) = args.extension_root.as_deref() {
+        command.arg("--extension-root").arg(root);
+    }
+    if let Some(cli) = args.editor_cli.as_deref() {
+        command.arg("--editor-cli").arg(cli);
     }
     let status = command
         .status()
@@ -630,13 +643,20 @@ fn fetch_manifest(source: &str) -> Result<SignedUpdateManifest> {
     Ok(manifest)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn latest_release_version() -> Result<String> {
+    let manifest = fetch_manifest(DEFAULT_UPDATE_MANIFEST)?;
+    verify_manifest(&manifest)?;
+    Version::parse(&manifest.payload.version)
+        .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
+    Ok(manifest.payload.version)
+}
+
 fn verify_manifest(manifest: &SignedUpdateManifest) -> Result<()> {
     let raw_key = env::var("RENIUM_UPDATE_PUBLIC_KEY")
         .ok()
         .or_else(|| option_env!("RENIUM_UPDATE_PUBLIC_KEY").map(str::to_string))
-        .context(
-            "No pinned update public key is configured in this build or RENIUM_UPDATE_PUBLIC_KEY",
-        )?;
+        .unwrap_or_else(|| UPDATE_PUBLIC_KEY.to_string());
     let key_bytes = base64::decode(raw_key.trim()).context("Invalid update public key base64")?;
     let key_bytes: [u8; 32] = key_bytes
         .try_into()
@@ -657,6 +677,8 @@ fn apply_update(
     requested: &[String],
     dry_run: bool,
     force: bool,
+    extension_root: Option<&Path>,
+    editor_cli: Option<&Path>,
     _lifecycle_lock: &LifecycleLock,
 ) -> Result<()> {
     let platform = platform_key();
@@ -762,7 +784,11 @@ fn apply_update(
         })
         .transpose()?;
     let editor_installs = if requested.iter().any(|name| name == "extension") {
-        find_installed_extension_editors()?
+        match (extension_root, editor_cli) {
+            (Some(root), Some(cli)) => vec![selected_extension_editor(root, cli)?],
+            (None, None) => find_installed_extension_editors()?,
+            _ => unreachable!("clap requires extension update arguments together"),
+        }
     } else {
         Vec::new()
     };
@@ -949,6 +975,7 @@ fn apply_update(
     #[cfg(windows)]
     {
         schedule_windows_update(&plan, plan.core_stage.as_deref())?;
+        let result_path = deferred_update_result_path()?;
         crate::app::output::emit_global_output(
             &json!({
                 "ok": true,
@@ -957,6 +984,7 @@ fn apply_update(
                 "applied": [],
                 "scheduled": requested,
                 "restartRequired": true,
+                "resultPath": result_path,
             }),
             &format!(
                 "Scheduled the Renium {} update; it will finish after this process exits",
@@ -2759,6 +2787,33 @@ fn find_installed_extension_editors() -> Result<Vec<EditorExtensionInstall>> {
         result.push(EditorExtensionInstall { cli, root });
     }
     Ok(result)
+}
+
+fn selected_extension_editor(root: &Path, cli: &Path) -> Result<EditorExtensionInstall> {
+    if !has_renium_extension(root) {
+        bail!(
+            "No installed Renium editor extension was found in {}",
+            root.display()
+        );
+    }
+    if !cli.is_file() {
+        bail!("Editor CLI does not exist: {}", cli.display());
+    }
+    let root_kind = editor_kind_from_extension_root(root)
+        .with_context(|| format!("Could not identify the editor that owns {}", root.display()))?;
+    let cli_kind = editor_kind_from_cli(cli)
+        .with_context(|| format!("Could not identify editor CLI {}", cli.display()))?;
+    if root_kind != cli_kind {
+        bail!(
+            "Editor CLI {} does not manage {}",
+            cli.display(),
+            root.display()
+        );
+    }
+    Ok(EditorExtensionInstall {
+        cli: cli.to_path_buf(),
+        root: root.to_path_buf(),
+    })
 }
 
 fn editor_platform(editor: &EditorExtensionInstall) -> Result<String> {

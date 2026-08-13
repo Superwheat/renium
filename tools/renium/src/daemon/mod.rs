@@ -113,12 +113,8 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     let lifecycle_lock = update::acquire_lifecycle_lock()?;
     let bridge_host = normalize_loopback_host(&args.bridge.host)?;
     let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, listen_metrics) = BridgeServer::listen_with_initial_wait(
-        &bridge_host,
-        &ports,
-        args.bridge.wait_seconds,
-        false,
-    )?;
+    let (bridge, listen_metrics) =
+        BridgeServer::listen_daemon(&bridge_host, &ports, args.bridge.wait_seconds)?;
     let bridge = Arc::new(bridge);
     let automation_state = Arc::new(automation::State::default());
     if !editor_stdio {
