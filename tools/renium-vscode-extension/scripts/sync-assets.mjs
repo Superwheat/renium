@@ -1,5 +1,7 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { generateRobloxPropertiesMetadata } from "./generate-properties-metadata.mjs";
@@ -22,13 +24,30 @@ const refreshStudioApi =
   process.env.RENIUM_REFRESH_STUDIO_API === "1";
 
 function syncStudioPluginBundle() {
-  const source = process.env.RENIUM_PLUGIN_BUNDLE?.trim() ||
-    path.join(repoRoot, "tools", "plugin_ws_bridge", "Renium.rbxm");
-  const bytes = fs.readFileSync(source);
-  if (bytes.length < 16 || bytes.subarray(0, 7).toString("ascii") !== "<roblox") {
-    throw new Error(`Invalid Studio plugin bundle: ${source}`);
+  const configured = process.env.RENIUM_PLUGIN_BUNDLE?.trim();
+  const generated = !configured;
+  const source = configured || path.join(os.tmpdir(), `renium-plugin-${process.pid}-${Date.now()}.rbxm`);
+  if (generated) {
+    const project = path.join(repoRoot, "tools", "plugin_ws_bridge", "Renium.project.json");
+    const result = spawnSync("rojo", ["build", project, "--output", source], { stdio: "inherit" });
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.status !== 0) {
+      throw new Error(`Rojo exited with code ${result.status}`);
+    }
   }
-  fs.copyFileSync(source, path.join(extensionAssets, "Renium.rbxm"));
+  try {
+    const bytes = fs.readFileSync(source);
+    if (bytes.length < 16 || bytes.subarray(0, 7).toString("ascii") !== "<roblox") {
+      throw new Error(`Invalid Studio plugin bundle: ${source}`);
+    }
+    fs.copyFileSync(source, path.join(extensionAssets, "Renium.rbxm"));
+  } finally {
+    if (generated) {
+      fs.rmSync(source, { force: true });
+    }
+  }
 }
 
 function syncProjectSchema() {

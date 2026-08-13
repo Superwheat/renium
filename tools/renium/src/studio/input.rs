@@ -7,11 +7,6 @@ pub struct StudioWindow {
     _reminimize: Option<platform::ReminimizeGuard>,
 }
 
-#[cfg(not(windows))]
-pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {
-    platform::list_studio_windows()
-}
-
 #[cfg(any(windows, target_os = "macos"))]
 pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
     platform::window_for_pid(pid, viewport, true)
@@ -1065,7 +1060,6 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::StudioWindow;
     use anyhow::{Result, bail};
     use std::ffi::c_void;
 
@@ -1352,32 +1346,6 @@ mod platform {
                     None
                 }
             })
-    }
-
-    pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {
-        let mut windows = studio_window_records(true)?
-            .into_iter()
-            .filter(|record| {
-                record.pid > 0
-                    && record.rect.size.width >= 320.0
-                    && record.rect.size.height >= 240.0
-                    && is_studio_owner(&record.owner)
-            })
-            .map(|record| StudioWindow {
-                label: format!("pid {}: {}", record.pid, record.owner),
-                handle: WindowHandle {
-                    pid: record.pid,
-                    window_number: record.window_number,
-                    origin_x: record.rect.origin.x,
-                    origin_y: record.rect.origin.y,
-                },
-            })
-            .collect::<Vec<_>>();
-        if windows.is_empty() {
-            bail!("No visible Roblox Studio windows found");
-        }
-        windows.sort_by_key(|window| window.handle.pid);
-        Ok(windows)
     }
 
     pub fn window_for_pid(
@@ -1673,14 +1641,9 @@ mod platform {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
-    use super::StudioWindow;
     use anyhow::{Result, bail};
 
     pub struct WindowHandle;
-
-    pub fn list_studio_windows() -> Result<Vec<StudioWindow>> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
 
     pub fn post_mouse_move(_handle: &WindowHandle, _x: i32, _y: i32) -> Result<()> {
         bail!("Input injection is only supported on Windows and macOS")

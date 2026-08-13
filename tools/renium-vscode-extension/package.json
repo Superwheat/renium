@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

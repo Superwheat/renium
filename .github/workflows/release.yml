@@ -18,7 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - id: version
         shell: pwsh
@@ -50,7 +50,7 @@ jobs:
     env:
       RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -110,7 +110,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
@@ -184,7 +184,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v4
         with:
@@ -248,7 +248,7 @@ jobs:
     needs: verify-tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: anchore/sbom-action@v0
         with:
@@ -271,7 +271,7 @@ jobs:
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v4
         with:
@@ -319,6 +319,20 @@ jobs:
           subject-path: release-assets/*
           sbom-path: release-assets/renium.spdx.json
 
+      - name: Prepare release notes
+        env:
+          RENIUM_VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          {
+            printf "# What's Changed\n"
+            awk -v heading="## $RENIUM_VERSION" '
+              index($0, heading) == 1 { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+              END { if (!found) exit 1 }
+            ' tools/renium-vscode-extension/changelog.md
+          } > /tmp/renium-release-notes.md
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -331,8 +345,11 @@ jobs:
               exit 1
             fi
           else
-            gh release create "${{ github.ref_name }}" --verify-tag --generate-notes --draft
+            gh release create "${{ github.ref_name }}" --verify-tag --draft
           fi
+          gh release edit "${{ github.ref_name }}" \
+            --title "Renium ${{ needs.verify-tag.outputs.version }}" \
+            --notes-file /tmp/renium-release-notes.md
           gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/renium-expected-assets
           gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' | sort > /tmp/renium-uploaded-assets
