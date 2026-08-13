@@ -321,6 +321,7 @@ function BridgePluginRuntime.start(context)
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 	})
+	Config.creatorApi = requireChildModule("BridgeCreatorApi").create()
 	function Config.applyBridgeRuntimeSettings(runtimeSettings: { [string]: any })
 		Config.studioChanges.setOptions({
 			syncbackProperties = runtimeSettings.syncbackProperties,
@@ -4751,6 +4752,14 @@ function BridgePluginRuntime.start(context)
 		return RuntimeApi.cancelLuauExecution(p, sessionGeneration)
 	end
 	Config.bridgeMethodHandlers.startStopPlay = RuntimeApi.startStopPlay
+	Config.bridgeMethodHandlers.getStudioState = Config.creatorApi.studioState
+	Config.bridgeMethodHandlers.getCreatorContext = Config.creatorApi.creatorContext
+	Config.bridgeMethodHandlers.cameraCapture = Config.creatorApi.cameraCapture
+	Config.bridgeMethodHandlers.insertAsset = Config.creatorApi.insertAsset
+	Config.bridgeMethodHandlers.generateModel = Config.creatorApi.generateModel
+	Config.bridgeMethodHandlers.creatorJob = Config.creatorApi.creatorJob
+	Config.bridgeMethodHandlers.multiEdit = Config.creatorApi.multiEdit
+	Config.bridgeMethodHandlers.uploadImages = Config.creatorApi.uploadImages
 
 	Config.bridgeMethodHandlers.recordSyncCompletion = function()
 		Config.recordSyncCompletion()
@@ -4907,6 +4916,11 @@ function BridgePluginRuntime.start(context)
 		captureViewportProbe = true,
 		executeLuau = true,
 		startStopPlay = true,
+		cameraCapture = true,
+		insertAsset = true,
+		generateModel = true,
+		multiEdit = true,
+		uploadImages = true,
 		prepareForNextRun = true,
 		prepare = true,
 		release = true,
@@ -4953,6 +4967,14 @@ function BridgePluginRuntime.start(context)
 		captureViewportProbe = true,
 		executeLuau = true,
 		startStopPlay = true,
+		getStudioState = true,
+		getCreatorContext = true,
+		cameraCapture = true,
+		insertAsset = true,
+		generateModel = true,
+		creatorJob = true,
+		multiEdit = true,
+		uploadImages = true,
 		prepareForNextRun = true,
 		prepare = true,
 		release = true,
@@ -5040,6 +5062,7 @@ function BridgePluginRuntime.start(context)
 				end
 				table.clear(transactionExpectations)
 				RuntimeApi.cleanup(runtimeCleanupGeneration)
+				Config.creatorApi.cleanup()
 			end
 		end,
 	})

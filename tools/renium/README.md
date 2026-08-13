@@ -398,6 +398,68 @@ $env:ROBLOX_API_KEY = "..."
 rbx --project .\renium.project.jsonc upload-place --universe-id 123 --place-id 456
 ```
 
+Agents can use the bound automation context for any JSON Open Cloud endpoint.
+The daemon reuses one HTTPS client, fills `{universe}` and `{place}` from the
+context, and accepts several requests in one payload:
+
+```json
+{
+  "requests": [{
+    "method": "GET",
+    "path": "/cloud/v2/universes/{universe}/data-stores",
+    "query": { "maxPageSize": 25 }
+  }]
+}
+```
+
+```powershell
+rbx a cloud CX -J open-cloud.json
+```
+
+`ROBLOX_API_KEY` must be set before the daemon starts. See the generated
+`AGENTS.md` for batched Creator Store and data-store recipes. API keys aren't
+accepted in payloads or command arguments.
+
+The automation API also covers the plugin-accessible Creator features used by
+Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
+AI model generation jobs, local image validation, and Open Cloud image upload.
+
+```powershell
+rbx a asset-search CX -J asset-search.json
+rbx a asset-insert CX -J asset-insert.json
+rbx a generate-model CX -J generate-model.json
+rbx a job-status CX -J job-status.json
+rbx a image-store CX -J image-store.json
+rbx a image-upload CX -J image-upload.json
+```
+
+`generate-model` uses the public `GenerationService:GenerateModelAsync` plugin
+API. Material generation and Roblox's internal primitive `ProceduralModel`
+generator require `RobloxScriptSecurity`, so third-party plugins cannot expose
+them reliably. Group and universe Creator Inventory searches are also absent
+from public plugin and Open Cloud APIs; Renium reports them as unsupported.
+HTTP image uploads use the locally installed plugin's prompt-free
+`AssetService:CreateAssetAsync` API. Local files and explicit user/group
+ownership use Open Cloud instead.
+
+Ordered mouse and keyboard sequences use `rbx a input CX -J input.json`.
+Windows posts events to the exact target window handle and macOS posts Quartz
+events to the exact target process. Neither implementation moves the system
+cursor, sends global input, or activates another application.
+
+Agents can record the edit viewport or one play client without activating its
+window or capturing the rest of the desktop:
+
+```powershell
+rbx a record-start CX -J record-start.json
+rbx a record-end CX -J record-end.json
+```
+
+`record-start` accepts `player`, `studio`, `client`, an `output` path ending in
+`.webp`, `fps` from 1 through 30, `maxSeconds` from 1 through 300, and `quality`
+from 0 through 100. Pass its returned `recordingId` to `record-end`. The result
+is an animated WebP with no audio and can be attached directly as a clip.
+
 `rbx docs [topic]` prints the bundled reference. `rbx docs --serve` exposes the
 same text on a read-only loopback page.
 
@@ -689,6 +751,9 @@ Protocol version: `1`
 | 21 | `tree` | - | no |
 | 22 | `inspect` | - | no |
 | 23 | `batch` | bb | no |
+| 24 | `script-search` | - | no |
+| 25 | `script-read` | - | no |
+| 26 | `script-grep` | - | no |
 | 30 | `get-property` | - | no |
 | 31 | `set-property` | - | yes |
 | 32 | `set-source` | - | no |
@@ -697,6 +762,7 @@ Protocol version: `1`
 | 35 | `move` | - | no |
 | 36 | `remove` | - | no |
 | 37 | `revert` | - | no |
+| 38 | `multi-edit` | - | no |
 | 40 | `import-model` | - | no |
 | 41 | `export-model` | - | no |
 | 42 | `export-place` | - | no |
@@ -720,6 +786,9 @@ Protocol version: `1`
 | 64 | `type` | - | no |
 | 65 | `wait` | - | no |
 | 66 | `goto` | - | no |
+| 67 | `input` | - | no |
+| 68 | `record-start` | - | no |
+| 69 | `record-end` | - | no |
 | 70 | `project-init` | - | no |
 | 71 | `project-validate` | - | no |
 | 72 | `place-add` | - | no |
@@ -728,4 +797,12 @@ Protocol version: `1`
 | 80 | `review-prepare` | - | no |
 | 81 | `review-apply` | - | no |
 | 82 | `review-reject` | - | no |
+| 90 | `cloud` | oc | no |
+| 91 | `asset-search` | - | no |
+| 92 | `asset-insert` | - | no |
+| 93 | `generate-model` | - | no |
+| 94 | `job-status` | - | no |
+| 95 | `image-upload` | - | no |
+| 96 | `image-store` | - | no |
+| 97 | `http-get` | - | no |
 <!-- automation-opcodes:end -->

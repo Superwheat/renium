@@ -286,7 +286,7 @@ $pluginVersion = $pluginVersionMatch.Groups["version"].Value
 if (($cliVersion -ne $extensionVersion) -or ($cliVersion -ne $pluginVersion)) {
     throw "Version mismatch: CLI=$cliVersion, extension=$extensionVersion, plugin=$pluginVersion. All three must match before packaging."
 }
-$cliProtocolSourcePath = Join-Path $cliDirectory "src\snapshot_export.rs"
+$cliProtocolSourcePath = Join-Path $cliDirectory "src\snapshot\export.rs"
 $cliProtocolSource = Get-Content -LiteralPath $cliProtocolSourcePath -Raw
 $compatibilityConstants = [ordered]@{
     BRIDGE_PROTOCOL_VERSION = "BRIDGE_PROTOCOL_VERSION"

@@ -67,6 +67,9 @@
       "BridgeRuntimeApi": {
         "$path": "BridgeRuntimeApi.module.lua"
       },
+      "BridgeCreatorApi": {
+        "$path": "BridgeCreatorApi.module.lua"
+      },
       "BridgePropertySchema": {
         "$path": "BridgePropertySchema.module.lua"
       },

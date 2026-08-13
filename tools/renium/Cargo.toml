@@ -15,9 +15,12 @@ clap = { version = "4.5.53", features = ["derive"] }
 full_moon = { version = "2.2.0", features = ["luau"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+ureq = { version = "=2.10.1", features = ["json", "proxy-from-env"] }
+url = "=2.4.1"
 rayon = "1.11.0"
 tungstenite = "0.28.0"
 png = "0.17"
+webp-animation = { version = "0.10", features = ["static"] }
 walkdir = "2.5.0"
 zstd = "0.13.2"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
