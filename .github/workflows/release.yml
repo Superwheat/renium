@@ -349,7 +349,7 @@ jobs:
             gh release create "${{ github.ref_name }}" --verify-tag --draft
           fi
           gh release edit "${{ github.ref_name }}" \
-            --title "Renium ${{ needs.verify-tag.outputs.version }}" \
+            --title "${{ github.ref_name }}" \
             --notes-file /tmp/renium-release-notes.md
           gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/renium-expected-assets
