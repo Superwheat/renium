@@ -215,7 +215,7 @@ jobs:
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $stage
           $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
           if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
-          if ("${{ runner.os }}" -ne "Windows") { chmod +x -- $cli.FullName }
+          if ("${{ runner.os }}" -ne "Windows") { chmod +x $cli.FullName }
           "RENIUM_CLI_BUILD=$($cli.FullName)" >> $env:GITHUB_ENV
 
       - name: Package extension
