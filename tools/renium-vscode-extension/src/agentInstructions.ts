@@ -10,7 +10,20 @@ const PROJECT_MARKERS = [
   ".renium",
 ] as const;
 
-const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
+const OLD_AGENT_MARKER = /^renium-\d+\.\d+\.\d+$/;
+
+function agentInstructions(pointer: string, current = ""): string {
+  if (current.includes(pointer.trimEnd())) {
+    return current;
+  }
+  if (OLD_AGENT_MARKER.test(current.trimEnd().split(/\r?\n/).at(-1) ?? "")) {
+    return pointer;
+  }
+  const separator = current.length === 0 || current.endsWith("\n\n")
+    ? ""
+    : current.endsWith("\n") ? "\n" : "\n\n";
+  return `${current}${separator}${pointer}`;
+}
 
 export function isReniumProjectRoot(projectRoot: string): boolean {
   return PROJECT_MARKERS.some((name) => fs.existsSync(path.join(projectRoot, name)));
@@ -20,27 +33,35 @@ export function ensureReniumAgentInstructions(
   extensionRoot: string,
   projectRoot: string,
 ): string[] {
-  const created: string[] = [];
-  if (!fs.existsSync(projectRoot) || !fs.statSync(projectRoot).isDirectory()) {
-    return created;
+  if (!fs.existsSync(projectRoot)
+    || !fs.statSync(projectRoot).isDirectory()
+    || !isReniumProjectRoot(projectRoot)) {
+    return [];
   }
-  for (const name of INSTRUCTION_FILES) {
+
+  const written: string[] = [];
+  const write = (target: string, contents: Buffer | string): void => {
+    if (fs.existsSync(target) && fs.readFileSync(target).equals(Buffer.from(contents))) {
+      return;
+    }
+    fs.writeFileSync(target, contents);
+    written.push(target);
+  };
+
+  const packagedGuide = path.join(extensionRoot, "resources", "RENIUM.md");
+  const guideSource = fs.existsSync(packagedGuide)
+    ? packagedGuide
+    : path.resolve(extensionRoot, "..", "renium", "renium-agents.md");
+  write(path.join(projectRoot, "RENIUM.md"), fs.readFileSync(guideSource));
+
+  const pointer = fs.readFileSync(path.join(extensionRoot, "resources", "RENIUM.pointer.md"), "utf8");
+  for (const name of ["AGENTS.md", "CLAUDE.md"]) {
     const target = path.join(projectRoot, name);
-    if (fs.existsSync(target)) {
+    const current = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+    if (name === "CLAUDE.md" && current.toLowerCase().includes("agents.md")) {
       continue;
     }
-    const packagedSource = path.join(extensionRoot, "resources", name);
-    const source = name === "AGENTS.md" && !fs.existsSync(packagedSource)
-      ? path.resolve(extensionRoot, "..", "renium", "renium-agents.md")
-      : packagedSource;
-    try {
-      fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
-      created.push(target);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-    }
+    write(target, agentInstructions(pointer, current));
   }
-  return created;
+  return written;
 }

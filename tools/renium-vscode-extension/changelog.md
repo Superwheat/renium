@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.6 - 2026-08-14
+
+- Restored a minimal `renium.project.jsonc` marker in every place root and create missing place markers during binding and place setup.
+- Included every serialized instance in sourcemaps while retaining source-file paths for scripts.
+- Fixed cached update checks when GitHub returns `304 Not Modified` and added **Check for Updates** to the editor menu.
+- Moved the generated agent guide to `RENIUM.md` and kept project-owned instructions in `AGENTS.md`.
+- Added one Unicode-marked guide instruction to `AGENTS.md` and to `CLAUDE.md` when Claude's file doesn't already refer to `AGENTS.md`.
+- Fixed generated GitHub release notes so the change list appears directly below **What's Changed**.
+
 ## 0.1.5 - 2026-08-14
 
 - Moved Renium's agent instructions into one packaged Markdown file instead of embedding the full guide in Rust and JavaScript source.

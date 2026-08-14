@@ -545,6 +545,9 @@ fn automation_bind(
             "bind",
         ));
     }
+    let root = canonical_path(&root).map_err(|error| {
+        automation::Failure::new("no_project", format!("{error:#}"), false, "project-init")
+    })?;
     let explicit_project = automation_string(object, "project")
         .map(PathBuf::from)
         .map(|project| {
@@ -560,10 +563,21 @@ fn automation_bind(
     if object.get("bootstrap").and_then(Value::as_bool) == Some(true) && !direct_project.is_file() {
         return automation_bootstrap_context(state, &root);
     }
-    let loaded =
-        config::load_project(explicit_project.as_deref(), Some(&root)).map_err(|error| {
-            automation::Failure::new("no_project", format!("{error:#}"), false, "project-init")
-        })?;
+    let loaded = (|| -> Result<config::LoadedProject> {
+        if explicit_project.is_some() {
+            return config::load_project(explicit_project.as_deref(), Some(&root));
+        }
+        if let Some(loaded) = config::try_load_project(None, Some(&root))?
+            && loaded.root == root
+        {
+            return Ok(loaded);
+        }
+        let project = workflows::initialize_place_root(&root, Path::new("src"))?;
+        config::load_project(Some(&project), None)
+    })()
+    .map_err(|error| {
+        automation::Failure::new("no_project", format!("{error:#}"), false, "project-init")
+    })?;
     let project_root = canonical_path(&loaded.root).map_err(|error| {
         automation::Failure::new(
             "no_project",
@@ -1278,6 +1292,11 @@ fn automation_place_add(context: &automation::BoundContext, parameters: &Value) 
                     .with_context(|| format!("Failed to move {}", source.display()))?;
             }
         }
+        let source_root = PathBuf::from(&context.source)
+            .strip_prefix(&context.root)
+            .unwrap_or_else(|_| Path::new("src"))
+            .to_path_buf();
+        workflows::initialize_place_root(&current_root, &source_root)?;
         json!({
             "version": 2,
             "gameId": context.game_id.unwrap_or(game_id),
@@ -1326,11 +1345,7 @@ fn automation_place_add(context: &automation::BoundContext, parameters: &Value) 
     if !place_root.starts_with(experience) || place_root == experience {
         bail!("Place root must stay inside the experience project");
     }
-    workflows::run_init(workflows::InitArgs {
-        path: place_root,
-        with: Vec::new(),
-        preview: false,
-    })?;
+    workflows::initialize_place_root(&place_root, Path::new("src"))?;
     places.insert(
         alias.clone(),
         json!({ "placeId": place_id, "name": name, "root": relative_root.clone() }),

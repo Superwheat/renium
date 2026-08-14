@@ -60,8 +60,9 @@ function syncProjectSchema() {
 function syncAgentInstructions() {
   fs.copyFileSync(
     path.join(repoRoot, "tools", "renium", "renium-agents.md"),
-    path.join(extensionResources, "AGENTS.md"),
+    path.join(extensionResources, "RENIUM.md"),
   );
+  fs.rmSync(path.join(extensionResources, "AGENTS.md"), { force: true });
 }
 
 function discoverInsertableObjectsIconRoot() {

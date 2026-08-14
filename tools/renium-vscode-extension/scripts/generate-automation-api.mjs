@@ -64,7 +64,6 @@ if (operationsStartIndex < 0 || operationsEndIndex < operationsStartIndex) {
 const generatedOperations = `${operationsStart}\n${operationLines.join("\n")}\n${operationsEnd}`;
 agents = agents.slice(0, operationsStartIndex) + generatedOperations + agents.slice(operationsEndIndex + operationsEnd.length);
 fs.writeFileSync(agentsPath, agents);
-fs.writeFileSync(path.join(extensionRoot, "resources", "CLAUDE.md"), "Read and follow AGENTS.md.\n");
 
 const rows = registry.operations.map((operation) => {
   const aliases = (operation.aliases ?? []).join(", ");

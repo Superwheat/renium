@@ -462,18 +462,21 @@ class RobloxSyncController {
     this.updateStatusBar();
   }
 
-  private ensureAgentInstructions(projectRoot: string): void {
+  private ensureAgentInstructions(projectRoot: string): string[] {
     try {
-      for (const filePath of ensureReniumAgentInstructions(
+      const written = ensureReniumAgentInstructions(
         this.context.extensionPath,
         projectRoot,
-      )) {
-        this.output.appendLine(`[renium] created ${filePath}`);
+      );
+      for (const filePath of written) {
+        this.output.appendLine(`[renium] wrote ${filePath}`);
       }
+      return written;
     } catch (error) {
       this.output.appendLine(
         `[renium] could not create agent instructions: ${error instanceof Error ? error.message : String(error)}`,
       );
+      return [];
     }
   }
 
@@ -511,17 +514,11 @@ class RobloxSyncController {
     if (!isReniumProjectRoot(cfg.experienceRoot)) {
       throw new Error("Open a Renium project before creating agent instructions.");
     }
-    const before = ["AGENTS.md", "CLAUDE.md"].filter((name) =>
-      fs.existsSync(path.join(cfg.experienceRoot, name))
-    ).length;
-    this.ensureAgentInstructions(cfg.experienceRoot);
-    const after = ["AGENTS.md", "CLAUDE.md"].filter((name) =>
-      fs.existsSync(path.join(cfg.experienceRoot, name))
-    ).length;
+    const written = this.ensureAgentInstructions(cfg.experienceRoot);
     vscode.window.showInformationMessage(
-      after > before
-        ? "Created Renium agent instructions."
-        : "Renium agent instructions already exist.",
+      written.length > 0
+        ? "Updated Renium agent instructions."
+        : "Renium agent instructions are up to date.",
     );
   }
 
@@ -1055,6 +1052,11 @@ class RobloxSyncController {
         description: "Install or update the Renium plugin in your Roblox Plugins folder",
         action: "installStudioPlugin",
       },
+      {
+        label: "$(versions) Check for Updates",
+        description: "Check for a newer Renium version",
+        action: "checkUpdates",
+      },
     ];
 
     const picked = await vscode.window.showQuickPick(items, {
@@ -1117,6 +1119,9 @@ class RobloxSyncController {
         return;
       case "installStudioPlugin":
         await this.installStudioPlugin();
+        return;
+      case "checkUpdates":
+        await this.checkForUpdates();
         return;
       default:
         return;

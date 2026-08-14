@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
 
 use crate::cli::{ProjectSourceArgs, SyncWallyPackagesArgs};
@@ -26,11 +26,11 @@ mod build_watch;
 
 use build_watch::{package_uses_roblox_ts, roblox_ts_command, should_run_tool, watch_build};
 
-const PROJECT_SCHEMA: &str = include_str!("../../../schemas/renium.project.schema.json");
 const CLI_DOCS: &str = include_str!("../../../README.md");
-const CLAUDE_INSTRUCTIONS: &str =
-    include_str!("../../../../renium-vscode-extension/resources/CLAUDE.md");
+const AGENT_POINTER: &str =
+    include_str!("../../../../renium-vscode-extension/resources/RENIUM.pointer.md");
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
+const PROJECT_INSTRUCTIONS_FILE: &str = "RENIUM.md";
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -150,6 +150,7 @@ pub struct UploadArgs {
 struct InitPlan {
     root: PathBuf,
     create: Vec<String>,
+    update: Vec<String>,
     keep: Vec<String>,
 }
 
@@ -182,10 +183,17 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     let source_root = detect_init_source_root(&root)?;
     let files = init_files(&root, &source_root, &args.with)?;
     let mut create = Vec::new();
+    let mut update = Vec::new();
+    let mut update_paths = Vec::new();
     let mut keep = Vec::new();
-    for (path, _) in &files {
+    for (path, bytes) in &files {
         if path.exists() {
-            keep.push(relative_display(&root, path));
+            if should_update_instruction_file(path, bytes)? {
+                update.push(relative_display(&root, path));
+                update_paths.push(path.clone());
+            } else {
+                keep.push(relative_display(&root, path));
+            }
         } else {
             create.push(relative_display(&root, path));
         }
@@ -193,15 +201,17 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     let plan = InitPlan {
         root: root.clone(),
         create,
+        update,
         keep,
     };
     if args.preview {
         return crate::emit_global_output(
             &serde_json::to_value(&plan)?,
             &format!(
-                "Would initialize {}: create {}, keep {}",
+                "Would initialize {}: create {}, update {}, keep {}",
                 plan.root.display(),
                 plan.create.len(),
+                plan.update.len(),
                 plan.keep.len()
             ),
         );
@@ -233,6 +243,7 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         Vec::new()
     };
     let mut created_files = Vec::new();
+    let mut replaced_files = Vec::new();
     let mut created_directories = Vec::new();
     let result = (|| -> Result<()> {
         if !root_existed {
@@ -242,6 +253,12 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         }
         for (path, bytes) in files {
             if path.exists() {
+                if update_paths.contains(&path) {
+                    let original = fs::read(&path)
+                        .with_context(|| format!("Failed to read {}", path.display()))?;
+                    atomic_write_file(&path, &bytes)?;
+                    replaced_files.push((path, original));
+                }
                 continue;
             }
             if let Some(parent) = path.parent() {
@@ -295,6 +312,9 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         for path in created_files.into_iter().rev() {
             let _ = fs::remove_file(path);
         }
+        for (path, original) in replaced_files.into_iter().rev() {
+            let _ = atomic_write_file(&path, &original);
+        }
         created_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for path in created_directories {
             let _ = fs::remove_dir(path);
@@ -304,9 +324,10 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     crate::emit_global_output(
         &serde_json::to_value(&plan)?,
         &format!(
-            "Initialized {}: created {}, kept {}",
+            "Initialized {}: created {}, updated {}, kept {}",
             plan.root.display(),
             plan.create.len(),
+            plan.update.len(),
             plan.keep.len()
         ),
     )
@@ -903,41 +924,20 @@ fn init_files(
     source_root: &Path,
     features: &[InitFeature],
 ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let agent_instructions = agent_instructions()?;
+    let renium_instructions = agent_instructions()?;
+    let agent_instructions = merged_instruction_file(&root.join("AGENTS.md"))?;
+    let claude_instructions = merged_instruction_file(&root.join("CLAUDE.md"))?;
     let name = root
         .file_name()
         .and_then(OsStr::to_str)
         .filter(|name| !name.is_empty())
         .unwrap_or("Renium project");
-    let project = json!({
-        "$schema": "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json",
-        "schemaVersion": 1,
-        "name": name,
-        "sourceRoot": path_text(source_root),
-        "tree": {},
-        "scriptExtension": "preserve",
-        "exportNaming": {
-            "serverSuffix": ".server",
-            "clientSuffix": ".client",
-            "moduleSuffix": "",
-            "pluginSuffix": ".plugin",
-            "clientRunContextSuffix": ".run-client"
-        }
-    });
+    let project = minimal_project_file(source_root)?;
     let mut files = vec![
         (root.join("AGENTS.md"), agent_instructions),
-        (
-            root.join("CLAUDE.md"),
-            CLAUDE_INSTRUCTIONS.as_bytes().to_vec(),
-        ),
-        (
-            root.join(PROJECT_FILE_NAME),
-            (serde_json::to_string_pretty(&project)? + "\n").into_bytes(),
-        ),
-        (
-            root.join(".vscode/renium.project.schema.json"),
-            PROJECT_SCHEMA.as_bytes().to_vec(),
-        ),
+        (root.join(PROJECT_INSTRUCTIONS_FILE), renium_instructions),
+        (root.join("CLAUDE.md"), claude_instructions),
+        (root.join(PROJECT_FILE_NAME), project),
     ];
     let features = features.iter().copied().collect::<BTreeSet<_>>();
     if features.contains(&InitFeature::Git) {
@@ -989,6 +989,35 @@ fn init_files(
     Ok(files)
 }
 
+fn minimal_project_file(source_root: &Path) -> Result<Vec<u8>> {
+    let mut project = Map::new();
+    project.insert("schemaVersion".to_string(), json!(1));
+    if source_root != Path::new("src") {
+        project.insert("sourceRoot".to_string(), json!(path_text(source_root)));
+    }
+    Ok((serde_json::to_string_pretty(&project)? + "\n").into_bytes())
+}
+
+pub(crate) fn ensure_project_file(root: &Path, source_root: &Path) -> Result<PathBuf> {
+    if let Some(loaded) = config::try_load_project(None, Some(root))?
+        && loaded.root == root
+    {
+        return Ok(loaded.path);
+    }
+    let path = root.join(PROJECT_FILE_NAME);
+    if !path.is_file() {
+        fs::create_dir_all(root).with_context(|| format!("Failed to create {}", root.display()))?;
+        atomic_write_file(&path, &minimal_project_file(source_root)?)?;
+    }
+    Ok(path)
+}
+
+pub(crate) fn initialize_place_root(root: &Path, source_root: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(root.join(source_root))
+        .with_context(|| format!("Failed to create {}", root.join(source_root).display()))?;
+    ensure_project_file(root, source_root)
+}
+
 fn agent_instructions() -> Result<Vec<u8>> {
     let installed = env::current_exe()
         .context("Failed to locate the Renium executable")?
@@ -1001,6 +1030,66 @@ fn agent_instructions() -> Result<Vec<u8>> {
         .find(|path| path.is_file())
         .context("Renium is missing renium-agents.md; reinstall Renium")?;
     fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
+    if !path.is_file() {
+        return Ok(AGENT_POINTER.as_bytes().to_vec());
+    }
+    let mut current =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    if path.file_name() == Some(OsStr::new("CLAUDE.md")) && mentions_agents_file(&current) {
+        return Ok(current.into_bytes());
+    }
+    if current.contains(AGENT_POINTER.trim_end()) {
+        return Ok(current.into_bytes());
+    }
+    let old_generated = current
+        .trim_end()
+        .lines()
+        .next_back()
+        .is_some_and(is_old_agent_marker);
+    if old_generated {
+        return Ok(AGENT_POINTER.as_bytes().to_vec());
+    }
+    if !current.is_empty() && !current.ends_with('\n') {
+        current.push('\n');
+    }
+    if !current.is_empty() && !current.ends_with("\n\n") {
+        current.push('\n');
+    }
+    current.push_str(AGENT_POINTER);
+    Ok(current.into_bytes())
+}
+
+fn mentions_agents_file(text: &str) -> bool {
+    text.as_bytes()
+        .windows(b"agents.md".len())
+        .any(|window| window.eq_ignore_ascii_case(b"agents.md"))
+}
+
+fn is_old_agent_marker(line: &str) -> bool {
+    let Some(version) = line.strip_prefix("renium-") else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+
+fn should_update_instruction_file(path: &Path, replacement: &[u8]) -> Result<bool> {
+    let name = path.file_name().and_then(OsStr::to_str);
+    if name != Some("AGENTS.md")
+        && name != Some("CLAUDE.md")
+        && name != Some(PROJECT_INSTRUCTIONS_FILE)
+    {
+        return Ok(false);
+    }
+    let current = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(current != replacement)
 }
 
 fn build_once(
@@ -1763,5 +1852,84 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::temp_dir;
+
+    #[test]
+    fn init_keeps_one_pointer_to_the_renium_guide() {
+        let root = temp_dir("agent-instructions");
+        let agents = root.join("AGENTS.md");
+        let claude = root.join("CLAUDE.md");
+        fs::write(&agents, "# Old guide\n\nrenium-0.1.4\n").unwrap();
+        fs::write(&claude, "Read and follow AgEnTs.Md.\n").unwrap();
+
+        run_init(InitArgs {
+            path: root.clone(),
+            with: Vec::new(),
+            preview: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&agents).unwrap(), AGENT_POINTER);
+        assert_eq!(
+            fs::read_to_string(&claude).unwrap(),
+            "Read and follow AgEnTs.Md.\n"
+        );
+        assert_eq!(
+            fs::read(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
+            agent_instructions().unwrap()
+        );
+
+        fs::write(&agents, "# Project rules\n\nKeep this.\n").unwrap();
+        fs::write(&claude, "# Claude rules\n").unwrap();
+        run_init(InitArgs {
+            path: root.clone(),
+            with: Vec::new(),
+            preview: false,
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&agents).unwrap(),
+            format!("# Project rules\n\nKeep this.\n\n{AGENT_POINTER}")
+        );
+        assert_eq!(
+            fs::read_to_string(&claude).unwrap(),
+            format!("# Claude rules\n\n{AGENT_POINTER}")
+        );
+        let before = [fs::read(&agents).unwrap(), fs::read(&claude).unwrap()];
+        run_init(InitArgs {
+            path: root.clone(),
+            with: Vec::new(),
+            preview: false,
+        })
+        .unwrap();
+        assert_eq!(
+            [fs::read(&agents).unwrap(), fs::read(&claude).unwrap()],
+            before
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn place_roots_get_minimal_independent_projects() {
+        let experience = temp_dir("place-projects");
+        atomic_write_file(
+            &experience.join(PROJECT_FILE_NAME),
+            &minimal_project_file(Path::new("src")).unwrap(),
+        )
+        .unwrap();
+        for name in ["place1", "place2"] {
+            let root = experience.join("places").join(name);
+            let project = initialize_place_root(&root, Path::new("src")).unwrap();
+            let value: Value = serde_json::from_slice(&fs::read(project).unwrap()).unwrap();
+            assert_eq!(value, json!({ "schemaVersion": 1 }));
+            assert!(root.join("src").is_dir());
+            assert!(!root.join("AGENTS.md").exists());
+        }
+        fs::remove_dir_all(experience).unwrap();
     }
 }

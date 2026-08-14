@@ -83,6 +83,9 @@ fn fetch_https_manifest(source: &str, etag: Option<&str>) -> Result<ManifestResp
         request = request.set("If-None-Match", etag);
     }
     let response = match request.call() {
+        Ok(response) if response.status() == 304 => {
+            return Ok(ManifestResponse::NotModified);
+        }
         Ok(response) => response,
         Err(ureq::Error::Status(304, _)) => return Ok(ManifestResponse::NotModified),
         Err(ureq::Error::Status(status, _)) => {
