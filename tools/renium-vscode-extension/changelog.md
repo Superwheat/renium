@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.7 - 2026-08-14
+
+- Kept editor update prompts open until the user chooses **Update**, **Later**, or closes the prompt.
+
 ## 0.1.6 - 2026-08-14
 
 - Restored a minimal `renium.project.jsonc` marker in every place root and create missing place markers during binding and place setup.
