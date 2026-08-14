@@ -1,6 +1,6 @@
 # Renium automation
 
-Use the compact Renium automation API for Studio and project operations. On Windows, the stable launcher is `%USERPROFILE%\.renium\bin\rbx.cmd`. On macOS and Linux, it is `~/.renium/bin/rbx`. If `rbx` is not on `PATH`, invoke that launcher directly; do not search extension folders.
+The Renium installer adds both `renium` and `rbx` to `PATH`. Use the compact `rbx` automation API for Studio and project operations. If the current process has not picked up the new `PATH`, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS and Linux; do not search extension folders.
 
 ## Bind once
 
@@ -21,6 +21,7 @@ Edit normal script files directly. Do not read, decode, edit, move, or replace f
 
 ## Operations
 
+<!-- automation-operations:start -->
 - Context: `cap`, `bind`, `context`, `unbind`
 - Sync: `pull`, `push`, `live-start`, `live-stop`, `live-status`, `retry-pending`, `discard-pending`
 - Read: `find`, `tree`, `inspect`, `batch`, `script-search`, `script-read`, `script-grep`
@@ -31,6 +32,7 @@ Edit normal script files directly. Do not read, decode, edit, move, or replace f
 - Project: `project-init`, `project-validate`, `place-add`, `place-rename`, `place-reorder`
 - Review: `review-prepare`, `review-apply`, `review-reject`
 - Roblox Cloud and creator assets: `cloud`, `asset-search`, `asset-insert`, `generate-model`, `job-status`, `image-upload`, `image-store`, `http-get`
+<!-- automation-operations:end -->
 
 `pull` writes Studio into project files. `push` writes project files into Studio. Live sync stays two-way. When an operation returns `rejected` with `e.n` set to `review-prepare`, the exact operation needs a receipt before `review-apply` can execute it. The `rbx a` wrapper handles that receipt for direct commands.
 

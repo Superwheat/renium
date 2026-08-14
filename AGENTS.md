@@ -2,7 +2,8 @@ Renium is a full-fidelity two-way sync and automation tool for Roblox Studio. It
 
 # Agent Notes
 
-- Use `rbx` (wrapper for `tools/renium/target/release/renium.exe`).
+- Use `rbx`; the Renium installer adds both `renium` and `rbx` to `PATH`.
+- If the current process has not picked up the new `PATH`, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS and Linux.
 - Edit `src/*.ts`, not built `out/` (renium-vscode-extension).
 - Full reference: `tools/renium/README.md`.
 

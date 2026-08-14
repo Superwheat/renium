@@ -126,6 +126,9 @@ jobs:
             if ($null -eq $pluginEntry) { throw "VSIX is missing its matching Studio plugin" }
             $cliEntry = $archive.GetEntry("extension/bin/win32-x64/renium.exe")
             if ($null -eq $cliEntry) { throw "VSIX is missing its matching Renium CLI" }
+            if ($null -eq $archive.GetEntry("extension/bin/win32-x64/renium-agents.md")) {
+              throw "VSIX is missing the Renium agent instructions"
+            }
             $stream = $pluginEntry.Open()
             $sha256 = [Security.Cryptography.SHA256]::Create()
             try {

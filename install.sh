@@ -964,7 +964,7 @@ previous_install="$install_parent/.renium-previous-$transaction_id"
 mkdir -p "$install_parent"
 mkdir "$staged_install"
 cp "$cli" "$staged_install/renium"
-for support_file in rbx Renium.rbxm; do
+for support_file in rbx Renium.rbxm renium-agents.md; do
   if [ -f "$(dirname "$cli")/$support_file" ]; then
     cp "$(dirname "$cli")/$support_file" "$staged_install/$support_file"
   fi

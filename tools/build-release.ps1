@@ -421,14 +421,17 @@ $releaseCliBinary = Join-Path $releaseDirectory $binaryName
 Copy-Item -LiteralPath $cliBinary -Destination $releaseCliBinary
 $releaseReadme = Join-Path $releaseDirectory "README.md"
 $releaseLicense = Join-Path $releaseDirectory "LICENSE"
+$releaseAgentInstructions = Join-Path $releaseDirectory "renium-agents.md"
 $releaseReadmeText = [IO.File]::ReadAllText(
     (Join-Path $repositoryRoot "tools\renium\RELEASE_README.md")
 ).Replace("{{VERSION}}", $cliVersion)
 [IO.File]::WriteAllText($releaseReadme, $releaseReadmeText, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\renium-agents.md") -Destination $releaseAgentInstructions
 $releaseSupportFiles = @(
     $releaseReadme,
-    $releaseLicense
+    $releaseLicense,
+    $releaseAgentInstructions
 )
 if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
@@ -512,6 +515,10 @@ try {
     $extensionCliEntry = $archive.GetEntry($extensionCliEntryPath)
     if ($null -eq $extensionCliEntry) {
         throw "Packaged VSIX is missing $extensionCliEntryPath"
+    }
+    $extensionAgentEntryPath = "extension/bin/$extensionPlatform-$extensionArchitecture/renium-agents.md"
+    if ($null -eq $archive.GetEntry($extensionAgentEntryPath)) {
+        throw "Packaged VSIX is missing $extensionAgentEntryPath"
     }
     $pluginStream = $pluginEntry.Open()
     $sha256 = [Security.Cryptography.SHA256]::Create()

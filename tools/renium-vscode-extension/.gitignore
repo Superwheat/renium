@@ -4,3 +4,4 @@ auto
 auto.ps1
 node_modules
 *.vsix
+resources/AGENTS.md
