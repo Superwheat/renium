@@ -34,6 +34,10 @@ const destinationDir = path.join(extensionRoot, "bin", `${targetPlatform}-${targ
 fs.mkdirSync(destinationDir, { recursive: true });
 const destination = path.join(destinationDir, binaryName);
 fs.copyFileSync(source, destination);
+fs.copyFileSync(
+  path.join(repoRoot, "tools", "renium", "renium-agents.md"),
+  path.join(destinationDir, "renium-agents.md"),
+);
 if (process.platform === "win32") {
   fs.copyFileSync(path.join(repoRoot, "rbx.cmd"), path.join(destinationDir, "rbx.cmd"));
   fs.copyFileSync(

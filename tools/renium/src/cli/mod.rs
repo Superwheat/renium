@@ -18,11 +18,7 @@ use crate::project::workflows;
 use crate::studio::bridge::DEFAULT_EXPORT_CHUNK_SIZE;
 
 #[derive(Parser)]
-#[command(
-    author,
-    version,
-    about = "High-performance Roblox snapshot importer and project JSON generator"
-)]
+#[command(author, version)]
 pub(super) struct Cli {
     #[arg(
         help = "Pin bridge commands to one Studio place by name, placeId, or gameId:placeId (env: RENIUM_PLACE)",

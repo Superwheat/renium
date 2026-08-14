@@ -29,7 +29,10 @@ export function ensureReniumAgentInstructions(
     if (fs.existsSync(target)) {
       continue;
     }
-    const source = path.join(extensionRoot, "resources", name);
+    const packagedSource = path.join(extensionRoot, "resources", name);
+    const source = name === "AGENTS.md" && !fs.existsSync(packagedSource)
+      ? path.resolve(extensionRoot, "..", "renium", "renium-agents.md")
+      : packagedSource;
     try {
       fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
       created.push(target);

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.5 - 2026-08-14
+
+- Moved Renium's agent instructions into one packaged Markdown file instead of embedding the full guide in Rust and JavaScript source.
+- Kept generated project instructions named `AGENTS.md` and the Claude pointer named `CLAUDE.md`.
+- Included the agent guide in platform archives, editor extensions, installers, repairs, and signed updates.
+- Updated generated instructions to use the installed `renium` and `rbx` commands from `PATH`, with stable fallback paths for shells opened before installation.
+- Removed the unrelated snapshot-importer tagline from the CLI help header.
+
 ## 0.1.4 - 2026-08-13
 
 - Added normal platform ZIP installers with short installation instructions and direct launchers.

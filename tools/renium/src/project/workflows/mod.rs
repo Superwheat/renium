@@ -28,10 +28,9 @@ use build_watch::{package_uses_roblox_ts, roblox_ts_command, should_run_tool, wa
 
 const PROJECT_SCHEMA: &str = include_str!("../../../schemas/renium.project.schema.json");
 const CLI_DOCS: &str = include_str!("../../../README.md");
-const AGENT_INSTRUCTIONS: &str =
-    include_str!("../../../../renium-vscode-extension/resources/AGENTS.md");
 const CLAUDE_INSTRUCTIONS: &str =
     include_str!("../../../../renium-vscode-extension/resources/CLAUDE.md");
+const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -904,6 +903,7 @@ fn init_files(
     source_root: &Path,
     features: &[InitFeature],
 ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let agent_instructions = agent_instructions()?;
     let name = root
         .file_name()
         .and_then(OsStr::to_str)
@@ -925,10 +925,7 @@ fn init_files(
         }
     });
     let mut files = vec![
-        (
-            root.join("AGENTS.md"),
-            AGENT_INSTRUCTIONS.as_bytes().to_vec(),
-        ),
+        (root.join("AGENTS.md"), agent_instructions),
         (
             root.join("CLAUDE.md"),
             CLAUDE_INSTRUCTIONS.as_bytes().to_vec(),
@@ -990,6 +987,20 @@ fn init_files(
         ));
     }
     Ok(files)
+}
+
+fn agent_instructions() -> Result<Vec<u8>> {
+    let installed = env::current_exe()
+        .context("Failed to locate the Renium executable")?
+        .parent()
+        .context("The Renium executable has no parent directory")?
+        .join(AGENT_INSTRUCTIONS_FILE);
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(AGENT_INSTRUCTIONS_FILE);
+    let path = [installed, source]
+        .into_iter()
+        .find(|path| path.is_file())
+        .context("Renium is missing renium-agents.md; reinstall Renium")?;
+    fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
 fn build_once(

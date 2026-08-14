@@ -57,6 +57,13 @@ function syncProjectSchema() {
   }
 }
 
+function syncAgentInstructions() {
+  fs.copyFileSync(
+    path.join(repoRoot, "tools", "renium", "renium-agents.md"),
+    path.join(extensionResources, "AGENTS.md"),
+  );
+}
+
 function discoverInsertableObjectsIconRoot() {
   const localAppData = process.env.LOCALAPPDATA;
   if (!localAppData) {
@@ -181,4 +188,5 @@ if (refreshStudioApi || !fs.existsSync(path.join(extensionResources, "roblox-pro
 }
 syncStudioPluginBundle();
 syncProjectSchema();
+syncAgentInstructions();
 syncInsertableObjectIcons();

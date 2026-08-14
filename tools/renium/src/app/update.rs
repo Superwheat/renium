@@ -17,10 +17,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::app::timing::current_millis;
+use crate::system::files::read_file_if_present;
 
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
 const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
+const SHARED_CORE_LAUNCHERS: [&str; 3] = ["rbx", "rbx.cmd", "rbx-run.ps1"];
+const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
 
 #[path = "update/check.rs"]
 mod check;
@@ -1454,12 +1457,15 @@ fn shared_core_install_paths(target: &Path, core_root: &Path) -> Result<Vec<Path
         .parent()
         .context("The running Renium CLI has no installation directory")?;
     let mut paths = vec![target.to_path_buf()];
-    for name in ["rbx", "rbx.cmd", "rbx-run.ps1"] {
+    for name in SHARED_CORE_LAUNCHERS {
         let source = core_root.join(name);
         let destination = root.join(name);
         if source.is_file() && destination.is_file() && is_renium_launcher(&destination) {
             paths.push(destination);
         }
+    }
+    if core_root.join(AGENT_INSTRUCTIONS_FILE).is_file() {
+        paths.push(root.join(AGENT_INSTRUCTIONS_FILE));
     }
     Ok(paths)
 }
@@ -1910,16 +1916,20 @@ fn install_shared_core_files(target: &Path, core_root: &Path) -> Result<()> {
         "renium"
     };
     let mut installs = vec![(core_root.join(executable), target.to_path_buf())];
-    for name in ["rbx", "rbx.cmd", "rbx-run.ps1"] {
+    for name in SHARED_CORE_LAUNCHERS {
         let source = core_root.join(name);
         let destination = root.join(name);
         if source.is_file() && destination.is_file() && is_renium_launcher(&destination) {
             installs.push((source, destination));
         }
     }
+    let agent_instructions = core_root.join(AGENT_INSTRUCTIONS_FILE);
+    if agent_instructions.is_file() {
+        installs.push((agent_instructions, root.join(AGENT_INSTRUCTIONS_FILE)));
+    }
     let originals = installs
         .iter()
-        .map(|(_, destination)| fs::read(destination).map(Some))
+        .map(|(_, destination)| read_file_if_present(destination))
         .collect::<std::io::Result<Vec<_>>>()?;
     for (index, (source, destination)) in installs.iter().enumerate() {
         if let Err(error) = fs::read(source)

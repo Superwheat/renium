@@ -6,7 +6,7 @@ import path from "node:path";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
 const executable = path.resolve(process.argv[2] ?? path.join(repository, "tools", "renium", "target", "debug", process.platform === "win32" ? "renium.exe" : "renium"));
-const agentsPath = path.join(repository, "tools", "renium-vscode-extension", "resources", "AGENTS.md");
+const agentsPath = path.join(repository, "tools", "renium", "renium-agents.md");
 const agents = fs.readFileSync(agentsPath, "utf8");
 for (const forbidden of ["--help", "local.renium-", "extensions/local.renium", "extensions\\local.renium"]) {
   if (agents.includes(forbidden)) {
