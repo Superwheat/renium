@@ -2308,15 +2308,12 @@ class RobloxSyncController {
     }
     const choice = await vscode.window.showInformationMessage(
       `Renium ${status.latestVersion} is available.`,
-      "Install Update",
-      "What's Changed",
+      { modal: true },
+      "Update",
+      "Later",
     );
-    if (choice === "Install Update") {
+    if (choice === "Update") {
       await this.installUpdate(status);
-    } else if (choice === "What's Changed") {
-      await vscode.env.openExternal(vscode.Uri.parse(
-        `https://github.com/Superwheat/renium/releases/tag/v${encodeURIComponent(status.latestVersion)}`,
-      ));
     }
   }
 
