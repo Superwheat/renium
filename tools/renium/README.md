@@ -33,6 +33,7 @@ src/
   ServerScriptService/
     ...
 sourcemap.json
+renium.project.jsonc
 ```
 
 Script sources live as normal `.luau` files you edit directly. The `.renium`
@@ -106,15 +107,14 @@ owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.
 
 ## Projects, adapters, and builds
 
-`renium.project.jsonc` is optional. It controls the source directory, projected
-tree, mounts, adapters, filters, and script naming without replacing the
-full-fidelity `.renium` stores.
+Each place root has a small `renium.project.jsonc` marker. The default file only
+contains `schemaVersion`; add fields when the place needs a different source
+directory, projected tree, mounts, adapters, filters, or script naming. It does
+not replace the full-fidelity `.renium` stores.
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json",
   "schemaVersion": 1,
-  "name": "my-place",
   "sourceRoot": "game"
 }
 ```
@@ -425,7 +425,7 @@ rbx a cloud CX -J open-cloud.json
 ```
 
 `ROBLOX_API_KEY` must be set before the daemon starts. See the generated
-`AGENTS.md` for batched Creator Store and data-store recipes. API keys aren't
+`RENIUM.md` for batched Creator Store and data-store recipes. API keys aren't
 accepted in payloads or command arguments.
 
 The automation API also covers the plugin-accessible Creator features used by
@@ -511,7 +511,7 @@ Selector rules that prevent surprises:
 
 Batched low-level reads go through `rbx bb` (one call, many queries). The op
 types are `counts`, `service`, `search`, `children`, `instance`, and `find`;
-see `AGENTS.md` for recipes and field presets.
+see `RENIUM.md` for recipes and field presets.
 
 Export/import whole models and places:
 

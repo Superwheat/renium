@@ -47,12 +47,17 @@ default source folder; `sourceRoot` in `renium.project.jsonc` can change it:
 renium.experience.json
 places/
   main/
+    renium.project.jsonc
     src/
     sourcemap.json
   lobby/
+    renium.project.jsonc
     src/
     sourcemap.json
 ```
+
+Each place file defaults to `{ "schemaVersion": 1 }`. Add `sourceRoot` or other
+project options only when that place differs from the defaults.
 
 The first alias comes from the published place name. It is lowercased, spaces
 become underscores, and non-ASCII letters and punctuation are removed. Choose

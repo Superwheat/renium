@@ -9,15 +9,20 @@ use anyhow::{Context, Result, bail};
 use globset::Glob;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use crate::cli::args::GenerateSourcemapArgs;
-use crate::editor::paths::infer_source_script;
+use crate::editor::paths::{infer_source_script, project_script_path};
 use crate::project::config;
 use crate::roblox::services::explorer_service_order;
+use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
+use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
+use crate::snapshot::types::{ServiceState, SnapshotInstance};
 use crate::system::files::{
     absolutize_for_daemon, path_key, read_json_file, resolve_existing_project_root,
-    strip_extended_prefix, write_json_file, write_utf8_file,
+    service_settings_path, strip_extended_prefix, unique_child_stem, write_json_file,
+    write_utf8_file,
 };
 use crate::system::watch::FileWatcher;
 
@@ -192,6 +197,143 @@ impl SourcemapBuildNode {
     }
 }
 
+trait SourcemapInstance {
+    fn name(&self) -> &str;
+    fn class_name(&self) -> &str;
+    fn properties(&self) -> &Map<String, Value>;
+}
+
+impl SourcemapInstance for SettingsBytecodeInstance {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn class_name(&self) -> &str {
+        &self.class_name
+    }
+
+    fn properties(&self) -> &Map<String, Value> {
+        &self.properties
+    }
+}
+
+impl SourcemapInstance for SnapshotInstance {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn class_name(&self) -> &str {
+        self.class_name.as_str()
+    }
+
+    fn properties(&self) -> &Map<String, Value> {
+        &self.properties
+    }
+}
+
+fn build_full_sourcemap_children<I: SourcemapInstance>(
+    instances: &[I],
+    children_by_parent: &[Vec<usize>],
+    child_indices: &[usize],
+    project_root: &Path,
+    parent_dir: &Path,
+) -> Vec<SourcemapNode> {
+    let mut used_stem_keys = std::collections::HashSet::new();
+    let mut next_suffix_by_base = HashMap::new();
+    child_indices
+        .iter()
+        .map(|&index| {
+            let instance = &instances[index];
+            let fs_stem = unique_child_stem(
+                instance.name(),
+                &mut used_stem_keys,
+                &mut next_suffix_by_base,
+            );
+            let child_indices = children_by_parent.get(index).map_or(&[][..], Vec::as_slice);
+            let source_path = project_script_path(
+                parent_dir,
+                &fs_stem,
+                !child_indices.is_empty(),
+                instance.class_name(),
+                instance.properties(),
+            )
+            .filter(|path| path.is_file());
+            SourcemapNode {
+                name: instance.name().to_string(),
+                class_name: instance.class_name().to_string(),
+                file_paths: source_path
+                    .as_deref()
+                    .map(|path| vec![path_to_sourcemap_relative(project_root, path)])
+                    .unwrap_or_default(),
+                children: build_full_sourcemap_children(
+                    instances,
+                    children_by_parent,
+                    child_indices,
+                    project_root,
+                    &parent_dir.join(fs_stem),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn build_full_service_sourcemap<I: SourcemapInstance>(
+    instances: &[I],
+    children_by_parent: &[Vec<usize>],
+    service_root_index: usize,
+    project_root: &Path,
+    service_dir: &Path,
+) -> SourcemapNode {
+    let root = &instances[service_root_index];
+    let child_indices = children_by_parent
+        .get(service_root_index)
+        .map_or(&[][..], Vec::as_slice);
+    SourcemapNode {
+        name: root.name().to_string(),
+        class_name: root.class_name().to_string(),
+        file_paths: Vec::new(),
+        children: build_full_sourcemap_children(
+            instances,
+            children_by_parent,
+            child_indices,
+            project_root,
+            service_dir,
+        ),
+    }
+}
+
+pub(crate) fn build_service_sourcemap_from_state(
+    state: &ServiceState,
+    project_root: &Path,
+    service_dir: &Path,
+) -> SourcemapNode {
+    build_full_service_sourcemap(
+        &state.instances,
+        &state.children_by_index,
+        state.service_root_index,
+        project_root,
+        service_dir,
+    )
+}
+
+fn build_service_sourcemap_from_settings(
+    document: &SettingsBytecode,
+    service: &str,
+    project_root: &Path,
+    service_dir: &Path,
+) -> Result<SourcemapNode> {
+    let root_index = editor_service_root_index(document, service)
+        .with_context(|| format!("{service} settings have no service root"))?;
+    let children_by_parent = settings_children_by_parent(document);
+    Ok(build_full_service_sourcemap(
+        &document.instances,
+        &children_by_parent,
+        root_index,
+        project_root,
+        service_dir,
+    ))
+}
+
 fn insert_script_path_into_service_tree(
     service_root: &mut SourcemapBuildNode,
     service_path: &Path,
@@ -356,11 +498,23 @@ fn build_project_sourcemap_from_source(
             }
 
             let service_name = entry.file_name().to_string_lossy().into_owned();
-            let node = build_service_sourcemap_node_from_paths(
-                &service_name,
-                &entry.path(),
-                sourcemap_base,
-            )?;
+            let service_path = entry.path();
+            let settings_path = service_settings_path(&service_path);
+            let node = if settings_path.is_file() {
+                let document = SettingsBytecode::read_file(&settings_path)?;
+                Some(build_service_sourcemap_from_settings(
+                    &document,
+                    &service_name,
+                    sourcemap_base,
+                    &service_path,
+                )?)
+            } else {
+                build_service_sourcemap_node_from_paths(
+                    &service_name,
+                    &service_path,
+                    sourcemap_base,
+                )?
+            };
             Ok(node.map(|node| (index, node)))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -610,5 +764,44 @@ fn wait_for_sourcemap_change(
             }
         }
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::bytecode::SETTINGS_BINARY_VERSION;
+    use crate::tests::support::{settings_instance, temp_dir};
+
+    #[test]
+    fn serialized_instances_are_kept_in_sourcemap() {
+        let root = temp_dir("full-sourcemap");
+        let service_dir = root.join("src/Workspace");
+        fs::create_dir_all(service_dir.join("Body")).unwrap();
+        fs::write(service_dir.join("Body/Logic.luau"), b"return true").unwrap();
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                settings_instance("root", "Workspace", "Workspace", None),
+                settings_instance("body", "Body", "Part", Some(0)),
+                settings_instance("logic", "Logic", "ModuleScript", Some(1)),
+                settings_instance("effect", "Smoke", "Smoke", Some(1)),
+            ],
+        };
+        document
+            .write_file(&service_settings_path(&service_dir))
+            .unwrap();
+
+        let sourcemap = build_project_sourcemap_with_loaded(&root, None).unwrap();
+        let body = &sourcemap.children[0].children[0];
+
+        assert_eq!(body.class_name, "Part");
+        assert_eq!(body.children[0].class_name, "ModuleScript");
+        assert_eq!(
+            body.children[0].file_paths,
+            ["src/Workspace/Body/Logic.luau"]
+        );
+        assert_eq!(body.children[1].class_name, "Smoke");
+        fs::remove_dir_all(root).unwrap();
     }
 }

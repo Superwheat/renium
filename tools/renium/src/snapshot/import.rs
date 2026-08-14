@@ -25,9 +25,9 @@ use crate::editor::paths::{project_script_file_names, script_file_names};
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
-    SourcemapNode, finalize_project_sourcemap_temp, load_existing_sourcemap_root,
-    path_to_sourcemap_relative, write_project_sourcemap_from_service_nodes,
-    write_project_sourcemap_with_updates,
+    SourcemapNode, build_service_sourcemap_from_state, finalize_project_sourcemap_temp,
+    load_existing_sourcemap_root, path_to_sourcemap_relative,
+    write_project_sourcemap_from_service_nodes, write_project_sourcemap_with_updates,
 };
 use crate::rbx::encode::settings_root_indices;
 use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
@@ -704,14 +704,8 @@ pub(crate) fn import_service_state_with_sourcemap(
 ) -> Result<SourcemapNode> {
     let import_started = Instant::now();
     let write_tree_started = Instant::now();
-    let child_nodes = import_service_children(state, project_root, src_root, service)?;
+    let node = import_service_tree(state, project_root, src_root, service)?;
     log_timing(&format!("{service}: write src tree"), write_tree_started);
-    let sourcemap_started = Instant::now();
-    let node = build_service_root_sourcemap_node(service, child_nodes);
-    log_timing(
-        &format!("{service}: build sourcemap node"),
-        sourcemap_started,
-    );
     log_timing(&format!("{service}: import service total"), import_started);
     Ok(node)
 }
@@ -2291,7 +2285,7 @@ fn complete_split_assembly(
             .collect::<Vec<_>>()
     };
 
-    let mut node = SourcemapNode {
+    let node = SourcemapNode {
         name: assembly.name.clone(),
         class_name: assembly.class_name.clone(),
         file_paths: assembly.file_paths.clone(),
@@ -2330,11 +2324,6 @@ fn complete_split_assembly(
         );
 
         if shared.fresh_stage {
-            let staged_prefix =
-                path_to_sourcemap_relative(&shared.project_root, &shared.service_dir);
-            let final_prefix =
-                path_to_sourcemap_relative(&shared.project_root, &shared.final_service_dir);
-            rewrite_sourcemap_path_prefix(&mut node, &staged_prefix, &final_prefix);
             fs::rename(&shared.service_dir, &shared.final_service_dir).with_context(|| {
                 format!(
                     "Failed to publish staged service {} to {}",
@@ -2349,6 +2338,12 @@ fn complete_split_assembly(
             );
             join_cleanup_handle(&shared.service, cleanup_handle)?;
         }
+
+        let node = build_service_sourcemap_from_state(
+            &shared.state,
+            &shared.project_root,
+            &shared.final_service_dir,
+        );
 
         if let Some(sender) = sourcemap_sender {
             let _ = sender.send(SourcemapWriterMessage::Service(
@@ -2380,22 +2375,6 @@ fn complete_split_assembly(
     }
 
     Ok(())
-}
-
-fn rewrite_sourcemap_path_prefix(node: &mut SourcemapNode, from: &str, to: &str) {
-    for path in &mut node.file_paths {
-        if path == from {
-            *path = to.to_string();
-        } else if let Some(suffix) = path
-            .strip_prefix(from)
-            .and_then(|value| value.strip_prefix('/'))
-        {
-            *path = format!("{to}/{suffix}");
-        }
-    }
-    for child in &mut node.children {
-        rewrite_sourcemap_path_prefix(child, from, to);
-    }
 }
 
 fn process_split_subtree_task(
@@ -2446,30 +2425,18 @@ fn process_split_subtree_task(
     Ok(())
 }
 
-fn build_service_root_sourcemap_node(
-    service: &str,
-    child_nodes: Vec<SourcemapNode>,
-) -> SourcemapNode {
-    SourcemapNode {
-        name: service.to_string(),
-        class_name: service.to_string(),
-        file_paths: Vec::new(),
-        children: child_nodes,
-    }
-}
-
-fn import_service_children(
+fn import_service_tree(
     state: &ServiceState,
     project_root: &Path,
     src_root: &Path,
     service: &str,
-) -> Result<Vec<SourcemapNode>> {
+) -> Result<SourcemapNode> {
     let service_dir = src_root.join(sanitize_name(service));
     let cleanup_required = ensure_import_service_dir(&service_dir)?;
     let fresh_service_dir = !cleanup_required;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
-    thread::scope(|scope| -> Result<Vec<SourcemapNode>> {
+    thread::scope(|scope| -> Result<SourcemapNode> {
         let settings_task = scope.spawn(|| {
             write_service_settings_file(
                 service,
@@ -2486,7 +2453,7 @@ fn import_service_children(
         mark_visited(&visited, state.service_root_index);
 
         let root_children = child_indices_for_instance(state, state.service_root_index);
-        let (child_nodes, expected_batch) = emit_children_indices(
+        let (_, expected_batch) = emit_children_indices(
             state,
             root_children,
             project_root,
@@ -2512,7 +2479,11 @@ fn import_service_children(
             join_cleanup_handle(service, cleanup_handle)?;
         }
 
-        Ok(child_nodes)
+        Ok(build_service_sourcemap_from_state(
+            state,
+            project_root,
+            &service_dir,
+        ))
     })
 }
 

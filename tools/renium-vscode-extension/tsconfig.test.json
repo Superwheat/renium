@@ -12,6 +12,7 @@
     "src/conflictMerge.ts",
     "src/editorLiveSyncCache.ts",
     "src/gitSync.ts",
+    "src/agentInstructions.ts",
     "src/pluginDistribution.ts",
     "test/**/*.ts"
   ],

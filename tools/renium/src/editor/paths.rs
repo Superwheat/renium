@@ -69,7 +69,7 @@ pub(crate) fn project_script_file_names(
     ))
 }
 
-fn project_script_path(
+pub(crate) fn project_script_path(
     parent_dir: &Path,
     fs_stem: &str,
     has_children: bool,
