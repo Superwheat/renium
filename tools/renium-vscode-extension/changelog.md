@@ -7,6 +7,7 @@
 - Added one Windows installer that selects x64 or ARM64 automatically and recovers when the wrong platform ZIP was downloaded.
 - Kept the editor extension active without a workspace and initialized project features when a folder becomes available.
 - Removed the redundant SPDX, checksum-list, and XML plugin files from GitHub release assets.
+- Reorganized the editor menu around sync, project, and tool groups with shorter result-focused descriptions.
 - Replaced untyped daemon command forwarding with a versioned operation registry, bound project/place contexts, stable errors, and review receipts.
 - Reused one Studio daemon across editor windows and direct `rbx` commands, and waited for the matching Studio runtime before runtime-bound operations.
 - Fixed pulls when Roblox omits engine-generated descendants while cloning and serializing a Studio tree.

@@ -156,6 +156,24 @@ const RENIUM_SINGLE_PLACE_FILES = [
   ".renium",
 ] as const;
 
+type ActionMenuItem = vscode.QuickPickItem & { action: string };
+
+function menuSeparator(label: string): vscode.QuickPickItem {
+  return { label, kind: vscode.QuickPickItemKind.Separator };
+}
+
+async function pickMenuAction(
+  title: string,
+  items: Array<ActionMenuItem | vscode.QuickPickItem>,
+): Promise<string | undefined> {
+  const picked = await vscode.window.showQuickPick(items, {
+    title,
+    placeHolder: "Choose an action",
+  });
+  const action = (picked as Partial<ActionMenuItem> | undefined)?.action;
+  return typeof action === "string" ? action : undefined;
+}
+
 function reniumPlaceProjectPaths(root: string): string[] {
   return [...new Set([loadProjectSourceRoot(root), ...RENIUM_PLACE_PROJECT_FILES])];
 }
@@ -973,104 +991,68 @@ class RobloxSyncController {
   public async openMenu(): Promise<void> {
     const cfg = this.getConfig();
     const liveSyncRunning = cfg.editorLiveSyncEnabled || this.liveSyncWatcher !== undefined || this.liveSyncStartPromise !== undefined;
-    const serving = this.bridgeServeRequested && this.isBridgeDaemonRunning();
-    const items: Array<vscode.QuickPickItem & { action: string }> = [
+    const placeName = cfg.activePlace?.name ?? cfg.activePlaceAlias;
+    const action = await pickMenuAction(placeName ? `Renium — ${placeName}` : "Renium", [
+      menuSeparator("Sync"),
       {
-        label: "$(cloud-download) Pull Studio to files",
-        description: "Replace project files with the connected Studio place",
+        label: "$(cloud-download) Pull from Studio",
+        description: "Replace project files with the current Studio place",
         action: "pullFromStudio",
       },
       {
-        label: "$(cloud-upload) Push files to Studio",
-        description: "Replace the connected Studio place with project files",
+        label: "$(cloud-upload) Push to Studio",
+        description: "Replace the current Studio place with project files",
         action: "pushToStudio",
       },
       {
-        label: "$(list-tree) Manage Places",
+        label: liveSyncRunning ? "$(circle-slash) Stop Live Sync" : "$(broadcast) Start Live Sync",
+        description: liveSyncRunning
+          ? "Stop synchronizing new Studio and project changes"
+          : "Keep Studio and project files synchronized in both directions",
+        action: liveSyncRunning ? "stopLive" : "startLive",
+      },
+      {
+        label: cfg.autoSyncOnSave ? "$(circle-slash) Disable Sync on Save" : "$(history) Enable Sync on Save",
+        description: cfg.autoSyncOnSave
+          ? "Stop sending saved file changes to Studio"
+          : "Send saved file changes to Studio when Live Sync is off",
+        action: "toggleAuto",
+      },
+      menuSeparator("Project"),
+      {
+        label: "$(list-tree) Places...",
         description: "Add, switch, rename, or reorder experience places",
         action: "managePlaces",
       },
       {
-        label: "$(export) Export Snapshots Only",
-        description: "Studio -> snapshots",
-        action: "exportOnly",
-      },
-      {
-        label: "$(save) Export Game File...",
-        description: "Write a .rbxl/.rbxlx place file from the project files",
-        action: "exportGameFile",
-      },
-      {
-        label: "$(package) Sync Wally Packages",
-        description: "Install Wally packages and import them into the configured package target",
-        action: "wallyPackages",
-      },
-      {
-        label: "$(link) Sync Link Mirrors",
-        description: "Rebuild project link targets from local, Git, Wally, or package sources",
-        action: "linkApply",
-      },
-      {
-        label: "$(add) Add Renium Link",
-        description: "Control one source script from multiple places",
-        action: "linkAdd",
-      },
-      {
-        label: serving ? "$(debug-disconnect) Stop Serve" : "$(radio-tower) Serve",
-        description: serving
-          ? `Stop bridge server on ${cfg.bridgePorts}`
-          : `Open bridge server on ${cfg.bridgePorts}; Studio plugin can connect once and reuse it`,
-        action: serving ? "stopServe" : "serve",
-      },
-      {
-        label: liveSyncRunning ? "$(circle-slash) Stop Live Sync" : "$(broadcast) Live Sync",
-        description: liveSyncRunning
-          ? "Stop watching project and Studio edits"
-          : "Two-way sync between project files and Studio",
-        action: liveSyncRunning ? "stopLive" : "startLive",
-      },
-      {
         label: "$(git) Git",
-        description: "Open the Git tab in the main Renium panel",
+        description: "Review changes and pull, commit, or push the project",
         action: "gitSync",
       },
       {
-        label: "$(tools) Project Tools",
-        description: "Build, diagnose, configure, update, or open the console",
-        action: "projectTools",
+        label: "$(package) Packages & Links...",
+        description: "Install packages and update linked content",
+        action: "packagesAndLinks",
       },
       {
-        label: cfg.autoSyncOnSave ? "$(circle-slash) Disable Auto Sync On Save" : "$(history) Enable Auto Sync On Save",
-        description: `Debounce ${cfg.autoSyncDebounceMs}ms`,
-        action: "toggleAuto",
+        label: "$(save) Build & Export...",
+        description: "Build the project or write place and snapshot files",
+        action: "buildAndExport",
+      },
+      menuSeparator("Tools"),
+      {
+        label: "$(radio-tower) Studio Tools...",
+        description: "Manage the Studio connection, console, and plugin",
+        action: "studioTools",
       },
       {
-        label: "$(output) Show Output",
-        description: "Open extension logs",
-        action: "showOutput",
+        label: "$(tools) Settings & Diagnostics...",
+        description: "Configure or diagnose Renium and open help, updates, or logs",
+        action: "settingsAndDiagnostics",
       },
-      {
-        label: "$(cloud-download) Install Studio Plugin",
-        description: "Install or update the Renium plugin in your Roblox Plugins folder",
-        action: "installStudioPlugin",
-      },
-      {
-        label: "$(versions) Check for Updates",
-        description: "Check for a newer Renium version",
-        action: "checkUpdates",
-      },
-    ];
+    ]);
 
-    const picked = await vscode.window.showQuickPick(items, {
-      title: "Renium",
-      placeHolder: "Choose an action",
-    });
-
-    if (!picked) {
-      return;
-    }
-
-    switch (picked.action) {
+    switch (action) {
       case "pullFromStudio":
         await this.pullFromStudio();
         return;
@@ -1079,12 +1061,6 @@ class RobloxSyncController {
         return;
       case "managePlaces":
         await this.managePlaces();
-        return;
-      case "exportOnly":
-        await this.exportSnapshotsOnly();
-        return;
-      case "exportGameFile":
-        await this.exportGameFile();
         return;
       case "startLive":
         await this.startLiveSync();
@@ -1095,37 +1071,143 @@ class RobloxSyncController {
       case "gitSync":
         await this.git.openGitSync();
         return;
-      case "projectTools":
+      case "packagesAndLinks":
+        await this.openPackagesAndLinks();
+        return;
+      case "buildAndExport":
+        await this.openBuildAndExport();
+        return;
+      case "studioTools":
+        await this.openStudioTools();
+        return;
+      case "settingsAndDiagnostics":
         await this.openProjectTools();
-        return;
-      case "wallyPackages":
-        await this.packages.syncWallyPackages();
-        return;
-      case "linkApply":
-        await this.packages.linkApply();
-        return;
-      case "linkAdd":
-        await this.packages.addLinkInteractive();
-        return;
-      case "serve":
-        await this.serve();
-        return;
-      case "stopServe":
-        await this.stopServe();
         return;
       case "toggleAuto":
         await this.toggleAutoSyncOnSave();
         return;
-      case "showOutput":
-        this.output.show(true);
+      default:
         return;
-      case "installStudioPlugin":
+    }
+  }
+
+  private async openPackagesAndLinks(): Promise<void> {
+    switch (await pickMenuAction("Renium — Packages & Links", [
+      {
+        label: "$(package) Sync Wally Packages",
+        description: "Install dependencies and update their package instances",
+        action: "wally",
+      },
+      {
+        label: "$(link) Sync Links",
+        description: "Update linked targets from their sources",
+        action: "syncLinks",
+      },
+      {
+        label: "$(add) Add Link...",
+        description: "Reuse a local, Git, or Wally source elsewhere in the project",
+        action: "addLink",
+      },
+    ])) {
+      case "wally":
+        await this.packages.syncWallyPackages();
+        return;
+      case "syncLinks":
+        await this.packages.linkApply();
+        return;
+      case "addLink":
+        await this.packages.addLinkInteractive();
+        return;
+    }
+  }
+
+  private async openBuildAndExport(): Promise<void> {
+    switch (await pickMenuAction("Renium — Build & Export", [
+      {
+        label: "$(package) Build Project",
+        description: "Build the outputs configured for the active place",
+        action: "build",
+      },
+      {
+        label: "$(save) Export Place File...",
+        description: "Write a standalone .rbxl or .rbxlx file from project files",
+        action: "placeFile",
+      },
+      {
+        label: "$(export) Export Studio Snapshots",
+        description: "Save Studio snapshots without changing project files",
+        action: "snapshots",
+      },
+    ])) {
+      case "build":
+        await this.buildProject();
+        return;
+      case "placeFile":
+        await this.exportGameFile();
+        return;
+      case "snapshots":
+        await this.exportSnapshotsOnly();
+        return;
+    }
+  }
+
+  private async openStudioTools(): Promise<void> {
+    const cfg = this.getConfig();
+    const liveSyncRunning = cfg.editorLiveSyncEnabled || this.liveSyncWatcher !== undefined || this.liveSyncStartPromise !== undefined;
+    const serving = this.bridgeServeRequested && this.isBridgeDaemonRunning();
+    const items: Array<ActionMenuItem | vscode.QuickPickItem> = [menuSeparator("Studio")];
+    if (!liveSyncRunning) {
+      items.push({
+        label: serving ? "$(debug-disconnect) Stop Studio Connection" : "$(radio-tower) Start Studio Connection",
+        description: serving
+          ? "Stop accepting connections from the Studio plugin"
+          : "Allow the Studio plugin to connect to this project",
+        action: serving ? "stopConnection" : "startConnection",
+      });
+    }
+    items.push(
+      {
+        label: this.consoleFollowRunning ? "$(debug-pause) Pause Studio Console" : "$(terminal) Follow Studio Console",
+        description: this.consoleFollowRunning
+          ? "Stop streaming new Studio output"
+          : "Stream Studio output into the editor",
+        action: "console",
+      },
+      menuSeparator("Plugin"),
+      {
+        label: "$(cloud-download) Install or Update Studio Plugin",
+        description: "Install this Renium version in Roblox Studio",
+        action: "install",
+      },
+      {
+        label: "$(tools) Repair Studio Plugin",
+        description: "Reinstall the matching plugin if setup is damaged",
+        action: "repair",
+      },
+      {
+        label: "$(trash) Uninstall Studio Plugin...",
+        description: "Remove Renium from Roblox Studio",
+        action: "uninstall",
+      },
+    );
+    switch (await pickMenuAction("Renium — Studio Tools", items)) {
+      case "startConnection":
+        await this.serve();
+        return;
+      case "stopConnection":
+        await this.stopServe();
+        return;
+      case "console":
+        await this.followStudioConsole();
+        return;
+      case "install":
         await this.installStudioPlugin();
         return;
-      case "checkUpdates":
-        await this.checkForUpdates();
+      case "repair":
+        await this.repairInstallation();
         return;
-      default:
+      case "uninstall":
+        await this.uninstallStudioPlugin();
         return;
     }
   }
@@ -1488,34 +1570,34 @@ class RobloxSyncController {
     try {
       const cfg = this.getConfig();
       const active = resolveActiveExperiencePlace(cfg.experienceRoot);
-      const items: Array<vscode.QuickPickItem & { action: string }> = [
+      const items: ActionMenuItem[] = [
         {
-          label: "$(add) Add Current Studio Place",
-          description: "Add a connected place to this experience project",
+          label: "$(add) Add Connected Place",
+          description: "Add the current Studio place to this experience",
           action: "addCurrentPlace",
         },
       ];
       if (active) {
         items.push(
           {
-            label: "$(arrow-swap) Switch Active Place",
-            description: `Current: ${active.alias}`,
+            label: "$(arrow-swap) Switch Place...",
+            description: "Choose which experience place is active",
             action: "switchPlace",
           },
           {
-            label: "$(edit) Rename Active Place",
-            description: `Current alias: ${active.alias}`,
+            label: "$(edit) Rename Place...",
+            description: "Rename the active place and its project folder",
             action: "renamePlace",
           },
           {
-            label: "$(list-ordered) Reorder Places",
-            description: "Set the order used when places are displayed",
+            label: "$(list-ordered) Reorder Places...",
+            description: "Change the order in which places appear",
             action: "reorderPlaces",
           },
         );
       }
       const picked = await vscode.window.showQuickPick(items, {
-        title: "Manage Places",
+        title: "Renium — Places",
         placeHolder: "Choose an action",
       });
       if (!picked) {
@@ -1865,57 +1947,37 @@ class RobloxSyncController {
   }
 
   public async openProjectTools(): Promise<void> {
-    const picked = await vscode.window.showQuickPick([
+    switch (await pickMenuAction("Renium — Settings & Diagnostics", [
+      menuSeparator("Project"),
       {
         label: "$(check) Diagnose Project",
-        description: "Check project files, tools, plugin installation, and daemon state",
+        description: "Check project files, required tools, and Studio integration",
         action: "doctor",
       },
       {
-        label: "$(package) Build Project",
-        description: "Build the active place using renium.project.jsonc",
-        action: "build",
-      },
-      {
         label: "$(json) Open Project Configuration",
-        description: "Edit renium.project.jsonc with schema validation",
+        description: "Edit settings for the active place",
         action: "config",
       },
+      menuSeparator("Help"),
       {
         label: "$(book) Show CLI Documentation",
-        description: "Show the bundled Renium command reference",
+        description: "Open the Renium command reference",
         action: "docs",
       },
       {
-        label: "$(terminal) Follow Studio Console",
-        description: "Open or pause the managed Studio console",
-        action: "console",
-      },
-      {
-        label: "$(cloud-download) Check for Updates",
-        description: "Verify the signed release manifest without installing anything",
+        label: "$(versions) Check for Updates",
+        description: "Check whether a newer Renium version is available",
         action: "update",
       },
       {
-        label: "$(tools) Repair Installation",
-        description: "Reinstall the matching Studio plugin",
-        action: "repair",
+        label: "$(output) Show Output",
+        description: "Open Renium extension logs",
+        action: "output",
       },
-      {
-        label: "$(trash) Uninstall Studio Plugin",
-        description: "Remove Renium from the Roblox Studio Plugins folder",
-        action: "uninstall",
-      },
-    ], {
-      title: "Renium Project Tools",
-      placeHolder: "Choose an action",
-    });
-    switch (picked?.action) {
+    ])) {
       case "doctor":
         await this.runProjectDoctor();
-        break;
-      case "build":
-        await this.buildProject();
         break;
       case "config":
         await this.openProjectConfiguration();
@@ -1923,17 +1985,11 @@ class RobloxSyncController {
       case "docs":
         await this.openCliDocumentation();
         break;
-      case "console":
-        this.followStudioConsole();
-        break;
       case "update":
         await this.checkForUpdates();
         break;
-      case "repair":
-        await this.repairInstallation();
-        break;
-      case "uninstall":
-        await this.uninstallStudioPlugin();
+      case "output":
+        this.output.show(true);
         break;
     }
   }
