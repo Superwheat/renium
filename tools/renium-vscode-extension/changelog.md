@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added one Windows installer that selects x64 or ARM64 automatically and recovers when the wrong platform ZIP was downloaded.
+
 ## 0.1.8 - 2026-08-15
 
 - Replaced untyped daemon command forwarding with a versioned operation registry, bound project/place contexts, stable errors, and review receipts.

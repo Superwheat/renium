@@ -784,12 +784,26 @@ try {
     }
     }
 
-$localCli = Join-Path $PSScriptRoot "renium.exe"
-if ([string]::IsNullOrWhiteSpace($Version) -and (Test-Path -LiteralPath $localCli -PathType Leaf)) {
-    $localVersionOutput = @(& $localCli --version 2>&1)
-    if ($LASTEXITCODE -eq 0 -and ($localVersionOutput -join " ") -match '\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b') {
-        $Version = $Matches[1]
+function Get-ReniumLocalVersion {
+    param([string]$Cli)
+    if (-not (Test-Path -LiteralPath $Cli -PathType Leaf)) {
+        return $null
     }
+    try {
+        $output = @(& $Cli --version 2>&1)
+        if ($LASTEXITCODE -eq 0 -and ($output -join " ") -match '\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b') {
+            return $Matches[1]
+        }
+    }
+    catch {
+    }
+    return $null
+}
+
+$localCli = Join-Path $PSScriptRoot "renium.exe"
+$localVersion = Get-ReniumLocalVersion $localCli
+if ([string]::IsNullOrWhiteSpace($Version) -and $null -ne $localVersion) {
+    $Version = $localVersion
 }
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $release = Invoke-RestMethod "https://api.github.com/repos/$repository/releases/latest"
@@ -831,12 +845,7 @@ foreach ($editor in $activeEditors) {
     $editor | Add-Member -NotePropertyName Architecture `
         -NotePropertyValue (Get-ReniumEditorArchitecture $editor.Cli) -Force
 }
-$useLocalPackage = $false
-if (Test-Path -LiteralPath $localCli -PathType Leaf) {
-    $localVersionOutput = @(& $localCli --version 2>&1)
-    $useLocalPackage = $LASTEXITCODE -eq 0 -and
-        ($localVersionOutput -join " ") -match ('(?<![0-9A-Za-z.-])' + [regex]::Escape($Version) + '(?![0-9A-Za-z.-])')
-}
+$useLocalPackage = $null -ne $localVersion -and $localVersion -eq $Version
 $transactionId = [guid]::NewGuid().ToString("N")
 $stage = Join-Path $env:TEMP "renium-install-$transactionId"
 $installParent = Split-Path -Parent $installRoot
