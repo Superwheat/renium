@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Added one Windows installer that selects x64 or ARM64 automatically and recovers when the wrong platform ZIP was downloaded.
+- Kept the editor extension active without a workspace and initialized project features when a folder becomes available.
+- Removed the redundant SPDX, checksum-list, and XML plugin files from GitHub release assets.
 
 ## 0.1.8 - 2026-08-15
 

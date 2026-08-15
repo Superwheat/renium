@@ -19,7 +19,7 @@ import {
   decodeSettingsStoreToTree,
   type DecodeResult,
 } from "./settingsStoreDecode";
-import { safeObject } from "./utils";
+import { pickWorkspaceRoot, safeObject } from "./utils";
 import { FileExplorerModel } from "./fileExplorerModel";
 import { FilePropertiesViewProvider } from "./filePropertiesView";
 import { spawnTrackedProcess, terminateProcess } from "./processSupervisor";
@@ -443,6 +443,9 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public async refresh(): Promise<void> {
+    if (!pickWorkspaceRoot()) {
+      return;
+    }
     const generation = this.projectGeneration;
     try {
       await this.backend.initialize();
@@ -659,7 +662,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async requestRows(start = this.rowWindow.start, count = this.rowWindow.count, mode = this.currentMode, scrollToSelected = false, includeMatchIds = false, revision?: number): Promise<void> {
-    if (!this.webviewView) {
+    if (!this.webviewView || !pickWorkspaceRoot()) {
       return;
     }
     if (!this.webviewReady) {

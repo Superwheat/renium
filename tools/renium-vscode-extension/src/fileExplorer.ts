@@ -265,10 +265,7 @@ export class FileExplorerController implements vscode.Disposable {
     let config: ExplorerConfig;
     try {
       config = getExplorerConfig();
-    } catch (error) {
-      vscode.window.showErrorMessage(
-        `Could not watch project files. ${error instanceof Error ? error.message : String(error)}`,
-      );
+    } catch {
       return;
     }
     const graph = loadProjectSourceGraph(config.projectRoot);
