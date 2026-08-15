@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 
 use super::{console_entry_level, wait_for_player_bridge};
 use crate::app::output::ensure_plugin_api_ok;
+use crate::automation::op;
 use crate::cli::PluginConsoleOutputArgs;
-use crate::daemon::{get_console_output_daemon_args, try_daemon_control_request};
+use crate::daemon::try_daemon_control_request;
 use crate::snapshot::export::{is_transient_bridge_error, parse_bridge_ports};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 
@@ -17,9 +18,12 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         if follow_console_via_daemon(&args)? {
             return Ok(());
         }
-    } else if let Some(result) =
-        try_daemon_control_request("co", get_console_output_daemon_args(&args))?
-    {
+    } else if let Some(result) = try_daemon_control_request(
+        op::CONSOLE,
+        None,
+        console_daemon_parameters(&args, args.since_seq, args.clear, args.from_oldest),
+        false,
+    )? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -32,6 +36,26 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     let result = get_console_output_result(&args, &bridge)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn console_daemon_parameters(
+    args: &PluginConsoleOutputArgs,
+    since_seq: u64,
+    clear: bool,
+    from_oldest: bool,
+) -> Value {
+    json!({
+        "limit": args.limit,
+        "sinceSeq": since_seq,
+        "fromOldest": from_oldest,
+        "clear": clear,
+        "client": args.client,
+        "player": args.player,
+        "grep": args.grep,
+        "level": args.level,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    })
 }
 
 pub(crate) fn get_console_output_result(
@@ -82,19 +106,13 @@ fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<bool> {
     let mut connected = false;
     let mut epoch = None;
     loop {
-        let mut request = get_console_output_daemon_args(args);
-        if let Some(position) = request.iter().position(|arg| arg == "-s")
-            && let Some(value) = request.get_mut(position + 1)
-        {
-            *value = since_seq.to_string();
-        }
-        if connected && let Some(position) = request.iter().position(|arg| arg == "-c") {
-            request.remove(position);
-        }
-        if from_oldest {
-            request.push("--from-oldest".to_string());
-        }
-        let result = match try_daemon_control_request("co", request) {
+        let parameters = console_daemon_parameters(
+            args,
+            since_seq,
+            args.clear && !connected,
+            args.from_oldest || from_oldest,
+        );
+        let result = match try_daemon_control_request(op::CONSOLE, None, parameters, false) {
             Ok(Some(result)) => result,
             Ok(None) if connected => {
                 thread::sleep(console_follow_interval(args));

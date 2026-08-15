@@ -10,15 +10,13 @@ use walkdir::WalkDir;
 
 use crate::app::output::{global_json_output, global_pretty_output, global_yes, print_json_output};
 use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_logs};
+use crate::automation::op;
 use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
 use crate::cli::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs,
     PushEditorChangesArgs,
 };
-use crate::daemon::{
-    apply_editor_delete_daemon_args, apply_editor_property_daemon_args, bridge_fetch_source,
-    push_editor_changes_daemon_args, try_daemon_control_request,
-};
+use crate::daemon::{bridge_fetch_source, try_daemon_control_request};
 use crate::editor::diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
     append_editor_target_inline_source_changes, append_editor_target_instance_upserts,
@@ -209,9 +207,34 @@ fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer
 
 pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
-    if let Some(result) =
-        try_daemon_control_request("push", push_editor_changes_daemon_args(&args))?
-    {
+    let incremental = !args.changed_paths.is_empty()
+        || !args.changed_paths_files.is_empty()
+        || !args.target_settings_ids.is_empty()
+        || !args.target_settings_id_files.is_empty()
+        || !args.target_properties.is_empty();
+    let parameters = json!({
+        "srcDir": args.project.src_root,
+        "changedPaths": args.changed_paths,
+        "changedPathsFiles": args.changed_paths_files,
+        "targetSettingsIds": args.target_settings_ids,
+        "targetSettingsIdFiles": args.target_settings_id_files,
+        "targetProperties": args.target_properties,
+        "upsertInstancesOnly": args.upsert_instances_only,
+        "probeEvents": args.probe_events,
+        "verifySources": args.verify_sources,
+        "overridePackages": args.override_packages,
+        "linkCacheDir": args.link_cache_dir,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+        "destructive": !incremental,
+    });
+    let approved = !args.no_review && (args.yes || global_yes());
+    if let Some(result) = try_daemon_control_request(
+        op::PUSH,
+        Some(&args.project.project_root),
+        parameters,
+        approved,
+    )? {
         return print_json_output(&result, global_pretty_output(false));
     }
     let started = Instant::now();
@@ -1323,9 +1346,21 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         &mut args.target.project.project_root,
         &mut args.target.project.src_root,
     )?;
-    if let Some(result) =
-        try_daemon_control_request("prop", apply_editor_property_daemon_args(&args))?
-    {
+    let mut parameters = editor_mutation_parameters(&args.target)?;
+    parameters.insert("editor".to_string(), Value::Bool(true));
+    parameters.insert("scope".to_string(), Value::String(args.scope.clone()));
+    parameters.insert("property".to_string(), Value::String(args.property.clone()));
+    parameters.insert(
+        "value".to_string(),
+        serde_json::from_str(&args.value_json).context("Failed to parse --value-json")?,
+    );
+    let approved = !args.no_review && (args.yes || global_yes());
+    if let Some(result) = try_daemon_control_request(
+        op::SET_PROPERTY,
+        Some(&args.target.project.project_root),
+        Value::Object(parameters),
+        approved,
+    )? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -1413,8 +1448,14 @@ fn collect_direct_editor_property_change(
 }
 
 pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("del", apply_editor_delete_daemon_args(&args))?
-    {
+    let mut parameters = editor_mutation_parameters(&args.target)?;
+    parameters.insert("editor".to_string(), Value::Bool(true));
+    if let Some(result) = try_daemon_control_request(
+        op::REMOVE,
+        Some(&args.target.project.project_root),
+        Value::Object(parameters),
+        false,
+    )? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -1425,6 +1466,41 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
         args.target.bridge.wait_seconds,
     )?;
     apply_editor_delete_with_warm_bridge(args, &bridge).map(|_| ())
+}
+
+fn editor_mutation_parameters(target: &EditorMutationArgs) -> Result<Map<String, Value>> {
+    let mut parameters = Map::new();
+    parameters.insert("service".to_string(), Value::String(target.service.clone()));
+    parameters.insert(
+        "settingsId".to_string(),
+        target
+            .settings_id
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    parameters.insert(
+        "className".to_string(),
+        Value::String(target.class_name.clone()),
+    );
+    parameters.insert(
+        "pathSegments".to_string(),
+        serde_json::from_str(&target.path_segments_json).context("Invalid --path-segments-json")?,
+    );
+    parameters.insert(
+        "pathOrdinals".to_string(),
+        serde_json::from_str(&target.path_ordinals_json).context("Invalid --path-ordinals-json")?,
+    );
+    parameters.insert(
+        "overridePackages".to_string(),
+        Value::Bool(target.override_packages),
+    );
+    parameters.insert("srcDir".to_string(), json!(target.project.src_root));
+    parameters.insert(
+        "bridgeWaitSeconds".to_string(),
+        json!(target.bridge.wait_seconds),
+    );
+    parameters.insert("bridgePorts".to_string(), json!(target.bridge.ports));
+    Ok(parameters)
 }
 
 pub(crate) fn apply_editor_delete_with_warm_bridge(

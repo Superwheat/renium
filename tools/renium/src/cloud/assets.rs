@@ -22,31 +22,20 @@ struct AssetSearch {
     scope: String,
     #[serde(default)]
     query: String,
-    #[serde(default)]
     asset_type: Option<String>,
-    #[serde(default)]
     filter: Option<String>,
-    #[serde(default)]
     user_id: Option<u64>,
-    #[serde(default)]
     max_results: Option<u32>,
-    #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
     facets: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
     verified_creators_only: Option<bool>,
-    #[serde(default)]
     min_price_cents: Option<u64>,
-    #[serde(default)]
     max_price_cents: Option<u64>,
-    #[serde(default)]
     price_filter: Option<String>,
-    #[serde(default)]
     audio_min_duration: Option<f64>,
-    #[serde(default)]
     audio_max_duration: Option<f64>,
     #[serde(default = "default_key_env")]
     key_env: String,
@@ -59,11 +48,8 @@ struct AssetSearch {
 struct ImageUpload {
     #[serde(alias = "imagePaths")]
     images: Vec<String>,
-    #[serde(default)]
     user_id: Option<u64>,
-    #[serde(default)]
     group_id: Option<u64>,
-    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     description: String,
@@ -71,7 +57,7 @@ struct ImageUpload {
     key_env: String,
     #[serde(default = "default_upload_wait")]
     wait_seconds: f64,
-    #[serde(default, rename = "via")]
+    #[serde(rename = "via")]
     _via: Option<String>,
 }
 

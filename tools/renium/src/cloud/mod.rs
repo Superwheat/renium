@@ -31,7 +31,6 @@ struct CloudBatch {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CloudRequest {
-    #[serde(default)]
     id: Option<Value>,
     method: String,
     path: String,
@@ -39,11 +38,8 @@ struct CloudRequest {
     path_params: Map<String, Value>,
     #[serde(default)]
     query: Map<String, Value>,
-    #[serde(default)]
     body: Option<Value>,
-    #[serde(default)]
     if_match: Option<String>,
-    #[serde(default)]
     if_none_match: Option<String>,
 }
 

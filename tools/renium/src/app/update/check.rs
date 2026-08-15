@@ -26,7 +26,7 @@ static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 struct Cache {
     schema_version: u32,
     checked_at_unix_ms: u128,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
     manifest: SignedUpdateManifest,
 }

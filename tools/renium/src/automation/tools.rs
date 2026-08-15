@@ -17,7 +17,6 @@ const MAX_HTTP_SNIPPET_CHARS: usize = 320;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScriptSearch {
     keywords: Value,
-    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -26,11 +25,11 @@ struct ScriptSearch {
 struct ScriptRead {
     #[serde(alias = "target_file", alias = "file_path")]
     path: String,
-    #[serde(default, alias = "start_line_one_indexed")]
+    #[serde(alias = "start_line_one_indexed")]
     start_line: Option<usize>,
-    #[serde(default, alias = "end_line_one_indexed_inclusive")]
+    #[serde(alias = "end_line_one_indexed_inclusive")]
     end_line: Option<usize>,
-    #[serde(default, alias = "should_read_entire_file")]
+    #[serde(alias = "should_read_entire_file")]
     _entire: Option<bool>,
 }
 
@@ -40,7 +39,6 @@ struct ScriptGrep {
     query: String,
     #[serde(default)]
     case_insensitive: bool,
-    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -48,7 +46,6 @@ struct ScriptGrep {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HttpGet {
     url: String,
-    #[serde(default)]
     query: Option<String>,
     #[serde(default = "default_context_lines", alias = "context_lines")]
     context_lines: usize,
@@ -96,7 +93,7 @@ fn script_files(context: &BoundContext) -> impl Iterator<Item = PathBuf> {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .filter(|path| {
             path.extension()
                 .and_then(|extension| extension.to_str())

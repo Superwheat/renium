@@ -1229,9 +1229,9 @@ pub(crate) fn build_rbx_place(
                 let refs = BytecodeModelExportRefs {
                     by_index: by_index.clone(),
                     by_settings_id: per_service_settings_refs[service_index].clone(),
-                    global_by_settings_id: Some(global_unique_settings_refs.clone()),
-                    global_by_path_key: Some(global_path_refs.clone()),
-                    global_by_path_segments_key: Some(global_path_segment_refs.clone()),
+                    global_by_settings_id: Some(Arc::clone(&global_unique_settings_refs)),
+                    global_by_path_key: Some(Arc::clone(&global_path_refs)),
+                    global_by_path_segments_key: Some(Arc::clone(&global_path_segment_refs)),
                     ..Default::default()
                 };
                 let mut instances = Vec::with_capacity(subtree.len());

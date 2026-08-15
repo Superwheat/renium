@@ -3311,10 +3311,11 @@ local function captureNativeExportSnapshot(
 	roots: { Instance },
 	fingerprint: { any },
 	ctx: { [string]: any }
-): ({ Instance }, { [string]: any }, { [Instance]: Instance }, { Instance })
+): ({ Instance }, { [string]: any }, { [Instance]: Instance }, { Instance }, { any })
 	local generationBefore = ctx.studioChangeGeneration(serviceName)
+	local liveFingerprint = fingerprint
 	local marker = roots[1]
-	local service = fingerprint[1][1]
+	local service = liveFingerprint[1][1]
 	local rootPropertyValues = ctx.captureRootProperties(serviceName)
 	for name, value in pairs(service:GetAttributes()) do
 		if name:sub(1, 3) ~= "RBX" then
@@ -3335,22 +3336,91 @@ local function captureNativeExportSnapshot(
 	local changed = collectNonArchivableInstances(roots)
 	local snapshotRoots = { roots[1] }
 	local replacements = { [service] = marker }
-	local function mapCloneTree(original: Instance, clone: Instance)
+	local omittedInstances = {}
+	local function childKey(instance: Instance): string
+		local name = instance.Name
+		return tostring(#name) .. ":" .. name .. instance.ClassName
+	end
+	local function mapCloneTree(
+		original: Instance,
+		clone: Instance,
+		allowOmissions: boolean
+	): (boolean, string, { [Instance]: boolean })
 		local pending = { { original, clone } }
+		local mapped = {}
+		local omitted = {}
 		while #pending > 0 do
 			local pair = table.remove(pending)
 			local currentOriginal = pair[1]
 			local currentClone = pair[2]
-			replacements[currentOriginal] = currentClone
+			if currentOriginal.ClassName ~= currentClone.ClassName or currentOriginal.Name ~= currentClone.Name then
+				return false, `changed {currentOriginal:GetFullName()}`, omitted
+			end
+			mapped[currentOriginal] = currentClone
 			local originalChildren = currentOriginal:GetChildren()
 			local cloneChildren = currentClone:GetChildren()
-			if #originalChildren ~= #cloneChildren then
-				error("Native export clone did not preserve the instance tree")
+			if #cloneChildren > #originalChildren then
+				return false, `added children under {currentOriginal:GetFullName()}`, omitted
 			end
-			for index = #originalChildren, 1, -1 do
-				pending[#pending + 1] = { originalChildren[index], cloneChildren[index] }
+			local originalsByKey = {}
+			local clonesByKey = {}
+			for _, child in ipairs(originalChildren) do
+				local key = childKey(child)
+				local bucket = originalsByKey[key]
+				if bucket == nil then
+					bucket = {}
+					originalsByKey[key] = bucket
+				end
+				bucket[#bucket + 1] = child
+			end
+			for _, child in ipairs(cloneChildren) do
+				local key = childKey(child)
+				local bucket = clonesByKey[key]
+				if bucket == nil then
+					bucket = {}
+					clonesByKey[key] = bucket
+				end
+				bucket[#bucket + 1] = child
+			end
+			for key, clonedChildren in pairs(clonesByKey) do
+				local liveChildren = originalsByKey[key]
+				if liveChildren == nil or #clonedChildren > #liveChildren then
+					return false, `added children under {currentOriginal:GetFullName()}`, omitted
+				end
+			end
+			for key, liveChildren in pairs(originalsByKey) do
+				local clonedChildren = clonesByKey[key] or {}
+				if #clonedChildren ~= #liveChildren then
+					if not allowOmissions or (#clonedChildren > 0 and #liveChildren > 1) then
+						return false,
+							`changed {currentOriginal:GetFullName()} from {#originalChildren} to {#cloneChildren} children`,
+							omitted
+					end
+					for index = #clonedChildren + 1, #liveChildren do
+						local omittedRoot = liveChildren[index]
+						omitted[omittedRoot] = true
+						for _, descendant in ipairs(omittedRoot:GetDescendants()) do
+							omitted[descendant] = true
+						end
+					end
+				end
+				for index = #clonedChildren, 1, -1 do
+					pending[#pending + 1] = { liveChildren[index], clonedChildren[index] }
+				end
 			end
 		end
+		for originalInstance, cloneInstance in pairs(mapped) do
+			replacements[originalInstance] = cloneInstance
+		end
+		return true, "", omitted
+	end
+	local function serializedClone(root: Instance): Instance
+		local serializedRoot = SerializationService:SerializeInstancesAsync({ root })
+		local clone = SerializationService:DeserializeInstancesAsync(serializedRoot)[1]
+		if clone == nil or clone.ClassName ~= root.ClassName then
+			error("Native export could not copy " .. root.ClassName)
+		end
+		return clone
 	end
 	ctx.beginStudioChangeSuppression(0)
 	local okClone, cloneError = xpcall(function()
@@ -3364,19 +3434,32 @@ local function captureNativeExportSnapshot(
 		end
 		for index = 2, #roots do
 			local root = roots[index]
+			local clone
+			local preserved
+			local mismatch
+			local omitted
 			if root:IsA("Terrain") or root:IsA("StarterPlayerScripts") or root:IsA("StarterCharacterScripts") then
-				local serializedRoot = SerializationService:SerializeInstancesAsync({ root })
-				local clone = SerializationService:DeserializeInstancesAsync(serializedRoot)[1]
-				if clone == nil or clone.ClassName ~= root.ClassName then
-					error("Native export could not copy " .. root.ClassName)
-				end
-				snapshotRoots[index] = clone
-				mapCloneTree(root, clone)
+				clone = serializedClone(root)
+				preserved, mismatch, omitted = mapCloneTree(root, clone, true)
 			else
-				local clone = root:Clone()
-				snapshotRoots[index] = clone
-				mapCloneTree(root, clone)
+				clone = root:Clone()
+				preserved, mismatch = mapCloneTree(root, clone, false)
+				if not preserved then
+					clone:Destroy()
+					clone = serializedClone(root)
+					preserved, mismatch, omitted = mapCloneTree(root, clone, true)
+				end
 			end
+			if not preserved then
+				if not clone:IsA("Terrain") then
+					clone:Destroy()
+				end
+				error("Native export serialization " .. mismatch)
+			end
+			for instance in pairs(omitted or {}) do
+				omittedInstances[instance] = true
+			end
+			snapshotRoots[index] = clone
 		end
 		for _, entry in ipairs(scriptDocuments) do
 			local clone = replacements[entry.instance]
@@ -3406,15 +3489,21 @@ local function captureNativeExportSnapshot(
 		destroyNativeSnapshotRoots(snapshotRoots, replacements)
 		error(restoreError or cloneError, 0)
 	end
-	local instances = table.create(#fingerprint)
-	local debugIds = table.create(#fingerprint)
+	local snapshotFingerprint = table.create(#liveFingerprint)
+	for _, entry in ipairs(liveFingerprint) do
+		if not omittedInstances[entry[1]] then
+			snapshotFingerprint[#snapshotFingerprint + 1] = entry
+		end
+	end
+	local instances = table.create(#snapshotFingerprint)
+	local debugIds = table.create(#snapshotFingerprint)
 	local debugIdByInstance = {}
 	local pathByInstance = {}
 	local pathSegmentsByInstance = {}
 	local pathOrdinalsByInstance = {}
 	local nonArchivableClones = {}
 	local okSnapshot, snapshotError = xpcall(function()
-		for index, entry in ipairs(fingerprint) do
+		for index, entry in ipairs(snapshotFingerprint) do
 			local original = entry[1]
 			local clone = if index == 1 then snapshotRoots[1] else replacements[original]
 			if clone == nil then
@@ -3448,7 +3537,7 @@ local function captureNativeExportSnapshot(
 		local generationAfter = ctx.studioChangeGeneration(serviceName)
 		if
 			(generationBefore ~= nil and generationAfter ~= generationBefore)
-			or not nativeExportFingerprintMatches(fingerprint, captureNativeExportFingerprint(serviceName, ctx))
+			or not nativeExportFingerprintMatches(liveFingerprint, captureNativeExportFingerprint(serviceName, ctx))
 		then
 			error("Studio changed during native export snapshot capture")
 		end
@@ -3460,7 +3549,7 @@ local function captureNativeExportSnapshot(
 	return snapshotRoots,
 		{
 			serviceName = serviceName,
-			serviceClassName = fingerprint[1][1].ClassName,
+			serviceClassName = liveFingerprint[1][1].ClassName,
 			instances = instances,
 			debugIds = debugIds,
 			debugIdBuffer = buffer.fromstring(table.concat(debugIds, "\0")),
@@ -3471,7 +3560,8 @@ local function captureNativeExportSnapshot(
 			rootPropertyValues = rootPropertyValues,
 		},
 		replacements,
-		nonArchivableClones
+		nonArchivableClones,
+		snapshotFingerprint
 end
 
 prepareNativeSnapshotSerializationJob = function(session: { [string]: any }, job: { [string]: any })
@@ -4013,12 +4103,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local beginOk, beginResult = xpcall(function()
 			if not metadataOnly then
 				for _, serviceName in ipairs(serviceNames) do
-					local snapshotRoots, snapshot, replacements, nonArchivableClones = captureNativeExportSnapshot(
+					local snapshotRoots, snapshot, replacements, nonArchivableClones, snapshotFingerprint =
+						captureNativeExportSnapshot(
 						serviceName,
 						rootsByService[serviceName],
 						fingerprintsByService[serviceName],
 						ctx
 					)
+					session.fingerprintsByService[serviceName] = snapshotFingerprint
 					rootsByService[serviceName] = snapshotRoots
 					session.nativeSnapshots[serviceName] = snapshot
 					for index = 2, #snapshotRoots do
