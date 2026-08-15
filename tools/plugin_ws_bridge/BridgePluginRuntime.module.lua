@@ -67,24 +67,16 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeRuntimeId = generatedRuntimeId
 
 	function Config.isPlayModeActiveForBridge(): boolean
-		if RunService.RunState == Enum.RunState.Stopped then
-			return false
-		elseif RunService:IsRunning() then
-			return true
-		elseif not RunService:IsEdit() then
-			return true
-		end
-		return not (game:GetService("StudioTestService") :: any).EditModeActive
+		return not RunService:IsEdit()
 	end
 
 	function Config.getBridgeRole(): string
-		if RunService:IsRunning() then
-			if RunService:IsClient() then
-				return "play-client"
-			end
-			return "play-server"
+		if RunService:IsEdit() then
+			return "edit"
+		elseif RunService:IsClient() then
+			return "play-client"
 		end
-		return "edit"
+		return "play-server"
 	end
 
 	Config.startedInPlayMode = Config.isPlayModeActiveForBridge()
@@ -156,7 +148,6 @@ function BridgePluginRuntime.start(context)
 	local RECONNECT_SECONDS = 0.5
 	local FAST_RECONNECT_SECONDS = 0.25
 	local FAST_RECONNECT_WINDOW_SECONDS = 8.0
-	local MAX_CONNECTION_FAILURES = 2
 	local CONNECT_SESSION_TIMEOUT_SECONDS = 2.0
 	local NEXT_RUN_CLOSE_DELAY_SECONDS = 0.02
 	local NEXT_RUN_RECONNECT_DELAY_SECONDS = 0.02
@@ -270,9 +261,13 @@ function BridgePluginRuntime.start(context)
 	local sessionLock
 	local transactionExpectations = {}
 	local RbxDomDatabase = requireModule(rootScript:FindFirstChild("RbxDom"), "database")
-	sessionLock = SessionLockModule.create(Config.bridgeRuntimeId, function()
-		Config.disconnectAll("Another Renium session took ownership")
-	end)
+	sessionLock = SessionLockModule.create(
+		Config.bridgeRuntimeId,
+		function()
+			Config.disconnectAll("Another Renium session took ownership")
+		end,
+		not Config.startedInPlayMode
+	)
 
 	local ui = UiModule.create(plugin, {
 		version = BRIDGE_VERSION,
@@ -569,7 +564,6 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeConnectSession = 0
 	Config.bridgeConnectDeadline = 0
 	Config.bridgeConnectionStatus = "Disconnected"
-	Config.bridgePausedForPlay = false
 
 	local editorSyncStats = {
 		requests = 0,
@@ -3617,10 +3611,16 @@ function BridgePluginRuntime.start(context)
 
 	function Config.getBridgeInfo(): { [string]: any }
 		local playerName, playerUserId = Config.getPlayerIdentity()
+		local testArgs = if Config.startedInPlayMode
+			then (game:GetService("StudioTestService") :: any):GetTestArgs()
+			else nil
+		local launch = if type(testArgs) == "table" and type(testArgs.__renium) == "table"
+			then testArgs.__renium
+			else nil
 		return {
 			runtimeId = Config.bridgeRuntimeId,
-			launchNonce = game:GetAttribute("__ReniumLaunchNonce"),
-			launchEditRuntimeId = game:GetAttribute("__ReniumEditRuntimeId"),
+			launchNonce = if launch then launch.nonce else game:GetAttribute("__ReniumLaunchNonce"),
+			launchEditRuntimeId = if launch then launch.editRuntimeId else game:GetAttribute("__ReniumEditRuntimeId"),
 			playerName = playerName,
 			playerUserId = playerUserId,
 			placeId = game.PlaceId,
@@ -4768,6 +4768,7 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.getGuiInventory = RuntimeApi.getGuiInventory
 	Config.bridgeMethodHandlers.getWorldPoint = RuntimeApi.getWorldPoint
 	Config.bridgeMethodHandlers.getMouseLocation = RuntimeApi.getMouseLocation
+	Config.bridgeMethodHandlers.sendVirtualInput = RuntimeApi.sendVirtualInput
 	Config.bridgeMethodHandlers.deviceSimulator = RuntimeApi.deviceSimulator
 	Config.bridgeMethodHandlers.captureViewportProbe = RuntimeApi.captureViewportProbe
 	Config.bridgeMethodHandlers.executeLuau = RuntimeApi.executeLuau
@@ -4937,6 +4938,7 @@ function BridgePluginRuntime.start(context)
 		setConflictResolution = true,
 		deviceSimulator = true,
 		captureViewportProbe = true,
+		sendVirtualInput = true,
 		executeLuau = true,
 		startStopPlay = true,
 		cameraCapture = true,
@@ -4986,6 +4988,7 @@ function BridgePluginRuntime.start(context)
 		getConsoleOutput = true,
 		getGuiBounds = true,
 		getMouseLocation = true,
+		sendVirtualInput = true,
 		deviceSimulator = true,
 		captureViewportProbe = true,
 		executeLuau = true,
@@ -5010,14 +5013,12 @@ function BridgePluginRuntime.start(context)
 		settingsModule = SettingsModule,
 		transportModule = TransportModule,
 		httpService = HttpService,
-		runService = RunService,
 		settingsPrefix = SETTINGS_PREFIX,
 		defaultHost = DEFAULT_HOST,
 		defaultPorts = DEFAULT_PORTS,
 		reconnectSeconds = RECONNECT_SECONDS,
 		fastReconnectSeconds = FAST_RECONNECT_SECONDS,
 		fastReconnectWindowSeconds = FAST_RECONNECT_WINDOW_SECONDS,
-		maxConnectionFailures = MAX_CONNECTION_FAILURES,
 		connectSessionTimeoutSeconds = CONNECT_SESSION_TIMEOUT_SECONDS,
 		nextRunCloseDelaySeconds = NEXT_RUN_CLOSE_DELAY_SECONDS,
 		nextRunReconnectDelaySeconds = NEXT_RUN_RECONNECT_DELAY_SECONDS,

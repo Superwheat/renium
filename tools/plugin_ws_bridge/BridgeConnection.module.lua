@@ -7,7 +7,6 @@ function BridgeConnection.create(context)
 	local SettingsModule = context.settingsModule
 	local TransportModule = context.transportModule
 	local HttpService = context.httpService
-	local RunService = context.runService
 
 	local host = SettingsModule.loadHost(plugin, context.settingsPrefix, context.defaultHost)
 	local ports = SettingsModule.loadPorts(plugin, context.settingsPrefix, context.defaultPorts)
@@ -17,10 +16,8 @@ function BridgeConnection.create(context)
 	local releaseClient
 	local prepareChannelsForNextRun
 	local handleSessionLockUnavailable
-	local pauseWatcherStarted = false
 	local pluginUnloading = false
 	local sessionTakeoverRequested = false
-	local maxConnectionFailures = context.maxConnectionFailures
 	local stableConnectionSeconds = 1
 	local maxRequestBytes = context.maxRequestBytes
 	local maxQueuedExclusiveRequests = context.maxQueuedExclusiveRequests
@@ -42,7 +39,7 @@ function BridgeConnection.create(context)
 	}
 
 	local function autoReconnectEnabled(): boolean
-		return runtimeSettings.autoReconnect
+		return runtimeSettings.autoConnect or runtimeSettings.autoReconnect
 	end
 
 	local function bridgeLogEnabled(level: string): boolean
@@ -86,6 +83,9 @@ function BridgeConnection.create(context)
 		explicitRuntimeSettings[key] = normalized
 		applyRuntimeSettingsToUi()
 		notifyRuntimeSettingsChanged()
+		if key == "autoConnect" and normalized and not Config.bridgeConnectRequested then
+			Config.connectAll()
+		end
 		return normalized
 	end
 
@@ -113,7 +113,7 @@ function BridgeConnection.create(context)
 
 	local function markConnectionFailure(channel, reason)
 		channel.lastError = conciseConnectionError(reason)
-		if Config.bridgeConnectRequested and not Config.bridgePausedForPlay then
+		if Config.bridgeConnectRequested then
 			if autoReconnectEnabled() then
 				Config.bridgeConnectionStatus = "Connecting..."
 			else
@@ -461,7 +461,6 @@ function BridgeConnection.create(context)
 
 	local function reconnectAllowed(channel): boolean
 		return not pluginUnloading
-			and not Config.bridgePausedForPlay
 			and Config.bridgeConnectRequested
 			and channel.shouldReconnect
 	end
@@ -485,16 +484,15 @@ function BridgeConnection.create(context)
 		if channel.reconnectScheduled then
 			return
 		end
+		if channel.id ~= 1 and channels[1] ~= nil and not channels[1].open then
+			return
+		end
 		local now = os.clock()
 		local channelCount = math.max(#channels, 1)
 		local failures = math.max(0, tonumber(channel.reconnectFailureCount) or 0)
-		if failures >= maxConnectionFailures then
-			Config.disconnectAll("Connection failed")
-			return
-		end
 		local period = if failures == 0 and channel.fastReconnectUntil > now
 			then context.fastReconnectSeconds
-			else tonumber(context.reconnectSeconds) or 0.5
+			else math.min((tonumber(context.reconnectSeconds) or 0.5) * 2 ^ math.max(failures - 1, 0), 8)
 		local target = channel.forcedReconnectAt
 		if target ~= nil and target > 0 then
 			channel.forcedReconnectAt = 0
@@ -514,6 +512,9 @@ function BridgeConnection.create(context)
 				return
 			end
 			channel.reconnectScheduled = false
+			if channel.id ~= 1 and channels[1] ~= nil and not channels[1].open then
+				return
+			end
 			if channel.client ~= nil then
 				return
 			end
@@ -650,8 +651,7 @@ function BridgeConnection.create(context)
 			return
 		end
 		if
-			not Config.bridgePausedForPlay
-			and Config.bridgeConnectRequested
+			Config.bridgeConnectRequested
 			and Config.bridgeConnectedOnce
 			and not Config.hasOpenChannel()
 		then
@@ -768,6 +768,19 @@ function BridgeConnection.create(context)
 			Config.bridgeConnectedOnce = true
 			Config.bridgeConnectionStatus = "Connected"
 			updateStatusText()
+			if channel.id == 1 then
+				task.spawn(function()
+					for _, otherChannel in ipairs(channels) do
+						if
+							otherChannel ~= channel
+							and otherChannel.client == nil
+							and not otherChannel.connecting
+						then
+							connectChannel(otherChannel)
+						end
+					end
+				end)
+			end
 			TransportModule.sendEnvelope(client, {
 				id = nil,
 				ok = true,
@@ -858,26 +871,6 @@ function BridgeConnection.create(context)
 		end
 	end
 
-	local function ensurePauseWatcher()
-		if pluginUnloading or pauseWatcherStarted then
-			return
-		end
-		pauseWatcherStarted = true
-		task.spawn(function()
-			while not pluginUnloading do
-				if Config.bridgePausedForPlay then
-					task.wait(1)
-					if not Config.isPlayModeActiveForBridge() then
-						Config.setPausedForPlay(false)
-					end
-				else
-					break
-				end
-			end
-			pauseWatcherStarted = false
-		end)
-	end
-
 	local function sessionOwnerText(details)
 		local userId = tonumber(details.userId) or 0
 		return if userId > 0 then `user {userId}` else "another Studio session"
@@ -887,19 +880,6 @@ function BridgeConnection.create(context)
 		Config.disconnectAll("Another Renium session is active")
 		Config.bridgeConnectionStatus = "Another Renium session is active"
 		updateStatusText()
-		local retryAfterSeconds = tonumber(details.retryAfterSeconds)
-		local session = Config.bridgeConnectSession
-		if runtimeSettings.autoConnect and retryAfterSeconds then
-			task.delay(retryAfterSeconds, function()
-				if
-					not pluginUnloading
-					and session == Config.bridgeConnectSession
-					and not Config.bridgeConnectRequested
-				then
-					Config.connectAll()
-				end
-			end)
-		end
 		if runtimeSettings.notifications then
 			ui.notify(
 				"session-lock",
@@ -915,7 +895,7 @@ function BridgeConnection.create(context)
 	end
 
 	function Config.connectAll(takeover)
-		if pluginUnloading or Config.bridgePausedForPlay then
+		if pluginUnloading then
 			return
 		end
 		Config.bridgeConnectRequested = true
@@ -931,7 +911,9 @@ function BridgeConnection.create(context)
 			channel.shouldReconnect = true
 			closeChannel(channel)
 			resetReconnectFailures(channel)
-			connectChannel(channel)
+			if channel.id == 1 then
+				connectChannel(channel)
+			end
 		end
 		task.delay(context.connectSessionTimeoutSeconds, function()
 			if pluginUnloading or session ~= Config.bridgeConnectSession or not Config.bridgeConnectRequested then
@@ -962,44 +944,8 @@ function BridgeConnection.create(context)
 		updateStatusText()
 	end
 
-	function Config.setPausedForPlay(paused)
-		if Config.startedInPlayMode then
-			return
-		end
-		if Config.bridgePausedForPlay == paused then
-			return
-		end
-		Config.bridgePausedForPlay = paused
-		if paused then
-			shutdownRequests(false)
-			Config.bridgeConnectSession += 1
-			Config.bridgeConnectDeadline = 0
-			Config.bridgeConnectionStatus = "Paused during play"
-			connectionSessionGeneration = nil
-			for _, channel in ipairs(channels) do
-				channel.shouldReconnect = false
-				channel.reconnectScheduled = false
-				closeChannel(channel)
-			end
-			ensurePauseWatcher()
-			updateStatusText()
-			return
-		end
-
-		Config.bridgeConnectionStatus = "Connecting..."
-		for _, channel in ipairs(channels) do
-			channel.shouldReconnect = Config.bridgeConnectRequested
-			channel.reconnectScheduled = false
-		end
-		if Config.bridgeConnectRequested then
-			Config.connectAll()
-		else
-			updateStatusText()
-		end
-	end
-
 	prepareChannelsForNextRun = function(channelClients)
-		if pluginUnloading or Config.bridgePausedForPlay or not Config.bridgeConnectRequested then
+		if pluginUnloading or not Config.bridgeConnectRequested then
 			return
 		end
 		local now = os.clock()
@@ -1191,17 +1137,7 @@ function BridgeConnection.create(context)
 	end
 	ui.setConflictResolutionActive(SettingsModule.loadConflictResolution(plugin, context.settingsPrefix, nil))
 
-	function Config.updatePlayModeBridgeState()
-		local playModeActive = Config.isPlayModeActiveForBridge()
-		ui.setPlayModeHidden(playModeActive)
-		Config.setPausedForPlay(playModeActive)
-	end
-
-	(game:GetService("StudioTestService") :: any)
-		:GetPropertyChangedSignal("EditModeActive")
-		:Connect(Config.updatePlayModeBridgeState)
-	RunService:GetPropertyChangedSignal("RunState"):Connect(Config.updatePlayModeBridgeState)
-	Config.updatePlayModeBridgeState()
+	ui.setPlayModeHidden(Config.startedInPlayMode)
 
 	plugin.Unloading:Connect(function()
 		pluginUnloading = true

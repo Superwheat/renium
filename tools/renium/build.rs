@@ -42,8 +42,10 @@ fn build_windows(out_dir: &Path) {
 fn build_macos(out_dir: &Path) {
     let helper_source = PathBuf::from("native").join("renium_studio_helper_macos.cpp");
     let launcher_source = PathBuf::from("native").join("renium_studio_launcher_macos.c");
+    let shield_source = PathBuf::from("native").join("renium_input_shield_macos.m");
     let helper = out_dir.join("renium-studio-helper.dylib");
     let launcher = out_dir.join("renium-studio-launcher");
+    let shield = out_dir.join("renium-input-shield");
     let mut helper_command = Command::new("clang++");
     helper_command.args([
         "-dynamiclib",
@@ -70,8 +72,34 @@ fn build_macos(out_dir: &Path) {
     ]);
     launcher_command.arg(&launcher).arg(&launcher_source);
     run(&mut launcher_command, "macOS Studio launcher build");
+    let mut shield_command = Command::new("clang");
+    shield_command.args([
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fobjc-arc",
+        "-framework",
+        "AppKit",
+        "-framework",
+        "ApplicationServices",
+        "-o",
+    ]);
+    shield_command.arg(&shield).arg(&shield_source);
+    run(&mut shield_command, "macOS input shield build");
     println!("cargo:rerun-if-changed={}", helper_source.display());
     println!("cargo:rerun-if-changed={}", launcher_source.display());
+    println!("cargo:rerun-if-changed={}", shield_source.display());
+}
+
+fn build_linux(out_dir: &Path) {
+    let source = PathBuf::from("native").join("renium_input_shield_linux.c");
+    let output = out_dir.join("renium-input-shield");
+    let mut command = cc::Build::new().get_compiler().to_command();
+    command.args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-o"]);
+    command.arg(&output).arg(&source).arg("-ldl");
+    run(&mut command, "Linux input shield build");
+    println!("cargo:rerun-if-changed={}", source.display());
 }
 
 fn emit_build_metadata() {
@@ -131,9 +159,19 @@ fn main() {
                 .expect("failed to create macOS helper placeholder");
             std::fs::write(out_dir.join("renium-studio-launcher"), [])
                 .expect("failed to create macOS launcher placeholder");
+            std::fs::write(out_dir.join("renium-input-shield"), [])
+                .expect("failed to create macOS input shield placeholder");
         }
         "macos" => panic!(
             "macOS helper artifacts must be built on macOS; set RENIUM_SKIP_MAC_HELPER_BUILD=1 only for cross-target checking"
+        ),
+        "linux" if host.contains("linux") => build_linux(&out_dir),
+        "linux" if env::var_os("RENIUM_SKIP_LINUX_HELPER_BUILD").is_some() => {
+            std::fs::write(out_dir.join("renium-input-shield"), [])
+                .expect("failed to create Linux input shield placeholder");
+        }
+        "linux" => panic!(
+            "Linux helper artifacts must be built on Linux; set RENIUM_SKIP_LINUX_HELPER_BUILD=1 only for cross-target checking"
         ),
         _ => {}
     }

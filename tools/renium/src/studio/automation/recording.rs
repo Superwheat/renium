@@ -1,4 +1,6 @@
-use std::fs;
+use std::borrow::Cow;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -6,9 +8,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use mp4::{AvcConfig, FourCC, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
+use openh264::OpenH264API;
+use openh264::encoder::{
+    Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, QpRange,
+    RateControlMode, UsageType, VuiConfig,
+};
+use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use webp_animation::prelude::{Encoder, EncoderOptions, EncodingConfig};
 
 #[cfg(any(windows, target_os = "macos"))]
 use super::client_viewport_size;
@@ -17,6 +25,9 @@ use super::set_capture_probe_phase;
 use super::{BridgeServer, BridgeTarget, studio_capture_status, wait_for_player_bridge};
 use crate::app::output::automation_token;
 use crate::studio::input as input_inject;
+use crate::system::files::{
+    cleanup_stale_sibling_temps, replace_file_with_backup, sibling_temp_path,
+};
 
 static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
 
@@ -64,6 +75,13 @@ struct RecordingOptions {
     fps: f64,
     max_seconds: f64,
     quality: f32,
+}
+
+struct EncodedFrame {
+    bytes: Vec<u8>,
+    is_sync: bool,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
 }
 
 fn default_fps() -> f64 {
@@ -123,6 +141,235 @@ fn client_window(
     bail!("Studio recording is only supported on Windows and macOS")
 }
 
+fn even_rgba(pixels: &[u8], width: u32, height: u32) -> Result<(Cow<'_, [u8]>, usize, usize)> {
+    let width = usize::try_from(width).context("Recording width is out of range")?;
+    let height = usize::try_from(height).context("Recording height is out of range")?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+        .context("Recording frame is too large")?;
+    if pixels.len() != expected {
+        bail!(
+            "Recording frame has {} bytes; expected {expected}",
+            pixels.len()
+        );
+    }
+    let even_width = width & !1;
+    let even_height = height & !1;
+    if even_width == 0 || even_height == 0 {
+        bail!("Recording window is too small");
+    }
+    if (even_width, even_height) == (width, height) {
+        return Ok((Cow::Borrowed(pixels), width, height));
+    }
+    let row_bytes = width * 4;
+    let encoded_row_bytes = even_width * 4;
+    let mut cropped = Vec::with_capacity(encoded_row_bytes * even_height);
+    for row in pixels.chunks_exact(row_bytes).take(even_height) {
+        cropped.extend_from_slice(&row[..encoded_row_bytes]);
+    }
+    Ok((Cow::Owned(cropped), even_width, even_height))
+}
+
+fn annex_b_payload(nal: &[u8]) -> Result<&[u8]> {
+    match nal {
+        [0, 0, 0, 1, payload @ ..] | [0, 0, 1, payload @ ..] if !payload.is_empty() => Ok(payload),
+        _ => bail!("H.264 encoder returned a malformed NAL unit"),
+    }
+}
+
+fn encode_frame(encoder: &mut Encoder, yuv: &mut YUVBuffer, rgba: &[u8]) -> Result<EncodedFrame> {
+    let dimensions = yuv.dimensions();
+    yuv.read_rgba8(RgbaSliceU8::new(rgba, dimensions));
+    let bitstream = encoder
+        .encode(yuv)
+        .context("Failed to encode a recording frame")?;
+    let mut bytes = Vec::new();
+    let mut sps = None;
+    let mut pps = None;
+    for layer_index in 0..bitstream.num_layers() {
+        let layer = bitstream
+            .layer(layer_index)
+            .context("H.264 encoder omitted a layer")?;
+        for nal_index in 0..layer.nal_count() {
+            let payload = annex_b_payload(
+                layer
+                    .nal_unit(nal_index)
+                    .context("H.264 encoder omitted a NAL unit")?,
+            )?;
+            match payload[0] & 0x1f {
+                7 => sps = Some(payload.to_vec()),
+                8 => pps = Some(payload.to_vec()),
+                _ => {
+                    let length = u32::try_from(payload.len())
+                        .context("Encoded recording frame is too large")?;
+                    bytes.extend_from_slice(&length.to_be_bytes());
+                    bytes.extend_from_slice(payload);
+                }
+            }
+        }
+    }
+    if bytes.is_empty() {
+        bail!("H.264 encoder returned an empty frame");
+    }
+    Ok(EncodedFrame {
+        bytes,
+        is_sync: matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I),
+        sps,
+        pps,
+    })
+}
+
+fn fourcc(value: &str) -> Result<FourCC> {
+    value
+        .parse()
+        .with_context(|| format!("Invalid MP4 brand {value}"))
+}
+
+fn write_sample(
+    writer: &mut Mp4Writer<BufWriter<File>>,
+    frame: EncodedFrame,
+    start_time: u64,
+    end_time: u64,
+) -> Result<()> {
+    let duration = u32::try_from(end_time.saturating_sub(start_time).max(1))
+        .context("Recording sample duration is out of range")?;
+    writer
+        .write_sample(
+            1,
+            &Mp4Sample {
+                start_time,
+                duration,
+                rendering_offset: 0,
+                is_sync: frame.is_sync,
+                bytes: frame.bytes.into(),
+            },
+        )
+        .context("Failed to write an MP4 frame")
+}
+
+fn record_file(
+    window: &input_inject::StudioWindow,
+    first: (u32, u32, Vec<u8>),
+    options: &RecordingOptions,
+    stop: &AtomicBool,
+    ready: mpsc::SyncSender<Result<()>>,
+    temp_path: &Path,
+) -> Result<FinishedRecording> {
+    let (source_width, source_height, first_pixels) = first;
+    let (first_pixels, width, height) = even_rgba(&first_pixels, source_width, source_height)?;
+    let quality = (51.0 - options.quality * 0.41).round().clamp(10.0, 51.0) as u8;
+    let frame_rate = options.fps as f32;
+    let intra_period = (options.fps.round() as u32).saturating_mul(2).max(1);
+    let config = EncoderConfig::new()
+        .max_frame_rate(FrameRate::from_hz(frame_rate))
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Quality)
+        .skip_frames(false)
+        .profile(Profile::Baseline)
+        .complexity(Complexity::Low)
+        .qp(QpRange::new(quality, quality))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period))
+        .vui(VuiConfig::bt709_full());
+    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+        .context("Failed to initialize the H.264 encoder")?;
+    let mut yuv = YUVBuffer::new(width, height);
+    let mut pending = encode_frame(&mut encoder, &mut yuv, &first_pixels)?;
+    let sps = pending
+        .sps
+        .take()
+        .context("H.264 encoder omitted the sequence parameters")?;
+    let pps = pending
+        .pps
+        .take()
+        .context("H.264 encoder omitted the picture parameters")?;
+    let width = u16::try_from(width).context("Recording width exceeds the MP4 limit")?;
+    let height = u16::try_from(height).context("Recording height exceeds the MP4 limit")?;
+    let file = File::create(temp_path)
+        .with_context(|| format!("Failed to create {}", temp_path.display()))?;
+    let mut writer = Mp4Writer::write_start(
+        BufWriter::new(file),
+        &Mp4Config {
+            major_brand: fourcc("isom")?,
+            minor_version: 512,
+            compatible_brands: vec![
+                fourcc("isom")?,
+                fourcc("iso2")?,
+                fourcc("avc1")?,
+                fourcc("mp41")?,
+            ],
+            timescale: 1000,
+        },
+    )
+    .context("Failed to initialize the MP4 file")?;
+    writer
+        .add_track(&TrackConfig::from(AvcConfig {
+            width,
+            height,
+            seq_param_set: sps,
+            pic_param_set: pps,
+        }))
+        .context("Failed to initialize the MP4 video track")?;
+    let _ = ready.send(Ok(()));
+    let started = Instant::now();
+    let interval = Duration::from_secs_f64(1.0 / options.fps);
+    let limit = Duration::from_secs_f64(options.max_seconds);
+    let mut next_frame = started + interval;
+    let mut pending_at = 0u64;
+    let mut frames = 1usize;
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
+        while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
+            let now = Instant::now();
+            if now >= next_frame {
+                break;
+            }
+            thread::sleep((next_frame - now).min(Duration::from_millis(10)));
+        }
+        if stop.load(Ordering::Relaxed) || started.elapsed() >= limit {
+            break;
+        }
+        let (frame_width, frame_height, pixels) = input_inject::capture_window_rgba(window)?;
+        if (frame_width, frame_height) != (source_width, source_height) {
+            bail!(
+                "The recorded window changed from {source_width}x{source_height} to {frame_width}x{frame_height}"
+            );
+        }
+        let (pixels, frame_width, frame_height) = even_rgba(&pixels, frame_width, frame_height)?;
+        if (frame_width, frame_height) != (usize::from(width), usize::from(height)) {
+            bail!("The encoded recording dimensions changed");
+        }
+        let timestamp = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let next = encode_frame(&mut encoder, &mut yuv, &pixels)?;
+        write_sample(&mut writer, pending, pending_at, timestamp)?;
+        pending = next;
+        pending_at = timestamp;
+        frames += 1;
+        next_frame += interval;
+        while next_frame <= Instant::now() {
+            next_frame += interval;
+        }
+    }
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    write_sample(&mut writer, pending, pending_at, duration_ms)?;
+    writer
+        .write_end()
+        .context("Failed to finish the MP4 file")?;
+    let mut file = writer.into_writer();
+    file.flush()
+        .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+    file.get_ref()
+        .sync_all()
+        .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+    drop(file);
+    replace_file_with_backup(temp_path, &options.output, "recording")?;
+    Ok(FinishedRecording {
+        width: u32::from(width),
+        height: u32::from(height),
+        frames,
+        duration_ms,
+    })
+}
+
 fn record(
     window: input_inject::StudioWindow,
     first: (u32, u32, Vec<u8>),
@@ -130,72 +377,13 @@ fn record(
     stop: Arc<AtomicBool>,
     ready: mpsc::SyncSender<Result<()>>,
 ) -> Result<FinishedRecording> {
-    let (width, height, pixels) = first;
-    let encoder_options = EncoderOptions {
-        encoding_config: Some(EncodingConfig::new_lossy(options.quality)),
-        ..EncoderOptions::default()
-    };
-    let mut encoder = match Encoder::new_with_options((width, height), encoder_options) {
-        Ok(encoder) => encoder,
-        Err(error) => {
-            let message = format!("Failed to initialize the WebP encoder: {error}");
-            let _ = ready.send(Err(anyhow!(message.clone())));
-            bail!(message);
-        }
-    };
-    if let Err(error) = encoder.add_frame(&pixels, 0) {
-        let message = format!("Failed to encode the first recording frame: {error}");
-        let _ = ready.send(Err(anyhow!(message.clone())));
-        bail!(message);
+    cleanup_stale_sibling_temps(&options.output);
+    let temp_path = sibling_temp_path(&options.output);
+    let result = record_file(&window, first, &options, &stop, ready, &temp_path);
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
     }
-    let _ = ready.send(Ok(()));
-    let started = Instant::now();
-    let interval = Duration::from_secs_f64(1.0 / options.fps);
-    let limit = Duration::from_secs_f64(options.max_seconds);
-    let mut frames = 1usize;
-    let mut last_timestamp = 0i32;
-    while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
-        let wait_until = Instant::now() + interval;
-        while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
-            let now = Instant::now();
-            if now >= wait_until {
-                break;
-            }
-            thread::sleep((wait_until - now).min(Duration::from_millis(10)));
-        }
-        if stop.load(Ordering::Relaxed) || started.elapsed() >= limit {
-            break;
-        }
-        let (frame_width, frame_height, pixels) = input_inject::capture_window_rgba(&window)?;
-        if (frame_width, frame_height) != (width, height) {
-            bail!(
-                "The recorded window changed from {width}x{height} to {frame_width}x{frame_height}"
-            );
-        }
-        let timestamp = i32::try_from(started.elapsed().as_millis())
-            .context("Recording duration exceeded the WebP timestamp range")?
-            .max(last_timestamp + 1);
-        encoder
-            .add_frame(&pixels, timestamp)
-            .context("Failed to encode a recording frame")?;
-        last_timestamp = timestamp;
-        frames += 1;
-    }
-    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let final_timestamp = i32::try_from(duration_ms)
-        .context("Recording duration exceeded the WebP timestamp range")?
-        .max(last_timestamp + 1);
-    let data = encoder
-        .finalize(final_timestamp)
-        .context("Failed to finish the WebP recording")?;
-    fs::write(&options.output, data.as_ref())
-        .with_context(|| format!("Failed to write {}", options.output.display()))?;
-    Ok(FinishedRecording {
-        width,
-        height,
-        frames,
-        duration_ms,
-    })
+    result
 }
 
 pub(crate) fn start(
@@ -253,7 +441,7 @@ pub(crate) fn start(
     let id = automation_token("recording");
     let output = request
         .output
-        .unwrap_or_else(|| PathBuf::from(format!("{id}.webp")));
+        .unwrap_or_else(|| PathBuf::from(format!("{id}.mp4")));
     let output = if output.is_absolute() {
         output
     } else {
@@ -262,9 +450,9 @@ pub(crate) fn start(
     if !output
         .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("webp"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
     {
-        bail!("Invalid record-start output; expected a .webp path");
+        bail!("Invalid record-start output; expected a .mp4 path");
     }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -311,7 +499,7 @@ pub(crate) fn start(
         "target": target,
         "fps": request.fps,
         "maxSeconds": request.max_seconds,
-        "mimeType": "image/webp",
+        "mimeType": "video/mp4",
     }))
 }
 
@@ -348,7 +536,7 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         "height": finished.height,
         "frames": finished.frames,
         "durationMs": finished.duration_ms,
-        "mimeType": "image/webp",
+        "mimeType": "video/mp4",
         "audio": false,
     }))
 }

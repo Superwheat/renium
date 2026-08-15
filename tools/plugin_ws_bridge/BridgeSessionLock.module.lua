@@ -3,13 +3,13 @@ local BridgeSessionLock = {}
 local LOCK_NAME = "__Renium_SessionLock"
 local LOCK_MARKER = "ReniumSessionLock"
 
-function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> ())
+function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> (), useTeamCreateLock: boolean)
 	local Players = game:GetService("Players")
 	local ServerStorage = game:GetService("ServerStorage")
 	local ownershipGeneration = 0
 	local active = false
 	local function teamCreateActive(): boolean
-		return #Players:GetChildren() > 0
+		return useTeamCreateLock and #Players:GetChildren() > 0
 	end
 
 	local function isSessionLock(value: Instance): boolean
@@ -78,7 +78,6 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> ())
 			return {
 				active = active and not teamCreateActive(),
 				owned = active and not teamCreateActive(),
-				retryAfterSeconds = 1,
 			}
 		end
 		local userId = tonumber(lock:GetAttribute("UserId")) or 0
@@ -91,7 +90,6 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> ())
 			owned = runtime(lock) == runtimeId,
 			runtime = runtime(lock),
 			userId = userId,
-			retryAfterSeconds = 1,
 		}
 	end
 

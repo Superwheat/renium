@@ -193,6 +193,73 @@ pub(crate) fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
+    use std::collections::HashSet;
+
+    let expected_port = format!("{port:04X}");
+    let mut inodes = HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(table) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in table.lines().skip(1) {
+            let mut columns = line.split_ascii_whitespace();
+            let _ = columns.next();
+            let local = columns.next();
+            let _ = columns.next();
+            let state = columns.next();
+            let inode = columns.nth(5);
+            if state == Some("01")
+                && local.and_then(|value| value.rsplit(':').next()) == Some(&expected_port)
+                && let Some(inode) = inode
+            {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    if inodes.is_empty() {
+        bail!("No TCP connection with local port {port} found");
+    }
+
+    let mut pids = Vec::new();
+    for process in std::fs::read_dir("/proc").context("Failed to inspect Linux processes")? {
+        let Ok(process) = process else {
+            continue;
+        };
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(files) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        let owns_socket = files.filter_map(|file| file.ok()).any(|file| {
+            let Ok(target) = std::fs::read_link(file.path()) else {
+                return false;
+            };
+            target
+                .to_str()
+                .and_then(|value| value.strip_prefix("socket:["))
+                .and_then(|value| value.strip_suffix(']'))
+                .is_some_and(|inode| inodes.contains(inode))
+        });
+        if owns_socket {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    match pids.as_slice() {
+        [pid] => Ok(*pid),
+        [] => bail!("No process owns the TCP connection on local port {port}"),
+        _ => bail!("Local TCP port {port} belongs to multiple processes"),
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn local_tcp_ports_owned_by_pid(pid: u32) -> Vec<u16> {
     use windows_sys::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_CONNECTIONS;

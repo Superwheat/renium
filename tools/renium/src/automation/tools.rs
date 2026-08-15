@@ -7,8 +7,11 @@ use walkdir::WalkDir;
 
 use crate::automation::{BoundContext, Failure};
 use crate::cloud::{agent, read_response};
+use crate::system::files::canonical_path;
 
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_HTTP_MATCHES: usize = 3;
+const MAX_HTTP_SNIPPET_CHARS: usize = 320;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -55,6 +58,32 @@ struct HttpGet {
 
 fn default_context_lines() -> usize {
     3
+}
+
+fn http_snippet_line(line: &str, needle: &str) -> String {
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.len() <= MAX_HTTP_SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let match_start = line
+        .to_lowercase()
+        .find(needle)
+        .map(|index| {
+            line.char_indices()
+                .take_while(|(offset, _)| *offset < index)
+                .count()
+        })
+        .unwrap_or_default();
+    let start = match_start
+        .saturating_sub(MAX_HTTP_SNIPPET_CHARS / 3)
+        .min(chars.len() - MAX_HTTP_SNIPPET_CHARS);
+    let end = start + MAX_HTTP_SNIPPET_CHARS;
+    format!(
+        "{}{}{}",
+        if start == 0 { "" } else { "…" },
+        chars[start..end].iter().collect::<String>(),
+        if end == chars.len() { "" } else { "…" }
+    )
 }
 
 fn failure(message: impl Into<String>, next: &str) -> Failure {
@@ -168,13 +197,13 @@ fn resolve_script(context: &BoundContext, requested: &str) -> Result<PathBuf, Fa
     } else {
         Path::new(&context.root).join(path)
     };
-    let path = fs::canonicalize(&path).map_err(|error| {
+    let path = canonical_path(&path).map_err(|error| {
         failure(
             format!("Failed to resolve {}: {error}", path.display()),
             "script-search",
         )
     })?;
-    let root = fs::canonicalize(&context.root)
+    let root = canonical_path(Path::new(&context.root))
         .map_err(|error| failure(format!("Failed to resolve project root: {error}"), "bind"))?;
     if !path.starts_with(root)
         || !path
@@ -338,7 +367,7 @@ pub(crate) fn http_get(parameters: &Value) -> Result<Value, Failure> {
     }
     let context = request.context_lines.min(50);
     let mut ranges = Vec::<(usize, usize)>::new();
-    for index in matching.iter().copied() {
+    for index in matching.iter().copied().take(MAX_HTTP_MATCHES) {
         let start = index.saturating_sub(context);
         let end = (index + context + 1).min(lines.len());
         match ranges.last_mut() {
@@ -352,7 +381,13 @@ pub(crate) fn http_get(parameters: &Value) -> Result<Value, Failure> {
             lines[start..end]
                 .iter()
                 .enumerate()
-                .map(|(offset, line)| format!("{}: {line}", start + offset + 1))
+                .map(|(offset, line)| {
+                    format!(
+                        "{}: {}",
+                        start + offset + 1,
+                        http_snippet_line(line, &needle)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -363,6 +398,7 @@ pub(crate) fn http_get(parameters: &Value) -> Result<Value, Failure> {
         "status": response.status,
         "query": query,
         "matches": matching.len(),
+        "truncated": matching.len() > MAX_HTTP_MATCHES,
         "body": body,
     }))
 }

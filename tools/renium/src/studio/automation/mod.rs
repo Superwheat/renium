@@ -250,7 +250,7 @@ pub(crate) fn studio_change_state_result(
             "ackEditorActionResults": action_results,
             "runtimeId": args.runtime_id,
             "suppressSeconds": args.suppress_seconds,
-            "waitSeconds": args.wait_seconds,
+            "waitSeconds": args.event_wait_seconds,
             "contextBound": args.context_bound,
         }),
     )?;
@@ -352,14 +352,26 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
         {
             ensure_plugin_api_ok(&start_result)?;
         }
-        if start_result.get("ok").and_then(Value::as_bool) == Some(true)
-            && start_result.get("running").and_then(Value::as_bool) == Some(true)
-        {
-            return Ok(start_result);
-        }
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut last_status = start_result;
         loop {
+            let clients = test_launch_clients(bridge, &launch);
+            let server_ready = clients
+                .iter()
+                .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
+            let client_ready = clients
+                .iter()
+                .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT);
+            if server_ready && (plugin_mode == "run" || client_ready) {
+                return Ok(json!({
+                    "ok": true,
+                    "action": "start",
+                    "mode": plugin_mode,
+                    "launchNonce": launch.nonce,
+                    "editRuntimeId": launch.edit_runtime_id,
+                    "clients": clients,
+                }));
+            }
             if Instant::now() >= deadline {
                 bail!(
                     "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
@@ -373,9 +385,6 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                         != Some(launch.nonce.as_str())
                     {
                         bail!("Studio switched to a different play session while starting");
-                    }
-                    if status.get("running").and_then(Value::as_bool) == Some(true) {
-                        return Ok(status);
                     }
                     if let Some(error) = status
                         .get("lastError")
@@ -433,16 +442,18 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
         }
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let status = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
-            if status.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
-                bail!("Studio switched to a different multiplayer session while starting");
-            }
-            if let Some(error) = status
-                .get("lastError")
-                .and_then(Value::as_str)
-                .filter(|error| !error.is_empty())
-            {
-                bail!("Studio could not start the multiplayer session: {error}");
+            if let Ok(status) = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id) {
+                if status.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str())
+                {
+                    bail!("Studio switched to a different multiplayer session while starting");
+                }
+                if let Some(error) = status
+                    .get("lastError")
+                    .and_then(Value::as_str)
+                    .filter(|error| !error.is_empty())
+                {
+                    bail!("Studio could not start the multiplayer session: {error}");
+                }
             }
             let clients = test_launch_clients(bridge, &launch);
             let client_count = clients
@@ -497,6 +508,119 @@ fn client_viewport_size(bridge: &BridgeServer, player: Option<&str>) -> Option<(
         return None;
     }
     Some((width.round() as i32, height.round() as i32))
+}
+
+#[cfg(windows)]
+fn input_delta(
+    _bridge: &BridgeServer,
+    _player: Option<&str>,
+    _window: &input_inject::StudioWindow,
+    _x: i32,
+    _y: i32,
+) -> (i32, i32) {
+    (0, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn input_delta(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+    window: &input_inject::StudioWindow,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
+    let read = || -> Result<(f64, f64)> {
+        let result = bridge.call_for_selector(
+            "getMouseLocation",
+            json!({}),
+            BridgeTarget::Client,
+            player,
+        )?;
+        ensure_plugin_api_ok(&result)?;
+        Ok((
+            result
+                .get("x")
+                .and_then(Value::as_f64)
+                .context("Mouse probe returned no x coordinate")?,
+            result
+                .get("y")
+                .and_then(Value::as_f64)
+                .context("Mouse probe returned no y coordinate")?,
+        ))
+    };
+    let Ok(initial) = read() else {
+        return (0, 0);
+    };
+    if input_inject::post_mouse_move(window, x, y).is_err() {
+        return (0, 0);
+    }
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(20));
+        if let Ok((seen_x, seen_y)) = read() {
+            let delta_x = x - seen_x.round() as i32;
+            let delta_y = y - seen_y.round() as i32;
+            let moved = (seen_x - initial.0).abs() > 0.5 || (seen_y - initial.1).abs() > 0.5;
+            if !moved && (delta_x.abs() > 1 || delta_y.abs() > 1) {
+                continue;
+            }
+            if delta_x.abs() <= 300 && delta_y.abs() <= 300 {
+                return (delta_x, delta_y);
+            }
+            break;
+        }
+    }
+    (0, 0)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn resolve_client_capture_window(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+) -> Result<input_inject::StudioWindow> {
+    let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+    input_inject::recording_window_for_pid(pid, client_viewport_size(bridge, player))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn resolve_client_capture_window(
+    _bridge: &BridgeServer,
+    _player: Option<&str>,
+) -> Result<input_inject::StudioWindow> {
+    bail!("Studio screenshots are only supported on Windows and macOS")
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn send_virtual_input(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+    actions: Vec<Value>,
+) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    let _shield = {
+        let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+        let window = input_inject::window_for_pid(pid, client_viewport_size(bridge, player))?;
+        input_inject::input_shield(&window)?
+    };
+    let result = bridge.call_for_selector(
+        "sendVirtualInput",
+        json!({ "actions": actions }),
+        BridgeTarget::Client,
+        player,
+    )?;
+    ensure_plugin_api_ok(&result)?;
+    Ok(result)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn virtual_click_actions(x: i32, y: i32, right: bool, hold_ms: u64) -> Vec<Value> {
+    let button = if right { "right" } else { "left" };
+    vec![
+        json!({ "type": "move", "x": x, "y": y }),
+        json!({ "type": "button", "x": x, "y": y, "button": button, "down": true }),
+        json!({ "type": "wait", "ms": hold_ms.min(10_000) }),
+        json!({ "type": "button", "x": x, "y": y, "button": button, "down": false }),
+        json!({ "type": "wait", "ms": 0 }),
+    ]
 }
 
 fn studio_capture_status(bridge: &BridgeServer) -> Option<Value> {
@@ -560,13 +684,42 @@ fn resolve_edit_window(
     bail!("Studio screenshots are only supported on Windows and macOS")
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-fn resolve_player_window(
-    _bridge: &BridgeServer,
-    _player: Option<&str>,
-    _viewport: Option<(i32, i32)>,
-) -> Result<(input_inject::StudioWindow, i32, i32)> {
-    bail!("Input injection is only supported on Windows and macOS")
+fn gui_input_bounds(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+    path: Option<&str>,
+    id: Option<&str>,
+    requested: &str,
+) -> Result<(Value, f64, f64)> {
+    let bounds = bridge.call_for_selector(
+        "getGuiBounds",
+        json!({ "path": path, "id": id, "scroll": true }),
+        BridgeTarget::Client,
+        player,
+    )?;
+    ensure_plugin_api_ok(&bounds)?;
+    let subject = bounds
+        .get("fullName")
+        .and_then(Value::as_str)
+        .unwrap_or(requested);
+    if bounds.get("onScreen").and_then(Value::as_bool) == Some(false) {
+        bail!(
+            "{subject} could not be brought on screen (auto-scroll was attempted; it is clipped \
+             by a non-scrolling container or positioned outside the viewport)"
+        );
+    }
+    if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
+        bail!("GUI element {subject} is not visible");
+    }
+    let x = bounds
+        .get("x")
+        .and_then(Value::as_f64)
+        .context("getGuiBounds returned no x")?;
+    let y = bounds
+        .get("y")
+        .and_then(Value::as_f64)
+        .context("getGuiBounds returned no y")?;
+    Ok((bounds, x, y))
 }
 
 pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -579,75 +732,46 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         .as_deref()
         .or(args.id.as_deref())
         .context("Provide a GUI path or --id")?;
-    let bounds = if args.world {
+    let (bounds, x, y) = if args.world {
         let path = args.path.as_deref().context("--world requires a path")?;
-        bridge.call_for_selector(
+        let bounds = bridge.call_for_selector(
             "getWorldPoint",
             json!({ "path": path }),
             BridgeTarget::Client,
             player,
-        )?
-    } else {
-        bridge.call_for_selector(
-            "getGuiBounds",
-            json!({ "path": args.path, "id": args.id, "scroll": true }),
-            BridgeTarget::Client,
-            player,
-        )?
-    };
-    ensure_plugin_api_ok(&bounds)?;
-    if bounds.get("onScreen").and_then(Value::as_bool) == Some(false) {
-        let subject = bounds
-            .get("fullName")
-            .and_then(Value::as_str)
-            .unwrap_or(requested);
-        if args.world {
+        )?;
+        ensure_plugin_api_ok(&bounds)?;
+        if bounds.get("onScreen").and_then(Value::as_bool) == Some(false) {
+            let subject = bounds
+                .get("fullName")
+                .and_then(Value::as_str)
+                .unwrap_or(requested);
             bail!(
                 "{subject} is not on screen (behind the camera or outside the viewport); move \
                  the character or camera first (rbx goto)"
             );
         }
-        bail!(
-            "{subject} could not be brought on screen (auto-scroll was attempted; it is clipped \
-             by a non-scrolling container or positioned outside the viewport)"
-        );
-    }
-    let x = bounds
-        .get("x")
-        .and_then(Value::as_f64)
-        .context("getGuiBounds returned no x")?;
-    let y = bounds
-        .get("y")
-        .and_then(Value::as_f64)
-        .context("getGuiBounds returned no y")?;
-    if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
-        bail!(
-            "GUI element {} is not visible",
-            bounds
-                .get("fullName")
-                .and_then(Value::as_str)
-                .unwrap_or(requested)
-        );
-    }
-    let viewport = match (
-        bounds.get("viewportWidth").and_then(Value::as_f64),
-        bounds.get("viewportHeight").and_then(Value::as_f64),
-    ) {
-        (Some(width), Some(height)) if width >= 1.0 && height >= 1.0 => {
-            Some((width.round() as i32, height.round() as i32))
-        }
-        _ => None,
+        let x = bounds
+            .get("x")
+            .and_then(Value::as_f64)
+            .context("getWorldPoint returned no x")?;
+        let y = bounds
+            .get("y")
+            .and_then(Value::as_f64)
+            .context("getWorldPoint returned no y")?;
+        (bounds, x, y)
+    } else {
+        gui_input_bounds(
+            bridge,
+            player,
+            args.path.as_deref(),
+            args.id.as_deref(),
+            requested,
+        )?
     };
-    let (window, offset_x, offset_y) = resolve_player_window(bridge, player, viewport)?;
-    let (delta_x, delta_y) =
-        calibrate_click_delta(bridge, player, &window, x.round() as i32, y.round() as i32);
-    let click_x = x.round() as i32 + offset_x + delta_x;
-    let click_y = y.round() as i32 + offset_y + delta_y;
-    input_inject::post_mouse_click(&window, click_x, click_y, args.right, args.hold)?;
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "action": "press",
-        "calibrationDelta": [delta_x, delta_y],
         "target": bounds
             .get("fullName")
             .cloned()
@@ -657,56 +781,43 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         "matchedCount": bounds.get("matchedCount").cloned().unwrap_or(Value::Null),
         "viewportX": x,
         "viewportY": y,
-        "window": window.label,
-    }))
-}
-
-fn read_client_mouse_location(bridge: &BridgeServer, player: Option<&str>) -> Result<(f64, f64)> {
-    let result =
-        bridge.call_for_selector("getMouseLocation", json!({}), BridgeTarget::Client, player)?;
-    ensure_plugin_api_ok(&result)?;
-    Ok((
-        result
-            .get("x")
-            .and_then(Value::as_f64)
-            .context("Mouse probe returned no x coordinate")?,
-        result
-            .get("y")
-            .and_then(Value::as_f64)
-            .context("Mouse probe returned no y coordinate")?,
-    ))
-}
-
-fn calibrate_click_delta(
-    bridge: &BridgeServer,
-    player: Option<&str>,
-    window: &input_inject::StudioWindow,
-    x: i32,
-    y: i32,
-) -> (i32, i32) {
-    let Ok(initial) = read_client_mouse_location(bridge, player) else {
-        return (0, 0);
-    };
-    if input_inject::post_mouse_move(window, x, y).is_err() {
-        return (0, 0);
-    }
-    for _ in 0..10 {
-        thread::sleep(Duration::from_millis(20));
-        if let Ok((seen_x, seen_y)) = read_client_mouse_location(bridge, player) {
-            let delta_x = x - seen_x.round() as i32;
-            let delta_y = y - seen_y.round() as i32;
-            let moved = (seen_x - initial.0).abs() > 0.5 || (seen_y - initial.1).abs() > 0.5;
-            if !moved && (delta_x.abs() > 1 || delta_y.abs() > 1) {
-                continue;
+    });
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let viewport = match (
+            bounds.get("viewportWidth").and_then(Value::as_f64),
+            bounds.get("viewportHeight").and_then(Value::as_f64),
+        ) {
+            (Some(width), Some(height)) if width >= 1.0 && height >= 1.0 => {
+                Some((width.round() as i32, height.round() as i32))
             }
-            if delta_x.abs() > 300 || delta_y.abs() > 300 {
-                return (0, 0);
-            }
-            return (delta_x, delta_y);
-        }
+            _ => None,
+        };
+        let (window, offset_x, offset_y) = resolve_player_window(bridge, player, viewport)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let _shield = input_inject::input_shield(&window)?;
+        let (delta_x, delta_y) =
+            input_delta(bridge, player, &window, x.round() as i32, y.round() as i32);
+        input_inject::post_mouse_click(
+            &window,
+            x.round() as i32 + offset_x + delta_x,
+            y.round() as i32 + offset_y + delta_y,
+            args.right,
+            args.hold,
+        )?;
+        result["input"] = json!("os");
+        result["window"] = json!(window.label);
     }
-    println!("[renium] warning: input position calibration was not observed by the client");
-    (0, 0)
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        send_virtual_input(
+            bridge,
+            player,
+            virtual_click_actions(x.round() as i32, y.round() as i32, args.right, args.hold),
+        )?;
+        result["input"] = json!("virtual");
+    }
+    Ok(result)
 }
 
 pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -714,23 +825,39 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let (window, offset_x, offset_y) =
-        resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-    let (delta_x, delta_y) = calibrate_click_delta(bridge, player, &window, args.x, args.y);
-    input_inject::post_mouse_click(
-        &window,
-        args.x + offset_x + delta_x,
-        args.y + offset_y + delta_y,
-        args.right,
-        args.hold,
-    )?;
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "action": "click",
         "viewportX": args.x,
         "viewportY": args.y,
-        "window": window.label,
-    }))
+    });
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (window, offset_x, offset_y) =
+            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let _shield = input_inject::input_shield(&window)?;
+        let (delta_x, delta_y) = input_delta(bridge, player, &window, args.x, args.y);
+        input_inject::post_mouse_click(
+            &window,
+            args.x + offset_x + delta_x,
+            args.y + offset_y + delta_y,
+            args.right,
+            args.hold,
+        )?;
+        result["input"] = json!("os");
+        result["window"] = json!(window.label);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        send_virtual_input(
+            bridge,
+            player,
+            virtual_click_actions(args.x, args.y, args.right, args.hold),
+        )?;
+        result["input"] = json!("virtual");
+    }
+    Ok(result)
 }
 
 pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -739,15 +866,35 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
     let key = input_inject::resolve_key(&args.key)?;
-    let (window, _, _) =
-        resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-    input_inject::post_key(&window, &key, args.hold_ms)?;
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "action": "key",
         "key": key.name,
-        "window": window.label,
-    }))
+    });
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (window, _, _) =
+            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let _shield = input_inject::input_shield(&window)?;
+        input_inject::post_key(&window, &key, args.hold_ms)?;
+        result["input"] = json!("os");
+        result["window"] = json!(window.label);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        send_virtual_input(
+            bridge,
+            player,
+            vec![
+                json!({ "type": "key", "key": key.name, "down": true }),
+                json!({ "type": "wait", "ms": args.hold_ms.min(10_000) }),
+                json!({ "type": "key", "key": key.name, "down": false }),
+            ],
+        )?;
+        result["input"] = json!("virtual");
+    }
+    Ok(result)
 }
 
 pub(crate) fn ui_result(args: &UiArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -770,39 +917,81 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let mut pressed = Value::Null;
-    if let Some(path) = args.path.as_ref() {
-        let press_args = PressArgs {
-            bridge: args.bridge.clone(),
-            path: Some(path.clone()),
-            id: None,
-            player: args.player.clone(),
-            right: false,
-            world: false,
-            hold: 30,
-        };
-        let press = press_result(&press_args, bridge)?;
-        pressed = press
-            .get("target")
-            .cloned()
-            .unwrap_or_else(|| Value::String(path.clone()));
-        thread::sleep(Duration::from_millis(250));
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut pressed = Value::Null;
+        if let Some(path) = args.path.as_ref() {
+            let press_args = PressArgs {
+                bridge: args.bridge.clone(),
+                path: Some(path.clone()),
+                id: None,
+                player: args.player.clone(),
+                right: false,
+                world: false,
+                hold: 30,
+            };
+            let press = press_result(&press_args, bridge)?;
+            pressed = press
+                .get("target")
+                .cloned()
+                .unwrap_or_else(|| Value::String(path.clone()));
+            thread::sleep(Duration::from_millis(250));
+        }
+        let (window, _, _) =
+            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let _shield = input_inject::input_shield(&window)?;
+        input_inject::post_text(&window, &args.text)?;
+        if args.enter {
+            let enter = input_inject::resolve_key("Enter")?;
+            input_inject::post_key(&window, &enter, 40)?;
+        }
+        Ok(json!({
+            "ok": true,
+            "action": "type",
+            "chars": args.text.chars().count(),
+            "focused": pressed,
+            "enter": args.enter,
+            "input": "os",
+            "window": window.label,
+        }))
     }
-    let (window, _, _) =
-        resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-    input_inject::post_text(&window, &args.text)?;
-    if args.enter {
-        let enter = input_inject::resolve_key("Enter")?;
-        input_inject::post_key(&window, &enter, 40)?;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let mut pressed = Value::Null;
+        let mut actions = Vec::new();
+        if let Some(path) = args.path.as_ref() {
+            let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+            pressed = bounds
+                .get("fullName")
+                .cloned()
+                .unwrap_or_else(|| Value::String(path.clone()));
+            actions.extend(virtual_click_actions(
+                x.round() as i32,
+                y.round() as i32,
+                false,
+                30,
+            ));
+        }
+        actions.push(json!({ "type": "text", "text": args.text }));
+        if args.enter {
+            actions.extend([
+                json!({ "type": "wait", "ms": 0 }),
+                json!({ "type": "key", "key": "Return", "down": true }),
+                json!({ "type": "wait", "ms": 40 }),
+                json!({ "type": "key", "key": "Return", "down": false }),
+            ]);
+        }
+        send_virtual_input(bridge, player, actions)?;
+        Ok(json!({
+            "ok": true,
+            "action": "type",
+            "chars": args.text.chars().count(),
+            "focused": pressed,
+            "enter": args.enter,
+            "input": "virtual",
+        }))
     }
-    Ok(json!({
-        "ok": true,
-        "action": "type",
-        "chars": args.text.chars().count(),
-        "focused": pressed,
-        "enter": args.enter,
-        "window": window.label,
-    }))
 }
 
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -838,7 +1027,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
             "elapsedSeconds": elapsed,
         })),
         ConsoleTaskOutcome::End(detail) => {
-            bail!("Condition did not become true within {timeout}s (last value:{detail})")
+            bail!("Timed out after {timeout}s waiting for condition (last value:{detail})")
         }
     }
 }
@@ -1142,7 +1331,7 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
         bridge.channel_count_for_target(BridgeTarget::Client) >= bridge.expected_channel_count();
     let use_studio =
         args.studio || (player.is_none() && !args.client && (simulated || !client_ready));
-    let probe_target = if simulated && client_ready {
+    let probe_target = if client_ready {
         BridgeTarget::Client
     } else {
         BridgeTarget::Edit
@@ -1155,7 +1344,7 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
         )
     } else {
         (
-            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?.0,
+            resolve_client_capture_window(bridge, player)?,
             "play-client",
             BridgeTarget::Client,
         )
@@ -1467,22 +1656,65 @@ pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> 
     Ok(())
 }
 
+fn connected_launch_nonce(bridge: &BridgeServer, edit_runtime_id: &str) -> Result<Option<String>> {
+    let mut nonces: Vec<String> = bridge
+        .list_bridge_clients()
+        .into_iter()
+        .filter(|entry| {
+            entry.get("launchEditRuntimeId").and_then(Value::as_str) == Some(edit_runtime_id)
+                && matches!(
+                    entry.get("role").and_then(Value::as_str),
+                    Some(BRIDGE_ROLE_PLAY_SERVER | BRIDGE_ROLE_PLAY_CLIENT)
+                )
+        })
+        .filter_map(|entry| {
+            entry
+                .get("launchNonce")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    nonces.sort_unstable();
+    nonces.dedup();
+    if nonces.len() > 1 {
+        bail!("Multiple Renium play launches are connected to the selected Studio window");
+    }
+    Ok(nonces.pop())
+}
+
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
     let edit_runtime_id = edit_pin.runtime_id;
     let initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
-    if studio_status_indicates_stopped(&initial)
-        && initial.get("starting").and_then(Value::as_bool) != Some(true)
-    {
-        return Ok(initial);
-    }
     let launch_nonce = initial
         .get("launchNonce")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or(connected_launch_nonce(bridge, &edit_runtime_id)?);
+    let launch = launch_nonce.as_ref().map(|nonce| TestLaunch {
+        nonce: nonce.clone(),
+        edit_runtime_id: edit_runtime_id.clone(),
+    });
+    if studio_status_indicates_stopped(&initial)
+        && initial.get("starting").and_then(Value::as_bool) != Some(true)
+        && launch
+            .as_ref()
+            .is_none_or(|launch| test_launch_clients(bridge, launch).is_empty())
+    {
+        return Ok(initial);
+    }
+    let clients = launch
+        .as_ref()
+        .map_or_else(Vec::new, |launch| test_launch_clients(bridge, launch));
+    let server_runtime_id = clients.iter().find_map(|client| {
+        (client.get("role").and_then(Value::as_str) == Some(BRIDGE_ROLE_PLAY_SERVER))
+            .then(|| client.get("runtimeId").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    });
     let mut last_status = Value::Null;
-    let mut last_play_roles = 0;
     for attempt in 1..=3 {
         let mut params = Map::new();
         params.insert("stop".to_string(), Value::Bool(true));
@@ -1492,72 +1724,77 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 Value::String(launch_nonce.clone()),
             );
         }
+        if server_runtime_id.is_some() {
+            params.insert("waitForStopped".to_string(), Value::Bool(false));
+        }
         let stop_result = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params),
-            BridgeTarget::Edit,
-            &edit_runtime_id,
+            if server_runtime_id.is_some() {
+                BridgeTarget::Main
+            } else {
+                BridgeTarget::Edit
+            },
+            server_runtime_id.as_deref().unwrap_or(&edit_runtime_id),
             None,
         )?;
         ensure_plugin_api_ok(&stop_result)?;
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut status_stopped = false;
+        let mut stopped = false;
         while Instant::now() < deadline {
-            match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
+            let status_stopped = match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
                 Ok(status) => {
                     last_status = status.clone();
-                    status_stopped = studio_status_indicates_stopped(&status);
+                    studio_status_indicates_stopped(&status)
                 }
                 Err(err) => {
                     last_status = json!({ "error": format!("{:#}", err) });
-                    status_stopped = false;
+                    false
                 }
-            }
-            if status_stopped {
+            };
+            let launch_stopped = launch
+                .as_ref()
+                .is_none_or(|launch| test_launch_clients(bridge, launch).is_empty());
+            stopped = if server_runtime_id.is_some() {
+                launch_stopped
+            } else {
+                status_stopped && launch_stopped
+            };
+            if stopped {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        if status_stopped {
-            let teardown_deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let (clients, play_roles) = if let Some(launch_nonce) = launch_nonce.as_ref() {
-                    let launch = TestLaunch {
-                        nonce: launch_nonce.clone(),
-                        edit_runtime_id: edit_runtime_id.clone(),
-                    };
-                    let clients = test_launch_clients(bridge, &launch);
-                    let count = clients.len();
-                    (clients, count)
-                } else {
-                    (Vec::new(), 0)
-                };
-                last_play_roles = play_roles;
-                if play_roles == 0 {
-                    return Ok(json!({
-                        "ok": true,
-                        "action": "stop",
-                        "method": "pluginApi",
-                        "attempts": attempt,
-                        "stopResult": stop_result,
-                        "status": last_status,
-                        "clients": clients,
-                    }));
+        if stopped {
+            if server_runtime_id.is_some() {
+                let mut cleanup = Map::new();
+                cleanup.insert("stop".to_string(), Value::Bool(true));
+                if let Some(launch_nonce) = launch_nonce.as_ref() {
+                    cleanup.insert(
+                        "launchNonce".to_string(),
+                        Value::String(launch_nonce.clone()),
+                    );
                 }
-                if Instant::now() >= teardown_deadline {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(250));
+                last_status = bridge.call_for_runtime_with_timeout(
+                    "startStopPlay",
+                    Value::Object(cleanup),
+                    BridgeTarget::Edit,
+                    &edit_runtime_id,
+                    None,
+                )?;
+                ensure_plugin_api_ok(&last_status)?;
             }
+            bridge.clear_runtime_pins();
+            return Ok(json!({
+                "ok": true,
+                "action": "stop",
+                "method": "pluginApi",
+                "attempts": attempt,
+                "stopResult": stop_result,
+                "status": last_status,
+                "clients": clients,
+            }));
         }
-    }
-    if last_play_roles > 0 {
-        bail!(
-            "Studio reported edit mode but {} play bridge(s) are still connected after stop; last status: {}, connected bridges: {}",
-            last_play_roles,
-            serde_json::to_string(&last_status)?,
-            serde_json::to_string(&bridge.list_bridge_clients())?
-        );
     }
     bail!(
         "Studio did not report edit mode after plugin stop request; last status: {}",

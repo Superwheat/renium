@@ -813,7 +813,10 @@ fn automation_payload_args(parameters: &Value) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
     let mut arguments = Vec::new();
     for (key, value) in object {
-        if matches!(key.as_str(), "reviewId" | "op" | "p" | "service") {
+        if matches!(
+            key.as_str(),
+            "reviewId" | "op" | "p" | "service" | "bridgePorts" | "bridgeWaitSeconds"
+        ) {
             continue;
         }
         let mut flag = String::from("--");
@@ -897,7 +900,9 @@ fn automation_local_command(
     }
     if operation == 70 {
         arguments.push(context.root.clone());
-    } else if operation == 43 {
+    } else if operation == 71 {
+        arguments.extend(["--root".to_string(), context.root.clone()]);
+    } else if matches!(operation, 37 | 43) {
         arguments.extend([
             "--project-root".to_string(),
             context.root.clone(),
@@ -982,6 +987,25 @@ fn automation_local_cli_args(
             .and_then(|value| value.as_str().map(str::to_string))
     {
         arguments.extend(["--to-service".to_string(), target]);
+    }
+    if operation == 33 {
+        for (key, flag) in [("properties", "--property"), ("attributes", "--attribute")] {
+            let Some(values) = flags.remove(key) else {
+                continue;
+            };
+            let values = values
+                .as_array()
+                .with_context(|| format!("p.{key} must be a string array"))?;
+            for value in values {
+                arguments.extend([
+                    flag.to_string(),
+                    value
+                        .as_str()
+                        .with_context(|| format!("p.{key} must contain strings"))?
+                        .to_string(),
+                ]);
+            }
+        }
     }
     if operation == 43 {
         if let Some(snapshot_dir) = flags
@@ -1143,22 +1167,60 @@ fn automation_editor_mutation_args(
     object: &Map<String, Value>,
     operation: &str,
 ) -> Result<EditorMutationArgs> {
+    let service = automation_string(object, "service")
+        .with_context(|| format!("{operation} requires p.service"))?;
+    let settings_id = automation_string(object, "settingsId");
+    let mut path_segments: Vec<String> = serde_json::from_value(
+        object
+            .get("pathSegments")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .context("p.pathSegments must be a string array")?;
+    let mut path_ordinals: Vec<usize> = serde_json::from_value(
+        object
+            .get("pathOrdinals")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .context("p.pathOrdinals must be an integer array")?;
+    let mut class_name = automation_string(object, "className").unwrap_or_default();
+    if path_segments.is_empty()
+        && let Some(settings_id) = settings_id.as_deref()
+    {
+        let resolved = automation_batch(
+            context,
+            &json!({
+                "service": service,
+                "ops": [{ "type": "instance", "id": settings_id, "fields": "brief,ords" }]
+            }),
+        )?;
+        let instance = resolved
+            .get("rs")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .with_context(|| format!("No project instance has settings ID {settings_id}"))?;
+        path_segments = serde_json::from_value(instance["path"].clone())?;
+        path_ordinals = serde_json::from_value(instance["ords"].clone())?;
+        if class_name.is_empty() {
+            class_name = instance
+                .get("c")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
     Ok(EditorMutationArgs {
         project: ProjectSourceArgs {
             project_root: PathBuf::from(&context.root),
             src_root: source_dir,
         },
         bridge: automation_bridge(object, 2.0)?,
-        service: automation_string(object, "service")
-            .with_context(|| format!("{operation} requires p.service"))?,
-        settings_id: automation_string(object, "settingsId"),
-        class_name: automation_string(object, "className").unwrap_or_default(),
-        path_segments_json: serde_json::to_string(
-            object.get("pathSegments").unwrap_or(&json!([])),
-        )?,
-        path_ordinals_json: serde_json::to_string(
-            object.get("pathOrdinals").unwrap_or(&json!([])),
-        )?,
+        service,
+        settings_id,
+        class_name,
+        path_segments_json: serde_json::to_string(&path_segments)?,
+        path_ordinals_json: serde_json::to_string(&path_ordinals)?,
         override_packages: object
             .get("overridePackages")
             .and_then(Value::as_bool)
@@ -1608,16 +1670,20 @@ fn automation_dispatch_operation(
             if let Some(file) = parsed.file.take() {
                 parsed.file = Some(automation_context_path(context, file));
             }
-            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            if parsed.player.is_none() {
+                let target = BridgeTarget::main_or_client(parsed.client);
+                bridge.wait_for_target(bridge_wait_seconds, target)?;
+            }
             execute_luau_result(parsed, bridge)
         }
         55 => {
             let arguments = automation_bridge_args(parameters, &[])?;
             let parsed: PluginConsoleOutputArgs =
                 parse_daemon_request_args("get-console-output", &arguments)?;
-            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            if parsed.player.is_none() {
+                let target = BridgeTarget::main_or_client(parsed.client);
+                bridge.wait_for_target(bridge_wait_seconds, target)?;
+            }
             get_console_output_result(&parsed, bridge)
         }
         56 if parameters.get("test").and_then(Value::as_bool) == Some(true) => {
@@ -1630,7 +1696,6 @@ fn automation_dispatch_operation(
         56 | 57 => {
             let mut arguments = automation_payload_args(parameters)?;
             arguments.push(if operation == 56 { "--start" } else { "--stop" }.to_string());
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
             start_stop_play_result(
                 parse_daemon_request_args("start-stop-play", &arguments)?,
                 bridge,
@@ -1681,12 +1746,14 @@ fn automation_dispatch_operation(
             let arguments = automation_bridge_args(&payload, &[])?;
             let mut parsed: ShotArgs = parse_daemon_request_args("shot", &arguments)?;
             parsed.output = automation_context_path(context, parsed.output);
-            let target = if parsed.studio {
-                BridgeTarget::Edit
-            } else {
-                BridgeTarget::main_or_client(parsed.client || parsed.player.is_some())
-            };
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            if parsed.player.is_none() {
+                let target = if parsed.studio {
+                    BridgeTarget::Edit
+                } else {
+                    BridgeTarget::main_or_client(parsed.client)
+                };
+                bridge.wait_for_target(bridge_wait_seconds, target)?;
+            }
             shot_result(&parsed, bridge)
         }
         59 => {
@@ -1699,43 +1766,59 @@ fn automation_dispatch_operation(
         }
         60 => {
             let arguments = automation_bridge_args(parameters, &[])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             ui_result(&parse_daemon_request_args("ui", &arguments)?, bridge)
         }
         61 => {
             let arguments = automation_bridge_args(parameters, &["path"])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             press_result(&parse_daemon_request_args("press", &arguments)?, bridge)
         }
         62 => {
             let arguments = automation_bridge_args(parameters, &["x", "y"])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             click_result(&parse_daemon_request_args("click", &arguments)?, bridge)
         }
         63 => {
             let arguments = automation_bridge_args(parameters, &["key"])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             key_result(&parse_daemon_request_args("key", &arguments)?, bridge)
         }
         64 => {
             let arguments = automation_bridge_args(parameters, &["text"])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             type_result(&parse_daemon_request_args("type", &arguments)?, bridge)
         }
         65 => {
             let arguments = automation_bridge_args(parameters, &["condition"])?;
             let parsed: WaitUntilArgs = parse_daemon_request_args("wait-until", &arguments)?;
-            let target = BridgeTarget::main_or_client(parsed.client || parsed.player.is_some());
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            if parsed.player.is_none() {
+                let target = BridgeTarget::main_or_client(parsed.client);
+                bridge.wait_for_target(bridge_wait_seconds, target)?;
+            }
             wait_until_result(&parsed, bridge)
         }
         66 => {
             let arguments = automation_bridge_args(parameters, &["target"])?;
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             goto_result(&parse_daemon_request_args("goto", &arguments)?, bridge)
         }
         67 => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+            }
             input_result(parameters, bridge)
         }
         68 => {
@@ -1747,7 +1830,9 @@ fn automation_dispatch_operation(
                         || parameters.get("player").is_some(),
                 )
             };
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            if parameters.get("player").is_none() {
+                bridge.wait_for_target(bridge_wait_seconds, target)?;
+            }
             record_start_result(
                 parameters,
                 bridge,

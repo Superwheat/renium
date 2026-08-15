@@ -2,8 +2,17 @@
 
 ## Unreleased
 
-## 0.1.7 - 2026-08-14
+## 0.1.7 - 2026-08-15
 
+- Changed exact-window recordings from animated WebP images to H.264 MP4 clips on every supported platform.
+- Kept normal pulls on Studio's plugin serializer and ignored Roblox-reserved service attributes that third-party plugins cannot recreate.
+- Kept automatic plugin reconnection active across Edit, Play server, and Play client states with bounded retry delays.
+- Fixed repeated Play start and stop cycles, multi-client runtime selection, stale runtime pins, and false duplicate-launch errors.
+- Added a targeted cross-platform input shield with an orange viewport outline and the current Renium version while preserving system window switching.
+- Added shielded plugin virtual input for Linux and retained exact-window native input on Windows and macOS.
+- Fixed typed automation requests for plural instance properties and attributes, settings-ID editor mutations, live status, bound project validation, and Revert history.
+- Returned useful Revert results, normalized Windows script paths, and bounded documentation snippets from minified Roblox pages.
+- Prevented Play clients from creating edit-session locks and fixed console filtering results.
 - Kept editor update prompts open until the user chooses **Update**, **Later**, or closes the prompt.
 
 ## 0.1.6 - 2026-08-14

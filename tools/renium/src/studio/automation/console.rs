@@ -20,10 +20,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     } else if let Some(result) =
         try_daemon_control_request("co", get_console_output_daemon_args(&args))?
     {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&filtered_console_result(&args, result))?
-        );
+        println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
@@ -33,10 +30,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         return follow_console_with_bridge(&args, &bridge);
     }
     let result = get_console_output_result(&args, &bridge)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&filtered_console_result(&args, result))?
-    );
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -61,7 +55,7 @@ pub(crate) fn get_console_output_result(
         args.player.as_deref(),
     )?;
     ensure_plugin_api_ok(&result)?;
-    Ok(result)
+    Ok(filtered_console_result(args, result))
 }
 
 fn update_console_follow_epoch(
@@ -218,7 +212,7 @@ fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) ->
             return result;
         };
     if let Some(object) = result.as_object_mut() {
-        object.insert("filteredCount".to_string(), json!(filtered_count));
+        object.insert("count".to_string(), json!(filtered_count));
     }
     result
 }

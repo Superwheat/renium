@@ -40,6 +40,7 @@ const VC_GITATTRIBUTES_TEMPLATE: &str = "\
 *.jpg binary
 *.jpeg binary
 *.webp binary
+*.mp4 binary
 *.ico binary
 *.mp3 binary
 *.ogg binary
