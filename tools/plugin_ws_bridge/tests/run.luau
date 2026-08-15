@@ -7,6 +7,7 @@ local Chunking = require("../BridgeChunking.module")
 local Content = require("../BridgeContent.module")
 local Identity = require("../BridgeIdentity.module")
 local InstanceSwap = require("../BridgeInstanceSwap.module")
+local ReferenceOverlay = require("../BridgeReferenceOverlay.module")
 local ReferenceRetarget = require("../BridgeReferenceRetarget.module")
 local Settings = require("../BridgeSettings.module")
 local Update = require("../BridgeUpdate.module")
@@ -305,6 +306,61 @@ local lockedChildren = lockedParent:GetChildren()
 equal(lockedReplacementOk, false, "locked sibling replacement rejected")
 equal(lockedChildren[1], lockedTarget, "locked sibling target retained")
 equal(lockedChildren[2], lockedSibling, "locked sibling retained")
+
+local nativeGroups = {}
+for _, serviceName in ipairs({ "Workspace", "ReplicatedStorage" }) do
+	local target = roblox.Instance.new("Folder")
+	local outgoing = roblox.Instance.new("Folder")
+	outgoing.Parent = target
+	nativeGroups[#nativeGroups + 1] = {
+		incoming = { roblox.Instance.new("Folder") },
+		outgoing = { outgoing },
+		packageRoots = {},
+		packageScanRoots = {},
+		serviceName = serviceName,
+		target = target,
+	}
+end
+local allIncomingAttachedBeforeRemoval = true
+local nativeOverlay = ReferenceOverlay.create({
+	BridgeIdentity = {},
+	BridgeReferenceRetarget = ReferenceRetarget,
+	RbxDomModule = {},
+	captureExplorerSelection = function()
+		return {}
+	end,
+	removeInstanceForUndo = function(instance)
+		for _, group in ipairs(nativeGroups) do
+			allIncomingAttachedBeforeRemoval = allIncomingAttachedBeforeRemoval
+				and group.incoming[1].Parent == group.target
+		end
+		instance.Parent = nil
+	end,
+	restoreExplorerSelection = function() end,
+	setParentForSync = function(instance, parent)
+		instance.Parent = parent
+	end,
+})
+nativeOverlay.commitNative({
+	generationsByService = {},
+	guard = { connections = {} },
+	prepared = nativeGroups,
+	referenceUpdates = 0,
+	replacements = {},
+	retainedLiveRoots = {},
+	outgoingScanRoots = {},
+}, {
+	allowedServices = {},
+	invalidateService = function() end,
+	studioChangeGeneration = function()
+		return 0
+	end,
+})
+equal(allIncomingAttachedBeforeRemoval, true, "all native replacements attached before removal")
+for _, group in ipairs(nativeGroups) do
+	equal(group.incoming[1].Parent, group.target, "native replacement retained")
+	equal(group.outgoing[1].Parent, nil, "native original detached")
+end
 
 equal(Content.serializeSource("None", nil), "", "empty content")
 equal(Content.serializeSource("Uri", "rbxassetid://123"), "rbxassetid://123", "URI content")

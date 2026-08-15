@@ -594,16 +594,16 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		if contentFailed > 0 then
 			error(`Could not retarget {contentFailed} native import content references`)
 		end
+		for _, group in ipairs(undo.prepared) do
+			for _, instance in ipairs(group.incoming) do
+				setParentForSync(instance, group.target, ctx)
+			end
+		end
 		local removedRootCount = 0
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.outgoing) do
 				removeInstanceForUndo(instance, ctx)
 				removedRootCount += 1
-			end
-		end
-		for _, group in ipairs(undo.prepared) do
-			for _, instance in ipairs(group.incoming) do
-				setParentForSync(instance, group.target, ctx)
 			end
 		end
 		local selectionReplacements = {}
