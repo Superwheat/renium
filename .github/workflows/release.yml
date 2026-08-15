@@ -9,7 +9,6 @@ permissions:
   contents: write
   id-token: write
   attestations: write
-  artifact-metadata: write
 
 jobs:
   verify-tag:
@@ -154,16 +153,11 @@ jobs:
           if (-not (Test-Path $release -PathType Container)) { throw "Release directory was not produced" }
           $shared = Join-Path $env:RUNNER_TEMP "renium-shared"
           New-Item -ItemType Directory -Path $shared | Out-Null
-          @(
-            "Renium.rbxm",
-            "Renium.rbxmx"
-          ) | ForEach-Object {
-            $source = Join-Path $release $_
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-              throw "Release directory is missing $_"
-            }
-            Copy-Item -LiteralPath $source -Destination $shared
+          $plugin = Join-Path $release "Renium.rbxm"
+          if (-not (Test-Path -LiteralPath $plugin -PathType Leaf)) {
+            throw "Release directory is missing Renium.rbxm"
           }
+          Copy-Item -LiteralPath $plugin -Destination $shared
           Copy-Item `
             -LiteralPath (Join-Path $release "Install Renium.cmd") `
             -Destination (Join-Path $shared "Install-Renium.cmd")
@@ -269,30 +263,9 @@ jobs:
         with:
           subject-path: ${{ env.RENIUM_VSIX }}
 
-  sbom:
-    name: Software bill of materials
-    needs: verify-tag
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: anchore/sbom-action@v0
-        with:
-          path: .
-          format: spdx-json
-          output-file: renium.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: renium.spdx.json
-          if-no-files-found: error
-
   publish:
     name: Publish GitHub release
-    needs: [verify-tag, cli, integration, extension, sbom]
+    needs: [verify-tag, cli, integration, extension]
     runs-on: ubuntu-latest
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
@@ -326,24 +299,9 @@ jobs:
             "${{ github.repository }}" \
             release-assets/update-manifest.json
 
-      - name: Generate checksums
-        run: |
-          (
-            cd release-assets
-            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\0' \
-              | sort -z \
-              | xargs -0 sha256sum \
-              > SHA256SUMS.txt
-          )
-
       - uses: actions/attest@v4
         with:
           subject-path: release-assets/*
-
-      - uses: actions/attest@v4
-        with:
-          subject-path: release-assets/*
-          sbom-path: release-assets/renium.spdx.json
 
       - name: Prepare release notes
         env:

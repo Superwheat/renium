@@ -370,7 +370,7 @@ class RobloxSyncController {
   private experienceChangeInProgress = false;
   private experienceGeneration = 0;
   private configuredProjectRoot: string | undefined;
-  private projectRootConfigurationSnapshot: ProjectRootConfigurationSnapshot;
+  private projectRootConfigurationSnapshot: ProjectRootConfigurationSnapshot = {};
   private configurationChangeQueue: Promise<void> = Promise.resolve();
   private sourcemapCache: SourcemapCache | undefined;
   private readonly consoleOutput = vscode.window.createOutputChannel("Renium Console");
@@ -451,12 +451,14 @@ class RobloxSyncController {
       executeCommandBestEffort,
     });
     this.restoreActiveExperiencePlace();
-    const initialConfig = this.getConfig();
-    this.configuredProjectRoot = initialConfig.projectRoot;
-    this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
-    this.ensureAgentInstructions(initialConfig.experienceRoot);
-    this.restorePendingEditorPaths();
-    void this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+    const initialConfig = pickWorkspaceRoot() ? this.getConfig() : undefined;
+    if (initialConfig) {
+      this.configuredProjectRoot = initialConfig.projectRoot;
+      this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
+      this.ensureAgentInstructions(initialConfig.experienceRoot);
+      this.restorePendingEditorPaths(initialConfig.projectRoot);
+      void this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+    }
     this.statusItem.command = "renium.openMenu";
     this.statusItem.show();
     this.updateStatusBar();
@@ -5574,13 +5576,13 @@ class RobloxSyncController {
     return "applied";
   }
 
-  public onConfigurationChanged(event?: vscode.ConfigurationChangeEvent): void {
+  public onConfigurationChanged(event?: vscode.ConfigurationChangeEvent): Promise<void> {
     if (!event || event.affectsConfiguration("renium.automaticUpdateChecks")) {
       this.scheduleAutomaticUpdateCheck();
     }
     const apply = this.configurationChangeQueue.then(() => this.applyConfigurationChanged(event));
     this.configurationChangeQueue = apply.catch(() => undefined);
-    void apply.catch((error) => {
+    return apply.catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`[renium] configuration reload failed: ${message}`);
       void vscode.window.showErrorMessage(`Could not reload Renium configuration. ${message}`);
@@ -5588,10 +5590,25 @@ class RobloxSyncController {
   }
 
   private async applyConfigurationChanged(event?: vscode.ConfigurationChangeEvent): Promise<void> {
+    if (!pickWorkspaceRoot()) {
+      this.configuredProjectRoot = undefined;
+      this.projectRootConfigurationSnapshot = {};
+      this.updateStatusBar();
+      return;
+    }
     const cfg = this.getConfig();
     const editorLiveSyncChanged = event?.affectsConfiguration("renium.editorLiveSyncEnabled") === true;
     const projectRootChanged = event?.affectsConfiguration("renium.projectRoot") === true;
-    if (projectRootChanged) {
+    if (!this.configuredProjectRoot) {
+      this.configuredProjectRoot = cfg.projectRoot;
+      this.projectRootConfigurationSnapshot = this.captureProjectRootConfiguration();
+      this.restorePendingEditorPaths(cfg.projectRoot);
+      this.resetProjectScopedCaches();
+      await this.configureLuauSourcemapForEditor(vscode.window.activeTextEditor);
+      await vscode.commands.executeCommand("renium.fileExplorer.switchProject");
+      this.ensureAgentInstructions(cfg.experienceRoot);
+      this.packages.resumePendingSources(cfg.projectRoot, this.experienceGeneration, 1000);
+    } else if (projectRootChanged) {
       const previousRoot = this.configuredProjectRoot;
       if (
         previousRoot !== undefined
@@ -6094,6 +6111,9 @@ class RobloxSyncController {
   }
 
   public settingsStoreViewerCli(): { cliPath: string; cwd: string } | undefined {
+    if (!pickWorkspaceRoot()) {
+      return undefined;
+    }
     const cfg = this.getConfig();
     if (!cfg.cliPath) {
       return undefined;
@@ -6858,8 +6878,15 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("renium")) {
-        controller.onConfigurationChanged(event);
+        void controller.onConfigurationChanged(event);
       }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void controller.onConfigurationChanged().then(() => {
+        if (controller.settingsStoreViewerCli()) {
+          controller.packages.scheduleStartupLinkRefresh();
+        }
+      });
     }),
   );
 
@@ -6943,10 +6970,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  void linkDecorationProvider.refresh();
-  void controller.packages.pushLinkStateToExplorer();
-  void controller.packages.refreshLinkPackageSourceWatchers().catch(() => undefined);
-  controller.packages.scheduleStartupLinkRefresh();
+  if (controller.settingsStoreViewerCli()) {
+    void linkDecorationProvider.refresh();
+    void controller.packages.pushLinkStateToExplorer();
+    void controller.packages.refreshLinkPackageSourceWatchers().catch(() => undefined);
+    controller.packages.scheduleStartupLinkRefresh();
+  }
   setTimeout(() => {
     void restoreOpenPackageScriptTabs().catch(() => undefined);
   }, 500);
