@@ -806,8 +806,8 @@ pub(super) fn studio_change_state_daemon_args(args: &StudioChangeStateArgs) -> V
         out.push("--suppress-seconds".to_string());
         out.push(suppress_seconds.to_string());
     }
-    if let Some(wait_seconds) = args.wait_seconds {
-        out.push("--wait-seconds".to_string());
+    if let Some(wait_seconds) = args.event_wait_seconds {
+        out.push("--event-wait-seconds".to_string());
         out.push(wait_seconds.to_string());
     }
     if args.context_bound {

@@ -1351,6 +1351,50 @@ updateMouse()
 		}
 	end
 
+	function api.sendVirtualInput(params)
+		if not RunService:IsRunning() or not RunService:IsClient() then
+			return { ok = false, error = "Virtual input requires a Play client" }
+		end
+		local actions = params.actions
+		if type(actions) ~= "table" or #actions < 1 or #actions > 1024 then
+			return { ok = false, error = "Virtual input requires 1 through 1024 actions" }
+		end
+		local virtualInput = game:GetService("UserInputService"):CreateVirtualInput()
+		for _, action in actions do
+			local actionType = tostring(action.type or "")
+			if actionType == "wait" then
+				task.wait(math.clamp((tonumber(action.ms) or 0) / 1000, 0, 10))
+			elseif actionType == "key" then
+				local keyCode = Enum.KeyCode[tostring(action.key or "")]
+				if keyCode == nil then
+					error("Unknown key " .. tostring(action.key), 0)
+				end
+				virtualInput:SendKey(action.down == true, keyCode, action.repeated == true)
+			elseif actionType == "text" then
+				virtualInput:SendTextInput(tostring(action.text or ""))
+			else
+				local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
+				if actionType == "move" then
+					virtualInput:SendMousePosition(position)
+				elseif actionType == "button" then
+					local button = Enum.UserInputType.MouseButton1
+					if action.button == "right" then
+						button = Enum.UserInputType.MouseButton2
+					elseif action.button == "middle" then
+						button = Enum.UserInputType.MouseButton3
+					end
+					virtualInput:SendMouseButton(position, button, action.down == true, tonumber(action.repeatCount) or 0)
+				elseif actionType == "scroll" then
+					virtualInput:SendPointerAction(position, { Wheel = tonumber(action.delta) or 0 })
+				else
+					error("Unknown virtual input action " .. actionType, 0)
+				end
+			end
+		end
+		task.wait()
+		return { ok = true, actions = #actions }
+	end
+
 	function api.getConsoleOutput(params)
 		local limit = if params.clear == true
 			then CONSOLE_BUFFER_LIMIT
@@ -2034,20 +2078,10 @@ updateMouse()
 	end
 
 	function api.isPlayModeRunning()
-		local studioTestState = currentStudioTestState()
-		local editMode = RunService:IsEdit()
-		local running = RunService:IsRunning()
-		local state = RunService.RunState
-		if state == Enum.RunState.Stopped and studioTestState.editModeActive ~= false then
-			return false
-		elseif studioTestState.editModeActive == true then
-			return false
-		elseif running then
-			return true
-		elseif studioTestState.editModeActive == false then
-			return true
-		end
-		return not editMode
+		return not RunService:IsEdit()
+			or RunService:IsRunning()
+			or RunService.RunState ~= Enum.RunState.Stopped
+			or not (StudioTestService :: any).EditModeActive
 	end
 
 	local function waitForStopped(timeoutSeconds, operationGeneration)
@@ -2090,7 +2124,7 @@ updateMouse()
 		return {
 			ok = true,
 			action = action,
-			running = api.isPlayModeRunning(),
+			running = api.isPlayModeRunning() or playSession.active,
 			starting = playSession.starting,
 			mode = playSession.mode,
 			launchNonce = playSession.launchNonce,
@@ -2099,18 +2133,6 @@ updateMouse()
 			runState = currentRunStateText(),
 			studioTest = currentStudioTestState(),
 		}
-	end
-
-	local function cancelOwnedPlayLaunch(token, ownerGeneration)
-		if playSession.token ~= token or not matchingOwnedPlayLaunch(ownerGeneration) then
-			return
-		end
-		playSession.token += 1
-		pcall((StudioTestService :: any).EndTest, StudioTestService, true)
-		playSession.active = false
-		playSession.starting = false
-		playSession.lastStoppedAt = os.clock()
-		releasePlayOwnership()
 	end
 
 	local function executeStudioTest(token, mode, testArgs, numPlayers)
@@ -2125,22 +2147,46 @@ updateMouse()
 		if playSession.token ~= token then
 			return
 		end
+		if ok then
+			playSession.active = true
+			playSession.starting = true
+			playSession.lastResult = serializeApiValue(result)
+			playSession.lastError = nil
+			return
+		end
 		playSession.active = false
 		playSession.starting = false
 		playSession.lastStoppedAt = os.clock()
-		if ok then
-			playSession.lastResult = serializeApiValue(result)
-			playSession.lastError = nil
-		else
-			playSession.lastResult = nil
-			playSession.lastError = tostring(result)
-		end
+		playSession.lastResult = nil
+		playSession.lastError = tostring(result)
 		releasePlayOwnership()
+	end
+
+	local function monitorStudioTest(token)
+		while playSession.token == token and playSession.active and not api.isPlayModeRunning() do
+			task.wait(0.05)
+		end
+		if playSession.token ~= token or not playSession.active then
+			return
+		end
+		playSession.starting = false
+		while playSession.token == token and api.isPlayModeRunning() do
+			task.wait(0.05)
+		end
+		if playSession.token == token and playSession.active then
+			playSession.active = false
+			playSession.starting = false
+			playSession.lastStoppedAt = os.clock()
+			releasePlayOwnership()
+		end
 	end
 
 	function api.startStopPlay(params)
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
+		if playSession.active and api.isPlayModeRunning() then
+			playSession.starting = false
+		end
 		local shouldStart = params.start == true
 		local shouldStop = params.stop == true
 		if shouldStart and shouldStop then
@@ -2151,15 +2197,6 @@ updateMouse()
 		if shouldStart then
 			action = "start"
 			local requestedLaunchNonce = tostring(params.launchNonce or "")
-			if playSession.starting and not api.isPlayModeRunning() and os.clock() - playSession.lastStartedAt > 60 then
-				cancelOwnedPlayLaunch(playSession.token, playSession.ownerGeneration)
-				if playSession.starting then
-					playSession.token += 1
-					playSession.starting = false
-					playSession.active = false
-					releasePlayOwnership()
-				end
-			end
 			if
 				requestedLaunchNonce ~= ""
 				and (api.isPlayModeRunning() or playSession.starting)
@@ -2196,17 +2233,25 @@ updateMouse()
 				game:SetAttribute("__ReniumEditRuntimeId", playSession.ownerRuntimeId)
 				local token = playSession.token
 				local mode = playSession.mode
-				local testArgs = params.args or ""
+				local testArgs = {
+					__renium = {
+						nonce = requestedLaunchNonce,
+						editRuntimeId = playSession.ownerRuntimeId,
+					},
+					value = params.args,
+				}
 				task.spawn(function()
 					executeStudioTest(token, mode, testArgs, numPlayers)
 				end)
+				task.spawn(monitorStudioTest, token)
 			end
 		elseif shouldStop then
 			action = "stop"
 			if
 				type(params.launchNonce) == "string"
 				and params.launchNonce ~= ""
-				and (not playSession.owned or playSession.launchNonce ~= params.launchNonce)
+				and playSession.owned
+				and playSession.launchNonce ~= params.launchNonce
 			then
 				return { ok = false, error = "The active Studio test does not match this Renium launch" }
 			end
@@ -2222,11 +2267,7 @@ updateMouse()
 				return attemptOk
 			end
 			local function requestStop()
-				if
-					operationGeneration ~= cancellationGeneration
-					or params.waitForStopped == false
-						and (not playSession.owned or playSession.ownerGeneration ~= operationGeneration)
-				then
+				if operationGeneration ~= cancellationGeneration then
 					return
 				end
 				if api.isPlayModeRunning() or playSession.active or playSession.starting then

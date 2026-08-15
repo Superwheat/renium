@@ -47,7 +47,7 @@ Put these two files anywhere together, or put the CLI on `PATH`:
 
 ```text
 rbx.cmd   renium.exe        (Windows; or bin\renium.exe)
-rbx       renium            (macOS; chmod +x both)
+rbx       renium            (macOS and Linux; chmod +x both)
 ```
 
 `rbx` is the short launcher used in every example below. It finds the CLI in
@@ -284,9 +284,11 @@ don't respond to injected clicks (engine limitation: hover events react, but
 MouseClick validation follows the real hardware cursor) — ProximityPrompts
 (`goto` + `key E`) and UserInputService-driven interaction work. `press`/`click`
 take `--hold <ms>` (default 30) for the down→up gap. Short aliases:
-`pr`, `clk`, `ky`, `ty`, `sc`, `wait`, `go`. Windows works today; macOS support
-is implemented via Quartz events (needs Accessibility + Screen Recording
-permissions) but has not been live-verified yet.
+`pr`, `clk`, `ky`, `ty`, `sc`, `wait`, `go`. Windows uses targeted window
+messages, macOS uses Quartz events and needs Accessibility permission, and
+Linux uses the connected Play client's virtual-input API. Input commands show
+an orange Renium shield over the target viewport while they run. The shield is
+a transparent native overlay; it never adds Roblox UI or project instances.
 
 Read Studio console output:
 
@@ -453,7 +455,10 @@ ownership use Open Cloud instead.
 Ordered mouse and keyboard sequences use `rbx a input CX -J input.json`.
 Windows posts events to the exact target window handle and macOS posts Quartz
 events to the exact target process. Neither implementation moves the system
-cursor, sends global input, or activates another application.
+cursor, sends global input, or activates another application. Linux sends the
+same ordered actions inside the selected Play client without desktop focus.
+The native shield follows the target app window while leaving its background
+transparent.
 
 Agents can record the edit viewport or one play client without activating its
 window or capturing the rest of the desktop:
@@ -464,9 +469,9 @@ rbx a record-end CX -J record-end.json
 ```
 
 `record-start` accepts `player`, `studio`, `client`, an `output` path ending in
-`.webp`, `fps` from 1 through 30, `maxSeconds` from 1 through 300, and `quality`
+`.mp4`, `fps` from 1 through 30, `maxSeconds` from 1 through 300, and `quality`
 from 0 through 100. Pass its returned `recordingId` to `record-end`. The result
-is an animated WebP with no audio and can be attached directly as a clip.
+is an H.264 MP4 with no audio and can be attached directly as a clip.
 
 `rbx docs [topic]` prints the bundled reference. `rbx docs --serve` exposes the
 same text on a read-only loopback page.

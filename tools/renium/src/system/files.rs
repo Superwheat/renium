@@ -270,7 +270,7 @@ pub(crate) fn write_bytes_if_changed_in_existing_dir(path: &Path, content: &[u8]
     publish_sibling_temp_with_permissions(&temp_path, path, was_readonly)
 }
 
-fn cleanup_stale_sibling_temps(path: &Path) {
+pub(crate) fn cleanup_stale_sibling_temps(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -329,7 +329,7 @@ fn publish_sibling_temp_with_permissions(
     Ok(())
 }
 
-fn sibling_temp_path(path: &Path) -> PathBuf {
+pub(crate) fn sibling_temp_path(path: &Path) -> PathBuf {
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = path

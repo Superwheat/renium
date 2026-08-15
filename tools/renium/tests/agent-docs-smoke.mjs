@@ -45,7 +45,7 @@ for (const [name, payload] of Object.entries({
   "client-luau.json": { player: "2", code: "return game.PlaceId" },
   "console.json": { player: "2", limit: 20 },
   "shot.json": { player: "2", output: "shot.png" },
-  "record-start.json": { player: "2", output: "test-clip.webp", fps: 12, maxSeconds: 60, quality: 80 },
+  "record-start.json": { player: "2", output: "test-clip.mp4", fps: 12, maxSeconds: 60, quality: 80 },
   "record-end.json": { recordingId: "RECORDING_ID_FROM_RECORD_START" },
   "ui.json": { player: "2", limit: 100 },
   "press.json": { player: "2", path: "PlayerGui.Shop.BuyButton" },

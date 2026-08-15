@@ -60,8 +60,6 @@ use crate::rbx::model::{RbxPlaceBuild, build_rbx_place, rbx_dom_instance_path_pa
 use crate::roblox::schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
-#[cfg(any(windows, target_os = "macos"))]
-use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
 use crate::snapshot::export::{log_chunk_fetch_metrics, merge_chunk_fetch_metrics};
 use crate::snapshot::types::{
     ExportedSnapshotParts, NativeConditionalOverlayFetch, NativeConditionalOverlayRequest,
@@ -119,40 +117,16 @@ pub(crate) fn begin_editor_binary_export(
     metadata_only: bool,
 ) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
-    #[cfg(any(windows, target_os = "macos"))]
-    let needs_material_access = !metadata_only
-        && service_order.is_none_or(|services| {
-            services
-                .iter()
-                .any(|service| service == MATERIAL_SERVICE_CLASS)
-        });
-    let begin_request = || {
-        bridge.call(
-            "beginEditorBinaryExport",
-            json!({
-                "exportId": &export_id,
-                "partitioned": partitioned,
-                "serviceOrder": service_order,
-                "serializationWorkers": partitioned.then_some(2),
-                "metadataOnly": metadata_only,
-            }),
-        )
-    };
-    #[cfg(any(windows, target_os = "macos"))]
-    let (begin, material_root_properties) = if needs_material_access {
-        let (begin, properties) = rayon::join(begin_request, || {
-            let database =
-                rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-            read_live_service_root_property_values(bridge, MATERIAL_SERVICE_CLASS, database)
-        });
-        #[cfg(any(windows, target_os = "macos"))]
-        let properties = Some(properties?);
-        (begin?, properties)
-    } else {
-        (begin_request()?, None)
-    };
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let begin = begin_request()?;
+    let begin = bridge.call(
+        "beginEditorBinaryExport",
+        json!({
+            "exportId": &export_id,
+            "partitioned": partitioned,
+            "serviceOrder": service_order,
+            "serializationWorkers": partitioned.then_some(2),
+            "metadataOnly": metadata_only,
+        }),
+    )?;
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -178,33 +152,6 @@ pub(crate) fn begin_editor_binary_export(
         {
             bail!("Studio returned invalid native export groups");
         }
-        #[cfg(any(windows, target_os = "macos"))]
-        let groups = {
-            let mut groups = groups;
-            if let Some(properties) = material_root_properties {
-                let database = rbx_reflection_database::get()
-                    .context("Failed to load Roblox reflection DB")?;
-                let material = groups
-                    .iter_mut()
-                    .find(|group| group.service == MATERIAL_SERVICE_CLASS)
-                    .context("Studio native export omitted MaterialService")?;
-                merge_live_service_root_property_values(
-                    MATERIAL_SERVICE_CLASS,
-                    &mut material.root_properties,
-                    &properties,
-                    database,
-                );
-                if material
-                    .root_properties
-                    .get(USE_2022_MATERIALS_PROPERTY)
-                    .and_then(Value::as_bool)
-                    .is_none()
-                {
-                    bail!("Native MaterialService root omitted Use2022Materials");
-                }
-            }
-            groups
-        };
         let serialization_batches = serde_json::from_value::<Vec<EditorBinarySerializationBatch>>(
             begin
                 .get("serializationBatches")

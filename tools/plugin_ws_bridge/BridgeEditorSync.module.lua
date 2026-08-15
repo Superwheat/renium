@@ -3317,7 +3317,9 @@ local function captureNativeExportSnapshot(
 	local service = fingerprint[1][1]
 	local rootPropertyValues = ctx.captureRootProperties(serviceName)
 	for name, value in pairs(service:GetAttributes()) do
-		marker:SetAttribute(name, value)
+		if name:sub(1, 3) ~= "RBX" then
+			marker:SetAttribute(name, value)
+		end
 	end
 	for _, tag in ipairs(CollectionService:GetTags(service)) do
 		CollectionService:AddTag(marker, tag)

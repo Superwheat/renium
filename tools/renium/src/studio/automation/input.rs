@@ -1,14 +1,17 @@
+#[cfg(any(windows, target_os = "macos"))]
 use std::thread;
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    calibrate_click_delta, client_viewport_size, ensure_plugin_api_ok, resolve_player_window,
-    wait_for_player_bridge,
-};
+#[cfg(any(windows, target_os = "macos"))]
+use super::{client_viewport_size, input_delta, resolve_player_window};
+use super::{ensure_plugin_api_ok, wait_for_player_bridge};
+#[cfg(not(any(windows, target_os = "macos")))]
+use super::{send_virtual_input, virtual_click_actions};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
 
@@ -118,6 +121,7 @@ fn action_position(
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let request: InputRequest = serde_json::from_value(parameters.clone())?;
     if request.actions.is_empty() || request.actions.len() > 256 {
@@ -129,6 +133,8 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
     }
     let (window, offset_x, offset_y) =
         resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let _shield = input_inject::input_shield(&window)?;
     let mut position = None;
     let mut calibration = None;
 
@@ -137,9 +143,8 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => {
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
-                    let (dx, dy) = *calibration.get_or_insert_with(|| {
-                        calibrate_click_delta(bridge, player, &window, x, y)
-                    });
+                    let (dx, dy) = *calibration
+                        .get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
                     input_inject::post_mouse_click(
                         &window,
                         x + offset_x + dx,
@@ -167,9 +172,8 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             InputActionKind::Text => {
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
-                    let (dx, dy) = *calibration.get_or_insert_with(|| {
-                        calibrate_click_delta(bridge, player, &window, x, y)
-                    });
+                    let (dx, dy) = *calibration
+                        .get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
                     input_inject::post_mouse_click(
                         &window,
                         x + offset_x + dx,
@@ -194,8 +198,8 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             | InputActionKind::ScrollUp
             | InputActionKind::ScrollDown => {
                 let (x, y) = action_position(action, bridge, player, position)?;
-                let (dx, dy) = *calibration
-                    .get_or_insert_with(|| calibrate_click_delta(bridge, player, &window, x, y));
+                let (dx, dy) =
+                    *calibration.get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
                 let window_x = x + offset_x + dx;
                 let window_y = y + offset_y + dy;
                 let right = matches!(action.button, Some(MouseButton::Right));
@@ -236,5 +240,114 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
         "action": "input",
         "actions": request.actions.len(),
         "window": window.label,
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
+    let request: InputRequest = serde_json::from_value(parameters.clone())?;
+    if request.actions.is_empty() || request.actions.len() > 256 {
+        bail!("input requires 1 through 256 actions");
+    }
+    let player = request.player.as_deref();
+    if let Some(player) = player {
+        wait_for_player_bridge(bridge, player, 8.0)?;
+    }
+    let mut position = None;
+    let mut commands = Vec::new();
+    for action in &request.actions {
+        match action.action {
+            InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => {
+                if action.path.is_some() {
+                    let (x, y) = action_position(action, bridge, player, position)?;
+                    commands.extend(virtual_click_actions(x, y, false, 30));
+                    position = Some((x, y));
+                }
+                let key = input_inject::resolve_key(
+                    action
+                        .key
+                        .as_deref()
+                        .context("Keyboard actions require key")?,
+                )?;
+                match action.action {
+                    InputActionKind::KeyDown => {
+                        commands.push(json!({ "type": "key", "key": key.name, "down": true }))
+                    }
+                    InputActionKind::KeyUp => {
+                        commands.push(json!({ "type": "key", "key": key.name, "down": false }))
+                    }
+                    InputActionKind::KeyPress => commands.extend([
+                        json!({ "type": "key", "key": key.name, "down": true }),
+                        json!({ "type": "wait", "ms": action.ms.unwrap_or(60).min(10_000) }),
+                        json!({ "type": "key", "key": key.name, "down": false }),
+                    ]),
+                    _ => unreachable!(),
+                }
+            }
+            InputActionKind::Text => {
+                if action.path.is_some() {
+                    let (x, y) = action_position(action, bridge, player, position)?;
+                    commands.extend(virtual_click_actions(x, y, false, 30));
+                    position = Some((x, y));
+                }
+                commands.push(json!({
+                    "type": "text",
+                    "text": action.text.as_deref().context("text action requires text")?,
+                }));
+                commands.push(json!({ "type": "wait", "ms": 0 }));
+            }
+            InputActionKind::Move
+            | InputActionKind::MouseDown
+            | InputActionKind::MouseUp
+            | InputActionKind::Click
+            | InputActionKind::ScrollUp
+            | InputActionKind::ScrollDown => {
+                let (x, y) = action_position(action, bridge, player, position)?;
+                let button = if matches!(action.button, Some(MouseButton::Right)) {
+                    "right"
+                } else {
+                    "left"
+                };
+                match action.action {
+                    InputActionKind::Move => {
+                        commands.push(json!({ "type": "move", "x": x, "y": y }))
+                    }
+                    InputActionKind::MouseDown => commands.extend([
+                        json!({ "type": "move", "x": x, "y": y }),
+                        json!({ "type": "button", "x": x, "y": y, "button": button, "down": true }),
+                    ]),
+                    InputActionKind::MouseUp => commands.extend([
+                        json!({ "type": "move", "x": x, "y": y }),
+                        json!({ "type": "button", "x": x, "y": y, "button": button, "down": false }),
+                    ]),
+                    InputActionKind::Click => commands.extend(virtual_click_actions(
+                        x,
+                        y,
+                        button == "right",
+                        action.ms.unwrap_or(30),
+                    )),
+                    InputActionKind::ScrollUp => commands.extend([
+                        json!({ "type": "move", "x": x, "y": y }),
+                        json!({ "type": "scroll", "x": x, "y": y, "delta": 1 }),
+                    ]),
+                    InputActionKind::ScrollDown => commands.extend([
+                        json!({ "type": "move", "x": x, "y": y }),
+                        json!({ "type": "scroll", "x": x, "y": y, "delta": -1 }),
+                    ]),
+                    _ => unreachable!(),
+                }
+                position = Some((x, y));
+            }
+            InputActionKind::Wait => {
+                commands.push(json!({ "type": "wait", "ms": action.ms.unwrap_or(0).min(10_000) }));
+            }
+        }
+    }
+    send_virtual_input(bridge, player, commands)?;
+    Ok(json!({
+        "ok": true,
+        "action": "input",
+        "actions": request.actions.len(),
+        "input": "virtual",
     }))
 }

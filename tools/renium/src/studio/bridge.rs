@@ -15,9 +15,11 @@ use tungstenite::{Message, WebSocket, accept_with_config};
 use crate::app::timing::elapsed_ms;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app::update;
-use crate::daemon::transport::normalize_loopback_host;
 #[cfg(any(windows, target_os = "macos"))]
-use crate::daemon::transport::{local_tcp_ports_owned_by_pid, pid_for_local_tcp_port};
+use crate::daemon::transport::local_tcp_ports_owned_by_pid;
+use crate::daemon::transport::normalize_loopback_host;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+use crate::daemon::transport::pid_for_local_tcp_port;
 use crate::snapshot::export::{parse_bridge_chunk, validate_bridge_chunk, validate_bridge_info};
 use crate::studio::automation::TestLaunch;
 use crate::studio::target::{place_filter, place_matches};
@@ -811,6 +813,7 @@ impl BridgeServer {
         }
         if let Some(runtime_id) = crate::app::context::automation_runtime()
             && socket.bridge_info.runtime_id != runtime_id
+            && socket.bridge_info.launch_edit_runtime_id != runtime_id
         {
             return false;
         }
@@ -844,6 +847,9 @@ impl BridgeServer {
         target: BridgeTarget,
         player: Option<&str>,
     ) -> Result<()> {
+        if crate::app::context::automation_runtime().is_some() {
+            return Ok(());
+        }
         let mut places = Self::distinct_places_for_selector(sockets, target, player);
         if places.len() > 1 {
             let dead_keys: Vec<String> = sockets
@@ -965,6 +971,16 @@ impl BridgeServer {
             return Ok(RuntimePin { runtime_id });
         }
 
+        if target == BridgeTarget::Client
+            && let Some(index) = player.and_then(|value| value.parse::<usize>().ok())
+            && index > 0
+            && let Some(runtime_id) = self.player_runtime_ids().get(index - 1)
+        {
+            return Ok(RuntimePin {
+                runtime_id: runtime_id.clone(),
+            });
+        }
+
         if matching_socket_count == 0 {
             bail!(
                 "No connected {} bridge{} found",
@@ -977,21 +993,71 @@ impl BridgeServer {
         bail!("Matching Studio bridge omitted its runtime identity; reinstall the Renium plugin")
     }
 
+    fn player_runtime_ids(&self) -> Vec<String> {
+        let mut players = Vec::new();
+        for channel in &self.channels {
+            let guard = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (role_key, socket) in guard.iter() {
+                let runtime_id = socket.bridge_info.runtime_id.trim();
+                if !runtime_id.is_empty()
+                    && Self::socket_matches_selector(role_key, socket, BridgeTarget::Client, None)
+                    && !players.iter().any(|(_, id)| id == runtime_id)
+                {
+                    players.push((
+                        socket.bridge_info.player_name.to_ascii_lowercase(),
+                        runtime_id.to_string(),
+                    ));
+                }
+            }
+        }
+        players.sort_unstable();
+        players
+            .into_iter()
+            .map(|(_, runtime_id)| runtime_id)
+            .collect()
+    }
+
     pub(crate) fn runtime_pin_for_selector(
         &self,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> Result<RuntimePin> {
         let key = Self::runtime_pin_key(target, player);
+        if target == BridgeTarget::Main {
+            let pin = self.choose_runtime_pin(target, player)?;
+            self.runtime_pins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, pin.clone());
+            return Ok(pin);
+        }
         let existing = self
             .runtime_pins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .cloned();
-        if let Some(pin) = existing {
+        if let Some(pin) = existing
+            && self.channels.iter().any(|channel| {
+                let guard = channel
+                    .sockets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.iter().any(|(role, socket)| {
+                    Self::socket_matches_selector(role, socket, target, player)
+                        && Self::socket_matches_runtime_pin(socket, &pin)
+                })
+            })
+        {
             return Ok(pin);
         }
+        self.runtime_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
         let pin = self.choose_runtime_pin(target, player)?;
         let mut pins = self
             .runtime_pins
@@ -1019,8 +1085,17 @@ impl BridgeServer {
         player: Option<&str>,
         pin: Option<&RuntimePin>,
     ) -> Option<String> {
+        let matched_player = if pin.is_some()
+            && player
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|index| index > 0)
+        {
+            None
+        } else {
+            player
+        };
         let matches = |key: &str, socket: &BridgeSocket| {
-            Self::socket_matches_selector(key, socket, target, player)
+            Self::socket_matches_selector(key, socket, target, matched_player)
                 && pin.is_none_or(|pin| Self::socket_matches_runtime_pin(socket, pin))
         };
         for role in target.preferred_roles() {
@@ -1051,18 +1126,7 @@ impl BridgeServer {
     ) -> usize {
         let deadline = Instant::now() + timeout;
         loop {
-            let key = Self::runtime_pin_key(target, None);
-            let already_pinned = self
-                .runtime_pins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&key);
-            let coverage = self.max_runtime_channel_coverage(target, None);
-            let ready_channels = if already_pinned || coverage >= required_channels {
-                self.channel_count_for_target(target)
-            } else {
-                coverage
-            };
+            let ready_channels = self.max_runtime_channel_coverage(target, None);
             if ready_channels >= required_channels || Instant::now() >= deadline {
                 return ready_channels;
             }
@@ -1092,7 +1156,7 @@ impl BridgeServer {
         validate_bridge_info(&self.cached_bridge_info_for_target(target)?)
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn peer_for_selector(
         &self,
         target: BridgeTarget,
@@ -1809,7 +1873,7 @@ impl BridgeServer {
         ))
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn studio_pid_for_selector(
         &self,
         target: BridgeTarget,

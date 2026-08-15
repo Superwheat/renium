@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use walkdir::WalkDir;
 
+use crate::app::output::print_json_output;
 use crate::app::timing::current_millis;
 use crate::cli::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
 use crate::editor::sync::push_editor_changes_with_warm_bridge;
@@ -386,16 +387,16 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
         manifest.settings_id.as_deref().unwrap_or(""),
         manifest.source_path.as_deref().unwrap_or("")
     );
-    println!(
-        "__ROBLOX_SYNC_EDITOR_REVERT_RESULT__ {}",
-        json!({
+    print_json_output(
+        &json!({
             "ok": true,
             "service": manifest.service,
             "settingsId": manifest.settings_id,
             "sourcePath": manifest.source_path,
             "changedPaths": changed_paths.iter().map(|path| path_to_sourcemap_relative(&project_root, path)).collect::<Vec<_>>(),
-        })
-    );
+        }),
+        false,
+    )?;
 
     if args.apply_studio && !changed_paths.is_empty() {
         let ports = parse_bridge_ports(&args.bridge.ports)?;

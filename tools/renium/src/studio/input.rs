@@ -1,5 +1,49 @@
 use anyhow::{Result, bail};
 
+#[cfg(windows)]
+#[path = "input/windows_shield.rs"]
+mod windows_shield;
+
+#[cfg(target_os = "macos")]
+#[path = "input/macos_shield.rs"]
+mod macos_shield;
+
+#[cfg(target_os = "linux")]
+#[path = "input/linux.rs"]
+mod platform;
+
+#[cfg(unix)]
+#[path = "input/unix_shield.rs"]
+mod unix_shield;
+
+#[cfg(windows)]
+struct ThreadDpiAwareness {
+    previous: isize,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetThreadDpiAwarenessContext(value: isize) -> isize;
+}
+
+#[cfg(windows)]
+impl ThreadDpiAwareness {
+    fn per_monitor_v2() -> Self {
+        let previous = unsafe { SetThreadDpiAwarenessContext(-4) };
+        Self { previous }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ThreadDpiAwareness {
+    fn drop(&mut self) {
+        if self.previous != 0 {
+            unsafe { SetThreadDpiAwarenessContext(self.previous) };
+        }
+    }
+}
+
 pub struct StudioWindow {
     pub label: String,
     handle: platform::WindowHandle,
@@ -7,7 +51,17 @@ pub struct StudioWindow {
     _reminimize: Option<platform::ReminimizeGuard>,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub struct InputShield {
+    _guard: platform::InputShield,
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub fn input_shield(window: &StudioWindow) -> Result<InputShield> {
+    platform::input_shield(&window.handle).map(|guard| InputShield { _guard: guard })
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
     platform::window_for_pid(pid, viewport, true)
 }
@@ -65,10 +119,12 @@ pub fn frontmost_studio_pid() -> Option<u32> {
     platform::frontmost_studio_pid()
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_mouse_move(window: &StudioWindow, x: i32, y: i32) -> Result<()> {
     platform::post_mouse_move(&window.handle, x, y)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_mouse_button(
     window: &StudioWindow,
     x: i32,
@@ -79,10 +135,12 @@ pub fn post_mouse_button(
     platform::post_mouse_button(&window.handle, x, y, right, down)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_mouse_scroll(window: &StudioWindow, x: i32, y: i32, delta: i32) -> Result<()> {
     platform::post_mouse_scroll(&window.handle, x, y, delta)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_text(window: &StudioWindow, text: &str) -> Result<()> {
     platform::post_text(&window.handle, text)
 }
@@ -95,6 +153,7 @@ pub fn capture_window_rgba(window: &StudioWindow) -> Result<(u32, u32, Vec<u8>)>
     platform::capture_window_rgba(&window.handle)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_mouse_click(
     window: &StudioWindow,
     x: i32,
@@ -105,10 +164,12 @@ pub fn post_mouse_click(
     platform::post_mouse_click(&window.handle, x, y, right, hold_ms)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_key(window: &StudioWindow, key: &KeySpec, hold_ms: u64) -> Result<()> {
     platform::post_key(&window.handle, key, hold_ms)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn post_key_state(window: &StudioWindow, key: &KeySpec, down: bool) -> Result<()> {
     platform::post_key_state(&window.handle, key, down)
 }
@@ -261,7 +322,7 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 
 #[cfg(windows)]
 mod platform {
-    use super::StudioWindow;
+    use super::{StudioWindow, ThreadDpiAwareness, windows_shield};
     use anyhow::{Context, Result, bail};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
@@ -273,9 +334,10 @@ mod platform {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsChild, IsIconic, IsWindowVisible, PostMessageW,
-        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, ShowWindow, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        GetWindowThreadProcessId, IsChild, IsIconic, IsWindowVisible, SMTO_ABORTIFHUNG,
+        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SendMessageTimeoutW, ShowWindow, WM_KEYDOWN,
+        WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
     };
 
     const MK_LBUTTON: WPARAM = 0x0001;
@@ -284,11 +346,16 @@ mod platform {
     pub struct WindowHandle {
         viewport: isize,
         capture: isize,
-        render_matched: bool,
         capture_verified: bool,
         verified_frame: Option<(u32, u32, Vec<u8>)>,
         offset_x: i32,
         offset_y: i32,
+    }
+
+    pub type InputShield = windows_shield::InputShield;
+
+    pub fn input_shield(handle: &WindowHandle) -> Result<InputShield> {
+        windows_shield::input_shield(handle.viewport)
     }
 
     struct EnumTopState {
@@ -317,11 +384,6 @@ mod platform {
     }
 
     struct EnumChildState {
-        best: isize,
-        best_area: i64,
-        best_width: i32,
-        best_height: i32,
-        exact: isize,
         render: isize,
         render_area: i64,
         viewport_width: i32,
@@ -359,9 +421,6 @@ mod platform {
         let Some((width, height)) = visible_client_size(hwnd) else {
             return 1;
         };
-        if width == state.viewport_width && height == state.viewport_height {
-            state.exact = hwnd as isize;
-        }
         if matches_scaled_viewport(width, height, state.viewport_width, state.viewport_height) {
             let area = width as i64 * height as i64;
             if state.render == 0 || area <= state.render_area {
@@ -369,24 +428,13 @@ mod platform {
                 state.render_area = area;
             }
         }
-        let area = width as i64 * height as i64;
-        if area > state.best_area {
-            state.best_area = area;
-            state.best = hwnd as isize;
-            state.best_width = width;
-            state.best_height = height;
-        }
         1
     }
 
-    fn viewport_child(top: isize, viewport: Option<(i32, i32)>) -> WindowHandle {
-        let (viewport_width, viewport_height) = viewport.unwrap_or((-1, -1));
+    fn viewport_child(top: isize, viewport: Option<(i32, i32)>) -> Result<WindowHandle> {
+        let (viewport_width, viewport_height) =
+            viewport.context("Client viewport size is unavailable")?;
         let mut state = EnumChildState {
-            best: top,
-            best_area: 0,
-            best_width: 0,
-            best_height: 0,
-            exact: 0,
             render: 0,
             render_area: 0,
             viewport_width,
@@ -402,25 +450,21 @@ mod platform {
                 );
             }
         }
-        let click_target = if state.exact != 0 {
-            state.exact
-        } else {
-            state.best
-        };
-        let capture = if state.render != 0 {
+        let target = if state.render != 0 {
             state.render
         } else {
-            click_target
+            bail!(
+                "No Studio child window matches the client viewport {viewport_width}x{viewport_height}"
+            )
         };
-        WindowHandle {
-            viewport: click_target,
-            capture,
-            render_matched: state.render != 0,
+        Ok(WindowHandle {
+            viewport: target,
+            capture: target,
             capture_verified: false,
             verified_frame: None,
             offset_x: 0,
             offset_y: 0,
-        }
+        })
     }
 
     #[derive(Clone, Copy)]
@@ -744,32 +788,6 @@ mod platform {
         Ok(())
     }
 
-    struct ThreadDpiAwareness {
-        previous: isize,
-    }
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SetThreadDpiAwarenessContext(value: isize) -> isize;
-    }
-
-    impl ThreadDpiAwareness {
-        fn per_monitor_v2() -> Self {
-            const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
-            let previous =
-                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for ThreadDpiAwareness {
-        fn drop(&mut self) {
-            if self.previous != 0 {
-                unsafe { SetThreadDpiAwarenessContext(self.previous) };
-            }
-        }
-    }
-
     pub struct ReminimizeGuard {
         top: isize,
     }
@@ -801,8 +819,7 @@ mod platform {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                let probe = viewport_child(hwnd, viewport);
-                if probe.render_matched || std::time::Instant::now() >= deadline {
+                if viewport_child(hwnd, viewport).is_ok() || std::time::Instant::now() >= deadline {
                     break;
                 }
             }
@@ -811,9 +828,10 @@ mod platform {
         } else {
             None
         };
+        let handle = viewport_child(hwnd, viewport)?;
         Ok(StudioWindow {
             label: format!("pid {pid}: {title}"),
-            handle: viewport_child(hwnd, viewport),
+            handle,
             _reminimize: reminimize,
         })
     }
@@ -931,7 +949,6 @@ mod platform {
         let handle = WindowHandle {
             viewport: candidate.hwnd,
             capture: candidate.hwnd,
-            render_matched: true,
             capture_verified: true,
             verified_frame: Some((
                 candidate.width as u32,
@@ -954,16 +971,28 @@ mod platform {
         (((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32 as LPARAM
     }
 
-    fn post(hwnd: isize, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
-        let ok = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) };
+    fn send(hwnd: isize, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+        let _yield = windows_shield::yield_mouse(hwnd, msg);
+        let mut result = 0;
+        let ok = unsafe {
+            SendMessageTimeoutW(
+                hwnd as HWND,
+                msg,
+                wparam,
+                lparam,
+                SMTO_ABORTIFHUNG,
+                500,
+                &mut result,
+            )
+        };
         if ok == 0 {
-            bail!("PostMessageW failed for message {msg:#x}");
+            bail!("Studio did not accept input message {msg:#x}");
         }
         Ok(())
     }
 
     pub fn post_mouse_move(handle: &WindowHandle, x: i32, y: i32) -> Result<()> {
-        post(handle.viewport, WM_MOUSEMOVE, 0, mouse_lparam(handle, x, y))
+        send(handle.viewport, WM_MOUSEMOVE, 0, mouse_lparam(handle, x, y))
     }
 
     pub fn post_mouse_button(
@@ -979,7 +1008,7 @@ mod platform {
             (true, true) => (WM_RBUTTONDOWN, MK_RBUTTON),
             (true, false) => (WM_RBUTTONUP, 0),
         };
-        post(handle.viewport, message, state, mouse_lparam(handle, x, y))
+        send(handle.viewport, message, state, mouse_lparam(handle, x, y))
     }
 
     pub fn post_mouse_scroll(handle: &WindowHandle, x: i32, y: i32, delta: i32) -> Result<()> {
@@ -993,7 +1022,7 @@ mod platform {
         let position = (((point.y as u32) << 16) | (point.x as u32 & 0xFFFF)) as i32 as LPARAM;
         let wheel_delta = delta.clamp(-10, 10) * 120;
         let wheel = ((wheel_delta as u16 as usize) << 16) as WPARAM;
-        post(handle.viewport, WM_MOUSEWHEEL, wheel, position)
+        send(handle.viewport, WM_MOUSEWHEEL, wheel, position)
     }
 
     pub fn post_mouse_click(
@@ -1019,7 +1048,7 @@ mod platform {
             1usize | (1 << 30) | (1 << 31)
         };
         let message = if down { WM_KEYDOWN } else { WM_KEYUP };
-        post(
+        send(
             handle.viewport,
             message,
             vk as WPARAM,
@@ -1036,7 +1065,7 @@ mod platform {
     pub fn post_text(handle: &WindowHandle, text: &str) -> Result<()> {
         const WM_CHAR: u32 = 0x0102;
         for unit in text.encode_utf16() {
-            post(handle.viewport, WM_CHAR, unit as WPARAM, 1)?;
+            send(handle.viewport, WM_CHAR, unit as WPARAM, 1)?;
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         Ok(())
@@ -1106,6 +1135,8 @@ mod platform {
     const EVENT_RIGHT_UP: u32 = 4;
     const BUTTON_LEFT: u32 = 0;
     const BUTTON_RIGHT: u32 = 1;
+    const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
+    const RENIUM_EVENT_MARKER: i64 = 0x5245_4e49_554d;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -1132,6 +1163,7 @@ mod platform {
         ) -> CGEventRef;
         fn CGEventPostToPid(pid: i32, event: CGEventRef);
         fn CGEventSetLocation(event: CGEventRef, location: CGPoint);
+        fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
         fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
         fn CGWindowListCreateImage(
             screen_bounds: CGRect,
@@ -1204,6 +1236,12 @@ mod platform {
         window_number: u32,
         origin_x: f64,
         origin_y: f64,
+    }
+
+    pub type InputShield = super::macos_shield::InputShield;
+
+    pub fn input_shield(handle: &WindowHandle) -> Result<InputShield> {
+        super::macos_shield::input_shield(handle.pid, handle.window_number)
     }
 
     fn cf_string(text: &str) -> CFStringRef {
@@ -1349,6 +1387,12 @@ mod platform {
             })
     }
 
+    unsafe fn mark_renium_event(event: CGEventRef) {
+        unsafe {
+            CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, RENIUM_EVENT_MARKER)
+        };
+    }
+
     pub fn window_for_pid(
         pid: u32,
         viewport: Option<(i32, i32)>,
@@ -1406,6 +1450,7 @@ mod platform {
                     "CGEventCreateMouseEvent failed; grant the Accessibility permission to the terminal running renium"
                 );
             }
+            mark_renium_event(event);
             CGEventPostToPid(handle.pid, event);
             CFRelease(event as CFTypeRef);
         }
@@ -1444,6 +1489,7 @@ mod platform {
             if event.is_null() {
                 bail!("CGEventCreateScrollWheelEvent failed");
             }
+            mark_renium_event(event);
             CGEventSetLocation(
                 event,
                 CGPoint {
@@ -1481,6 +1527,7 @@ mod platform {
                      the terminal running renium (System Settings > Privacy & Security)"
                 );
             }
+            mark_renium_event(event);
             CGEventPostToPid(handle.pid, event);
             CFRelease(event as CFTypeRef);
         }
@@ -1505,11 +1552,13 @@ mod platform {
                          to the terminal running renium"
                     );
                 }
+                mark_renium_event(down);
                 CGEventKeyboardSetUnicodeString(down, encoded.len(), encoded.as_ptr());
                 CGEventPostToPid(handle.pid, down);
                 CFRelease(down as CFTypeRef);
                 let up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
                 if !up.is_null() {
+                    mark_renium_event(up);
                     CGEventKeyboardSetUnicodeString(up, encoded.len(), encoded.as_ptr());
                     CGEventPostToPid(handle.pid, up);
                     CFRelease(up as CFTypeRef);
@@ -1640,33 +1689,11 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod platform {
     use anyhow::{Result, bail};
 
     pub struct WindowHandle;
-
-    pub fn post_mouse_move(_handle: &WindowHandle, _x: i32, _y: i32) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
-
-    pub fn post_mouse_button(
-        _handle: &WindowHandle,
-        _x: i32,
-        _y: i32,
-        _right: bool,
-        _down: bool,
-    ) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
-
-    pub fn post_mouse_scroll(_handle: &WindowHandle, _x: i32, _y: i32, _delta: i32) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
-
-    pub fn post_text(_handle: &WindowHandle, _text: &str) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
 
     pub fn capture_window_png(
         _handle: &WindowHandle,
@@ -1677,27 +1704,5 @@ mod platform {
 
     pub fn capture_window_rgba(_handle: &WindowHandle) -> Result<(u32, u32, Vec<u8>)> {
         bail!("Window capture is only supported on Windows and macOS")
-    }
-
-    pub fn post_mouse_click(
-        _handle: &WindowHandle,
-        _x: i32,
-        _y: i32,
-        _right: bool,
-        _hold_ms: u64,
-    ) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
-
-    pub fn post_key(_handle: &WindowHandle, _key: &super::KeySpec, _hold_ms: u64) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
-    }
-
-    pub fn post_key_state(
-        _handle: &WindowHandle,
-        _key: &super::KeySpec,
-        _down: bool,
-    ) -> Result<()> {
-        bail!("Input injection is only supported on Windows and macOS")
     }
 }

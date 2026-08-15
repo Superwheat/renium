@@ -850,8 +850,8 @@ pub(super) struct StudioChangeStateArgs {
     pub(super) runtime_id: Option<String>,
     #[arg(long, value_name = "SECONDS")]
     pub(super) suppress_seconds: Option<f64>,
-    #[arg(long, alias = "event-wait-seconds", value_name = "SECONDS")]
-    pub(super) wait_seconds: Option<f64>,
+    #[arg(long = "event-wait-seconds", value_name = "SECONDS")]
+    pub(super) event_wait_seconds: Option<f64>,
     #[arg(long)]
     pub(super) context_bound: bool,
 }
