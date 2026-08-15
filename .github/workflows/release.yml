@@ -155,6 +155,7 @@ jobs:
           $shared = Join-Path $env:RUNNER_TEMP "renium-shared"
           New-Item -ItemType Directory -Path $shared | Out-Null
           @(
+            "Install Renium.cmd",
             "Renium.rbxm",
             "Renium.rbxmx"
           ) | ForEach-Object {
@@ -355,7 +356,7 @@ jobs:
               END { if (!found) exit 1 }
             ' tools/renium-vscode-extension/changelog.md
             printf '%s\n\n' '## Install'
-            printf '%s\n' 'On Windows, open the platform ZIP and double-click **Install Renium.cmd**; extraction is optional. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.'
+            printf '%s\n' 'On Windows, download and double-click **Install Renium.cmd**; it selects the correct x64 or ARM64 package automatically. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.'
           } > /tmp/renium-release-notes.md
 
       - name: Publish

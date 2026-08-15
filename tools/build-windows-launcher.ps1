@@ -131,8 +131,8 @@ function Find-ReniumArchive {
     $expectedName = "renium-$Version-windows-" +
         $(if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") { "arm64" } else { "x64" }) +
         ".zip"
-    foreach ($candidate in @($candidates | Sort-Object {
-        if ([IO.Path]::GetFileName($_) -ieq $expectedName) { 0 } else { 1 }
+    foreach ($candidate in @($candidates | Where-Object {
+        [IO.Path]::GetFileName($_) -ieq $expectedName
     })) {
         if (Test-ReniumArchive $candidate) {
             return $candidate
