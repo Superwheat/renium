@@ -81,7 +81,7 @@
       },
       {
         "command": "renium.projectTools",
-        "title": "Project Tools",
+        "title": "Settings & Diagnostics",
         "category": "Renium"
       },
       {
@@ -136,12 +136,12 @@
       },
       {
         "command": "renium.pullFromStudio",
-        "title": "Pull Studio to Files",
+        "title": "Pull from Studio",
         "category": "Renium"
       },
       {
         "command": "renium.pushToStudio",
-        "title": "Push Files to Studio",
+        "title": "Push to Studio",
         "category": "Renium"
       },
       {
