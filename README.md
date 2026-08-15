@@ -11,7 +11,7 @@ It is still in active development and any suggestions/bug reports are greatly ap
 
 ## Getting started
 
-1. On Windows, download **Install Renium.cmd** from [GitHub Releases](https://github.com/Superwheat/renium/releases/latest) and double-click it. The installer selects x64 or ARM64 and asks which detected editor to use. On macOS or Linux, download the matching platform ZIP and run its installer.
+1. On Windows, download **Install-Renium.cmd** from [GitHub Releases](https://github.com/Superwheat/renium/releases/latest) and double-click it. The installer selects x64 or ARM64 and asks which detected editor to use. On macOS or Linux, download the matching platform ZIP and run its installer.
 2. Restart the selected editor and Roblox Studio.
 3. See [tools/renium/README.md](tools/renium/README.md) for the command reference, and [AGENTS.md](AGENTS.md) if you are pointing an AI agent at it.
 
