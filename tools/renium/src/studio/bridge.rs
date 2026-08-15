@@ -345,10 +345,10 @@ impl BridgeServer {
                 .map_or(0, |duration| duration.as_nanos())
         );
         let accept_state = BridgeAcceptState {
-            alive: alive.clone(),
+            alive: Arc::clone(&alive),
             request_session_id,
             #[cfg(any(windows, target_os = "macos"))]
-            next_id: next_id.clone(),
+            next_id: Arc::clone(&next_id),
             #[cfg(any(windows, target_os = "macos"))]
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
@@ -374,14 +374,14 @@ impl BridgeServer {
                 bind_host.clone(),
                 *port,
                 listener,
-                channel.clone(),
+                Arc::clone(&channel),
                 accept_state.clone(),
             );
             channels.push(channel);
         }
 
         #[cfg(any(windows, target_os = "macos"))]
-        Self::spawn_focus_watcher(channels.clone(), alive.clone());
+        Self::spawn_focus_watcher(channels.clone(), Arc::clone(&alive));
 
         let bind_ms = elapsed_ms(bind_started);
         let wait_started = Instant::now();
@@ -502,9 +502,9 @@ impl BridgeServer {
                                 if let Some(runtime_id) = update_target {
                                     Self::check_for_update(
                                         runtime_id,
-                                        channel.clone(),
-                                        next_id.clone(),
-                                        update_checked_runtimes.clone(),
+                                        Arc::clone(&channel),
+                                        Arc::clone(&next_id),
+                                        Arc::clone(&update_checked_runtimes),
                                     );
                                 }
                             }

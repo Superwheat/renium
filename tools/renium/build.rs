@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,6 +124,84 @@ fn emit_build_metadata() {
     println!("cargo:rustc-env=BUILD_TIMESTAMP_UNIX={build_timestamp}");
 }
 
+fn generate_operations(out_dir: &Path) {
+    let path = Path::new("protocol").join("opcodes.json");
+    let text = std::fs::read_to_string(&path).expect("failed to read opcode registry");
+    let registry: serde_json::Value =
+        serde_json::from_str(&text).expect("failed to parse opcode registry");
+    let version = registry["version"]
+        .as_u64()
+        .expect("opcode registry version must be an unsigned integer");
+    let version = u8::try_from(version).expect("opcode registry version must fit in u8");
+    let operations = registry["operations"]
+        .as_array()
+        .expect("opcode registry operations must be an array");
+    let mut constants = format!("pub const PROTOCOL_VERSION: u8 = {version};\n");
+    let mut entries = String::new();
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    for operation in operations {
+        let name = operation["name"]
+            .as_str()
+            .expect("opcode name must be a string");
+        let id = operation["id"]
+            .as_u64()
+            .expect("opcode id must be an unsigned integer");
+        let id = u16::try_from(id).expect("opcode id must fit in u16");
+        assert!(ids.insert(id), "duplicate opcode {id}");
+        assert!(names.insert(name), "duplicate operation name {name}");
+        for alias in operation
+            .get("aliases")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let alias = alias.as_str().expect("opcode alias must be a string");
+            assert!(names.insert(alias), "duplicate operation name {alias}");
+        }
+        let constant = name.replace('-', "_").to_ascii_uppercase();
+        writeln!(constants, "pub const {constant}: u16 = {id};")
+            .expect("failed to generate opcode");
+        let aliases = operation
+            .get("aliases")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|alias| {
+                format!(
+                    "{:?}",
+                    alias.as_str().expect("opcode alias must be a string")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let review = operation
+            .get("review")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let runtime = operation
+            .get("runtime")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let queued = operation
+            .get("queued")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        writeln!(
+            entries,
+            "    super::Opcode {{ id: {id}, name: {name:?}, aliases: &[{aliases}], review: {review}, runtime: {runtime}, queued: {queued} }},"
+        )
+        .expect("failed to generate opcode metadata");
+    }
+    let mut source = constants;
+    source.push_str("pub static REGISTRY: &[super::Opcode] = &[\n");
+    source.push_str(&entries);
+    source.push_str("];\n");
+    std::fs::write(out_dir.join("operations.rs"), source)
+        .expect("failed to write generated operations");
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
 fn embed_windows_manifest(out_dir: &Path) {
     let manifest_path = out_dir.join("renium.exe.manifest");
     let manifest = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -148,6 +228,7 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is missing");
     let host = env::var("HOST").expect("HOST is missing");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
+    generate_operations(&out_dir);
     match target_os.as_str() {
         "windows" => {
             build_windows(&out_dir);

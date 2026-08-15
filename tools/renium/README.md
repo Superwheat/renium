@@ -747,75 +747,75 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
 <!-- automation-opcodes:start -->
 Protocol version: `1`
 
-| ID | Operation | Aliases | Review |
-|---:|---|---|:---:|
-| 0 | `cap` | - | no |
-| 1 | `bind` | - | no |
-| 2 | `context` | - | no |
-| 3 | `unbind` | - | no |
-| 10 | `pull` | - | yes |
-| 11 | `push` | - | yes |
-| 12 | `live-start` | - | no |
-| 13 | `live-stop` | - | no |
-| 14 | `live-status` | - | no |
-| 15 | `retry-pending` | - | no |
-| 16 | `discard-pending` | - | no |
-| 20 | `find` | - | no |
-| 21 | `tree` | - | no |
-| 22 | `inspect` | - | no |
-| 23 | `batch` | bb | no |
-| 24 | `script-search` | - | no |
-| 25 | `script-read` | - | no |
-| 26 | `script-grep` | - | no |
-| 30 | `get-property` | - | no |
-| 31 | `set-property` | - | yes |
-| 32 | `set-source` | - | no |
-| 33 | `add` | - | no |
-| 34 | `clone` | - | no |
-| 35 | `move` | - | no |
-| 36 | `remove` | - | no |
-| 37 | `revert` | - | no |
-| 38 | `multi-edit` | - | no |
-| 40 | `import-model` | - | no |
-| 41 | `export-model` | - | no |
-| 42 | `export-place` | - | no |
-| 43 | `import-snapshots` | - | no |
-| 44 | `export-snapshots` | - | no |
-| 45 | `sourcemap` | - | no |
-| 50 | `studios` | - | no |
-| 51 | `studio-status` | - | no |
-| 52 | `studio-open` | - | yes |
-| 53 | `studio-close` | - | yes |
-| 54 | `luau` | - | no |
-| 55 | `console` | - | no |
-| 56 | `play-start` | - | no |
-| 57 | `play-stop` | - | no |
-| 58 | `shot` | - | no |
-| 59 | `device` | - | no |
-| 60 | `ui` | - | no |
-| 61 | `press` | - | no |
-| 62 | `click` | - | no |
-| 63 | `key` | - | no |
-| 64 | `type` | - | no |
-| 65 | `wait` | - | no |
-| 66 | `goto` | - | no |
-| 67 | `input` | - | no |
-| 68 | `record-start` | - | no |
-| 69 | `record-end` | - | no |
-| 70 | `project-init` | - | no |
-| 71 | `project-validate` | - | no |
-| 72 | `place-add` | - | no |
-| 73 | `place-rename` | - | no |
-| 74 | `place-reorder` | - | no |
-| 80 | `review-prepare` | - | no |
-| 81 | `review-apply` | - | no |
-| 82 | `review-reject` | - | no |
-| 90 | `cloud` | oc | no |
-| 91 | `asset-search` | - | no |
-| 92 | `asset-insert` | - | no |
-| 93 | `generate-model` | - | no |
-| 94 | `job-status` | - | no |
-| 95 | `image-upload` | - | no |
-| 96 | `image-store` | - | no |
-| 97 | `http-get` | - | no |
+| ID | Operation | Aliases | Review | Studio |
+|---:|---|---|:---:|:---:|
+| 0 | `cap` | - | no | no |
+| 1 | `bind` | - | no | no |
+| 2 | `context` | - | no | no |
+| 3 | `unbind` | - | no | no |
+| 10 | `pull` | - | yes | yes |
+| 11 | `push` | - | yes | yes |
+| 12 | `live-start` | - | no | yes |
+| 13 | `live-stop` | - | no | yes |
+| 14 | `live-status` | - | no | yes |
+| 15 | `retry-pending` | - | no | yes |
+| 16 | `discard-pending` | - | no | yes |
+| 20 | `find` | - | no | no |
+| 21 | `tree` | - | no | no |
+| 22 | `inspect` | - | no | no |
+| 23 | `batch` | bb | no | no |
+| 24 | `script-search` | - | no | no |
+| 25 | `script-read` | - | no | no |
+| 26 | `script-grep` | - | no | no |
+| 30 | `get-property` | - | no | no |
+| 31 | `set-property` | - | yes | no |
+| 32 | `set-source` | - | no | no |
+| 33 | `add` | - | no | no |
+| 34 | `clone` | - | no | no |
+| 35 | `move` | - | no | no |
+| 36 | `remove` | - | no | no |
+| 37 | `revert` | - | no | no |
+| 38 | `multi-edit` | - | no | yes |
+| 40 | `import-model` | - | no | no |
+| 41 | `export-model` | - | no | no |
+| 42 | `export-place` | - | no | no |
+| 43 | `import-snapshots` | - | no | no |
+| 44 | `export-snapshots` | - | no | yes |
+| 45 | `sourcemap` | - | no | no |
+| 50 | `studios` | - | no | no |
+| 51 | `studio-status` | - | no | no |
+| 52 | `studio-open` | - | yes | no |
+| 53 | `studio-close` | - | yes | yes |
+| 54 | `luau` | - | no | yes |
+| 55 | `console` | - | no | yes |
+| 56 | `play-start` | - | no | yes |
+| 57 | `play-stop` | - | no | yes |
+| 58 | `shot` | - | no | yes |
+| 59 | `device` | - | no | yes |
+| 60 | `ui` | - | no | yes |
+| 61 | `press` | - | no | yes |
+| 62 | `click` | - | no | yes |
+| 63 | `key` | - | no | yes |
+| 64 | `type` | - | no | yes |
+| 65 | `wait` | - | no | yes |
+| 66 | `goto` | - | no | yes |
+| 67 | `input` | - | no | yes |
+| 68 | `record-start` | - | no | yes |
+| 69 | `record-end` | - | no | no |
+| 70 | `project-init` | - | no | no |
+| 71 | `project-validate` | - | no | no |
+| 72 | `place-add` | - | no | no |
+| 73 | `place-rename` | - | no | no |
+| 74 | `place-reorder` | - | no | no |
+| 80 | `review-prepare` | - | no | no |
+| 81 | `review-apply` | - | no | no |
+| 82 | `review-reject` | - | no | no |
+| 90 | `cloud` | oc | no | no |
+| 91 | `asset-search` | - | no | no |
+| 92 | `asset-insert` | - | no | yes |
+| 93 | `generate-model` | - | no | yes |
+| 94 | `job-status` | - | no | yes |
+| 95 | `image-upload` | - | no | no |
+| 96 | `image-store` | - | no | no |
+| 97 | `http-get` | - | no | no |
 <!-- automation-opcodes:end -->

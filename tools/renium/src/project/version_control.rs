@@ -13,6 +13,7 @@ use crate::cli::args::{VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs};
 use crate::editor::paths::build_editor_source_paths_by_index;
 use crate::editor::sync::is_lua_source_class;
 use crate::project::package_links::RENIUM_DIR_GITIGNORE;
+use crate::rbx::model::read_settings_model_document;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
 };
@@ -411,7 +412,12 @@ pub(crate) fn settings_doc_to_json_tree(document: &SettingsBytecode, file: &Path
 pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
     let metadata = fs::metadata(&args.file)
         .with_context(|| format!("File not found: {}", args.file.display()))?;
-    if metadata.len() == 0 {
+    let extension = args
+        .file
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    if metadata.len() == 0 && extension.as_deref() == Some("renium") {
         if args.json {
             return print_json_output(
                 &json!({"version": 0, "instanceCount": 0, "roots": []}),
@@ -421,7 +427,14 @@ pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
         println!("# renium store: empty file");
         return Ok(());
     }
-    let document = SettingsBytecode::read_file(&args.file)?;
+    let document = match extension.as_deref() {
+        Some("renium") => SettingsBytecode::read_file(&args.file)?,
+        Some("rbxm" | "rbxmx") => read_settings_model_document(&args.file)?,
+        _ => bail!(
+            "Unsupported file type for {}; expected .renium, .rbxm, or .rbxmx",
+            args.file.display()
+        ),
+    };
     if args.json {
         return print_json_output(
             &settings_doc_to_json_tree(&document, &args.file),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -169,7 +169,14 @@ fn read_bytecode_explorer_batch_ops(
     let raw = if let Some(raw) = args.ops_json.as_deref() {
         raw.to_string()
     } else if let Some(path) = args.ops_file.as_deref() {
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?
+        if path == Path::new("-") {
+            let mut raw = String::new();
+            io::stdin().read_to_string(&mut raw)?;
+            raw
+        } else {
+            fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+        }
     } else {
         bail!("Provide -j/--ops, --ops-json, or -J/--ops-file")
     };

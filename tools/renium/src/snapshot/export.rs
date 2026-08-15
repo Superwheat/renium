@@ -18,9 +18,10 @@ use crate::app::build::{
 use crate::app::timing::{
     elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
+use crate::automation::op;
 use crate::cli::ExportSnapshotsArgs;
 use crate::cli::args::ImportSnapshotsArgs;
-use crate::daemon::{export_snapshots_daemon_args, try_daemon_control_request};
+use crate::daemon::try_daemon_control_request;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
@@ -1069,7 +1070,33 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
 
 pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
-    if let Some(result) = try_daemon_control_request("x", export_snapshots_daemon_args(&args))? {
+    let operation = if args.run_import {
+        op::PULL
+    } else {
+        op::EXPORT_SNAPSHOTS
+    };
+    let parameters = json!({
+        "srcDir": args.src_dir,
+        "snapshotDir": args.snapshot_dir,
+        "services": args.services,
+        "chunkSize": args.chunk_size,
+        "adaptiveSeedBatch": args.adaptive_seed_batch,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+        "importMode": args.import_mode,
+        "sourceWorkers": args.source_workers,
+        "instanceWorkers": args.instance_workers,
+        "importWorkers": args.import_workers,
+        "performanceMode": args.performance_mode,
+        "modifiedDefaultBypass": args.modified_default_bypass,
+        "noModifiedDefaultBypass": args.no_modified_default_bypass,
+        "adaptiveThrottle": !args.no_adaptive_throttle,
+        "exportAllProperties": args.export_all_properties,
+        "noExportAllProperties": args.no_export_all_properties,
+    });
+    if let Some(result) =
+        try_daemon_control_request(operation, Some(&args.project_root), parameters, false)?
+    {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -1234,11 +1261,7 @@ fn prepare_export_bridge(
     }
     let bridge_info_done_ms = elapsed_ms(total_started);
     let property_schema_by_class = load_rbx_dom_property_schema(project_root)?.unwrap_or_default();
-    if property_schema_by_class.is_empty() {
-        println!(
-            "[renium] warning: rbx-dom property database not found, falling back to built-in property candidates"
-        );
-    } else {
+    if !property_schema_by_class.is_empty() {
         println!("[renium] configuring plugin property candidates from rbx-dom schema");
         configure_bridge_property_candidates(bridge, &property_schema_by_class)
             .context("Failed to configure plugin property candidates")?;

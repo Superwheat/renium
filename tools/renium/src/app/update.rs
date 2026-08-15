@@ -87,14 +87,49 @@ struct SignedUpdateManifest {
 struct UpdatePayload {
     schema_version: u32,
     version: String,
-    components: BTreeMap<String, UpdateComponents>,
+    components: BTreeMap<String, PlatformArtifacts>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct UpdateComponents {
+struct PlatformArtifacts {
     cli: Option<UpdateArtifact>,
     plugin: Option<UpdateArtifact>,
     extension: Option<UpdateArtifact>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UpdateComponent {
+    Cli,
+    Plugin,
+    Extension,
+}
+
+impl UpdateComponent {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "cli" => Ok(Self::Cli),
+            "plugin" => Ok(Self::Plugin),
+            "extension" => Ok(Self::Extension),
+            _ => bail!("Unknown update component '{value}'"),
+        }
+    }
+
+    fn available(self, artifacts: &PlatformArtifacts) -> bool {
+        match self {
+            Self::Cli => artifacts.cli.is_some(),
+            Self::Plugin => artifacts.plugin.is_some(),
+            Self::Extension => artifacts.extension.is_some(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Plugin => "plugin",
+            Self::Extension => "extension",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,7 +160,7 @@ struct DeferredUpdatePlan {
     managed_studio_core_stage: Option<PathBuf>,
     plugin: Option<DeferredFileInstall>,
     extension_installs: Vec<DeferredExtensionInstall>,
-    components: Vec<String>,
+    components: Vec<UpdateComponent>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -695,33 +730,29 @@ fn apply_update(
                 manifest.payload.version
             )
         })?;
-    let mut requested = requested
+    let mut requested = if requested.is_empty() {
+        default_update_components(components)?
+    } else if requested
         .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if requested.is_empty() {
-        requested = default_update_components(components)?;
-    }
-    if requested.iter().any(|name| name == "all") {
-        requested = ["cli", "plugin", "extension"]
-            .into_iter()
-            .filter(|name| match *name {
-                "cli" => components.cli.is_some(),
-                "plugin" => components.plugin.is_some(),
-                "extension" => components.extension.is_some(),
-                _ => false,
-            })
-            .map(str::to_string)
-            .collect();
-    }
+        .any(|name| name.eq_ignore_ascii_case("all"))
+    {
+        [
+            UpdateComponent::Cli,
+            UpdateComponent::Plugin,
+            UpdateComponent::Extension,
+        ]
+        .into_iter()
+        .filter(|component| component.available(components))
+        .collect()
+    } else {
+        requested
+            .iter()
+            .map(|name| UpdateComponent::parse(name))
+            .collect::<Result<Vec<_>>>()?
+    };
     requested.sort();
     requested.dedup();
-    for name in &requested {
-        if !matches!(name.as_str(), "cli" | "plugin" | "extension") {
-            bail!("Unknown update component '{name}'");
-        }
-    }
-    if requested.iter().any(|name| name == "cli")
+    if requested.contains(&UpdateComponent::Cli)
         && env::current_exe()
             .ok()
             .is_some_and(|path| cli_is_extension_owned(&path))
@@ -732,9 +763,9 @@ fn apply_update(
                 manifest.payload.version
             );
         }
-        requested.retain(|name| name != "cli");
-        if !requested.iter().any(|name| name == "extension") {
-            requested.push("extension".to_string());
+        requested.retain(|component| *component != UpdateComponent::Cli);
+        if !requested.contains(&UpdateComponent::Extension) {
+            requested.push(UpdateComponent::Extension);
             requested.sort();
         }
     }
@@ -757,22 +788,17 @@ fn apply_update(
         }
         requested.sort();
     }
-    for name in &requested {
-        let available = match name.as_str() {
-            "cli" => components.cli.is_some(),
-            "plugin" => components.plugin.is_some(),
-            "extension" => components.extension.is_some(),
-            _ => false,
-        };
-        if !available {
+    for component in &requested {
+        if !component.available(components) {
             bail!(
-                "Release {} has no {name} artifact for {platform}",
-                manifest.payload.version
+                "Release {} has no {} artifact for {platform}",
+                manifest.payload.version,
+                component.name()
             );
         }
     }
-    let apply_cli = requested.iter().any(|name| name == "cli");
-    let update_plugin = requested.iter().any(|name| name == "plugin");
+    let apply_cli = requested.contains(&UpdateComponent::Cli);
+    let update_plugin = requested.contains(&UpdateComponent::Plugin);
     let repair_core = cfg!(target_os = "macos") && update_plugin;
     if repair_core && components.cli.is_none() {
         bail!(
@@ -786,7 +812,7 @@ fn apply_update(
                 .map(|dir| dir.join(crate::app::setup::PLUGIN_ASSET_NAME))
         })
         .transpose()?;
-    let editor_installs = if requested.iter().any(|name| name == "extension") {
+    let editor_installs = if requested.contains(&UpdateComponent::Extension) {
         match (extension_root, editor_cli) {
             (Some(root), Some(cli)) => vec![selected_extension_editor(root, cli)?],
             (None, None) => find_installed_extension_editors()?,
@@ -858,7 +884,7 @@ fn apply_update(
     }
     let stage = fresh_temp_dir(&format!("renium-update-{}", manifest.payload.version))?;
     let staged: Result<_> = (|| {
-        let plugin = if requested.iter().any(|name| name == "plugin") {
+        let plugin = if requested.contains(&UpdateComponent::Plugin) {
             Some(fetch_artifact(
                 components
                     .plugin
@@ -1000,7 +1026,7 @@ fn apply_update(
         write_pending_update_transaction(&plan)?;
         plan.phase = "applying".to_string();
         write_pending_update_transaction(&plan)?;
-        let result = (|| -> Result<(Vec<String>, Vec<String>)> {
+        let result = (|| -> Result<(Vec<UpdateComponent>, Vec<UpdateComponent>)> {
             apply_staged_update_plan(&plan, _lifecycle_lock)?;
             Ok((plan.components.clone(), Vec::new()))
         })();
@@ -1114,19 +1140,19 @@ fn extension_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn default_update_components(components: &UpdateComponents) -> Result<Vec<String>> {
+fn default_update_components(components: &PlatformArtifacts) -> Result<Vec<UpdateComponent>> {
     let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
     let extension_owned = cli_is_extension_owned(&current);
     let mut requested = Vec::new();
     if extension_owned {
         if components.extension.is_some() {
-            requested.push("extension".to_string());
+            requested.push(UpdateComponent::Extension);
         }
     } else if components.cli.is_some() {
-        requested.push("cli".to_string());
+        requested.push(UpdateComponent::Cli);
     }
     if components.extension.is_some() && renium_extension_is_installed() {
-        requested.push("extension".to_string());
+        requested.push(UpdateComponent::Extension);
     }
     if components.plugin.is_some()
         && !cfg!(target_os = "linux")
@@ -1134,7 +1160,7 @@ fn default_update_components(components: &UpdateComponents) -> Result<Vec<String
             .ok()
             .is_some_and(|dir| dir.join(crate::app::setup::PLUGIN_ASSET_NAME).is_file())
     {
-        requested.push("plugin".to_string());
+        requested.push(UpdateComponent::Plugin);
     }
     requested.sort();
     requested.dedup();
@@ -1493,7 +1519,7 @@ fn prepare_update_originals(plan: &DeferredUpdatePlan) -> Result<DeferredUpdateO
         snapshot_extension_installation(&root.join("extensions"), &editors)?
     };
     let mut core_backups = Vec::new();
-    if plan.components.iter().any(|component| component == "cli")
+    if plan.components.contains(&UpdateComponent::Cli)
         && let Some(core_root) = plan.core_stage.as_deref()
     {
         if let Some(target_root) = managed_core_root(&plan.target) {
@@ -1811,9 +1837,7 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 #[cfg(windows)]
 fn plan_mutates_running_executable(plan: &DeferredUpdatePlan) -> Result<bool> {
     let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
-    if plan.components.iter().any(|component| component == "cli")
-        && paths_equal(&current, &plan.target)
-    {
+    if plan.components.contains(&UpdateComponent::Cli) && paths_equal(&current, &plan.target) {
         return Ok(true);
     }
     Ok(plan_editor_installs(plan)
@@ -2004,7 +2028,7 @@ fn apply_staged_update_plan(
             }
         }
     }
-    if plan.components.iter().any(|component| component == "cli")
+    if plan.components.contains(&UpdateComponent::Cli)
         && let Some(core_root) = plan.core_stage.as_deref()
     {
         #[cfg(windows)]

@@ -33,6 +33,10 @@ const generatedTypeScript = [
   ...registry.operations.map((operation) => `  ${propertyName(operation.name)}: ${operation.id},`),
   "} as const;",
   "",
+  "export const AUTOMATION_RUNTIME_OPS = new Set<number>([",
+  ...registry.operations.filter((operation) => operation.runtime).map((operation) => `  ${operation.id},`),
+  "]);",
+  "",
 ].join("\n");
 fs.writeFileSync(path.join(extensionRoot, "src", "automationProtocol.generated.ts"), generatedTypeScript);
 
@@ -67,14 +71,14 @@ fs.writeFileSync(agentsPath, agents);
 
 const rows = registry.operations.map((operation) => {
   const aliases = (operation.aliases ?? []).join(", ");
-  return `| ${operation.id} | \`${operation.name}\` | ${aliases || "-"} | ${operation.review ? "yes" : "no"} |`;
+  return `| ${operation.id} | \`${operation.name}\` | ${aliases || "-"} | ${operation.review ? "yes" : "no"} | ${operation.runtime ? "yes" : "no"} |`;
 });
 const table = [
   "<!-- automation-opcodes:start -->",
   `Protocol version: \`${registry.version}\``,
   "",
-  "| ID | Operation | Aliases | Review |",
-  "|---:|---|---|:---:|",
+  "| ID | Operation | Aliases | Review | Studio |",
+  "|---:|---|---|:---:|:---:|",
   ...rows,
   "<!-- automation-opcodes:end -->",
 ].join("\n");

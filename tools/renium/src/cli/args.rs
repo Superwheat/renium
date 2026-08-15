@@ -73,10 +73,10 @@ pub(crate) struct VcTextconvArgs {
 
 #[derive(Parser)]
 #[command(
-    about = "Inspect a .renium store: print its instance tree as text, or as a structured JSON tree (`--json`) for the VS Code viewer. Reuses the one decoder, so a dropped file decodes exactly like a synced one"
+    about = "Inspect a .renium store or .rbxm/.rbxmx model as text or a structured JSON tree"
 )]
 pub(crate) struct ViewArgs {
-    #[arg(help = "The .renium file to inspect")]
+    #[arg(help = "The .renium, .rbxm, or .rbxmx file to inspect")]
     pub(crate) file: PathBuf,
     #[arg(
         help = "Emit a nested JSON tree (name/class/id/properties/attributes/source) instead of the human-readable text rendering",

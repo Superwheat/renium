@@ -18,7 +18,6 @@ use crate::studio::input as input_inject;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct InputRequest {
-    #[serde(default)]
     player: Option<String>,
     actions: Vec<InputAction>,
 }
@@ -27,19 +26,17 @@ pub(super) struct InputRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InputAction {
     action: InputActionKind,
-    #[serde(default, alias = "key_code")]
+    #[serde(alias = "key_code")]
     key: Option<String>,
-    #[serde(default, alias = "text_inputs")]
+    #[serde(alias = "text_inputs")]
     text: Option<String>,
-    #[serde(default, alias = "instance_path")]
+    #[serde(alias = "instance_path")]
     path: Option<String>,
-    #[serde(default)]
     x: Option<i32>,
-    #[serde(default)]
     y: Option<i32>,
-    #[serde(default, alias = "mouse_button")]
+    #[serde(alias = "mouse_button")]
     button: Option<MouseButton>,
-    #[serde(default, alias = "wait_time_ms", alias = "hold_ms")]
+    #[serde(alias = "wait_time_ms", alias = "hold_ms")]
     ms: Option<u64>,
 }
 

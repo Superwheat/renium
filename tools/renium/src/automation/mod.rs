@@ -1,79 +1,51 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) mod client;
+pub(crate) mod context;
+pub(crate) mod local;
+pub(crate) mod places;
 pub(crate) mod runtime;
+pub(crate) mod studio_args;
 pub(crate) mod tools;
 
-pub const PROTOCOL_VERSION: u8 = 1;
-pub const REGISTRY_JSON: &str = include_str!("../../protocol/opcodes.json");
-static REGISTRY: OnceLock<std::result::Result<Vec<Opcode>, String>> = OnceLock::new();
+pub mod op {
+    include!(concat!(env!("OUT_DIR"), "/operations.rs"));
+}
 
-#[derive(Deserialize)]
+pub const PROTOCOL_VERSION: u8 = op::PROTOCOL_VERSION;
+const REVIEW_TTL: Duration = Duration::from_secs(300);
+
 pub struct Opcode {
     pub id: u16,
-    pub name: String,
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    #[serde(default)]
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
     pub review: bool,
+    pub runtime: bool,
+    pub queued: bool,
 }
 
-#[derive(Deserialize)]
-struct Registry {
-    version: u8,
-    operations: Vec<Opcode>,
-}
-
-fn parse_registry() -> Result<Vec<Opcode>> {
-    let registry: Registry =
-        serde_json::from_str(REGISTRY_JSON).context("Invalid opcode registry")?;
-    if registry.version != PROTOCOL_VERSION {
-        bail!(
-            "Opcode registry version {} does not match protocol version {PROTOCOL_VERSION}",
-            registry.version
-        );
-    }
-    let mut ids = HashSet::new();
-    let mut names = HashSet::new();
-    for operation in &registry.operations {
-        if !ids.insert(operation.id) {
-            bail!("Duplicate opcode {}", operation.id);
-        }
-        for name in std::iter::once(&operation.name).chain(&operation.aliases) {
-            if !names.insert(name.clone()) {
-                bail!("Duplicate operation name {name}");
-            }
-        }
-    }
-    Ok(registry.operations)
-}
-
-pub fn registry() -> Result<&'static [Opcode]> {
-    match REGISTRY.get_or_init(|| parse_registry().map_err(|error| format!("{error:#}"))) {
-        Ok(operations) => Ok(operations),
-        Err(error) => bail!("{error}"),
-    }
+pub fn registry() -> &'static [Opcode] {
+    op::REGISTRY
 }
 
 pub fn opcode_by_id(id: u16) -> Result<&'static Opcode> {
-    registry()?
+    registry()
         .iter()
         .find(|operation| operation.id == id)
         .with_context(|| format!("Unknown opcode {id}"))
 }
 
 pub fn opcode_by_name(name: &str) -> Result<&'static Opcode> {
-    registry()?
+    registry()
         .iter()
-        .find(|operation| {
-            operation.name == name || operation.aliases.iter().any(|alias| alias == name)
-        })
+        .find(|operation| operation.name == name || operation.aliases.contains(&name))
         .with_context(|| format!("Unknown operation {name}"))
 }
 
@@ -114,7 +86,7 @@ impl Request {
                 "cap",
             )
         })?;
-        if self.op != 0 && self.op != 1 && self.cx.is_none() {
+        if self.op != op::CAP && self.op != op::BIND && self.cx.is_none() {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));
         }
         Ok(operation)
@@ -212,6 +184,22 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
+impl BoundContext {
+    fn same_binding(&self, other: &Self) -> bool {
+        self.initialized == other.initialized
+            && self.project == other.project
+            && self.root == other.root
+            && self.experience == other.experience
+            && self.source == other.source
+            && self.place_id == other.place_id
+            && self.game_id == other.game_id
+            && self.selector == other.selector
+            && self.runtime_id == other.runtime_id
+            && self.plugin_build == other.plugin_build
+            && self.fingerprint == other.fingerprint
+    }
+}
+
 pub struct Review {
     pub context_id: u64,
     pub runtime_id: Option<String>,
@@ -240,11 +228,16 @@ impl Default for State {
 
 impl State {
     pub fn insert_context(&self, mut context: BoundContext) -> BoundContext {
+        let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = contexts
+            .values()
+            .find(|existing| existing.same_binding(&context))
+        {
+            return existing.clone();
+        }
+        contexts.retain(|_, existing| existing.root != context.root);
         context.id = self.next_context.fetch_add(1, Ordering::Relaxed);
-        self.contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(context.id, context.clone());
+        contexts.insert(context.id, context.clone());
         context
     }
 
@@ -279,10 +272,9 @@ impl State {
             parameters,
             created: Instant::now(),
         };
-        self.reviews
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.clone(), review);
+        let mut reviews = self.reviews.lock().unwrap_or_else(PoisonError::into_inner);
+        reviews.retain(|_, review| review.created.elapsed() <= REVIEW_TTL);
+        reviews.insert(id.clone(), review);
         id
     }
 
@@ -292,7 +284,7 @@ impl State {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id)?;
-        (review.created.elapsed() <= Duration::from_secs(300)).then_some(review)
+        (review.created.elapsed() <= REVIEW_TTL).then_some(review)
     }
 
     pub fn reject_review(&self, id: &str) -> bool {
@@ -307,11 +299,13 @@ impl State {
 pub fn capabilities() -> Result<Value> {
     Ok(json!({
         "v": PROTOCOL_VERSION,
-        "ops": registry()?.iter().map(|operation| json!({
+        "ops": registry().iter().map(|operation| json!({
             "id": operation.id,
             "name": operation.name,
             "aliases": operation.aliases,
             "review": operation.review,
+            "runtime": operation.runtime,
+            "queued": operation.queued,
         })).collect::<Vec<_>>()
     }))
 }
@@ -322,12 +316,15 @@ mod tests {
 
     #[test]
     fn registry_is_unique_and_complete() {
-        let operations = registry().unwrap();
+        let operations = registry();
         assert_eq!(operations.len(), 69);
-        assert_eq!(opcode_by_name("bb").unwrap().id, 23);
-        assert!(opcode_by_id(31).unwrap().review);
-        assert_eq!(opcode_by_id(82).unwrap().name, "review-reject");
-        assert_eq!(opcode_by_name("oc").unwrap().id, 90);
+        assert_eq!(opcode_by_name("bb").unwrap().id, op::BATCH);
+        assert!(opcode_by_id(op::SET_PROPERTY).unwrap().review);
+        assert_eq!(
+            opcode_by_id(op::REVIEW_REJECT).unwrap().name,
+            "review-reject"
+        );
+        assert_eq!(opcode_by_name("oc").unwrap().id, op::CLOUD);
     }
 
     #[test]
@@ -345,7 +342,7 @@ mod tests {
         let request = Request {
             v: 1,
             id: 1,
-            op: 20,
+            op: op::FIND,
             cx: None,
             p: json!({}),
         };
@@ -376,11 +373,11 @@ mod tests {
             plugin_build: Some(3),
             fingerprint: "fingerprint".to_string(),
         });
-        let id = state.prepare_review(&context, 11, json!({ "destructive": true }));
+        let id = state.prepare_review(&context, op::PUSH, json!({ "destructive": true }));
         let review = state.take_review(&id).unwrap();
         assert_eq!(review.context_id, context.id);
         assert_eq!(review.runtime_id, context.runtime_id);
-        assert_eq!(review.operation, 11);
+        assert_eq!(review.operation, op::PUSH);
         assert!(state.take_review(&id).is_none());
     }
 }

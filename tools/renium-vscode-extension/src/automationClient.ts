@@ -8,7 +8,11 @@ import {
   terminateProcess,
   trackProcess,
 } from "./processSupervisor";
-import { AUTOMATION_OP, AUTOMATION_PROTOCOL_VERSION } from "./automationProtocol.generated";
+import {
+  AUTOMATION_OP,
+  AUTOMATION_PROTOCOL_VERSION,
+  AUTOMATION_RUNTIME_OPS,
+} from "./automationProtocol.generated";
 import { delay, prefixProcessOutput } from "./utils";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
@@ -61,7 +65,12 @@ type PendingRequest = {
 };
 
 export function editorBridgeWaitSeconds(config: AutomationClientConfig): number {
-  return Math.max(1, Math.min(2, Number(config.bridgeWaitSeconds) || 2));
+  return Math.max(1, Math.min(MAX_CHANNEL_WAIT_MS / 1_000, Number(config.bridgeWaitSeconds) || 8));
+}
+
+function operationRequiresRuntime(op: number, parameters: Record<string, unknown>): boolean {
+  return AUTOMATION_RUNTIME_OPS.has(op)
+    || ((op === AUTOMATION_OP.setProperty || op === AUTOMATION_OP.remove) && parameters.editor === true);
 }
 
 export class AutomationClient {
@@ -99,7 +108,7 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    const contextId = await this.ensureContext(config);
+    const contextId = await this.ensureContext(config, operationRequiresRuntime(op, parameters));
     return this.send(config, label, op, contextId, parameters, options);
   }
 
@@ -112,7 +121,7 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    const contextId = await this.ensureContext(config);
+    const contextId = await this.ensureContext(config, operationRequiresRuntime(op, parameters));
     const prepared = await this.send(
       config,
       `${label}-review`,
@@ -225,7 +234,7 @@ export class AutomationClient {
     });
   }
 
-  private async ensureContext(config: AutomationClientConfig): Promise<number> {
+  private async ensureContext(config: AutomationClientConfig, requireRuntime: boolean): Promise<number> {
     const key = JSON.stringify({
       projectRoot: path.resolve(config.projectRoot),
       place: config.placeSelector ?? "",
@@ -234,26 +243,63 @@ export class AutomationClient {
     if (this.context?.key === key) {
       return this.context.id;
     }
-    const bound = await this.send(
-      config,
-      "bind",
-      AUTOMATION_OP.bind,
-      undefined,
-      { root: config.projectRoot, place: config.placeSelector },
-      { quietWait: true, timeoutMs: 2_000 },
-    );
-    if (bound.code !== 0) {
-      throw new Error(bound.automationError?.m ?? "Renium could not bind this project.");
+    const deadline = Date.now() + editorBridgeWaitSeconds(config) * 1_000;
+    while (true) {
+      const bound = await this.send(
+        config,
+        "bind",
+        AUTOMATION_OP.bind,
+        undefined,
+        { root: config.projectRoot, place: config.placeSelector },
+        { quietWait: true, timeoutMs: 2_000 },
+      );
+      if (bound.code !== 0) {
+        throw new Error(bound.automationError?.m ?? "Renium could not bind this project.");
+      }
+      const result = bound.result as Record<string, unknown> | undefined;
+      const id = Number(result?.id);
+      if (!Number.isSafeInteger(id) || id < 1) {
+        throw new Error("Renium bind response omitted the context ID.");
+      }
+      if (typeof result?.runtimeId === "string" && result.runtimeId.length > 0) {
+        this.context = { key, id };
+        return id;
+      }
+      if (!requireRuntime) {
+        return id;
+      }
+      let runtimeConnected = false;
+      while (Date.now() < deadline) {
+        const status = await this.send(
+          config,
+          "studios",
+          AUTOMATION_OP.studios,
+          id,
+          {},
+          { quietWait: true, timeoutMs: 1_000 },
+        );
+        if (status.code !== 0) {
+          break;
+        }
+        const clients = (status.result as Record<string, unknown> | undefined)?.clients;
+        if (Array.isArray(clients) && clients.length > 0) {
+          runtimeConnected = true;
+          break;
+        }
+        await delay(50);
+      }
+      await this.send(
+        config,
+        "unbind",
+        AUTOMATION_OP.unbind,
+        id,
+        {},
+        { quietWait: true, timeoutMs: 1_000 },
+      );
+      if (!runtimeConnected) {
+        throw new Error("No Studio runtime is connected to this project.");
+      }
     }
-    const result = bound.result as Record<string, unknown> | undefined;
-    const id = Number(result?.id);
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new Error("Renium bind response omitted the context ID.");
-    }
-    if (typeof result?.runtimeId === "string" && result.runtimeId.length > 0) {
-      this.context = { key, id };
-    }
-    return id;
   }
 
   private send(

@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::app::setup::setup_command;
 use crate::app::update;
-use crate::automation::runtime::automation_command;
+use crate::automation::client::automation_command;
 use crate::bytecode::edit::{
     bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
     bytecode_remove_instance,

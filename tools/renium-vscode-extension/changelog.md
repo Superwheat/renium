@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.1.8 - 2026-08-15
+
+- Replaced untyped daemon command forwarding with a versioned operation registry, bound project/place contexts, stable errors, and review receipts.
+- Reused one Studio daemon across editor windows and direct `rbx` commands, and waited for the matching Studio runtime before runtime-bound operations.
+- Fixed pulls when Roblox omits engine-generated descendants while cloning and serializing a Studio tree.
+- Made signed updates component-aware so the CLI, extension, and Studio plugin stay on compatible versions during installation and rollback.
+- Added read-only `.rbxm` and `.rbxmx` inspection through `rbx view` and stdin support for batched project reads.
+- Shortened the generated `RENIUM.md`, removed temporary command-payload files, and clarified ordinary Play, local-server, multiplayer, and Luau runtime selection.
+- Split the daemon and automation implementation into focused modules while removing duplicated parsing and dispatch code.
+- Removed the missing-property-database warning from installed builds that use the plugin's bundled schema.
+
 ## 0.1.7 - 2026-08-15
 
 - Changed exact-window recordings from animated WebP images to H.264 MP4 clips on every supported platform.

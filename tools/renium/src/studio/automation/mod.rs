@@ -9,15 +9,13 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::{automation_token, ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
 use crate::app::timing::current_millis;
+use crate::automation::op;
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
     ListClientsArgs, PressArgs, ShotArgs, StartStopPlayArgs, StudioChangeStateArgs,
     StudioDeviceArgs, TestArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
-use crate::daemon::{
-    execute_luau_daemon_args, start_stop_play_daemon_args, studio_change_state_daemon_args,
-    studio_device_daemon_args, try_daemon_control_request,
-};
+use crate::daemon::try_daemon_control_request;
 use crate::snapshot::export::parse_bridge_ports;
 use crate::snapshot::import::parse_services;
 use crate::studio::bridge::{
@@ -43,7 +41,16 @@ fn console_entry_level(entry: &Value) -> &str {
 }
 
 pub(crate) fn execute_luau_command(args: ExecuteLuauArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("lx", execute_luau_daemon_args(&args))? {
+    let parameters = json!({
+        "code": args.code,
+        "file": args.file,
+        "client": args.client,
+        "player": args.player,
+        "timeout": args.timeout,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    if let Some(result) = try_daemon_control_request(op::LUAU, None, parameters, false)? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -106,7 +113,17 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
 }
 
 pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("device", studio_device_daemon_args(&args))? {
+    let parameters = json!({
+        "action": args.action,
+        "device": args.device,
+        "orientation": args.orientation,
+        "scalingMode": args.scaling_mode,
+        "resolution": args.resolution,
+        "pixelDensity": args.pixel_density,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    if let Some(result) = try_daemon_control_request(op::DEVICE, None, parameters, false)? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -191,7 +208,18 @@ fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64
 }
 
 pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("play", start_stop_play_daemon_args(&args))? {
+    let operation = if args.stop {
+        op::PLAY_STOP
+    } else {
+        op::PLAY_START
+    };
+    let parameters = json!({
+        "players": args.players,
+        "mode": args.mode,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -207,8 +235,30 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
 }
 
 pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("st", studio_change_state_daemon_args(&args))?
-    {
+    let operation = if args.stop {
+        op::LIVE_STOP
+    } else if args.no_start {
+        op::LIVE_STATUS
+    } else if args.clear_pending {
+        op::DISCARD_PENDING
+    } else {
+        op::LIVE_START
+    };
+    let parameters = json!({
+        "services": args.services,
+        "reset": args.reset,
+        "replaceServices": args.replace_services,
+        "ackSeq": args.ack_seq,
+        "ackActions": args.ack_actions,
+        "ackActionResults": args.ack_action_results,
+        "runtimeId": args.runtime_id,
+        "suppressSeconds": args.suppress_seconds,
+        "eventWaitSeconds": args.event_wait_seconds,
+        "contextBound": args.context_bound,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
         println!(
             "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ {}",
             serde_json::to_string(&result)?
@@ -1277,24 +1327,16 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
 }
 
 pub(crate) fn goto_command(args: GotoArgs) -> Result<()> {
-    let mut daemon_args = Vec::new();
-    if let Some(target) = args.target.as_ref() {
-        daemon_args.push(target.clone());
-    }
-    if let Some(pos) = args.pos.as_ref() {
-        daemon_args.push("--pos".to_string());
-        daemon_args.push(pos.clone());
-    }
-    if args.tp {
-        daemon_args.push("--tp".to_string());
-    }
-    daemon_args.push("-t".to_string());
-    daemon_args.push(args.timeout.to_string());
-    daemon_args.push("--speed-multiplier".to_string());
-    daemon_args.push(args.speed_multiplier.to_string());
     run_input_command(
-        "goto",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::GOTO,
+        json!({
+            "target": args.target,
+            "pos": args.pos,
+            "player": args.player,
+            "tp": args.tp,
+            "timeout": args.timeout,
+            "speedMultiplier": args.speed_multiplier,
+        }),
         &args.bridge,
         true,
         |bridge| goto_result(&args, bridge),
@@ -1429,30 +1471,30 @@ fn compact_json(mut value: Value) -> Value {
     value
 }
 
-fn input_daemon_args(player: Option<&str>, rest: Vec<String>) -> Vec<String> {
-    let mut out = rest;
-    if let Some(player) = player {
-        out.push("--player".to_string());
-        out.push(player.to_string());
-    }
-    out
-}
-
 fn run_input_command(
-    daemon_command: &str,
-    daemon_args: Vec<String>,
+    operation: u16,
+    mut parameters: Value,
     bridge_args: &BridgeConnectionArgs,
     compact: bool,
     direct: impl FnOnce(&BridgeServer) -> Result<Value>,
 ) -> Result<()> {
-    let result = if let Some(result) = try_daemon_control_request(daemon_command, daemon_args)? {
-        result
-    } else {
-        let ports = parse_bridge_ports(&bridge_args.ports)?;
-        let (bridge, _listen_metrics) =
-            BridgeServer::listen(&bridge_args.host, &ports, bridge_args.wait_seconds)?;
-        direct(&bridge)?
-    };
+    let object = parameters
+        .as_object_mut()
+        .context("Input operation parameters must be an object")?;
+    object.insert(
+        "bridgeWaitSeconds".to_string(),
+        json!(bridge_args.wait_seconds),
+    );
+    object.insert("bridgePorts".to_string(), json!(bridge_args.ports));
+    let result =
+        if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
+            result
+        } else {
+            let ports = parse_bridge_ports(&bridge_args.ports)?;
+            let (bridge, _listen_metrics) =
+                BridgeServer::listen(&bridge_args.host, &ports, bridge_args.wait_seconds)?;
+            direct(&bridge)?
+        };
     let result = if compact {
         compact_json(result)
     } else {
@@ -1463,25 +1505,16 @@ fn run_input_command(
 }
 
 pub(crate) fn press_command(args: PressArgs) -> Result<()> {
-    let mut daemon_args = Vec::new();
-    if let Some(path) = args.path.as_ref() {
-        daemon_args.push(path.clone());
-    }
-    if let Some(id) = args.id.as_ref() {
-        daemon_args.push("--id".to_string());
-        daemon_args.push(id.clone());
-    }
-    if args.right {
-        daemon_args.push("--right".to_string());
-    }
-    if args.world {
-        daemon_args.push("--world".to_string());
-    }
-    daemon_args.push("--hold".to_string());
-    daemon_args.push(args.hold.to_string());
     run_input_command(
-        "press",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::PRESS,
+        json!({
+            "path": args.path,
+            "id": args.id,
+            "player": args.player,
+            "right": args.right,
+            "world": args.world,
+            "hold": args.hold,
+        }),
         &args.bridge,
         true,
         |bridge| press_result(&args, bridge),
@@ -1489,15 +1522,15 @@ pub(crate) fn press_command(args: PressArgs) -> Result<()> {
 }
 
 pub(crate) fn click_command(args: ClickArgs) -> Result<()> {
-    let mut daemon_args = vec![args.x.to_string(), args.y.to_string()];
-    if args.right {
-        daemon_args.push("--right".to_string());
-    }
-    daemon_args.push("--hold".to_string());
-    daemon_args.push(args.hold.to_string());
     run_input_command(
-        "click",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::CLICK,
+        json!({
+            "x": args.x,
+            "y": args.y,
+            "player": args.player,
+            "right": args.right,
+            "hold": args.hold,
+        }),
         &args.bridge,
         true,
         |bridge| click_result(&args, bridge),
@@ -1505,14 +1538,9 @@ pub(crate) fn click_command(args: ClickArgs) -> Result<()> {
 }
 
 pub(crate) fn key_command(args: KeyArgs) -> Result<()> {
-    let daemon_args = vec![
-        args.key.clone(),
-        "--hold-ms".to_string(),
-        args.hold_ms.to_string(),
-    ];
     run_input_command(
-        "key",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::KEY,
+        json!({ "key": args.key, "player": args.player, "holdMs": args.hold_ms }),
         &args.bridge,
         true,
         |bridge| key_result(&args, bridge),
@@ -1520,13 +1548,13 @@ pub(crate) fn key_command(args: KeyArgs) -> Result<()> {
 }
 
 pub(crate) fn ui_command(args: UiArgs) -> Result<()> {
-    let mut daemon_args = vec!["-n".to_string(), args.limit.to_string()];
-    if args.include_offscreen {
-        daemon_args.push("--include-offscreen".to_string());
-    }
     run_input_command(
-        "ui",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::UI,
+        json!({
+            "player": args.player,
+            "limit": args.limit,
+            "includeOffscreen": args.include_offscreen,
+        }),
         &args.bridge,
         false,
         |bridge| ui_result(&args, bridge),
@@ -1534,17 +1562,14 @@ pub(crate) fn ui_command(args: UiArgs) -> Result<()> {
 }
 
 pub(crate) fn type_command(args: TypeArgs) -> Result<()> {
-    let mut daemon_args = vec![args.text.clone()];
-    if let Some(path) = args.path.as_ref() {
-        daemon_args.push("--path".to_string());
-        daemon_args.push(path.clone());
-    }
-    if args.enter {
-        daemon_args.push("--enter".to_string());
-    }
     run_input_command(
-        "type",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::TYPE,
+        json!({
+            "text": args.text,
+            "path": args.path,
+            "player": args.player,
+            "enter": args.enter,
+        }),
         &args.bridge,
         true,
         |bridge| type_result(&args, bridge),
@@ -1552,19 +1577,15 @@ pub(crate) fn type_command(args: TypeArgs) -> Result<()> {
 }
 
 pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
-    let mut daemon_args = vec![
-        args.condition.clone(),
-        "-t".to_string(),
-        args.timeout.to_string(),
-        "--interval".to_string(),
-        args.interval.to_string(),
-    ];
-    if args.client {
-        daemon_args.push("-c".to_string());
-    }
     run_input_command(
-        "wait-until",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::WAIT,
+        json!({
+            "condition": args.condition,
+            "player": args.player,
+            "client": args.client,
+            "timeout": args.timeout,
+            "interval": args.interval,
+        }),
         &args.bridge,
         true,
         |bridge| wait_until_result(&args, bridge),
@@ -1579,16 +1600,16 @@ pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(&args.output)
     };
-    let mut daemon_args = vec!["-o".to_string(), output.display().to_string()];
-    if args.studio {
-        daemon_args.push("--studio".to_string());
-    }
-    if args.client {
-        daemon_args.push("--client".to_string());
-    }
     run_input_command(
-        "shot",
-        input_daemon_args(args.player.as_deref(), daemon_args),
+        op::SHOT,
+        json!({
+            "output": output,
+            "player": args.player,
+            "studio": args.studio,
+            "client": args.client,
+            "cameraPosition": args.camera_position,
+            "lookAt": args.look_at,
+        }),
         &args.bridge,
         true,
         |bridge| shot_result(&args, bridge),
@@ -1596,7 +1617,7 @@ pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
 }
 
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request("clients", Vec::new())? {
+    if let Some(result) = try_daemon_control_request(op::STUDIOS, None, json!({}), false)? {
         println!("{}", serde_json::to_string(&compact_json(result))?);
         return Ok(());
     }
@@ -1608,23 +1629,6 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
         serde_json::to_string_pretty(&json!({ "clients": bridge.list_bridge_clients() }))?
     );
     Ok(())
-}
-
-fn editor_review_decision_daemon_args(args: &EditorReviewDecisionArgs) -> Vec<String> {
-    let mut out = vec![
-        args.decision.clone(),
-        "-w".to_string(),
-        args.bridge.wait_seconds.to_string(),
-        "-H".to_string(),
-        args.bridge.host.clone(),
-        "-P".to_string(),
-        args.bridge.ports.clone(),
-    ];
-    if let Some(review_id) = &args.review_id {
-        out.push("-i".to_string());
-        out.push(review_id.clone());
-    }
-    out
 }
 
 pub(crate) fn editor_review_decision_result(
@@ -1649,8 +1653,14 @@ pub(crate) fn editor_review_decision_result(
 }
 
 pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> Result<()> {
-    let daemon_args = editor_review_decision_daemon_args(&args);
-    let result = try_daemon_control_request("review", daemon_args)?
+    let parameters = json!({
+        "studioDecision": true,
+        "decision": args.decision,
+        "reviewId": args.review_id,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    let result = try_daemon_control_request(op::REVIEW_APPLY, None, parameters, false)?
         .context("No Renium daemon is running; start `rbx bd` first")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -1835,24 +1845,15 @@ pub(crate) fn test_command(args: TestArgs) -> Result<()> {
     if args.players.is_some() && args.mode != "play" {
         bail!("--players can only be used with --mode play");
     }
-    let mut daemon_args = vec![
-        "--mode".to_string(),
-        args.mode,
-        "--timeout".to_string(),
-        args.timeout.to_string(),
-    ];
-    if let Some(players) = args.players {
-        daemon_args.push("--players".to_string());
-        daemon_args.push(players.to_string());
-    }
-    if args.fail_on_error {
-        daemon_args.push("--fail-on-error".to_string());
-    }
-    if let Some(player) = args.player {
-        daemon_args.push("--player".to_string());
-        daemon_args.push(player);
-    }
-    let result = try_daemon_control_request("test", daemon_args)?
+    let parameters = json!({
+        "test": true,
+        "mode": args.mode,
+        "players": args.players,
+        "timeout": args.timeout,
+        "failOnError": args.fail_on_error,
+        "player": args.player,
+    });
+    let result = try_daemon_control_request(op::PLAY_START, None, parameters, false)?
         .context("No Renium daemon is running; start `rbx bd` first")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
