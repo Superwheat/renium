@@ -800,6 +800,43 @@ function Get-ReniumLocalVersion {
     return $null
 }
 
+function Get-ReniumReleaseManifest {
+    param(
+        [string]$BaseUrl,
+        [string]$Version,
+        [string]$Destination
+    )
+    Invoke-WebRequest "$BaseUrl/update-manifest.json" -OutFile $Destination -UseBasicParsing
+    $manifest = Get-Content -LiteralPath $Destination -Raw | ConvertFrom-Json
+    if ($manifest.payload.schemaVersion -ne 1 -or [string]$manifest.payload.version -ne $Version) {
+        throw "The Renium $Version update manifest is invalid"
+    }
+    return $manifest.payload
+}
+
+function Save-ReniumReleaseAsset {
+    param(
+        [object]$Manifest,
+        [string]$Platform,
+        [string]$Component,
+        [string]$Name,
+        [string]$BaseUrl,
+        [string]$Destination
+    )
+    $platformProperty = $Manifest.components.PSObject.Properties[$Platform]
+    $platformEntry = if ($null -ne $platformProperty) { $platformProperty.Value } else { $null }
+    $asset = if ($null -ne $platformEntry) { $platformEntry.$Component } else { $null }
+    $expectedUrl = "$BaseUrl/$Name"
+    if ($null -eq $asset -or [string]$asset.url -ne $expectedUrl -or [string]$asset.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "$Name is missing from the Renium update manifest"
+    }
+    Invoke-WebRequest $expectedUrl -OutFile $Destination -UseBasicParsing
+    $actual = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne ([string]$asset.sha256).ToLowerInvariant()) {
+        throw "$Name failed SHA-256 verification"
+    }
+}
+
 $localCli = Join-Path $PSScriptRoot "renium.exe"
 $localVersion = Get-ReniumLocalVersion $localCli
 if ([string]::IsNullOrWhiteSpace($Version) -and $null -ne $localVersion) {
@@ -854,23 +891,16 @@ $previousInstall = Join-Path $installParent (".renium-previous-$transactionId")
 
 try {
     New-Item -ItemType Directory -Path $stage | Out-Null
-    $checksums = Join-Path $stage "SHA256SUMS.txt"
+    $releaseManifest = $null
+    $manifestPath = Join-Path $stage "update-manifest.json"
     if ($useLocalPackage) {
         $cli = Get-Item -LiteralPath $localCli
     }
     else {
-        Invoke-WebRequest "$baseUrl/SHA256SUMS.txt" -OutFile $checksums
+        $releaseManifest = Get-ReniumReleaseManifest $baseUrl $Version $manifestPath
         $archive = Join-Path $stage $archiveName
-        Invoke-WebRequest "$baseUrl/$archiveName" -OutFile $archive
-        $expectedLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($archiveName) } | Select-Object -First 1
-        if ($null -eq $expectedLine) {
-            throw "$archiveName is missing from SHA256SUMS.txt"
-        }
-        $expected = ($expectedLine -split "\s+")[0].ToLowerInvariant()
-        $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -ne $expected) {
-            throw "$archiveName failed SHA-256 verification"
-        }
+        $manifestPlatform = "windows-$(if ($releaseArchitecture -eq 'x64') { 'x86_64' } else { 'aarch64' })"
+        Save-ReniumReleaseAsset $releaseManifest $manifestPlatform "cli" $archiveName $baseUrl $archive
         $expanded = Join-Path $stage "expanded"
         Expand-Archive -LiteralPath $archive -DestinationPath $expanded
         $cli = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter "renium.exe" | Select-Object -First 1
@@ -888,19 +918,11 @@ try {
         }
         else {
             $vsix = Join-Path $stage $vsixName
-            if (-not (Test-Path -LiteralPath $checksums -PathType Leaf)) {
-                Invoke-WebRequest "$baseUrl/SHA256SUMS.txt" -OutFile $checksums
+            if ($null -eq $releaseManifest) {
+                $releaseManifest = Get-ReniumReleaseManifest $baseUrl $Version $manifestPath
             }
-            Invoke-WebRequest "$baseUrl/$vsixName" -OutFile $vsix
-            $expectedVsixLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match [regex]::Escape($vsixName) } | Select-Object -First 1
-            if ($null -eq $expectedVsixLine) {
-                throw "$vsixName is missing from SHA256SUMS.txt"
-            }
-            $expectedVsix = ($expectedVsixLine -split "\s+")[0].ToLowerInvariant()
-            $actualVsix = (Get-FileHash -LiteralPath $vsix -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actualVsix -ne $expectedVsix) {
-                throw "$vsixName failed SHA-256 verification"
-            }
+            $manifestPlatform = "windows-$(if ($editorArchitecture -eq 'x64') { 'x86_64' } else { 'aarch64' })"
+            Save-ReniumReleaseAsset $releaseManifest $manifestPlatform "extension" $vsixName $baseUrl $vsix
         }
         $vsixFiles[$editorArchitecture] = $vsix
     }
