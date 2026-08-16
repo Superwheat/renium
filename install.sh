@@ -734,6 +734,60 @@ stage="$(mktemp -d "${TMPDIR:-/tmp}/renium-install.XXXXXX")"
 transaction_active=0
 committed=0
 staged_install=""
+release_manifest="$stage/update-manifest.json"
+fetch_release_manifest() {
+  [ -f "$release_manifest" ] && return
+  curl -fsSL "$base_url/update-manifest.json" -o "$release_manifest"
+  manifest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$release_manifest" | head -n 1)"
+  if [ "$manifest_version" != "$version" ]; then
+    printf '%s\n' "The Renium $version update manifest is invalid." >&2
+    return 1
+  fi
+}
+manifest_sha256() {
+  asset_name="$1"
+  fetch_release_manifest || return 1
+  expected="$(awk -v suffix="/$asset_name\"" '
+    index($0, suffix) { matches += 1; waiting = 1; next }
+    waiting && /"sha256"[[:space:]]*:/ {
+      line = $0
+      sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      value = line
+      waiting = 0
+    }
+    END { if (matches == 1 && value != "") print value; else exit 1 }
+  ' "$release_manifest")" || {
+    printf '%s\n' "$asset_name is missing from the Renium update manifest." >&2
+    return 1
+  }
+  case "$expected" in
+    *[!0-9a-fA-F]*|'')
+      printf '%s\n' "$asset_name has an invalid digest in the Renium update manifest." >&2
+      return 1
+      ;;
+  esac
+  if [ "${#expected}" -ne 64 ]; then
+    printf '%s\n' "$asset_name has an invalid digest in the Renium update manifest." >&2
+    return 1
+  fi
+  printf '%s\n' "$expected" | tr '[:upper:]' '[:lower:]'
+}
+download_release_asset() {
+  asset_name="$1"
+  destination="$2"
+  expected="$(manifest_sha256 "$asset_name")" || return 1
+  curl -fsSL "$base_url/$asset_name" -o "$destination"
+  if command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$destination" | awk '{print $1}')"
+  else
+    actual="$(sha256sum "$destination" | awk '{print $1}')"
+  fi
+  if [ "$actual" != "$expected" ]; then
+    printf '%s\n' "$asset_name failed SHA-256 verification." >&2
+    return 1
+  fi
+}
 cleanup_install() {
   code=$?
   trap - EXIT HUP INT TERM
@@ -753,42 +807,10 @@ cleanup_install() {
 trap cleanup_install EXIT HUP INT TERM
 
 if [ "$use_local_package" -eq 0 ]; then
-  curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
-  curl -fsSL "$base_url/$archive_name" -o "$stage/$archive_name"
-  expected="$(grep "$archive_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
-  if [ -z "$expected" ]; then
-    printf '%s\n' "$archive_name is missing from SHA256SUMS.txt." >&2
-    exit 1
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$stage/$archive_name" | awk '{print $1}')"
-  else
-    actual="$(sha256sum "$stage/$archive_name" | awk '{print $1}')"
-  fi
-  if [ "$actual" != "$expected" ]; then
-    printf '%s\n' "$archive_name failed SHA-256 verification." >&2
-    exit 1
-  fi
+  download_release_asset "$archive_name" "$stage/$archive_name"
 fi
 if [ "$studio_archive_name" != "$archive_name" ]; then
-  if [ ! -f "$stage/SHA256SUMS.txt" ]; then
-    curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
-  fi
-  curl -fsSL "$base_url/$studio_archive_name" -o "$stage/$studio_archive_name"
-  expected_studio="$(grep "$studio_archive_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
-  if [ -z "$expected_studio" ]; then
-    printf '%s\n' "$studio_archive_name is missing from SHA256SUMS.txt." >&2
-    exit 1
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    actual_studio="$(shasum -a 256 "$stage/$studio_archive_name" | awk '{print $1}')"
-  else
-    actual_studio="$(sha256sum "$stage/$studio_archive_name" | awk '{print $1}')"
-  fi
-  if [ "$actual_studio" != "$expected_studio" ]; then
-    printf '%s\n' "$studio_archive_name failed SHA-256 verification." >&2
-    exit 1
-  fi
+  download_release_asset "$studio_archive_name" "$stage/$studio_archive_name"
 fi
 editor_architecture() {
   editor_cli="$1"
@@ -913,24 +935,7 @@ for extension_arch in x64 arm64; do
   if [ -f "$script_root/$vsix_name" ]; then
     cp "$script_root/$vsix_name" "$stage/$vsix_name"
   else
-    if [ ! -f "$stage/SHA256SUMS.txt" ]; then
-      curl -fsSL "$base_url/SHA256SUMS.txt" -o "$stage/SHA256SUMS.txt"
-    fi
-    curl -fsSL "$base_url/$vsix_name" -o "$stage/$vsix_name"
-    expected_vsix="$(grep "$vsix_name" "$stage/SHA256SUMS.txt" | head -n 1 | awk '{print $1}')"
-    if [ -z "$expected_vsix" ]; then
-      printf '%s\n' "$vsix_name is missing from SHA256SUMS.txt." >&2
-      exit 1
-    fi
-    if command -v shasum >/dev/null 2>&1; then
-      actual_vsix="$(shasum -a 256 "$stage/$vsix_name" | awk '{print $1}')"
-    else
-      actual_vsix="$(sha256sum "$stage/$vsix_name" | awk '{print $1}')"
-    fi
-    if [ "$actual_vsix" != "$expected_vsix" ]; then
-      printf '%s\n' "$vsix_name failed SHA-256 verification." >&2
-      exit 1
-    fi
+    download_release_asset "$vsix_name" "$stage/$vsix_name"
   fi
 done
 

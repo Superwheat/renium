@@ -24,6 +24,13 @@ const hasCommand = (command) => childProcess.spawnSync(
   { stdio: "ignore" },
 ).status === 0;
 
+for (const installer of ["install.ps1", "install.sh"]) {
+  const source = fs.readFileSync(path.join(repository, installer), "utf8");
+  if (!source.includes("update-manifest.json") || source.includes("SHA256SUMS.txt")) {
+    throw new Error(`${installer} does not use the published update manifest`);
+  }
+}
+
 try {
   if (process.platform === "win32") {
     const stub = path.join(temporary, "renium-stub.cmd");
