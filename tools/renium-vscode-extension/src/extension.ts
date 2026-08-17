@@ -1047,8 +1047,13 @@ class RobloxSyncController {
       },
       {
         label: "$(tools) Settings & Diagnostics...",
-        description: "Configure or diagnose Renium and open help, updates, or logs",
+        description: "Configure or diagnose Renium and open help or logs",
         action: "settingsAndDiagnostics",
+      },
+      {
+        label: "$(versions) Check for Updates",
+        description: "Check for and install a newer Renium version",
+        action: "update",
       },
     ]);
 
@@ -1082,6 +1087,9 @@ class RobloxSyncController {
         return;
       case "settingsAndDiagnostics":
         await this.openProjectTools();
+        return;
+      case "update":
+        await this.checkForUpdates();
         return;
       case "toggleAuto":
         await this.toggleAutoSyncOnSave();
@@ -1966,11 +1974,6 @@ class RobloxSyncController {
         action: "docs",
       },
       {
-        label: "$(versions) Check for Updates",
-        description: "Check whether a newer Renium version is available",
-        action: "update",
-      },
-      {
         label: "$(output) Show Output",
         description: "Open Renium extension logs",
         action: "output",
@@ -1984,9 +1987,6 @@ class RobloxSyncController {
         break;
       case "docs":
         await this.openCliDocumentation();
-        break;
-      case "update":
-        await this.checkForUpdates();
         break;
       case "output":
         this.output.show(true);
