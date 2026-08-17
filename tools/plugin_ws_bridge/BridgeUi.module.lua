@@ -1630,6 +1630,15 @@ function BridgeUi.create(plugin, bridgeInfo)
 
 	local settingsUi = buildSettingsWidget(plugin)
 	local statusUi = buildStatusWidget(plugin, versionText)
+	if bridgeInfo.initiallyConnecting == true then
+		statusUi.dot.BackgroundColor3 = WARN_AMBER
+		statusUi.statusTitle.Text = "Connecting..."
+		statusUi.statusSubtitle.Text = " "
+		statusUi.syncLine.Text = "Waiting for sync"
+		statusUi.connectButton.Visible = false
+		statusUi.disconnectButton.Visible = true
+		statusUi.disconnectButton.Text = "Cancel"
+	end
 
 	statusUi.settingsButton.MouseButton1Click:Connect(function()
 		settingsUi.open()
@@ -1655,7 +1664,8 @@ function BridgeUi.create(plugin, bridgeInfo)
 
 	local notificationKey = nil
 	local notificationAction = nil
-	local storedSnoozes = plugin:GetSetting("Renium.NotificationSnoozeUntil")
+	local notificationSnoozeSetting = "Renium_NotificationSnoozeUntil"
+	local storedSnoozes = plugin:GetSetting(notificationSnoozeSetting)
 	local notificationSnoozeUntil = if type(storedSnoozes) == "table" then storedSnoozes else {}
 	local notificationPayloads = {}
 	local scheduledSnoozes = {}
@@ -1671,7 +1681,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 		notificationPayloads[normalizedKey] = nil
 		notificationSnoozeUntil[normalizedKey] = nil
 		scheduledSnoozes[normalizedKey] = nil
-		plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+		plugin:SetSetting(notificationSnoozeSetting, notificationSnoozeUntil)
 		if notificationKey == normalizedKey then
 			hideNotification()
 		end
@@ -1689,7 +1699,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 			local key = notificationKey
 			local payload = notificationPayloads[key]
 			notificationSnoozeUntil[key] = os.time() + 300
-			plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+			plugin:SetSetting(notificationSnoozeSetting, notificationSnoozeUntil)
 			hideNotification()
 			if payload ~= nil then
 				task.defer(function()
@@ -1735,7 +1745,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 					scheduledSnoozes[normalizedKey] = nil
 					if (tonumber(notificationSnoozeUntil[normalizedKey]) or 0) <= os.time() then
 						notificationSnoozeUntil[normalizedKey] = nil
-						plugin:SetSetting("Renium.NotificationSnoozeUntil", notificationSnoozeUntil)
+						plugin:SetSetting(notificationSnoozeSetting, notificationSnoozeUntil)
 						local payload = notificationPayloads[normalizedKey]
 						notificationPayloads[normalizedKey] = nil
 						if payload ~= nil then

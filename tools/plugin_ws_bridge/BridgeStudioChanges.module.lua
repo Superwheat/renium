@@ -167,6 +167,9 @@ type State = {
 	expectedTags: ExpectedInstanceEvents,
 	expectedGeneration: number,
 	luaSourceDescendantCounts: { [Instance]: number },
+	archivableByInstance: { [Instance]: boolean },
+	nonArchivableCountByService: { [string]: number },
+	exportInstancesByService: { [string]: { Instance } },
 	changeJournal: any?,
 }
 
@@ -279,11 +282,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		expectedTags = setmetatable({}, { __mode = "k" }) :: any,
 		expectedGeneration = 0,
 		luaSourceDescendantCounts = setmetatable({}, { __mode = "k" }) :: any,
+		archivableByInstance = setmetatable({}, { __mode = "k" }) :: any,
+		nonArchivableCountByService = {},
+		exportInstancesByService = {},
 		changeJournal = nil,
 	}
 
 	local api = {}
 	local luaSourceClasses = config.LUA_SOURCE_CLASS
+	local rebuildExportInstances
 
 	local function persistPendingServices()
 		local services = {}
@@ -524,6 +531,28 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return state.mutationSeqByService[serviceName] or 0
 	end
 
+	function api.isTracking(serviceName: string): boolean
+		return state.started and state.watchedServices[serviceName] == true
+	end
+
+	function api.hasNonArchivable(serviceName: string): boolean?
+		if not api.isTracking(serviceName) or state.onlyCodeMode then
+			return nil
+		end
+		return (state.nonArchivableCountByService[serviceName] or 0) > 0
+	end
+
+	function api.exportInstances(serviceName: string): { Instance }?
+		if not api.isTracking(serviceName) then
+			return nil
+		end
+		local instances = state.exportInstancesByService[serviceName]
+		if instances == nil then
+			instances = rebuildExportInstances(state.serviceRoots[serviceName], serviceName)
+		end
+		return instances
+	end
+
 	function api.beginChangeJournal(transactionId: string, services: { string })
 		if state.changeJournal ~= nil then
 			error("Another Studio change journal is already active")
@@ -583,21 +612,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeEvent:Fire(state.seq)
 	end
 
-	local function hasDirtyServices(services: { string }): boolean
+	local function hasPendingChanges(services: { string }): boolean
 		for _, serviceName in ipairs(services) do
 			if state.dirtySeqByService[serviceName] ~= nil or state.fullSyncSeqByService[serviceName] ~= nil then
 				return true
 			end
 		end
-		return false
+		return type(config.hasPendingBridgeSettingChanges) == "function"
+			and config.hasPendingBridgeSettingChanges()
 	end
 
 	local function waitForDirtyServices(services: { string }, waitSeconds: number?): boolean
 		local duration = tonumber(waitSeconds) or 0
 		if duration <= 0 then
-			return hasDirtyServices(services)
+			return hasPendingChanges(services)
 		end
-		if hasDirtyServices(services) then
+		if hasPendingChanges(services) then
 			return true
 		end
 		duration = math.min(duration, 25)
@@ -623,14 +653,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end)
 
-		while not timedOut and os.clock() < deadline and not hasDirtyServices(services) do
+		while not timedOut and os.clock() < deadline and not hasPendingChanges(services) do
 			wakeEvent.Event:Wait()
 		end
 
 		done = true
 		connection:Disconnect()
 		wakeEvent:Destroy()
-		return hasDirtyServices(services)
+		return hasPendingChanges(services)
 	end
 
 	local function pathToString(pathSegments: { string }?): string?
@@ -1119,6 +1149,76 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return instance:IsDescendantOf(currentCamera)
 	end
 
+	local function includeExportInstance(serviceName: string, instance: Instance): boolean
+		local callback = config.includeExportInstance
+		if type(callback) == "function" then
+			return callback(serviceName, instance)
+		end
+		return not config.shouldIgnoreInstance(instance)
+	end
+
+	local function updateTrackedArchivable(instance: Instance, serviceName: string)
+		if not includeExportInstance(serviceName, instance) then
+			return
+		end
+		local current = instance.Archivable
+		local previous = state.archivableByInstance[instance]
+		if previous == current then
+			return
+		end
+		local count = state.nonArchivableCountByService[serviceName] or 0
+		if previous == false then
+			count -= 1
+		end
+		if current == false then
+			count += 1
+		end
+		state.archivableByInstance[instance] = current
+		state.nonArchivableCountByService[serviceName] = count
+	end
+
+	local function removeTrackedArchivable(instance: Instance, serviceName: string)
+		if state.archivableByInstance[instance] == false then
+			state.nonArchivableCountByService[serviceName] =
+				math.max(0, (state.nonArchivableCountByService[serviceName] or 0) - 1)
+		end
+		state.archivableByInstance[instance] = nil
+	end
+
+	local function rebuildTrackedArchivable(
+		service: Instance,
+		serviceName: string,
+		descendants: { Instance }?
+	)
+		local instances = descendants or service:GetDescendants()
+		local count = 0
+		for _, instance in ipairs(instances) do
+			if includeExportInstance(serviceName, instance) then
+				local archivable = instance.Archivable
+				state.archivableByInstance[instance] = archivable
+				if not archivable then
+					count += 1
+				end
+			end
+		end
+		state.nonArchivableCountByService[serviceName] = count
+	end
+
+	rebuildExportInstances = function(
+		service: Instance,
+		serviceName: string,
+		descendants: { Instance }?
+	): { Instance }
+		local instances = { service }
+		for _, instance in ipairs(descendants or service:GetDescendants()) do
+			if includeExportInstance(serviceName, instance) then
+				instances[#instances + 1] = instance
+			end
+		end
+		state.exportInstancesByService[serviceName] = instances
+		return instances
+	end
+
 	local function isLuaSourceInstance(instance: Instance): boolean
 		return luaSourceClasses[instance.ClassName]
 	end
@@ -1584,6 +1684,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local connections: { RBXScriptConnection } = {}
 		state.lastParentByInstance[instance] = instance.Parent
 		local changedConnection = instance.Changed:Connect(function(propertyName: any)
+			if string.lower(tostring(propertyName)) == "archivable" then
+				updateTrackedArchivable(instance, serviceName)
+			end
 			local dirtyPropertyName = if instance:IsA("ValueBase") then "Value" else propertyName
 			if isRelevantInstanceProperty(instance, dirtyPropertyName) then
 				local property = tostring(dirtyPropertyName)
@@ -1684,6 +1787,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.serviceRoots[serviceName] = service
 		state.serviceNameByRoot[service] = serviceName
 		local descendants = rebuildLuaSourceCounts(service)
+		rebuildTrackedArchivable(service, serviceName, descendants)
+		rebuildExportInstances(service, serviceName, descendants)
 
 		local connections: { RBXScriptConnection } = {
 			service.Changed:Connect(function(propertyName: string)
@@ -1725,6 +1830,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end),
 			service.DescendantAdded:Connect(function(instance: Instance)
+				state.exportInstancesByService[serviceName] = nil
+				updateTrackedArchivable(instance, serviceName)
 				local expected = consumeExpectedInstanceEvent(
 					state.expectedStructuralByInstance,
 					instance,
@@ -1752,6 +1859,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end),
 			service.DescendantRemoving:Connect(function(instance: Instance)
+				state.exportInstancesByService[serviceName] = nil
+				removeTrackedArchivable(instance, serviceName)
 				local expected = consumeExpectedInstanceEvent(
 					state.expectedStructuralByInstance,
 					instance,
@@ -1818,6 +1927,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, instance in ipairs(disconnect) do
 			disconnectInstance(instance)
 		end
+		for _, instance in ipairs(service:GetDescendants()) do
+			state.archivableByInstance[instance] = nil
+		end
+		state.nonArchivableCountByService[serviceName] = nil
+		state.exportInstancesByService[serviceName] = nil
 		state.watchedServices[serviceName] = nil
 		state.serviceRoots[serviceName] = nil
 		state.serviceNameByRoot[service] = nil
@@ -1946,6 +2060,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			state.onlyCodeMode = rawOptions.onlyCodeMode
 			for serviceName, service in pairs(state.serviceRoots) do
 				reconcileServiceConnections(service, serviceName)
+				if not state.onlyCodeMode then
+					rebuildTrackedArchivable(service, serviceName)
+				end
 			end
 		end
 	end
@@ -2244,6 +2361,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	function api.onChanged(callback): RBXScriptConnection
 		return state.changeEvent.Event:Connect(callback)
+	end
+
+	function api.signalChange()
+		signalChange()
 	end
 
 	function api.stop()

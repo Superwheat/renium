@@ -231,16 +231,19 @@ impl SourcemapInstance for SnapshotInstance {
     }
 }
 
-fn build_full_sourcemap_children<I: SourcemapInstance>(
+fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
     instances: &[I],
     children_by_parent: &[Vec<usize>],
     child_indices: &[usize],
     project_root: &Path,
     parent_dir: &Path,
 ) -> Vec<SourcemapNode> {
+    if child_indices.is_empty() {
+        return Vec::new();
+    }
     let mut used_stem_keys = std::collections::HashSet::new();
     let mut next_suffix_by_base = HashMap::new();
-    child_indices
+    let named_children = child_indices
         .iter()
         .map(|&index| {
             let instance = &instances[index];
@@ -249,35 +252,50 @@ fn build_full_sourcemap_children<I: SourcemapInstance>(
                 &mut used_stem_keys,
                 &mut next_suffix_by_base,
             );
-            let child_indices = children_by_parent.get(index).map_or(&[][..], Vec::as_slice);
-            let source_path = project_script_path(
-                parent_dir,
-                &fs_stem,
-                !child_indices.is_empty(),
-                instance.class_name(),
-                instance.properties(),
-            )
-            .filter(|path| path.is_file());
-            SourcemapNode {
-                name: instance.name().to_string(),
-                class_name: instance.class_name().to_string(),
-                file_paths: source_path
-                    .as_deref()
-                    .map(|path| vec![path_to_sourcemap_relative(project_root, path)])
-                    .unwrap_or_default(),
-                children: build_full_sourcemap_children(
+            (index, fs_stem)
+        })
+        .collect::<Vec<_>>();
+    let build = |(index, fs_stem): &(usize, String)| {
+        let instance = &instances[*index];
+        let child_indices = children_by_parent
+            .get(*index)
+            .map_or(&[][..], Vec::as_slice);
+        let source_path = project_script_path(
+            parent_dir,
+            fs_stem,
+            !child_indices.is_empty(),
+            instance.class_name(),
+            instance.properties(),
+        )
+        .filter(|path| path.is_file());
+        SourcemapNode {
+            name: instance.name().to_string(),
+            class_name: instance.class_name().to_string(),
+            file_paths: source_path
+                .as_deref()
+                .map(|path| vec![path_to_sourcemap_relative(project_root, path)])
+                .unwrap_or_default(),
+            children: if child_indices.is_empty() {
+                Vec::new()
+            } else {
+                build_full_sourcemap_children(
                     instances,
                     children_by_parent,
                     child_indices,
                     project_root,
                     &parent_dir.join(fs_stem),
-                ),
-            }
-        })
-        .collect()
+                )
+            },
+        }
+    };
+    if named_children.len() >= 8 && rayon::current_num_threads() > 1 {
+        named_children.par_iter().map(build).collect()
+    } else {
+        named_children.iter().map(build).collect()
+    }
 }
 
-fn build_full_service_sourcemap<I: SourcemapInstance>(
+fn build_full_service_sourcemap<I: SourcemapInstance + Sync>(
     instances: &[I],
     children_by_parent: &[Vec<usize>],
     service_root_index: usize,

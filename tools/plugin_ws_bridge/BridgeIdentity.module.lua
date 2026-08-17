@@ -213,6 +213,13 @@ function BridgeIdentity.serializeRefValue(state, instance)
 		end
 		if type(cachedDebugId) == "string" and #cachedDebugId > 0 then
 			out.debugId = cachedDebugId
+			local exported = state.exportedInstances and state.exportedInstances[instance]
+			if not exported and state.isExportedInstance then
+				exported = state.isExportedInstance(instance, pathSegments[1])
+			end
+			if #pathSegments > 1 and exported then
+				out.settingsId = "debug:" .. cachedDebugId
+			end
 		end
 		return out
 	end
@@ -256,7 +263,10 @@ function BridgeIdentity.getCachedDebugId(state, instance)
 		return cached
 	end
 
-	local debugId = BridgeIdentity.getDebugId(instance)
+	local index = state.instanceIdByInstance[instance]
+	local debugId = if type(index) == "number" and state.nativeDebugIds
+		then state.nativeDebugIds[index]
+		else BridgeIdentity.getDebugId(instance)
 	if debugId then
 		state.debugIdByInstance[instance] = debugId
 		return debugId

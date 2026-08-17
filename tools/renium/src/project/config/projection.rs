@@ -15,10 +15,10 @@ use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, is_reference_object,
     reindex_reference_indices,
 };
-use crate::settings::tree::settings_children_by_parent;
+use crate::settings::tree::{editor_child_stems, settings_children_by_parent};
 use crate::system::files::{
-    atomic_write_file, create_unique_directory, path_extension_is, service_settings_path,
-    sha256_hex,
+    atomic_write_file, create_unique_directory, normalized_child_stem_key, path_extension_is,
+    sanitize_name, service_settings_path, sha256_hex,
 };
 
 use super::adapter_format::{
@@ -125,12 +125,59 @@ fn projection_entry(
 }
 
 pub fn project_requires_temporary_stage(loaded: &LoadedProject) -> Result<bool> {
-    Ok(!(loaded.project.tree.is_empty()
-        && loaded.project.mounts.is_empty()
-        && loaded.project.adapters.is_empty()
-        && loaded.project.sync_rules.is_empty()
-        && loaded.project.glob_ignore_paths.is_empty()
-        && !contains_metadata_sidecars(&loaded.root.join(&loaded.project.source_root))?))
+    if !loaded.project.mounts.is_empty()
+        || !loaded.project.adapters.is_empty()
+        || project_tree_requires_stage(loaded)
+    {
+        return Ok(true);
+    }
+    let source_root = loaded.root.join(&loaded.project.source_root);
+    Ok(contains_metadata_sidecars(&source_root)?
+        || source_files_require_stage(loaded, &source_root)?)
+}
+
+fn project_tree_requires_stage(loaded: &LoadedProject) -> bool {
+    loaded.project.tree.iter().any(|(service, node)| {
+        let direct_source = loaded.root.join(&loaded.project.source_root).join(service);
+        node.path.as_deref().is_some_and(|path| {
+            absolute_path(&loaded.root.join(path)) != absolute_path(&direct_source)
+        }) || node.id.is_some()
+            || node.class_name.is_some()
+            || !node.properties.is_empty()
+            || !node.attributes.is_empty()
+            || node.tags.is_some()
+            || node.ignore_unknown_instances.is_some()
+            || !node.children.is_empty()
+    })
+}
+
+fn source_files_require_stage(loaded: &LoadedProject, source_root: &Path) -> Result<bool> {
+    if !source_root.is_dir()
+        || (loaded.project.sync_rules.is_empty() && loaded.project.glob_ignore_paths.is_empty())
+    {
+        return Ok(false);
+    }
+    for entry in walkdir::WalkDir::new(source_root).min_depth(1) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(source_root)?;
+        let mut matched_rule = false;
+        for rule in &loaded.project.sync_rules {
+            if sync_rule_matches(rule, relative)? {
+                matched_rule = true;
+                break;
+            }
+        }
+        if matched_rule
+            || (!loaded.project.glob_ignore_paths.is_empty()
+                && path_is_ignored(loaded, entry.path())?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn fresh_projection_stage(parent: &Path, prefix: &str) -> Result<PathBuf> {
@@ -2812,55 +2859,52 @@ fn merge_source_only_document(
         destination.instances.clone_from(&generated.instances);
         return Ok(());
     }
+    let children = settings_children_by_parent(destination);
+    let mut by_parent_stem = HashMap::new();
+    for (index, instance) in destination.instances.iter().enumerate() {
+        if instance.parent_index.is_none() {
+            by_parent_stem.insert(
+                (
+                    None,
+                    normalized_child_stem_key(&sanitize_name(&instance.name)),
+                ),
+                index,
+            );
+        }
+    }
+    for (parent, child_indices) in children.iter().enumerate() {
+        for (index, stem, _) in editor_child_stems(destination, child_indices) {
+            by_parent_stem.insert((Some(parent), normalized_child_stem_key(&stem)), index);
+        }
+    }
     let mut remap = BTreeMap::new();
     for (index, instance) in generated.instances.iter().enumerate() {
         let parent = instance
             .parent_index
             .and_then(|parent| remap.get(&parent).copied());
-        let matches = destination
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, existing)| {
-                existing.parent_index == parent
-                    && existing.name == instance.name
-                    && existing.class_name == instance.class_name
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let mapped = match matches.as_slice() {
-            [only] => *only,
-            [] => {
-                let mapped = destination.instances.len();
-                let mut appended = instance.clone();
-                appended.parent_index = parent;
-                if destination
-                    .instances
-                    .iter()
-                    .any(|existing| existing.settings_id == appended.settings_id)
-                {
-                    appended.settings_id = projection_settings_id(
-                        "source",
-                        &format!("{}:{index}", appended.settings_id),
-                    );
-                }
-                destination.instances.push(appended);
-                mapped
-            }
-            _ if !generated
+        let stem = if parent.is_none() {
+            sanitize_name(&instance.name)
+        } else {
+            instance.name.clone()
+        };
+        let key = (parent, normalized_child_stem_key(&stem));
+        let mapped = if let Some(mapped) = by_parent_stem.get(&key).copied() {
+            mapped
+        } else {
+            let mapped = destination.instances.len();
+            let mut appended = instance.clone();
+            appended.parent_index = parent;
+            if destination
                 .instances
                 .iter()
-                .any(|child| child.parent_index == Some(index)) =>
+                .any(|existing| existing.settings_id == appended.settings_id)
             {
-                matches[0]
+                appended.settings_id =
+                    projection_settings_id("source", &format!("{}:{index}", appended.settings_id));
             }
-            _ => {
-                bail!(
-                    "Source-only projection is ambiguous at '{}' ({})",
-                    instance.name,
-                    instance.class_name
-                )
-            }
+            destination.instances.push(appended);
+            by_parent_stem.insert(key, mapped);
+            mapped
         };
         remap.insert(index, mapped);
     }

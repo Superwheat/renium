@@ -28,14 +28,12 @@ use crate::roblox::schema::{
 use crate::snapshot::codec::{
     bitmask_names, decode_native_overlay_debug_ids, parse_native_overlay_class_groups,
 };
-use crate::snapshot::export::{
-    fetch_typed_payload_with_size, is_supported_bridge_codec, merge_chunk_fetch_metrics,
-};
+use crate::snapshot::export::{fetch_typed_payload_with_size, is_supported_bridge_codec};
 use crate::snapshot::types::{
     NativeOverlayFetch, NativeOverlayItem, NativeOverlayPayload, NativeSettingsProperty,
     NativeSettingsValue, SnapshotInstance,
 };
-use crate::studio::bridge::{BridgeServer, ChunkFetchMetrics, DEFAULT_EXPORT_CHUNK_SIZE};
+use crate::studio::bridge::{BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE};
 use crate::studio::native::editor::rbx_variant_referent;
 
 const NATIVE_OVERLAY_PROTOCOL_VERSION: &str = "native-overlay-v3";
@@ -458,34 +456,7 @@ pub(crate) fn fetch_native_overlay_batches(
     bridge: &BridgeServer,
     request: NativeOverlayRequest<'_>,
 ) -> Result<NativeOverlayFetch> {
-    const RANGE_SIZE: usize = 5000;
-    let started = Instant::now();
-    let end_index = request.start_index.saturating_add(request.take_count);
-    let mut next_index = request.start_index;
-    let mut metrics = ChunkFetchMetrics::default();
-    let mut compact_expand_ms = 0.0;
-    let mut debug_ids = Vec::with_capacity(if request.include_debug_ids {
-        request.take_count
-    } else {
-        0
-    });
-    let mut items = Vec::with_capacity(request.take_count);
-    while next_index < end_index {
-        let count = RANGE_SIZE.min(end_index - next_index);
-        let mut range = fetch_native_overlay_batch_once(bridge, &request, next_index, count)?;
-        merge_chunk_fetch_metrics(&mut metrics, range.metrics);
-        compact_expand_ms += range.compact_expand_ms;
-        debug_ids.append(&mut range.debug_ids);
-        items.append(&mut range.items);
-        next_index += count;
-    }
-    Ok(NativeOverlayFetch {
-        metrics,
-        compact_expand_ms,
-        request_ms: elapsed_ms(started),
-        debug_ids,
-        items,
-    })
+    fetch_native_overlay_batch_once(bridge, &request, request.start_index, request.take_count)
 }
 
 fn fetch_native_overlay_batch_once(
@@ -605,7 +576,7 @@ pub(crate) fn rbx_instance_to_settings_records(
     elide_defaults: bool,
     native_filter: Option<&NativePropertyFilter>,
 ) -> (Map<String, Value>, Map<String, Value>, Option<String>) {
-    rbx_properties_to_settings_records(
+    let mut records = rbx_properties_to_settings_records(
         instance.class.as_str(),
         instance.properties.iter(),
         database,
@@ -616,7 +587,27 @@ pub(crate) fn rbx_instance_to_settings_records(
             native_properties_pre_filtered: false,
             native_filter,
         },
-    )
+    );
+    if rbx_model_primary_part_is_set(
+        database,
+        instance.class.as_str(),
+        instance.properties.iter(),
+    ) {
+        records.0.remove("WorldPivot");
+    }
+    records
+}
+
+pub(crate) fn rbx_model_primary_part_is_set<'a>(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    properties: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
+) -> bool {
+    rbx_reflection_class_is_a(database, class_name, "Model")
+        && properties.into_iter().any(|(name, value)| {
+            name.as_str() == "PrimaryPart"
+                && rbx_variant_referent(value).is_some_and(|referent| !referent.is_none())
+        })
 }
 
 fn native_settings_enum_name(

@@ -840,6 +840,9 @@ pub(crate) fn protected_root_write_rows_with_live_values(
     bridge: &BridgeServer,
     rows: Vec<Value>,
 ) -> std::result::Result<Vec<Value>, Vec<Value>> {
+    if rows.is_empty() {
+        return Ok(rows);
+    }
     let Ok(database) = rbx_reflection_database::get() else {
         return Err(rows);
     };

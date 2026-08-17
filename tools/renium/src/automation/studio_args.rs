@@ -111,6 +111,7 @@ pub(super) fn live(operation: u16, parameters: &Value) -> Result<StudioChangeSta
         no_start: operation == op::LIVE_STATUS,
         stop: operation == op::LIVE_STOP,
         ack_seq: optional_number(object, "ackSeq")?,
+        ack_runtime_settings_seq: optional_number(object, "ackRuntimeSettingsSeq")?,
         ack_actions: strings(object, "ackActions")?,
         ack_action_results: action_results,
         runtime_id: string(object, "runtimeId"),

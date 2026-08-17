@@ -11,8 +11,8 @@ use crate::editor::review::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::{
-    EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor, EditorInstancePath,
-    EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
+    EditorBinaryImport, EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor,
+    EditorInstancePath, EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
 };
 use crate::roblox::schema::{MESH_SIZE_TRANSPORT_PROPERTY, PropertySchemaMap};
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
@@ -410,6 +410,7 @@ pub(crate) fn append_native_editor_full_property_changes(
     document: &SettingsBytecode,
     paths_by_index: &[Option<EditorInstancePath>],
     service: &str,
+    binary_import: &EditorBinaryImport,
     rules: NativeEditorPropertyRules<'_, '_>,
 ) {
     let root_index = editor_service_root_index(document, service);
@@ -431,16 +432,20 @@ pub(crate) fn append_native_editor_full_property_changes(
                             instance.class_name.as_str(),
                             "StarterPlayerScripts" | "StarterCharacterScripts"
                         ))));
-        let post_apply_names = rules
+        let class_post_apply_names = rules
             .post_apply_properties_by_class
             .get(&instance.class_name);
-        if !send_all && post_apply_names.is_none() && rules.post_apply_properties_by_path.is_empty()
+        if !send_all
+            && class_post_apply_names.is_none()
+            && rules.post_apply_properties_by_path.is_empty()
         {
             continue;
         }
         let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
             continue;
         };
+        let retained =
+            binary_import.retains_path(service, &path_info.path_segments, &path_info.path_ordinals);
         let path_segments = path_info.path_segments.clone();
         let path_post_apply_names = if rules.post_apply_properties_by_path.is_empty() {
             None
@@ -452,6 +457,11 @@ pub(crate) fn append_native_editor_full_property_changes(
                     &path_info.path_ordinals,
                 ))
         };
+        let post_apply_names = if retained {
+            None
+        } else {
+            class_post_apply_names
+        };
         if !send_all && post_apply_names.is_none() && path_post_apply_names.is_none() {
             continue;
         }
@@ -460,6 +470,7 @@ pub(crate) fn append_native_editor_full_property_changes(
         for (name, value) in &instance.properties {
             if name.eq_ignore_ascii_case("Source")
                 || name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY)
+                || (name == "WorldPivot" && instance.properties.contains_key("PrimaryPart"))
                 || (!send_all
                     && post_apply_names.is_none_or(|names| !names.contains(name))
                     && path_post_apply_names.is_none_or(|names| !names.contains(name)))

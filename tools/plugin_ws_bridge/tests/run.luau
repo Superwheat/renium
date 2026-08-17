@@ -317,6 +317,7 @@ for _, serviceName in ipairs({ "Workspace", "ReplicatedStorage" }) do
 		outgoing = { outgoing },
 		packageRoots = {},
 		packageScanRoots = {},
+		retainedLiveRoots = {},
 		serviceName = serviceName,
 		target = target,
 	}

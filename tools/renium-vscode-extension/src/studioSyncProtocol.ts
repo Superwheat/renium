@@ -53,8 +53,8 @@ export type StudioChangeState = {
   waitSeconds?: number;
   waitTimedOut?: boolean;
   twoWaySyncEnabled?: boolean;
-  runtimeSettings?: Record<string, unknown>;
-  explicitRuntimeSettings?: Record<string, unknown>;
+  runtimeSettingChanges?: Record<string, unknown>;
+  runtimeSettingsSeq?: number;
   conflictResolution?: string;
 };
 
@@ -180,8 +180,10 @@ function studioChangeState(record: Record<string, unknown>): StudioChangeState {
     waitSeconds: typeof record.waitSeconds === "number" ? record.waitSeconds : undefined,
     waitTimedOut: typeof record.waitTimedOut === "boolean" ? record.waitTimedOut : undefined,
     twoWaySyncEnabled: typeof record.twoWaySyncEnabled === "boolean" ? record.twoWaySyncEnabled : undefined,
-    runtimeSettings: recordValue(record.runtimeSettings),
-    explicitRuntimeSettings: recordValue(record.explicitRuntimeSettings),
+    runtimeSettingChanges: recordValue(record.runtimeSettingChanges),
+    runtimeSettingsSeq: typeof record.runtimeSettingsSeq === "number"
+      ? record.runtimeSettingsSeq
+      : undefined,
     conflictResolution: typeof record.conflictResolution === "string" ? record.conflictResolution : undefined,
   };
 }

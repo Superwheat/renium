@@ -838,7 +838,7 @@ pub(crate) fn syncback_command(args: SyncbackArgs, global_project: Option<&Path>
         &services,
         &loaded.project.filters,
     )?;
-    stage.finish_projection()?;
+    stage.finish_projection(true)?;
     let operations = stage.preview_operations(&loaded.root)?;
     result["operations"] = Value::Array(operations.clone());
     result["operationCount"] = Value::Number(Number::from(operations.len() as u64));

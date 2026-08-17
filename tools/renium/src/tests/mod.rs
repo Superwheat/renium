@@ -75,7 +75,7 @@ use crate::settings::bytecode::{
 use crate::snapshot::codec::{decode_compact_v5_value, parse_compact_v5_instance_items};
 use crate::snapshot::export::{parse_bridge_chunk, parse_place_guard_config};
 use crate::snapshot::import::{
-    quarantine_stale_import_paths, state_with_preserved_material_service_settings,
+    remove_stale_import_paths, state_with_preserved_material_service_settings,
 };
 use crate::snapshot::types::{ServiceState, SnapshotInstance};
 use crate::studio::automation::validate_luau_syntax;
@@ -196,8 +196,8 @@ fn place_guard_rejects_typos_and_empty_allowlists() {
 }
 
 #[test]
-fn stale_import_paths_are_quarantined_not_deleted() {
-    let root = temp_dir("import-quarantine");
+fn stale_import_paths_are_deleted() {
+    let root = temp_dir("import-cleanup");
     let service_dir = root.join("src").join("Workspace");
     let stale_dir = service_dir.join("Old");
     let stale_file = service_dir.join("loose.luau");
@@ -205,24 +205,15 @@ fn stale_import_paths_are_quarantined_not_deleted() {
     fs::write(stale_dir.join("child.luau"), "return 1").unwrap();
     fs::write(&stale_file, "return 2").unwrap();
 
-    let backup = quarantine_stale_import_paths(
+    remove_stale_import_paths(
         &service_dir,
         &[stale_dir.join("child.luau"), stale_file.clone()],
         std::slice::from_ref(&stale_dir),
     )
-    .unwrap()
     .unwrap();
 
     assert!(!stale_dir.exists());
     assert!(!stale_file.exists());
-    assert_eq!(
-        fs::read_to_string(backup.join("Old").join("child.luau")).unwrap(),
-        "return 1"
-    );
-    assert_eq!(
-        fs::read_to_string(backup.join("loose.luau")).unwrap(),
-        "return 2"
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
