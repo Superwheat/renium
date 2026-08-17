@@ -2345,18 +2345,18 @@ class RobloxSyncController {
       if (applied?.resultPath) {
         await this.waitForDeferredUpdate(applied.resultPath, version);
       }
-      const choice = await vscode.window.showInformationMessage(
-        `Renium ${version} is installed. Reload the editor and restart Studio to use it.`,
-        "Reload Editor",
-      );
-      if (choice === "Reload Editor") {
-        await vscode.commands.executeCommand("workbench.action.reloadWindow");
-      }
     }));
     try {
       await this.updateInstallPromise;
     } finally {
       this.updateInstallPromise = undefined;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `Renium ${version} is installed. Reload the editor and restart Studio to use it.`,
+      "Reload Editor",
+    );
+    if (choice === "Reload Editor") {
+      await vscode.commands.executeCommand("workbench.action.reloadWindow");
     }
   }
 
