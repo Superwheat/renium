@@ -13,6 +13,7 @@
 - Allowed VS Code and `rbx` automation to share one Renium connection.
 - Fixed duplicate-name paths, sourcemaps, model pivots, and source mappings.
 - Closed the update progress notification before prompting the user to reload the editor.
+- Moved **Check for Updates** to the bottom of the main Renium menu.
 
 ## 0.1.8 - 2026-08-15
 
