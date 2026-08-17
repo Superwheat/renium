@@ -18,7 +18,11 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 
 	local ReferenceOverlay = {}
 
-	function ReferenceOverlay.beginNativeGuard(prepared: { any }): { [string]: any }
+	function ReferenceOverlay.beginNativeGuard(
+		prepared: { any },
+		allProperties: boolean?,
+		ignoredProperties: { [string]: boolean }?
+	): { [string]: any }
 		local guard = {
 			services = {},
 			connections = {},
@@ -28,7 +32,12 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			guard.services[group.serviceName] = group.service
 		end
 		guard.connections[#guard.connections + 1] = (game :: any).ItemChanged:Connect(function(instance, propertyName)
-			if typeof(instance) ~= "Instance" or string.lower(tostring(propertyName)) ~= "name" then
+			local normalizedProperty = string.lower(tostring(propertyName))
+			if
+				typeof(instance) ~= "Instance"
+				or ignoredProperties ~= nil and ignoredProperties[normalizedProperty]
+				or not allProperties and normalizedProperty ~= "name"
+			then
 				return
 			end
 			for serviceName, service in pairs(guard.services) do
@@ -257,49 +266,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		return duplicateCount
 	end
 
-	function ReferenceOverlay.assertRetainedReferences(retainedRoots: { Instance }, outgoingRoots: { Instance })
-		if #retainedRoots == 0 then
-			return
-		end
-		local removed = {}
-		for _, root in ipairs(outgoingRoots) do
-			removed[root] = true
-			for _, descendant in ipairs(root:GetDescendants()) do
-				removed[descendant] = true
-			end
-		end
-		for _, root in ipairs(retainedRoots) do
-			local pending = { root }
-			while #pending > 0 do
-				local instance = table.remove(pending)
-				for _, child in ipairs(instance:GetChildren()) do
-					pending[#pending + 1] = child
-				end
-				for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
-					local okRead, target = readProperty(instance, propertyName)
-					if okRead and removed[target] then
-						error(
-							`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`
-						)
-					end
-				end
-				for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
-					local okRead, value = readProperty(instance, propertyName)
-					if
-						okRead
-						and typeof(value) == "Content"
-						and value.SourceType == Enum.ContentSourceType.Object
-						and removed[value.Object]
-					then
-						error(
-							`Retained package reference {instance:GetFullName()}.{propertyName} crosses a changed root`
-						)
-					end
-				end
-			end
-		end
-	end
-
 	function ReferenceOverlay.assertPackageRoots(group: { [string]: any })
 		local actual = {}
 		for _, root in ipairs(group.packageScanRoots) do
@@ -404,11 +370,11 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		local excludedOutgoing = {}
 		local incomingAliases = {}
 		local retainedDuplicates = {}
-		local retainedLiveRoots = {}
 		local retainedDuplicateInstanceCount = 0
 		for _, group in ipairs(prepared) do
 			group.packageScanRoots = table.clone(group.outgoing)
 			group.incomingRootsByPath = {}
+			group.retainedLiveRoots = {}
 			for index, descriptor in ipairs(group.rootPaths) do
 				local incomingRoot = group.incomingByPayloadIndex[index]
 				if incomingRoot ~= nil then
@@ -435,27 +401,31 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 					or live.Name ~= descriptor.pathSegments[#descriptor.pathSegments]
 					or duplicate.Name ~= live.Name
 					or (not live:IsA("PackageLink") and live:FindFirstChildWhichIsA("PackageLink", true) == nil)
-					or (
+					or descriptor.payloadOmitted and #duplicate:GetChildren() ~= 0
+					or not descriptor.payloadOmitted
+						and (
 						not duplicate:IsA("PackageLink")
 						and duplicate:FindFirstChildWhichIsA("PackageLink", true) == nil
 					)
 				then
 					error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
 				end
-				local duplicateInstanceCount = ReferenceOverlay.retainedAliases(
-					live,
-					duplicate,
-					descriptor.pathSegments,
-					descriptor.pathOrdinals,
-					incomingAliases
-				)
-				if duplicateInstanceCount ~= descriptor.instanceCount then
-					error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
+				if not descriptor.payloadOmitted then
+					local duplicateInstanceCount = ReferenceOverlay.retainedAliases(
+						live,
+						duplicate,
+						descriptor.pathSegments,
+						descriptor.pathOrdinals,
+						incomingAliases
+					)
+					if duplicateInstanceCount ~= descriptor.instanceCount then
+						error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
+					end
 				end
 				excludedIncoming[duplicate] = true
 				excludedOutgoing[live] = true
+				group.retainedLiveRoots[#group.retainedLiveRoots + 1] = live
 				retainedDuplicates[#retainedDuplicates + 1] = duplicate
-				retainedLiveRoots[#retainedLiveRoots + 1] = live
 				retainedDuplicateInstanceCount += descriptor.instanceCount
 			end
 		end
@@ -483,7 +453,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			end
 			group.outgoing = outgoing
 		end
-		ReferenceOverlay.assertRetainedReferences(retainedLiveRoots, outgoingScanRoots)
 		local aliasUpdated = 0
 		local aliasContentUpdated = 0
 		if next(incomingAliases) then
@@ -535,8 +504,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			resolveStagedPath = resolveStagedPath,
 			retainedDuplicates = retainedDuplicates,
 			retainedDuplicateInstanceCount = retainedDuplicateInstanceCount,
-			retainedLiveRoots = retainedLiveRoots,
-			outgoingScanRoots = outgoingScanRoots,
 			removedRootCount = removedRootCount,
 			referenceUpdates = #referenceOverlay + aliasUpdated + aliasContentUpdated,
 		}
@@ -544,7 +511,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 
 	function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }): (number, number)
 		ReferenceOverlay.assertNativeImportState(undo, ctx)
-		ReferenceOverlay.assertRetainedReferences(undo.retainedLiveRoots, undo.outgoingScanRoots)
 		ReferenceOverlay.finishNativeGuard(undo.guard)
 		undo.guard = nil
 		local selected = captureExplorerSelection()
@@ -564,6 +530,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				excludedRoots[instance] = true
 			end
 			for _, instance in ipairs(group.incoming) do
+				excludedRoots[instance] = true
+			end
+			for _, instance in ipairs(group.retainedLiveRoots) do
 				excludedRoots[instance] = true
 			end
 		end

@@ -11,6 +11,20 @@ local function findScriptDocument(instance: Instance): any?
 	return nil
 end
 
+local function closeScriptDocument(document: any): (boolean, any)
+	if table.find(ScriptEditorService:GetScriptDocuments(), document) == nil then
+		return true, nil
+	end
+	local ok, closed, closeError = pcall(document.CloseAsync, document)
+	if not ok then
+		return false, closed
+	end
+	if closed == false then
+		return false, closeError or closed
+	end
+	return true, nil
+end
+
 function BridgeScriptDocuments.readSource(instance: Instance): (boolean, any)
 	local okEditor, editorSource = pcall((ScriptEditorService :: any).GetEditorSource, ScriptEditorService, instance)
 	if okEditor then
@@ -194,9 +208,9 @@ function BridgeScriptDocuments.apply(
 			end
 		end
 		if (target == nil or not target:IsA("LuaSourceContainer")) and allSourcesChanged then
-			local okClose, closed, closeError = pcall(entry.document.CloseAsync, entry.document)
-			if not okClose or closed == false then
-				error(`Could not close removed script document: {closeError or closed}`)
+			local closed, closeError = closeScriptDocument(entry.document)
+			if not closed then
+				error(`Could not close removed script document: {closeError}`)
 			end
 			continue
 		end
@@ -236,9 +250,9 @@ function BridgeScriptDocuments.apply(
 		end
 		restoreDocumentSelection(targetDocument, selection)
 		if entry.document ~= targetDocument then
-			local okClose, closed, closeError = pcall(entry.document.CloseAsync, entry.document)
-			if not okClose or closed == false then
-				error(`Could not close replaced script document: {closeError or closed}`)
+			local closed, closeError = closeScriptDocument(entry.document)
+			if not closed then
+				error(`Could not close replaced script document: {closeError}`)
 			end
 		end
 	end

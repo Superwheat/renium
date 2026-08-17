@@ -285,20 +285,79 @@ pub(crate) struct BytecodeModelImportRefs {
     pub(crate) path_ordinals_by_ref: Arc<HashMap<RbxRef, Vec<usize>>>,
 }
 
+fn collect_rbx_dom_path_import_refs(
+    dom: &RbxWeakDom,
+    parent: RbxRef,
+    parent_segments: &[String],
+    parent_ordinals: &[usize],
+    refs_preorder: &mut Vec<RbxRef>,
+    path_segments_by_ref: &mut HashMap<RbxRef, Vec<String>>,
+    path_ordinals_by_ref: &mut HashMap<RbxRef, Vec<usize>>,
+) {
+    let Some(parent_instance) = dom.get_by_ref(parent) else {
+        return;
+    };
+    let mut counts = HashMap::<&str, usize>::new();
+    for child_ref in parent_instance.children().iter().copied() {
+        let Some(child) = dom.get_by_ref(child_ref) else {
+            continue;
+        };
+        let ordinal = counts.entry(child.name.as_str()).or_default();
+        *ordinal += 1;
+        let mut segments = Vec::with_capacity(parent_segments.len() + 1);
+        segments.extend_from_slice(parent_segments);
+        segments.push(child.name.clone());
+        let mut ordinals = Vec::with_capacity(parent_ordinals.len() + 1);
+        ordinals.extend_from_slice(parent_ordinals);
+        ordinals.push(*ordinal);
+        refs_preorder.push(child_ref);
+        path_segments_by_ref.insert(child_ref, segments.clone());
+        path_ordinals_by_ref.insert(child_ref, ordinals.clone());
+        collect_rbx_dom_path_import_refs(
+            dom,
+            child_ref,
+            &segments,
+            &ordinals,
+            refs_preorder,
+            path_segments_by_ref,
+            path_ordinals_by_ref,
+        );
+    }
+}
+
 pub(crate) fn rbx_dom_path_import_refs(
     dom: &RbxWeakDom,
     include_indices: bool,
 ) -> BytecodeModelImportRefs {
     let mut refs_preorder = Vec::new();
-    for referent in rbx_model_top_level_refs(dom) {
-        collect_rbx_subtree_preorder(dom, referent, &mut refs_preorder);
-    }
-    let mut path_segments_by_ref = HashMap::with_capacity(refs_preorder.len());
-    let mut path_ordinals_by_ref = HashMap::with_capacity(refs_preorder.len());
-    for referent in refs_preorder.iter().copied() {
-        let (segments, ordinals) = rbx_dom_instance_path_parts(dom, referent);
-        path_segments_by_ref.insert(referent, segments);
-        path_ordinals_by_ref.insert(referent, ordinals);
+    let mut path_segments_by_ref = HashMap::new();
+    let mut path_ordinals_by_ref = HashMap::new();
+    if dom.root().class.as_str() == "DataModel" {
+        collect_rbx_dom_path_import_refs(
+            dom,
+            dom.root_ref(),
+            &[],
+            &[],
+            &mut refs_preorder,
+            &mut path_segments_by_ref,
+            &mut path_ordinals_by_ref,
+        );
+    } else {
+        let root_ref = dom.root_ref();
+        let segments = vec![dom.root().name.clone()];
+        let ordinals = vec![1];
+        refs_preorder.push(root_ref);
+        path_segments_by_ref.insert(root_ref, segments.clone());
+        path_ordinals_by_ref.insert(root_ref, ordinals.clone());
+        collect_rbx_dom_path_import_refs(
+            dom,
+            root_ref,
+            &segments,
+            &ordinals,
+            &mut refs_preorder,
+            &mut path_segments_by_ref,
+            &mut path_ordinals_by_ref,
+        );
     }
     let new_index_by_ref = if include_indices {
         refs_preorder
@@ -673,6 +732,7 @@ pub(crate) struct RbxPlaceBuild {
     pub(crate) paths_by_service: HashMap<String, Vec<Option<EditorInstancePath>>>,
     pub(crate) settings_writes: Vec<EditorSettingsWrite>,
     pub(crate) total_instances: usize,
+    pub(crate) has_package_links: bool,
     pub(crate) omitted_properties_by_class: HashMap<String, HashSet<String>>,
     pub(crate) logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
 }
@@ -1150,7 +1210,7 @@ pub(crate) fn build_rbx_place(
     log_timing("native editor place input read", phase_started);
 
     let phase_started = Instant::now();
-    let mut unique_settings_id_counts = HashMap::<String, usize>::new();
+    let mut unique_settings_id_counts = HashMap::<&str, usize>::new();
     let mut global_path_refs = HashMap::<String, RbxRef>::new();
     let mut global_path_segment_refs = HashMap::<String, Option<RbxRef>>::new();
     let mut per_service_index_refs =
@@ -1169,7 +1229,7 @@ pub(crate) fn build_rbx_place(
             if let Some(instance) = document.instances.get(index) {
                 by_settings_id.insert(instance.settings_id.clone(), referent);
                 *unique_settings_id_counts
-                    .entry(instance.settings_id.clone())
+                    .entry(instance.settings_id.as_str())
                     .or_insert(0) += 1;
             }
         }
@@ -1188,7 +1248,7 @@ pub(crate) fn build_rbx_place(
             };
             if let Some(instance) = document.instances.get(index)
                 && unique_settings_id_counts
-                    .get(&instance.settings_id)
+                    .get(instance.settings_id.as_str())
                     .copied()
                     .unwrap_or(0)
                     == 1
@@ -1222,13 +1282,19 @@ pub(crate) fn build_rbx_place(
     let phase_started = Instant::now();
     let built_services = export_inputs
         .par_iter()
-        .enumerate()
+        .zip(
+            per_service_index_refs
+                .into_par_iter()
+                .zip(per_service_settings_refs.into_par_iter()),
+        )
         .map(
-            |(service_index, (_, _, _, document, source_paths, _, root_index, subtree, _))| {
-                let by_index = &per_service_index_refs[service_index];
+            |(
+                (_, _, _, document, source_paths, _, root_index, subtree, _),
+                (by_index, by_settings_id),
+            )| {
                 let refs = BytecodeModelExportRefs {
-                    by_index: by_index.clone(),
-                    by_settings_id: per_service_settings_refs[service_index].clone(),
+                    by_index,
+                    by_settings_id,
                     global_by_settings_id: Some(Arc::clone(&global_unique_settings_refs)),
                     global_by_path_key: Some(Arc::clone(&global_path_refs)),
                     global_by_path_segments_key: Some(Arc::clone(&global_path_segment_refs)),
@@ -1247,7 +1313,7 @@ pub(crate) fn build_rbx_place(
                             document.instances[index].parent_index.ok_or_else(|| {
                                 anyhow::anyhow!("Export subtree contains a detached child")
                             })?;
-                        Some(*by_index.get(&parent_index).ok_or_else(|| {
+                        Some(*refs.by_index.get(&parent_index).ok_or_else(|| {
                             anyhow::anyhow!("Export subtree is missing parent referent")
                         })?)
                     };
@@ -1264,7 +1330,8 @@ pub(crate) fn build_rbx_place(
                     )?;
                     if !logical_properties.is_empty() {
                         logical_properties_by_ref.insert(
-                            *by_index
+                            *refs
+                                .by_index
                                 .get(&index)
                                 .context("Export instance referent is missing")?,
                             logical_properties,
@@ -1273,7 +1340,8 @@ pub(crate) fn build_rbx_place(
                     instances.push((parent_ref, builder));
                 }
                 Ok(ServiceBuild {
-                    root_ref: *by_index
+                    root_ref: *refs
+                        .by_index
                         .get(root_index)
                         .ok_or_else(|| anyhow::anyhow!("Export root referent missing"))?,
                     instances,
@@ -1322,6 +1390,14 @@ pub(crate) fn build_rbx_place(
         )
         .collect::<Result<Vec<_>>>()?;
     settings_writes.sort_by(|left, right| left.path.cmp(&right.path));
+    let has_package_links = export_inputs
+        .iter()
+        .any(|(_, _, _, document, _, _, _, _, _)| {
+            document
+                .instances
+                .iter()
+                .any(|instance| instance.class_name == "PackageLink")
+        });
     let mut documents_by_service = HashMap::with_capacity(export_inputs.len());
     let mut paths_by_service = HashMap::with_capacity(export_inputs.len());
     for (service, _, _, document, _, instance_paths, _, _, _) in export_inputs {
@@ -1336,6 +1412,7 @@ pub(crate) fn build_rbx_place(
         paths_by_service,
         settings_writes,
         total_instances,
+        has_package_links,
         omitted_properties_by_class,
         logical_properties_by_ref,
     })

@@ -3161,28 +3161,40 @@ local function rollbackTransactionSession(session: { [string]: any }, ctx: { [st
 	return result
 end
 
-captureNativeExportFingerprint = function(serviceName: string, ctx: { [string]: any }): { any }
+captureNativeExportFingerprint = function(
+	serviceName: string,
+	ctx: { [string]: any },
+	instancesOnly: boolean?
+): { any }
 	local service = game:GetService(serviceName)
-	local fingerprint = {
-		{ service, service.Parent, service.Name, 1 },
-	}
+	if instancesOnly then
+		local tracked = ctx.trackedExportInstances(serviceName)
+		if tracked ~= nil then
+			return tracked
+		end
+	end
+	local fingerprint = if instancesOnly then { service } else { { service, service.Parent, service.Name, 1 } }
 	local countsByParent = {}
 	for _, instance in ipairs(service:GetDescendants()) do
-		local parent = instance.Parent
-		local counts = countsByParent[parent]
-		if counts == nil then
-			counts = {}
-			countsByParent[parent] = counts
-		end
-		local ordinal = (counts[instance.Name] or 0) + 1
-		counts[instance.Name] = ordinal
 		if ctx.includeExportInstance(serviceName, instance) then
-			fingerprint[#fingerprint + 1] = {
-				instance,
-				parent,
-				instance.Name,
-				ordinal,
-			}
+			if instancesOnly then
+				fingerprint[#fingerprint + 1] = instance
+			else
+				local parent = instance.Parent
+				local counts = countsByParent[parent]
+				if counts == nil then
+					counts = {}
+					countsByParent[parent] = counts
+				end
+				local ordinal = (counts[instance.Name] or 0) + 1
+				counts[instance.Name] = ordinal
+				fingerprint[#fingerprint + 1] = {
+					instance,
+					parent,
+					instance.Name,
+					ordinal,
+				}
+			end
 		end
 	end
 	return fingerprint
@@ -3207,275 +3219,77 @@ nativeExportFingerprintMatches = function(expected: { any }, actual: { any }): b
 	return true
 end
 
-local function validateNativeExportFingerprint(
-	session: { [string]: any },
-	serviceName: string,
-	ctx: { [string]: any },
-	state: { [string]: any }?
-): boolean
-	local expected = session.fingerprintsByService[serviceName]
-	if state ~= nil and state.nativeSnapshotRoot then
-		if expected == nil or #(state.instances or {}) ~= #expected then
-			session.structureChanged = true
-			return false
-		end
-		return true
-	end
-	if
-		expected == nil
-		or not nativeExportFingerprintMatches(expected, captureNativeExportFingerprint(serviceName, ctx))
-	then
-		session.structureChanged = true
-		return false
-	end
-	if state ~= nil then
-		local instances = state.instances or {}
-		if #instances ~= #expected then
-			session.structureChanged = true
-			return false
-		end
-		for index, entry in ipairs(expected) do
-			if instances[index] ~= entry[1] then
-				session.structureChanged = true
-				return false
-			end
-		end
-	end
-	return true
-end
-
 local function updateNativeSerializationStatus(session: { [string]: any })
 	if session.serializationScheduleReady and session.pendingPayloads == 0 then
 		session.status = if session.error or next(session.payloadErrors) then "failed" else "ready"
 	end
 end
 
-local prepareNativeSnapshotSerializationJob
-
-local function appendNativeSerializationJob(
+local function completeNativeSerializationPayload(
 	session: { [string]: any },
-	payloadKey: string,
-	roots: { Instance },
-	markers: { Instance },
-	nonArchivableInstances: { Instance }
+	payloadKey: string?,
+	ok: boolean,
+	payload: any
 )
-	for _, instance in ipairs(nonArchivableInstances) do
-		session.originalNonArchivableInstances[instance] = true
+	if session.cancelled then
+		return
 	end
-	local job = {
-		payloadKey = payloadKey,
-		roots = roots,
-		markers = markers,
-		nonArchivableInstances = nonArchivableInstances,
-	}
-	if session.snapshotReplacements ~= nil then
-		prepareNativeSnapshotSerializationJob(session, job)
+	if not ok then
+		if payloadKey then
+			session.payloadErrors[payloadKey] = tostring(payload)
+		else
+			session.error = tostring(payload)
+		end
+	else
+		local totalBytes = buffer.len(payload)
+		if totalBytes > 536870912 then
+			local message = "Native export exceeds the supported size"
+			if payloadKey then
+				session.payloadErrors[payloadKey] = message
+			else
+				session.error = message
+			end
+		elseif payloadKey then
+			session.payloads[payloadKey] = payload
+		else
+			session.payload = payload
+			session.totalBytes = totalBytes
+		end
 	end
-	session.serializationJobs[#session.serializationJobs + 1] = job
-	session.pendingPayloads += 1
+	session.pendingPayloads -= 1
+	updateNativeSerializationStatus(session)
+	session.updatedAt = os.clock()
+	session.payloadReadyEvent:Fire()
 end
 
-local function collectNonArchivableInstances(roots: { Instance }, seen: { [Instance]: boolean }?): { Instance }
-	local included = seen or {}
-	local instances = {}
-	for _, root in ipairs(roots) do
-		if not included[root] then
-			included[root] = true
-			if not root.Archivable then
-				instances[#instances + 1] = root
-			end
-		end
-		for _, descendant in ipairs(root:GetDescendants()) do
-			if not included[descendant] then
-				included[descendant] = true
-				if not descendant.Archivable then
-					instances[#instances + 1] = descendant
-				end
-			end
-		end
-	end
-	return instances
-end
+local NO_INSTANCES = {}
 
-local function destroyNativeSnapshotRoots(snapshotRoots: { Instance }, replacements: { [Instance]: Instance })
-	for index = 2, #snapshotRoots do
-		local root = snapshotRoots[index]
-		if replacements[root] ~= root and not root:IsA("Terrain") then
-			root:Destroy()
-		end
+local function runNativeSerializationJob(session: { [string]: any }, job: { [string]: any })
+	if session.cancelled then
+		return
 	end
-end
-
-local function captureNativeExportSnapshot(
-	serviceName: string,
-	roots: { Instance },
-	fingerprint: { any },
-	ctx: { [string]: any }
-): ({ Instance }, { [string]: any }, { [Instance]: Instance }, { Instance }, { any })
-	local generationBefore = ctx.studioChangeGeneration(serviceName)
-	local liveFingerprint = fingerprint
-	local marker = roots[1]
-	local service = liveFingerprint[1][1]
-	local rootPropertyValues = ctx.captureRootProperties(serviceName)
-	for name, value in pairs(service:GetAttributes()) do
-		if name:sub(1, 3) ~= "RBX" then
-			marker:SetAttribute(name, value)
-		end
+	session.activeSerializations += 1
+	local changed = {}
+	local nonArchivableInstances = job.nonArchivableInstances or NO_INSTANCES
+	if #nonArchivableInstances > 0 then
+		session.ctx.beginStudioChangeSuppression(0)
 	end
-	for _, tag in ipairs(CollectionService:GetTags(service)) do
-		CollectionService:AddTag(marker, tag)
-	end
-	local scriptDocuments = ScriptDocumentState.capture({ serviceName })
-	for index, root in ipairs(roots) do
-		if index > 1 and containsPackageLink(root) then
-			if #collectNonArchivableInstances({ root }) > 0 then
-				error(`Package root {root:GetFullName()} contains a non-archivable instance`)
-			end
-		end
-	end
-	local changed = collectNonArchivableInstances(roots)
-	local snapshotRoots = { roots[1] }
-	local replacements = { [service] = marker }
-	local omittedInstances = {}
-	local function childKey(instance: Instance): string
-		local name = instance.Name
-		return tostring(#name) .. ":" .. name .. instance.ClassName
-	end
-	local function mapCloneTree(
-		original: Instance,
-		clone: Instance,
-		allowOmissions: boolean
-	): (boolean, string, { [Instance]: boolean })
-		local pending = { { original, clone } }
-		local mapped = {}
-		local omitted = {}
-		while #pending > 0 do
-			local pair = table.remove(pending)
-			local currentOriginal = pair[1]
-			local currentClone = pair[2]
-			if currentOriginal.ClassName ~= currentClone.ClassName or currentOriginal.Name ~= currentClone.Name then
-				return false, `changed {currentOriginal:GetFullName()}`, omitted
-			end
-			mapped[currentOriginal] = currentClone
-			local originalChildren = currentOriginal:GetChildren()
-			local cloneChildren = currentClone:GetChildren()
-			if #cloneChildren > #originalChildren then
-				return false, `added children under {currentOriginal:GetFullName()}`, omitted
-			end
-			local originalsByKey = {}
-			local clonesByKey = {}
-			for _, child in ipairs(originalChildren) do
-				local key = childKey(child)
-				local bucket = originalsByKey[key]
-				if bucket == nil then
-					bucket = {}
-					originalsByKey[key] = bucket
-				end
-				bucket[#bucket + 1] = child
-			end
-			for _, child in ipairs(cloneChildren) do
-				local key = childKey(child)
-				local bucket = clonesByKey[key]
-				if bucket == nil then
-					bucket = {}
-					clonesByKey[key] = bucket
-				end
-				bucket[#bucket + 1] = child
-			end
-			for key, clonedChildren in pairs(clonesByKey) do
-				local liveChildren = originalsByKey[key]
-				if liveChildren == nil or #clonedChildren > #liveChildren then
-					return false, `added children under {currentOriginal:GetFullName()}`, omitted
-				end
-			end
-			for key, liveChildren in pairs(originalsByKey) do
-				local clonedChildren = clonesByKey[key] or {}
-				if #clonedChildren ~= #liveChildren then
-					if not allowOmissions or (#clonedChildren > 0 and #liveChildren > 1) then
-						return false,
-							`changed {currentOriginal:GetFullName()} from {#originalChildren} to {#cloneChildren} children`,
-							omitted
-					end
-					for index = #clonedChildren + 1, #liveChildren do
-						local omittedRoot = liveChildren[index]
-						omitted[omittedRoot] = true
-						for _, descendant in ipairs(omittedRoot:GetDescendants()) do
-							omitted[descendant] = true
-						end
-					end
-				end
-				for index = #clonedChildren, 1, -1 do
-					pending[#pending + 1] = { liveChildren[index], clonedChildren[index] }
-				end
-			end
-		end
-		for originalInstance, cloneInstance in pairs(mapped) do
-			replacements[originalInstance] = cloneInstance
-		end
-		return true, "", omitted
-	end
-	local function serializedClone(root: Instance): Instance
-		local serializedRoot = SerializationService:SerializeInstancesAsync({ root })
-		local clone = SerializationService:DeserializeInstancesAsync(serializedRoot)[1]
-		if clone == nil or clone.ClassName ~= root.ClassName then
-			error("Native export could not copy " .. root.ClassName)
-		end
-		return clone
-	end
-	ctx.beginStudioChangeSuppression(0)
-	local okClone, cloneError = xpcall(function()
-		for _, instance in ipairs(changed) do
+	local ok, payload = xpcall(function()
+		for _, instance in ipairs(nonArchivableInstances) do
 			if instance.Parent ~= nil and not instance.Archivable then
-				local okWrite, writeError = writePropertyForSync(instance, "Archivable", true, ctx)
+				local okWrite, writeError = writePropertyForSync(instance, "Archivable", true, session.ctx)
 				if not okWrite then
 					error(writeError, 0)
 				end
+				changed[#changed + 1] = instance
 			end
 		end
-		for index = 2, #roots do
-			local root = roots[index]
-			local clone
-			local preserved
-			local mismatch
-			local omitted
-			if root:IsA("Terrain") or root:IsA("StarterPlayerScripts") or root:IsA("StarterCharacterScripts") then
-				clone = serializedClone(root)
-				preserved, mismatch, omitted = mapCloneTree(root, clone, true)
-			else
-				clone = root:Clone()
-				preserved, mismatch = mapCloneTree(root, clone, false)
-				if not preserved then
-					clone:Destroy()
-					clone = serializedClone(root)
-					preserved, mismatch, omitted = mapCloneTree(root, clone, true)
-				end
-			end
-			if not preserved then
-				if not clone:IsA("Terrain") then
-					clone:Destroy()
-				end
-				error("Native export serialization " .. mismatch)
-			end
-			for instance in pairs(omitted or {}) do
-				omittedInstances[instance] = true
-			end
-			snapshotRoots[index] = clone
-		end
-		for _, entry in ipairs(scriptDocuments) do
-			local clone = replacements[entry.instance]
-			if clone ~= nil then
-				local okSource, sourceError = setSource(clone, entry.source, nil)
-				if not okSource then
-					error(sourceError, 0)
-				end
-			end
-		end
+		return SerializationService:SerializeInstancesAsync(job.roots)
 	end, debug.traceback)
-	local restoreError = nil
+	local restoreError
 	for index = #changed, 1, -1 do
-		local instance = changed[index]
 		local restored, result = pcall(function()
-			local okWrite, writeError = writePropertyForSync(instance, "Archivable", false, ctx)
+			local okWrite, writeError = writePropertyForSync(changed[index], "Archivable", false, session.ctx)
 			if not okWrite then
 				error(writeError, 0)
 			end
@@ -3484,98 +3298,66 @@ local function captureNativeExportSnapshot(
 			restoreError = result
 		end
 	end
-	ctx.endStudioChangeSuppression(0)
-	if not okClone or restoreError ~= nil then
-		destroyNativeSnapshotRoots(snapshotRoots, replacements)
-		error(restoreError or cloneError, 0)
+	if #nonArchivableInstances > 0 then
+		session.ctx.endStudioChangeSuppression(0)
 	end
-	local snapshotFingerprint = table.create(#liveFingerprint)
-	for _, entry in ipairs(liveFingerprint) do
-		if not omittedInstances[entry[1]] then
-			snapshotFingerprint[#snapshotFingerprint + 1] = entry
-		end
+	if restoreError ~= nil then
+		ok = false
+		payload = restoreError
 	end
-	local instances = table.create(#snapshotFingerprint)
-	local debugIds = table.create(#snapshotFingerprint)
-	local debugIdByInstance = {}
-	local pathByInstance = {}
-	local pathSegmentsByInstance = {}
-	local pathOrdinalsByInstance = {}
-	local nonArchivableClones = {}
-	local okSnapshot, snapshotError = xpcall(function()
-		for index, entry in ipairs(snapshotFingerprint) do
-			local original = entry[1]
-			local clone = if index == 1 then snapshotRoots[1] else replacements[original]
-			if clone == nil then
-				error("Native export clone omitted an included instance")
-			end
-			local debugId = original:GetDebugId(32)
-			instances[index] = clone
-			debugIds[index] = debugId
-			debugIdByInstance[original] = debugId
-			debugIdByInstance[clone] = debugId
-			local parentSegments = if index == 1 then {} else pathSegmentsByInstance[entry[2]]
-			local parentOrdinals = if index == 1 then {} else pathOrdinalsByInstance[entry[2]]
-			if parentSegments == nil or parentOrdinals == nil then
-				error("Native export fingerprint did not preserve parent order")
-			end
-			local pathSegments = table.clone(parentSegments)
-			local pathOrdinals = table.clone(parentOrdinals)
-			pathSegments[#pathSegments + 1] = entry[3]
-			pathOrdinals[#pathOrdinals + 1] = entry[4]
-			local path = table.concat(pathSegments, ".")
-			pathByInstance[original] = path
-			pathByInstance[clone] = path
-			pathSegmentsByInstance[original] = pathSegments
-			pathSegmentsByInstance[clone] = pathSegments
-			pathOrdinalsByInstance[original] = pathOrdinals
-			pathOrdinalsByInstance[clone] = pathOrdinals
-			if not original.Archivable then
-				nonArchivableClones[#nonArchivableClones + 1] = clone
-			end
-		end
-		local generationAfter = ctx.studioChangeGeneration(serviceName)
-		if
-			(generationBefore ~= nil and generationAfter ~= generationBefore)
-			or not nativeExportFingerprintMatches(liveFingerprint, captureNativeExportFingerprint(serviceName, ctx))
-		then
-			error("Studio changed during native export snapshot capture")
-		end
-	end, debug.traceback)
-	if not okSnapshot then
-		destroyNativeSnapshotRoots(snapshotRoots, replacements)
-		error(snapshotError, 0)
+	session.activeSerializations -= 1
+	completeNativeSerializationPayload(session, job.payloadKey, ok, payload)
+	if session.snapshotCleanupPending and session.activeSerializations == 0 then
+		session.cleanupSnapshot()
 	end
-	return snapshotRoots,
-		{
-			serviceName = serviceName,
-			serviceClassName = liveFingerprint[1][1].ClassName,
-			instances = instances,
-			debugIds = debugIds,
-			debugIdBuffer = buffer.fromstring(table.concat(debugIds, "\0")),
-			debugIdByInstance = debugIdByInstance,
-			pathByInstance = pathByInstance,
-			pathSegmentsByInstance = pathSegmentsByInstance,
-			pathOrdinalsByInstance = pathOrdinalsByInstance,
-			rootPropertyValues = rootPropertyValues,
-		},
-		replacements,
-		nonArchivableClones,
-		snapshotFingerprint
 end
 
-prepareNativeSnapshotSerializationJob = function(session: { [string]: any }, job: { [string]: any })
-	local _, referenceFailures = BridgeReferenceRetarget.apply(
-		job.roots,
-		session.snapshotReplacements,
-		RbxDomModule.getReferencePropertyNames,
-		readProperty,
-		writeProperty
-	)
-	local _, contentFailures = ReferenceOverlay.retargetPreservedContent(job.roots, session.snapshotReplacements)
-	if referenceFailures > 0 or contentFailures > 0 then
-		error(`Could not preserve {referenceFailures + contentFailures} cross-root references in native export`)
+local function startNativeSerializationWorkers(session: { [string]: any }, workerCount: number)
+	local nextSerializationIndex = 0
+	for _ = 1, workerCount do
+		task.spawn(function()
+			while not session.cancelled do
+				local job = session.serializationJobs[nextSerializationIndex + 1]
+				if job ~= nil then
+					nextSerializationIndex += 1
+					runNativeSerializationJob(session, job)
+			elseif session.serializationScheduleReady then
+				break
+			else
+				session.payloadReadyEvent.Event:Wait()
+			end
+		end
+		end)
 	end
+end
+
+local function appendNativeSerializationJob(
+	session: { [string]: any },
+	payloadKey: string,
+	roots: { Instance },
+	nonArchivableInstances: { Instance }
+)
+	for _, instance in ipairs(nonArchivableInstances) do
+		session.originalNonArchivableInstances[instance] = true
+	end
+	local job = {
+		payloadKey = payloadKey,
+		roots = roots,
+		nonArchivableInstances = nonArchivableInstances,
+	}
+	session.serializationJobs[#session.serializationJobs + 1] = job
+	session.pendingPayloads += 1
+	session.payloadReadyEvent:Fire()
+end
+
+local function serializationNonArchivableInstances(session: { [string]: any }, services: { string }): { Instance }
+	local instances = {}
+	for _, serviceName in ipairs(services) do
+		for _, instance in ipairs(session.nonArchivableByService[serviceName] or NO_INSTANCES) do
+			instances[#instances + 1] = instance
+		end
+	end
+	return instances
 end
 
 local function appendNativeSerializationGroups(
@@ -3586,17 +3368,20 @@ local function appendNativeSerializationGroups(
 	if #groups == 1 then
 		local group = groups[1]
 		local roots = rootsByService[group.service]
-		appendNativeSerializationJob(session, group.service, roots, { roots[1] }, collectNonArchivableInstances(roots))
+		appendNativeSerializationJob(
+			session,
+			group.service,
+			roots,
+			serializationNonArchivableInstances(session, { group.service })
+		)
 		return
 	end
 
 	local roots = {}
-	local markers = table.create(#groups)
 	local services = table.create(#groups)
 	for index, group in ipairs(groups) do
 		local groupRoots = rootsByService[group.service]
 		services[index] = group.service
-		markers[index] = groupRoots[1]
 		for _, root in ipairs(groupRoots) do
 			roots[#roots + 1] = root
 		end
@@ -3607,7 +3392,12 @@ local function appendNativeSerializationGroups(
 		services = services,
 	}
 	session.serializationBatchIds[batchId] = true
-	appendNativeSerializationJob(session, batchId, roots, markers, collectNonArchivableInstances(roots))
+	appendNativeSerializationJob(
+		session,
+		batchId,
+		roots,
+		serializationNonArchivableInstances(session, services)
+	)
 end
 
 local function finishNativeSerializationSchedule(
@@ -3640,8 +3430,7 @@ local function finishNativeSerializationSchedule(
 				session,
 				group.service,
 				roots,
-				{ roots[1] },
-				collectNonArchivableInstances(roots)
+				serializationNonArchivableInstances(session, { group.service })
 			)
 		end
 	end
@@ -3814,6 +3603,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			instanceReplacements = {},
 			snapshot = snapshot,
 			nativeImport = nativeImport,
+			postCommitPropertyChanges = params.postCommitPropertyChanges or {},
 			historyRecording = beginHistoryRecording("Sync from filesystem"),
 			journalActive = false,
 		}
@@ -3871,6 +3661,51 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local records = finishTransactionJournal(session, ctx)
 		replayTransactionJournal(records, session.instanceReplacements, ctx)
 		timings.journalMs = (os.clock() - phaseStarted) * 1000
+		phaseStarted = os.clock()
+		local postCommitPropertyChanges = session.postCommitPropertyChanges
+		if #postCommitPropertyChanges > 0 then
+			local updated = 0
+			local packageSkipped = 0
+			RunService.Heartbeat:Wait()
+			for _, change in ipairs(postCommitPropertyChanges) do
+				local instance = resolvePathSegments(change.pathSegments, nil, change.pathOrdinals)
+				if instance == nil or not instance:IsA("Model") then
+					error(`WorldPivot target was not found: {pathKey(change.pathSegments)}`)
+				end
+				local okDecode, value = decodePropertyValue(
+					instance,
+					"WorldPivot",
+					change.properties.WorldPivot,
+					ctx,
+					change.service
+				)
+				if not okDecode then
+					error(`Failed to decode WorldPivot: {value}`)
+				end
+				local okRead, current = readProperty(instance, "WorldPivot")
+				if not okRead or current ~= value then
+					local ancestor: Instance? = instance
+					while ancestor ~= nil and ancestor ~= game do
+						if ancestor:FindFirstChildWhichIsA("PackageLink") ~= nil then
+							break
+						end
+						ancestor = ancestor.Parent
+					end
+					if ancestor ~= nil and ancestor ~= game then
+						packageSkipped += 1
+					else
+						local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
+						if not okWrite then
+							error(`Failed to write WorldPivot on {instance:GetFullName()}: {writeError}`)
+						end
+						updated += 1
+					end
+				end
+			end
+			timings.postCommitPropertyUpdated = updated
+			timings.postCommitPackageSkipped = packageSkipped
+		end
+		timings.postCommitPropertiesMs = (os.clock() - phaseStarted) * 1000
 		phaseStarted = os.clock()
 		finishHistoryRecording(session.historyRecording)
 		timings.historyMs = (os.clock() - phaseStarted) * 1000
@@ -3938,6 +3773,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
+		local phaseTimings = { started = os.clock() }
 		pruneExpiredSessions(binaryExports)
 		local exportId = tostring(params.exportId or "")
 		local partitioned = params.partitioned == true
@@ -3961,6 +3797,27 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		table.sort(serviceNames)
+		if params.serviceFilter ~= nil then
+			local filterIsArray, filterCount = denseArrayLength(params.serviceFilter)
+			if not filterIsArray or filterCount < 1 then
+				error("Invalid native export service filter")
+			end
+			local allowedByName = {}
+			for _, serviceName in ipairs(serviceNames) do
+				allowedByName[serviceName] = true
+			end
+			local filteredNames = table.create(filterCount)
+			local included = {}
+			for index, rawServiceName in ipairs(params.serviceFilter) do
+				local serviceName = tostring(rawServiceName)
+				if not allowedByName[serviceName] or included[serviceName] then
+					error("Invalid native export service filter")
+				end
+				included[serviceName] = true
+				filteredNames[index] = serviceName
+			end
+			serviceNames = filteredNames
+		end
 		if partitioned and type(params.serviceOrder) == "table" then
 			local allowedByName = {}
 			for _, serviceName in ipairs(serviceNames) do
@@ -3987,18 +3844,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local groups = {}
 		local groupByService = {}
 		local rootsByService = {}
-		local fingerprintsByService = {}
-		local function failChangedExport()
-			for _, marker in ipairs(markers) do
-				marker:Destroy()
-			end
-			error("Studio structure changed during native export")
-		end
 		for _, serviceName in ipairs(serviceNames) do
-			local fingerprintBefore = captureNativeExportFingerprint(serviceName, ctx)
 			local service = game:GetService(serviceName)
 			local marker = Instance.new("Folder")
 			marker.Name = serviceName
+			for name, value in pairs(service:GetAttributes()) do
+				if name:sub(1, 3) ~= "RBX" then
+					marker:SetAttribute(name, value)
+				end
+			end
+			for _, tag in ipairs(CollectionService:GetTags(service)) do
+				CollectionService:AddTag(marker, tag)
+			end
 			markers[#markers + 1] = marker
 			local children = service:GetChildren()
 			local groupRoots = table.create(#children + 1)
@@ -4018,26 +3875,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				service = serviceName,
 				targetPath = { serviceName },
 				count = #groupRoots - 1,
-				changeGeneration = ctx.studioChangeGeneration(serviceName),
 			}
 			groups[#groups + 1] = group
 			groupByService[serviceName] = group
-			local fingerprintAfter = captureNativeExportFingerprint(serviceName, ctx)
-			if not nativeExportFingerprintMatches(fingerprintBefore, fingerprintAfter) then
-				failChangedExport()
-			end
-			fingerprintsByService[serviceName] = fingerprintAfter
 		end
-		for _, serviceName in ipairs(serviceNames) do
-			if
-				not nativeExportFingerprintMatches(
-					fingerprintsByService[serviceName],
-					captureNativeExportFingerprint(serviceName, ctx)
-				)
-			then
-				failChangedExport()
-			end
-		end
+		phaseTimings.services = os.clock()
+		phaseTimings.documents = phaseTimings.services
+		phaseTimings.states = phaseTimings.services
 		local session: { [string]: any } = {
 			groups = groups,
 			serviceNames = serviceNames,
@@ -4053,19 +3897,26 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			serializationBatches = {},
 			serializationBatchIds = {},
 			originalNonArchivableInstances = {},
-			snapshotReplacements = {},
-			snapshotPathByInstance = {},
-			snapshotPathSegmentsByInstance = {},
-			snapshotPathOrdinalsByInstance = {},
-			snapshotDebugIdByInstance = {},
 			snapshotRoots = table.clone(markers),
-			nativeSnapshots = {},
 			activeSerializations = 0,
-			fingerprintsByService = fingerprintsByService,
+			nonArchivableByService = {},
 			serializationScheduleReady = not partitioned,
 			pendingPayloads = if partitioned then 0 else 1,
 			updatedAt = os.clock(),
+			ctx = ctx,
 		}
+		if not metadataOnly then
+			local guardedServices = table.create(#serviceNames)
+			for index, serviceName in ipairs(serviceNames) do
+				guardedServices[index] = {
+					serviceName = serviceName,
+					service = game:GetService(serviceName),
+				}
+			end
+			session.nativeGuard = ReferenceOverlay.beginNativeGuard(guardedServices, true, {
+				archivable = true,
+			})
+		end
 		session.cleanupSnapshot = function()
 			if session.activeSerializations > 0 then
 				session.snapshotCleanupPending = true
@@ -4078,12 +3929,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 			table.clear(session.snapshotRoots)
-			table.clear(session.snapshotReplacements)
-			table.clear(session.snapshotPathByInstance)
-			table.clear(session.snapshotPathSegmentsByInstance)
-			table.clear(session.snapshotPathOrdinalsByInstance)
-			table.clear(session.snapshotDebugIdByInstance)
-			table.clear(session.nativeSnapshots)
 		end
 		session.onExpire = function()
 			if session.released then
@@ -4093,6 +3938,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			session.released = true
 			session.serializationScheduleReady = true
 			session.payloadReadyEvent:Fire()
+			ReferenceOverlay.finishNativeGuard(session.nativeGuard)
+			session.nativeGuard = nil
 			session.cleanupSnapshot()
 			table.clear(session.nativeStates)
 			table.clear(session.binaryBatchPayloads)
@@ -4102,165 +3949,48 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(binaryExports, exportId, session)
 		local beginOk, beginResult = xpcall(function()
 			if not metadataOnly then
-				for _, serviceName in ipairs(serviceNames) do
-					local snapshotRoots, snapshot, replacements, nonArchivableClones, snapshotFingerprint =
-						captureNativeExportSnapshot(
-						serviceName,
-						rootsByService[serviceName],
-						fingerprintsByService[serviceName],
-						ctx
-					)
-					session.fingerprintsByService[serviceName] = snapshotFingerprint
-					rootsByService[serviceName] = snapshotRoots
-					session.nativeSnapshots[serviceName] = snapshot
-					for index = 2, #snapshotRoots do
-						local root = snapshotRoots[index]
-						if replacements[root] ~= root then
-							session.snapshotRoots[#session.snapshotRoots + 1] = root
-						end
-					end
-					for original, clone in pairs(replacements) do
-						session.snapshotReplacements[original] = clone
-					end
-					for instance, path in pairs(snapshot.pathByInstance) do
-						session.snapshotPathByInstance[instance] = path
-					end
-					for instance, pathSegments in pairs(snapshot.pathSegmentsByInstance) do
-						session.snapshotPathSegmentsByInstance[instance] = pathSegments
-					end
-					for instance, pathOrdinals in pairs(snapshot.pathOrdinalsByInstance) do
-						session.snapshotPathOrdinalsByInstance[instance] = pathOrdinals
-					end
-					for instance, debugId in pairs(snapshot.debugIdByInstance) do
-						session.snapshotDebugIdByInstance[instance] = debugId
-					end
-					for _, instance in ipairs(nonArchivableClones) do
-						session.originalNonArchivableInstances[instance] = true
-					end
+				local scriptSourcesByInstance = {}
+				for _, entry in ipairs(ScriptDocumentState.capture(serviceNames)) do
+					scriptSourcesByInstance[entry.instance] = entry.source
 				end
-				for _, serviceName in ipairs(serviceNames) do
-					local snapshot = session.nativeSnapshots[serviceName]
-					snapshot.pathByInstance = session.snapshotPathByInstance
-					snapshot.pathSegmentsByInstance = session.snapshotPathSegmentsByInstance
-					snapshot.pathOrdinalsByInstance = session.snapshotPathOrdinalsByInstance
-					snapshot.debugIdByInstance = session.snapshotDebugIdByInstance
-					for propertyName, value in pairs(snapshot.rootPropertyValues) do
-						if typeof(value) == "Instance" then
-							snapshot.rootPropertyValues[propertyName] = session.snapshotReplacements[value] or value
-						end
-					end
-					local state = ctx.prepareNativeState(serviceName, snapshot)
-					if not validateNativeExportFingerprint(session, serviceName, ctx, state) then
-						error("Studio structure changed during native export")
-					end
+				phaseTimings.documents = os.clock()
+				local serializerWorkerCount = if partitioned
+					then math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
+					else 0
+				if partitioned then
+					session.firstUnscheduledSerializationGroup = serializerWorkerCount + 1
+					session.serializerWorkerCount = serializerWorkerCount
+					startNativeSerializationWorkers(session, serializerWorkerCount)
+				end
+				for serviceIndex, serviceName in ipairs(serviceNames) do
+					local state = ctx.prepareNativeState(serviceName, scriptSourcesByInstance)
 					session.nativeStates[serviceName] = state
+					session.nonArchivableByService[serviceName] = state.nonArchivableInstances
 					local values = ctx.readRootProperties(serviceName, state)
 					if type(values) == "table" and next(values) then
 						groupByService[serviceName].rootProperties = values
 					end
-				end
-				if not partitioned then
-					table.clear(roots)
-					for _, serviceName in ipairs(serviceNames) do
-						for _, root in ipairs(rootsByService[serviceName]) do
-							roots[#roots + 1] = root
-						end
-					end
-					prepareNativeSnapshotSerializationJob(session, { roots = roots })
-				end
-				local function completePayload(
-					payloadKey: string?,
-					payloadMarkers: { Instance },
-					ok: boolean,
-					payload: any
-				)
-					for _, marker in ipairs(payloadMarkers) do
-						marker:Destroy()
-					end
-					if session.cancelled then
-						return
-					end
-					if not ok then
-						if payloadKey then
-							session.payloadErrors[payloadKey] = tostring(payload)
-						else
-							session.error = tostring(payload)
-						end
-					else
-						local totalBytes = buffer.len(payload)
-						if totalBytes > 536870912 then
-							local message = "Native export exceeds the supported size"
-							if payloadKey then
-								session.payloadErrors[payloadKey] = message
-							else
-								session.error = message
-							end
-						elseif payloadKey then
-							session.payloads[payloadKey] = payload
-						else
-							session.payload = payload
-							session.totalBytes = totalBytes
-						end
-					end
-					session.pendingPayloads -= 1
-					updateNativeSerializationStatus(session)
-					session.updatedAt = os.clock()
-					session.payloadReadyEvent:Fire()
-				end
-				local function runSerializationJob(job: { [string]: any })
-					if session.cancelled then
-						return
-					end
-					session.activeSerializations += 1
-					local ok, payload = xpcall(function()
-						return SerializationService:SerializeInstancesAsync(job.roots)
-					end, debug.traceback)
-					session.activeSerializations -= 1
-					completePayload(job.payloadKey, job.markers, ok, payload)
-					if session.snapshotCleanupPending and session.activeSerializations == 0 then
-						session.cleanupSnapshot()
-					end
-				end
-				if partitioned then
-					local serializerWorkerCount =
-						math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
-					for index = 1, serializerWorkerCount do
-						local group = groups[index]
-						local groupRoots = rootsByService[group.service]
+					if partitioned and serviceIndex <= serializerWorkerCount then
 						appendNativeSerializationJob(
 							session,
-							group.service,
-							groupRoots,
-							{ groupRoots[1] },
-							collectNonArchivableInstances(groupRoots)
+							serviceName,
+							rootsByService[serviceName],
+							serializationNonArchivableInstances(session, { serviceName })
 						)
 					end
-					session.firstUnscheduledSerializationGroup = serializerWorkerCount + 1
-					local nextSerializationIndex = 0
-					for _ = 1, serializerWorkerCount do
-						task.spawn(function()
-							while not session.cancelled do
-								local job = session.serializationJobs[nextSerializationIndex + 1]
-								if job ~= nil then
-									nextSerializationIndex += 1
-									runSerializationJob(job)
-								elseif session.serializationScheduleReady then
-									break
-								else
-									session.payloadReadyEvent.Event:Wait()
-								end
-							end
-						end)
-					end
-					session.serializerWorkerCount = serializerWorkerCount
-				else
-					task.spawn(function()
-						runSerializationJob({
-							roots = roots,
-							markers = markers,
-						})
-					end)
 				end
+				ReferenceOverlay.assertNativeGuard(session.nativeGuard)
+				if not partitioned then
+					local job = {
+						roots = roots,
+						nonArchivableInstances = serializationNonArchivableInstances(session, serviceNames),
+					}
+					for _, instance in ipairs(job.nonArchivableInstances) do
+						session.originalNonArchivableInstances[instance] = true
+					end
+					task.spawn(runNativeSerializationJob, session, job)
+				end
+				phaseTimings.states = os.clock()
 			else
 				session.pendingPayloads = 0
 				session.serializationScheduleReady = true
@@ -4272,11 +4002,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local state = session.nativeStates[serviceName]
 				if state == nil then
 					state = ctx.getState(serviceName)
-					if not validateNativeExportFingerprint(session, serviceName, ctx, state) then
-						binaryExports[exportId] = nil
-						session.onExpire()
-						error("Studio structure changed during native export")
-					end
 					session.nativeStates[serviceName] = state
 				end
 				state.originalNonArchivableInstances = session.originalNonArchivableInstances
@@ -4289,6 +4014,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 				end
 				group.instanceCount = #instances
+				group.scriptCount = #(state.scriptObjects or {})
 				group.classNames = state.classNames or {}
 				for _, className in ipairs(state.classNames or {}) do
 					if propertySchemaByClass[className] == nil then
@@ -4314,6 +4040,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					session.firstUnscheduledSerializationGroup
 				)
 			end
+			phaseTimings.complete = os.clock()
+			print(
+				string.format(
+					"[Renium profile] services=%.1f documents=%.1f states=%.1f finish=%.1f total=%.1f",
+					(phaseTimings.services - phaseTimings.started) * 1000,
+					(phaseTimings.documents - phaseTimings.services) * 1000,
+					(phaseTimings.states - phaseTimings.documents) * 1000,
+					(phaseTimings.complete - phaseTimings.states) * 1000,
+					(phaseTimings.complete - phaseTimings.started) * 1000
+				)
+			)
 			return {
 				ok = true,
 				exportId = exportId,
@@ -4342,9 +4079,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if state == nil then
 			error("Native export service state was not found")
 		end
-		if not validateNativeExportFingerprint(session, serviceName, ctx, state) then
-			error("Studio structure changed during native export")
-		end
+		ReferenceOverlay.assertNativeGuard(session.nativeGuard)
 		return state
 	end
 
@@ -4627,9 +4362,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local session = binaryExports[exportId]
 		local found = session ~= nil
 		if type(session) == "table" then
+			local changedService = if session.nativeGuard then session.nativeGuard.changedService else nil
 			session.cancelled = true
 			session.payloadReadyEvent:Fire()
 			expireSession(binaryExports, exportId, session)
+			if changedService ~= nil then
+				error(`Studio changed {changedService} during native export; retry the sync`)
+			end
 		end
 		return { ok = true, found = found }
 	end
@@ -4775,6 +4514,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					local className = descriptor.className
 					local payloadIndex = tonumber(descriptor.payloadIndex)
 					local retainedInstanceCount = tonumber(descriptor.instanceCount)
+					local payloadOmitted = descriptor.payloadOmitted == true
 					if
 						type(className) ~= "string"
 						or className == ""
@@ -4796,6 +4536,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						className = className,
 						payloadIndex = payloadIndex,
 						instanceCount = retainedInstanceCount,
+						payloadOmitted = payloadOmitted,
 					}
 				end
 			end
@@ -5058,8 +4799,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				resolveStagedPath = retention.resolveStagedPath,
 				referenceUpdates = retention.referenceUpdates,
 				retainedDuplicates = retention.retainedDuplicates,
-				retainedLiveRoots = retention.retainedLiveRoots,
-				outgoingScanRoots = retention.outgoingScanRoots,
 				generationsByService = generationsByService,
 				guard = transaction.nativeGuard,
 			}

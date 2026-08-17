@@ -1,7 +1,12 @@
 type ServiceState = {
 	instances: { Instance },
 	nativeExportOnly: boolean,
+	nativeSnapshotRoot: boolean?,
+	nativeLiveSnapshot: boolean?,
+	exportedInstances: { [Instance]: boolean }?,
+	isExportedInstance: ((Instance, string) -> boolean)?,
 	nonArchivableInstance: Instance?,
+	nonArchivableInstances: { Instance },
 	originalNonArchivableInstances: { [Instance]: boolean }?,
 	nativeDebugIdBuffer: buffer?,
 	nativeRootPropertyValues: { [string]: any }?,
@@ -142,7 +147,7 @@ function BridgePluginRuntime.start(context)
 		return localPlayer.Name, localPlayer.UserId
 	end
 
-	local SETTINGS_PREFIX = "Renium."
+	local SETTINGS_PREFIX = "Renium_"
 	local DEFAULT_HOST = "127.0.0.1"
 	local DEFAULT_PORTS = { 8781, 8782 }
 	local RECONNECT_SECONDS = 0.5
@@ -160,7 +165,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.1.8"
+	local BRIDGE_VERSION = "0.1.9"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -256,6 +261,7 @@ function BridgePluginRuntime.start(context)
 	local PropertySchemaModule = requireChildModule("BridgePropertySchema")
 	local StudioApiSchemaModule = requireChildModule("BridgeStudioApiSchema")
 	local EditorSyncModule = requireChildModule("BridgeEditorSync")
+	local initialRuntimeSettings = SettingsModule.loadRuntimeSettings(plugin, SETTINGS_PREFIX)
 	local activeExclusiveSessionGeneration = nil
 	local editorSync
 	local sessionLock
@@ -272,6 +278,7 @@ function BridgePluginRuntime.start(context)
 	local ui = UiModule.create(plugin, {
 		version = BRIDGE_VERSION,
 		buildUnix = BRIDGE_BUILD_UNIX,
+		initiallyConnecting = initialRuntimeSettings.autoConnect,
 	})
 	ui.setPlayModeHidden(Config.isPlayModeActiveForBridge())
 
@@ -595,15 +602,32 @@ function BridgePluginRuntime.start(context)
 	local prepareService
 	local getState
 
-	local function includeExportInstance(serviceName: string, instance: Instance): boolean
-		if sessionLock.isLockInstance(instance) then
-			return false
+	local function excludedExportRoots(serviceName: string, service: Instance): { Instance }
+		local roots = {}
+		if serviceName == "ServerStorage" then
+			for _, child in ipairs(service:GetChildren()) do
+				if sessionLock.isLockInstance(child) then
+					roots[#roots + 1] = child
+				end
+			end
+		elseif serviceName == "Players" then
+			for _, child in ipairs(service:GetChildren()) do
+				if child:IsA("Player") then
+					roots[#roots + 1] = child
+				end
+			end
 		end
-		if serviceName ~= "Players" then
-			return true
-		end
-		return not instance:IsA("Player") and not instance:FindFirstAncestorWhichIsA("Player")
+		return roots
 	end
+
+	local function includeExportInstance(serviceName: string, instance: Instance): boolean
+		if serviceName == "ServerStorage" then
+			return not sessionLock.isLockInstance(instance)
+		end
+		return serviceName ~= "Players"
+			or not instance:IsA("Player") and not instance:FindFirstAncestorWhichIsA("Player")
+	end
+	Config.includeExportInstance = includeExportInstance
 
 	function Config.updateStatusText()
 		local statusState = {
@@ -679,8 +703,8 @@ function BridgePluginRuntime.start(context)
 		getState = function(serviceName: string)
 			return getState(serviceName)
 		end,
-		prepareNativeState = function(serviceName: string, snapshot)
-			local _, state = prepareService(serviceName, true, snapshot)
+		prepareNativeState = function(serviceName: string, scriptSourcesByInstance)
+			local _, state = prepareService(serviceName, true, nil, scriptSourcesByInstance)
 			return state
 		end,
 		includeExportInstance = includeExportInstance,
@@ -719,6 +743,9 @@ function BridgePluginRuntime.start(context)
 		drainStudioChangeJournal = Config.studioChanges.drainChangeJournal,
 		finishStudioChangeJournal = Config.studioChanges.finishChangeJournal,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
+		isStudioChangeTracking = Config.studioChanges.isTracking,
+		hasNonArchivable = Config.studioChanges.hasNonArchivable,
+		trackedExportInstances = Config.studioChanges.exportInstances,
 	})
 	local function tryReadModelPivotProperty(instance: Instance, propertyName: string): (boolean, any)
 		if not (instance:IsA("Model") or instance:IsA("WorldModel")) then
@@ -3408,7 +3435,8 @@ function BridgePluginRuntime.start(context)
 	prepareService = function(
 		serviceName: string,
 		nativeExportOnly: boolean?,
-		nativeSnapshot: { [string]: any }?
+		nativeSnapshot: { [string]: any }?,
+		nativeScriptSourcesOverride: { [Instance]: string }?
 	): ({ [string]: any }?, ServiceState)
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
@@ -3417,28 +3445,32 @@ function BridgePluginRuntime.start(context)
 
 		local nativeExport = nativeExportOnly == true
 		local snapshotInstances = if nativeExport and nativeSnapshot then nativeSnapshot.instances else nil
-		local descendants
-		if snapshotInstances then
-			descendants = table.create(math.max(0, #snapshotInstances - 1))
-			for index = 2, #snapshotInstances do
-				descendants[index - 1] = snapshotInstances[index]
-			end
-		else
-			descendants = service:GetDescendants()
-			local descendantCount = #descendants
-			local includedCount = 0
-			for index = 1, descendantCount do
-				local instance = descendants[index]
-				if includeExportInstance(serviceName, instance) then
-					includedCount += 1
-					descendants[includedCount] = instance
+		local descendants = snapshotInstances or service:GetDescendants()
+		if not snapshotInstances then
+			local excludedRoots = excludedExportRoots(serviceName, service)
+			if #excludedRoots > 0 then
+				local descendantCount = #descendants
+				local includedCount = 0
+				for index = 1, descendantCount do
+					local instance = descendants[index]
+					local included = true
+					for _, root in ipairs(excludedRoots) do
+						if instance == root or instance:IsDescendantOf(root) then
+							included = false
+							break
+						end
+					end
+					if included then
+						includedCount += 1
+						descendants[includedCount] = instance
+					end
+				end
+				for index = includedCount + 1, descendantCount do
+					descendants[index] = nil
 				end
 			end
-			for index = includedCount + 1, descendantCount do
-				descendants[index] = nil
-			end
 		end
-		local expectedCount = #descendants + 1
+		local expectedCount = if snapshotInstances then #snapshotInstances else #descendants + 1
 		local instances = table.create(expectedCount)
 		instances[1] = if snapshotInstances then snapshotInstances[1] else service
 		local instanceCount = 1
@@ -3453,6 +3485,9 @@ function BridgePluginRuntime.start(context)
 		local parentIndexByIndex = if nativeExport then {} else table.create(expectedCount)
 		local unresolvedParentIndices = {}
 		local serviceClassName = if nativeSnapshot then tostring(nativeSnapshot.serviceClassName) else service.ClassName
+		local nativeScriptSources = if nativeSnapshot
+			then nativeSnapshot.scriptSourcesByInstance
+			else nativeScriptSourcesOverride
 		local serviceIsLuaSourceContainer = not not Config.LUA_SOURCE_CLASS[serviceClassName]
 		classNames[1] = serviceClassName
 		classIdByName[serviceClassName] = 0
@@ -3469,7 +3504,13 @@ function BridgePluginRuntime.start(context)
 			else {}
 		local instanceIdByInstance: { [Instance]: string | number | boolean } = {}
 		local scriptKeyByInstance: { [Instance]: string } = {}
-		local nonArchivableInstance = if snapshotInstances then nil elseif service.Archivable then nil else service
+		local scriptSourcesByIndex = {}
+		local nonArchivableInstances = {}
+		local nonArchivableInstance
+		if not snapshotInstances and not service.Archivable then
+			nonArchivableInstance = service
+			nonArchivableInstances[1] = service
+		end
 		local nativeDebugIdData = if nativeSnapshot
 			then nativeSnapshot.debugIdBuffer
 			elseif nativeExport then table.create(expectedCount)
@@ -3489,10 +3530,14 @@ function BridgePluginRuntime.start(context)
 		end
 
 		local yieldIfNeeded = if nativeExport then nil else makeExportBurstYielder()
-		for _, inst in ipairs(descendants) do
+		local firstDescendant = if snapshotInstances then 2 else 1
+		for descendantIndex = firstDescendant, #descendants do
+			local inst = descendants[descendantIndex]
 			instanceCount += 1
 			instances[instanceCount] = inst
-			instanceIdByInstance[inst] = instanceCount
+			if not nativeExport then
+				instanceIdByInstance[inst] = instanceCount
+			end
 			if nativeDebugIdData and not nativeSnapshot then
 				Config.writeNativeOverlayDebugId(inst, nativeDebugIdData, instanceCount)
 			end
@@ -3505,8 +3550,15 @@ function BridgePluginRuntime.start(context)
 			classNameByIndex[instanceCount] = className
 			classValueByIndex[instanceCount] = classIdByName[className] or className
 			if nativeExport then
-				if nonArchivableInstance == nil and not inst.Archivable then
-					nonArchivableInstance = inst
+				if not inst.Archivable then
+					nonArchivableInstance = nonArchivableInstance or inst
+					nonArchivableInstances[#nonArchivableInstances + 1] = inst
+				end
+				local source = if nativeScriptSources then nativeScriptSources[inst] else nil
+				if source ~= nil and Config.LUA_SOURCE_CLASS[className] then
+					scriptCount += 1
+					scriptObjects[scriptCount] = inst
+					scriptSourcesByIndex[instanceCount] = source
 				end
 			else
 				local parent = inst.Parent
@@ -3538,8 +3590,12 @@ function BridgePluginRuntime.start(context)
 			instances = instances,
 			nativeExportOnly = nativeExport,
 			nativeSnapshotRoot = snapshotInstances ~= nil,
+			nativeLiveSnapshot = if nativeSnapshot then nativeSnapshot.nativeLiveSnapshot == true else false,
+			exportedInstances = if nativeSnapshot then nativeSnapshot.exportedInstances else nil,
+			isExportedInstance = if nativeSnapshot then nativeSnapshot.isExportedInstance else nil,
 			nativeDebugIds = if nativeSnapshot then nativeSnapshot.debugIds else nil,
 			nonArchivableInstance = nonArchivableInstance,
+			nonArchivableInstances = nonArchivableInstances,
 			nativeDebugIdBuffer = nativeDebugIdData,
 			nativeRootPropertyValues = if nativeSnapshot then nativeSnapshot.rootPropertyValues else nil,
 			classNames = classNames,
@@ -3558,7 +3614,7 @@ function BridgePluginRuntime.start(context)
 			scriptPaths = nil,
 			scriptIndices = nil,
 			scriptSources = {},
-			scriptSourcesByIndex = {},
+			scriptSourcesByIndex = scriptSourcesByIndex,
 			scriptInstances = nil,
 			scriptInstancesByIndex = nil,
 			scriptKeyByInstance = scriptKeyByInstance,
@@ -3910,7 +3966,10 @@ function BridgePluginRuntime.start(context)
 		local instances = state.instances
 		local total = #instances
 		local startPos = Config.boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
-		local take = Config.boundedPositiveInteger(maxCount, 300, MAX_INSTANCE_BATCH_ITEMS)
+		local maximumItems = if type(overlayId) == "string" and overlayId ~= ""
+			then math.max(total, 1)
+			else MAX_INSTANCE_BATCH_ITEMS
+		local take = Config.boundedPositiveInteger(maxCount, 300, maximumItems)
 
 		local function buildPayload(): { [string]: any }
 			if startPos > total then
@@ -4348,9 +4407,12 @@ function BridgePluginRuntime.start(context)
 	function Config.getSourceRangeBatchCompact(
 		serviceName: string,
 		startIndex: number?,
-		maxCount: number?
+		maxCount: number?,
+		exportId: string?
 	): (string, number)
-		local state = getState(serviceName)
+		local state = if exportId and exportId ~= ""
+			then editorSync.getBinaryExportState(exportId, serviceName)
+			else getState(serviceName)
 		ensureScriptRangeIndex(state)
 		local total = state.scriptIndices and #state.scriptIndices or 0
 		local startPos = Config.boundedPositiveInteger(startIndex, 1, math.max(total + 1, 1))
@@ -4467,9 +4529,10 @@ function BridgePluginRuntime.start(context)
 		startIndex: number?,
 		maxCount: number?,
 		chunkStart: number?,
-		maxLen: number?
+		maxLen: number?,
+		exportId: string?
 	): { [string]: any }
-		local encoded, encodeMs = Config.getSourceRangeBatchCompact(serviceName, startIndex, maxCount)
+		local encoded, encodeMs = Config.getSourceRangeBatchCompact(serviceName, startIndex, maxCount, exportId)
 		return ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
 	end
 
@@ -4727,9 +4790,10 @@ function BridgePluginRuntime.start(context)
 
 	Config.bridgeMethodHandlers.getStudioChangeState = function(p)
 		local runtimeSettings = Config.getBridgeSettings()
-		local explicitRuntimeSettings = if Config.getExplicitBridgeSettings
-			then Config.getExplicitBridgeSettings()
-			else {}
+		if tostring(p.runtimeId or "") == Config.bridgeRuntimeId then
+			Config.ackPendingBridgeSettingChanges(p.ackRuntimeSettingsSeq)
+		end
+		local runtimeSettingChanges, runtimeSettingsSeq = Config.getPendingBridgeSettingChanges()
 		if runtimeSettings.twoWaySync == false then
 			return {
 				ok = true,
@@ -4740,16 +4804,16 @@ function BridgePluginRuntime.start(context)
 				propertyChanges = {},
 				changes = {},
 				twoWaySyncEnabled = false,
-				runtimeSettings = runtimeSettings,
-				explicitRuntimeSettings = explicitRuntimeSettings,
+				runtimeSettingChanges = runtimeSettingChanges,
+				runtimeSettingsSeq = runtimeSettingsSeq,
 				runtimeId = Config.bridgeRuntimeId,
 				editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId),
 			}
 		end
 		local changeState = Config.studioChanges.getState(p)
 		changeState.twoWaySyncEnabled = true
-		changeState.runtimeSettings = runtimeSettings
-		changeState.explicitRuntimeSettings = explicitRuntimeSettings
+		changeState.runtimeSettingChanges = runtimeSettingChanges
+		changeState.runtimeSettingsSeq = runtimeSettingsSeq
 		changeState.editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
 		return changeState
 	end
@@ -4857,7 +4921,8 @@ function BridgePluginRuntime.start(context)
 			p.startIndex,
 			p.maxCount,
 			p.chunkStart,
-			p.maxLen
+			p.maxLen,
+			tostring(p.exportId or "")
 		)
 	end
 
@@ -5014,6 +5079,7 @@ function BridgePluginRuntime.start(context)
 		transportModule = TransportModule,
 		httpService = HttpService,
 		settingsPrefix = SETTINGS_PREFIX,
+		runtimeSettings = initialRuntimeSettings,
 		defaultHost = DEFAULT_HOST,
 		defaultPorts = DEFAULT_PORTS,
 		reconnectSeconds = RECONNECT_SECONDS,

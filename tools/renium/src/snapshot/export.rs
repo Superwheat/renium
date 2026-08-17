@@ -39,9 +39,9 @@ use crate::snapshot::codec::{
 };
 use crate::snapshot::import::{
     DirectImportDispatcher, SourcemapWriter, build_service_state_from_instances,
-    direct_import_export_order, fetch_script_sources, import_snapshots, normalize_class_defaults,
-    parse_services, resolve_direct_import_drain_workers, resolve_direct_import_workers,
-    resolve_source_worker_count,
+    direct_import_export_order, fetch_script_sources, import_snapshots, merge_script_sources,
+    normalize_class_defaults, parse_services, resolve_direct_import_drain_workers,
+    resolve_direct_import_workers, resolve_source_worker_count,
 };
 use crate::snapshot::types::{
     AdaptiveTuneCache, AdaptiveTuneEntry, CompactBatchPayload, ExportedSnapshotParts,
@@ -436,7 +436,8 @@ pub(crate) struct ExportProjectStage {
     pub(crate) import_project_root: PathBuf,
     pub(crate) import_src_dir: PathBuf,
     publish_paths: Vec<PathBuf>,
-    publish_baseline: BTreeMap<PathBuf, PublishEntryState>,
+    publish_baseline: Option<BTreeMap<PathBuf, PublishEntryState>>,
+    move_staged_paths: bool,
     pub(crate) loaded: Option<config::LoadedProject>,
     pub(crate) projection: Option<config::ProjectionStage>,
     active: bool,
@@ -581,7 +582,8 @@ impl ExportProjectStage {
             import_project_root,
             import_src_dir,
             publish_paths,
-            publish_baseline,
+            publish_baseline: Some(publish_baseline),
+            move_staged_paths: false,
             loaded: staged_loaded,
             projection,
             active: true,
@@ -590,7 +592,7 @@ impl ExportProjectStage {
         Ok(stage)
     }
 
-    pub(crate) fn finish_projection(&self) -> Result<()> {
+    pub(crate) fn finish_projection(&self, generate_sourcemap: bool) -> Result<()> {
         if let (Some(loaded), Some(projection)) = (&self.loaded, &self.projection)
             && projection.is_temporary()
         {
@@ -603,7 +605,10 @@ impl ExportProjectStage {
             );
             config::syncback_project_adapters_from_root(loaded, &adapter_root, false)?;
         }
-        generate_project_sourcemap(&self.project_root)
+        if generate_sourcemap {
+            generate_project_sourcemap(&self.project_root)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn preview_operations(&self, project_root: &Path) -> Result<Vec<Value>> {
@@ -654,14 +659,20 @@ impl ExportProjectStage {
 
     pub(crate) fn publish(mut self, project_root: &Path) -> Result<Vec<PathBuf>> {
         let started = Instant::now();
-        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        if current != self.publish_baseline {
+        let current = self
+            .publish_baseline
+            .as_ref()
+            .map(|_| collect_publish_hashes(project_root, &self.publish_paths))
+            .transpose()?;
+        if let (Some(current), Some(baseline)) = (&current, &self.publish_baseline)
+            && current != baseline
+        {
             let changed = current
                 .keys()
-                .chain(self.publish_baseline.keys())
+                .chain(baseline.keys())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .filter(|path| current.get(*path) != self.publish_baseline.get(*path))
+                .filter(|path| current.get(*path) != baseline.get(*path))
                 .take(10)
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>();
@@ -673,8 +684,12 @@ impl ExportProjectStage {
         let backup_root = self.container.join("previous");
         fs::create_dir_all(&backup_root)
             .with_context(|| format!("Failed to create {}", backup_root.display()))?;
-        let staged_state = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
-        let operation_paths = publish_operation_paths(&current, &staged_state);
+        let operation_paths = if let Some(current) = current.as_ref() {
+            let staged_state = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
+            publish_operation_paths(current, &staged_state)
+        } else {
+            self.publish_paths.clone()
+        };
         let changed_paths = operation_paths.clone();
         let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
         let publish_result = (|| -> Result<()> {
@@ -698,9 +713,15 @@ impl ExportProjectStage {
                 };
                 published.push((destination.clone(), backup));
                 if fs::symlink_metadata(&staged).is_ok() {
-                    copy_isolated_path(&staged, &destination).with_context(|| {
-                        format!("Failed to publish staged path {}", relative.display())
-                    })?;
+                    if self.move_staged_paths {
+                        fs::rename(&staged, &destination).with_context(|| {
+                            format!("Failed to publish staged path {}", relative.display())
+                        })?;
+                    } else {
+                        copy_isolated_path(&staged, &destination).with_context(|| {
+                            format!("Failed to publish staged path {}", relative.display())
+                        })?;
+                    }
                 }
             }
             Ok(())
@@ -743,6 +764,18 @@ impl ExportProjectStage {
             return Err(error);
         }
         self.active = false;
+        published
+            .par_iter()
+            .filter_map(|(_, backup)| backup.as_ref())
+            .for_each(|backup| match fs::symlink_metadata(backup) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    let _ = fs::remove_dir_all(backup);
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(backup);
+                }
+                Err(_) => {}
+            });
         let _ = fs::remove_dir_all(&self.container);
         log_timing_ms("export project stage publish", elapsed_ms(started));
         Ok(changed_paths)
@@ -1406,10 +1439,12 @@ fn finish_export_import(
             threads: 0,
         })?;
     }
-    let changed =
-        canonicalize_settings_reference_stores(&import_project_root.join(import_src_dir))?;
-    if changed > 0 {
-        println!("[renium] refreshed reference identities in {changed} service store(s)");
+    if args.import_mode != "direct" {
+        let changed =
+            canonicalize_settings_reference_stores(&import_project_root.join(import_src_dir))?;
+        if changed > 0 {
+            println!("[renium] refreshed reference identities in {changed} service store(s)");
+        }
     }
     Ok(metrics)
 }
@@ -1440,11 +1475,13 @@ fn start_direct_import(
     }
     let default_workers = resolve_direct_import_workers(args.import_workers);
     let drain_workers = resolve_direct_import_drain_workers(args.import_workers, default_workers);
-    println!("[renium] direct import workers during export: 0, after export: {drain_workers}");
+    println!(
+        "[renium] direct import workers during export: {default_workers}, after export: {drain_workers}"
+    );
     DirectImportDispatcher::start(
         project_root.to_path_buf(),
         src_dir.to_path_buf(),
-        0,
+        default_workers,
         drain_workers,
         sourcemap_writer.map(SourcemapWriter::sender),
         total_started,
@@ -1477,9 +1514,16 @@ fn prepare_export_execution(
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
     let run_import = !args.no_run_import;
-    let project_stage = run_import
-        .then(|| ExportProjectStage::create(project_root, &args.src_dir, services))
-        .transpose()?;
+    let direct_import_mode = run_import && args.import_mode == "direct";
+    let project_stage = if run_import && !direct_import_mode {
+        Some(ExportProjectStage::create(
+            project_root,
+            &args.src_dir,
+            services,
+        )?)
+    } else {
+        None
+    };
     let import_project_root = project_stage.as_ref().map_or_else(
         || project_root.to_path_buf(),
         |stage| stage.import_project_root.clone(),
@@ -1504,7 +1548,6 @@ fn prepare_export_execution(
             args.adaptive_seed_batch
         );
     }
-    let direct_import_mode = run_import && args.import_mode == "direct";
     let effective_chunk = clamp_bridge_chunk_size(args.chunk_size);
     if effective_chunk != args.chunk_size {
         println!(
@@ -1689,7 +1732,7 @@ fn export_snapshots_core(
         sourcemap_writer,
     )?;
     if let Some(stage) = project_stage.take() {
-        stage.finish_projection()?;
+        stage.finish_projection(!direct_import_mode)?;
         stage.publish(&project_root)?;
     }
     if tune_updated {
@@ -1892,6 +1935,7 @@ impl ServiceExportContext<'_> {
                 chunk_size,
                 script_count,
                 source_worker_count,
+                None,
             )?;
             log_timing(&format!("{service}: script source fetch"), started);
             Ok(value)
@@ -3297,56 +3341,4 @@ where
     let value = serde_json::from_slice(text.as_bytes()).context("Invalid chunked JSON payload")?;
     metrics.json_parse_ms = elapsed_ms(parse_started);
     Ok((value, metrics))
-}
-
-fn merge_script_sources(instances: &mut [SnapshotInstance], source_map: &SourceBatchMap) {
-    for instance in instances.iter_mut() {
-        let is_script_class = matches!(
-            instance.class_name.as_str(),
-            "Script" | "LocalScript" | "ModuleScript"
-        );
-        if !is_script_class {
-            instance.source_key = None;
-            continue;
-        }
-
-        let source = instance
-            .instance_index
-            .and_then(|instance_index| source_map.by_index.get(&instance_index))
-            .or_else(|| {
-                instance
-                    .source_key
-                    .as_deref()
-                    .and_then(|source_key| source_map.by_key.get(source_key))
-            })
-            .or_else(|| {
-                instance
-                    .instance_id
-                    .as_deref()
-                    .and_then(|instance_id| source_map.by_key.get(&format!("id:{instance_id}")))
-            })
-            .or_else(|| {
-                instance.instance_index.and_then(|instance_index| {
-                    source_map.by_key.get(&format!("id:{instance_index:x}"))
-                })
-            })
-            .or_else(|| {
-                instance
-                    .debug_id
-                    .as_deref()
-                    .and_then(|debug_id| source_map.by_key.get(&format!("debug:{debug_id}")))
-            })
-            .or_else(|| source_map.by_key.get(&instance.path));
-        if let Some(source) = source {
-            instance
-                .properties
-                .insert("Source".to_string(), Value::String(source.clone()));
-        } else if is_script_class && instance.source_key.is_some() {
-            instance
-                .properties
-                .entry("Source".to_string())
-                .or_insert_with(|| Value::String("__SOURCE_EXTERNAL__".to_string()));
-        }
-        instance.source_key = None;
-    }
 }

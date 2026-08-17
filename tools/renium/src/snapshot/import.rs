@@ -16,9 +16,7 @@ use crate::app::build::{
     GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
 };
 use crate::app::output::emit_global_output;
-use crate::app::timing::{
-    current_millis, elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs,
-};
+use crate::app::timing::{elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
 use crate::bytecode::acquire_settings_file_lock;
 use crate::cli::args::{ImportServiceArgs, ImportSnapshotsArgs};
 use crate::editor::paths::{project_script_file_names, script_file_names};
@@ -63,45 +61,10 @@ enum DirectImportTask {
 }
 
 #[derive(Default)]
-struct DirectImportPhase {
-    core_complete: AtomicBool,
-    state: Mutex<()>,
-    ready: Condvar,
-}
-
-impl DirectImportPhase {
-    fn is_core_complete(&self) -> bool {
-        self.core_complete.load(Ordering::Acquire)
-    }
-
-    fn wait_for_core(&self) {
-        if self.is_core_complete() {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while !self.is_core_complete() {
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    fn complete_core(&self) {
-        if !self.core_complete.swap(true, Ordering::AcqRel) {
-            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            drop(state);
-            self.ready.notify_all();
-        }
-    }
-}
-
-#[derive(Default)]
 struct DirectImportTaskQueueState {
     services: VecDeque<DirectImportTask>,
     subtrees: VecDeque<DirectImportTask>,
     prefer_subtree: bool,
-    early_service_started: bool,
     active_workers: usize,
     closed: bool,
 }
@@ -110,19 +73,17 @@ struct DirectImportTaskQueue {
     state: Mutex<DirectImportTaskQueueState>,
     ready: Condvar,
     worker_gate: Condvar,
-    phase: Arc<DirectImportPhase>,
 }
 
 impl DirectImportTaskQueue {
-    fn new(active_workers: usize, phase: Arc<DirectImportPhase>) -> Self {
+    fn new(active_workers: usize) -> Self {
         Self {
             state: Mutex::new(DirectImportTaskQueueState {
-                active_workers,
+                active_workers: active_workers.max(1),
                 ..Default::default()
             }),
             ready: Condvar::new(),
             worker_gate: Condvar::new(),
-            phase,
         }
     }
 
@@ -154,24 +115,6 @@ impl DirectImportTaskQueue {
             if worker_index >= state.active_workers && !state.closed {
                 state = self
                     .worker_gate
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
-                continue;
-            }
-            if !self.phase.is_core_complete() && worker_index == 0 {
-                if !state.early_service_started {
-                    if let Some(task) = state.services.pop_front() {
-                        state.early_service_started = true;
-                        return Some(task);
-                    }
-                } else if let Some(task) = state.subtrees.pop_front() {
-                    return Some(task);
-                }
-                if state.closed {
-                    return None;
-                }
-                state = self
-                    .ready
                     .wait(state)
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
@@ -209,14 +152,7 @@ impl DirectImportTaskQueue {
         self.ready.notify_all();
     }
 
-    fn complete_core_phase(&self) {
-        self.phase.complete_core();
-        self.worker_gate.notify_all();
-        self.ready.notify_all();
-    }
-
     fn close(&self) {
-        self.complete_core_phase();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.closed = true;
         drop(state);
@@ -394,7 +330,6 @@ struct DirectImportWorker {
     pending_signal: Arc<(Mutex<()>, Condvar)>,
     sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
     run_started: Instant,
-    early_pool: Arc<rayon::ThreadPool>,
 }
 
 impl DirectImportWorker {
@@ -456,7 +391,6 @@ impl DirectImportWorker {
                         Ok(None)
                     }
                     SplitImportDecision::Inline(state) => {
-                        self.queue.phase.wait_for_core();
                         let import_started = Instant::now();
                         let node = import_service_state_with_sourcemap(
                             &state,
@@ -499,20 +433,13 @@ impl DirectImportWorker {
         let started = Instant::now();
         let shared = Arc::clone(&task.shared);
         let service = shared.service.clone();
-        let run = || {
-            process_split_subtree_task(
-                task,
-                &self.service_nodes,
-                self.sourcemap_sender.as_ref(),
-                started,
-            )
-        };
-        let result = if self.queue.phase.is_core_complete() {
-            run()
-        } else {
-            self.early_pool.install(run)
-        };
-        result.with_context(|| service)
+        process_split_subtree_task(
+            task,
+            &self.service_nodes,
+            self.sourcemap_sender.as_ref(),
+            started,
+        )
+        .with_context(|| service)
     }
 
     fn run_task(&self, task: DirectImportTask) -> Result<()> {
@@ -561,18 +488,7 @@ impl DirectImportDispatcher {
         run_started: Instant,
     ) -> Result<Self> {
         let worker_count = drain_worker_count.max(active_worker_count);
-        let phase = Arc::new(DirectImportPhase::default());
-        let queue = Arc::new(DirectImportTaskQueue::new(
-            active_worker_count,
-            Arc::clone(&phase),
-        ));
-        let early_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .thread_name(|index| format!("renium-early-import-{index}"))
-                .build()
-                .context("Failed to create early import worker pool")?,
-        );
+        let queue = Arc::new(DirectImportTaskQueue::new(active_worker_count));
         let first_error = Arc::new(Mutex::new(None::<String>));
         let service_nodes = Arc::new(Mutex::new(HashMap::<String, SourcemapNode>::new()));
         let pending_tasks = Arc::new(AtomicUsize::new(0));
@@ -588,7 +504,6 @@ impl DirectImportDispatcher {
             pending_signal: Arc::clone(&pending_signal),
             sourcemap_sender,
             run_started,
-            early_pool,
         };
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
@@ -637,7 +552,6 @@ impl DirectImportDispatcher {
 
     fn activate_all_workers(&self) {
         if let Some(queue) = self.queue.as_ref() {
-            queue.complete_core_phase();
             queue.activate_workers(self.workers.len());
         }
     }
@@ -743,7 +657,7 @@ fn import_snapshots_inner(
         args.project_root.clone_from(&stage.import_project_root);
         args.src_dir.clone_from(&stage.import_src_dir);
         import_snapshots_inner(args, false)?;
-        stage.finish_projection()?;
+        stage.finish_projection(true)?;
         return stage.publish(&project_root).map(|paths| {
             paths
                 .into_iter()
@@ -851,7 +765,7 @@ fn import_service_inner(mut args: ImportServiceArgs, allow_project_stage: bool) 
         args.project_root.clone_from(&stage.import_project_root);
         args.src_dir.clone_from(&stage.import_src_dir);
         import_service_inner(args, false)?;
-        stage.finish_projection()?;
+        stage.finish_projection(true)?;
         stage.publish(&project_root)?;
         return Ok(());
     }
@@ -1083,6 +997,7 @@ pub(crate) fn fetch_script_sources(
     chunk_size: usize,
     script_count: usize,
     source_worker_count: usize,
+    export_id: Option<&str>,
 ) -> Result<SourceBatchMap> {
     const SOURCE_BATCH_SIZE: usize = 128;
     let mut source_map = SourceBatchMap::default();
@@ -1114,6 +1029,7 @@ pub(crate) fn fetch_script_sources(
                             "maxCount": batch_len,
                             "chunkStart": chunk_start,
                             "maxLen": max_len,
+                            "exportId": export_id,
                         }),
                     )
                 })?;
@@ -1150,6 +1066,7 @@ pub(crate) fn fetch_script_sources(
                                 "maxCount": batch_len,
                                 "chunkStart": chunk_start,
                                 "maxLen": max_len,
+                                "exportId": export_id,
                             }),
                         )
                     })?;
@@ -1171,6 +1088,59 @@ pub(crate) fn fetch_script_sources(
     }
 
     Ok(source_map)
+}
+
+pub(crate) fn merge_script_sources(
+    instances: &mut [SnapshotInstance],
+    source_map: &SourceBatchMap,
+) {
+    for instance in instances {
+        if !matches!(
+            instance.class_name.as_str(),
+            "Script" | "LocalScript" | "ModuleScript"
+        ) {
+            instance.source_key = None;
+            continue;
+        }
+        let source = instance
+            .instance_index
+            .and_then(|index| source_map.by_index.get(&index))
+            .or_else(|| {
+                instance
+                    .source_key
+                    .as_deref()
+                    .and_then(|key| source_map.by_key.get(key))
+            })
+            .or_else(|| {
+                instance
+                    .instance_id
+                    .as_deref()
+                    .and_then(|id| source_map.by_key.get(&format!("id:{id}")))
+            })
+            .or_else(|| {
+                instance
+                    .instance_index
+                    .and_then(|index| source_map.by_key.get(&format!("id:{index:x}")))
+            })
+            .or_else(|| {
+                instance
+                    .debug_id
+                    .as_deref()
+                    .and_then(|id| source_map.by_key.get(&format!("debug:{id}")))
+            })
+            .or_else(|| source_map.by_key.get(&instance.path));
+        if let Some(source) = source {
+            instance
+                .properties
+                .insert("Source".to_string(), Value::String(source.clone()));
+        } else if instance.source_key.is_some() {
+            instance
+                .properties
+                .entry("Source".to_string())
+                .or_insert_with(|| Value::String("__SOURCE_EXTERNAL__".to_string()));
+        }
+        instance.source_key = None;
+    }
 }
 
 fn direct_import_cpu_cap() -> usize {
@@ -2744,101 +2714,67 @@ fn cleanup_service_dir(service_dir: &Path, expected_paths: &ImportPathSets) -> R
     );
 
     let delete_started = Instant::now();
-    let backup = quarantine_stale_import_paths(service_dir, &stale_files, &stale_dirs)?;
-    if let Some(backup) = backup {
-        println!(
-            "[renium] moved {} stale file(s) and {} stale directorie(s) to {}",
-            stale_files.len(),
-            stale_dirs.len(),
-            backup.display()
-        );
-    }
+    remove_stale_import_paths(service_dir, &stale_files, &stale_dirs)?;
     log_timing(
-        &format!("cleanup quarantine {}", service_dir.display()),
+        &format!("cleanup delete {}", service_dir.display()),
         delete_started,
     );
 
     Ok(())
 }
 
-pub(crate) fn quarantine_stale_import_paths(
+pub(crate) fn remove_stale_import_paths(
     service_dir: &Path,
     stale_files: &[PathBuf],
     stale_dirs: &[PathBuf],
-) -> Result<Option<PathBuf>> {
+) -> Result<()> {
     if stale_files.is_empty() && stale_dirs.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
-    let src_root = service_dir
-        .parent()
-        .context("Import service directory has no src parent")?;
-    let project_root = src_root
-        .parent()
-        .context("Import src directory has no project parent")?;
-    let service_name = service_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("service");
-    let backup_root = project_root
-        .join(".renium")
-        .join("import-backups")
-        .join(format!("{}-{}", current_millis(), std::process::id()))
-        .join(service_name);
 
     let mut ordered_dirs = stale_dirs.to_vec();
     ordered_dirs.sort_by_key(|path| path.components().count());
     let mut root_dirs: Vec<PathBuf> = Vec::new();
     for dir in ordered_dirs {
-        if !root_dirs.iter().any(|root| dir.starts_with(root)) {
-            root_dirs.push(dir);
-        }
-    }
-
-    for dir in &root_dirs {
-        if !dir.exists() {
-            continue;
-        }
         let relative = dir.strip_prefix(service_dir).with_context(|| {
             format!(
                 "Stale import directory escaped service root: {}",
                 dir.display()
             )
         })?;
-        let destination = backup_root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        if relative.as_os_str().is_empty() {
+            bail!("Refusing to delete import service root {}", dir.display());
         }
-        fs::rename(dir, &destination).with_context(|| {
-            format!(
-                "Failed to move stale import directory {} to {}",
-                dir.display(),
-                destination.display()
-            )
+        if !root_dirs.iter().any(|root| dir.starts_with(root)) {
+            root_dirs.push(dir);
+        }
+    }
+
+    for file in stale_files {
+        let relative = file.strip_prefix(service_dir).with_context(|| {
+            format!("Stale import file escaped service root: {}", file.display())
         })?;
+        if relative.as_os_str().is_empty() {
+            bail!("Refusing to delete import service root {}", file.display());
+        }
+    }
+
+    for dir in &root_dirs {
+        if dir.exists() {
+            fs::remove_dir_all(dir).with_context(|| {
+                format!("Failed to delete stale import directory {}", dir.display())
+            })?;
+        }
     }
 
     for file in stale_files {
         if root_dirs.iter().any(|root| file.starts_with(root)) || !file.exists() {
             continue;
         }
-        let relative = file.strip_prefix(service_dir).with_context(|| {
-            format!("Stale import file escaped service root: {}", file.display())
-        })?;
-        let destination = backup_root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        fs::rename(file, &destination).with_context(|| {
-            format!(
-                "Failed to move stale import file {} to {}",
-                file.display(),
-                destination.display()
-            )
-        })?;
+        fs::remove_file(file)
+            .with_context(|| format!("Failed to delete stale import file {}", file.display()))?;
     }
-    Ok(Some(backup_root))
+    Ok(())
 }
 
 fn collect_stale_paths(

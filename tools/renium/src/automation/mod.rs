@@ -235,7 +235,12 @@ impl State {
         {
             return existing.clone();
         }
-        contexts.retain(|_, existing| existing.root != context.root);
+        contexts.retain(|_, existing| {
+            existing.root != context.root
+                || existing.fingerprint == context.fingerprint
+                    && (existing.runtime_id != context.runtime_id
+                        || existing.plugin_build == context.plugin_build)
+        });
         context.id = self.next_context.fetch_add(1, Ordering::Relaxed);
         contexts.insert(context.id, context.clone());
         context

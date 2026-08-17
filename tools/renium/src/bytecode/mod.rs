@@ -1142,7 +1142,7 @@ pub(super) fn bytecode_apply_property_batch(args: BytecodeApplyPropertyBatchArgs
                 *source_path = loaded.root.join(canonical_relative);
             }
         }
-        stage.finish_projection()?;
+        stage.finish_projection(true)?;
         let operations = stage.preview_operations(&loaded.root)?;
         result.changed_paths = operations
             .iter()

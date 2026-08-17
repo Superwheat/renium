@@ -842,6 +842,8 @@ pub(super) struct StudioChangeStateArgs {
     pub(super) stop: bool,
     #[arg(long, value_name = "SEQ")]
     pub(super) ack_seq: Option<u64>,
+    #[arg(long, value_name = "SEQ")]
+    pub(super) ack_runtime_settings_seq: Option<u64>,
     #[arg(long, value_name = "IDS", value_delimiter = ',')]
     pub(super) ack_actions: Vec<String>,
     #[arg(long, value_name = "JSON", default_value = "{}")]

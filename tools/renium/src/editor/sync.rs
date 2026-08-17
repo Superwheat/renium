@@ -102,6 +102,27 @@ impl<'a> EditorTransaction<'a> {
             })
             .collect::<Vec<_>>();
         let has_instance_changes = !changes.instance_changes.is_empty();
+        let mut post_commit_property_changes = changes
+            .property_changes
+            .iter()
+            .filter_map(|change| {
+                (native_import && change.class_name == "Model")
+                    .then(|| change.properties.get("WorldPivot"))
+                    .flatten()
+                    .map(|value| {
+                        let mut change = change.clone();
+                        change.properties.clear();
+                        change
+                            .properties
+                            .insert("WorldPivot".to_string(), value.clone());
+                        change.attributes.clear();
+                        change.deleted_attributes.clear();
+                        change
+                    })
+            })
+            .collect::<Vec<_>>();
+        post_commit_property_changes
+            .sort_by_key(|change| std::cmp::Reverse(change.path_segments.len()));
         let property_changes = changes
             .property_changes
             .iter()
@@ -115,6 +136,7 @@ impl<'a> EditorTransaction<'a> {
                 "hasInstanceChanges": has_instance_changes,
                 "sourceChanges": source_changes,
                 "propertyChanges": property_changes,
+                "postCommitPropertyChanges": post_commit_property_changes,
                 "nativeImport": native_import,
             }),
         )?;
@@ -290,7 +312,9 @@ fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool
     {
         return Ok(false);
     }
-    if config::try_load_project(None, Some(&args.project.project_root))?.is_some() {
+    if let Some(project) = config::try_load_project(None, Some(&args.project.project_root))?
+        && config::project_requires_temporary_stage(&project)?
+    {
         return Ok(false);
     }
     if !args.override_packages && args.project.project_root.join("renium-link.json").exists() {

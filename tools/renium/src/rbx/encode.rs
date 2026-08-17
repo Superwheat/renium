@@ -109,6 +109,12 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         );
 
         for (name, value) in &instance.properties {
+            if class_metadata.model
+                && name == "WorldPivot"
+                && instance.properties.contains_key("PrimaryPart")
+            {
+                continue;
+            }
             let property_metadata = class_metadata
                 .properties
                 .entry(name.clone())

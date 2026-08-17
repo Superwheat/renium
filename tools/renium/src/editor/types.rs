@@ -257,10 +257,11 @@ pub(crate) struct EditorBinaryExportGroup {
     pub(crate) target_path: Vec<String>,
     pub(crate) count: usize,
     pub(crate) instance_count: usize,
+    #[serde(default)]
+    pub(crate) script_count: usize,
     pub(crate) class_names: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_json_object_or_empty_array")]
     pub(crate) root_properties: Map<String, Value>,
-    pub(crate) change_generation: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -296,6 +297,7 @@ pub(crate) struct EditorBinaryRetainedRoot {
     pub(crate) class_name: String,
     pub(crate) payload_index: usize,
     pub(crate) instance_count: usize,
+    pub(crate) payload_omitted: bool,
 }
 
 #[derive(Serialize)]

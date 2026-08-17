@@ -177,18 +177,16 @@ end
 
 function BridgeSettings.loadRuntimeSettings(plugin, prefix)
 	local out = table.clone(RUNTIME_DEFAULTS)
-	local explicit = {}
 	for key in pairs(out) do
 		local stored = plugin:GetSetting(prefix .. key)
 		if stored ~= nil then
 			local normalized = BridgeSettings.normalizeRuntimeSetting(key, stored)
 			if normalized ~= nil then
 				out[key] = normalized
-				explicit[key] = normalized
 			end
 		end
 	end
-	return out, explicit
+	return out
 end
 
 function BridgeSettings.saveRuntimeSetting(plugin, prefix, key, value)

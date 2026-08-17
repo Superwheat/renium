@@ -13,7 +13,9 @@ use serde_json::{Map, Value, json};
 use crate::bytecode::apply_file_mutations;
 use crate::bytecode::edit::validate_settings_model_internal_references;
 use crate::editor::document::read_editor_service_documents;
-use crate::editor::paths::{infer_source_script, run_context_name};
+use crate::editor::paths::{
+    infer_source_script, merge_editor_source_files_into_document, run_context_name,
+};
 use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
 };
@@ -2108,13 +2110,11 @@ fn projection_sources(
         .map(|instance| instance.name.as_str())
         .context("Projected settings have no root")?;
     let service_dir = root.join(service);
-    let paths =
-        crate::editor::paths::build_editor_source_paths_by_index(document, service, &service_dir);
+    let mut reconciled = document.clone();
+    let (_, paths) =
+        merge_editor_source_files_into_document(&mut reconciled, service, &service_dir)?;
     let mut output = HashMap::new();
-    for (index, path) in paths.into_iter().enumerate() {
-        let Some(path) = path else {
-            continue;
-        };
+    for (settings_id, path) in paths {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read projected source {}", path.display()))?;
         let extension = path
@@ -2122,10 +2122,7 @@ fn projection_sources(
             .and_then(OsStr::to_str)
             .unwrap_or("luau")
             .to_string();
-        output.insert(
-            document.instances[index].settings_id.clone(),
-            ReverseSource { text, extension },
-        );
+        output.insert(settings_id, ReverseSource { text, extension });
     }
     Ok(output)
 }

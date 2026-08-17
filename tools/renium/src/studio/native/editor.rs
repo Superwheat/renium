@@ -37,7 +37,8 @@ use crate::rbx::decode::rbx_variant_to_settings_json;
 use crate::rbx::decode::{
     NativeOverlayRequest, conditional_ref_overlay_request, fetch_native_overlay_batches,
     merge_native_overlay_items, native_overlay_property_schemas, native_property_filter,
-    overlay_property_names_value, rbx_properties_to_native_settings_records,
+    overlay_property_names_value, rbx_model_primary_part_is_set,
+    rbx_properties_to_native_settings_records,
 };
 #[cfg(windows)]
 use crate::rbx::encode::collect_rbx_subtree_preorder;
@@ -61,13 +62,18 @@ use crate::roblox::schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
 use crate::snapshot::export::{log_chunk_fetch_metrics, merge_chunk_fetch_metrics};
+use crate::snapshot::import::{
+    fetch_script_sources, merge_script_sources, resolve_source_worker_count,
+};
 use crate::snapshot::types::{
     ExportedSnapshotParts, NativeConditionalOverlayFetch, NativeConditionalOverlayRequest,
     NativeOverlayItem, NativeServiceFetch, NativeServiceFinishDependencies,
     NativeServiceFinishInput, NativeSettingsProperty, NativeSettingsValue, ServiceExecutionSpan,
     ServiceExportOutput, SnapshotInstance,
 };
-use crate::studio::bridge::{BridgeChunk, BridgeServer, ChunkFetchMetrics, MAX_BRIDGE_CHUNK_BYTES};
+use crate::studio::bridge::{
+    BridgeChunk, BridgeServer, ChunkFetchMetrics, DEFAULT_EXPORT_CHUNK_SIZE, MAX_BRIDGE_CHUNK_BYTES,
+};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::system::files::sanitize_name;
 use crate::system::files::{OnDrop, fnv1a_hex};
@@ -114,6 +120,7 @@ pub(crate) fn begin_editor_binary_export(
     bridge: &BridgeServer,
     partitioned: bool,
     service_order: Option<&[String]>,
+    service_filter: Option<&[String]>,
     metadata_only: bool,
 ) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
@@ -123,6 +130,7 @@ pub(crate) fn begin_editor_binary_export(
             "exportId": &export_id,
             "partitioned": partitioned,
             "serviceOrder": service_order,
+            "serviceFilter": service_filter,
             "serializationWorkers": partitioned.then_some(2),
             "metadataOnly": metadata_only,
         }),
@@ -285,7 +293,7 @@ fn observe_native_serialization_complete(
     }
 }
 
-fn receive_editor_binary_export_bytes(
+pub(crate) fn receive_editor_binary_export_bytes(
     bridge: &BridgeServer,
     export_id: &str,
     service: Option<&str>,
@@ -567,7 +575,7 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
 
 #[cfg(windows)]
 fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExport> {
-    let mut export = begin_editor_binary_export(bridge, false, None, false)?;
+    let mut export = begin_editor_binary_export(bridge, false, None, None, false)?;
     let _finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
@@ -649,7 +657,7 @@ fn decode_native_service_dom(
 ) -> Result<NativeServiceDom> {
     let decode_started = Instant::now();
     let mut flat = rbx_binary::Deserializer::new()
-        .elide_defaults(false)
+        .elide_defaults(true)
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
         .with_context(|| {
@@ -728,7 +736,7 @@ fn decode_native_serialization_batch(
     })?;
     let decode_started = Instant::now();
     let flat = match rbx_binary::Deserializer::new()
-        .elide_defaults(false)
+        .elide_defaults(true)
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
     {
@@ -1052,6 +1060,14 @@ fn convert_native_service_output(
             |(index, ((rbx_instance, overlay), debug_id))| -> Result<_> {
                 let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
                 let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
+                let primary_part_is_set = rbx_model_primary_part_is_set(
+                    dependencies.database,
+                    rbx_instance.class.as_str(),
+                    rbx_instance
+                        .properties
+                        .iter()
+                        .map(|(name, value)| (name, value)),
+                );
                 let (mut native_properties, mut properties, mut attributes, source) =
                     rbx_properties_to_native_settings_records(
                         rbx_instance.class.as_str(),
@@ -1118,6 +1134,10 @@ fn convert_native_service_output(
                     properties.extend(overlay_properties);
                     attributes.extend(overlay.attributes);
                 }
+                if primary_part_is_set {
+                    native_properties.retain(|property| property.name != "WorldPivot");
+                    properties.remove("WorldPivot");
+                }
                 Ok((
                     SnapshotInstance {
                         name: rbx_instance.name,
@@ -1167,7 +1187,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
 ) -> Result<EditorBinaryExportFinishGuard<'a>> {
     let export_started_ms = elapsed_ms(run_started);
     let begin_started = Instant::now();
-    let export = begin_editor_binary_export(bridge, true, Some(requested_services), false)?;
+    let export = begin_editor_binary_export(bridge, true, Some(requested_services), None, false)?;
     let finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
@@ -1528,7 +1548,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         let (native, reference_prefetched, reference_request) = native?;
                         let mut overlay = overlay?;
                         let debug_ids = std::mem::take(&mut overlay.debug_ids);
-                        finish_native_service_export(
+                        let mut result = finish_native_service_export(
                             finish_dependencies,
                             group,
                             NativeServiceFinishInput {
@@ -1540,7 +1560,25 @@ pub(crate) fn editor_binary_export_parts<'a>(
                             reference_request,
                             export_started_ms,
                         },
-                        )
+                        )?;
+                        if group.script_count > 0 {
+                            let worker_count = resolve_source_worker_count(
+                                0,
+                                bridge.channel_count(),
+                                group.script_count,
+                                group.instance_count,
+                            );
+                            let sources = fetch_script_sources(
+                                bridge,
+                                &group.service,
+                                DEFAULT_EXPORT_CHUNK_SIZE,
+                                group.script_count,
+                                worker_count,
+                                Some(export_id),
+                            )?;
+                            merge_script_sources(&mut result.output.parts.instances, &sources);
+                        }
+                        Ok(result)
                         });
                         priority_release.run();
                         if sender.send(result).is_err() {
@@ -1964,7 +2002,12 @@ pub(crate) fn write_live_editor_place_snapshot(
             .context("Studio native place snapshot lost a service root")?
             .properties = properties;
     }
-    let total_instances = dom.descendants().count();
+    let mut total_instances = 0;
+    let mut has_package_links = false;
+    for instance in dom.descendants() {
+        total_instances += 1;
+        has_package_links |= instance.class.as_str() == "PackageLink";
+    }
     let build = RbxPlaceBuild {
         dom,
         service_roots,
@@ -1972,6 +2015,7 @@ pub(crate) fn write_live_editor_place_snapshot(
         paths_by_service: HashMap::new(),
         settings_writes: Vec::new(),
         total_instances,
+        has_package_links,
         omitted_properties_by_class: HashMap::new(),
         logical_properties_by_ref: HashMap::new(),
     };
@@ -2354,8 +2398,9 @@ pub(crate) fn send_editor_change_batches(
             .properties
             .iter()
             .filter(|(name, _)| {
-                class_names.is_some_and(|names| names.contains(*name))
-                    || path_names.is_some_and(|names| names.contains(*name))
+                !(change.class_name == "Model" && name.as_str() == "WorldPivot")
+                    && (class_names.is_some_and(|names| names.contains(*name))
+                        || path_names.is_some_and(|names| names.contains(*name)))
             })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Map<_, _>>();

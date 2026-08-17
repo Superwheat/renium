@@ -10,7 +10,31 @@ function BridgeConnection.create(context)
 
 	local host = SettingsModule.loadHost(plugin, context.settingsPrefix, context.defaultHost)
 	local ports = SettingsModule.loadPorts(plugin, context.settingsPrefix, context.defaultPorts)
-	local runtimeSettings, explicitRuntimeSettings = SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
+	local runtimeSettings = context.runtimeSettings
+	if runtimeSettings == nil then
+		runtimeSettings = SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
+	end
+	local pendingRuntimeSettingsKey = context.settingsPrefix .. "pendingRuntimeSettingChanges"
+	local pendingRuntimeSettingChanges = {}
+	local runtimeSettingsSeq = 0
+	do
+		local stored = plugin:GetSetting(pendingRuntimeSettingsKey)
+		if type(stored) == "table" then
+			runtimeSettingsSeq = math.max(0, math.floor(tonumber(stored.seq) or 0))
+			if type(stored.changes) == "table" then
+				for key, entry in pairs(stored.changes) do
+					if type(key) == "string" and type(entry) == "table" then
+						local seq = math.max(0, math.floor(tonumber(entry.seq) or 0))
+						local value = SettingsModule.normalizeRuntimeSetting(key, entry.value)
+						if seq > 0 and value ~= nil then
+							pendingRuntimeSettingChanges[key] = { seq = seq, value = value }
+							runtimeSettingsSeq = math.max(runtimeSettingsSeq, seq)
+						end
+					end
+				end
+			end
+		end
+	end
 	local channels = {}
 	local connectChannel
 	local releaseClient
@@ -61,17 +85,68 @@ function BridgeConnection.create(context)
 		ui.setRuntimeSettingText("diffLinesLimit", runtimeSettings.diffLinesLimit)
 	end
 
-	local function notifyRuntimeSettingsChanged()
+	local function applyRuntimeSettings()
 		Config.bridgeSettings = runtimeSettings
 		context.onRuntimeSettingsChanged(runtimeSettings)
+	end
+
+	local function savePendingRuntimeSettingChanges()
+		if next(pendingRuntimeSettingChanges) == nil then
+			plugin:SetSetting(pendingRuntimeSettingsKey, nil)
+			return
+		end
+		plugin:SetSetting(pendingRuntimeSettingsKey, {
+			seq = runtimeSettingsSeq,
+			changes = pendingRuntimeSettingChanges,
+		})
+	end
+
+	local function queueRuntimeSettingChange(key, value)
+		runtimeSettingsSeq += 1
+		pendingRuntimeSettingChanges[key] = {
+			seq = runtimeSettingsSeq,
+			value = value,
+		}
+		savePendingRuntimeSettingChanges()
+		if Config.studioChanges then
+			Config.studioChanges.signalChange()
+		end
 	end
 
 	function Config.getBridgeSettings()
 		return table.clone(runtimeSettings)
 	end
 
-	function Config.getExplicitBridgeSettings()
-		return table.clone(explicitRuntimeSettings)
+	function Config.getPendingBridgeSettingChanges(): ({ [string]: any }?, number?)
+		local changes = nil
+		local maxSeq = nil
+		for key, entry in pairs(pendingRuntimeSettingChanges) do
+			changes = changes or {}
+			changes[key] = entry.value
+			maxSeq = math.max(maxSeq or 0, entry.seq)
+		end
+		return changes, maxSeq
+	end
+
+	function Config.hasPendingBridgeSettingChanges(): boolean
+		return next(pendingRuntimeSettingChanges) ~= nil
+	end
+
+	function Config.ackPendingBridgeSettingChanges(value)
+		local ackSeq = math.max(0, math.floor(tonumber(value) or 0))
+		if ackSeq == 0 then
+			return
+		end
+		local changed = false
+		for key, entry in pairs(pendingRuntimeSettingChanges) do
+			if entry.seq <= ackSeq then
+				pendingRuntimeSettingChanges[key] = nil
+				changed = true
+			end
+		end
+		if changed then
+			savePendingRuntimeSettingChanges()
+		end
 	end
 
 	function Config.setBridgeSetting(key, value)
@@ -80,9 +155,9 @@ function BridgeConnection.create(context)
 			return nil
 		end
 		runtimeSettings[key] = normalized
-		explicitRuntimeSettings[key] = normalized
 		applyRuntimeSettingsToUi()
-		notifyRuntimeSettingsChanged()
+		applyRuntimeSettings()
+		queueRuntimeSettingChange(key, normalized)
 		if key == "autoConnect" and normalized and not Config.bridgeConnectRequested then
 			Config.connectAll()
 		end
@@ -1028,7 +1103,7 @@ function BridgeConnection.create(context)
 	syncConfigState()
 	ui.hostBox.Text = host
 	ui.portsBox.Text = table.concat(ports, ",")
-	notifyRuntimeSettingsChanged()
+	applyRuntimeSettings()
 	applyRuntimeSettingsToUi()
 
 	ui.panelConnectButton.MouseButton1Click:Connect(function()

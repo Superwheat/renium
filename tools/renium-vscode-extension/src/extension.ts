@@ -3205,6 +3205,7 @@ class RobloxSyncController {
       replaceServices?: boolean;
       clearPending?: boolean;
       ackSeq?: number;
+      ackRuntimeSettingsSeq?: number;
       ackActionIds?: string[];
       runtimeId?: string;
       start?: boolean;
@@ -3217,6 +3218,7 @@ class RobloxSyncController {
     ensureFileExists(command);
     if (
       typeof options.ackSeq === "number"
+      || typeof options.ackRuntimeSettingsSeq === "number"
       || options.ackActionIds?.length
     ) {
       if (typeof options.runtimeId !== "string" || options.runtimeId.length === 0) {
@@ -3247,6 +3249,9 @@ class RobloxSyncController {
         ...(typeof options.ackSeq === "number" && Number.isFinite(options.ackSeq)
           ? { ackSeq: Math.max(0, Math.floor(options.ackSeq)) }
           : {}),
+        ...(typeof options.ackRuntimeSettingsSeq === "number" && Number.isFinite(options.ackRuntimeSettingsSeq)
+          ? { ackRuntimeSettingsSeq: Math.max(0, Math.floor(options.ackRuntimeSettingsSeq)) }
+          : {}),
         ...(options.ackActionIds?.length ? { ackActions: options.ackActionIds.join(",") } : {}),
         ...(typeof options.runtimeId === "string" && options.runtimeId.length > 0
           ? { runtimeId: options.runtimeId }
@@ -3268,13 +3273,21 @@ class RobloxSyncController {
     if (!state) {
       throw new Error("Studio change state did not return a plugin result.");
     }
-    if (state.explicitRuntimeSettings) {
-      this.studioRuntimeSettings = state.explicitRuntimeSettings;
+    if (state.runtimeSettingChanges && Object.keys(state.runtimeSettingChanges).length > 0) {
+      this.studioRuntimeSettings = {
+        ...this.studioRuntimeSettings,
+        ...state.runtimeSettingChanges,
+      };
     }
     const handledActions = await this.handleStudioEditorActions(state.editorActions);
-    if (handledActions.acknowledged.length > 0) {
+    const runtimeSettingsSeq = typeof state.runtimeSettingsSeq === "number"
+      && Number.isFinite(state.runtimeSettingsSeq)
+      ? Math.max(0, Math.floor(state.runtimeSettingsSeq))
+      : undefined;
+    if (handledActions.acknowledged.length > 0 || runtimeSettingsSeq !== undefined) {
       await this.getStudioChangeState(cfg, services, {
         start: false,
+        ackRuntimeSettingsSeq: runtimeSettingsSeq,
         ackActionIds: handledActions.acknowledged,
         runtimeId: state.runtimeId,
       });

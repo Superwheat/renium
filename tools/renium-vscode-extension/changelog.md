@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.1.9 - 2026-08-17
+
+- Preserved non-Archivable instances and current script documents during full Studio pulls without cloning the live DataModel.
+- Kept package roots and cross-service references intact during full pushes while avoiding unnecessary package snapshot work.
+- Reduced full-push time with direct project builds, filtered native exports, and faster retained-package matching.
+- Verified a 95,691-instance pull-to-push round trip with no class, property, attribute, source, or reference differences.
+- Sent only plugin settings edited while disconnected when the matching editor reconnects.
+- Started automatic connections immediately in every Studio state and made the plugin show connection progress without moving its controls.
+- Kept bound automation contexts valid when editor and direct `rbx` commands share one daemon.
+- Improved source projection, duplicate-name mapping, sourcemap generation, model pivot restoration, and native export mutation checks.
+
 ## 0.1.8 - 2026-08-15
 
 - Added one Windows installer that selects x64 or ARM64 automatically and recovers when the wrong platform ZIP was downloaded.
