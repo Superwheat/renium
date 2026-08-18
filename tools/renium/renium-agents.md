@@ -42,6 +42,7 @@ rbx ba Workspace -I editor:parent -n NewPart -c Part
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
 rbx move Workspace -i editor:id -I editor:parent
+rbx move StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
@@ -205,7 +206,7 @@ rbx wally --realms shared --force
 
 Wally sync needs a working `wally` command; Aftman users must declare Wally for the project first. Use `--force` to reinstall and reimport packages that are already current. Add `--details` only when the full changed-path and instance-ID lists are needed.
 
-`bem`/`bim` export and import model trees. `x` exports raw Studio snapshots; `im` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
+`bem`/`bim` export and import model trees. They copy instances; use `move --to-service` to reparent an existing project subtree across services without a temporary model or a separate remove. `x` exports raw Studio snapshots; `im` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
 
 Version control: run `rbx vc-init` once in a project to initialize Git and Renium's ignore, text-diff, and merge rules; rerunning it is safe. `rbx vc-textconv FILE.renium` renders one binary store as deterministic text. Git invokes `rbx vc-merge BASE OURS THEIRS` automatically for a conflicting `.renium` merge. Use normal or path-scoped `git status`; `--untracked-files=all` expands every generated package file.
 

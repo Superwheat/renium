@@ -48,6 +48,7 @@ use crate::editor::types::{
     EditorPropertyFilter,
 };
 use crate::project::package_links::place::place_desync_package_link;
+use crate::project::structural::move_instance_between_service_stores;
 use crate::project::version_control::{
     merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
 };
@@ -716,6 +717,129 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
     assert_eq!(
         package_link.properties.get("PackageId"),
         Some(&json!("rbxassetid://123456789"))
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
+fn cross_service_move_preserves_package_link_sources_and_references() {
+    let project_root = temp_dir("cross-service-move");
+    let src_root = project_root.join("src");
+    let source_dir = src_root.join("StarterGui");
+    let target_dir = src_root.join("ReplicatedStorage");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    let source_file = service_settings_path(&source_dir);
+    let target_file = service_settings_path(&target_dir);
+
+    let mut script = settings_instance("script", "Handler", "LocalScript", Some(1));
+    script.properties.insert(
+        "Adornee".to_string(),
+        json!({"_type":"Ref", "instanceIndex":4}),
+    );
+    let source = settings_document(vec![
+        settings_instance("starter-root", "StarterGui", "StarterGui", None),
+        settings_instance("widget", "Widget", "ScreenGui", Some(0)),
+        script,
+        settings_instance("part", "Target", "Part", Some(1)),
+    ]);
+    source.write_file(&source_file).unwrap();
+    let source_paths = build_editor_source_paths_by_index(&source, "StarterGui", &source_dir);
+    let script_path = source_paths[2].as_ref().unwrap();
+    fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+    fs::write(script_path, "return 1\n").unwrap();
+
+    let mut public = settings_instance("public", "Public", "Folder", Some(0));
+    public.properties.insert(
+        "MovedRef".to_string(),
+        json!({
+            "_type":"Ref",
+            "pathSegments":["StarterGui", "Widget"],
+            "pathOrdinals":[1, 1]
+        }),
+    );
+    settings_document(vec![
+        settings_instance(
+            "replicated-root",
+            "ReplicatedStorage",
+            "ReplicatedStorage",
+            None,
+        ),
+        public,
+        SettingsBytecodeInstance {
+            settings_id: "package-link".to_string(),
+            name: "PackageLink".to_string(),
+            class_name: "PackageLink".to_string(),
+            parent_index: Some(1),
+            properties: Map::from_iter([(
+                "PackageId".to_string(),
+                json!("rbxassetid://123456789"),
+            )]),
+            attributes: Map::new(),
+        },
+        settings_instance("widget", "Existing", "Folder", Some(0)),
+    ])
+    .write_file(&target_file)
+    .unwrap();
+
+    move_instance_between_service_stores(
+        &source_file,
+        "StarterGui",
+        "widget",
+        &target_file,
+        "ReplicatedStorage",
+        "public",
+    )
+    .unwrap();
+
+    assert!(!source_file.exists());
+    let moved = SettingsBytecode::read_file(&target_file).unwrap();
+    let package_link = moved
+        .instances
+        .iter()
+        .find(|instance| instance.class_name == "PackageLink")
+        .unwrap();
+    assert_eq!(package_link.parent_index, Some(1));
+    assert_eq!(
+        package_link.properties.get("PackageId"),
+        Some(&json!("rbxassetid://123456789"))
+    );
+    let widget_index = moved
+        .instances
+        .iter()
+        .position(|instance| instance.name == "Widget")
+        .unwrap();
+    assert_eq!(moved.instances[widget_index].parent_index, Some(1));
+    assert_ne!(moved.instances[widget_index].settings_id, "widget");
+    let moved_ref = moved.instances[1].properties["MovedRef"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        moved_ref.get("instanceIndex"),
+        Some(&json!(widget_index + 1))
+    );
+    let moved_paths = build_editor_source_paths_by_index(&moved, "ReplicatedStorage", &target_dir);
+    let moved_script_index = moved
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == "script")
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(moved_paths[moved_script_index].as_ref().unwrap()).unwrap(),
+        "return 1\n"
+    );
+    let internal_ref = moved.instances[moved_script_index].properties["Adornee"]
+        .as_object()
+        .unwrap();
+    let target_index = moved
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == "part")
+        .unwrap();
+    assert_eq!(
+        internal_ref.get("instanceIndex"),
+        Some(&json!(target_index + 1))
     );
 
     let _ = fs::remove_dir_all(project_root);
