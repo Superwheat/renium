@@ -15,8 +15,10 @@ use serde_json::{Map, Value, json};
 use crate::app::build::{
     GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
 };
-use crate::app::output::emit_global_output;
-use crate::app::timing::{elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
+use crate::app::output::{emit_global_output, log_global};
+use crate::app::timing::{
+    elapsed_ms, log_timing, log_timing_ms, set_quiet_timings, verbose_timing_logs,
+};
 use crate::bytecode::acquire_settings_file_lock;
 use crate::cli::args::{ImportServiceArgs, ImportSnapshotsArgs};
 use crate::editor::paths::{project_script_file_names, script_file_names};
@@ -625,6 +627,7 @@ pub(crate) fn import_service_state_with_sourcemap(
 }
 
 pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
+    set_quiet_timings(true);
     let snapshot_dir = args.snapshot_dir.clone();
     let services = args.services.clone();
     let changed_paths = import_snapshots_inner(args, true)?;
@@ -684,26 +687,29 @@ fn import_snapshots_inner(
     let before = collect_publish_hashes(&project_root, &tracked_paths)?;
 
     let thread_count = resolve_thread_count(args.threads, services.len());
-    println!(
-        "[renium] import-snapshots start: version={}, git={}, build_ts={}, protocol={}, services={}, threads={}",
-        BUILD_VERSION,
-        BUILD_GIT_HASH,
-        BUILD_TIMESTAMP_UNIX,
-        BRIDGE_PROTOCOL_VERSION,
-        services.len(),
-        thread_count
+    log_global(
+        4,
+        format_args!(
+            "[renium] import-snapshots start: version={}, git={}, build_ts={}, protocol={}, services={}, threads={}",
+            BUILD_VERSION,
+            BUILD_GIT_HASH,
+            BUILD_TIMESTAMP_UNIX,
+            BRIDGE_PROTOCOL_VERSION,
+            services.len(),
+            thread_count
+        ),
     );
     let mut sourcemap_nodes: HashMap<String, SourcemapNode> = HashMap::new();
 
     if thread_count <= 1 || services.len() <= 1 {
         for service in &services {
-            println!("[renium] {service}: loading snapshot");
+            log_global(4, format_args!("[renium] {service}: loading snapshot"));
             let state = load_service_state(&snapshot_dir, service)?;
-            println!("[renium] {service}: writing src tree");
+            log_global(4, format_args!("[renium] {service}: writing src tree"));
             let node =
                 import_service_state_with_sourcemap(&state, &project_root, &src_root, service)?;
             sourcemap_nodes.insert(service.clone(), node);
-            println!("[renium] {service}: done");
+            log_global(4, format_args!("[renium] {service}: done"));
         }
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -713,16 +719,16 @@ fn import_snapshots_inner(
         let shared_nodes = Mutex::new(HashMap::<String, SourcemapNode>::new());
         pool.install(|| -> Result<()> {
             services.par_iter().try_for_each(|service| -> Result<()> {
-                println!("[renium] {service}: loading snapshot");
+                log_global(4, format_args!("[renium] {service}: loading snapshot"));
                 let state = load_service_state(&snapshot_dir, service)?;
-                println!("[renium] {service}: writing src tree");
+                log_global(4, format_args!("[renium] {service}: writing src tree"));
                 let node =
                     import_service_state_with_sourcemap(&state, &project_root, &src_root, service)?;
                 {
                     let mut nodes = shared_nodes.lock().unwrap_or_else(PoisonError::into_inner);
                     nodes.insert(service.clone(), node);
                 }
-                println!("[renium] {service}: done");
+                log_global(4, format_args!("[renium] {service}: done"));
                 Ok(())
             })
         })?;
@@ -734,7 +740,7 @@ fn import_snapshots_inner(
 
     finish_import_sourcemap(&project_root, sourcemap_nodes, args.no_project_write)?;
 
-    println!("[renium] import-snapshots done");
+    log_global(4, format_args!("[renium] import-snapshots done"));
     let after = collect_publish_hashes(&project_root, &tracked_paths)?;
     Ok(publish_operation_paths(&before, &after)
         .into_iter()

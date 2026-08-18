@@ -37,6 +37,23 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
 
+  quality:
+    name: Rust format and lints
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Check Rust quality
+        run: |
+          cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings
+
   cli:
     name: CLI (${{ matrix.os }})
     needs: verify-tag
@@ -52,15 +69,11 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy,rustfmt
 
       - name: Test and build
         shell: pwsh
         run: |
           $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
-          cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
-          cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
 
@@ -122,7 +135,7 @@ jobs:
 
   integration:
     name: Plugin and extension
-    needs: verify-tag
+    needs: [verify-tag, cli]
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -145,10 +158,24 @@ jobs:
           cache: npm
           cache-dependency-path: tools/renium-vscode-extension/package-lock.json
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-Windows-X64
+          path: cli-artifact
+
       - name: Build release components
         run: |
+          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *.zip | Select-Object -First 1
+          if ($null -eq $archive) { throw "Windows x64 CLI artifact is missing" }
+          $cliStage = Join-Path $env:RUNNER_TEMP "renium-integration-cli"
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $cliStage
+          $cli = Get-ChildItem $cliStage -Recurse -File -Filter renium.exe | Select-Object -First 1
+          if ($null -eq $cli) { throw "Windows x64 CLI binary is missing" }
           $output = Join-Path $env:RUNNER_TEMP "release-output"
-          ./tools/build-release.ps1 -OutputDirectory $output -AllowLocalPublisher
+          ./tools/build-release.ps1 `
+            -OutputDirectory $output `
+            -AllowLocalPublisher `
+            -PrebuiltCli $cli.FullName
           $release = Join-Path $output "renium-${{ needs.verify-tag.outputs.version }}"
           if (-not (Test-Path $release -PathType Container)) { throw "Release directory was not produced" }
           $shared = Join-Path $env:RUNNER_TEMP "renium-shared"
@@ -265,7 +292,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: [verify-tag, cli, integration, extension]
+    needs: [verify-tag, quality, cli, integration, extension]
     runs-on: ubuntu-latest
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}

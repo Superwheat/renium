@@ -364,7 +364,10 @@ impl BridgeServer {
             listener.set_nonblocking(true).with_context(|| {
                 format!("Failed to set nonblocking listener {bind_host}:{port}")
             })?;
-            println!("[renium] bridge listening on {bind_host}:{port}");
+            crate::app::output::log_global(
+                4,
+                format_args!("[renium] bridge listening on {bind_host}:{port}"),
+            );
 
             let channel = Arc::new(BridgeChannel {
                 port: *port,
@@ -407,8 +410,11 @@ impl BridgeServer {
                 let ready_channels = server.max_runtime_channel_coverage(BridgeTarget::Main, None);
                 if ready_channels != last_ready_channels {
                     last_ready_channels = ready_channels;
-                    println!(
-                        "[renium] bridge ready channels: {ready_channels}/{required_channels}"
+                    crate::app::output::log_global(
+                        4,
+                        format_args!(
+                            "[renium] bridge ready channels: {ready_channels}/{required_channels}"
+                        ),
                     );
                 }
                 if ready_channels >= required_channels {
@@ -430,10 +436,18 @@ impl BridgeServer {
                 );
             }
 
-            println!("[renium] bridge all channels ready: {ready_channels}/{required_channels}");
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] bridge all channels ready: {ready_channels}/{required_channels}"
+                ),
+            );
         } else {
-            println!(
-                "[renium] bridge serving on {required_channels} port(s); waiting for plugin clients on demand"
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] bridge serving on {required_channels} port(s); waiting for plugin clients on demand"
+                ),
             );
         }
         Ok((
@@ -487,13 +501,16 @@ impl BridgeServer {
                                 let socket_key =
                                     Self::bridge_socket_key(&guard, &role, &socket.peer);
                                 if socket_key == role {
-                                    println!(
-                                        "[renium] bridge channel ready on {}:{} role={} from {} build={}",
-                                        bind_host,
-                                        port,
-                                        socket.role,
-                                        socket.peer,
-                                        socket.bridge_info.bridge_build_unix
+                                    crate::app::output::log_global(
+                                        4,
+                                        format_args!(
+                                            "[renium] bridge channel ready on {}:{} role={} from {} build={}",
+                                            bind_host,
+                                            port,
+                                            socket.role,
+                                            socket.peer,
+                                            socket.bridge_info.bridge_build_unix
+                                        ),
                                     );
                                 }
                                 guard.insert(socket_key, socket);
@@ -1776,6 +1793,16 @@ impl BridgeServer {
                         ports: vec![socket.port],
                     }),
                 }
+            }
+        }
+        let edit_place_names = entries
+            .iter()
+            .filter(|entry| entry.role == BRIDGE_ROLE_EDIT && !entry.place_name.is_empty())
+            .map(|entry| (entry.runtime_id.clone(), entry.place_name.clone()))
+            .collect::<HashMap<_, _>>();
+        for entry in &mut entries {
+            if let Some(place_name) = edit_place_names.get(&entry.launch_edit_runtime_id) {
+                entry.place_name.clone_from(place_name);
             }
         }
         entries.sort_by(|a, b| {

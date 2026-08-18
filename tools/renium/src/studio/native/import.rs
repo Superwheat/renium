@@ -83,9 +83,6 @@ fn pending_editor_binary_groups(
                 children.push(referent);
             }
         }
-        if service == "Workspace" {
-            children.reverse();
-        }
         groups.push(PendingEditorBinaryGroup {
             service: service.clone(),
             target_path: vec![service.clone()],
@@ -1693,18 +1690,23 @@ fn build_editor_binary_import_for_services(
             let mut subtree = Vec::new();
             collect_rbx_subtree_preorder(&build.dom, *referent, &mut subtree);
             instance_count += subtree.len();
+            let payload_name = format!("__ReniumImportRoot_{}", index + 1);
             if omitted_payloads.contains(&(index + 1)) {
                 let instance = build
                     .dom
                     .get_by_ref(*referent)
                     .context("Retained package payload root is missing")?;
                 let class_name = instance.class;
-                let name = instance.name.clone();
                 build.dom.insert(
                     payload_root_ref,
-                    RbxInstanceBuilder::new(class_name).with_name(name),
+                    RbxInstanceBuilder::new(class_name).with_name(payload_name),
                 );
             } else {
+                build
+                    .dom
+                    .get_by_ref_mut(*referent)
+                    .context("Native import payload root is missing")?
+                    .name = payload_name;
                 build.dom.transfer_within(*referent, payload_root_ref);
             }
         }

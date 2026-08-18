@@ -134,6 +134,45 @@ fn normalize_bind(mut payload: Value) -> Result<Value> {
     Ok(payload)
 }
 
+fn direct_place_add(args: &[String]) -> Result<Value> {
+    if args.len() < 2 {
+        bail!(
+            "Expected: rbx a place-add CX PLACE_ID NAME [--game-id ID] [--alias NAME] [--root PATH]"
+        );
+    }
+    let place_id = args[0]
+        .parse::<i64>()
+        .context("PLACE_ID must be an integer for place-add")?;
+    let mut payload = json!({ "placeId": place_id, "name": args[1] });
+    let object = payload.as_object_mut().context("place-add payload")?;
+    let mut index = 2;
+    while index < args.len() {
+        let (key, integer) = match args[index].as_str() {
+            "--game" | "--game-id" => ("gameId", true),
+            "--alias" => ("alias", false),
+            "--root" => ("root", false),
+            _ => bail!("Unknown place-add option {}", args[index]),
+        };
+        let value = args
+            .get(index + 1)
+            .with_context(|| format!("Expected a value after {} for place-add", args[index]))?;
+        object.insert(
+            key.to_string(),
+            if integer {
+                json!(
+                    value
+                        .parse::<i64>()
+                        .context("GAME_ID must be an integer for place-add")?
+                )
+            } else {
+                Value::String(value.clone())
+            },
+        );
+        index += 2;
+    }
+    Ok(payload)
+}
+
 fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<u64>, Value)> {
     if operation.id == op::CAP {
         if !args.is_empty() {
@@ -151,16 +190,33 @@ fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<
             }
             return Ok((None, normalize_bind(read_json(&args[1])?)?));
         }
-        if args.len() > 2 {
-            bail!("Expected: rbx a bind [project] [place]");
+        let bootstrap = args.iter().any(|value| value == "--bootstrap");
+        let positional = args
+            .iter()
+            .filter(|value| value.as_str() != "--bootstrap")
+            .collect::<Vec<_>>();
+        if positional.len() > 2 {
+            bail!("Expected: rbx a bind [project] [place] [--bootstrap]");
         }
         return Ok((
             None,
             normalize_bind(json!({
-                "root": args.first().map_or(".", String::as_str),
-                "place": args.get(1),
+                "root": positional.first().map_or(".", |value| value.as_str()),
+                "place": positional.get(1),
+                "bootstrap": bootstrap,
             }))?,
         ));
+    }
+    if operation.id == op::STUDIOS {
+        let payload = match args {
+            [] => json!({}),
+            [flag, source] if flag == "-J" || flag == "--json-file" => read_json(source)?,
+            _ => bail!("Expected: rbx a studios [-J FILE]"),
+        };
+        if !payload.is_object() {
+            bail!("studios payload must be a JSON object");
+        }
+        return Ok((None, payload));
     }
     let cx = args
         .first()
@@ -177,6 +233,46 @@ fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<
                 json!({})
             },
         ));
+    }
+    if operation.id == op::PLACE_ADD
+        && remaining
+            .first()
+            .is_some_and(|value| value != "-J" && value != "--json-file")
+    {
+        return Ok((Some(cx), direct_place_add(remaining)?));
+    }
+    if operation.id == op::PLACE_RENAME
+        && remaining
+            .first()
+            .is_some_and(|value| value != "-J" && value != "--json-file")
+    {
+        let [place_id, alias] = remaining else {
+            bail!("Expected: rbx a place-rename CX PLACE_ID ALIAS");
+        };
+        return Ok((
+            Some(cx),
+            json!({
+                "placeId": place_id
+                    .parse::<i64>()
+                    .context("PLACE_ID must be an integer for place-rename")?,
+                "alias": alias,
+            }),
+        ));
+    }
+    if operation.id == op::PLACE_REORDER
+        && remaining
+            .first()
+            .is_some_and(|value| value != "-J" && value != "--json-file")
+    {
+        let order = remaining
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .context("PLACE_ID must be an integer for place-reorder")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((Some(cx), json!({ "order": order })));
     }
     let (service, source) = match remaining {
         [flag, source] if flag == "-J" || flag == "--json-file" => (None, source),
@@ -209,6 +305,12 @@ fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<
 }
 
 pub(crate) fn send_request(request: &super::Request) -> Result<super::Response> {
+    if let Some(response) = try_send_request(request)? {
+        return Ok(response);
+    }
+    if request.op == op::BIND {
+        crate::daemon::start_shared_daemon("8781,8782", 1.0);
+    }
     try_send_request(request)?.context("Renium daemon is not running")
 }
 

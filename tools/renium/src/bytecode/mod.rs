@@ -41,15 +41,21 @@ use crate::project::commands::load_structural_project;
 use crate::project::config;
 use crate::project::layout::configured_project_layout;
 use crate::project::package_links::{LinkEnforcement, build_loaded_project_link_enforcement};
-use crate::rbx::model::canonicalize_settings_reference_documents;
+use crate::rbx::decode::rbx_variant_to_settings_json;
+use crate::rbx::encode::{rbx_model_property_descriptor, rbx_property_descriptor};
+use crate::rbx::model::{
+    BytecodeModelImportRefs, canonicalize_settings_reference_documents,
+    source_structure_settings_document,
+};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+    stabilize_reference_objects,
 };
 use crate::settings::instance::{self as instance_api, InstanceQuery, PropertyScope};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::snapshot::export::ExportProjectStage;
 use crate::system::files::{
-    absolutize_under, case_folded_path_key, exact_path_key, read_file_if_present,
+    absolutize_under, canonical_path, case_folded_path_key, exact_path_key, read_file_if_present,
     service_settings_path, set_path_readonly, validate_filesystem_instance_name,
     write_bytes_if_changed, write_utf8_file,
 };
@@ -157,6 +163,31 @@ fn parse_cli_source_text(value_json: Option<&str>, value_str: Option<&str>) -> R
     Ok(value_str.unwrap_or_default().to_string())
 }
 
+fn validate_auto_property_name(
+    document: &SettingsBytecode,
+    index: usize,
+    property: &str,
+    scope: PropertyScope,
+) -> Result<()> {
+    if scope != PropertyScope::Auto
+        || matches!(property, "Name" | "Parent")
+        || document.instances[index].properties.contains_key(property)
+        || document.instances[index].attributes.contains_key(property)
+    {
+        return Ok(());
+    }
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let class_name = document.instances[index].class_name.as_str();
+    if rbx_model_property_descriptor(database, class_name, property).is_some()
+        || rbx_property_descriptor(database, class_name, property).is_some()
+    {
+        return Ok(());
+    }
+    bail!(
+        "Property {property:?} does not exist on {class_name}; use --scope property only for an unlisted Roblox property"
+    )
+}
+
 struct HighLevelBytecodeContext {
     service: String,
     settings_file: PathBuf,
@@ -164,7 +195,9 @@ struct HighLevelBytecodeContext {
     children_by_parent: Vec<Vec<usize>>,
     path_segments_by_index: Vec<Option<Vec<String>>>,
     path_ordinals_by_index: Vec<Option<Vec<usize>>>,
+    canonical_settings_ids_by_index: Vec<Option<String>>,
     source_paths_by_index: Vec<Option<PathBuf>>,
+    _projection: Option<config::ProjectionStage>,
 }
 
 impl HighLevelBytecodeContext {
@@ -178,6 +211,7 @@ impl HighLevelBytecodeContext {
             children_by_parent: &self.children_by_parent,
             path_segments_by_index: &self.path_segments_by_index,
             path_ordinals_by_index: &self.path_ordinals_by_index,
+            canonical_settings_ids_by_index: &self.canonical_settings_ids_by_index,
             source_paths_by_index: &self.source_paths_by_index,
             mode,
             fields,
@@ -193,19 +227,61 @@ fn high_level_context(
     validate_filesystem_instance_name(service, "service")?;
     let (project_root, src_root) = configured_project_layout(project_root, src_root)?;
     let src_root = absolutize_under(&project_root, &src_root);
-    let service_dir = src_root.join(service);
-    let settings_file = service_settings_path(&service_dir);
-    if !settings_file.exists() {
+    let canonical_service_dir = src_root.join(service);
+    let settings_file = service_settings_path(&canonical_service_dir);
+    let loaded = config::try_load_project(None, Some(&project_root))?
+        .filter(|loaded| absolutize_under(&loaded.root, &loaded.project.source_root) == src_root);
+    let projection = loaded.as_ref().map(config::stage_project).transpose()?;
+    let service_dir = projection
+        .as_ref()
+        .map_or(canonical_service_dir, |stage| stage.root().join(service));
+    let projected_settings = service_settings_path(&service_dir);
+    let document = if projected_settings.exists() {
+        SettingsBytecode::read_file(&projected_settings)
+            .with_context(|| format!("Failed to read {}", projected_settings.display()))?
+    } else if let Some(loaded) = loaded.as_ref()
+        && service_dir.is_dir()
+    {
+        source_structure_settings_document(
+            &service_dir,
+            service,
+            &config::project_script_naming(&loaded.project),
+            &[],
+        )?
+    } else {
         return Err(missing_service_store_error(&settings_file));
-    }
-
-    let document = SettingsBytecode::read_file(&settings_file)
-        .with_context(|| format!("Failed to read {}", settings_file.display()))?;
+    };
     let children_by_parent = settings_children_by_parent(&document);
     let (path_segments_by_index, path_ordinals_by_index) =
         build_editor_instance_path_parts(&document, service);
-    let source_paths_by_index =
+    let canonical_settings_ids_by_index = document
+        .instances
+        .iter()
+        .map(|instance| {
+            projection
+                .as_ref()
+                .and_then(|stage| stage.canonical_identity(&instance.settings_id))
+                .map_or_else(
+                    || Some(instance.settings_id.clone()),
+                    |(_, settings_id)| Some(settings_id.to_string()),
+                )
+        })
+        .collect();
+    let mut source_paths_by_index =
         build_editor_source_paths_by_index(&document, service, &service_dir);
+    if let (Some(loaded), Some(projection)) = (loaded.as_ref(), projection.as_ref()) {
+        for source in &mut source_paths_by_index {
+            let Some(path) = source.as_ref() else {
+                continue;
+            };
+            let Ok(relative) = path.strip_prefix(projection.root()) else {
+                *source = None;
+                continue;
+            };
+            *source = config::staged_path_to_project_source(loaded, relative)?
+                .map(|path| canonical_path(&path).unwrap_or(path));
+        }
+    }
 
     Ok(HighLevelBytecodeContext {
         service: service.to_string(),
@@ -214,8 +290,39 @@ fn high_level_context(
         children_by_parent,
         path_segments_by_index,
         path_ordinals_by_index,
+        canonical_settings_ids_by_index,
         source_paths_by_index,
+        _projection: projection,
     })
+}
+
+pub(crate) fn stabilize_reference_output(
+    document: &SettingsBytecode,
+    path_segments_by_index: &[Option<Vec<String>>],
+    path_ordinals_by_index: &[Option<Vec<usize>>],
+    canonical_settings_ids_by_index: &[Option<String>],
+    record: &mut Map<String, Value>,
+) {
+    stabilize_reference_objects(record, |object, index| {
+        let Some(instance) = document.instances.get(index) else {
+            return;
+        };
+        let settings_id = canonical_settings_ids_by_index
+            .get(index)
+            .and_then(Option::as_deref)
+            .unwrap_or(&instance.settings_id);
+        object.insert(
+            "settingsId".to_string(),
+            Value::String(settings_id.to_string()),
+        );
+        if let (Some(Some(path_segments)), Some(Some(path_ordinals))) = (
+            path_segments_by_index.get(index),
+            path_ordinals_by_index.get(index),
+        ) {
+            object.insert("pathSegments".to_string(), json!(path_segments));
+            object.insert("pathOrdinals".to_string(), json!(path_ordinals));
+        }
+    });
 }
 
 fn high_level_service_and_value(
@@ -939,31 +1046,109 @@ pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
 }
 
 pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()> {
-    let (settings_file, document, service) = resolve_bytecode_read_input(
+    let projected_service = project_service_input(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
+        None,
+    );
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
         None,
     )?;
+    let direct = read_bytecode_document_if_present(&settings_file, &service_hint)?;
+    let use_project = projected_service.is_some()
+        && direct.as_ref().is_none_or(|(document, service)| {
+            resolve_bytecode_selector(document, service, &args.selector, "No matching instance")
+                .is_err()
+        });
+    let (document, service, source_paths, canonical_settings_ids) = if use_project {
+        let service = projected_service.context("Project service is missing")?;
+        let context = high_level_context(Path::new("."), Path::new("src"), service)?;
+        (
+            context.document,
+            context.service,
+            Some(context.source_paths_by_index),
+            Some(context.canonical_settings_ids_by_index),
+        )
+    } else {
+        let (document, service) =
+            direct.ok_or_else(|| missing_service_store_error(&settings_file))?;
+        (document, service, None, None)
+    };
     let scope = parse_property_scope(&args.scope)?;
     let index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
             .index;
-    if let Some(value) =
-        instance_api::get_instance_property(&document, index, &args.property, scope)
-    {
-        return print_json_output(&value, args.pretty);
-    }
     if args.property.eq_ignore_ascii_case("source")
         && is_lua_source_class(&document.instances[index].class_name)
     {
-        let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
-        let source_paths = build_editor_source_paths_by_index(&document, &service, service_dir);
+        let direct_source_paths;
+        let source_paths = if let Some(source_paths) = source_paths.as_ref() {
+            source_paths
+        } else {
+            let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+            direct_source_paths =
+                build_editor_source_paths_by_index(&document, &service, service_dir);
+            &direct_source_paths
+        };
         if let Some(Some(path)) = source_paths.get(index)
             && path.exists()
         {
             let source = fs::read_to_string(path)
                 .with_context(|| format!("Failed to read source mirror {}", path.display()))?;
             return print_json_output(&json!(source), args.pretty);
+        }
+    }
+    if let Some(value) =
+        instance_api::get_instance_property(&document, index, &args.property, scope)
+    {
+        let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
+        let fallback_settings_ids;
+        let canonical_settings_ids = if let Some(settings_ids) = canonical_settings_ids.as_ref() {
+            settings_ids
+        } else {
+            fallback_settings_ids = document
+                .instances
+                .iter()
+                .map(|instance| Some(instance.settings_id.clone()))
+                .collect::<Vec<_>>();
+            &fallback_settings_ids
+        };
+        let mut record = Map::from_iter([("value".to_string(), value)]);
+        stabilize_reference_output(
+            &document,
+            &path_segments,
+            &path_ordinals,
+            canonical_settings_ids,
+            &mut record,
+        );
+        let value = record
+            .remove("value")
+            .context("Property output is missing")?;
+        return print_json_output(&value, args.pretty);
+    }
+    if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
+        && !args.property.eq_ignore_ascii_case("source")
+    {
+        let database =
+            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+        let class_name = document.instances[index].class_name.as_str();
+        if let Some(default) = database
+            .classes
+            .get(class_name)
+            .and_then(|class| database.find_default_property(class, &args.property))
+        {
+            let descriptor = rbx_model_property_descriptor(database, class_name, &args.property)
+                .or_else(|| rbx_property_descriptor(database, class_name, &args.property));
+            if let Some(value) = rbx_variant_to_settings_json(
+                default,
+                descriptor,
+                database,
+                &BytecodeModelImportRefs::default(),
+            ) {
+                return print_json_output(&value, args.pretty);
+            }
         }
     }
     bail!("Property not found: {}", args.property)
@@ -1014,6 +1199,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         args.value_null,
     )?;
     let index = resolved.index;
+    validate_auto_property_name(&document, index, &args.property, scope)?;
     if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
         && matches!(args.property.as_str(), "ClassName" | "Parent")
         && is_protected_starter_player_container(&document, index)
@@ -1021,6 +1207,27 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         bail!("{} metadata is read-only", document.instances[index].name);
     }
     let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+    if args.property.eq_ignore_ascii_case("source")
+        && matches!(scope, PropertyScope::Auto | PropertyScope::Property)
+    {
+        let source = value.as_str().context("Source must be a string")?;
+        let (source_path, changed) =
+            write_bytecode_source_file(&settings_file, &document, &service, index, source)?;
+        let changed_paths = changed
+            .then(|| source_path.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        return print_json_output(
+            &json!({
+                "ok": true,
+                "settingsFile": settings_file,
+                "property": args.property,
+                "sourcePath": source_path,
+                "changedPaths": changed_paths,
+            }),
+            args.pretty,
+        );
+    }
     let affects_source_path = property_affects_source_path(scope, &args.property);
     let before_document = affects_source_path.then(|| document.clone());
     let source_paths_before = before_document
@@ -1069,15 +1276,24 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             );
         }
     }
+    let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "property": args.property,
-        }),
-        args.pretty,
-    )
+    let mut result = json!({
+        "ok": true,
+        "settingsFile": settings_file,
+        "property": args.property,
+        "changedPaths": changed_paths,
+    });
+    if structural_reference_update {
+        let instance = &document.instances[index];
+        let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
+        result["settingsId"] = json!(instance.settings_id);
+        result["name"] = json!(instance.name);
+        result["className"] = json!(instance.class_name);
+        result["pathSegments"] = json!(path_segments.get(index).and_then(Clone::clone));
+        result["pathOrdinals"] = json!(path_ordinals.get(index).and_then(Clone::clone));
+    }
+    print_json_output(&result, args.pretty)
 }
 
 pub(super) fn bytecode_apply_property_batch(args: BytecodeApplyPropertyBatchArgs) -> Result<()> {
@@ -1696,9 +1912,35 @@ pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
         args.input.service_or_file.as_deref(),
         args.service.as_deref(),
     )?;
-    let _lock = lock_existing_service_store(&settings_file)?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
-    let inferred_service = bytecode_service_name(&document, &settings_file, &service_hint);
+    let project_service = project_service_input(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
+        args.service.as_deref(),
+    );
+    let _lock = settings_file
+        .exists()
+        .then(|| lock_existing_service_store(&settings_file))
+        .transpose()?;
+    let direct = read_bytecode_document_if_present(&settings_file, &service_hint)?;
+    let use_project = project_service.is_some()
+        && direct.as_ref().is_none_or(|(document, service)| {
+            resolve_bytecode_selector(document, service, &args.selector, "No matching instance")
+                .is_err()
+        });
+    let (document, inferred_service, source_paths, path_segments) = if use_project {
+        let service = project_service.context("Project service is missing")?;
+        let context = high_level_context(Path::new("."), Path::new("src"), service)?;
+        (
+            context.document,
+            context.service,
+            Some(context.source_paths_by_index),
+            Some(context.path_segments_by_index),
+        )
+    } else {
+        let (document, service) =
+            direct.ok_or_else(|| missing_service_store_error(&settings_file))?;
+        (document, service, None, None)
+    };
     let resolved = resolve_bytecode_selector(
         &document,
         &inferred_service,
@@ -1706,14 +1948,6 @@ pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
         "No matching instance",
     )?;
     let index = resolved.index;
-
-    let instance = document
-        .instances
-        .get(index)
-        .ok_or_else(|| anyhow::anyhow!("Invalid instance index {index}"))?;
-    if script_file_names(&instance.class_name).is_none() {
-        bail!("{} is not a Lua source container", instance.class_name);
-    }
 
     let source = match &args.source_file {
         Some(path) => {
@@ -1734,27 +1968,108 @@ pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
     } else {
         inferred_service
     };
+    let (source_path, changed) = if let Some(source_paths) = source_paths {
+        let path_segments = path_segments
+            .as_ref()
+            .and_then(|paths| paths.get(index))
+            .and_then(Option::as_ref)
+            .context("Could not resolve projected instance path")?;
+        if let Some(loaded) = config::try_load_project(None, Some(Path::new(".")))? {
+            config::resolve_project_write_segments(&loaded, path_segments)?;
+        }
+        let source_path = source_paths
+            .get(index)
+            .and_then(Option::as_ref)
+            .context("Could not resolve projected source file path")?;
+        let changed = file_contents_differ(source_path, source.as_bytes())?;
+        write_utf8_file(source_path, &source)?;
+        (source_path.clone(), changed)
+    } else {
+        write_bytecode_source_file(&settings_file, &document, &service, index, &source)?
+    };
+    let instance = &document.instances[index];
+    let mut result = Map::from_iter([
+        ("ok".to_string(), Value::Bool(true)),
+        ("sourcePath".to_string(), json!(&source_path)),
+        ("service".to_string(), Value::String(service)),
+        (
+            "settingsId".to_string(),
+            Value::String(instance.settings_id.clone()),
+        ),
+        (
+            "changedPaths".to_string(),
+            Value::Array(changed.then(|| json!(&source_path)).into_iter().collect()),
+        ),
+    ]);
+    if settings_file.exists() {
+        result.insert("settingsFile".to_string(), json!(settings_file));
+    }
+    print_json_output(&Value::Object(result), args.pretty)
+}
+
+fn read_bytecode_document_if_present(
+    settings_file: &Path,
+    service_hint: &str,
+) -> Result<Option<(SettingsBytecode, String)>> {
+    if !settings_file.exists() {
+        return Ok(None);
+    }
+    let document = SettingsBytecode::read_file(settings_file)
+        .with_context(|| format!("Failed to read {}", settings_file.display()))?;
+    let service = bytecode_service_name(&document, settings_file, service_hint);
+    Ok(Some((document, service)))
+}
+
+fn project_service_input<'a>(
+    settings_file: Option<&Path>,
+    service_or_file: Option<&'a str>,
+    explicit_service: Option<&'a str>,
+) -> Option<&'a str> {
+    if settings_file.is_some()
+        || service_or_file.is_some_and(bytecode_input_looks_like_settings_file)
+    {
+        return None;
+    }
+    explicit_service
+        .or(service_or_file)
+        .map(str::trim)
+        .filter(|service| !service.is_empty())
+}
+
+fn write_bytecode_source_file(
+    settings_file: &Path,
+    document: &SettingsBytecode,
+    service: &str,
+    index: usize,
+    source: &str,
+) -> Result<(PathBuf, bool)> {
+    let instance = document
+        .instances
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("Invalid instance index {index}"))?;
+    if script_file_names(&instance.class_name).is_none() {
+        bail!("{} is not a Lua source container", instance.class_name);
+    }
     let service_dir = settings_file
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Settings file has no parent directory"))?;
-    let source_paths = build_editor_source_paths_by_index(&document, &service, service_dir);
-    let source_path = source_paths
+    let source_path = build_editor_source_paths_by_index(document, service, service_dir)
         .get(index)
-        .and_then(std::clone::Clone::clone)
+        .and_then(Clone::clone)
         .ok_or_else(|| {
             anyhow::anyhow!("Could not resolve source file path for {}", instance.name)
         })?;
-    write_utf8_file(&source_path, &source)?;
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "sourcePath": source_path,
-            "service": service,
-            "settingsId": instance.settings_id,
-        }),
-        args.pretty,
-    )
+    let changed = file_contents_differ(&source_path, source.as_bytes())?;
+    write_utf8_file(&source_path, source)?;
+    Ok((source_path, changed))
+}
+
+fn file_contents_differ(path: &Path, expected: &[u8]) -> Result<bool> {
+    match fs::read(path) {
+        Ok(current) => Ok(current != expected),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
 }
 
 fn collect_source_path_moves(
@@ -1907,7 +2222,22 @@ pub(super) fn file_mutation_paths(
     writes: &BTreeMap<PathBuf, Vec<u8>>,
     removals: &[PathBuf],
 ) -> Vec<PathBuf> {
-    writes.keys().chain(removals).cloned().collect()
+    let mut changed = BTreeSet::new();
+    for (path, bytes) in writes {
+        let case_move = removals.iter().any(|from| {
+            exact_path_key(from) != exact_path_key(path)
+                && case_folded_path_key(from) == case_folded_path_key(path)
+        });
+        if case_move || fs::read(path).map_or(true, |current| current != *bytes) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in removals {
+        if path.is_file() {
+            changed.insert(path.clone());
+        }
+    }
+    changed.into_iter().collect()
 }
 
 pub(super) fn apply_file_mutations_with_permissions(

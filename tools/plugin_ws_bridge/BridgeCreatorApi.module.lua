@@ -243,7 +243,17 @@ function BridgeCreatorApi.create()
 				instance = Instance.new("Animation")
 				instance.AnimationId = "rbxassetid://" .. assetId
 			else
-				instance = game:GetService("AssetService"):LoadAssetAsync(assetId)
+				local objects = game:GetObjects("rbxassetid://" .. assetId)
+				if #objects == 0 then
+					error("Roblox returned no instances for the asset")
+				elseif #objects == 1 then
+					instance = objects[1]
+				else
+					instance = Instance.new("Model")
+					for _, object in ipairs(objects) do
+						object.Parent = instance
+					end
+				end
 			end
 			instance.Name = name
 			instance.Parent = parent

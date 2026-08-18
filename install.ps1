@@ -12,6 +12,7 @@ $repository = "Superwheat/renium"
 $installRoot = Join-Path $env:LOCALAPPDATA "Renium\bin"
 $stableLauncherRoot = Join-Path $env:USERPROFILE ".renium\bin"
 $stableLauncher = Join-Path $stableLauncherRoot "rbx.cmd"
+$stableExecutable = Join-Path $stableLauncherRoot "rbx.exe"
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathEntries = @($currentPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
@@ -26,6 +27,25 @@ function Get-NormalizedPathEntry {
     }
     catch {
         return $null
+    }
+}
+
+function Install-ReniumCommandAliases {
+    $cli = Join-Path $installRoot "renium.exe"
+    if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) {
+        return
+    }
+    New-Item -ItemType Directory -Path $stableLauncherRoot -Force | Out-Null
+    foreach ($alias in @((Join-Path $installRoot "rbx.exe"), $stableExecutable)) {
+        if (Test-Path -LiteralPath $alias -PathType Leaf) {
+            Remove-Item -LiteralPath $alias -Force
+        }
+        try {
+            New-Item -ItemType HardLink -Path $alias -Target $cli -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Copy-Item -LiteralPath $cli -Destination $alias
+        }
     }
 }
 
@@ -621,6 +641,12 @@ function Restore-ReniumInstallTransaction {
             Out-Null
         Copy-Item -LiteralPath (Join-Path $root "core") -Destination $journal.InstallRoot -Recurse
     }
+    if ($journal.CoreExisted) {
+        Install-ReniumCommandAliases
+    }
+    elseif (Test-Path -LiteralPath $stableExecutable -PathType Leaf) {
+        Remove-Item -LiteralPath $stableExecutable -Force
+    }
     foreach ($file in @(
         [pscustomobject]@{
             Path = [string]$journal.PluginPath
@@ -727,6 +753,9 @@ try {
         }
         if (Test-Path -LiteralPath $stableLauncher -PathType Leaf) {
             Remove-Item -LiteralPath $stableLauncher -Force
+        }
+        if (Test-Path -LiteralPath $stableExecutable -PathType Leaf) {
+            Remove-Item -LiteralPath $stableExecutable -Force
         }
         if ((Test-Path -LiteralPath $stableLauncherRoot -PathType Container) -and
             @(Get-ChildItem -LiteralPath $stableLauncherRoot -Force).Count -eq 0) {
@@ -908,6 +937,18 @@ try {
             throw "$archiveName does not contain renium.exe"
         }
     }
+    $plugin = @(
+        (Join-Path $PSScriptRoot "Renium.rbxm"),
+        (Join-Path $cli.DirectoryName "Renium.rbxm")
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if ($null -eq $plugin) {
+        if ($null -eq $releaseManifest) {
+            $releaseManifest = Get-ReniumReleaseManifest $baseUrl $Version $manifestPath
+        }
+        $plugin = Join-Path $stage "Renium.rbxm"
+        $manifestPlatform = "windows-$(if ($releaseArchitecture -eq 'x64') { 'x86_64' } else { 'aarch64' })"
+        Save-ReniumReleaseAsset $releaseManifest $manifestPlatform "plugin" "Renium.rbxm" $baseUrl $plugin
+    }
     $vsixFiles = @{}
     foreach ($editorArchitecture in @($activeEditors.Architecture | Sort-Object -Unique)) {
         $editorTarget = "win32-$editorArchitecture"
@@ -935,12 +976,13 @@ try {
     }
     New-Item -ItemType Directory -Path $stagedInstall | Out-Null
     Copy-Item -LiteralPath $cli.FullName -Destination (Join-Path $stagedInstall "renium.exe")
-    foreach ($supportFile in @("rbx.cmd", "rbx-run.ps1", "Renium.rbxm", "renium-agents.md")) {
+    foreach ($supportFile in @("rbx.cmd", "rbx-run.ps1", "renium-agents.md")) {
         $supportPath = Join-Path $cli.DirectoryName $supportFile
         if (Test-Path -LiteralPath $supportPath -PathType Leaf) {
             Copy-Item -LiteralPath $supportPath -Destination $stagedInstall
         }
     }
+    Copy-Item -LiteralPath $plugin -Destination (Join-Path $stagedInstall "Renium.rbxm")
     $existingCli = Join-Path $installRoot "renium.exe"
     $stagedCli = Join-Path $stagedInstall "renium.exe"
     Stop-ReniumDaemons $existingCli $stagedCli
@@ -964,6 +1006,7 @@ try {
         }
         New-Item -ItemType Directory -Path $stableLauncherRoot -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $installRoot "rbx.cmd") -Destination $stableLauncher -Force
+        Install-ReniumCommandAliases
         if (-not ($pathEntries | Where-Object {
             $normalized = Get-NormalizedPathEntry $_
             [string]::Equals(

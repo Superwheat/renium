@@ -1,7 +1,7 @@
 use super::*;
 use crate::cli::{
-    LinkAddArgs, LinkApplyArgs, LinkDeletePackageArgs, LinkMoveTargetArgs, LinkPackArgs,
-    LinkTargetArgs, ProjectSourceArgs,
+    LinkAddArgs, LinkApplyArgs, LinkBreakArgs, LinkDeletePackageArgs, LinkMoveTargetArgs,
+    LinkPackArgs, LinkTargetArgs, ProjectSourceArgs,
 };
 use crate::editor::document::read_editor_service_settings;
 use crate::tests::support::{settings_document, settings_instance, temp_dir};
@@ -128,6 +128,12 @@ fn setup_package_delete(name: &str, source: &str) -> (PathBuf, PathBuf) {
         .write_file(&package_dir.join("pkg.renium"))
         .unwrap();
     write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    let mut lock = LinkLock {
+        version: LINK_MANIFEST_VERSION,
+        ..Default::default()
+    };
+    lock.entries.insert("pkg".into(), LinkLockEntry::default());
+    write_link_lock(&dir, &lock).unwrap();
     (dir, service_dir)
 }
 
@@ -573,7 +579,8 @@ fn link_delete_package_unlinks_uses_and_externalizes_sources() {
     delete_test_package(&dir, "unlink-uses");
 
     assert!(!package_path.exists());
-    assert!(read_link_manifest(&manifest_path).unwrap().links.is_empty());
+    assert!(!manifest_path.exists());
+    assert!(!link_lock_path(&dir).exists());
     let source_path = service_dir.join("Pkg").join("Child.server.luau");
     assert_eq!(fs::read_to_string(&source_path).unwrap(), "print('kept')");
     let updated = SettingsBytecode::read_file(&settings_path).unwrap();
@@ -598,7 +605,8 @@ fn link_delete_package_deletes_uses_and_package_file() {
     delete_test_package(&dir, "delete-uses");
 
     assert!(!package_path.exists());
-    assert!(read_link_manifest(&manifest_path).unwrap().links.is_empty());
+    assert!(!manifest_path.exists());
+    assert!(!link_lock_path(&dir).exists());
     let updated = SettingsBytecode::read_file(&settings_path).unwrap();
     assert_eq!(updated.instances.len(), 1);
     fs::remove_dir_all(dir).unwrap();
@@ -1045,7 +1053,7 @@ fn link_manifest_rejects_duplicate_ids() {
 }
 
 #[test]
-fn link_apply_rejects_missing_target_service_with_clear_error() {
+fn link_apply_creates_missing_target_service() {
     let dir = temp_dir("missing-target-service");
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::create_dir_all(dir.join("links")).unwrap();
@@ -1054,12 +1062,51 @@ fn link_apply_rejects_missing_target_service_with_clear_error() {
         .unwrap();
     write_package_link_manifest(&dir, "MissingService", true, &["Pkg"]);
 
-    let error = link_apply(test_link_apply_args(&dir))
-        .unwrap_err()
-        .to_string();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let settings_file = service_settings_path(&dir.join("src").join("MissingService"));
+    let document = SettingsBytecode::read_file(&settings_file).unwrap();
+    assert_eq!(document.instances[0].name, "MissingService");
     assert!(
-        error.contains("Link target service MissingService has no Renium bytecode settings file")
+        document
+            .instances
+            .iter()
+            .any(|instance| instance.name == "Pkg")
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn link_break_remove_drops_manifest_target_and_keeps_mirror() {
+    let dir = temp_dir("link-break-remove");
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    fs::create_dir_all(dir.join("links")).unwrap();
+    fs::write(dir.join("links").join("Logger.luau"), "return 1\n").unwrap();
+    write_single_file_link_manifest(&dir, true);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+
+    let mirror = service_dir.join("Logger.luau");
+    assert!(mirror.is_file());
+    link_break(LinkBreakArgs {
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
+        manifest: PathBuf::from("renium-link.json"),
+        link: None,
+        service: Some("ReplicatedStorage".into()),
+        path_segments_json: Some(r#"["ReplicatedStorage","Logger"]"#.into()),
+        path_ordinals_json: "[]".into(),
+        remove: true,
+        cache_dir: None,
+        pretty: false,
+    })
+    .unwrap();
+
+    assert!(!dir.join("renium-link.json").exists());
+    assert!(!link_lock_path(&dir).exists());
+    assert!(mirror.is_file());
+    assert!(!fs::metadata(&mirror).unwrap().permissions().readonly());
     let _ = fs::remove_dir_all(&dir);
 }
 

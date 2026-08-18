@@ -1,21 +1,12 @@
-use std::sync::Mutex;
-
+use crate::app::context;
 use crate::studio::bridge::BridgeInfoPayload;
 
-static PLACE_FILTER: Mutex<Option<String>> = Mutex::new(None);
-
 pub(crate) fn set_place_filter(value: Option<String>) {
-    let mut guard = PLACE_FILTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = value.filter(|text| !text.trim().is_empty());
+    context::set_place_selector(value);
 }
 
 pub(crate) fn place_filter() -> Option<String> {
-    PLACE_FILTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    context::place_selector()
 }
 
 pub(crate) fn place_matches(info: &BridgeInfoPayload, selector: &str) -> bool {

@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -77,6 +78,8 @@ pub(super) enum Commands {
     #[command(name = "a", alias = "automation")]
     Automation(AutomationArgs),
     FmtProject(project_config::FmtProjectArgs),
+    #[command(name = "project-validate", alias = "validate-project")]
+    ProjectValidate(project_config::AdapterProjectArgs),
     ExplainPath(project_config::ExplainPathArgs),
     Config(project_config::ConfigArgs),
     Adapters(project_config::AdaptersArgs),
@@ -105,6 +108,8 @@ pub(super) enum Commands {
     Test(TestArgs),
     #[command(alias = "x")]
     ExportSnapshots(ExportSnapshotsArgs),
+    #[command(about = "Pull the connected Studio place into project files")]
+    Pull(ExportSnapshotsArgs),
     #[command(alias = "bd")]
     BridgeDaemon(BridgeDaemonArgs),
     #[command(alias = "ed")]
@@ -113,17 +118,49 @@ pub(super) enum Commands {
     BridgeGetSource(BridgeGetSourceArgs),
     #[command(alias = "co")]
     GetConsoleOutput(PluginConsoleOutputArgs),
-    #[command(alias = "lx")]
+    #[command(alias = "lx", alias = "l")]
     ExecuteLuau(ExecuteLuauArgs),
+    #[command(name = "lc", hide = true)]
+    ExecuteClientLuau(ExecuteClientLuauArgs),
     #[command(
         alias = "device",
         alias = "dev",
         about = "Control Studio's built-in device simulator"
     )]
     StudioDevice(StudioDeviceArgs),
+    #[command(name = "asset-search", about = "Search the public Creator Store")]
+    AssetSearch(AssetSearchArgs),
+    #[command(
+        name = "asset-insert",
+        about = "Insert a Creator Store asset into Studio"
+    )]
+    AssetInsert(AssetInsertArgs),
+    #[command(
+        name = "generate-model",
+        about = "Start an AI model generation job in Studio"
+    )]
+    GenerateModel(GenerateModelArgs),
+    #[command(name = "job-status", about = "Read or wait for a creator job")]
+    JobStatus(JobStatusArgs),
+    #[command(
+        name = "image-store",
+        about = "Validate a local image for Roblox upload"
+    )]
+    ImageStore(ImageStoreArgs),
+    #[command(name = "http-get", about = "Read Roblox Creator documentation")]
+    HttpGet(HttpGetArgs),
+    #[command(
+        name = "script-search",
+        about = "Find saved script files containing every keyword"
+    )]
+    ScriptSearch(ScriptSearchArgs),
+    #[command(name = "script-grep", about = "Find literal text in saved scripts")]
+    ScriptGrep(ScriptGrepArgs),
+    #[command(name = "script-read", about = "Read a saved script or line range")]
+    ScriptRead(ScriptReadArgs),
     #[command(alias = "play")]
     StartStopPlay(StartStopPlayArgs),
-    #[command(alias = "clients")]
+    #[command(alias = "clients", alias = "studios")]
     ListClients(ListClientsArgs),
     #[command(alias = "review")]
     EditorReviewDecision(EditorReviewDecisionArgs),
@@ -142,6 +179,8 @@ pub(super) enum Commands {
     Goto(GotoArgs),
     #[command(alias = "sc")]
     Shot(ShotArgs),
+    RecordStart(RecordStartArgs),
+    RecordEnd(RecordEndArgs),
     Setup(SetupArgs),
     #[command(alias = "st")]
     StudioChangeState(StudioChangeStateArgs),
@@ -444,11 +483,23 @@ pub(super) struct ExecuteLuauArgs {
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(short = 'e', long)]
     pub(super) code: Option<String>,
+    #[arg(value_name = "LUAU", conflicts_with_all = ["code", "file"])]
+    pub(super) inline_code: Option<String>,
     #[arg(short, long, value_name = "PATH")]
     pub(super) file: Option<PathBuf>,
     #[arg(short, long)]
     pub(super) client: bool,
     #[arg(long, value_name = "NAME|N")]
+    pub(super) player: Option<String>,
+    #[arg(short, long, default_value_t = 10.0)]
+    pub(super) timeout: f64,
+}
+
+#[derive(Parser)]
+pub(super) struct ExecuteClientLuauArgs {
+    #[command(flatten)]
+    pub(super) bridge: BridgeConnectionArgs,
+    pub(super) code: String,
     pub(super) player: Option<String>,
     #[arg(short, long, default_value_t = 10.0)]
     pub(super) timeout: f64,
@@ -487,8 +538,112 @@ pub(super) struct StudioDeviceArgs {
         help = "Override pixels per inch"
     )]
     pub(super) pixel_density: Option<f64>,
+    #[arg(long, help = "Include dimensions and density in device listings")]
+    pub(super) details: bool,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+}
+
+#[derive(Parser)]
+pub(super) struct AssetSearchArgs {
+    pub(super) query: String,
+    #[arg(short, long, default_value_t = 5)]
+    pub(super) limit: u32,
+    #[arg(long = "type", default_value = "Model")]
+    pub(super) asset_type: String,
+    #[arg(long)]
+    pub(super) cursor: Option<String>,
+    #[arg(long)]
+    pub(super) details: bool,
+}
+
+#[derive(Parser)]
+pub(super) struct AssetInsertArgs {
+    pub(super) asset_id: NonZeroU64,
+    #[arg(long, default_value = "Workspace")]
+    pub(super) parent: String,
+    #[arg(long)]
+    pub(super) name: Option<String>,
+    #[arg(long = "type")]
+    pub(super) asset_type: Option<String>,
+    #[command(flatten)]
+    pub(super) bridge: BridgeConnectionArgs,
+}
+
+#[derive(Parser)]
+pub(super) struct GenerateModelArgs {
+    pub(super) prompt: Option<String>,
+    #[arg(long)]
+    pub(super) image_asset_id: Option<NonZeroU64>,
+    #[arg(long, default_value = "Workspace")]
+    pub(super) parent: String,
+    #[arg(long, default_value = "GeneratedModel")]
+    pub(super) name: String,
+    #[arg(long, value_name = "X,Y,Z")]
+    pub(super) size: Option<String>,
+    #[arg(long)]
+    pub(super) max_triangles: Option<u32>,
+    #[arg(long)]
+    pub(super) generate_textures: Option<bool>,
+    #[arg(long = "part")]
+    pub(super) parts: Vec<String>,
+    #[arg(long)]
+    pub(super) segmentation: Option<String>,
+    #[arg(long)]
+    pub(super) unanchored: bool,
+    #[command(flatten)]
+    pub(super) bridge: BridgeConnectionArgs,
+}
+
+#[derive(Parser)]
+pub(super) struct JobStatusArgs {
+    pub(super) job_id: String,
+    #[arg(long, default_value_t = 0.0)]
+    pub(super) wait_seconds: f64,
+}
+
+#[derive(Parser)]
+pub(super) struct ImageStoreArgs {
+    pub(super) path: PathBuf,
+}
+
+#[derive(Parser)]
+pub(super) struct HttpGetArgs {
+    pub(super) url: String,
+    #[arg(short, long)]
+    pub(super) query: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    pub(super) context_lines: usize,
+    #[arg(short, long, default_value_t = 3)]
+    pub(super) limit: usize,
+    #[arg(long)]
+    pub(super) full: bool,
+}
+
+#[derive(Parser)]
+pub(super) struct ScriptSearchArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub(super) keywords: Vec<String>,
+    #[arg(short, long, default_value_t = 25)]
+    pub(super) limit: usize,
+}
+
+#[derive(Parser)]
+pub(super) struct ScriptGrepArgs {
+    pub(super) query: String,
+    #[arg(short = 'i', long)]
+    pub(super) case_insensitive: bool,
+    #[arg(short, long, default_value_t = 100)]
+    pub(super) limit: usize,
+}
+
+#[derive(Parser)]
+pub(super) struct ScriptReadArgs {
+    pub(super) path: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    pub(super) start_line: usize,
+    #[arg(long)]
+    pub(super) end_line: Option<usize>,
 }
 
 #[derive(Parser)]
@@ -825,6 +980,29 @@ pub(super) struct ShotArgs {
 }
 
 #[derive(Parser)]
+pub(super) struct RecordStartArgs {
+    #[arg(short, long, value_name = "PATH")]
+    pub(super) output: Option<PathBuf>,
+    #[arg(short, long, value_name = "NAME|N")]
+    pub(super) player: Option<String>,
+    #[arg(long, conflicts_with_all = ["client", "player"])]
+    pub(super) studio: bool,
+    #[arg(long, conflicts_with = "studio")]
+    pub(super) client: bool,
+    #[arg(long, default_value_t = 12.0)]
+    pub(super) fps: f64,
+    #[arg(long, default_value_t = 60.0)]
+    pub(super) max_seconds: f64,
+    #[arg(long, default_value_t = 80.0)]
+    pub(super) quality: f32,
+}
+
+#[derive(Parser)]
+pub(super) struct RecordEndArgs {
+    pub(super) recording_id: Option<String>,
+}
+
+#[derive(Parser)]
 pub(super) struct StudioChangeStateArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -1132,7 +1310,7 @@ pub(super) struct BytecodeSetPropertyArgs {
     pub(super) property: String,
     #[arg(short = 'j', long, alias = "value", alias = "json")]
     pub(super) value_json: Option<String>,
-    #[arg(long = "str", alias = "value-str")]
+    #[arg(long = "str", alias = "value-str", allow_hyphen_values = true)]
     pub(super) value_str: Option<String>,
     #[arg(long = "num", alias = "value-num")]
     pub(super) value_num: Option<f64>,
@@ -1168,7 +1346,12 @@ pub(super) struct BytecodeSetSourceArgs {
     pub(super) selector: BytecodeInstanceSelectorArgs,
     #[arg(short = 'j', long, alias = "value", alias = "json")]
     pub(super) value_json: Option<String>,
-    #[arg(long = "str", visible_alias = "source", alias = "value-str")]
+    #[arg(
+        long = "str",
+        visible_alias = "source",
+        alias = "value-str",
+        allow_hyphen_values = true
+    )]
     pub(super) value_str: Option<String>,
     #[arg(
         help = "Read the source from a file instead of an argument — use this for large scripts that exceed the OS command-line length limit",
@@ -1459,6 +1642,8 @@ pub(super) struct SyncWallyPackagesArgs {
     #[arg(long)]
     pub(super) skip_install: bool,
     #[arg(long)]
+    pub(super) details: bool,
+    #[arg(long)]
     pub(super) pretty: bool,
 }
 
@@ -1538,6 +1723,11 @@ pub(super) struct LinkBreakArgs {
         default_value = "[]"
     )]
     pub(super) path_ordinals_json: String,
+    #[arg(
+        help = "Remove the selected target from the link manifest instead of retaining it as temporarily broken",
+        long
+    )]
+    pub(super) remove: bool,
     #[arg(
         help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir",
         long,

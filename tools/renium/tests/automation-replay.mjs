@@ -27,13 +27,23 @@ let secondPort = await openPort();
 while (secondPort === firstPort) {
   secondPort = await openPort();
 }
+let controlPort = await openPort();
+while (controlPort === firstPort || controlPort === secondPort) {
+  controlPort = await openPort();
+}
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-automation-replay-"));
 const project = path.join(root, "renium.project.jsonc");
 fs.mkdirSync(path.join(root, "src"));
+fs.mkdirSync(path.join(root, "src", "Workspace"));
 fs.writeFileSync(project, JSON.stringify({ schemaVersion: 1, sourceRoot: "src", tree: {} }));
 
-const daemon = childProcess.spawn(executable, ["bd", "--editor-stdio", "-w", "0.1", "-P", `${firstPort},${secondPort}`], {
+const daemon = childProcess.spawn(executable, ["bd", "--editor-stdio", "--control-port", String(controlPort), "-w", "0.1", "-P", `${firstPort},${secondPort}`], {
   cwd: root,
+  env: {
+    ...process.env,
+    RENIUM_DAEMON_CONTROL_PORT: String(controlPort),
+    RENIUM_DAEMON_FILE: path.join(root, "daemon.json"),
+  },
   stdio: ["pipe", "pipe", "pipe"],
 });
 const stdoutLines = [];
@@ -104,7 +114,10 @@ try {
   const prepared = await send({ v: 1, id: 7, op: 80, cx, p: { op: 11, p: { destructive: true } } });
   expect(prepared.ok === 1 && prepared.r.name === "push", "review receipt targeted the wrong operation");
   const applied = await send({ v: 1, id: 8, op: 81, cx, p: { reviewId: prepared.r.reviewId } });
-  expect(applied.ok === 0 && applied.e.c === "no_studio" && applied.e.rt === 0, "missing Studio was retried or misclassified");
+  expect(
+    applied.ok === 0 && applied.e.c === "no_studio" && applied.e.rt === 0,
+    `missing Studio was retried or misclassified: ${JSON.stringify(applied)}`,
+  );
   const newProjectRoot = path.join(root, "new-project");
   fs.mkdirSync(newProjectRoot);
   const bootstrap = await send({ v: 1, id: 9, op: 1, p: { root: newProjectRoot, bootstrap: true } });
@@ -119,6 +132,30 @@ try {
   expect(!initializedFiles.some((file) => /\.lua(u)?$/i.test(file)), "project-init generated starter source");
   const staleBootstrap = await send({ v: 1, id: 12, op: 2, cx: bootstrapCx, p: {} });
   expect(staleBootstrap.ok === 0 && staleBootstrap.e.c === "stale_cx", "initialized bootstrap context did not become stale");
+  const experienceRoot = path.join(root, "multi-project");
+  fs.mkdirSync(path.join(experienceRoot, "src"), { recursive: true });
+  fs.writeFileSync(path.join(experienceRoot, "src", "Saved.server.luau"), "return true\n");
+  fs.writeFileSync(path.join(experienceRoot, "renium.project.jsonc"), JSON.stringify({ schemaVersion: 1, sourceRoot: "src", tree: {} }));
+  const singlePlace = await send({ v: 1, id: 14, op: 1, p: { root: experienceRoot, place: "700001" } });
+  const converted = await send({ v: 1, id: 15, op: 72, cx: singlePlace.r.id, p: { placeId: 700001, gameId: 800001, name: "Main Lobby" } });
+  expect(converted.ok === 1 && converted.r.alias === "main_lobby", "place-add rejected the bound single place");
+  expect(fs.existsSync(path.join(experienceRoot, "places", "main_lobby", "src", "Saved.server.luau")), "place-add lost the existing source tree");
+  expect(!fs.existsSync(path.join(experienceRoot, "renium.project.jsonc")), "place-add left the old root project behind");
+  const convertedManifest = JSON.parse(fs.readFileSync(path.join(experienceRoot, "renium.experience.json"), "utf8"));
+  expect(Object.keys(convertedManifest.places).length === 1, "place-add duplicated the converted place");
+  const convertedContext = await send({ v: 1, id: 16, op: 2, cx: singlePlace.r.id, p: {} });
+  expect(convertedContext.ok === 0 && convertedContext.e.c === "stale_cx", "place-add did not invalidate the old context");
+  const reboundMain = await send({ v: 1, id: 17, op: 1, p: { root: experienceRoot, place: "700001" } });
+  const added = await send({ v: 1, id: 18, op: 72, cx: reboundMain.r.id, p: { placeId: 700002, gameId: 800001, name: "Arena" } });
+  expect(added.ok === 1 && fs.existsSync(path.join(experienceRoot, "places", "arena", "renium.project.jsonc")), "place-add did not create the second place");
+  const reboundArena = await send({ v: 1, id: 19, op: 1, p: { root: experienceRoot, place: "700002" } });
+  const renamed = await send({ v: 1, id: 20, op: 73, cx: reboundArena.r.id, p: { placeId: 700002, alias: "match" } });
+  expect(renamed.ok === 1 && fs.existsSync(path.join(experienceRoot, "places", "match")), "place-rename did not move the place root");
+  const reboundMatch = await send({ v: 1, id: 21, op: 1, p: { root: experienceRoot, place: "700002" } });
+  const reordered = await send({ v: 1, id: 22, op: 74, cx: reboundMatch.r.id, p: { order: [700002, 700001] } });
+  expect(reordered.ok === 1, "place-reorder failed for the complete place ID set");
+  const finalManifest = JSON.parse(fs.readFileSync(path.join(experienceRoot, "renium.experience.json"), "utf8"));
+  expect(finalManifest.placeOrder.join(",") === "700002,700001" && finalManifest.places.match.placeId === 700002, "place management wrote the wrong manifest");
   fs.appendFileSync(project, "\n");
   const stale = await send({ v: 1, id: 13, op: 2, cx, p: {} });
   expect(stale.ok === 0 && stale.e.c === "stale_cx", "project changes did not invalidate the context");

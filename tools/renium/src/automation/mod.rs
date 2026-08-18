@@ -86,7 +86,7 @@ impl Request {
                 "cap",
             )
         })?;
-        if self.op != op::CAP && self.op != op::BIND && self.cx.is_none() {
+        if !matches!(self.op, op::CAP | op::BIND | op::STUDIOS) && self.cx.is_none() {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));
         }
         Ok(operation)
@@ -355,6 +355,14 @@ mod tests {
             request.validate(),
             Err(Failure(ProtocolError { c, .. })) if c == "bad_req"
         ));
+        assert!(
+            Request {
+                op: op::STUDIOS,
+                ..request
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(
             serde_json::from_str::<Request>(r#"{"v":1,"id":1,"op":0,"p":{},"command":"find"}"#)
                 .is_err()

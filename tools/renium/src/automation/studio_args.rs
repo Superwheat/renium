@@ -133,6 +133,7 @@ pub(super) fn luau(root: &Path, parameters: &Value) -> Result<ExecuteLuauArgs> {
     Ok(ExecuteLuauArgs {
         bridge: bridge(object)?,
         code: string(object, "code"),
+        inline_code: None,
         file,
         client: boolean(object, "client")?,
         player: string(object, "player"),
@@ -182,7 +183,7 @@ pub(super) fn test(parameters: &Value) -> Result<TestArgs> {
 fn vector(object: &Map<String, Value>, names: &[&str]) -> Result<Option<String>> {
     let value = names.iter().find_map(|name| object.get(*name));
     match value {
-        None => Ok(None),
+        None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(Value::Array(values)) if values.len() == 3 && values.iter().all(Value::is_number) => {
             Ok(Some(
@@ -243,6 +244,7 @@ pub(super) fn device(parameters: &Value) -> Result<StudioDeviceArgs> {
         scaling_mode: string(object, "scalingMode"),
         resolution: string(object, "resolution"),
         pixel_density: optional_number(object, "pixelDensity")?,
+        details: boolean(object, "details")?,
         bridge: bridge(object)?,
     })
 }

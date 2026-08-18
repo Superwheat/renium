@@ -5,6 +5,11 @@ use anyhow::Result;
 use crate::app::setup::setup_command;
 use crate::app::update;
 use crate::automation::client::automation_command;
+use crate::automation::tools::{
+    asset_insert_command, asset_search_command, generate_model_command, http_get_command,
+    image_store_command, job_status_command, script_grep_command, script_read_command,
+    script_search_command,
+};
 use crate::bytecode::edit::{
     bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
     bytecode_remove_instance,
@@ -16,7 +21,7 @@ use crate::bytecode::{
     bytecode_apply_property_batch, bytecode_get_property, bytecode_set_property,
     bytecode_set_source, find_command, inspect_command, tree_command,
 };
-use crate::cli::Commands;
+use crate::cli::{Commands, ExecuteLuauArgs};
 use crate::daemon::{bridge_daemon, bridge_get_source, cursor_poll};
 use crate::editor::history::editor_revert;
 use crate::editor::sync::{apply_editor_delete, apply_editor_property, push_editor_changes};
@@ -37,13 +42,14 @@ use crate::project::workflows;
 use crate::rbx::model::{
     bytecode_export_model, bytecode_export_place, bytecode_import_model, bytecode_repack,
 };
-use crate::snapshot::export::export_snapshots;
+use crate::snapshot::export::{export_snapshots, pull_from_studio};
 use crate::snapshot::import::{import_service, import_snapshots};
 use crate::studio::automation::{
     click_command, editor_review_decision_command, execute_luau_command,
     get_console_output_command, goto_command, key_command, list_clients_command, press_command,
-    shot_command, start_stop_play_command, studio_change_state_command, studio_device_command,
-    test_command, type_command, ui_command, wait_until_command,
+    record_end_command, record_start_command, shot_command, start_stop_play_command,
+    studio_change_state_command, studio_device_command, test_command, type_command, ui_command,
+    wait_until_command,
 };
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
@@ -53,6 +59,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
             Ok(())
         }
         Commands::FmtProject(args) => config::run_fmt_project(args, project),
+        Commands::ProjectValidate(args) => config::run_validate_project(args, project),
         Commands::ExplainPath(args) => config::run_explain_path(args, project),
         Commands::Config(args) => config::run_config(args),
         Commands::Adapters(args) => config::run_adapters(args, project),
@@ -78,12 +85,31 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ExportModel(args) => export_model_command(args, project),
         Commands::Test(args) => test_command(args),
         Commands::ExportSnapshots(args) => export_snapshots(args),
+        Commands::Pull(args) => pull_from_studio(args),
         Commands::BridgeDaemon(args) => bridge_daemon(args),
         Commands::ExplorerDaemon(args) => explorer_daemon(args),
         Commands::BridgeGetSource(args) => bridge_get_source(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
+        Commands::ExecuteClientLuau(args) => execute_luau_command(ExecuteLuauArgs {
+            bridge: args.bridge,
+            code: Some(args.code),
+            inline_code: None,
+            file: None,
+            client: args.player.is_none(),
+            player: args.player,
+            timeout: args.timeout,
+        }),
         Commands::StudioDevice(args) => studio_device_command(args),
+        Commands::AssetSearch(args) => asset_search_command(args),
+        Commands::AssetInsert(args) => asset_insert_command(args, project),
+        Commands::GenerateModel(args) => generate_model_command(args, project),
+        Commands::JobStatus(args) => job_status_command(args, project),
+        Commands::ImageStore(args) => image_store_command(args, project),
+        Commands::HttpGet(args) => http_get_command(args),
+        Commands::ScriptSearch(args) => script_search_command(args, project),
+        Commands::ScriptGrep(args) => script_grep_command(args, project),
+        Commands::ScriptRead(args) => script_read_command(args, project),
         Commands::StartStopPlay(args) => start_stop_play_command(args),
         Commands::ListClients(args) => list_clients_command(args),
         Commands::EditorReviewDecision(args) => editor_review_decision_command(args),
@@ -95,6 +121,8 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::WaitUntil(args) => wait_until_command(args),
         Commands::Goto(args) => goto_command(args),
         Commands::Shot(args) => shot_command(args),
+        Commands::RecordStart(args) => record_start_command(args),
+        Commands::RecordEnd(args) => record_end_command(args),
         Commands::Setup(args) => setup_command(args),
         Commands::StudioChangeState(args) => studio_change_state_command(args),
         Commands::PushEditorChanges(args) => push_editor_changes(args),

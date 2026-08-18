@@ -19,7 +19,7 @@ use crate::cli::{ProjectSourceArgs, SyncWallyPackagesArgs};
 use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
-    exact_path_key as path_text,
+    exact_path_key as path_text, write_bytes_if_changed,
 };
 
 mod build_watch;
@@ -152,6 +152,7 @@ struct InitPlan {
     create: Vec<String>,
     update: Vec<String>,
     keep: Vec<String>,
+    directories: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -182,6 +183,8 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     let root = absolute_path(&args.path);
     let source_root = detect_init_source_root(&root)?;
     let files = init_files(&root, &source_root, &args.with)?;
+    let source_directory = root.join(&source_root);
+    validate_init_output_types(&files, &source_directory)?;
     let mut create = Vec::new();
     let mut update = Vec::new();
     let mut update_paths = Vec::new();
@@ -203,17 +206,15 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         create,
         update,
         keep,
+        directories: (!source_directory.exists())
+            .then(|| relative_display(&root, &source_directory))
+            .into_iter()
+            .collect(),
     };
     if args.preview {
         return crate::emit_global_output(
             &serde_json::to_value(&plan)?,
-            &format!(
-                "Would initialize {}: create {}, update {}, keep {}",
-                plan.root.display(),
-                plan.create.len(),
-                plan.update.len(),
-                plan.keep.len()
-            ),
+            &format_init_plan("Would initialize", &plan, false),
         );
     }
     let root_existed = root.exists();
@@ -267,7 +268,6 @@ pub fn run_init(args: InitArgs) -> Result<()> {
             atomic_write_file(&path, &bytes)?;
             created_files.push(path);
         }
-        let source_directory = root.join(&source_root);
         if !source_directory.exists() {
             create_directories_tracked(&source_directory, &mut created_directories)?;
         }
@@ -323,14 +323,43 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     }
     crate::emit_global_output(
         &serde_json::to_value(&plan)?,
-        &format!(
-            "Initialized {}: created {}, updated {}, kept {}",
-            plan.root.display(),
-            plan.create.len(),
-            plan.update.len(),
-            plan.keep.len()
-        ),
+        &format_init_plan("Initialized", &plan, true),
     )
+}
+
+fn validate_init_output_types(files: &[(PathBuf, Vec<u8>)], source_directory: &Path) -> Result<()> {
+    for (path, _) in files {
+        if path.exists() && !path.is_file() {
+            bail!("Initialization requires a file at {}", path.display());
+        }
+    }
+    if source_directory.exists() && !source_directory.is_dir() {
+        bail!(
+            "Initialization requires a directory at {}",
+            source_directory.display()
+        );
+    }
+    Ok(())
+}
+
+fn format_init_plan(action: &str, plan: &InitPlan, completed: bool) -> String {
+    let (create, update, keep, directories) = if completed {
+        ("created", "updated", "kept", "created directories")
+    } else {
+        ("create", "update", "keep", "create directories")
+    };
+    format!(
+        "{action} {}: {create} {}, {update} {}, {keep} {}, {directories} {}",
+        plan.root.display(),
+        format_init_paths(&plan.create),
+        format_init_paths(&plan.update),
+        format_init_paths(&plan.keep),
+        format_init_paths(&plan.directories),
+    )
+}
+
+fn format_init_paths(paths: &[String]) -> String {
+    format!("{} [{}]", paths.len(), paths.join(", "))
 }
 
 fn project_package_manager(root: &Path) -> Result<PathBuf> {
@@ -394,6 +423,7 @@ fn create_directories_tracked(path: &Path, created: &mut Vec<PathBuf>) -> Result
 }
 
 pub fn run_build(args: BuildArgs, global_project: Option<&Path>) -> Result<()> {
+    crate::app::timing::set_quiet_timings(true);
     crate::set_global_stream_output(args.watch);
     let mut loaded = config::load_project(args.project.as_deref().or(global_project), None)?;
     let output = args.output.clone().unwrap_or_else(|| {
@@ -429,41 +459,49 @@ pub fn run_build(args: BuildArgs, global_project: Option<&Path>) -> Result<()> {
 pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()> {
     let root = absolute_path(&args.root);
     let mut checks = Vec::new();
-    match config::load_project(args.project.as_deref().or(global_project), Some(&root)) {
-        Ok(project) => match config::validate_project(&project)
-            .and_then(|()| config::stage_project(&project).map(drop))
-        {
-            Ok(()) => checks.push(DoctorCheck {
-                name: "project".to_string(),
-                status: "ok",
-                detail: format!("{} compiles successfully", project.path.display()),
-                action: None,
-            }),
-            Err(error) => checks.push(DoctorCheck {
-                name: "project".to_string(),
-                status: "error",
-                detail: error.to_string(),
-                action: Some(
-                    "Fix the reported project path or field, then run `rbx doctor` again"
-                        .to_string(),
-                ),
-            }),
-        },
+    let explicit_project = args.project.as_deref().or(global_project);
+    let project_marker_exists = project_marker_exists_from(&root);
+    let mut bundle_project = None;
+    match config::load_project(explicit_project, Some(&root)) {
+        Ok(project) => {
+            bundle_project = Some(project.path.clone());
+            match config::validate_project(&project)
+                .and_then(|()| config::stage_project(&project).map(drop))
+            {
+                Ok(()) => {
+                    checks.push(DoctorCheck {
+                        name: "project".to_string(),
+                        status: "ok",
+                        detail: format!("{} compiles successfully", project.path.display()),
+                        action: None,
+                    });
+                }
+                Err(error) => checks.push(DoctorCheck {
+                    name: "project".to_string(),
+                    status: "error",
+                    detail: format!("{error:#}"),
+                    action: Some(
+                        "Fix the reported project path or field, then run `rbx doctor` again"
+                            .to_string(),
+                    ),
+                }),
+            }
+        }
         Err(error) => checks.push(DoctorCheck {
             name: "project".to_string(),
-            status: if args.project.is_some()
-                || global_project.is_some()
-                || project_marker_exists_from(&root)
-            {
+            status: if explicit_project.is_some() || project_marker_exists {
                 "error"
             } else {
                 "warn"
             },
-            detail: error.to_string(),
-            action: Some(format!(
-                "Run `rbx init {}` or pass --project",
-                root.display()
-            )),
+            detail: format!("{error:#}"),
+            action: Some(if explicit_project.is_some() {
+                "Fix the project passed with --project, then run `rbx doctor` again".to_string()
+            } else if project_marker_exists {
+                "Fix the existing project file, then run `rbx doctor` again".to_string()
+            } else {
+                format!("Run `rbx init {}` or pass --project", root.display())
+            }),
         }),
     }
     let config = config::load_merged_config(&root);
@@ -477,7 +515,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
         Err(error) => DoctorCheck {
             name: "configuration".to_string(),
             status: "error",
-            detail: error.to_string(),
+            detail: format!("{error:#}"),
             action: Some("Run `rbx config list --origins` to locate the invalid file".to_string()),
         },
     });
@@ -521,7 +559,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
             Err(error) => DoctorCheck {
                 name: "studioPlugin".to_string(),
                 status: "error",
-                detail: error.to_string(),
+                detail: format!("{error:#}"),
                 action: Some("Run `rbx setup` to repair the Studio plugin".to_string()),
             },
         },
@@ -534,7 +572,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
         Err(error) => DoctorCheck {
             name: "studioPlugin".to_string(),
             status: "optional",
-            detail: error.to_string(),
+            detail: format!("{error:#}"),
             action: None,
         },
     });
@@ -557,7 +595,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
         "checks": checks,
     });
     if let Some(bundle) = args.bundle {
-        write_doctor_bundle(&bundle, &result, &root)?;
+        write_doctor_bundle(&bundle, &result, bundle_project.as_deref())?;
     }
     if args.json {
         crate::emit_global_output(&result, &serde_json::to_string_pretty(&result)?)?;
@@ -1018,6 +1056,23 @@ pub(crate) fn initialize_place_root(root: &Path, source_root: &Path) -> Result<P
     ensure_project_file(root, source_root)
 }
 
+pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
+    for (path, content) in [
+        (root.join(PROJECT_INSTRUCTIONS_FILE), agent_instructions()?),
+        (
+            root.join("AGENTS.md"),
+            merged_instruction_file(&root.join("AGENTS.md"))?,
+        ),
+        (
+            root.join("CLAUDE.md"),
+            merged_instruction_file(&root.join("CLAUDE.md"))?,
+        ),
+    ] {
+        write_bytes_if_changed(&path, &content)?;
+    }
+    Ok(())
+}
+
 fn agent_instructions() -> Result<Vec<u8>> {
     let installed = env::current_exe()
         .context("Failed to locate the Renium executable")?
@@ -1270,6 +1325,7 @@ fn run_optional_toolchains(loaded: &LoadedProject, args: &BuildArgs) -> Result<(
             dev_target_name: "DevPackages".to_string(),
             force: false,
             skip_install: false,
+            details: false,
             pretty: false,
         })?;
     }
@@ -1290,7 +1346,7 @@ fn run_optional_toolchains(loaded: &LoadedProject, args: &BuildArgs) -> Result<(
     Ok(())
 }
 
-fn write_doctor_bundle(path: &Path, result: &Value, root: &Path) -> Result<()> {
+fn write_doctor_bundle(path: &Path, result: &Value, project_path: Option<&Path>) -> Result<()> {
     let directory = if path.extension().is_some() {
         path.with_extension("")
     } else {
@@ -1301,9 +1357,13 @@ fn write_doctor_bundle(path: &Path, result: &Value, root: &Path) -> Result<()> {
         &directory.join("doctor.json"),
         (serde_json::to_string_pretty(result)? + "\n").as_bytes(),
     )?;
-    if let Ok(project) = config::load_project(None, Some(root)) {
-        let text = fs::read_to_string(&project.path)?;
-        atomic_write_file(&directory.join(PROJECT_FILE_NAME), text.as_bytes())?;
+    let bundled_project = directory.join(PROJECT_FILE_NAME);
+    if let Some(project_path) = project_path {
+        let text = fs::read_to_string(project_path)?;
+        atomic_write_file(&bundled_project, text.as_bytes())?;
+    } else if bundled_project.exists() {
+        fs::remove_file(&bundled_project)
+            .with_context(|| format!("Failed to remove {}", bundled_project.display()))?;
     }
     let environment = json!({
         "os": env::consts::OS,
@@ -1315,10 +1375,6 @@ fn write_doctor_bundle(path: &Path, result: &Value, root: &Path) -> Result<()> {
         &directory.join("environment.json"),
         (serde_json::to_string_pretty(&environment)? + "\n").as_bytes(),
     )?;
-    crate::log_global(
-        3,
-        format_args!("Wrote diagnostic bundle {}", directory.display()),
-    );
     Ok(())
 }
 

@@ -2053,27 +2053,23 @@ fn stage_source_directory(
 pub(super) fn projection_source_owner_paths(loaded: &LoadedProject) -> Vec<PathBuf> {
     let mut paths = project_tree_nodes(&loaded.project.tree)
         .into_iter()
-        .filter_map(|(_, node)| {
-            node.path.map(|path| {
-                fs::canonicalize(loaded.root.join(&path))
-                    .unwrap_or_else(|_| absolute_path(&loaded.root.join(&path)))
-            })
-        })
-        .chain(loaded.project.mounts.iter().map(|mount| {
-            fs::canonicalize(loaded.root.join(&mount.source))
-                .unwrap_or_else(|_| absolute_path(&loaded.root.join(&mount.source)))
-        }))
-        .chain(loaded.project.adapters.iter().flat_map(|adapter| {
-            std::iter::once(
-                fs::canonicalize(loaded.root.join(&adapter.source))
-                    .unwrap_or_else(|_| absolute_path(&loaded.root.join(&adapter.source))),
-            )
-            .chain(adapter.output.as_deref().map(|output| {
-                fs::canonicalize(loaded.root.join(output))
-                    .unwrap_or_else(|_| absolute_path(&loaded.root.join(output)))
-            }))
-        }))
+        .filter_map(|(_, node)| node.path.map(|path| absolute_path(&loaded.root.join(path))))
+        .chain(
+            loaded
+                .project
+                .mounts
+                .iter()
+                .map(|mount| absolute_path(&loaded.root.join(&mount.source))),
+        )
         .collect::<Vec<_>>();
+    paths.extend(loaded.project.adapters.iter().flat_map(|adapter| {
+        std::iter::once(absolute_path(&loaded.root.join(&adapter.source))).chain(
+            adapter
+                .output
+                .as_deref()
+                .map(|output| absolute_path(&loaded.root.join(output))),
+        )
+    }));
     paths.sort_by_key(|path| projection_path_key(path));
     paths.dedup_by(|left, right| projection_path_key(left) == projection_path_key(right));
     paths

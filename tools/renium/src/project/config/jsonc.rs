@@ -98,6 +98,12 @@ pub(super) fn format_jsonc(text: &str) -> Result<String> {
     Ok(output)
 }
 
+pub(super) fn has_jsonc_comments(text: &str) -> Result<bool> {
+    Ok(tokenize(text)?
+        .into_iter()
+        .any(|token| matches!(token.kind, TokenKind::LineComment | TokenKind::BlockComment)))
+}
+
 pub(crate) fn parse_jsonc_value(text: &str) -> Result<Value> {
     let mut json = String::with_capacity(text.len());
     let mut tokens = tokenize(text)?

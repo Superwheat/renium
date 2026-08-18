@@ -47,8 +47,6 @@ impl Drop for ThreadDpiAwareness {
 pub struct StudioWindow {
     pub label: String,
     handle: platform::WindowHandle,
-    #[cfg(windows)]
-    _reminimize: Option<platform::ReminimizeGuard>,
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -63,12 +61,7 @@ pub fn input_shield(window: &StudioWindow) -> Result<InputShield> {
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
-    platform::window_for_pid(pid, viewport, true)
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-pub fn recording_window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
-    platform::window_for_pid(pid, viewport, false)
+    platform::window_for_pid(pid, viewport)
 }
 
 #[cfg(windows)]
@@ -76,18 +69,7 @@ pub fn verified_studio_window_for_pid<F>(pid: u32, mut set_probe_phase: F) -> Re
 where
     F: FnMut(u8, &[u32]) -> Result<()>,
 {
-    platform::verified_studio_window_for_pid(pid, &mut set_probe_phase, true)
-}
-
-#[cfg(windows)]
-pub fn verified_recording_window_for_pid<F>(
-    pid: u32,
-    mut set_probe_phase: F,
-) -> Result<StudioWindow>
-where
-    F: FnMut(u8, &[u32]) -> Result<()>,
-{
-    platform::verified_studio_window_for_pid(pid, &mut set_probe_phase, false)
+    platform::verified_studio_window_for_pid(pid, &mut set_probe_phase)
 }
 
 #[cfg(windows)]
@@ -98,6 +80,16 @@ pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
 #[cfg(windows)]
 pub fn studio_window_title(pid: u32) -> Result<String> {
     platform::studio_window_title(pid)
+}
+
+#[cfg(windows)]
+pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
+    platform::recover_stalled_window_for_pid(pid)
+}
+
+#[cfg(windows)]
+pub fn watch_auto_recovery_dialogs() {
+    platform::watch_auto_recovery_dialogs();
 }
 
 #[cfg(windows)]
@@ -331,14 +323,22 @@ mod platform {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
+    use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsChild, IsIconic, IsWindowVisible, SMTO_ABORTIFHUNG,
-        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SendMessageTimeoutW, ShowWindow, WM_KEYDOWN,
-        WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-        WM_RBUTTONUP,
+        CHILDID_SELF, EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, GA_ROOT, GW_OWNER,
+        GetAncestor, GetClassNameW, GetClientRect, GetMessageW, GetWindow, GetWindowTextW,
+        GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible, MSG, OBJID_WINDOW,
+        SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SendMessageTimeoutW, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT,
+        WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsWindowEnabled(hwnd: HWND) -> i32;
+    }
 
     const MK_LBUTTON: WPARAM = 0x0001;
     const MK_RBUTTON: WPARAM = 0x0002;
@@ -381,6 +381,208 @@ mod platform {
         let text = String::from_utf16_lossy(&title[..len as usize]);
         state.windows.push((hwnd as isize, pid, text));
         1
+    }
+
+    struct EnumModalState {
+        top: isize,
+        dialogs: Vec<(isize, String)>,
+    }
+
+    unsafe extern "system" fn enum_modal_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut EnumModalState) };
+        if unsafe { IsWindowVisible(hwnd) } == 0
+            || unsafe { GetWindow(hwnd, GW_OWNER) } as isize != state.top
+        {
+            return 1;
+        }
+        let mut title = [0u16; 256];
+        let len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        if len > 0 {
+            state.dialogs.push((
+                hwnd as isize,
+                String::from_utf16_lossy(&title[..len as usize]),
+            ));
+        }
+        1
+    }
+
+    struct EnumRecoveryState {
+        dialogs: Vec<isize>,
+    }
+
+    unsafe extern "system" fn enum_recovery_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut EnumRecoveryState) };
+        if auto_recovery_pid(hwnd).is_some() {
+            state.dialogs.push(hwnd as isize);
+        }
+        1
+    }
+
+    fn studio_window_pid(hwnd: HWND) -> Option<u32> {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        process_executable_path(pid)
+            .ok()
+            .is_some_and(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+            })
+            .then_some(pid)
+    }
+
+    fn auto_recovery_pid(hwnd: HWND) -> Option<u32> {
+        if unsafe { IsWindowVisible(hwnd) } == 0 {
+            return None;
+        }
+        let mut title = [0u16; 256];
+        let len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        if len <= 0 || String::from_utf16_lossy(&title[..len as usize]) != "Auto-Recovery" {
+            return None;
+        }
+        studio_window_pid(hwnd)
+    }
+
+    fn dismiss_auto_recovery_dialog(hwnd: HWND) -> bool {
+        if auto_recovery_pid(hwnd).is_none() {
+            return false;
+        }
+        let mut result = 0;
+        if unsafe { SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 500, &mut result) }
+            == 0
+        {
+            return false;
+        }
+        auto_recovery_pid(hwnd).is_none()
+    }
+
+    fn dismiss_auto_recovery_until_closed(hwnd: HWND) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline && unsafe { IsWindow(hwnd) } != 0 {
+            if dismiss_auto_recovery_dialog(hwnd) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    unsafe extern "system" fn recovery_event_proc(
+        _hook: *mut core::ffi::c_void,
+        event: u32,
+        hwnd: HWND,
+        object: i32,
+        child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        if event == EVENT_OBJECT_SHOW && object == OBJID_WINDOW && child == CHILDID_SELF as i32 {
+            if dismiss_auto_recovery_dialog(hwnd)
+                || unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
+                || studio_window_pid(hwnd).is_none()
+            {
+                return;
+            }
+            let window = hwnd as isize;
+            std::thread::spawn(move || dismiss_auto_recovery_until_closed(window as HWND));
+        }
+    }
+
+    fn modal_dialogs(top: isize) -> Vec<(isize, String)> {
+        let mut state = EnumModalState {
+            top,
+            dialogs: Vec::new(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(enum_modal_proc),
+                &mut state as *mut EnumModalState as LPARAM,
+            );
+        }
+        state.dialogs
+    }
+
+    fn dismiss_auto_recovery_dialogs() {
+        let mut state = EnumRecoveryState {
+            dialogs: Vec::new(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(enum_recovery_proc),
+                &mut state as *mut EnumRecoveryState as LPARAM,
+            );
+        }
+        for dialog in state.dialogs {
+            dismiss_auto_recovery_until_closed(dialog as HWND);
+        }
+    }
+
+    pub fn watch_auto_recovery_dialogs() {
+        dismiss_auto_recovery_dialogs();
+        std::thread::spawn(|| {
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_SHOW,
+                    EVENT_OBJECT_SHOW,
+                    std::ptr::null_mut(),
+                    Some(recovery_event_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if hook.is_null() {
+                return;
+            }
+            let mut message = unsafe { std::mem::zeroed::<MSG>() };
+            while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
+            unsafe {
+                UnhookWinEvent(hook);
+            }
+        });
+    }
+
+    fn ensure_input_unblocked(viewport: isize) -> Result<()> {
+        let top = unsafe { GetAncestor(viewport as HWND, GA_ROOT) };
+        if top.is_null() {
+            bail!("Studio input window no longer exists")
+        }
+        if unsafe { IsWindowEnabled(top) } != 0 {
+            return Ok(());
+        }
+        let dialogs = modal_dialogs(top as isize);
+        if let Some((dialog, _)) = dialogs.iter().find(|(_, title)| title == "Auto-Recovery") {
+            let mut result = 0;
+            unsafe {
+                SendMessageTimeoutW(
+                    *dialog as HWND,
+                    WM_CLOSE,
+                    0,
+                    0,
+                    SMTO_ABORTIFHUNG,
+                    500,
+                    &mut result,
+                );
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while unsafe { IsWindowEnabled(top) } == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if unsafe { IsWindowEnabled(top) } != 0 {
+                return Ok(());
+            }
+        }
+        let titles = modal_dialogs(top as isize)
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect::<Vec<_>>();
+        bail!(
+            "Studio input is blocked by {}",
+            if titles.is_empty() {
+                "an open dialog".to_string()
+            } else {
+                format!("open dialog: {}", titles.join(", "))
+            }
+        )
     }
 
     struct EnumChildState {
@@ -432,6 +634,7 @@ mod platform {
     }
 
     fn viewport_child(top: isize, viewport: Option<(i32, i32)>) -> Result<WindowHandle> {
+        ensure_input_unblocked(top)?;
         let (viewport_width, viewport_height) =
             viewport.context("Client viewport size is unavailable")?;
         let mut state = EnumChildState {
@@ -450,16 +653,14 @@ mod platform {
                 );
             }
         }
-        let target = if state.render != 0 {
-            state.render
-        } else {
+        if state.render == 0 {
             bail!(
                 "No Studio child window matches the client viewport {viewport_width}x{viewport_height}"
             )
-        };
+        }
         Ok(WindowHandle {
-            viewport: target,
-            capture: target,
+            viewport: state.render,
+            capture: state.render,
             capture_verified: false,
             verified_frame: None,
             offset_x: 0,
@@ -771,6 +972,39 @@ mod platform {
             .with_context(|| format!("No Studio window found for process {pid}"))
     }
 
+    fn restore_window_at_bottom(hwnd: isize) -> Result<()> {
+        unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+        let bottom = 1usize as HWND;
+        if unsafe {
+            SetWindowPos(
+                hwnd as HWND,
+                bottom,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        } == 0
+        {
+            bail!("Could not restore the Studio window behind other applications");
+        }
+        Ok(())
+    }
+
+    pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
+        let (hwnd, _, _) = windows_for_pid(pid)
+            .into_iter()
+            .find(|(hwnd, _, title)| {
+                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+            })
+            .with_context(|| format!("No Studio window found for process {pid}"))?;
+        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+            restore_window_at_bottom(hwnd)?;
+        }
+        Ok(())
+    }
+
     pub fn terminate_studio_process(pid: u32) -> Result<()> {
         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
         if handle.is_null() {
@@ -788,21 +1022,7 @@ mod platform {
         Ok(())
     }
 
-    pub struct ReminimizeGuard {
-        top: isize,
-    }
-
-    impl Drop for ReminimizeGuard {
-        fn drop(&mut self) {
-            unsafe { ShowWindow(self.top as HWND, SW_SHOWMINNOACTIVE) };
-        }
-    }
-
-    pub fn window_for_pid(
-        pid: u32,
-        viewport: Option<(i32, i32)>,
-        restore_minimized: bool,
-    ) -> Result<StudioWindow> {
+    pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
         let (hwnd, pid, title) = windows_for_pid(pid)
             .into_iter()
             .max_by_key(|(hwnd, _, _)| {
@@ -811,11 +1031,8 @@ mod platform {
                     .unwrap_or_default()
             })
             .with_context(|| format!("No visible window found for Studio process {pid}"))?;
-        let reminimize = if unsafe { IsIconic(hwnd as HWND) } != 0 {
-            if !restore_minimized {
-                bail!("The selected Studio window is minimized; restore it before recording");
-            }
-            unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+            restore_window_at_bottom(hwnd)?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(150));
@@ -824,22 +1041,17 @@ mod platform {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-            Some(ReminimizeGuard { top: hwnd })
-        } else {
-            None
-        };
+        }
         let handle = viewport_child(hwnd, viewport)?;
         Ok(StudioWindow {
             label: format!("pid {pid}: {title}"),
             handle,
-            _reminimize: reminimize,
         })
     }
 
     pub fn verified_studio_window_for_pid<F>(
         pid: u32,
         set_probe_phase: &mut F,
-        restore_minimized: bool,
     ) -> Result<StudioWindow>
     where
         F: FnMut(u8, &[u32]) -> Result<()>,
@@ -850,16 +1062,10 @@ mod platform {
                 window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
             })
             .with_context(|| format!("No visible Studio window found for process {pid}"))?;
-        let reminimize = if unsafe { IsIconic(hwnd as HWND) } != 0 {
-            if !restore_minimized {
-                bail!("The selected Studio window is minimized; restore it before recording");
-            }
-            unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+            restore_window_at_bottom(hwnd)?;
             std::thread::sleep(std::time::Duration::from_millis(400));
-            Some(ReminimizeGuard { top: hwnd })
-        } else {
-            None
-        };
+        }
         let mut probe_started = false;
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -961,7 +1167,6 @@ mod platform {
         Ok(StudioWindow {
             label: format!("verified viewport for pid {pid}: {title}"),
             handle,
-            _reminimize: reminimize,
         })
     }
 
@@ -972,7 +1177,7 @@ mod platform {
     }
 
     fn send(hwnd: isize, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
-        let _yield = windows_shield::yield_mouse(hwnd, msg);
+        ensure_input_unblocked(hwnd)?;
         let mut result = 0;
         let ok = unsafe {
             SendMessageTimeoutW(
@@ -1033,10 +1238,15 @@ mod platform {
         hold_ms: u64,
     ) -> Result<()> {
         let hold = std::time::Duration::from_millis(hold_ms.clamp(10, 2000));
-        post_mouse_move(handle, x, y)?;
-        post_mouse_button(handle, x, y, right, true)?;
+        send(handle.viewport, WM_MOUSEMOVE, 0, mouse_lparam(handle, x, y))?;
+        let (down, up, state) = if right {
+            (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON)
+        } else {
+            (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON)
+        };
+        send(handle.viewport, down, state, mouse_lparam(handle, x, y))?;
         std::thread::sleep(hold);
-        post_mouse_button(handle, x, y, right, false)
+        send(handle.viewport, up, 0, mouse_lparam(handle, x, y))
     }
 
     pub fn post_key_state(handle: &WindowHandle, key: &super::KeySpec, down: bool) -> Result<()> {
@@ -1393,11 +1603,7 @@ mod platform {
         };
     }
 
-    pub fn window_for_pid(
-        pid: u32,
-        viewport: Option<(i32, i32)>,
-        _restore_minimized: bool,
-    ) -> Result<StudioWindow> {
+    pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
         let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
         let mut records = studio_window_records(false)?
             .into_iter()

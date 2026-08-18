@@ -590,10 +590,15 @@ pub(crate) fn absolutize_under(root: &Path, path: &Path) -> PathBuf {
 }
 
 pub(crate) fn absolutize_for_daemon(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    absolute
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 pub(crate) fn validate_filesystem_instance_name(raw: &str, label: &str) -> Result<()> {

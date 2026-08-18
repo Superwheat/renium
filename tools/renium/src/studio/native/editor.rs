@@ -2339,27 +2339,24 @@ pub(crate) fn send_editor_change_batches(
         }
     }
 
-    let source_changes = changes
-        .source_changes
-        .iter()
-        .filter(|_| binary_import.is_none())
-        .collect::<Vec<_>>();
     summary.insert(
         "sourceSent".to_string(),
-        Value::Number(serde_json::Number::from(source_changes.len() as u64)),
+        Value::Number(serde_json::Number::from(changes.source_changes.len() as u64)),
     );
-    for source_batch in source_changes.chunks(SOURCE_BATCH_SIZE) {
-        let result = bridge.call(
-            "applyEditorChanges",
-            json!({
-                "probeEvents": probe_events,
-                "instanceChanges": [],
-                "sourceChanges": source_batch,
-                "propertyChanges": [],
-                "transactionId": transaction_id,
-            }),
-        )?;
-        merge_editor_summary_checked(&mut summary, &result)?;
+    if binary_import.is_none() {
+        for source_batch in changes.source_changes.chunks(SOURCE_BATCH_SIZE) {
+            let result = bridge.call(
+                "applyEditorChanges",
+                json!({
+                    "probeEvents": probe_events,
+                    "instanceChanges": [],
+                    "sourceChanges": source_batch,
+                    "propertyChanges": [],
+                    "transactionId": transaction_id,
+                }),
+            )?;
+            merge_editor_summary_checked(&mut summary, &result)?;
+        }
     }
 
     let mut property_changes = Vec::new();

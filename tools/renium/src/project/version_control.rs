@@ -9,8 +9,9 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
 use crate::bytecode::edit::next_editor_settings_id_fast;
+use crate::bytecode::stabilize_reference_output;
 use crate::cli::args::{VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs};
-use crate::editor::paths::build_editor_source_paths_by_index;
+use crate::editor::paths::{build_editor_instance_path_parts, build_editor_source_paths_by_index};
 use crate::editor::sync::is_lua_source_class;
 use crate::project::package_links::RENIUM_DIR_GITIGNORE;
 use crate::rbx::model::read_settings_model_document;
@@ -27,9 +28,13 @@ use crate::system::tools::run_git_checked;
 const VC_GITATTRIBUTES_TEMPLATE: &str = "\
 # Renium project version-control policy (written by `renium vc-init`).
 * text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.renium/.gitignore text eol=lf
 *.lua text eol=lf
 *.luau text eol=lf
 *.json text eol=lf
+*.jsonc text eol=lf
 *.toml text eol=lf
 *.md text eol=lf
 *.rbxmx text eol=lf
@@ -76,55 +81,61 @@ fn read_optional_text(path: &Path) -> Result<String> {
     }
 }
 
+fn append_missing_lines<'a>(
+    path: &Path,
+    heading: Option<&str>,
+    required: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<&'a str>> {
+    let existing = read_optional_text(path)?;
+    let existing_lines = existing.lines().map(str::trim).collect::<HashSet<_>>();
+    let missing = required
+        .into_iter()
+        .filter(|line| !existing_lines.contains(line.trim()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+
+    let mut output = existing;
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    if let Some(heading) = heading {
+        output.push_str(heading);
+        output.push('\n');
+    }
+    for line in &missing {
+        output.push_str(line);
+        output.push('\n');
+    }
+    fs::write(path, output).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(missing)
+}
+
 pub(crate) fn vc_init(args: VcInitArgs) -> Result<()> {
     let project_root = resolve_link_project_root(&args.project_root)?;
 
     let attributes_path = project_root.join(".gitattributes");
-    let wrote_gitattributes = if attributes_path.exists() {
-        false
-    } else {
-        fs::write(&attributes_path, VC_GITATTRIBUTES_TEMPLATE)
-            .with_context(|| format!("Failed to write {}", attributes_path.display()))?;
-        true
-    };
+    let wrote_gitattributes =
+        !append_missing_lines(&attributes_path, None, VC_GITATTRIBUTES_TEMPLATE.lines())?
+            .is_empty();
 
     let ignore_path = project_root.join(".gitignore");
-    let existing_ignore = read_optional_text(&ignore_path)?;
-    let existing_lines: HashSet<&str> = existing_ignore.lines().map(str::trim).collect();
-    let added_ignore_lines: Vec<&str> = VC_GITIGNORE_LINES
-        .iter()
-        .copied()
-        .filter(|line| !existing_lines.contains(line))
-        .collect();
-    if !added_ignore_lines.is_empty() {
-        let mut out = existing_ignore.clone();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("# Renium version control (added by `renium vc-init`)\n");
-        for line in &added_ignore_lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        fs::write(&ignore_path, out)
-            .with_context(|| format!("Failed to write {}", ignore_path.display()))?;
-    }
+    let added_ignore_lines = append_missing_lines(
+        &ignore_path,
+        Some("# Renium version control (added by `renium vc-init`)"),
+        VC_GITIGNORE_LINES.iter().copied(),
+    )?;
 
     let renium_dir = project_root.join(".renium");
     fs::create_dir_all(&renium_dir)
         .with_context(|| format!("Failed to create {}", renium_dir.display()))?;
     let renium_ignore_path = renium_dir.join(".gitignore");
-    let current_renium_ignore = read_optional_text(&renium_ignore_path)?;
-    let renium_ignore_updated = if current_renium_ignore.is_empty() {
-        fs::write(&renium_ignore_path, RENIUM_DIR_GITIGNORE)
-            .with_context(|| format!("Failed to write {}", renium_ignore_path.display()))?;
-        true
-    } else {
-        false
-    };
+    let renium_ignore_updated =
+        !append_missing_lines(&renium_ignore_path, None, RENIUM_DIR_GITIGNORE.lines())?.is_empty();
 
     let mut git_initialized = false;
     let mut git_configured = false;
@@ -178,7 +189,7 @@ pub(crate) fn vc_init(args: VcInitArgs) -> Result<()> {
             &[
                 "config",
                 "merge.renium.driver",
-                &format!("{exe} vc-merge %O %A %B --path %P"),
+                &format!("{exe} vc-merge \"%O\" \"%A\" \"%B\" --path \"%P\""),
             ],
             &project_root,
         )?;
@@ -236,6 +247,19 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
         document.version,
         document.instances.len()
     );
+    let service = document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.as_str())
+        .unwrap_or_default();
+    let (path_segments_by_index, path_ordinals_by_index) =
+        build_editor_instance_path_parts(document, service);
+    let canonical_settings_ids_by_index = document
+        .instances
+        .iter()
+        .map(|instance| Some(instance.settings_id.clone()))
+        .collect::<Vec<_>>();
     let mut stack: Vec<(usize, String)> = Vec::new();
     for root in children
         .get(&None)
@@ -258,7 +282,15 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
             "= {path} [{}] id={}",
             instance.class_name, instance.settings_id
         );
-        let mut properties: Vec<(&String, &Value)> = instance.properties.iter().collect();
+        let mut property_record = instance.properties.clone();
+        stabilize_reference_output(
+            document,
+            &path_segments_by_index,
+            &path_ordinals_by_index,
+            &canonical_settings_ids_by_index,
+            &mut property_record,
+        );
+        let mut properties: Vec<(&String, &Value)> = property_record.iter().collect();
         properties.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in properties {
             if key == "Source"
@@ -275,7 +307,15 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
             }
             let _ = writeln!(out, "  {key} = {value}");
         }
-        let mut attributes: Vec<(&String, &Value)> = instance.attributes.iter().collect();
+        let mut attribute_record = instance.attributes.clone();
+        stabilize_reference_output(
+            document,
+            &path_segments_by_index,
+            &path_ordinals_by_index,
+            &canonical_settings_ids_by_index,
+            &mut attribute_record,
+        );
+        let mut attributes: Vec<(&String, &Value)> = attribute_record.iter().collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in attributes {
             let _ = writeln!(out, "  @{key} = {value}");
@@ -301,14 +341,17 @@ pub(crate) fn vc_textconv(args: VcTextconvArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_view_node(
-    document: &SettingsBytecode,
-    children_by_parent: &[Vec<usize>],
-    source_paths: &[Option<PathBuf>],
-    index: usize,
-    visited: &mut HashSet<usize>,
-) -> Value {
-    let instance = &document.instances[index];
+struct ViewTree<'a> {
+    document: &'a SettingsBytecode,
+    children_by_parent: &'a [Vec<usize>],
+    source_paths: &'a [Option<PathBuf>],
+    path_segments_by_index: &'a [Option<Vec<String>>],
+    path_ordinals_by_index: &'a [Option<Vec<usize>>],
+    canonical_settings_ids_by_index: &'a [Option<String>],
+}
+
+fn build_view_node(tree: &ViewTree<'_>, index: usize, visited: &mut HashSet<usize>) -> Value {
+    let instance = &tree.document.instances[index];
     let mut node = Map::new();
     node.insert("name".into(), json!(instance.name));
     node.insert("className".into(), json!(instance.class_name));
@@ -321,33 +364,39 @@ fn build_view_node(
         .collect();
     properties.sort_by(|a, b| a.0.cmp(b.0));
     if !properties.is_empty() {
-        node.insert(
-            "properties".into(),
-            Value::Object(
-                properties
-                    .into_iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+        let mut properties = properties
+            .into_iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Map<String, Value>>();
+        stabilize_reference_output(
+            tree.document,
+            tree.path_segments_by_index,
+            tree.path_ordinals_by_index,
+            tree.canonical_settings_ids_by_index,
+            &mut properties,
         );
+        node.insert("properties".into(), Value::Object(properties));
     }
     if !instance.attributes.is_empty() {
         let mut attributes: Vec<(&String, &Value)> = instance.attributes.iter().collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
-        node.insert(
-            "attributes".into(),
-            Value::Object(
-                attributes
-                    .into_iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+        let mut attributes = attributes
+            .into_iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Map<String, Value>>();
+        stabilize_reference_output(
+            tree.document,
+            tree.path_segments_by_index,
+            tree.path_ordinals_by_index,
+            tree.canonical_settings_ids_by_index,
+            &mut attributes,
         );
+        node.insert("attributes".into(), Value::Object(attributes));
     }
     if is_lua_source_class(&instance.class_name) {
         if let Some(source) = instance.properties.get("Source").and_then(Value::as_str) {
             node.insert("source".into(), json!(source));
-        } else if let Some(Some(path)) = source_paths.get(index)
+        } else if let Some(Some(path)) = tree.source_paths.get(index)
             && let Ok(source) = fs::read_to_string(path)
         {
             node.insert("source".into(), json!(source));
@@ -355,16 +404,10 @@ fn build_view_node(
     }
 
     let mut children = Vec::new();
-    if let Some(kids) = children_by_parent.get(index) {
+    if let Some(kids) = tree.children_by_parent.get(index) {
         for &kid in kids {
             if visited.insert(kid) {
-                children.push(build_view_node(
-                    document,
-                    children_by_parent,
-                    source_paths,
-                    kid,
-                    visited,
-                ));
+                children.push(build_view_node(tree, kid, visited));
             }
         }
     }
@@ -377,29 +420,36 @@ fn build_view_node(
 
 pub(crate) fn settings_doc_to_json_tree(document: &SettingsBytecode, file: &Path) -> Value {
     let children_by_parent = settings_children_by_parent(document);
+    let service = document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.clone())
+        .unwrap_or_default();
+    let (path_segments_by_index, path_ordinals_by_index) =
+        build_editor_instance_path_parts(document, &service);
+    let canonical_settings_ids_by_index = document
+        .instances
+        .iter()
+        .map(|instance| Some(instance.settings_id.clone()))
+        .collect::<Vec<_>>();
     let source_paths = match file.parent() {
-        Some(dir) => {
-            let service = document
-                .instances
-                .iter()
-                .find(|instance| instance.parent_index.is_none())
-                .map(|instance| instance.name.clone())
-                .unwrap_or_default();
-            build_editor_source_paths_by_index(document, &service, dir)
-        }
+        Some(dir) => build_editor_source_paths_by_index(document, &service, dir),
         None => vec![None; document.instances.len()],
+    };
+    let tree = ViewTree {
+        document,
+        children_by_parent: &children_by_parent,
+        source_paths: &source_paths,
+        path_segments_by_index: &path_segments_by_index,
+        path_ordinals_by_index: &path_ordinals_by_index,
+        canonical_settings_ids_by_index: &canonical_settings_ids_by_index,
     };
     let mut visited: HashSet<usize> = HashSet::new();
     let mut roots = Vec::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if instance.parent_index.is_none() && visited.insert(index) {
-            roots.push(build_view_node(
-                document,
-                &children_by_parent,
-                &source_paths,
-                index,
-                &mut visited,
-            ));
+            roots.push(build_view_node(&tree, index, &mut visited));
         }
     }
     json!({
@@ -973,7 +1023,7 @@ pub(crate) fn vc_merge(args: VcMergeArgs) -> Result<()> {
             );
         }
         bail!(
-            "{} merge conflict(s) in {label}. Re-run with --prefer ours|theirs, or resolve the listed properties manually and retry.",
+            "{} merge conflict(s) in {label}. Re-run with --prefer ours|theirs, or resolve the listed fields manually and retry.",
             conflicts.len()
         );
     }

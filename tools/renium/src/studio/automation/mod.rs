@@ -12,8 +12,8 @@ use crate::app::timing::current_millis;
 use crate::automation::op;
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
-    ListClientsArgs, PressArgs, ShotArgs, StartStopPlayArgs, StudioChangeStateArgs,
-    StudioDeviceArgs, TestArgs, TypeArgs, UiArgs, WaitUntilArgs,
+    ListClientsArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs, StartStopPlayArgs,
+    StudioChangeStateArgs, StudioDeviceArgs, TestArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
 use crate::daemon::try_daemon_control_request;
 use crate::snapshot::export::parse_bridge_ports;
@@ -40,7 +40,10 @@ fn console_entry_level(entry: &Value) -> &str {
         .unwrap_or("output")
 }
 
-pub(crate) fn execute_luau_command(args: ExecuteLuauArgs) -> Result<()> {
+pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
+    if args.code.is_none() {
+        args.code = args.inline_code.take();
+    }
     let parameters = json!({
         "code": args.code,
         "file": args.file,
@@ -83,7 +86,7 @@ pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
 }
 
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
-    let code = if let Some(code) = args.code {
+    let code = if let Some(code) = args.code.or(args.inline_code) {
         code
     } else if let Some(path) = args.file {
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?
@@ -120,6 +123,7 @@ pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
         "scalingMode": args.scaling_mode,
         "resolution": args.resolution,
         "pixelDensity": args.pixel_density,
+        "details": args.details,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
@@ -190,6 +194,9 @@ pub(crate) fn studio_device_result(
             bail!("Pixel density must be a finite number greater than zero");
         }
         params.insert("pixelDensity".to_string(), json!(pixel_density));
+    }
+    if args.details {
+        params.insert("details".to_string(), Value::Bool(true));
     }
     let result =
         bridge.call_for_target("deviceSimulator", Value::Object(params), BridgeTarget::Edit)?;
@@ -294,7 +301,7 @@ pub(crate) fn studio_change_state_result(
             "reset": args.reset,
             "replaceServices": args.replace_services,
             "clearPending": args.clear_pending,
-            "start": !args.no_start,
+            "start": !args.no_start && !args.clear_pending,
             "stop": args.stop,
             "ackSeq": args.ack_seq,
             "ackRuntimeSettingsSeq": args.ack_runtime_settings_seq,
@@ -546,6 +553,7 @@ fn resolve_player_window(
     viewport: Option<(i32, i32)>,
 ) -> Result<(input_inject::StudioWindow, i32, i32)> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+    let viewport = recover_client_viewport(bridge, player, pid, viewport)?;
     let window = input_inject::window_for_pid(pid, viewport)?;
     Ok((window, 0, 0))
 }
@@ -556,10 +564,46 @@ fn client_viewport_size(bridge: &BridgeServer, player: Option<&str>) -> Option<(
         .ok()?;
     let width = result.get("viewportWidth").and_then(Value::as_f64)?;
     let height = result.get("viewportHeight").and_then(Value::as_f64)?;
-    if width < 1.0 || height < 1.0 {
-        return None;
-    }
     Some((width.round() as i32, height.round() as i32))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn result_viewport_size(result: &Value) -> Option<(i32, i32)> {
+    let width = result.get("viewportWidth").and_then(Value::as_f64)?;
+    let height = result.get("viewportHeight").and_then(Value::as_f64)?;
+    Some((width.round() as i32, height.round() as i32))
+}
+
+#[cfg(windows)]
+fn recover_client_viewport(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+    pid: u32,
+    mut viewport: Option<(i32, i32)>,
+) -> Result<Option<(i32, i32)>> {
+    if !viewport.is_some_and(|(width, height)| width <= 1 || height <= 1) {
+        return Ok(viewport);
+    }
+    input_inject::recover_stalled_window_for_pid(pid)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+        viewport = client_viewport_size(bridge, player);
+        if viewport.is_some_and(|(width, height)| width > 1 && height > 1) {
+            break;
+        }
+    }
+    Ok(viewport)
+}
+
+#[cfg(target_os = "macos")]
+fn recover_client_viewport(
+    _bridge: &BridgeServer,
+    _player: Option<&str>,
+    _pid: u32,
+    viewport: Option<(i32, i32)>,
+) -> Result<Option<(i32, i32)>> {
+    Ok(viewport)
 }
 
 #[cfg(windows)]
@@ -630,7 +674,9 @@ fn resolve_client_capture_window(
     player: Option<&str>,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
-    input_inject::recording_window_for_pid(pid, client_viewport_size(bridge, player))
+    let viewport = client_viewport_size(bridge, player);
+    let viewport = recover_client_viewport(bridge, player, pid, viewport)?;
+    input_inject::window_for_pid(pid, viewport)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -679,7 +725,7 @@ fn studio_capture_status(bridge: &BridgeServer) -> Option<Value> {
     let result = bridge
         .call_for_target(
             "deviceSimulator",
-            json!({ "action": "status" }),
+            json!({ "action": "status", "includeSettle": true }),
             BridgeTarget::Edit,
         )
         .ok()?;
@@ -743,13 +789,27 @@ fn gui_input_bounds(
     id: Option<&str>,
     requested: &str,
 ) -> Result<(Value, f64, f64)> {
-    let bounds = bridge.call_for_selector(
-        "getGuiBounds",
-        json!({ "path": path, "id": id, "scroll": true }),
-        BridgeTarget::Client,
-        player,
-    )?;
+    let read = || {
+        bridge.call_for_selector(
+            "getGuiBounds",
+            json!({ "path": path, "id": id, "scroll": true }),
+            BridgeTarget::Client,
+            player,
+        )
+    };
+    let bounds = read()?;
     ensure_plugin_api_ok(&bounds)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let bounds =
+        if result_viewport_size(&bounds).is_some_and(|(width, height)| width <= 1 || height <= 1) {
+            let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+            recover_client_viewport(bridge, player, pid, result_viewport_size(&bounds))?;
+            let bounds = read()?;
+            ensure_plugin_api_ok(&bounds)?;
+            bounds
+        } else {
+            bounds
+        };
     let subject = bounds
         .get("fullName")
         .and_then(Value::as_str)
@@ -786,13 +846,28 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         .context("Provide a GUI path or --id")?;
     let (bounds, x, y) = if args.world {
         let path = args.path.as_deref().context("--world requires a path")?;
-        let bounds = bridge.call_for_selector(
-            "getWorldPoint",
-            json!({ "path": path }),
-            BridgeTarget::Client,
-            player,
-        )?;
+        let read = || {
+            bridge.call_for_selector(
+                "getWorldPoint",
+                json!({ "path": path }),
+                BridgeTarget::Client,
+                player,
+            )
+        };
+        let bounds = read()?;
         ensure_plugin_api_ok(&bounds)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let bounds = if result_viewport_size(&bounds)
+            .is_some_and(|(width, height)| width <= 1 || height <= 1)
+        {
+            let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+            recover_client_viewport(bridge, player, pid, result_viewport_size(&bounds))?;
+            let bounds = read()?;
+            ensure_plugin_api_ok(&bounds)?;
+            bounds
+        } else {
+            bounds
+        };
         if bounds.get("onScreen").and_then(Value::as_bool) == Some(false) {
             let subject = bounds
                 .get("fullName")
@@ -857,7 +932,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
             args.right,
             args.hold,
         )?;
-        result["input"] = json!("os");
+        result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -867,7 +942,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
             player,
             virtual_click_actions(x.round() as i32, y.round() as i32, args.right, args.hold),
         )?;
-        result["input"] = json!("virtual");
+        result["inputMethod"] = json!("virtual");
     }
     Ok(result)
 }
@@ -897,7 +972,7 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
             args.right,
             args.hold,
         )?;
-        result["input"] = json!("os");
+        result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -907,7 +982,7 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
             player,
             virtual_click_actions(args.x, args.y, args.right, args.hold),
         )?;
-        result["input"] = json!("virtual");
+        result["inputMethod"] = json!("virtual");
     }
     Ok(result)
 }
@@ -918,10 +993,12 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
     let key = input_inject::resolve_key(&args.key)?;
+    let hold_ms = args.hold_ms.clamp(10, 2000);
     let mut result = json!({
         "ok": true,
         "action": "key",
         "key": key.name,
+        "holdMs": hold_ms,
     });
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -929,8 +1006,8 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
         #[cfg(any(windows, target_os = "macos"))]
         let _shield = input_inject::input_shield(&window)?;
-        input_inject::post_key(&window, &key, args.hold_ms)?;
-        result["input"] = json!("os");
+        input_inject::post_key(&window, &key, hold_ms)?;
+        result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -940,11 +1017,11 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
             player,
             vec![
                 json!({ "type": "key", "key": key.name, "down": true }),
-                json!({ "type": "wait", "ms": args.hold_ms.min(10_000) }),
+                json!({ "type": "wait", "ms": hold_ms }),
                 json!({ "type": "key", "key": key.name, "down": false }),
             ],
         )?;
-        result["input"] = json!("virtual");
+        result["inputMethod"] = json!("virtual");
     }
     Ok(result)
 }
@@ -954,13 +1031,32 @@ pub(crate) fn ui_result(args: &UiArgs, bridge: &BridgeServer) -> Result<Value> {
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let result = bridge.call_for_selector(
-        "getGuiInventory",
-        json!({ "limit": args.limit, "includeOffscreen": args.include_offscreen }),
-        BridgeTarget::Client,
-        player,
-    )?;
+    let read = || {
+        bridge.call_for_selector(
+            "getGuiInventory",
+            json!({ "limit": args.limit, "includeOffscreen": args.include_offscreen }),
+            BridgeTarget::Client,
+            player,
+        )
+    };
+    let result = read()?;
     ensure_plugin_api_ok(&result)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let result =
+        if !args.include_offscreen && result.get("count").and_then(Value::as_u64) == Some(0) {
+            let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+            let viewport = client_viewport_size(bridge, player);
+            if viewport.is_some_and(|(width, height)| width <= 1 || height <= 1) {
+                recover_client_viewport(bridge, player, pid, viewport)?;
+                let result = read()?;
+                ensure_plugin_api_ok(&result)?;
+                result
+            } else {
+                result
+            }
+        } else {
+            result
+        };
     Ok(result)
 }
 
@@ -1004,7 +1100,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             "chars": args.text.chars().count(),
             "focused": pressed,
             "enter": args.enter,
-            "input": "os",
+            "inputMethod": "os",
             "window": window.label,
         }))
     }
@@ -1041,7 +1137,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             "chars": args.text.chars().count(),
             "focused": pressed,
             "enter": args.enter,
-            "input": "virtual",
+            "inputMethod": "virtual",
         }))
     }
 }
@@ -1072,7 +1168,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
         condition = args.condition,
     );
     match run_console_task(bridge, target, player, client, &code, &token, timeout + 5.0)? {
-        ConsoleTaskOutcome::True(elapsed) => Ok(json!({
+        ConsoleTaskOutcome::True { elapsed, .. } => Ok(json!({
             "ok": true,
             "action": "wait",
             "condition": args.condition,
@@ -1085,7 +1181,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
 }
 
 enum ConsoleTaskOutcome {
-    True(f64),
+    True { elapsed: f64, detail: String },
     End(String),
 }
 
@@ -1125,6 +1221,7 @@ fn run_console_task(
         .map(str::to_string);
     let outcome = (|| -> Result<ConsoleTaskOutcome> {
         let true_marker = format!("{token}_TRUE");
+        let true_prefix = format!("{true_marker} ");
         let end_marker = format!("{token}_END");
         let end_prefix = format!("{end_marker} ");
         let started = Instant::now();
@@ -1153,10 +1250,20 @@ fn run_console_task(
                     let Some(message) = entry.get("message").and_then(Value::as_str) else {
                         continue;
                     };
-                    if message.trim() == true_marker {
-                        return Ok(ConsoleTaskOutcome::True(started.elapsed().as_secs_f64()));
+                    let message = message.trim();
+                    if message == true_marker {
+                        return Ok(ConsoleTaskOutcome::True {
+                            elapsed: started.elapsed().as_secs_f64(),
+                            detail: String::new(),
+                        });
                     }
-                    if let Some(rest) = message.trim().strip_prefix(&end_prefix) {
+                    if let Some(rest) = message.strip_prefix(&true_prefix) {
+                        return Ok(ConsoleTaskOutcome::True {
+                            elapsed: started.elapsed().as_secs_f64(),
+                            detail: rest.trim_end().to_string(),
+                        });
+                    }
+                    if let Some(rest) = message.strip_prefix(&end_prefix) {
                         return Ok(ConsoleTaskOutcome::End(rest.trim_end().to_string()));
                     }
                 }
@@ -1184,6 +1291,8 @@ fn run_console_task(
 }
 
 pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Value> {
+    const ARRIVAL_RADIUS: f64 = 8.0;
+
     let player = args.player.as_deref();
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
@@ -1251,25 +1360,26 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
         format!(
             "\tch:PivotTo(CFrame.new(targetPos + Vector3.new(0, 4, 0)))\n\
              \tlocal dist = (ch:GetPivot().Position - targetPos).Magnitude\n\
-             \tif dist < 8 then print('{token}_TRUE') return end\n\
+             \tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
              \tprint('{token}_END dist=' .. tostring(math.floor(dist + 0.5)))"
         )
     } else {
         format!(
             "\tlocal deadline = os.clock() + {timeout}\n\
-             \tlocal function arrived()\n\
-             \t\treturn (ch:GetPivot().Position - targetPos).Magnitude < 8\n\
+             \tlocal function distance()\n\
+             \t\treturn (ch:GetPivot().Position - targetPos).Magnitude\n\
              \tend\n\
              \tlocal PathfindingService = game:GetService('PathfindingService')\n\
              \twhile os.clock() < deadline do\n\
-             \t\tif arrived() then print('{token}_TRUE') return end\n\
+             \t\tlocal dist = distance()\n\
+             \t\tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
              \t\tlocal path = PathfindingService:CreatePath()\n\
              \t\tlocal okCompute = pcall(function()\n\
              \t\t\tpath:ComputeAsync(ch:GetPivot().Position, targetPos)\n\
              \t\tend)\n\
              \t\tif okCompute and path.Status == Enum.PathStatus.Success then\n\
              \t\t\tfor _, waypoint in ipairs(path:GetWaypoints()) do\n\
-             \t\t\t\tif os.clock() >= deadline or arrived() then break end\n\
+             \t\t\t\tif os.clock() >= deadline or distance() < {ARRIVAL_RADIUS} then break end\n\
              \t\t\t\tif waypoint.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end\n\
              \t\t\t\thum:MoveTo(waypoint.Position)\n\
              \t\t\t\tlocal reached = false\n\
@@ -1284,8 +1394,9 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
              \t\tend\n\
              \t\ttask.wait(0.2)\n\
              \tend\n\
-             \tif arrived() then print('{token}_TRUE') return end\n\
-             \tprint('{token}_END dist=' .. tostring(math.floor((ch:GetPivot().Position - targetPos).Magnitude + 0.5)))"
+             \tlocal dist = distance()\n\
+             \tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
+             \tprint('{token}_END dist=' .. tostring(math.floor(dist + 0.5)))"
         )
     };
     let code = format!(
@@ -1313,14 +1424,22 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
         &token,
         timeout + 5.0,
     )? {
-        ConsoleTaskOutcome::True(elapsed) => Ok(json!({
+        ConsoleTaskOutcome::True { elapsed, detail } => {
+            let final_distance = detail
+                .strip_prefix("dist=")
+                .and_then(|value| value.parse::<f64>().ok())
+                .context("Goto returned a malformed final distance")?;
+            Ok(json!({
             "ok": true,
             "action": if args.tp { "teleport" } else { "goto" },
             "target": label,
-        "position": [x, y, z],
+            "position": [x, y, z],
+            "arrivalRadius": ARRIVAL_RADIUS,
+            "finalDistance": final_distance,
             "speedMultiplier": speed_multiplier,
             "elapsedSeconds": elapsed,
-        })),
+            }))
+        }
         ConsoleTaskOutcome::End(detail) => bail!(
             "Character did not reach {label} within {timeout}s ({})",
             detail.trim()
@@ -1618,9 +1737,48 @@ pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
     )
 }
 
+pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
+    let result = try_daemon_control_request(
+        op::RECORD_START,
+        None,
+        json!({
+            "output": args.output,
+            "player": args.player,
+            "studio": args.studio,
+            "client": args.client,
+            "fps": args.fps,
+            "maxSeconds": args.max_seconds,
+            "quality": args.quality,
+        }),
+        false,
+    )?
+    .context("Recording requires an active Renium daemon")?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
+    let result = try_daemon_control_request(
+        op::RECORD_END,
+        None,
+        json!({
+            "recordingId": args.recording_id,
+        }),
+        false,
+    )?
+    .context("No Renium recording is active")?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     if let Some(result) = try_daemon_control_request(op::STUDIOS, None, json!({}), false)? {
-        println!("{}", serde_json::to_string(&compact_json(result))?);
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "clients": result.get("clients").cloned().unwrap_or(Value::Array(Vec::new()))
+            }))?
+        );
         return Ok(());
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
@@ -1802,9 +1960,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 "action": "stop",
                 "method": "pluginApi",
                 "attempts": attempt,
-                "stopResult": stop_result,
                 "status": last_status,
-                "clients": clients,
             }));
         }
     }

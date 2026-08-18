@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use crate::app::timing::quiet_timings;
 use crate::cli::args::GenerateSourcemapArgs;
 use crate::editor::paths::{infer_source_script, project_script_path};
 use crate::project::config;
@@ -88,7 +89,9 @@ fn write_sourcemap_root(project_root: &Path, mut root: SourcemapNode) -> Result<
     sort_sourcemap_root_children(&mut root);
     let output_file = project_root.join("sourcemap.json");
     write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
-    println!("[renium] wrote {}", output_file.display());
+    if !quiet_timings() {
+        println!("[renium] wrote {}", output_file.display());
+    }
     Ok(())
 }
 
@@ -121,7 +124,9 @@ pub(crate) fn finalize_project_sourcemap_temp(
     sort_sourcemap_root_children(&mut root);
     let output_file = project_root.join("sourcemap.json");
     write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
-    println!("[renium] wrote {}", output_file.display());
+    if !quiet_timings() {
+        println!("[renium] wrote {}", output_file.display());
+    }
     Ok(())
 }
 

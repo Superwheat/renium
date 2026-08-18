@@ -525,8 +525,8 @@ impl ExportProjectStage {
                         adapter.direction != config::AdapterDirection::ToProject,
                     )?;
                 }
-                if let Some(output) = adapter.output.as_ref() {
-                    clone_paths.push(output.clone());
+                if let Some(output) = config::project_adapter_output_path(loaded, adapter)? {
+                    clone_paths.push(output.strip_prefix(project_root)?.to_path_buf());
                 }
             }
         } else {
@@ -614,24 +614,16 @@ impl ExportProjectStage {
     pub(crate) fn preview_operations(&self, project_root: &Path) -> Result<Vec<Value>> {
         let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
         let current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        let adapter_paths = self
-            .loaded
-            .as_ref()
-            .map(|loaded| {
-                let mut paths = loaded
-                    .project
-                    .adapters
-                    .iter()
-                    .flat_map(|adapter| {
-                        [Some(adapter.source.clone()), adapter.output.clone()]
-                            .into_iter()
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>();
-                paths.push(PathBuf::from(".renium/adapter-baseline.json"));
-                paths
-            })
-            .unwrap_or_default();
+        let mut adapter_paths = Vec::new();
+        if let Some(loaded) = self.loaded.as_ref() {
+            for adapter in &loaded.project.adapters {
+                adapter_paths.push(adapter.source.clone());
+                if let Some(output) = config::project_adapter_output_path(loaded, adapter)? {
+                    adapter_paths.push(output.strip_prefix(&loaded.root)?.to_path_buf());
+                }
+            }
+            adapter_paths.push(PathBuf::from(".renium/adapter-baseline.json"));
+        }
         let paths = publish_operation_paths(&current, &staged);
         let mut operations = Vec::new();
         for relative in paths {
@@ -892,8 +884,8 @@ fn collect_nested_project_paths(
                 writable && adapter.direction != config::AdapterDirection::ToProject,
             )?;
         }
-        if let Some(output) = adapter.output.as_ref() {
-            clone_paths.push(relative(&loaded.root.join(output))?);
+        if let Some(output) = config::project_adapter_output_path(&loaded, adapter)? {
+            clone_paths.push(relative(&output)?);
         }
     }
     let baseline = loaded.root.join(".renium/adapter-baseline.json");
@@ -1195,6 +1187,15 @@ pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
         all_channels_connected_to_bridge_info_ms,
         ExportBridgeMode::Cold,
     )
+}
+
+pub(crate) fn pull_from_studio(mut args: ExportSnapshotsArgs) -> Result<()> {
+    args.run_import = true;
+    args.no_run_import = false;
+    if args.snapshot_dir == Path::new("snapshots") {
+        args.snapshot_dir = PathBuf::from(".renium/snapshots");
+    }
+    export_snapshots(args)
 }
 
 pub(crate) fn export_snapshots_with_warm_bridge(

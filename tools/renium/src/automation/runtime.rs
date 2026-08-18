@@ -29,6 +29,7 @@ use crate::editor::sync::{
 };
 use crate::project::workflows;
 use crate::snapshot::export::export_snapshots_with_warm_bridge;
+use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
     click_result, editor_review_decision_result, execute_luau_result, get_console_output_result,
     goto_result, input_result, key_result, press_result, record_end_result, record_start_result,
@@ -139,12 +140,17 @@ fn automation_failure(error: anyhow::Error) -> automation::Failure {
     if lower.contains("unsupported") || lower.contains("does not support") {
         return automation::Failure::new("unsupported", message, false, "cap");
     }
-    if lower.contains("conflict") || lower.contains("changed while") {
+    if lower.contains("conflict")
+        || lower.contains("changed while")
+        || lower.contains("no editor revert history")
+        || lower.starts_with("stop play before ")
+    {
         return automation::Failure::new("conflict", message, false, "context");
     }
     if lower.contains("invalid")
         || lower.contains("requires")
         || lower.contains("expected")
+        || lower.starts_with("provide ")
         || lower.contains("cannot be combined")
     {
         return automation::Failure::new("bad_req", message, false, "context");
@@ -378,6 +384,107 @@ fn automation_requires_runtime(operation: u16, parameters: &Value) -> bool {
             && parameters.get("editor").and_then(Value::as_bool) == Some(true)
 }
 
+fn pending_change_ack(bridge: &BridgeServer, services: &[String]) -> Result<Option<(u64, String)>> {
+    let state = bridge.call(
+        "getStudioChangeState",
+        json!({
+            "services": services,
+            "start": false,
+        }),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    let has_pending = ["dirtyServices", "propertyChanges", "changes"]
+        .iter()
+        .any(|key| {
+            state[*key]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+        });
+    if !has_pending {
+        return Ok(None);
+    }
+    let seq = state["seq"]
+        .as_u64()
+        .context("Studio change state did not include seq")?;
+    let runtime_id = state["runtimeId"]
+        .as_str()
+        .context("Studio change state did not include runtimeId")?
+        .to_string();
+    Ok(Some((seq, runtime_id)))
+}
+
+fn acknowledge_pulled_changes(
+    bridge: &BridgeServer,
+    services: &[String],
+    seq: u64,
+    runtime_id: &str,
+) -> Result<()> {
+    let result = bridge.call(
+        "getStudioChangeState",
+        json!({
+            "services": services,
+            "start": false,
+            "ackSeq": seq,
+            "runtimeId": runtime_id,
+        }),
+    )?;
+    ensure_plugin_api_ok(&result)
+}
+
+fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map<String, Value> {
+    let is_non_empty = |value: &Value| match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_none_or(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    };
+    let mut result = Map::new();
+    result.insert(
+        "ok".to_string(),
+        summary.get("ok").cloned().unwrap_or(Value::Bool(true)),
+    );
+    result.insert(
+        "direction".to_string(),
+        Value::String("files-to-studio".to_string()),
+    );
+    let filtered = [
+        "changedPaths",
+        "changedPathsFiles",
+        "targetSettingsIds",
+        "targetSettingsIdFiles",
+        "targetProperties",
+    ]
+    .into_iter()
+    .any(|key| parameters.get(key).is_some_and(&is_non_empty))
+        || parameters
+            .get("upsertInstancesOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    result.insert(
+        "selection".to_string(),
+        Value::String(if filtered { "filtered" } else { "full" }.to_string()),
+    );
+    for key in [
+        "changedPaths",
+        "targetSettingsIds",
+        "targetProperties",
+        "skippedByReview",
+        "sourceVerified",
+        "sourceVerifyFailed",
+        "sourceVerifyErrors",
+        "protectedWrites",
+        "protectedApplied",
+    ] {
+        let value = parameters.get(key).or_else(|| summary.get(key));
+        if let Some(value) = value.filter(|value| is_non_empty(value)) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    result
+}
+
 fn automation_dispatch_operation(
     operation: u16,
     context: &automation::BoundContext,
@@ -396,23 +503,36 @@ fn automation_dispatch_operation(
             let target = BridgeTarget::Main;
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             let info = bridge.cached_bridge_info_for_target(target)?;
-            export_snapshots_with_warm_bridge(
-                automation_pull_args(context, parameters, operation == op::PULL)?,
-                bridge,
-                &info,
-                0.0,
-                false,
-            )?;
-            Ok(
-                json!({ "direction": if operation == op::PULL { "studio-to-files" } else { "snapshots" } }),
-            )
+            let args = automation_pull_args(context, parameters, operation == op::PULL)?;
+            let services = args.services.clone();
+            let parsed_services = parse_services(&services)?;
+            let pending_ack = if operation == op::PULL {
+                pending_change_ack(bridge, &parsed_services)?
+            } else {
+                None
+            };
+            let acknowledged_pending = pending_ack.is_some();
+            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+            if let Some((seq, runtime_id)) = pending_ack {
+                acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
+            }
+            Ok(if operation == op::PULL {
+                json!({
+                    "direction": "studio-to-files",
+                    "services": parsed_services,
+                    "pendingChangesAcknowledged": acknowledged_pending,
+                })
+            } else {
+                json!({ "direction": "snapshots" })
+            })
         }
         op::PUSH => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
-            Ok(Value::Object(push_editor_changes_with_warm_bridge(
+            let summary = push_editor_changes_with_warm_bridge(
                 automation_push_args(context, parameters, reviewed)?,
                 bridge,
-            )?))
+            )?;
+            Ok(Value::Object(compact_push_summary(&summary, parameters)))
         }
         op::LIVE_START
         | op::LIVE_STOP
@@ -483,7 +603,7 @@ fn automation_dispatch_operation(
             bail!("Studio close is unsupported on this platform")
         }
         op::BATCH => automation_batch(context, parameters),
-        op::STUDIOS | op::STUDIO_STATUS => {
+        op::STUDIO_STATUS => {
             let clients = bridge.list_bridge_clients();
             let mut result = json!({
                 "studios": bound_context::studio_candidates_from(
@@ -493,41 +613,37 @@ fn automation_dispatch_operation(
                 "clients": bound_context::context_clients(clients, context),
                 "selected": context.runtime_id,
             });
-            if operation == op::STUDIO_STATUS {
-                let clients = result["clients"].as_array().cloned().unwrap_or_default();
-                let mut available = Vec::new();
-                let has_edit = clients.iter().any(|client| client["role"] == "edit");
-                if has_edit {
-                    available.push("Edit");
-                }
-                if clients.iter().any(|client| client["role"] == "play-server") {
-                    available.push("Server");
-                }
-                if clients.iter().any(|client| client["role"] == "play-client") {
-                    available.push("Client");
-                }
-                result["availableDataModels"] = json!(available);
-                result["playState"] =
-                    json!(if clients
-                        .iter()
-                        .any(|client| client["role"] == "play-server"
-                            || client["role"] == "play-client")
-                    {
-                        "running"
-                    } else {
-                        "stopped"
-                    });
-                if has_edit
-                    && let Ok(state) = bridge.call_for_selector_with_timeout(
-                        "getStudioState",
-                        json!({}),
-                        BridgeTarget::Edit,
-                        None,
-                        Some(Duration::from_millis(200)),
-                    )
-                {
-                    result["studioState"] = state;
-                }
+            let clients = result["clients"].as_array().cloned().unwrap_or_default();
+            let mut available = Vec::new();
+            let has_edit = clients.iter().any(|client| client["role"] == "edit");
+            if has_edit {
+                available.push("Edit");
+            }
+            if clients.iter().any(|client| client["role"] == "play-server") {
+                available.push("Server");
+            }
+            if clients.iter().any(|client| client["role"] == "play-client") {
+                available.push("Client");
+            }
+            result["availableDataModels"] = json!(available);
+            result["playState"] = json!(if clients
+                .iter()
+                .any(|client| client["role"] == "play-server" || client["role"] == "play-client")
+            {
+                "running"
+            } else {
+                "stopped"
+            });
+            if has_edit
+                && let Ok(state) = bridge.call_for_selector_with_timeout(
+                    "getStudioState",
+                    json!({}),
+                    BridgeTarget::Edit,
+                    None,
+                    Some(Duration::from_millis(200)),
+                )
+            {
+                result["studioState"] = state;
             }
             Ok(result)
         }
@@ -740,6 +856,14 @@ fn automation_execute_request(
     match operation.id {
         op::CAP => automation::capabilities().map_err(automation_failure),
         op::BIND => bound_context::bind(state, bridge, &request.p),
+        op::STUDIOS => {
+            let clients = bridge.list_bridge_clients();
+            Ok(json!({
+                "studios": bound_context::studio_candidates_from(&clients, ""),
+                "clients": clients,
+                "selected": Value::Null,
+            }))
+        }
         _ => {
             let context_id = request
                 .cx
@@ -776,7 +900,7 @@ fn automation_execute_request(
                 let _selection = bound_context::select(&context);
                 bridge.clear_runtime_pins();
                 return if operation.id == op::ASSET_SEARCH {
-                    crate::cloud::assets::search(&request.p, bridge)
+                    crate::cloud::assets::search(&request.p, Some(bridge))
                 } else if crate::cloud::assets::studio_upload(&request.p) {
                     bridge
                         .wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)
@@ -847,19 +971,16 @@ fn automation_execute_request(
                 );
             }
             if operation.id == op::REVIEW_REJECT {
-                let review_id = request
-                    .p
-                    .get("reviewId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        automation::Failure::new(
-                            "bad_req",
-                            "review-reject requires p.reviewId",
-                            false,
-                            "review-prepare",
-                        )
-                    })?;
-                return Ok(json!({ "rejected": state.reject_review(review_id) }));
+                let object = automation_object(&request.p)?;
+                let review_id = automation_string(object, "reviewId").ok_or_else(|| {
+                    automation::Failure::new(
+                        "bad_req",
+                        "review-reject requires p.reviewId",
+                        false,
+                        "review-prepare",
+                    )
+                })?;
+                return Ok(json!({ "rejected": state.reject_review(&review_id) }));
             }
             if operation.id == op::REVIEW_APPLY {
                 if request.p.get("studioDecision").and_then(Value::as_bool) == Some(true) {
@@ -880,19 +1001,16 @@ fn automation_execute_request(
                     return editor_review_decision_result(&args, bridge)
                         .map_err(automation_failure);
                 }
-                let review_id = request
-                    .p
-                    .get("reviewId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        automation::Failure::new(
-                            "bad_req",
-                            "review-apply requires p.reviewId",
-                            false,
-                            "review-prepare",
-                        )
-                    })?;
-                let review = state.take_review(review_id).ok_or_else(|| {
+                let object = automation_object(&request.p)?;
+                let review_id = automation_string(object, "reviewId").ok_or_else(|| {
+                    automation::Failure::new(
+                        "bad_req",
+                        "review-apply requires p.reviewId",
+                        false,
+                        "review-prepare",
+                    )
+                })?;
+                let review = state.take_review(&review_id).ok_or_else(|| {
                     automation::Failure::new(
                         "rejected",
                         "Review receipt is invalid or expired",

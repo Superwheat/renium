@@ -6,7 +6,8 @@ param(
     [switch]$AllowUnlicensed,
     [switch]$AllowLocalPublisher,
     [switch]$LocalBuild,
-    [string]$TargetTriple
+    [string]$TargetTriple,
+    [string]$PrebuiltCli
 )
 
 Set-StrictMode -Version Latest
@@ -399,11 +400,20 @@ $buildError = $null
 $restoreErrors = @()
 try {
 $binaryName = if ($env:OS -eq "Windows_NT") { "renium.exe" } else { "renium" }
-$cliBinary = Join-Path $cliDirectory ("target\" + $releaseTarget.Triple + "\release\" + $binaryName)
+$cliBinary = if ([string]::IsNullOrWhiteSpace($PrebuiltCli)) {
+    Join-Path $cliDirectory ("target\" + $releaseTarget.Triple + "\release\" + $binaryName)
+}
+else {
+    [IO.Path]::GetFullPath($PrebuiltCli)
+}
 
-Invoke-Checked -File "cargo" -Arguments @("build", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+if ([string]::IsNullOrWhiteSpace($PrebuiltCli)) {
+    Invoke-Checked -File "cargo" -Arguments @("build", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+}
 if (-not $SkipTests) {
-    Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+    if ([string]::IsNullOrWhiteSpace($PrebuiltCli)) {
+        Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
+    }
     Invoke-Checked -File "lune" -Arguments @("run", "tools/plugin_ws_bridge/tests/run") -WorkingDirectory $repositoryRoot
     if ($env:OS -eq "Windows_NT") {
         Invoke-Checked -File "node" -Arguments @("tools/renium/tests/automation-replay.mjs", $cliBinary) -WorkingDirectory $repositoryRoot
@@ -412,7 +422,7 @@ if (-not $SkipTests) {
     }
 }
 if (-not (Test-Path -LiteralPath $cliBinary -PathType Leaf)) {
-    throw "Cargo reported success but did not create $cliBinary"
+    throw "Release CLI does not exist: $cliBinary"
 }
 if ((Get-BinaryArchitecture -Path $cliBinary) -ne $releaseTarget.Architecture) {
     throw "Cargo built a CLI whose architecture does not match $($releaseTarget.Triple)"

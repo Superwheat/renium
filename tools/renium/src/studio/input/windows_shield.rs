@@ -16,12 +16,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindow, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_INJECTED,
     LLMHF_INJECTED, LWA_ALPHA, LWA_COLORKEY, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
     RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW,
-    ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    SW_HIDE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const OUTLINE_KEY: COLORREF = 0x00ff00ff;
@@ -31,8 +31,6 @@ const BADGE_TEXT: &str = concat!("Renium ", env!("CARGO_PKG_VERSION"));
 
 static KEYBOARD_TARGET: AtomicIsize = AtomicIsize::new(0);
 static VIEWPORT: AtomicIsize = AtomicIsize::new(0);
-static SHIELD_WINDOW: AtomicIsize = AtomicIsize::new(0);
-static YIELDING: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct InputShield {
     stop: Arc<AtomicBool>,
@@ -46,46 +44,6 @@ impl Drop for InputShield {
             let _ = worker.join();
         }
     }
-}
-
-pub(super) struct MouseYield {
-    shield: isize,
-}
-
-impl Drop for MouseYield {
-    fn drop(&mut self) {
-        if self.shield == 0 {
-            return;
-        }
-        let viewport = VIEWPORT.load(Ordering::Acquire);
-        let top = KEYBOARD_TARGET.load(Ordering::Acquire);
-        if viewport_rect(viewport as HWND, top as HWND).is_some() {
-            unsafe { ShowWindow(self.shield as HWND, SW_SHOWNOACTIVATE) };
-        }
-        YIELDING.store(false, Ordering::Release);
-    }
-}
-
-pub(super) fn yield_mouse(viewport: isize, message: u32) -> MouseYield {
-    let is_mouse = matches!(
-        message,
-        WM_MOUSEMOVE
-            | WM_LBUTTONDOWN
-            | WM_LBUTTONUP
-            | WM_RBUTTONDOWN
-            | WM_RBUTTONUP
-            | WM_MOUSEWHEEL
-    );
-    let shield = if is_mouse && VIEWPORT.load(Ordering::Acquire) == viewport {
-        SHIELD_WINDOW.load(Ordering::Acquire)
-    } else {
-        0
-    };
-    if shield != 0 {
-        YIELDING.store(true, Ordering::Release);
-        unsafe { ShowWindow(shield as HWND, SW_HIDE) };
-    }
-    MouseYield { shield }
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> isize {
@@ -187,10 +145,8 @@ fn viewport_rect(viewport: HWND, top: HWND) -> Option<RECT> {
 }
 
 fn clear_state() {
-    SHIELD_WINDOW.store(0, Ordering::Release);
     VIEWPORT.store(0, Ordering::Release);
     KEYBOARD_TARGET.store(0, Ordering::Release);
-    YIELDING.store(false, Ordering::Release);
 }
 
 unsafe extern "system" fn outline_window_proc(
@@ -386,7 +342,6 @@ fn run(
         let _ = ready.send(Err("Another viewport input shield is active".to_string()));
         return;
     }
-    SHIELD_WINDOW.store(shield as isize, Ordering::Release);
     let keyboard = unsafe {
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
@@ -445,29 +400,23 @@ fn run(
     }
     let _ = ready.send(Ok(()));
     while !stop.load(Ordering::Acquire) && unsafe { IsWindow(viewport as HWND) } != 0 {
-        if !YIELDING.load(Ordering::Acquire) {
-            if let Some(rect) = viewport_rect(viewport as HWND, top as HWND) {
-                let next = unsafe { GetWindow(shield, GW_HWNDNEXT) };
-                let outline_next = unsafe { GetWindow(outline, GW_HWNDNEXT) };
-                let bounds = (rect.left, rect.top, rect.right, rect.bottom);
-                if previous != Some(bounds)
-                    || next != top as HWND
-                    || outline_next != shield
-                    || !shown
-                {
-                    place_above(shield, top as HWND, rect);
-                    place_above(outline, shield, rect);
-                    previous = Some(bounds);
-                    shown = true;
-                }
-            } else if shown {
-                unsafe {
-                    ShowWindow(outline, SW_HIDE);
-                    ShowWindow(shield, SW_HIDE);
-                }
-                shown = false;
-                previous = None;
+        if let Some(rect) = viewport_rect(viewport as HWND, top as HWND) {
+            let next = unsafe { GetWindow(shield, GW_HWNDNEXT) };
+            let outline_next = unsafe { GetWindow(outline, GW_HWNDNEXT) };
+            let bounds = (rect.left, rect.top, rect.right, rect.bottom);
+            if previous != Some(bounds) || next != top as HWND || outline_next != shield || !shown {
+                place_above(shield, top as HWND, rect);
+                place_above(outline, shield, rect);
+                previous = Some(bounds);
+                shown = true;
             }
+        } else if shown {
+            unsafe {
+                ShowWindow(outline, SW_HIDE);
+                ShowWindow(shield, SW_HIDE);
+            }
+            shown = false;
+            previous = None;
         }
         let mut message: MSG = unsafe { std::mem::zeroed() };
         while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
