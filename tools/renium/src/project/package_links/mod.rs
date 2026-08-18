@@ -23,8 +23,8 @@ use crate::project::config;
 use crate::rbx::encode::settings_root_indices;
 use crate::rbx::model::canonicalize_settings_reference_documents;
 use crate::settings::bytecode::{
-    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
-    encode_settings_bytecode, reindex_reference_indices,
+    SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
+    SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec, InstanceSelector};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
@@ -157,10 +157,19 @@ struct LinkTargetRef {
     ords: Vec<usize>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct LinkLock {
     version: u32,
     entries: BTreeMap<String, LinkLockEntry>,
+}
+
+impl Default for LinkLock {
+    fn default() -> Self {
+        Self {
+            version: LINK_MANIFEST_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -278,6 +287,7 @@ struct LinkResolveOptions {
     offline: bool,
     fetch: bool,
     read_only: bool,
+    allow_missing_store: bool,
     git_path: String,
     wally_path: String,
     cache_dir: PathBuf,
@@ -290,6 +300,7 @@ impl Default for LinkResolveOptions {
             offline: true,
             fetch: false,
             read_only: true,
+            allow_missing_store: false,
             git_path: "git".to_string(),
             wally_path: "wally".to_string(),
             cache_dir: PathBuf::from(".renium").join("link-cache"),
@@ -342,6 +353,31 @@ fn read_link_manifest(path: &Path) -> Result<LinkManifest> {
     validate_link_manifest(&manifest)
         .with_context(|| format!("Invalid link manifest {}", path.display()))?;
     Ok(manifest)
+}
+
+pub(crate) fn local_project_package_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
+    let manifest = read_link_manifest(&link_manifest_path(
+        project_root,
+        Path::new("renium-link.json"),
+    ))?;
+    let mut paths = Vec::new();
+    for link in &manifest.links {
+        let LinkSource::Local { path } = &link.source else {
+            continue;
+        };
+        if is_global_link_path(path) {
+            continue;
+        }
+        let package_path = resolve_local_link_path(project_root, path);
+        if !package_path.is_file() || !is_package_path(&package_path) {
+            continue;
+        }
+        ensure_existing_ancestor_inside(project_root, &package_path, "link package source")?;
+        paths.push(package_path);
+    }
+    paths.sort_by_key(|path| exact_path_key(path));
+    paths.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
+    Ok(paths)
 }
 
 fn validate_link_manifest(manifest: &LinkManifest) -> Result<()> {
@@ -440,9 +476,9 @@ fn read_link_lock(project_root: &Path) -> Result<LinkLock> {
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read Renium link lock {}", path.display()))?;
-    let lock: LinkLock = serde_json::from_str(&raw)
+    let mut lock: LinkLock = serde_json::from_str(&raw)
         .with_context(|| format!("Invalid Renium link lock {}", path.display()))?;
-    if lock.version != LINK_MANIFEST_VERSION {
+    if lock.version != 0 && lock.version != LINK_MANIFEST_VERSION {
         bail!(
             "Unsupported Renium link lock version {} in {}; expected {}",
             lock.version,
@@ -450,6 +486,7 @@ fn read_link_lock(project_root: &Path) -> Result<LinkLock> {
             LINK_MANIFEST_VERSION
         );
     }
+    lock.version = LINK_MANIFEST_VERSION;
     Ok(lock)
 }
 
@@ -915,6 +952,7 @@ fn resolve_link_target_storage(
     src_root: &Path,
     target: &LinkTargetRef,
     enforce_projection_ownership: bool,
+    allow_missing_store: bool,
 ) -> Result<LinkTargetStorage> {
     let segments = validate_link_target_ref(target)?;
     let mut staged_segments = vec![target.service.clone()];
@@ -1002,7 +1040,7 @@ fn resolve_link_target_storage(
     }
     let settings_file = (!source_is_file)
         .then(|| service_settings_path(&source_root))
-        .filter(|path| path.is_file());
+        .filter(|path| allow_missing_store || path.is_file());
     let settings_output_file = if source_is_file {
         None
     } else {
@@ -1260,6 +1298,7 @@ fn resolve_link_targets(
                 src_root,
                 target,
                 !options.read_only,
+                options.allow_missing_store,
             ) {
                 Ok(storage) => storage,
                 Err(error) => {
@@ -1692,6 +1731,39 @@ fn load_settings_documents(
     }
     canonicalize_loaded_settings_documents(&mut documents)?;
     Ok((documents, outputs))
+}
+
+fn ensure_settings_document(
+    documents: &mut HashMap<PathBuf, SettingsBytecode>,
+    outputs: &mut HashMap<PathBuf, PathBuf>,
+    storage: &LinkTargetStorage,
+    service: &str,
+) {
+    let Some(settings_file) = storage.settings_file.as_ref() else {
+        return;
+    };
+    if documents.contains_key(settings_file) {
+        return;
+    }
+    documents.insert(
+        settings_file.clone(),
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "editor:0".to_string(),
+                service.to_string(),
+                service.to_string(),
+                None,
+            )],
+        },
+    );
+    outputs.insert(
+        settings_file.clone(),
+        storage
+            .settings_output_file
+            .clone()
+            .unwrap_or_else(|| settings_file.clone()),
+    );
 }
 
 fn stage_settings_document_writes(

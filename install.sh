@@ -748,17 +748,19 @@ manifest_sha256() {
   asset_name="$1"
   fetch_release_manifest || return 1
   expected="$(awk -v suffix="/$asset_name\"" '
-    index($0, suffix) { matches += 1; waiting = 1; next }
+    index($0, suffix) { waiting = 1; next }
     waiting && /"sha256"[[:space:]]*:/ {
       line = $0
       sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", line)
       sub(/".*$/, "", line)
+      if (value != "" && value != line) inconsistent = 1
       value = line
+      matches += 1
       waiting = 0
     }
-    END { if (matches == 1 && value != "") print value; else exit 1 }
+    END { if (matches >= 1 && !inconsistent && value != "") print value; else exit 1 }
   ' "$release_manifest")" || {
-    printf '%s\n' "$asset_name is missing from the Renium update manifest." >&2
+    printf '%s\n' "$asset_name is missing or inconsistent in the Renium update manifest." >&2
     return 1
   }
   case "$expected" in
@@ -806,12 +808,6 @@ cleanup_install() {
 }
 trap cleanup_install EXIT HUP INT TERM
 
-if [ "$use_local_package" -eq 0 ]; then
-  download_release_asset "$archive_name" "$stage/$archive_name"
-fi
-if [ "$studio_archive_name" != "$archive_name" ]; then
-  download_release_asset "$studio_archive_name" "$stage/$studio_archive_name"
-fi
 editor_architecture() {
   editor_cli="$1"
   version_output="$("$editor_cli" --version 2>&1)" || {
@@ -925,6 +921,12 @@ if [ "$interactive" -eq 1 ]; then
     printf '%s\n' "Enter a number from 0 to $editor_count."
   done
 fi
+if [ "$use_local_package" -eq 0 ]; then
+  download_release_asset "$archive_name" "$stage/$archive_name"
+fi
+if [ "$studio_archive_name" != "$archive_name" ]; then
+  download_release_asset "$studio_archive_name" "$stage/$studio_archive_name"
+fi
 for extension_arch in x64 arm64; do
   if ! awk -F '	' -v arch="$extension_arch" '$3 == arch { found=1 } END { exit !found }' \
     "$editor_installs"
@@ -962,6 +964,15 @@ if [ "$studio_archive_name" != "$archive_name" ]; then
   fi
   chmod +x "$studio_cli"
 fi
+plugin_source=""
+if [ "$os" = "macos" ]; then
+  if [ -f "$script_root/Renium.rbxm" ]; then
+    plugin_source="$script_root/Renium.rbxm"
+  else
+    plugin_source="$stage/Renium.rbxm"
+    download_release_asset "Renium.rbxm" "$plugin_source"
+  fi
+fi
 install_parent="$(dirname "$install_root")"
 transaction_id="$$-${stage##*.}"
 staged_install="$install_parent/.renium-install-$transaction_id"
@@ -969,11 +980,14 @@ previous_install="$install_parent/.renium-previous-$transaction_id"
 mkdir -p "$install_parent"
 mkdir "$staged_install"
 cp "$cli" "$staged_install/renium"
-for support_file in rbx Renium.rbxm renium-agents.md; do
+for support_file in rbx renium-agents.md; do
   if [ -f "$(dirname "$cli")/$support_file" ]; then
     cp "$(dirname "$cli")/$support_file" "$staged_install/$support_file"
   fi
 done
+if [ -n "$plugin_source" ]; then
+  cp "$plugin_source" "$staged_install/Renium.rbxm"
+fi
 chmod +x "$staged_install/renium"
 if [ -f "$staged_install/rbx" ]; then
   chmod +x "$staged_install/rbx"
@@ -1032,7 +1046,7 @@ if [ -f "$install_root/rbx" ]; then
   ln -sf "$install_root/rbx" "$stable_bin_root/rbx"
 fi
 if [ "$os" = "macos" ]; then
-  if ! "$studio_cli" setup; then
+  if ! "$studio_cli" setup --file "$install_root/Renium.rbxm"; then
     exit 1
   fi
 fi

@@ -345,6 +345,6 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
         "ok": true,
         "action": "input",
         "actions": request.actions.len(),
-        "input": "virtual",
+        "inputMethod": "virtual",
     }))
 }

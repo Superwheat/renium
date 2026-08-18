@@ -47,7 +47,6 @@ use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor, EditorInstancePath,
     EditorPropertyFilter,
 };
-use crate::project::package_links::RENIUM_DIR_GITIGNORE;
 use crate::project::package_links::place::place_desync_package_link;
 use crate::project::version_control::{
     merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
@@ -2433,6 +2432,10 @@ fn view_json_tree_nests_children_and_surfaces_source() {
 #[test]
 fn vc_init_writes_policy_files_idempotently() {
     let dir = temp_dir("vc-init");
+    fs::write(dir.join(".gitattributes"), "*.txt text\n").unwrap();
+    fs::write(dir.join(".gitignore"), "custom-output/\n").unwrap();
+    fs::create_dir_all(dir.join(".renium")).unwrap();
+    fs::write(dir.join(".renium").join(".gitignore"), "custom-state/\n").unwrap();
     vc_init(VcInitArgs {
         project_root: dir.clone(),
         skip_git: true,
@@ -2442,11 +2445,14 @@ fn vc_init_writes_policy_files_idempotently() {
     })
     .unwrap();
     let attributes = fs::read_to_string(dir.join(".gitattributes")).unwrap();
+    assert!(attributes.contains("*.txt text"));
     assert!(attributes.contains("*.renium binary diff=renium merge=renium"));
     let ignore = fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(ignore.contains("custom-output/"));
     assert!(ignore.contains("/sourcemap.json"));
     let renium_ignore = fs::read_to_string(dir.join(".renium").join(".gitignore")).unwrap();
-    assert_eq!(renium_ignore, RENIUM_DIR_GITIGNORE);
+    assert!(renium_ignore.contains("custom-state/"));
+    assert!(renium_ignore.contains("editor-history/"));
 
     vc_init(VcInitArgs {
         project_root: dir.clone(),
@@ -2531,8 +2537,8 @@ fn bytecode_remove_instance_removes_source_files_and_empty_dirs() {
 
     assert!(!source_path.exists());
     assert!(!service_dir.join("Pkg").exists());
-    let updated = SettingsBytecode::read_file(&settings_path).unwrap();
-    assert_eq!(updated.instances.len(), 1);
+    assert!(!settings_path.exists());
+    assert!(!service_dir.exists());
     fs::remove_dir_all(dir).unwrap();
 }
 

@@ -2,18 +2,106 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-08-18
+
+### Syncing
+
+- Added direct `rbx pull`, which starts or reuses the shared daemon, waits for the matching Studio place, and keeps temporary data under `.renium`.
+- Pulling a place to files and pushing it back preserves classes, properties, attributes, references, scripts, hierarchy, and sibling order.
+- Fixed full pushes swapping instances that share the same parent.
+- External script `Source` reads and writes now use the exact source file instead of exposing `__SOURCE_EXTERNAL__` or creating a shadow property.
+- Snapshot export and import reproduce every generated project file byte-for-byte.
+- Model and store inspection use stable instance references that remain useful across commands.
+- Removing the final imported tree from a service also removes its empty settings store and directory.
+- File-backed commands and sourcemaps work from experience roots and individual place folders.
+- Multi-place commands infer the current place when possible and list valid places when selection is ambiguous.
+- Pull and push results are smaller and clearly identify their direction and affected services.
+
+### Studio and automation
+
+- Runtime listing no longer repeats the same Studio runtime under separate collections.
+- Unpublished Play and local-server runtimes retain the name of their originating Edit place.
+- Studio Auto-Recovery dialogs are dismissed automatically for Studio instances controlled by Renium.
+- Minimized Studio windows can be restored without taking focus or moving ahead of other windows.
+- Input commands recover from a minimized `1x1` Play viewport before interacting with it.
+- Held-key results include the effective duration, and navigation results include the arrival radius and final distance.
+- MP4 recording can be controlled with `record-start` and `record-end` without JSON, context IDs, or recording IDs.
+- Device status reflects Studio's actual emulator selection, including devices selected outside Renium.
+- `device stop` resets Studio to the normal desktop device, while disconnecting Renium no longer changes the selected device.
+- Device changes fail clearly during Play instead of reporting an edit-side state that does not affect the running client.
+- Fixed portrait resolution, native-versus-effective density, rounded viewport dimensions, duplicate device IDs, and detailed native-orientation output.
+- Local-server tests no longer print repeated missing-plugin-icon errors.
+
+### Direct agent commands
+
+- Added offline `project-validate`, `script-search`, `script-grep`, and ranged `script-read` commands that need no Studio connection, daemon, context, or JSON payload.
+- Limited script searches report complete totals, deterministic ordering, and whether results were truncated.
+- Creator Store search and Roblox documentation reads work directly without context binding.
+- Creator Store results are compact by default and identify the requested asset type.
+- Public Creator Store models use Roblox's plugin-accessible loader when ownership-only loading APIs reject them.
+- AI model generation, creator-job polling, and local image validation have direct commands.
+- Roblox documentation results contain readable text and signatures instead of minified page markup.
+- Created, cloned, renamed, and moved instances return their resulting stable identity for immediate reuse.
+- Batched `prop:Source` reads return exact external script text, and requested field filters no longer leak unrequested internal paths and IDs.
+- Property and source values beginning with hyphens are accepted normally.
+- Repeating an edit that changes nothing does not rewrite files or report false changes.
+- Misspelled properties are rejected, while explicit property scope remains available for hidden or newly introduced Roblox properties.
+- Typed instance references survive cloning and are remapped to cloned targets.
+
+### Projects and configuration
+
+- Single-place projects can be converted safely into multi-place experience layouts.
+- Place addition validates IDs, aliases, destinations, and game identity before moving project files.
+- Failed place conversions and renames restore the original project instead of leaving a partial migration.
+- Place add, rename, and reorder results state when the project must be rebound.
+- Project initialization previews every file and directory it will create or update and rejects wrong-type collisions before changing anything.
+- Validation accepts absent source roots for mount-only projects but rejects existing source roots that are not directories.
+- Rojo imports preserve JSONC comments, no longer mistake URLs for comments, and omit redundant default, empty, and null fields.
+- Generated adapter modules remain visible through `find`, `tree`, `inspect`, and `bb` without invalidating later validation, builds, path explanations, or syncback.
+- Adapter syncback counts only source files changed by the user.
+- Writable mounts update their backing files, read-only mounts reject edits, and mount-only projects export through their projected content.
+- `explain-path` identifies transformed sources, excluded rules, matching selectors, sync direction, and property or attribute decisions.
+- Configuration paths are normalized across Windows, macOS, and Linux, and removing the final scoped value cleans up its empty file and directory.
+- File and directory imports identify each file as `create`, `overwrite`, or `unchanged`; unchanged files are not rewritten or included in later push work.
+- Newly imported scripts can be inspected before their service has a `.renium` settings store.
+- `doctor` reports complete parser errors, normalized paths, correct repair instructions, and deterministic diagnostic bundles.
+
+### Packages and version control
+
+- Link application can initialize a missing service store without requiring a Studio pull first.
+- Links can be removed permanently while keeping their instances as editable project content, and empty manifests and lock files are removed automatically.
+- Link results distinguish total and active targets, return stable root IDs, and report no changes for unchanged refreshes.
+- Fixed link path forms, ordinals, hierarchy counts, exact source reads, and manifest and lock cleanup.
+- Wally directory `init.lua` files retain their children, lock versions are correct, unchanged normalized package trees are detected, and forced refresh is supported.
+- Detaching a reusable package writes embedded scripts back as exact editable source files.
+- Package operations return stable IDs for the complete materialized subtree, and repacking includes local packages referenced by the project.
+- Unchanged packages, stores, and formatted project files retain their bytes and timestamps.
+- Git initialization adds missing Renium rules without replacing existing user rules.
+- Renium policy files and JSONC configuration retain LF line endings on Windows.
+- Binary-store merges support independent field edits and clearly reject conflicting edits to the same field.
+- Merge-driver paths containing spaces work correctly.
+
+### Editor and installation
+
+- Completed editor updates close their progress notification before asking for a reload.
+- **Check for Updates** appears at the bottom of the main Renium menu.
+- Windows installs directly from the selected platform ZIP instead of downloading the CLI again.
+- Windows and macOS verify the Studio plugin against the signed release manifest before installation.
+- macOS and Linux show editor choices and **Exit** before downloading release files.
+- Normal command output no longer includes bridge startup lines, channel-ready messages, internal build timings, or per-service import progress.
+- Generated `RENIUM.md` uses direct commands and avoids unnecessary daemon checks, help calls, recursive searches, temporary JSON files, repeated reads, and local-server tests.
+- The Windows `rbx.cmd` fallback correctly handles complex inline Luau containing `cmd.exe`-sensitive syntax.
+
 ## 0.1.9 - 2026-08-17
 
-- Made full pushes up to 10× faster on large projects.
-- Preserved non-Archivable instances and unsaved script edits when pulling from Studio.
-- Preserved packages and references between services when pushing to Studio.
-- Prevented live sync from repeating its own edits or losing changes between Studio and files.
-- Applied plugin settings edited while disconnected after reconnecting.
-- Started automatic connections immediately in Edit, Play, and local server sessions.
-- Allowed VS Code and `rbx` automation to share one Renium connection.
-- Fixed duplicate-name paths, sourcemaps, model pivots, and source mappings.
-- Closed the update progress notification before prompting the user to reload the editor.
-- Moved **Check for Updates** to the bottom of the main Renium menu.
+- Preserved non-Archivable instances and current script documents during full Studio pulls without cloning the live DataModel.
+- Kept package roots and cross-service references intact during full pushes while avoiding unnecessary package snapshot work.
+- Reduced full-push time with direct project builds, filtered native exports, and faster retained-package matching.
+- Verified a 95,691-instance pull-to-push round trip with no class, property, attribute, source, or reference differences.
+- Sent only plugin settings edited while disconnected when the matching editor reconnects.
+- Started automatic connections immediately in every Studio state and made the plugin show connection progress without moving its controls.
+- Kept bound automation contexts valid when editor and direct `rbx` commands share one daemon.
+- Improved source projection, duplicate-name mapping, sourcemap generation, model pivot restoration, and native export mutation checks.
 
 ## 0.1.8 - 2026-08-15
 

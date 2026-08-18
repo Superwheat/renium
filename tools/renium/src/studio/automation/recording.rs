@@ -18,11 +18,11 @@ use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[cfg(any(windows, target_os = "macos"))]
-use super::client_viewport_size;
 #[cfg(windows)]
 use super::set_capture_probe_phase;
 use super::{BridgeServer, BridgeTarget, studio_capture_status, wait_for_player_bridge};
+#[cfg(any(windows, target_os = "macos"))]
+use super::{client_viewport_size, recover_client_viewport};
 use crate::app::output::automation_token;
 use crate::studio::input as input_inject;
 use crate::system::files::{
@@ -51,7 +51,7 @@ struct StartRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EndRequest {
-    recording_id: String,
+    recording_id: Option<String>,
 }
 
 struct ActiveRecording {
@@ -102,7 +102,7 @@ fn edit_window(
     probe_target: BridgeTarget,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
-    input_inject::verified_recording_window_for_pid(pid, |phase, colors| {
+    input_inject::verified_studio_window_for_pid(pid, |phase, colors| {
         set_capture_probe_phase(bridge, probe_target, phase, colors)
     })
 }
@@ -113,7 +113,7 @@ fn edit_window(
     _probe_target: BridgeTarget,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
-    input_inject::recording_window_for_pid(pid, None)
+    input_inject::window_for_pid(pid, None)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -130,7 +130,9 @@ fn client_window(
     player: Option<&str>,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
-    input_inject::recording_window_for_pid(pid, client_viewport_size(bridge, player))
+    let viewport = client_viewport_size(bridge, player);
+    let viewport = recover_client_viewport(bridge, player, pid, viewport)?;
+    input_inject::window_for_pid(pid, viewport)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -511,13 +513,18 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         let recording = slot
             .take()
             .context("Recording conflict: no recording is active")?;
-        if recording.id != request.recording_id {
+        if request
+            .recording_id
+            .as_ref()
+            .is_some_and(|id| recording.id != *id)
+        {
             let current = recording.id.clone();
+            let requested = request.recording_id.as_deref().unwrap_or_default();
             *slot = Some(recording);
             bail!(
                 "Recording conflict: {} is active, not {}",
                 current,
-                request.recording_id
+                requested
             );
         }
         recording

@@ -1902,6 +1902,25 @@ fn replace_core_directory(target_root: &Path, prepared: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
+    let cli = target_root.join("renium.exe");
+    let home = env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .context("USERPROFILE is unavailable")?;
+    let stable_root = home.join(".renium").join("bin");
+    fs::create_dir_all(&stable_root)?;
+    for alias in [target_root.join("rbx.exe"), stable_root.join("rbx.exe")] {
+        if alias.is_file() {
+            fs::remove_file(&alias)?;
+        }
+        if fs::hard_link(&cli, &alias).is_err() {
+            fs::copy(&cli, &alias)?;
+        }
+    }
+    Ok(())
+}
+
 fn restore_installed_files(paths: &[PathBuf], originals: &[Option<Vec<u8>>]) -> Result<()> {
     let mut errors = Vec::new();
     for (path, original) in paths.iter().zip(originals).rev() {
@@ -2035,6 +2054,7 @@ fn apply_staged_update_plan(
         if let Some(target_root) = managed_core_root(&plan.target) {
             let prepared = prepare_core_directory(core_root, &target_root)?;
             replace_core_directory(&target_root, &prepared)?;
+            install_windows_rbx_aliases(&target_root)?;
         } else {
             install_shared_core_files(&plan.target, core_root)?;
         }

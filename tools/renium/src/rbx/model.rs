@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::app::output::print_json_output;
-use crate::app::timing::log_timing;
+use crate::app::timing::{log_timing, set_quiet_timings};
 use crate::bytecode::edit::{
     bytecode_service_name, collect_settings_subtree_preorder, insert_unique_rbx_path,
     instance_path_key, instance_path_parts_key, next_editor_settings_id_fast,
@@ -40,6 +40,7 @@ use crate::editor::paths::{
 use crate::editor::types::{EditorInstancePath, EditorSettingsWrite};
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
+use crate::project::package_links::local_project_package_paths;
 use crate::rbx::decode::rbx_instance_to_settings_records;
 use crate::rbx::encode::{
     BytecodeRbxBuildOptions, BytecodeRbxEncoder, collect_rbx_subtree_preorder,
@@ -54,6 +55,7 @@ use crate::settings::tree::{editor_service_root_index, settings_children_by_pare
 use crate::system::files::{
     absolutize_under, create_output_writer, exact_path_key, is_service_settings_file_name,
     resolve_existing_project_root, service_settings_path, validate_filesystem_instance_name,
+    write_bytes_if_changed,
 };
 
 enum RbxModelFormat {
@@ -1419,15 +1421,22 @@ pub(crate) fn build_rbx_place(
 }
 
 pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result<()> {
+    set_quiet_timings(true);
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let project_root = resolve_existing_project_root(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
+    let loaded = config::try_load_project(None, Some(&project_root))?
+        .filter(|loaded| absolutize_under(&loaded.root, &loaded.project.source_root) == src_root);
+    let projection = loaded.as_ref().map(config::stage_project).transpose()?;
+    let active_root = projection
+        .as_ref()
+        .map_or(src_root.as_path(), config::ProjectionStage::root);
     let format = match args.format.as_deref() {
         Some(raw) => RbxPlaceFormat::parse(raw)?,
         None => RbxPlaceFormat::from_path(&args.output)?,
     };
-    let services = explorer_daemon_services(&src_root, &args.services)?;
-    let build = build_rbx_place(&src_root, services, None, false, false, false)?;
+    let services = explorer_daemon_services(active_root, &args.services)?;
+    let build = build_rbx_place(active_root, services, None, false, false, false)?;
     let top_level_refs = build
         .service_roots
         .iter()
@@ -1693,7 +1702,20 @@ pub(crate) fn read_settings_model_document(path: &Path) -> Result<SettingsByteco
         version: SETTINGS_BINARY_VERSION,
         instances: Vec::new(),
     };
-    import_rbx_model_into_document(&mut document, path, "", path, None)?;
+    let mut sources =
+        import_rbx_model_into_document(&mut document, path, "", path, None)?.source_by_settings_id;
+    for instance in &mut document.instances {
+        let Some(source) = sources.remove(&instance.settings_id) else {
+            continue;
+        };
+        instance.properties.insert(
+            "Source".to_string(),
+            Value::String(
+                String::from_utf8(source)
+                    .with_context(|| format!("Model source for {} is not UTF-8", instance.name))?,
+            ),
+        );
+    }
     Ok(document)
 }
 
@@ -1701,6 +1723,7 @@ pub(crate) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let settings_files = bytecode_repack_settings_files(&args)?;
     let mut rewritten = Vec::with_capacity(settings_files.len());
+    let mut changed_paths = Vec::new();
     let mut total_before = 0_u64;
     let mut total_after = 0_u64;
 
@@ -1709,14 +1732,20 @@ pub(crate) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
             .with_context(|| format!("Failed to stat {}", settings_file.display()))?
             .len();
         let document = SettingsBytecode::read_file(&settings_file)?;
-        document.write_file(&settings_file)?;
+        let encoded = encode_settings_bytecode(&document)?;
+        let changed = fs::read(&settings_file)? != encoded;
+        write_bytes_if_changed(&settings_file, &encoded)?;
         let after = fs::metadata(&settings_file)
             .with_context(|| format!("Failed to stat {}", settings_file.display()))?
             .len();
         total_before += before;
         total_after += after;
+        if changed {
+            changed_paths.push(settings_file.clone());
+        }
         rewritten.push(json!({
             "path": settings_file,
+            "changed": changed,
             "bytesBefore": before,
             "bytesAfter": after,
             "bytesSaved": before.saturating_sub(after),
@@ -1728,6 +1757,8 @@ pub(crate) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
             "ok": true,
             "files": rewritten,
             "fileCount": rewritten.len(),
+            "changedFiles": changed_paths.len(),
+            "changedPaths": changed_paths,
             "bytesBefore": total_before,
             "bytesAfter": total_after,
             "bytesSaved": total_before.saturating_sub(total_after),
@@ -1753,6 +1784,7 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
                 settings_files.push(entry.into_path());
             }
         }
+        settings_files.extend(local_project_package_paths(&project_root)?);
     } else {
         for raw_path in &args.paths {
             let raw = raw_path.to_string_lossy();

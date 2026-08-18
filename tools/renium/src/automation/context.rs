@@ -7,10 +7,11 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{BoundContext, Failure, State};
+use crate::project::experience::{AmbiguousExperiencePlace, resolve_experience_place};
 use crate::project::{config, workflows};
 use crate::studio::bridge::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer};
 use crate::studio::target::{place_matches, set_place_filter};
-use crate::system::files::{canonical_path, read_json_file};
+use crate::system::files::canonical_path;
 
 fn object(value: &Value) -> std::result::Result<&Map<String, Value>, Failure> {
     value
@@ -46,47 +47,33 @@ fn fingerprint(project: &Path, experience: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn experience_root(project_root: &Path) -> PathBuf {
-    let mut current = project_root.to_path_buf();
-    loop {
-        if current.join("renium.experience.json").is_file() {
-            return current;
-        }
-        if !current.pop() {
-            return project_root.to_path_buf();
-        }
-    }
+fn bind_project_failure(error: anyhow::Error) -> Failure {
+    let code = if error.downcast_ref::<AmbiguousExperiencePlace>().is_some() {
+        "ambiguous_place"
+    } else {
+        "no_project"
+    };
+    Failure::new(code, format!("{error:#}"), false, "bind")
 }
 
-fn manifest_identity(
-    experience: &Path,
-    project_root: &Path,
-) -> Result<(Option<i64>, Option<i64>, Option<String>)> {
-    let path = experience.join("renium.experience.json");
-    if !path.is_file() {
-        return Ok((None, None, None));
-    }
-    let value: Value = read_json_file(&path)?;
-    let game_id = value.get("gameId").and_then(Value::as_i64);
-    let Some(places) = value.get("places").and_then(Value::as_object) else {
-        return Ok((game_id, None, None));
-    };
-    let wanted = canonical_path(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    for (alias, place) in places {
-        let Some(root) = place.get("root").and_then(Value::as_str) else {
-            continue;
-        };
-        let candidate =
-            canonical_path(&experience.join(root)).unwrap_or_else(|_| experience.join(root));
-        if candidate == wanted {
-            return Ok((
-                game_id,
-                place.get("placeId").and_then(Value::as_i64),
-                Some(alias.clone()),
-            ));
-        }
-    }
-    Ok((game_id, None, None))
+fn ambiguous_studios(candidates: &[Value]) -> Failure {
+    let compact = candidates
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.get("runtimeId"),
+                "n": entry.get("placeName"),
+                "p": entry.get("placeId"),
+            })
+        })
+        .collect::<Vec<_>>();
+    Failure::new(
+        "ambiguous_place",
+        "More than one Studio runtime matches this project",
+        false,
+        "studios",
+    )
+    .detail(json!({ "candidates": compact }))
 }
 
 fn client_matches(entry: &Value, selector: &str) -> bool {
@@ -111,6 +98,14 @@ fn client_matches(entry: &Value, selector: &str) -> bool {
         },
         selector,
     )
+}
+
+fn client_selector(entry: &Value) -> Option<String> {
+    let place_id = entry.get("placeId").and_then(Value::as_i64)?;
+    Some(entry.get("gameId").and_then(Value::as_i64).map_or_else(
+        || place_id.to_string(),
+        |game_id| format!("{game_id}:{place_id}"),
+    ))
 }
 
 pub(super) fn studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
@@ -206,22 +201,62 @@ pub(super) fn bind(
             root.join(project)
         }
     });
+    let requested_place = string(object, "place").filter(|value| !value.trim().is_empty());
+    let requested_runtime = string(object, "runtime");
+    let mut connected = studio_candidates(bridge, requested_place.as_deref().unwrap_or_default());
+    if let Some(runtime) = requested_runtime.as_deref() {
+        connected.retain(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime));
+    }
+    let selected_root = if explicit_project.is_none() {
+        let selected = match resolve_experience_place(&root, requested_place.as_deref()) {
+            Ok(place) => place,
+            Err(error) if requested_place.is_none() => {
+                let mut seen = HashSet::new();
+                let mut matches = connected
+                    .iter()
+                    .filter_map(|entry| {
+                        let selector = client_selector(entry)?;
+                        let place = resolve_experience_place(&root, Some(&selector))
+                            .ok()
+                            .flatten()?;
+                        seen.insert(place.root.clone())
+                            .then(|| (entry.clone(), place))
+                    })
+                    .collect::<Vec<_>>();
+                match matches.len() {
+                    0 => return Err(bind_project_failure(error)),
+                    1 => matches.pop().map(|(_, place)| place),
+                    _ => {
+                        let clients = matches
+                            .into_iter()
+                            .map(|(client, _)| client)
+                            .collect::<Vec<_>>();
+                        return Err(ambiguous_studios(&clients));
+                    }
+                }
+            }
+            Err(error) => return Err(bind_project_failure(error)),
+        };
+        selected.map_or_else(|| root.clone(), |place| place.root)
+    } else {
+        root.clone()
+    };
     let direct_project = explicit_project
         .clone()
-        .unwrap_or_else(|| root.join(config::PROJECT_FILE_NAME));
+        .unwrap_or_else(|| selected_root.join(config::PROJECT_FILE_NAME));
     if object.get("bootstrap").and_then(Value::as_bool) == Some(true) && !direct_project.is_file() {
         return bootstrap(state, &root);
     }
     let loaded = (|| -> Result<config::LoadedProject> {
         if explicit_project.is_some() {
-            return config::load_project(explicit_project.as_deref(), Some(&root));
+            return config::load_project(explicit_project.as_deref(), Some(&selected_root));
         }
-        if let Some(loaded) = config::try_load_project(None, Some(&root))?
-            && loaded.root == root
+        if let Some(loaded) = config::try_load_project(None, Some(&selected_root))?
+            && loaded.root == selected_root
         {
             return Ok(loaded);
         }
-        let project = workflows::initialize_place_root(&root, Path::new("src"))?;
+        let project = workflows::initialize_place_root(&selected_root, Path::new("src"))?;
         config::load_project(Some(&project), None)
     })()
     .map_err(|error| Failure::new("no_project", format!("{error:#}"), false, "project-init"))?;
@@ -241,17 +276,29 @@ pub(super) fn bind(
             "project-validate",
         )
     })?;
-    let experience = experience_root(&project_root);
-    let (manifest_game_id, manifest_place_id, alias) =
-        manifest_identity(&experience, &project_root).map_err(|error| {
-            Failure::new(
-                "no_project",
-                format!("{error:#}"),
-                false,
-                "project-validate",
-            )
-        })?;
-    let requested_place = string(object, "place").filter(|value| !value.trim().is_empty());
+    workflows::refresh_agent_instructions(&project_root).map_err(|error| {
+        Failure::new(
+            "internal",
+            format!("Failed to refresh Renium project instructions: {error:#}"),
+            false,
+            "bind",
+        )
+    })?;
+    let identity = resolve_experience_place(&project_root, None).map_err(|error| {
+        Failure::new(
+            "no_project",
+            format!("{error:#}"),
+            false,
+            "project-validate",
+        )
+    })?;
+    let experience = identity.as_ref().map_or_else(
+        || project_root.clone(),
+        |place| place.experience_root.clone(),
+    );
+    let manifest_game_id = identity.as_ref().and_then(|place| place.game_id);
+    let manifest_place_id = identity.as_ref().and_then(|place| place.place_id);
+    let alias = identity.as_ref().map(|place| place.alias.clone());
     let selector =
         requested_place
             .clone()
@@ -262,29 +309,12 @@ pub(super) fn bind(
                 (_, Some(place_id)) if place_id > 0 => place_id.to_string(),
                 _ => alias.clone().unwrap_or_default(),
             });
-    let requested_runtime = string(object, "runtime");
     let mut candidates = studio_candidates(bridge, &selector);
     if let Some(runtime) = requested_runtime.as_deref() {
         candidates.retain(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime));
     }
     if candidates.len() > 1 {
-        let compact = candidates
-            .iter()
-            .map(|entry| {
-                json!({
-                    "id": entry.get("runtimeId"),
-                    "n": entry.get("placeName"),
-                    "p": entry.get("placeId"),
-                })
-            })
-            .collect::<Vec<_>>();
-        return Err(Failure::new(
-            "ambiguous_place",
-            "More than one Studio runtime matches this project",
-            false,
-            "studios",
-        )
-        .detail(json!({ "candidates": compact })));
+        return Err(ambiguous_studios(&candidates));
     }
     let candidate = candidates.first();
     let runtime_id = candidate

@@ -15,7 +15,9 @@ use crate::cli::SyncWallyPackagesArgs;
 use crate::editor::document::ensure_editor_source_target_in_bytecode;
 use crate::editor::paths::{build_editor_instance_paths, infer_editor_source_path_spec_in_service};
 use crate::project::layout::apply_configured_project_layout;
-use crate::settings::bytecode::SettingsBytecode;
+use crate::settings::bytecode::{
+    SettingsBytecode, decode_settings_bytecode, encode_settings_bytecode,
+};
 use crate::settings::instance::{self as instance_api, InstanceSelector};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::system::files::{
@@ -27,12 +29,13 @@ use crate::system::tools::run_checked_external_tool;
 use super::{
     LinkLock, LinkTargetRef, LinkTargetStorage, RENIUM_DIR_GITIGNORE,
     apply_preserved_subtree_identity, collect_project_settings_files, ensure_editor_container_path,
-    link_lock_path, link_manifest_path, link_target_document_selector_parts,
-    link_target_file_pairs_at, link_target_ordinals, link_target_ref_key, link_target_segments,
-    load_settings_documents, package_target_fingerprint, prepare_package_replacement,
-    read_link_lock, read_link_manifest, referenced_settings_ids_outside,
-    resolve_editor_instance_by_path_ordinals, resolve_link_target_storage, selector_starts_with,
-    serialize_link_lock, stage_settings_document_writes, subtree_relative_indices,
+    ensure_settings_document, link_lock_path, link_manifest_path,
+    link_target_document_selector_parts, link_target_file_pairs_at, link_target_ordinals,
+    link_target_ref_key, link_target_segments, load_settings_documents, package_target_fingerprint,
+    prepare_package_replacement, read_link_lock, read_link_manifest,
+    referenced_settings_ids_outside, resolve_editor_instance_by_path_ordinals,
+    resolve_link_target_storage, selector_starts_with, serialize_link_lock,
+    stage_settings_document_writes, subtree_relative_indices,
 };
 
 struct WallyRealm {
@@ -243,6 +246,7 @@ fn import_wally_realm(
         .collect::<Vec<_>>();
     let root_key = instance_path_parts_key(&[], &[]);
     let mut expected_classes = HashMap::from([(root_key, "Folder".to_string())]);
+    let mut explicit_sources = HashMap::<String, PathBuf>::new();
     for pair in &pairs {
         let Some(spec) =
             infer_editor_source_path_spec_in_service(&service_dir, &service, &pair.mirror)
@@ -261,18 +265,31 @@ fn import_wally_realm(
         for end in 1..=relative.len() {
             let segments = relative[..end].to_vec();
             let key = instance_path_parts_key(&segments, &vec![1; segments.len()]);
-            let class_name = if end == relative.len() {
-                spec.class_name.clone()
-            } else {
-                "Folder".to_string()
-            };
-            if let Some(existing) = expected_classes.insert(key, class_name.clone())
-                && existing != class_name
+            if end < relative.len() {
+                expected_classes
+                    .entry(key)
+                    .or_insert_with(|| "Folder".to_string());
+                continue;
+            }
+            if let Some(existing_source) = explicit_sources.get(&key)
+                && expected_classes.get(&key) != Some(&spec.class_name)
             {
+                let path = target_prefix
+                    .iter()
+                    .chain(relative.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(".");
                 bail!(
-                    "Wally sources map the same instance to incompatible classes {existing} and {class_name}"
+                    "Wally sources {} and {} map {path} to incompatible classes {} and {}",
+                    existing_source.display(),
+                    pair.canonical.display(),
+                    expected_classes[&key],
+                    spec.class_name,
                 );
             }
+            expected_classes.insert(key.clone(), spec.class_name.clone());
+            explicit_sources.insert(key, pair.canonical.clone());
         }
     }
 
@@ -523,6 +540,8 @@ fn wally_realm_is_fresh(
         false,
         &HashSet::new(),
     )?;
+    let expected_document =
+        decode_settings_bytecode(&encode_settings_bytecode(&expected_document)?)?;
     let expected_fingerprint = package_target_fingerprint(
         &expected_document,
         &service,
@@ -540,8 +559,13 @@ fn resolve_wally_realm_storages(
 ) -> Result<HashMap<&'static str, LinkTargetStorage>> {
     let mut storages = HashMap::new();
     for realm in realms {
-        match resolve_link_target_storage(project_root, src_root, &wally_realm_target(realm), true)
-        {
+        match resolve_link_target_storage(
+            project_root,
+            src_root,
+            &wally_realm_target(realm),
+            true,
+            true,
+        ) {
             Ok(storage) => {
                 storages.insert(realm.realm, storage);
             }
@@ -616,7 +640,7 @@ fn run_wally_install(
     if all_realms_fresh {
         return Ok(json!({
             "skipped": true,
-            "reason": "fresh",
+            "reason": "current",
             "command": wally_path,
             "args": ["install"],
         }));
@@ -683,15 +707,19 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
     for settings_file in &settings_files {
         guards.push(acquire_settings_file_lock(settings_file)?);
     }
-    let (mut documents, mut settings_outputs) = load_settings_documents(&settings_files)?;
-    for storage in realm_storages.values() {
-        if let Some(settings_file) = storage.settings_file.as_ref() {
-            settings_outputs.insert(
-                settings_file.clone(),
-                storage
-                    .settings_output_file
-                    .clone()
-                    .unwrap_or_else(|| settings_file.clone()),
+    let existing_settings_files = settings_files
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    let (mut documents, mut settings_outputs) = load_settings_documents(&existing_settings_files)?;
+    for realm in &realms {
+        if let Some(storage) = realm_storages.get(realm.realm) {
+            ensure_settings_document(
+                &mut documents,
+                &mut settings_outputs,
+                storage,
+                &realm.service,
             );
         }
     }
@@ -904,23 +932,52 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
 
     let primary = realm_results
         .iter()
-        .find(|value| value.get("skipped").and_then(Value::as_bool) == Some(false));
-    Ok(json!({
+        .find(|value| value.get("skipped").and_then(Value::as_bool) == Some(false))
+        .or_else(|| realm_results.first());
+    let compact_realms = realm_results
+        .iter()
+        .map(|realm| {
+            let mut compact = json!({
+                "realm": realm.get("realm"),
+                "service": realm.get("service"),
+                "targetName": realm.get("targetName"),
+                "skipped": realm.get("skipped"),
+            });
+            if let Some(removed) = realm.get("removed") {
+                compact["removed"] = removed.clone();
+            }
+            compact
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
         "ok": true,
         "projectRoot": project_root,
         "manifest": manifest,
         "appliedRealms": applied,
         "skippedRealms": skipped,
-        "service": primary.and_then(|value| value.get("service").cloned()).unwrap_or(Value::Null),
-        "targetName": primary.and_then(|value| value.get("targetName").cloned()).unwrap_or(Value::Null),
-        "settingsFile": primary.and_then(|value| value.get("settingsFile").cloned()).unwrap_or(Value::Null),
-        "settingsIds": target_settings_ids,
-        "changedPaths": changed_paths,
-        "targetSettingsIds": target_settings_ids,
-        "removedTargets": removed_targets,
-        "realms": realm_results,
+        "processedPathCount": changed_paths.len(),
+        "importedInstanceCount": target_settings_ids.len(),
+        "removedTargetCount": removed_targets.len(),
+        "realms": compact_realms,
         "wallyInstall": wally_result,
-    }))
+    });
+    if args.details {
+        let object = result
+            .as_object_mut()
+            .context("Wally result was not an object")?;
+        if let Some(primary) = primary {
+            for key in ["service", "targetName", "settingsFile"] {
+                if let Some(value) = primary.get(key).filter(|value| !value.is_null()) {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        object.insert("changedPaths".to_string(), json!(changed_paths));
+        object.insert("targetSettingsIds".to_string(), json!(target_settings_ids));
+        object.insert("removedTargets".to_string(), json!(removed_targets));
+        object.insert("realms".to_string(), json!(realm_results));
+    }
+    Ok(result)
 }
 
 fn validate_wally_target_name(raw: &str, label: &str) -> Result<String> {

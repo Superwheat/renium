@@ -73,23 +73,18 @@ Screen Recording permissions.
    directly to a local file without showing a file picker. The original Studio
    app is not changed. The VS Code extension provides the same setup through
    **Renium: Install Studio Plugin** in the command palette and status-bar menu.
-2. Start the daemon and leave it running:
+2. Pull the place into files:
 
    ```powershell
-   rbx bd
+   rbx pull
    ```
 
-3. Export the place into files:
+   Renium starts or reuses the shared daemon, writes its internal snapshots
+   under `.renium`, and imports the place into `src/`. From the extension, use
+   **Renium: Pull Studio to Files**. Use **Renium: Push Files to Studio** for
+   the opposite direction.
 
-   ```powershell
-   rbx x -r . -d snapshots --run-import
-   ```
-
-   This writes service snapshots and imports them into `src/`. From the
-   extension, use **Renium: Pull Studio to Files**. Use **Renium: Push Files to
-   Studio** for the opposite direction.
-
-4. Check the connection any time:
+3. Check the connection any time:
 
    ```powershell
    rbx status
@@ -100,10 +95,10 @@ The daemon is found automatically by later commands (env vars
 `RENIUM_DAEMON_FILE`, then `%LOCALAPPDATA%\Renium\daemon.json`, then the
 default local endpoint).
 
-`rbx bd` is a standalone long-running process. It keeps ports 8781-8782 open
-until it is stopped. `--editor-stdio` is reserved for the VS Code extension's
-owned child process: it reads daemon requests from stdin and exits when its
-owner closes stdin. Do not use `--editor-stdio` when starting Renium manually.
+`rbx bd` is an optional standalone long-running process. Direct commands start
+or reuse the shared daemon automatically. `--editor-stdio` is reserved for the
+VS Code extension's owned child process: it reads daemon requests from stdin
+and exits when its owner closes stdin.
 
 ## Projects, adapters, and builds
 
@@ -138,6 +133,14 @@ rbx init .\my-place --with git,wally,selene,docs
 rbx init .\empty-project --preview
 ```
 
+Without `--with`, initialization creates a minimal `renium.project.jsonc`, an
+empty `src` directory, the current `RENIUM.md` agent guide, and one marked
+instruction in `AGENTS.md` and `CLAUDE.md`. Existing guidance in those two
+files is preserved, and repeated initialization doesn't duplicate or rewrite
+unchanged instructions. Preview lists each file action and directory without
+writing anything. A required path with the wrong file type stops the whole
+initialization before any project file is changed.
+
 Adapters explicitly map non-Luau files into Roblox instances. TXT maps to
 `StringValue`, CSV maps to `LocalizationTable`, model JSON maps to an instance
 subtree, and JSON/JSONC/TOML/YAML/MessagePack/Markdown generate deterministic
@@ -146,7 +149,26 @@ returned. Roblox models and nested Renium or Rojo projects can be mounted.
 Generated or one-way formats must be marked as such in the project file. Mounts
 can be `exclusive`, `overlay`, or `read-only`, and can be `optional`.
 
+```jsonc
+{
+  "mounts": [
+    {
+      "source": "shared",
+      "target": "ReplicatedStorage.Shared",
+      "ownership": "read-only",
+      "optional": true
+    }
+  ]
+}
+```
+
+`exclusive` is the default ownership. An optional missing source projects
+nothing and doesn't block validation or builds. Project reads include mounted
+instances, writable mount scripts can be edited through `bss`, and
+`explain-path` follows descendants inside nested projects.
+
 ```powershell
+rbx project-validate
 rbx adapters validate
 rbx adapters build
 rbx adapters build --check
@@ -156,6 +178,10 @@ rbx adapters syncback --preview
 rbx import-rojo --project .\default.project.json --preview
 rbx import-rojo --project .\default.project.json --apply
 ```
+
+`project-validate` checks the complete project without Studio. It exits nonzero
+for invalid configuration, ownership, mounts, adapters, filters, or source
+paths.
 
 Two-way TXT, CSV, and model-JSON adapters update their canonical instances
 during `adapters build` or `adapters watch`. Studio imports update their source
@@ -169,22 +195,92 @@ rbx syncback --input .\snapshots --list
 rbx syncback --input .\snapshots --dry-run
 rbx syncback --input .\snapshots -y
 rbx import-path .\Shared.luau --path-json '["ReplicatedStorage","Shared"]' --dry-run
+rbx import-path .\Shared.luau --path-json '["ReplicatedStorage","Shared"]'
+rbx import-path .\SharedFolder --destination src\ReplicatedStorage\Shared --dry-run
 ```
+
+`--path-json` maps one file to a Roblox path and preserves its script suffix, so
+`.server.luau` becomes a `Script` and `.client.luau` becomes a `LocalScript`.
+`--destination` copies a file or directory to a portable project-relative path.
+Each result labels every file `create`, `overwrite`, or `unchanged`. Preview
+first; omitting `--dry-run` applies the listed actions. Add `--push` only when
+the imported files should immediately update Studio; pushed destinations must
+belong to the active project.
 
 Filters are ordered and last-match wins. They can match path glob, name, class,
 tag, attribute, or property and can apply to either sync direction. Ignored
 Studio instances and ignored script sources remain unchanged, including during
 a structural reconcile.
 
+`syncRules` map files not covered by normal script naming. Each rule has a
+`pattern`, `use`, and optional `suffix` and `exclude`. The last matching rule
+wins. `suffix` is removed from the instance name, `exclude` disqualifies that
+rule for matching paths, and `use: "ignore"` suppresses the file. Supported
+script middleware names are `moduleScript`, `serverScript`, `clientScript`, and
+`pluginScript`; adapter format names are also accepted. `globIgnorePaths`
+ignores matching project-relative paths before projection.
+
+```jsonc
+{
+  "syncRules": [
+    {
+      "pattern": "**/*.server.txt",
+      "use": "serverScript",
+      "suffix": ".server.txt"
+    },
+    {
+      "pattern": "**/draft/**",
+      "use": "ignore"
+    }
+  ],
+  "globIgnorePaths": ["src/generated/**"],
+  "filters": [
+    {
+      "action": "ignore",
+      "direction": "files-to-studio",
+      "class": "ModuleScript"
+    },
+    {
+      "action": "include",
+      "direction": "files-to-studio",
+      "name": "Shared"
+    },
+    {
+      "action": "ignore",
+      "direction": "both",
+      "glob": "Workspace/Generated/**",
+      "property": "Source"
+    }
+  ]
+}
+```
+
+Filter actions are `include` or `ignore`; directions are `files-to-studio`,
+`studio-to-files`, or `both`. A filter can select by `glob`, `name`, `class`,
+`tag`, `attribute`, `property`, or `id`. Property and attribute selectors affect
+only the matching field. In `rbx explain-path PATH`, `owned` means a configured
+mapping claims the path, `ignored` means `globIgnorePaths` blocks it, and
+`selectedSyncRule` identifies the winning rule even when another setting
+suppresses its output. The command also reports excluded rules, matching filter
+selectors, instance decisions for both directions, and field decisions.
+
+### Layered configuration
+
 Shared settings merge in this order: user, workspace, experience, place, then
 the project file's `settings` object. Explicit editor settings and CLI flags
 override the merged value.
+
+`get` and `list` read the merged configuration by default; only `list` accepts
+`--origins`. `set`, `unset`, `reset`, `edit`, and `path` accept a writable
+`--scope`. `export` always writes the merged configuration and has no scope.
 
 ```powershell
 rbx config list --origins
 rbx config get liveSync.changesThreshold
 rbx config set liveSync.changesThreshold 10 --scope place
 rbx config unset liveSync.changesThreshold --scope place
+rbx config reset --scope place
+rbx config path --scope workspace
 rbx config edit --scope user
 rbx config export -o effective-renium-config.json
 ```
@@ -223,6 +319,8 @@ rbx device status
 rbx shot --studio -o iphone-16-pro.png
 rbx device stop
 ```
+
+`device set` returns the resulting state. Use `device status` when reading the current state separately. Add `--details` to listing or status commands for native preset dimensions and density.
 
 The command accepts catalog names or stable ids and requires no keyboard,
 mouse, focus, coordinates, or ribbon interaction. Notched devices reproduce
@@ -334,9 +432,8 @@ rbx del  -s Workspace -p '["ModelName"]'
 Export Studio to files:
 
 ```powershell
+rbx pull                                      # Studio -> project files
 rbx x -r . -d snapshots --no-run-import    # snapshots only
-rbx x -r . -d snapshots --run-import       # snapshots + import into src/
-rbx x -r . --src-dir game -d snapshots --run-import
 ```
 
 Friendly structural commands edit the canonical store by stable id:
@@ -375,6 +472,14 @@ rbx doctor --json
 rbx doctor --bundle .\.renium\diagnostics\release-check
 ```
 
+`doctor` checks the project, merged configuration, optional tools, Studio
+plugin, and daemon discoveries. `--root` selects its working directory; a
+global `--project` pins the project check. Warnings and missing optional tools
+keep exit code 0, while errors return 1. `--json` returns the check list and
+build identity. `--bundle` writes `doctor.json`, `environment.json`, and an
+exact copy of the selected project file when one loaded successfully. Repeating
+the same bundle replaces only those diagnostic files.
+
 The editor extension checks for a signed GitHub release when it opens. The Rust
 updater shares that verified result with the daemon for five minutes. After the
 cache expires, it sends the saved ETag so GitHub returns no manifest body when
@@ -412,18 +517,8 @@ Agents can use the bound automation context for any JSON Open Cloud endpoint.
 The daemon reuses one HTTPS client, fills `{universe}` and `{place}` from the
 context, and accepts several requests in one payload:
 
-```json
-{
-  "requests": [{
-    "method": "GET",
-    "path": "/cloud/v2/universes/{universe}/data-stores",
-    "query": { "maxPageSize": 25 }
-  }]
-}
-```
-
 ```powershell
-rbx a cloud CX -J open-cloud.json
+'{"requests":[{"method":"GET","path":"/cloud/v2/universes/{universe}/data-stores","query":{"maxPageSize":25}}]}' | rbx a cloud CX -J -
 ```
 
 `ROBLOX_API_KEY` must be set before the daemon starts. See the generated
@@ -434,13 +529,37 @@ The automation API also covers the plugin-accessible Creator features used by
 Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
 AI model generation jobs, local image validation, and Open Cloud image upload.
 
+Common reads and Studio creator jobs have direct commands:
+
 ```powershell
-rbx a asset-search CX -J asset-search.json
-rbx a asset-insert CX -J asset-insert.json
-rbx a generate-model CX -J generate-model.json
-rbx a job-status CX -J job-status.json
-rbx a image-store CX -J image-store.json
-rbx a image-upload CX -J image-upload.json
+rbx asset-search "wooden crate" --limit 5
+rbx asset-insert 182451181 --parent Workspace --name AuditCrate
+rbx generate-model "small wooden crate" --parent Workspace --name GeneratedCrate --size 4,4,4 --max-triangles 2000
+rbx job-status JOB_ID --wait-seconds 30
+rbx image-store assets/reference.png
+rbx http-get "https://create.roblox.com/docs/reference/engine/classes/StudioDeviceSimulatorService" --query GetResolutionAsync --limit 1
+```
+
+Asset insertion returns the inserted path, name, class, and asset ID. Insertion
+and generation change the live Edit runtime; pull or save to persist them.
+Generation returns a `jobId`; `job-status` can wait up to 120 seconds and returns
+`running`, `succeeded`, or `failed`. An expired wait returns `running` with exit 0.
+Filtered `http-get` lines include readable-document line numbers, and its counts
+refer to matching lines. `image-store` only validates a local PNG, JPEG, BMP, or
+TGA up to 5 MiB; it does not upload anything.
+
+Variable Open Cloud and image-upload payloads use stdin instead of temporary
+files. Open Cloud request entries accept `method`, `path`, and optional `query`,
+`body`, `pathParams`, `ifMatch`, and `ifNoneMatch`. Uploading creates assets in
+the user's Roblox account and should be run only as an explicit write:
+
+Bound `{universe}` and `{place}` values require a published project with nonzero
+game and place IDs. For an unpublished project, provide explicit numeric path
+parameters instead.
+
+```powershell
+'{"images":["https://example.com/image.png"],"name":"Reference"}' | rbx a image-upload CX -J -
+'{"images":["assets/reference.png"],"userId":123,"via":"open-cloud","waitSeconds":30}' | rbx a image-upload CX -J -
 ```
 
 `generate-model` uses the public `GenerationService:GenerateModelAsync` plugin
@@ -452,7 +571,8 @@ HTTP image uploads use the locally installed plugin's prompt-free
 `AssetService:CreateAssetAsync` API. Local files and explicit user/group
 ownership use Open Cloud instead.
 
-Ordered mouse and keyboard sequences use `rbx a input CX -J input.json`.
+Ordered mouse and keyboard sequences use `rbx a input CX -J -` with the payload
+piped through stdin.
 Windows posts events to the exact target window handle and macOS posts Quartz
 events to the exact target process. Neither implementation moves the system
 cursor, sends global input, or activates another application. Linux sends the
@@ -464,13 +584,15 @@ Agents can record the edit viewport or one play client without activating its
 window or capturing the rest of the desktop:
 
 ```powershell
-rbx a record-start CX -J record-start.json
-rbx a record-end CX -J record-end.json
+rbx record-start -p 2 -o test.mp4
+rbx key W --hold-ms 700 -p 2
+rbx record-end
 ```
 
-`record-start` accepts `player`, `studio`, `client`, an `output` path ending in
-`.mp4`, `fps` from 1 through 30, `maxSeconds` from 1 through 300, and `quality`
-from 0 through 100. Pass its returned `recordingId` to `record-end`. The result
+`record-start` accepts `--player`, `--studio`, `--client`, an `--output` path ending in
+`.mp4`, `--fps` from 1 through 30, `--max-seconds` from 1 through 300, and `--quality`
+from 0 through 100. `record-end` stops the sole active recording; pass its optional
+recording ID to verify which recording is being stopped. The result
 is an H.264 MP4 with no audio and can be attached directly as a clip.
 
 `rbx docs [topic]` prints the bundled reference. `rbx docs --serve` exposes the
@@ -505,18 +627,48 @@ rbx bg  Workspace -i editor:script-id -p Source                 # get property
 
 Selector rules that prevent surprises:
 
-- Select with `-i` (settings id), `-x` (index), `-n`/`-c` (name/class), or
-  `--path` + optional `--ords`. Don't combine `--path` with the others.
+- Select with `-i` (settings id), `-x` (index), `-n` (name), `-c` (class), or
+  `--path` + optional `--ords`. Use exactly one selector and don't combine
+  `--path` with another selector.
 - A bare service name resolves `src\<Service>\__roblox_sync_settings.renium`;
   pass an explicit file with `-f` instead — never both.
 - Duplicate names or paths are rejected rather than silently picking the first
   match; disambiguate with `--ords`, `--id`, or `--index`.
 - `--scope auto|metadata|property|attribute` controls what a property write
-  targets; `auto` is right almost always.
+  targets. `auto` rejects names missing from the selected class. Use `property`
+  only for a real newer or hidden Roblox property absent from the bundled
+  schema, and `attribute` to create an attribute, for example
+  `rbx bs Workspace -i editor:id -p Reviewed --scope attribute --bool true`.
+
+Set an instance reference with
+`-j '{"_type":"Ref","settingsId":"editor:target"}'`; `--null` clears it.
+Mutation results include only actual file changes in `changedPaths`, so an
+empty list is a successful no-op and needs no push.
 
 Batched low-level reads go through `rbx bb` (one call, many queries). The op
 types are `counts`, `service`, `search`, `children`, `instance`, and `find`;
 see `RENIUM.md` for recipes and field presets.
+
+Search and read saved scripts directly without a daemon or Studio:
+
+```powershell
+rbx script-search DataStoreService UpdateAsync --limit 20
+rbx script-grep RemoteEvent --limit 100
+rbx script-read src/ServerScriptService/Main.server.luau --start-line 40 --end-line 80
+```
+
+`script-search` finds files containing every keyword without case sensitivity
+and reports `returnedFiles`, `totalFiles`, and truncation. `script-grep` matches
+literal source text, is case-sensitive unless `--case-insensitive` is used,
+and reports returned and total line counts. Limits cap returned results while
+totals still cover the full project. Script reads use inclusive one-based line
+numbers and reject invalid ranges.
+
+RBXM stores properties in class-wide columns, so reading it can materialize a
+Roblox class default for an instance that did not store that property. Requested
+`bb` properties also return class defaults. Inspect the source `.renium` store
+with `rbx view <store>.renium --json` before treating a decoded default as an
+explicit override.
 
 Export/import whole models and places:
 
@@ -524,7 +676,15 @@ Export/import whole models and places:
 rbx bem Workspace -i editor:id -o model.rbxm    # store subtree -> .rbxm
 rbx bim model.rbxm --service Workspace          # .rbxm -> store
 rbx bep -o place.rbxl                           # whole place file
+rbx view model.rbxm --json                      # inspect a model without importing it
+rbx sm --stdout                                 # print the complete sourcemap
+rbx bpack                                       # repack outdated stores and packages
 ```
+
+`sm` without `--stdout` writes `sourcemap.json`. Repacking leaves files that
+already use the current format untouched and reports its changed paths. `view`
+accepts stores and model files, not places; use `bep`'s manifest plus
+`sm --stdout` to verify project contents before comparing place-file hashes.
 
 ## Links (shared code across places)
 
@@ -562,7 +722,10 @@ cache location with `--cache-dir`, the manifest `cacheDir` field, or the
 Treat third-party `.renium` packages like source-code dependencies, not inert
 data: they can contain scripts that run, arbitrary properties, and
 `PackageLink` instances. `rbx lkp` packs an existing subtree into a reusable
-package; `rbx link-delete-package` removes one.
+package. `rbx link-delete-package --action delete-unused` removes an unused
+package, `delete-uses` also removes its active trees, and `unlink-uses` keeps
+those trees as ordinary editable instances. Bare `rbx bpack` repacks service
+stores and local project packages; pass explicit paths to limit it.
 
 In VS Code/Cursor, linked files show an `L` badge and open read-only;
 right-click for **Break Link** / **Reveal Link Source**.

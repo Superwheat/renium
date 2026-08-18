@@ -165,7 +165,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.1.9"
+	local BRIDGE_VERSION = "0.2.0"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -469,17 +469,6 @@ function BridgePluginRuntime.start(context)
 	local EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS: { [string]: { { any } } } = BUNDLED_PROPERTY_SCHEMAS_BY_CLASS
 	local EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS: { [string]: { string } } =
 		PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
-	do
-		local classCount, propertyCount = PropertySchemaModule.countCandidates(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
-		if classCount > 0 then
-			print(
-				("[Renium] loaded bundled rbx-dom property candidates: classes=%d, properties=%d"):format(
-					classCount,
-					propertyCount
-				)
-			)
-		end
-	end
 
 	Config.studioChanges.configurePropertyCandidates(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 

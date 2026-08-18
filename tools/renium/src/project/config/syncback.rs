@@ -2573,7 +2573,8 @@ pub fn syncback_project_adapters_from_root(
     check: bool,
 ) -> Result<usize> {
     let plan = plan_adapter_syncback(loaded, source_root)?;
-    let changed = plan.writes.len() + usize::from(plan.baseline_changed);
+    let source_changes = plan.writes.len();
+    let changed = source_changes + usize::from(plan.baseline_changed);
     if check && changed > 0 {
         let mut changed_paths = plan
             .writes
@@ -2597,7 +2598,7 @@ pub fn syncback_project_adapters_from_root(
             write_file_transaction(&writes)?;
         }
     }
-    Ok(changed)
+    Ok(source_changes)
 }
 
 pub(super) struct AdapterSyncbackPlan {

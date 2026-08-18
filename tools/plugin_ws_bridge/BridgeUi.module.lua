@@ -8,7 +8,7 @@ local TweenService = game:GetService("TweenService")
 local TWEEN_FAST = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local LOGO_IMAGE = "rbxthumb://type=Asset&id=140594231959629&w=150&h=150"
-local TOOLBAR_ICON = LOGO_IMAGE
+local TOOLBAR_ICON = "rbxasset://textures/StudioSharedUI/import.png"
 
 local BRAND = Color3.fromRGB(96, 165, 250)
 local OK_GREEN = Color3.fromRGB(86, 194, 126)

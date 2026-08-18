@@ -18,9 +18,9 @@ use serde_json::{Map, Value, json};
 use crate::editor::paths::infer_source_script;
 use crate::settings::bytecode::SettingsBytecode;
 use crate::system::files::{
-    absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
-    exact_path_key as path_slash, is_windows_reserved_name, path_extension_is,
-    service_settings_path,
+    absolutize_for_daemon as absolute_path, atomic_write_file, canonical_path,
+    ends_with_ignore_ascii_case, exact_path_key as path_slash, is_windows_reserved_name,
+    path_extension_is, service_settings_path, write_utf8_file,
 };
 
 mod adapter_format;
@@ -31,14 +31,14 @@ mod projection_references;
 mod syncback;
 mod validation;
 
-use adapter_format::{AdapterFormat, adapter_format};
-use jsonc::format_jsonc;
+use adapter_format::{AdapterFormat, adapter_format, adapter_output_path};
 pub(crate) use jsonc::parse_jsonc_value;
+use jsonc::{format_jsonc, has_jsonc_comments};
 
 use projection::{
     adapter_target_script_path, compile_projection, file_target_destination, is_metadata_sidecar,
     metadata_sidecar_target, nested_project_targets, path_is_ignored, sync_rule_instance_name,
-    sync_rule_matches, target_segments,
+    target_segments,
 };
 pub use projection::{
     compiled_files_to_studio_filters, compiled_files_to_studio_ignore_unknown_targets,
@@ -215,24 +215,49 @@ fn active_target_ordinals(target: &[String]) -> Vec<usize> {
     })
 }
 
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
+}
+
+fn is_default_source_root(path: &PathBuf) -> bool {
+    path == Path::new("src")
+}
+
+fn is_empty_json_object(value: &Value) -> bool {
+    value.as_object().is_some_and(Map::is_empty)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReniumProject {
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "is_default_source_root")]
     pub source_root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub build_target: Option<ProjectTarget>,
+    #[serde(skip_serializing_if = "is_default")]
     pub root: ProjectNode,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tree: BTreeMap<String, ProjectNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ProjectMount>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub adapters: Vec<AdapterSpec>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sync_rules: Vec<SyncRule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub glob_ignore_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<FilterRule>,
+    #[serde(skip_serializing_if = "is_default")]
     pub script_extension: ScriptExtensionPolicy,
+    #[serde(skip_serializing_if = "is_default")]
     pub export_naming: ExportNaming,
+    #[serde(skip_serializing_if = "is_empty_json_object")]
     pub settings: Value,
 }
 
@@ -258,22 +283,25 @@ impl Default for ReniumProject {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProjectNode {
-    #[serde(rename = "$id")]
+    #[serde(rename = "$id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "$path")]
+    #[serde(rename = "$path", skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    #[serde(rename = "$className")]
+    #[serde(rename = "$className", skip_serializing_if = "Option::is_none")]
     pub class_name: Option<String>,
-    #[serde(rename = "$properties")]
+    #[serde(rename = "$properties", skip_serializing_if = "Map::is_empty")]
     pub properties: Map<String, Value>,
-    #[serde(rename = "$attributes")]
+    #[serde(rename = "$attributes", skip_serializing_if = "Map::is_empty")]
     pub attributes: Map<String, Value>,
-    #[serde(rename = "$tags")]
+    #[serde(rename = "$tags", skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
-    #[serde(rename = "$ignoreUnknownInstances")]
+    #[serde(
+        rename = "$ignoreUnknownInstances",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ignore_unknown_instances: Option<bool>,
     #[serde(flatten)]
     pub children: BTreeMap<String, Value>,
@@ -284,9 +312,9 @@ pub struct ProjectNode {
 pub struct ProjectMount {
     pub source: PathBuf,
     pub target: ProjectTarget,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub ownership: MountOwnership,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub optional: bool,
 }
 
@@ -304,11 +332,13 @@ pub enum MountOwnership {
 pub struct AdapterSpec {
     pub source: PathBuf,
     pub target: ProjectTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub direction: AdapterDirection,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub generated: bool,
 }
 
@@ -316,9 +346,11 @@ pub struct AdapterSpec {
 #[serde(deny_unknown_fields)]
 pub struct SyncRule {
     pub pattern: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<String>,
     #[serde(rename = "use")]
     pub middleware: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
 }
 
@@ -334,18 +366,27 @@ pub enum AdapterDirection {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilterRule {
+    #[serde(skip_serializing_if = "is_default")]
     pub action: FilterAction,
+    #[serde(skip_serializing_if = "is_default")]
     pub direction: FilterDirection,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attribute: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub property: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilterAction {
     Include,
@@ -371,7 +412,7 @@ pub enum ScriptExtensionPolicy {
     Lua,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportNaming {
     pub server_suffix: String,
@@ -875,6 +916,13 @@ pub fn project_source_roots(loaded: &LoadedProject) -> Result<Vec<PathBuf>> {
     Ok(roots.into_iter().collect())
 }
 
+pub(crate) fn project_adapter_output_path(
+    loaded: &LoadedProject,
+    adapter: &AdapterSpec,
+) -> Result<Option<PathBuf>> {
+    adapter_output_path(loaded, adapter, adapter_format(adapter)?)
+}
+
 pub fn project_config_paths(loaded: &LoadedProject) -> Result<Vec<PathBuf>> {
     fn collect(
         loaded: &LoadedProject,
@@ -956,8 +1004,7 @@ fn project_source_roots_into(
         if source.is_file() && adapter_format(adapter)? == AdapterFormat::NestedProject {
             project_source_roots_into(&load_nested_project(&source)?, roots, visited)?;
         }
-        if let Some(output) = adapter.output.as_deref() {
-            let output = loaded.root.join(output);
+        if let Some(output) = project_adapter_output_path(loaded, adapter)? {
             roots.insert(output.parent().unwrap_or(&loaded.root).to_path_buf());
         }
     }
@@ -1465,7 +1512,7 @@ pub fn run_fmt_project(args: FmtProjectArgs, global_project: Option<&Path>) -> R
         .with_context(|| format!("Failed to read {}", project_path.display()))?;
     let value = parse_jsonc_value(&text)
         .with_context(|| format!("Invalid JSONC in {}", project_path.display()))?;
-    let formatted = if text.contains("//") || text.contains("/*") {
+    let formatted = if has_jsonc_comments(&text)? {
         let formatted = format_jsonc(&text)?;
         if parse_jsonc_value(&formatted)? != value {
             bail!(
@@ -1486,10 +1533,17 @@ pub fn run_fmt_project(args: FmtProjectArgs, global_project: Option<&Path>) -> R
             &format!("{} is formatted", project_path.display()),
         );
     }
-    atomic_write_file(&project_path, formatted.as_bytes())?;
+    let changed = text != formatted;
+    if changed {
+        write_utf8_file(&project_path, &formatted)?;
+    }
     crate::app::output::emit_global_output(
-        &json!({ "ok": true, "path": project_path, "formatted": true }),
-        &format!("Formatted {}", project_path.display()),
+        &json!({ "ok": true, "path": project_path, "formatted": true, "changed": changed }),
+        &if changed {
+            format!("Formatted {}", project_path.display())
+        } else {
+            format!("{} is already formatted", project_path.display())
+        },
     )
 }
 
@@ -1512,11 +1566,21 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         })?
         .to_path_buf();
     let relative_text = path_slash(&relative);
+    let staged_relatives = project_source_to_staged_relatives(&loaded, &absolute)?;
+    let maps_to_target = |target: &[String]| {
+        let target = target.iter().collect::<PathBuf>();
+        staged_relatives
+            .iter()
+            .any(|relative| relative == &target || relative.starts_with(&target))
+    };
     let mut matches = Vec::new();
     for (target, node) in project_tree_nodes(&loaded.project.tree) {
         if let Some(source) = node.path.as_deref() {
             let source = path_slash(source);
-            if relative_text == source || relative_text.starts_with(&(source.clone() + "/")) {
+            if relative_text == source
+                || relative_text.starts_with(&(source.clone() + "/"))
+                || maps_to_target(&target)
+            {
                 matches.push(json!({
                     "kind": "tree",
                     "source": source,
@@ -1527,7 +1591,10 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
     }
     for mount in &loaded.project.mounts {
         let source = path_slash(&mount.source);
-        if relative_text == source || relative_text.starts_with(&(source.clone() + "/")) {
+        if relative_text == source
+            || relative_text.starts_with(&(source.clone() + "/"))
+            || maps_to_target(&mount.target.segments())
+        {
             matches.push(json!({
                 "kind": "mount",
                 "source": source,
@@ -1538,8 +1605,14 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
     }
     for adapter in &loaded.project.adapters {
         let source = path_slash(&adapter.source);
-        let output = adapter.output.as_deref().map(path_slash);
-        if relative_text == source || output.as_deref() == Some(relative_text.as_str()) {
+        let output = project_adapter_output_path(&loaded, adapter)?
+            .as_deref()
+            .and_then(|path| path.strip_prefix(&loaded.root).ok())
+            .map(path_slash);
+        if relative_text == source
+            || output.as_deref() == Some(relative_text.as_str())
+            || maps_to_target(&adapter.target.segments())
+        {
             matches.push(json!({
                 "kind": "adapter",
                 "source": source,
@@ -1550,30 +1623,41 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         }
     }
     let rule_relative = source_owner_relative_path(&loaded, &absolute).unwrap_or(relative);
-    let selected_rule = loaded
-        .project
-        .sync_rules
-        .iter()
-        .enumerate()
-        .filter_map(|(index, rule)| {
-            sync_rule_matches(rule, &rule_relative)
-                .ok()?
-                .then_some(index)
-        })
-        .next_back();
+    let mut rule_matches = Vec::new();
     for (index, rule) in loaded.project.sync_rules.iter().enumerate() {
-        if sync_rule_matches(rule, &rule_relative)? {
-            matches.push(json!({
-                "kind": "syncRule",
-                "index": index,
-                "selected": selected_rule == Some(index),
-                "pattern": rule.pattern,
-                "exclude": rule.exclude,
-                "use": rule.middleware,
-                "suffix": rule.suffix,
-                "targetName": sync_rule_instance_name(rule, &rule_relative)?,
-            }));
+        if !compile_glob(&rule.pattern)?.is_match(&rule_relative) {
+            continue;
         }
+        let excluded = match rule.exclude.as_deref() {
+            Some(pattern) => compile_glob(pattern)?.is_match(&rule_relative),
+            None => false,
+        };
+        rule_matches.push((index, rule, excluded));
+    }
+    let selected_rule = rule_matches
+        .iter()
+        .filter_map(|(index, _, excluded)| (!excluded).then_some(*index))
+        .next_back();
+    let has_owner_match = !matches.is_empty() || selected_rule.is_some();
+    for (index, rule, excluded) in rule_matches {
+        let mut entry = Map::new();
+        entry.insert("kind".to_string(), json!("syncRule"));
+        entry.insert("index".to_string(), json!(index));
+        entry.insert("selected".to_string(), json!(selected_rule == Some(index)));
+        entry.insert("excluded".to_string(), json!(excluded));
+        entry.insert("pattern".to_string(), json!(rule.pattern));
+        entry.insert("use".to_string(), json!(rule.middleware));
+        entry.insert(
+            "targetName".to_string(),
+            json!(sync_rule_instance_name(rule, &rule_relative)?),
+        );
+        if let Some(exclude) = &rule.exclude {
+            entry.insert("exclude".to_string(), json!(exclude));
+        }
+        if let Some(suffix) = &rule.suffix {
+            entry.insert("suffix".to_string(), json!(suffix));
+        }
+        matches.push(Value::Object(entry));
     }
     let ignored_by_path = path_is_ignored(&loaded, &absolute)?;
     let projection = stage_project(&loaded)?;
@@ -1598,6 +1682,7 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
     };
     let mut filter_candidates = Vec::new();
     let mut matching_filters = Vec::new();
+    let requested_absolute = absolute_path(&absolute);
     for service in fs::read_dir(projection.root())? {
         let service = service?;
         if !service.file_type()?.is_dir() {
@@ -1619,7 +1704,13 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
             let source_matches = source_path
                 .as_deref()
                 .is_some_and(|source_path| staged_absolute.contains(&absolute_path(source_path)));
-            if !source_matches && sidecar_target.as_ref() != Some(&paths[index]) {
+            let transformed_matches = projection
+                .transformed_source_for_target(&paths[index])
+                .is_some_and(|source| absolute_path(source) == requested_absolute);
+            if !source_matches
+                && !transformed_matches
+                && sidecar_target.as_ref() != Some(&paths[index])
+            {
                 continue;
             }
             let instance = &document.instances[index];
@@ -1632,20 +1723,57 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
                 &instance.class_name,
             );
             let mut candidate_rules = Vec::new();
+            let mut property_filters = BTreeSet::new();
+            let mut attribute_filters = BTreeSet::new();
             for (rule_index, rule) in loaded.project.filters.iter().enumerate() {
                 if filter_matches(rule, &candidate, FilterScope::Any)? {
-                    let entry = json!({
-                        "index": rule_index,
-                        "action": rule.action,
-                        "direction": rule.direction,
-                        "glob": rule.glob,
-                        "candidatePath": candidate_path,
-                    });
+                    let mut entry = Map::new();
+                    entry.insert("index".to_string(), json!(rule_index));
+                    entry.insert("action".to_string(), json!(rule.action));
+                    entry.insert("direction".to_string(), json!(rule.direction));
+                    entry.insert("candidatePath".to_string(), json!(candidate_path));
+                    for (key, value) in [
+                        ("glob", rule.glob.as_ref()),
+                        ("name", rule.name.as_ref()),
+                        ("class", rule.class.as_ref()),
+                        ("tag", rule.tag.as_ref()),
+                        ("attribute", rule.attribute.as_ref()),
+                        ("property", rule.property.as_ref()),
+                        ("id", rule.id.as_ref()),
+                    ] {
+                        if let Some(value) = value {
+                            entry.insert(key.to_string(), json!(value));
+                        }
+                    }
+                    let entry = Value::Object(entry);
                     candidate_rules.push(entry.clone());
                     matching_filters.push(entry);
+                    property_filters.extend(rule.property.iter().cloned());
+                    attribute_filters.extend(rule.attribute.iter().cloned());
                 }
             }
-            filter_candidates.push(json!({
+            let mut field_filters = Map::new();
+            for property in property_filters {
+                field_filters.insert(
+                    format!("property:{property}"),
+                    filter_scope_decisions(
+                        &loaded.project.filters,
+                        &candidate,
+                        FilterScope::Property(&property),
+                    )?,
+                );
+            }
+            for attribute in attribute_filters {
+                field_filters.insert(
+                    format!("attribute:{attribute}"),
+                    filter_scope_decisions(
+                        &loaded.project.filters,
+                        &candidate,
+                        FilterScope::Attribute(&attribute),
+                    )?,
+                );
+            }
+            let mut candidate_result = json!({
                 "path": candidate_path,
                 "id": instance.settings_id,
                 "filesToStudio": if filter_allows_instance(
@@ -1659,7 +1787,11 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
                     &candidate,
                 )? { "include" } else { "ignore" },
                 "matchingFilters": candidate_rules,
-            }));
+            });
+            if !field_filters.is_empty() {
+                candidate_result["fieldFilters"] = Value::Object(field_filters);
+            }
+            filter_candidates.push(candidate_result);
         }
     }
     let result = json!({
@@ -1672,7 +1804,7 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         "selectedSyncRule": selected_rule,
         "stagedPaths": staged_paths,
         "ignored": ignored_by_path,
-        "owned": !matches.is_empty() && !ignored_by_path,
+        "owned": has_owner_match && !ignored_by_path,
     });
     print_json(&result, args.pretty)
 }
@@ -1718,7 +1850,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
                 );
             }
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
-            write_json(&path, &value)?;
+            write_config_scope(&path, &value)?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "unset", "key": args.key, "path": path }),
                 &format!("Removed {} from {}", args.key, path.display()),
@@ -1728,10 +1860,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             ensure_writable_scope(args.scope)?;
             let path = config_scope_path(args.scope, &args.root)?;
             validate_config_scope_change(args.scope, &args.root, &path, &json!({}))?;
-            if path.exists() {
-                fs::remove_file(&path)
-                    .with_context(|| format!("Failed to remove {}", path.display()))?;
-            }
+            remove_config_scope(&path)?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "reset", "path": path }),
                 &format!("Reset {}", path.display()),
@@ -1778,28 +1907,25 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
     }
 }
 
+pub fn run_validate_project(args: AdapterProjectArgs, global_project: Option<&Path>) -> Result<()> {
+    let loaded = load_project(args.project.as_deref().or(global_project), None)?;
+    validate_project(&loaded)?;
+    let projection = compile_projection(&loaded);
+    crate::app::output::emit_global_output(
+        &json!({
+            "ok": true,
+            "entries": projection.entries.len(),
+            "adapters": loaded.project.adapters.len(),
+            "mounts": loaded.project.mounts.len(),
+            "project": loaded.path,
+        }),
+        &format!("Validated {}", loaded.path.display()),
+    )
+}
+
 pub fn run_adapters(args: AdaptersArgs, global_project: Option<&Path>) -> Result<()> {
     match args.command {
-        AdaptersCommand::Validate(args) => {
-            let loaded = load_project(args.project.as_deref().or(global_project), None)?;
-            validate_project(&loaded)?;
-            let projection = compile_projection(&loaded);
-            crate::app::output::emit_global_output(
-                &json!({
-                    "ok": true,
-                    "entries": projection.entries.len(),
-                    "adapters": loaded.project.adapters.len(),
-                    "mounts": loaded.project.mounts.len(),
-                    "project": loaded.path,
-                }),
-                &format!(
-                    "Validated {} adapters and {} mounts in {}",
-                    loaded.project.adapters.len(),
-                    loaded.project.mounts.len(),
-                    loaded.path.display()
-                ),
-            )
-        }
+        AdaptersCommand::Validate(args) => run_validate_project(args, global_project),
         AdaptersCommand::Build(args) => {
             let loaded = load_project(args.project.as_deref().or(global_project), None)?;
             validate_project(&loaded)?;
@@ -1928,6 +2054,7 @@ pub fn try_load_project(
     let Some(path) = try_resolve_project_path(explicit, start)? else {
         return Ok(None);
     };
+    let path = absolute_path(&path);
     let project = load_project_schema(&path)?;
     let root = path
         .parent()
@@ -2428,6 +2555,27 @@ fn filter_allows_scope(
     Ok(allowed)
 }
 
+fn filter_scope_decisions(
+    rules: &[FilterRule],
+    candidate: &FilterCandidate<'_>,
+    scope: FilterScope<'_>,
+) -> Result<Value> {
+    Ok(json!({
+        "filesToStudio": if filter_allows_scope(
+            rules,
+            FilterDirection::FilesToStudio,
+            candidate,
+            scope,
+        )? { "include" } else { "ignore" },
+        "studioToFiles": if filter_allows_scope(
+            rules,
+            FilterDirection::StudioToFiles,
+            candidate,
+            scope,
+        )? { "include" } else { "ignore" },
+    }))
+}
+
 fn filter_matches(
     rule: &FilterRule,
     candidate: &FilterCandidate<'_>,
@@ -2783,9 +2931,9 @@ fn load_config_scope(scope: ConfigScope, root: &Path) -> Result<Value> {
 fn config_scope_path(scope: ConfigScope, root: &Path) -> Result<PathBuf> {
     match scope {
         ConfigScope::User => user_config_path(),
-        ConfigScope::Workspace => {
-            Ok(config_scope_root(root, ".git").join(".renium/workspace.config.json"))
-        }
+        ConfigScope::Workspace => Ok(config_scope_root(root, ".git")
+            .join(".renium")
+            .join("workspace.config.json")),
         ConfigScope::Experience => {
             Ok(config_scope_root(root, "renium.experience.json").join("renium.config.json"))
         }
@@ -2795,7 +2943,10 @@ fn config_scope_path(scope: ConfigScope, root: &Path) -> Result<PathBuf> {
             } else {
                 absolute_path(root)
             };
-            Ok(root.join(".renium/config.json"))
+            Ok(canonical_path(&root)
+                .unwrap_or(root)
+                .join(".renium")
+                .join("config.json"))
         }
         ConfigScope::Merged => bail!("Merged configuration has no writable path"),
     }
@@ -2821,21 +2972,29 @@ fn nearest_project_marker(root: &Path) -> Option<PathBuf> {
 fn user_config_path() -> Result<PathBuf> {
     if cfg!(windows) {
         let base = env::var_os("APPDATA").context("APPDATA is not set")?;
-        return Ok(PathBuf::from(base).join("Renium/config.json"));
+        return Ok(PathBuf::from(base).join("Renium").join("config.json"));
     }
     if cfg!(target_os = "macos") {
         let home = env::var_os("HOME").context("HOME is not set")?;
-        return Ok(PathBuf::from(home).join("Library/Application Support/Renium/config.json"));
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Renium")
+            .join("config.json"));
     }
     if let Some(base) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(base).join("renium/config.json"));
+        return Ok(PathBuf::from(base).join("renium").join("config.json"));
     }
     let home = env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config/renium/config.json"))
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("renium")
+        .join("config.json"))
 }
 
 fn config_scope_root(root: &Path, marker: &str) -> PathBuf {
-    find_ancestor_with(root, marker).unwrap_or_else(|| absolute_path(root))
+    let root = find_ancestor_with(root, marker).unwrap_or_else(|| absolute_path(root));
+    canonical_path(&root).unwrap_or(root)
 }
 
 fn find_ancestor_with(root: &Path, marker: &str) -> Option<PathBuf> {
@@ -2896,6 +3055,35 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     )
 }
 
+fn write_config_scope(path: &Path, value: &Value) -> Result<()> {
+    if value.as_object().is_some_and(Map::is_empty) {
+        remove_config_scope(path)
+    } else {
+        write_json(path, value)
+    }
+}
+
+fn remove_config_scope(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    let Some(parent) = path.parent().filter(|parent| parent.ends_with(".renium")) else {
+        return Ok(());
+    };
+    match fs::remove_dir(parent) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to remove {}", parent.display())),
+    }
+}
+
 fn merge_json(base: &mut Value, overlay: Value) {
     match (base, overlay) {
         (Value::Object(base), Value::Object(overlay)) => {
@@ -2942,21 +3130,29 @@ fn set_dotted(value: &mut Value, key: &str, new_value: Value) -> Result<()> {
 
 fn remove_dotted(value: &mut Value, key: &str) -> Result<bool> {
     let segments = dotted_segments(key)?;
-    let (leaf, parents) = segments
-        .split_last()
-        .context("Configuration key is empty")?;
-    let mut current = value;
-    for segment in parents {
-        let Some(next) = current.get_mut(*segment) else {
-            return Ok(false);
+    fn remove(value: &mut Value, segments: &[&str]) -> Result<bool> {
+        let object = value
+            .as_object_mut()
+            .context("A parent configuration key is not an object")?;
+        if segments.len() == 1 {
+            return Ok(object.remove(segments[0]).is_some());
+        }
+        let segment = segments[0];
+        let remove_parent = {
+            let Some(next) = object.get_mut(segment) else {
+                return Ok(false);
+            };
+            if !remove(next, &segments[1..])? {
+                return Ok(false);
+            }
+            next.as_object().is_some_and(Map::is_empty)
         };
-        current = next;
+        if remove_parent {
+            object.remove(segment);
+        }
+        Ok(true)
     }
-    Ok(current
-        .as_object_mut()
-        .context("A parent configuration key is not an object")?
-        .remove(*leaf)
-        .is_some())
+    remove(value, &segments)
 }
 
 fn dotted_segments(key: &str) -> Result<Vec<&str>> {

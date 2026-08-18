@@ -10,10 +10,10 @@ use super::projection::{
 };
 use super::{
     AdapterDirection, LoadedProject, MountOwnership, PROJECT_SCHEMA_VERSION, ProjectNode,
-    ProjectTarget, absolute_path, compile_glob, instance_target_overlaps, path_slash,
-    project_script_naming, project_tree_nodes, projection_path_contains, projection_path_key,
-    validate_direct_owner_source, validate_filesystem_target, validate_instance_target,
-    validate_relative_portable_path,
+    ProjectTarget, absolute_path, compile_glob, instance_target_overlaps,
+    project_adapter_output_path, project_script_naming, project_tree_nodes,
+    projection_path_contains, projection_path_key, validate_direct_owner_source,
+    validate_filesystem_target, validate_instance_target, validate_relative_portable_path,
 };
 
 type MountTarget<'a> = (&'a ProjectTarget, &'a Path, MountOwnership);
@@ -48,6 +48,10 @@ fn validate_project_header(loaded: &LoadedProject) -> Result<()> {
         );
     }
     validate_relative_portable_path(&loaded.project.source_root, "sourceRoot")?;
+    let source_root = loaded.root.join(&loaded.project.source_root);
+    if source_root.exists() && !source_root.is_dir() {
+        bail!("sourceRoot must be a directory: {}", source_root.display());
+    }
     if let Some(target) = loaded.project.build_target.as_ref() {
         validate_instance_target(target, "buildTarget")?;
     }
@@ -257,20 +261,26 @@ fn validate_adapters(
         adapter_targets.push((&adapter.target, &adapter.source));
         if let Some(output) = adapter.output.as_deref() {
             validate_relative_portable_path(output, &format!("adapters[{index}].output"))?;
-            if !outputs.insert(path_slash(output).to_ascii_lowercase()) {
-                bail!("More than one adapter writes {}", output.display());
+        }
+        let format = adapter_format(adapter)?;
+        if let Some(output) = project_adapter_output_path(loaded, adapter)? {
+            let output_key = projection_path_key(&output);
+            let output_label = output.strip_prefix(&loaded.root).unwrap_or(&output);
+            if !outputs.insert(output_key.clone()) {
+                bail!("More than one adapter writes {}", output_label.display());
             }
-            if loaded.project.adapters.iter().any(|other| {
-                projection_path_key(&loaded.root.join(&other.source))
-                    == projection_path_key(&loaded.root.join(output))
-            }) {
+            if loaded
+                .project
+                .adapters
+                .iter()
+                .any(|other| projection_path_key(&loaded.root.join(&other.source)) == output_key)
+            {
                 bail!(
                     "Adapter output {} collides with an adapter source",
-                    output.display()
+                    output_label.display()
                 );
             }
         }
-        let format = adapter_format(adapter)?;
         if adapter.direction != AdapterDirection::ToProject && !format.is_reversible() {
             bail!(
                 "Adapter {} uses {} in {:?}; this format is not reversible and must use to-project",
@@ -385,7 +395,12 @@ fn validate_explicit_source_owners(
     explicit_targets.dedup();
     let source_root = loaded.root.join(&loaded.project.source_root);
     let source_naming = project_script_naming(&loaded.project);
-    let claimed_sources = projection_source_owner_paths(loaded);
+    let mut claimed_sources = projection_source_owner_paths(loaded);
+    for adapter in &loaded.project.adapters {
+        if let Some(output) = project_adapter_output_path(loaded, adapter)? {
+            claimed_sources.push(absolute_path(&output));
+        }
+    }
     let mut source_documents = HashMap::new();
     for target in explicit_targets {
         let Some(service) = target.first() else {

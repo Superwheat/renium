@@ -130,7 +130,7 @@ export type CliImportModelResult = {
 
 export type CliRemoveInstanceResult = {
   ok?: boolean;
-  removedIndexes?: number[];
+  removedSettingsIds?: string[];
   removedSourcePaths?: string[];
   changedPaths?: string[];
 };

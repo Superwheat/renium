@@ -48,6 +48,7 @@ export type CliLinkStatusLink = {
   source?: string;
   sourcePath?: string;
   targetCount?: number;
+  activeTargetCount?: number;
   isPackage?: boolean;
   rootClass?: string | null;
   rootName?: string | null;

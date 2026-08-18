@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 static CLI_PROJECT: OnceLock<Option<PathBuf>> = OnceLock::new();
 static AUTOMATION_PROJECT: Mutex<Option<PathBuf>> = Mutex::new(None);
 static AUTOMATION_RUNTIME: Mutex<Option<String>> = Mutex::new(None);
+static PLACE_SELECTOR: Mutex<Option<String>> = Mutex::new(None);
 static AUTOMATION_STDIO: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_cli_project(project: Option<PathBuf>) {
@@ -39,6 +40,20 @@ pub(crate) fn clear_automation() {
 
 pub(crate) fn automation_runtime() -> Option<String> {
     AUTOMATION_RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub(crate) fn set_place_selector(value: Option<String>) {
+    *PLACE_SELECTOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        value.filter(|text| !text.trim().is_empty());
+}
+
+pub(crate) fn place_selector() -> Option<String> {
+    PLACE_SELECTOR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()

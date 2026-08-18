@@ -38,10 +38,10 @@ use crate::system::files::{
 };
 
 use super::{
-    GLOBAL_LINK_PREFIX, LINK_MANIFEST_VERSION, LinkEntry, LinkLockEntry, LinkManifest,
-    LinkResolveOptions, LinkSource, LinkSourceMeta, LinkTargetRef, LinkTargetStorage,
-    PackageMaterialization, RENIUM_DIR_GITIGNORE, RENIUM_STORE_EXTENSION, ResolvedLinkTarget,
-    collect_project_settings_files, is_global_link_path, is_package_path, link_lock_path,
+    GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
+    LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
+    RENIUM_STORE_EXTENSION, ResolvedLinkTarget, collect_project_settings_files,
+    ensure_settings_document, is_global_link_path, is_package_path, link_lock_path,
     link_manifest_path, link_mirror_lock_key, link_slug, link_target_document_selector,
     link_target_document_selector_parts, link_target_key, link_target_ordinals,
     link_target_ref_key, link_target_segments, load_settings_documents,
@@ -77,6 +77,14 @@ fn parse_link_target(service: &str, path: &str, ordinals: &str) -> Result<LinkTa
     Ok(target)
 }
 
+fn link_target_output_ordinals(ordinals: Vec<usize>) -> Vec<usize> {
+    if ordinals.iter().all(|ordinal| *ordinal == 1) {
+        Vec::new()
+    } else {
+        ordinals
+    }
+}
+
 #[derive(Default)]
 struct LinkApplyChanges {
     changed_paths: Vec<String>,
@@ -85,8 +93,8 @@ struct LinkApplyChanges {
     settings_seen: HashSet<String>,
     link_results: Vec<Value>,
     warnings: Vec<String>,
-    applied: usize,
-    drift: usize,
+    processed_targets: usize,
+    differences: usize,
     manifest_changed: bool,
     transaction_writes: BTreeMap<PathBuf, Vec<u8>>,
     transaction_removals: Vec<PathBuf>,
@@ -128,8 +136,8 @@ impl LinkApplyChanges {
         if !check {
             self.manifest_changed |= mark_manifest_target_broken(manifest, target);
         }
-        self.drift += 1;
-        self.applied += 1;
+        self.differences += 1;
+        self.processed_targets += 1;
         let mut result = json!({
             "id": target.link_id,
             "service": target.service,
@@ -248,7 +256,7 @@ impl PackageLinkApply<'_> {
 
         if args.check {
             if !unchanged {
-                changes.drift += 1;
+                changes.differences += 1;
             }
         } else if !unchanged && (!preserved_target_edits || target_forced) {
             if !target_matches_package {
@@ -269,7 +277,7 @@ impl PackageLinkApply<'_> {
                 }
                 changes.mark_settings_ids(&settings_ids);
                 changes.mark_path(settings_file);
-                changes.drift += 1;
+                changes.differences += 1;
             }
             if let Some(hash) = package_hash {
                 lock_entry.files.insert(lock_key, hash);
@@ -295,7 +303,7 @@ impl PackageLinkApply<'_> {
                 .files
                 .insert(target_fingerprint_key, package_fingerprint);
         } else if preserved_target_edits {
-            changes.drift += 1;
+            changes.differences += 1;
             if package_conflict {
                 changes.warnings.push(format!(
                     "{}: both the package and writable target {}.{} changed since the last apply",
@@ -305,13 +313,22 @@ impl PackageLinkApply<'_> {
                 ));
             }
         }
-        changes.applied += 1;
+        changes.processed_targets += 1;
+        let settings_ids = package_target_settings_ids(
+            document,
+            document_service,
+            document_segments,
+            document_ordinals,
+        );
+        let root_settings_id = settings_ids.first().cloned();
         changes.link_results.push(json!({
             "id": target.link_id,
             "service": target.service,
             "path": target.target_segments,
+            "rootSettingsId": root_settings_id,
             "readOnly": target.read_only,
             "resolvedRef": target.resolved_ref,
+            "settingsIds": settings_ids,
             "package": true,
             "skipped": unchanged || preserved_target_edits,
             "forced": target_forced && (unchanged || preserved_target_edits),
@@ -410,11 +427,13 @@ impl MirrorLinkApply<'_> {
                     .insert(pair.mirror.clone(), content.as_bytes().to_vec());
             }
             if mirror_changed {
-                changes.drift += 1;
+                changes.differences += 1;
             }
             if locally_edited {
                 preserved_edits.push(pair.mirror.to_string_lossy().into_owned());
             }
+            let mut structure_changed = false;
+            let mut target_settings_id = None;
             if let Some((service, _, _)) = document_selector
                 && let Some(settings_file) = settings_file
                 && let Some(document) = documents.get_mut(settings_file)
@@ -425,14 +444,25 @@ impl MirrorLinkApply<'_> {
                 )
             {
                 let ensured = ensure_editor_source_target_in_bytecode(document, &spec)?;
+                structure_changed = ensured.changed;
                 if let Some(id) = ensured.target.settings_id {
                     settings_ids.push(id.clone());
-                    changes.mark_settings_ids(&[id]);
+                    target_settings_id = Some(id);
+                }
+                if structure_changed {
+                    changes.mark_path(settings_file);
                 }
             }
-            let mirror_path = pair.mirror.to_string_lossy().into_owned();
-            changes.mark_path(&pair.mirror);
-            source_writes.push(json!({ "path": mirror_path }));
+            let target_changed = structure_changed || mirror_changed && !locally_edited;
+            if target_changed {
+                if let Some(id) = target_settings_id {
+                    changes.mark_settings_ids(&[id]);
+                }
+                changes.mark_path(&pair.mirror);
+                source_writes.push(json!({
+                    "path": pair.mirror.to_string_lossy(),
+                }));
+            }
             if !locally_edited {
                 target_lock
                     .files
@@ -463,7 +493,7 @@ impl MirrorLinkApply<'_> {
                 });
             if args.check {
                 if mirror.exists() {
-                    changes.drift += 1;
+                    changes.differences += 1;
                 }
                 continue;
             }
@@ -471,16 +501,26 @@ impl MirrorLinkApply<'_> {
                 preserved_edits.push(mirror.to_string_lossy().into_owned());
             } else if mirror.exists() {
                 changes.transaction_removals.push(mirror.clone());
-                changes.drift += 1;
+                changes.differences += 1;
                 changes.mark_path(&mirror);
             }
             target_lock.files.remove(&key);
         }
-        changes.applied += 1;
+        changes.processed_targets += 1;
+        let root_settings_id = document_selector.zip(settings_file).and_then(
+            |((service, segments, ordinals), settings_file)| {
+                let document = documents.get(settings_file)?;
+                let index = resolve_editor_instance_by_path_ordinals(
+                    document, service, segments, ordinals,
+                )?;
+                Some(document.instances[index].settings_id.clone())
+            },
+        );
         changes.link_results.push(json!({
             "id": target.link_id,
             "service": target.service,
             "path": target.target_segments,
+            "rootSettingsId": root_settings_id,
             "readOnly": target.read_only,
             "resolvedRef": target.resolved_ref,
             "settingsIds": settings_ids,
@@ -499,6 +539,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         offline: args.offline || args.check,
         fetch: !args.offline && !args.check,
         read_only: args.check,
+        allow_missing_store: true,
         git_path: args.git_path.clone(),
         wally_path: args.wally_path.clone(),
         cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
@@ -508,14 +549,37 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         &src_root,
         targets
             .iter()
+            .filter(|target| target.resolved && !target.broken)
             .filter_map(|target| target.storage.as_ref()?.settings_file.clone()),
     )?;
     let mut settings_guards = Vec::with_capacity(settings_files.len());
-    for settings_file in &settings_files {
+    for settings_file in settings_files
+        .iter()
+        .filter(|path| path.is_file() || !args.check)
+    {
         settings_guards.push(acquire_settings_file_lock(settings_file)?);
     }
 
-    let (mut documents, mut settings_outputs) = load_settings_documents(&settings_files)?;
+    let existing_settings_files = settings_files
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    let (mut documents, mut settings_outputs) = load_settings_documents(&existing_settings_files)?;
+    for target in targets
+        .iter()
+        .filter(|target| target.resolved && !target.broken)
+    {
+        let Some(storage) = target.storage.as_ref() else {
+            continue;
+        };
+        ensure_settings_document(
+            &mut documents,
+            &mut settings_outputs,
+            storage,
+            &target.service,
+        );
+    }
     let mut lock = read_link_lock(&project_root)?;
     let mut changes = LinkApplyChanges::default();
 
@@ -643,7 +707,6 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
             &mut changes.transaction_writes,
             &mut changes.transaction_removals,
         )?;
-        lock.version = LINK_MANIFEST_VERSION;
         changes
             .transaction_writes
             .insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
@@ -689,10 +752,10 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
             "ok": !strict_failure,
             "check": args.check,
             "manifest": manifest_path,
-            "appliedTargets": changes.applied,
-            "driftedFiles": changes.drift,
+            "processedTargets": changes.processed_targets,
+            "differenceCount": changes.differences,
             "changedPaths": changes.changed_paths,
-            "targetSettingsIds": changes.target_settings_ids,
+            "changedSettingsIds": changes.target_settings_ids,
             "links": changes.link_results,
             "warnings": changes.warnings,
         }),
@@ -745,17 +808,17 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
         );
     }
 
-    let existing: HashSet<String> = manifest.broken.iter().map(link_target_ref_key).collect();
     let mut broken_keys: HashSet<String> = HashSet::new();
     let mut broken_out: Vec<Value> = Vec::new();
-    for target in to_break {
-        validate_link_target_ref(&target)?;
-        let key = link_target_ref_key(&target);
-        broken_keys.insert(key.clone());
-        broken_out.push(json!({ "service": target.service, "path": target.path }));
-        if !existing.contains(&key) {
-            manifest.broken.push(target);
-        }
+    for target in &to_break {
+        validate_link_target_ref(target)?;
+        let key = link_target_ref_key(target);
+        broken_keys.insert(key);
+        broken_out.push(json!({
+            "service": target.service,
+            "path": link_target_segments(target),
+            "ords": link_target_output_ordinals(link_target_ordinals(target)),
+        }));
     }
 
     let options = LinkResolveOptions {
@@ -764,6 +827,8 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
     };
     let resolved = resolve_link_targets(&project_root, &src_root, &manifest, &options);
     let mut mirrors_to_unlock = Vec::new();
+    let mut package_target_keys = HashSet::new();
+    let mut package_settings_files = Vec::new();
     for target in &resolved {
         let key = link_target_key(
             &target.service,
@@ -776,30 +841,146 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
         for pair in &target.files {
             mirrors_to_unlock.push(pair.mirror.clone());
         }
+        if target.package_source.is_some() {
+            package_target_keys.insert(key);
+            if let Some(settings_file) = target
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.settings_file.clone())
+            {
+                package_settings_files.push(settings_file);
+            }
+        }
     }
 
-    let mirror_permissions = mirrors_to_unlock
+    let package_targets = to_break
+        .iter()
+        .filter(|target| package_target_keys.contains(&link_target_ref_key(target)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut settings_guards = Vec::new();
+    let mut documents = HashMap::new();
+    let mut settings_outputs = HashMap::new();
+    let mut writes = BTreeMap::new();
+    let mut removals = Vec::new();
+    let mut externalized_source_paths = Vec::new();
+    if !package_targets.is_empty() {
+        let settings_files = collect_project_settings_files(&src_root, package_settings_files)?;
+        settings_guards.reserve(settings_files.len());
+        for settings_file in &settings_files {
+            settings_guards.push(acquire_settings_file_lock(settings_file)?);
+        }
+        for target in &package_targets {
+            let (_, paths) = plan_unlink_link_target_instance(
+                &project_root,
+                &src_root,
+                target,
+                &mut documents,
+                &mut settings_outputs,
+                &mut writes,
+            )?;
+            externalized_source_paths.extend(paths);
+        }
+        stage_settings_document_writes(&documents, &settings_outputs, &mut writes, &mut removals)?;
+    }
+
+    if args.remove {
+        manifest
+            .broken
+            .retain(|target| !broken_keys.contains(&link_target_ref_key(target)));
+        for link in &mut manifest.links {
+            link.targets
+                .retain(|target| !broken_keys.contains(&link_target_ref_key(target)));
+        }
+        manifest.links.retain(|link| !link.targets.is_empty());
+    } else {
+        let existing: HashSet<String> = manifest.broken.iter().map(link_target_ref_key).collect();
+        for target in to_break {
+            let key = link_target_ref_key(&target);
+            if !existing.contains(&key) {
+                manifest.broken.push(target);
+            }
+        }
+    }
+
+    let mut mirror_permissions = mirrors_to_unlock
         .into_iter()
         .filter(|path| path.exists())
         .map(|path| (path, false))
         .collect::<BTreeMap<_, _>>();
-    apply_file_mutations_with_permissions(
-        &BTreeMap::from([(
+    mirror_permissions.extend(
+        externalized_source_paths
+            .iter()
+            .map(|path| (PathBuf::from(path), false)),
+    );
+    let remove_manifest = args.remove && manifest.links.is_empty() && manifest.broken.is_empty();
+    if remove_manifest {
+        removals.push(manifest_path.clone());
+    } else {
+        writes.insert(
             manifest_path.clone(),
             serialize_link_manifest(&manifest)?.into_bytes(),
-        )]),
-        &[],
-        &mirror_permissions,
-    )?;
-    print_json_output(
-        &json!({
-            "ok": true,
-            "manifest": manifest_path,
-            "broken": broken_out,
-            "clearedFiles": mirror_permissions.len(),
-        }),
-        args.pretty,
-    )
+        );
+    }
+    let mut lock_removed = None;
+    if args.remove {
+        let active_links = manifest
+            .links
+            .iter()
+            .map(|link| link.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut lock = read_link_lock(&project_root)?;
+        lock.entries
+            .retain(|link_id, _| active_links.contains(link_id.as_str()));
+        let lock_path = link_lock_path(&project_root);
+        let removed = lock.entries.is_empty();
+        lock_removed = Some(removed);
+        if removed {
+            removals.push(lock_path);
+        } else {
+            writes.insert(lock_path, serialize_link_lock(&lock)?);
+        }
+    }
+    apply_file_mutations_with_permissions(&writes, &removals, &mirror_permissions)?;
+    let mut result = json!({
+        "ok": true,
+        "manifest": manifest_path,
+        "manifestRemoved": remove_manifest,
+        "targetsRetained": true,
+        "unlockedFiles": mirror_permissions.len(),
+        "externalizedSourcePaths": externalized_source_paths,
+    });
+    if let Some(removed) = lock_removed {
+        result["lockRemoved"] = json!(removed);
+    }
+    result[if args.remove { "removed" } else { "broken" }] = Value::Array(broken_out);
+    print_json_output(&result, args.pretty)
+}
+
+fn link_target_source_instance_count(target: &ResolvedLinkTarget) -> usize {
+    let Some(storage) = target.storage.as_ref() else {
+        return 0;
+    };
+    let mut target_path = Vec::with_capacity(target.target_segments.len() + 1);
+    target_path.push(target.service.clone());
+    target_path.extend(target.target_segments.iter().cloned());
+    let mut instances = HashSet::new();
+    for pair in &target.files {
+        let Some(spec) = infer_editor_source_path_spec_in_service(
+            &storage.source_root,
+            &target.service,
+            &pair.mirror,
+        ) else {
+            continue;
+        };
+        if !spec.path_segments.starts_with(&target_path) {
+            continue;
+        }
+        for depth in target_path.len()..=spec.path_segments.len() {
+            instances.insert(spec.path_segments[..depth].to_vec());
+        }
+    }
+    instances.len()
 }
 
 pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
@@ -812,11 +993,17 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
     let resolved = resolve_link_targets(&project_root, &src_root, &manifest, &options);
 
     let mut meta_by_link: HashMap<String, LinkSourceMeta> = HashMap::new();
+    let mut source_instances_by_link: HashMap<String, usize> = HashMap::new();
     let mut source_path_by_link: HashMap<String, PathBuf> = HashMap::new();
     let mut package_fingerprints = HashMap::<PathBuf, Option<String>>::new();
     let mut settings_documents = HashMap::<PathBuf, Option<SettingsBytecode>>::new();
     let mut file_contents = HashMap::<PathBuf, Option<String>>::new();
     for target in &resolved {
+        let source_instances = link_target_source_instance_count(target);
+        source_instances_by_link
+            .entry(target.link_id.clone())
+            .and_modify(|count| *count = (*count).max(source_instances))
+            .or_insert(source_instances);
         if let Some(source_path) = &target.source_path {
             meta_by_link
                 .entry(target.link_id.clone())
@@ -946,12 +1133,13 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             "linkId": target.link_id,
             "service": target.service,
             "path": target.target_segments,
+            "ords": link_target_output_ordinals(target.target_ordinals.clone()),
             "pathKey": link_target_key(
                 &target.service,
                 &target.target_segments,
                 &target.target_ordinals,
             ),
-            "readOnly": target.read_only,
+            "readOnly": target.read_only && !target.broken,
             "broken": target.broken,
             "resolved": target.resolved,
             "resolvedRef": target.resolved_ref,
@@ -963,7 +1151,11 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             "isPackage": meta.is_some_and(|meta| meta.is_package),
             "rootClass": meta.and_then(|meta| meta.root_class.clone()),
             "rootName": meta.and_then(|meta| meta.root_name.clone()),
-            "sourceInstances": meta.map_or(0, |meta| meta.instances),
+            "sourceInstances": if meta.is_some_and(|meta| meta.is_package) {
+                meta.map_or(0, |meta| meta.instances)
+            } else {
+                link_target_source_instance_count(target)
+            },
             "updatedUnixMs": meta.and_then(|meta| meta.updated_unix_ms).map(|value| value as u64),
         }));
     }
@@ -979,11 +1171,16 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
                 "sourceKind": link.source.kind(),
                 "source": link.source.summary(),
                 "sourcePath": source_path_by_link.get(&link.id).map(|path| path.to_string_lossy().into_owned()),
-                "targetCount": active_target_count_by_link.get(&link.id).copied().unwrap_or(0),
+                "targetCount": link.targets.len(),
+                "activeTargetCount": active_target_count_by_link.get(&link.id).copied().unwrap_or(0),
                 "isPackage": meta.is_some_and(|meta| meta.is_package),
                 "rootClass": meta.and_then(|meta| meta.root_class.clone()),
                 "rootName": meta.and_then(|meta| meta.root_name.clone()),
-                "instances": meta.map_or(0, |meta| meta.instances),
+                "instances": if meta.is_some_and(|meta| meta.is_package) {
+                    meta.map_or(0, |meta| meta.instances)
+                } else {
+                    source_instances_by_link.get(&link.id).copied().unwrap_or(0)
+                },
                 "updatedUnixMs": meta.and_then(|meta| meta.updated_unix_ms).map(|value| value as u64),
             })
         })
@@ -994,6 +1191,7 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
             "ok": true,
             "manifest": manifest_path,
             "manifestExists": manifest_path.exists(),
+            "lockExists": link_lock_path(&project_root).exists(),
             "linkCount": manifest.links.len(),
             "brokenTargets": broken,
             "driftedTargets": drifted,
@@ -1016,6 +1214,11 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
     )?;
     let path = &target.path;
     let target_key = link_target_ref_key(&target);
+    let target_out = json!({
+        "service": &target.service,
+        "path": link_target_segments(&target),
+        "ords": link_target_output_ordinals(link_target_ordinals(&target)),
+    });
     let id = args
         .id
         .unwrap_or_else(|| link_slug(path.last().map_or("link", String::as_str)));
@@ -1072,6 +1275,11 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
     manifest
         .broken
         .retain(|broken_target| link_target_ref_key(broken_target) != target_key);
+    let target_count = manifest
+        .links
+        .iter()
+        .find(|link| link.id == id)
+        .map_or(0, |link| link.targets.len());
 
     write_link_manifest(&manifest_path, &manifest)?;
     print_json_output(
@@ -1080,6 +1288,8 @@ pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
             "id": id,
             "manifest": manifest_path,
             "linkCount": manifest.links.len(),
+            "targetCount": target_count,
+            "target": target_out,
         }),
         args.pretty,
     )
@@ -1442,7 +1652,6 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         &args.target.path_segments_json,
         &args.target.path_ordinals_json,
     )?;
-    let path = target.path.clone();
     let segments_after_service = link_target_segments(&target);
     let target_ordinals = link_target_ordinals(&target);
     if let Some(id) = &args.id {
@@ -1494,7 +1703,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
         }
     }
 
-    let storage = resolve_link_target_storage(&project_root, &src_root, &target, true)?;
+    let storage = resolve_link_target_storage(&project_root, &src_root, &target, true, false)?;
     let settings_file = storage
         .settings_file
         .as_ref()
@@ -1618,7 +1827,6 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     };
     let package_bytes = encode_settings_bytecode(&package)?;
     let mut lock = read_link_lock(&project_root)?;
-    lock.version = LINK_MANIFEST_VERSION;
     let default_ordinals = vec![1; segments_after_service.len()];
     let default_target_exists = manifest
         .links
@@ -1731,9 +1939,9 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             "source": source_rel,
             "instances": package.instances.len(),
             "service": args.target.service,
-            "path": path,
-            "inlinedSourcePaths": inlined_source_paths,
-            "removedSourcePaths": removed_source_paths,
+            "path": segments_after_service,
+            "embeddedSourceFiles": inlined_source_paths,
+            "deletedSourceFiles": removed_source_paths,
         }),
         args.pretty,
     )
@@ -1819,7 +2027,7 @@ fn prepare_link_target_document(
 ) -> Result<Option<PreparedLinkTarget>> {
     validate_link_target_ref(target)?;
     let segments = link_target_segments(target);
-    let storage = resolve_link_target_storage(project_root, src_root, target, true)?;
+    let storage = resolve_link_target_storage(project_root, src_root, target, true, false)?;
     let Some(settings_file) = storage.settings_file.clone() else {
         return Ok(None);
     };
@@ -1984,7 +2192,8 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
     let mut target_settings_files = Vec::new();
     for target in &active_targets {
         if let Some(settings_file) =
-            resolve_link_target_storage(&project_root, &src_root, target, true)?.settings_file
+            resolve_link_target_storage(&project_root, &src_root, target, true, false)?
+                .settings_file
         {
             target_settings_files.push(settings_file);
         }
@@ -2069,12 +2278,27 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
         &mut transaction_writes,
         &mut transaction_removals,
     )?;
-    transaction_writes.insert(
-        manifest_path.clone(),
-        serialize_link_manifest(&manifest)?.into_bytes(),
-    );
-    transaction_writes.insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
+    let manifest_removed = manifest.links.is_empty() && manifest.broken.is_empty();
+    if manifest_removed {
+        transaction_removals.push(manifest_path.clone());
+    } else {
+        transaction_writes.insert(
+            manifest_path.clone(),
+            serialize_link_manifest(&manifest)?.into_bytes(),
+        );
+    }
+    let lock_path = link_lock_path(&project_root);
+    let lock_removed = lock.entries.is_empty();
+    if lock_removed {
+        transaction_removals.push(lock_path);
+    } else {
+        transaction_writes.insert(lock_path, serialize_link_lock(&lock)?);
+    }
     let deleted_package_path = package_path.is_file().then(|| package_path.clone());
+    let deleted_package_output = deleted_package_path.as_ref().map(|path| {
+        path.to_string_lossy()
+            .replace('/', std::path::MAIN_SEPARATOR_STR)
+    });
     if deleted_package_path.is_some() {
         transaction_removals.push(package_path);
     }
@@ -2099,7 +2323,9 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
             "ok": true,
             "id": link.id,
             "manifest": manifest_path,
-            "deletedPackage": deleted_package_path,
+            "manifestRemoved": manifest_removed,
+            "lockRemoved": lock_removed,
+            "deletedPackage": deleted_package_output,
             "activeUses": active_targets.len(),
             "deletedTargets": deleted_targets,
             "unlinkedTargets": unlinked_targets,

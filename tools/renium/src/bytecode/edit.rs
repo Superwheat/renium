@@ -28,7 +28,7 @@ use crate::settings::bytecode::{
     encode_settings_bytecode, settings_reference_index, strict_reference_path,
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
-use crate::settings::tree::settings_children_by_parent;
+use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key, path_key};
 
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
@@ -303,6 +303,10 @@ pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
     writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
+    let root_index = old_to_new_index[&source_index];
+    let root = &document.instances[root_index];
+    let (path_segments_by_index, path_ordinals_by_index) =
+        build_editor_instance_path_parts(&document, &service);
 
     print_json_output(
         &json!({
@@ -310,6 +314,10 @@ pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
             "settingsFile": settings_file,
             "service": service,
             "rootSettingsId": root_settings_id,
+            "name": root.name,
+            "className": root.class_name,
+            "pathSegments": path_segments_by_index.get(root_index).and_then(std::clone::Clone::clone),
+            "pathOrdinals": path_ordinals_by_index.get(root_index).and_then(std::clone::Clone::clone),
             "settingsIds": cloned_settings_ids,
             "sourceCopies": source_copies,
             "changedPaths": changed_paths,
@@ -807,7 +815,7 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
         args.input.service_or_file.as_deref(),
         None,
     )?;
-    let _lock = lock_existing_service_store(&settings_file)?;
+    let lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
@@ -823,6 +831,11 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     }
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &[index], !args.no_recursive)?;
+    let removed_settings_ids = removed
+        .iter()
+        .filter_map(|index| before_document.instances.get(*index))
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
     let removed_paths = removed
         .iter()
         .filter_map(|index| source_paths_by_index.get(*index).and_then(Option::as_ref))
@@ -845,22 +858,35 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
     removals.sort_by_key(|path| path_key(path));
     removals.dedup_by(|left, right| path_key(left) == path_key(right));
-    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let removed_source_paths = removals.clone();
+    let removed_settings_file = document.instances.is_empty()
+        || (document.instances.len() == 1
+            && editor_service_root_index(&document, &service).is_some());
+    if removed_settings_file {
+        removals.push(settings_file.clone());
+    } else {
+        writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    }
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    let removed_source_paths = removals
+    drop(lock);
+    let removed_source_paths_json = removed_source_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     if let Some(service_dir) = settings_file.parent() {
-        prune_removed_source_dirs(service_dir, &removals);
+        prune_removed_source_dirs(service_dir, &removed_source_paths);
+        if removed_settings_file && let Some(source_root) = service_dir.parent() {
+            prune_empty_source_dirs(source_root, service_dir)?;
+        }
     }
     print_json_output(
         &json!({
             "ok": true,
             "settingsFile": settings_file,
-            "removedIndexes": removed,
-            "removedSourcePaths": removed_source_paths,
+            "storeRemoved": removed_settings_file,
+            "removedSettingsIds": removed_settings_ids,
+            "removedSourcePaths": removed_source_paths_json,
             "changedPaths": changed_paths,
         }),
         args.pretty,

@@ -199,13 +199,26 @@ fn editor_instance_descriptor(
     if !path_info.is_descendant_of(service) {
         return None;
     }
-    editor_instance_descriptor_from_path(
+    let instance = document.instances.get(index)?;
+    let anchor_only = path_info.path_segments.len() == 2
+        && ((service == "Workspace"
+            && instance.class_name == "Terrain"
+            && path_info.path_segments[1] == "Terrain")
+            || (service == "StarterPlayer"
+                && matches!(
+                    instance.class_name.as_str(),
+                    "StarterPlayerScripts" | "StarterCharacterScripts"
+                )
+                && path_info.path_segments[1] == instance.class_name));
+    let mut descriptor = editor_instance_descriptor_from_path(
         document,
         index,
         path_info.path_segments,
         path_info.path_ordinals,
         sibling_counts,
-    )
+    )?;
+    descriptor.anchor_only = anchor_only;
+    Some(descriptor)
 }
 
 pub(crate) fn push_editor_instance_change(

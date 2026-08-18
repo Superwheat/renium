@@ -11,7 +11,10 @@ use crate::app::output::{OutputMode, print_json_output};
 use crate::app::timing::elapsed_ms;
 use crate::bytecode::edit::has_direct_package_link_child;
 use crate::bytecode::query::{bytecode_selector, parse_property_predicates};
-use crate::bytecode::{ensure_bytecode_service_path_segments, resolve_bytecode_read_input};
+use crate::bytecode::{
+    bytecode_input_looks_like_settings_file, ensure_bytecode_service_path_segments,
+    resolve_bytecode_read_input,
+};
 use crate::cli::{
     BytecodeBatchFields, BytecodeEditorTargetsArgs, BytecodeExplorerBatchArgs,
     BytecodeExplorerBatchOp, BytecodeExplorerBatchRequest, ExplorerDaemonArgs,
@@ -20,7 +23,7 @@ use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_boun
 use crate::editor::document::is_protected_starter_player_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
-    build_editor_source_paths_by_index, document_instance_index_by_path_unique,
+    build_editor_source_paths_by_index, document_instance_index_by_path,
 };
 use crate::project::commands::load_structural_project;
 use crate::project::config;
@@ -101,6 +104,7 @@ impl<'a> BytecodeExplorerBatchContext<'a> {
             children_by_parent: self.children_by_parent,
             path_segments_by_index: self.service_path_segments_by_index,
             path_ordinals_by_index: self.service_path_ordinals_by_index,
+            canonical_settings_ids_by_index: self.service_canonical_settings_ids_by_index,
             source_paths_by_index: self.service_source_paths_by_index,
             mode,
             fields,
@@ -117,6 +121,7 @@ impl<'a> BytecodeExplorerBatchContext<'a> {
             children_by_parent: self.children_by_parent,
             path_segments_by_index: self.global_path_segments_by_index,
             path_ordinals_by_index: self.global_path_ordinals_by_index,
+            canonical_settings_ids_by_index: self.service_canonical_settings_ids_by_index,
             source_paths_by_index: self.global_source_paths_by_index,
             mode,
             fields,
@@ -135,7 +140,7 @@ fn bytecode_project_explorer_node_json(
         .service_projection(mode, fields)
         .node(index, include_children);
     if let Some(map) = node.as_object_mut() {
-        insert_project_node_metadata(ctx, index, map);
+        insert_project_node_metadata(ctx, index, map, fields);
     }
     node
 }
@@ -144,23 +149,34 @@ fn insert_project_node_metadata(
     ctx: &BytecodeExplorerBatchContext<'_>,
     index: usize,
     node: &mut Map<String, Value>,
+    fields: Option<&HashSet<String>>,
 ) {
-    node.insert(
-        "settingsFile".to_string(),
-        json!(
-            ctx.service_settings_files_by_index
-                .get(index)
-                .and_then(|path| path.as_ref())
-        ),
-    );
-    node.insert(
-        "canonicalSettingsId".to_string(),
-        json!(
-            ctx.service_canonical_settings_ids_by_index
-                .get(index)
-                .and_then(|settings_id| settings_id.as_deref())
-        ),
-    );
+    if fields.is_none() || requested_field(fields, "settingsFile", &["f", "settingsfile"]) {
+        node.insert(
+            "settingsFile".to_string(),
+            json!(
+                ctx.service_settings_files_by_index
+                    .get(index)
+                    .and_then(|path| path.as_ref())
+            ),
+        );
+    }
+    if fields.is_none()
+        || requested_field(
+            fields,
+            "canonicalSettingsId",
+            &["canonical", "canonicalsettingsid"],
+        )
+    {
+        node.insert(
+            "canonicalSettingsId".to_string(),
+            json!(
+                ctx.service_canonical_settings_ids_by_index
+                    .get(index)
+                    .and_then(|settings_id| settings_id.as_deref())
+            ),
+        );
+    }
 }
 
 fn read_bytecode_explorer_batch_ops(
@@ -237,19 +253,17 @@ fn bytecode_batch_instance_index(
     service: &str,
     op: &BytecodeExplorerBatchOp,
     default_to_service_root: bool,
-    missing_message: &str,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     if let Some(path_segments) = op.path_segments.as_deref() {
         if bytecode_batch_selector_specified(op) {
             bail!("pathSegments cannot be combined with another selector");
         }
         let path_segments = ensure_bytecode_service_path_segments(path_segments, service);
-        return document_instance_index_by_path_unique(document, &path_segments, &op.path_ordinals);
+        return document_instance_index_by_path(document, &path_segments, &op.path_ordinals);
     }
     if !bytecode_batch_selector_specified(op) {
         if default_to_service_root {
-            return editor_service_root_index(document, service)
-                .ok_or_else(|| anyhow::anyhow!("No service root in settings bytecode"));
+            return Ok(editor_service_root_index(document, service));
         }
         bail!("Provide one selector: index, settingsId, name, className, or pathSegments")
     }
@@ -259,8 +273,7 @@ fn bytecode_batch_instance_index(
         op.name.as_deref(),
         op.class_name.as_deref(),
     )?;
-    instance_api::find_unique_instance_index(document, selector)?
-        .ok_or_else(|| anyhow::anyhow!("{missing_message}"))
+    instance_api::find_unique_instance_index(document, selector)
 }
 
 fn node_field_aliases(key: &str) -> &'static [&'static str] {
@@ -438,10 +451,28 @@ pub(crate) fn bytecode_explorer_batch(args: BytecodeExplorerBatchArgs) -> Result
     print_json_output(&bytecode_explorer_batch_result(args)?, pretty)
 }
 
-pub(crate) fn bytecode_explorer_batch_result(args: BytecodeExplorerBatchArgs) -> Result<Value> {
+pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs) -> Result<Value> {
     let ops = read_bytecode_explorer_batch_ops(&args)?;
     if ops.is_empty() {
         bail!("Batch request is empty")
+    }
+    if args.project_root.is_none() && args.input.settings_file.is_none() {
+        let positional_service = args
+            .input
+            .service_or_file
+            .as_deref()
+            .filter(|value| !bytecode_input_looks_like_settings_file(value));
+        let explicit_service = (!args.service.trim().is_empty()).then(|| args.service.clone());
+        let service = match (explicit_service, positional_service) {
+            (Some(service), None) => Some(service),
+            (None, Some(service)) => Some(service.to_string()),
+            _ => None,
+        };
+        if let (Some(service), Some(loaded)) = (service, config::try_load_project(None, None)?) {
+            args.project_root = Some(loaded.root);
+            args.service = service;
+            args.input.service_or_file = None;
+        }
     }
 
     let mut loaded_project = None;
@@ -622,13 +653,12 @@ fn bytecode_explorer_batch_op_json(
             );
         }
         "children" => {
-            let parent_index = bytecode_batch_instance_index(
-                ctx.document,
-                ctx.service,
-                op,
-                true,
-                "No matching parent instance",
-            )?;
+            let Some(parent_index) =
+                bytecode_batch_instance_index(ctx.document, ctx.service, op, true)?
+            else {
+                insert_top_field(&mut response, mode, "found", Value::Bool(false));
+                return Ok(Value::Object(response));
+            };
             let child_nodes = ctx
                 .children_by_parent
                 .get(parent_index)
@@ -711,7 +741,7 @@ fn bytecode_explorer_batch_op_json(
                 .map(|index| {
                     let mut node = projection.search_node(index, &visible_indices);
                     if let Some(map) = node.as_object_mut() {
-                        insert_project_node_metadata(ctx, index, map);
+                        insert_project_node_metadata(ctx, index, map, fields.as_ref());
                     }
                     node
                 })
@@ -736,13 +766,11 @@ fn bytecode_explorer_batch_op_json(
             insert_top_field(&mut response, mode, "nodes", Value::Array(nodes));
         }
         "instance" => {
-            let index = bytecode_batch_instance_index(
-                ctx.document,
-                ctx.service,
-                op,
-                false,
-                "No matching instance",
-            )?;
+            let Some(index) = bytecode_batch_instance_index(ctx.document, ctx.service, op, false)?
+            else {
+                insert_top_field(&mut response, mode, "found", Value::Bool(false));
+                return Ok(Value::Object(response));
+            };
             let node = bytecode_project_explorer_node_json(ctx, index, true, mode, fields.as_ref());
             if let Some(node) = node.as_object() {
                 response.extend(node.clone());
@@ -795,6 +823,7 @@ pub(crate) struct BytecodeNodeProjection<'a> {
     pub children_by_parent: &'a [Vec<usize>],
     pub path_segments_by_index: &'a [Option<Vec<String>>],
     pub path_ordinals_by_index: &'a [Option<Vec<usize>>],
+    pub canonical_settings_ids_by_index: &'a [Option<String>],
     pub source_paths_by_index: &'a [Option<PathBuf>],
     pub mode: OutputMode,
     pub fields: Option<&'a HashSet<String>>,
@@ -924,23 +953,53 @@ impl BytecodeNodeProjection<'_> {
                 Value::String(source_path.to_string_lossy().into_owned()),
             );
         }
-        if let Some(properties) = filtered_record(
+        let mut properties = filtered_record(
             &instance.properties,
             self.fields,
             matches!(self.mode, OutputMode::Full),
             false,
-        ) {
+        );
+        if requested_property_field(self.fields, "Source")
+            && let Some(Some(source_path)) = self.source_paths_by_index.get(index)
+            && let Ok(source) = fs::read_to_string(source_path)
+        {
+            properties
+                .get_or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("filtered records are objects")
+                .insert("Source".to_string(), Value::String(source));
+        }
+        if let Some(Value::Object(properties)) = properties.as_mut() {
+            super::stabilize_reference_output(
+                self.document,
+                self.path_segments_by_index,
+                self.path_ordinals_by_index,
+                self.canonical_settings_ids_by_index,
+                properties,
+            );
+        }
+        if let Some(properties) = properties {
             node.insert(
                 node_output_key(self.mode, "properties").to_string(),
                 properties,
             );
         }
-        if let Some(attributes) = filtered_record(
+        let mut attributes = filtered_record(
             &instance.attributes,
             self.fields,
             matches!(self.mode, OutputMode::Full),
             true,
-        ) {
+        );
+        if let Some(Value::Object(attributes)) = attributes.as_mut() {
+            super::stabilize_reference_output(
+                self.document,
+                self.path_segments_by_index,
+                self.path_ordinals_by_index,
+                self.canonical_settings_ids_by_index,
+                attributes,
+            );
+        }
+        if let Some(attributes) = attributes {
             node.insert(
                 node_output_key(self.mode, "attributes").to_string(),
                 attributes,

@@ -212,7 +212,7 @@ fn apply_command(
     object: &Map<String, Value>,
 ) -> Result<()> {
     match command {
-        Commands::ExportSnapshots(args) => {
+        Commands::ExportSnapshots(args) | Commands::Pull(args) => {
             apply_default_path(
                 matches,
                 "project_root",

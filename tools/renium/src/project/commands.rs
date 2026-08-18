@@ -180,7 +180,7 @@ fn projected_structural_store(
             }
         })
         .transpose()?;
-    Ok((store, target, canonical_id))
+    Ok((canonical_path(&store)?, target, canonical_id))
 }
 
 fn projected_instance_store(
@@ -217,7 +217,7 @@ fn metadata_property_change(
         value_bool: None,
         value_null: false,
         scope: "metadata".to_string(),
-        pretty: true,
+        pretty: false,
     }
 }
 
@@ -545,20 +545,22 @@ pub(crate) fn import_path_command(
             validate_import_destination_ownership(project, &projection, target)?;
         }
     }
+    let PreparedImportPaths {
+        writes,
+        results: file_results,
+        changed_paths,
+    } = prepare_import_path_files(&root, &files)?;
     let result = json!({
         "ok": true,
         "source": source,
         "destination": destination,
-        "files": files.iter().map(|(_, to)| path_to_sourcemap_relative(&root, to)).collect::<Vec<_>>(),
+        "files": file_results,
         "dryRun": args.dry_run,
     });
     if args.dry_run {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
-    let mut changed_paths = Vec::with_capacity(files.len());
-    write_import_files_transactionally(&files)?;
-    changed_paths.extend(files.into_iter().map(|(_, to)| to));
+    apply_file_mutations(&writes, &[])?;
     if args.push && !changed_paths.is_empty() {
         push_editor_changes(PushEditorChangesArgs {
             changed_paths,
@@ -572,8 +574,7 @@ pub(crate) fn import_path_command(
             )
         })?;
     }
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 fn validate_import_destination_ownership(
@@ -687,16 +688,48 @@ fn import_path_json_destination(
     Ok(destination)
 }
 
-fn write_import_files_transactionally(files: &[(PathBuf, PathBuf)]) -> Result<()> {
-    let writes = files
-        .iter()
-        .map(|(source, destination)| {
-            fs::read(source)
-                .with_context(|| format!("Failed to read {}", source.display()))
-                .map(|bytes| (destination.clone(), bytes))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    apply_file_mutations(&writes, &[])
+struct PreparedImportPaths {
+    writes: BTreeMap<PathBuf, Vec<u8>>,
+    results: Vec<Value>,
+    changed_paths: Vec<PathBuf>,
+}
+
+fn prepare_import_path_files(
+    root: &Path,
+    files: &[(PathBuf, PathBuf)],
+) -> Result<PreparedImportPaths> {
+    let mut writes = BTreeMap::new();
+    let mut results = Vec::with_capacity(files.len());
+    let mut changed_paths = Vec::with_capacity(files.len());
+    for (source, destination) in files {
+        let bytes =
+            fs::read(source).with_context(|| format!("Failed to read {}", source.display()))?;
+        let action = if destination.exists() {
+            if fs::read(destination)
+                .with_context(|| format!("Failed to read {}", destination.display()))?
+                == bytes
+            {
+                "unchanged"
+            } else {
+                "overwrite"
+            }
+        } else {
+            "create"
+        };
+        results.push(json!({
+            "path": path_to_sourcemap_relative(root, destination),
+            "action": action,
+        }));
+        if action != "unchanged" {
+            writes.insert(destination.clone(), bytes);
+            changed_paths.push(destination.clone());
+        }
+    }
+    Ok(PreparedImportPaths {
+        writes,
+        results,
+        changed_paths,
+    })
 }
 
 fn import_source_suffix(

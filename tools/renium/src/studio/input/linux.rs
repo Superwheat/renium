@@ -25,11 +25,7 @@ pub fn input_shield(handle: &WindowHandle) -> Result<InputShield> {
     )
 }
 
-pub fn window_for_pid(
-    pid: u32,
-    viewport: Option<(i32, i32)>,
-    _restore_minimized: bool,
-) -> Result<StudioWindow> {
+pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
     if pid == 0 {
         bail!("Studio PID is invalid");
     }

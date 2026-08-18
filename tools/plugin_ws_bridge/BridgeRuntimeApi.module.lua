@@ -432,8 +432,6 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		launchNonce = nil,
 	}
 	local deviceSimulatorReadyAt = os.clock() + 4
-	local deviceSimulationOwned = false
-	local deviceSimulationOwnerGeneration = nil
 	local captureProbeGui = nil
 	local captureProbeFrame = nil
 	local activeEditThreads = {}
@@ -1560,6 +1558,9 @@ updateMouse()
 		assertOperationOwnership(operationGeneration)
 		local action = string.lower(tostring(params.action or "status"))
 		local service = game:GetService("StudioDeviceSimulatorService")
+		if action ~= "list" and api.isPlayModeRunning() then
+			return { ok = false, error = "Stop Play before reading or changing device simulation" }
+		end
 
 		local function enumName(value)
 			local text = tostring(value)
@@ -1573,13 +1574,27 @@ updateMouse()
 				name = tostring(info.Name or deviceId),
 				form = enumName(info.DeviceForm),
 				custom = not not info.IsCustom,
-				width = tonumber(info.Width),
-				height = tonumber(info.Height),
-				pixelDensity = tonumber(info.PixelDensity),
+				nativeWidth = tonumber(info.Width),
+				nativeHeight = tonumber(info.Height),
+				nativeResolutionOrientation = if info.Width >= info.Height then "Landscape" else "Portrait",
+				nativePixelDensity = tonumber(info.PixelDensity),
 				resolutionScale = tonumber(info.ResolutionScale),
 				portraitKeyboardHeight = tonumber(info.PortraitKeyboardHeight),
 				landscapeKeyboardHeight = tonumber(info.LandscapeKeyboardHeight),
 			}
+		end
+
+		local function selectionInfo(info)
+			return {
+				id = info.id,
+				name = info.name,
+				form = info.form,
+				custom = info.custom,
+			}
+		end
+
+		local function vectorSize(value)
+			return { width = math.round(value.X), height = math.round(value.Y) }
 		end
 
 		local function status()
@@ -1589,39 +1604,46 @@ updateMouse()
 				ok = true,
 				action = "status",
 				simulating = false,
-				viewport = { width = viewport.X, height = viewport.Y },
+				viewport = vectorSize(viewport),
 			}
 			local okDevice, deviceId = pcall(service.GetDeviceAsync, service)
-			if not okDevice or type(deviceId) ~= "string" or deviceId == "" then
-				return inactive
+			if not okDevice then
+				return { ok = false, error = tostring(deviceId) }
 			end
-			local okConfig, resolution, orientation, scalingMode, pixelDensity = pcall(function()
-				return service:GetResolutionAsync(),
-					service:GetOrientationAsync(),
-					service:GetScalingModeAsync(),
-					service:GetPixelDensityAsync()
-			end)
-			if not okConfig then
+			if type(deviceId) ~= "string" or deviceId == "" or deviceId == "default" then
 				return inactive
 			end
 			local result = {
 				ok = true,
 				action = "status",
 				simulating = true,
-				settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock()),
-				viewport = { width = viewport.X, height = viewport.Y },
-				deviceId = deviceId,
-				orientation = enumName(orientation),
-				scalingMode = enumName(scalingMode),
-				resolution = {
-					width = resolution.X,
-					height = resolution.Y,
-				},
-				pixelDensity = pixelDensity,
+				viewport = vectorSize(viewport),
 			}
+			local okConfig, resolution, orientation, scalingMode, pixelDensity = pcall(function()
+				return service:GetResolutionAsync(),
+					service:GetOrientationAsync(),
+					service:GetScalingModeAsync(),
+					service:GetPixelDensityAsync()
+			end)
+			if okConfig then
+				local orientationName = enumName(orientation)
+				local portrait = orientationName == "Portrait"
+				result.orientation = orientationName
+				result.scalingMode = enumName(scalingMode)
+				result.resolution = {
+					width = if portrait then resolution.Y else resolution.X,
+					height = if portrait then resolution.X else resolution.Y,
+				}
+				result.effectivePixelDensity = pixelDensity
+			end
+			if params.includeSettle == true then
+				result.settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock())
+			end
 			local okInfo, info = pcall(deviceInfo, deviceId)
 			if okInfo then
-				result.device = info
+				result.device = if params.details == true then info else selectionInfo(info)
+			else
+				result.device = { id = deviceId, name = deviceId }
 			end
 			return result
 		end
@@ -1677,22 +1699,28 @@ updateMouse()
 
 		if action == "list" then
 			local devices = listDevices()
+			if params.details ~= true then
+				for index, device in ipairs(devices) do
+					devices[index] = selectionInfo(device)
+				end
+			end
 			return { ok = true, action = "list", count = #devices, devices = devices }
 		elseif action == "status" or action == "get" then
 			return status()
 		elseif action == "stop" or action == "reset" then
 			local before = status()
-			if not before.simulating then
-				return { ok = true, action = "stop", stopped = true, alreadyStopped = true }
-			end
-			local okStop, stopError = pcall(service.StopSimulationAsync, service)
-			if not okStop and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true) then
-				return { ok = false, error = tostring(stopError) }
+			local okReset, resetError = pcall(service.SetDeviceAsync, service, "default")
+			if not okReset then
+				local okStop, stopError = pcall(service.StopSimulationAsync, service)
+				if
+					not okStop
+					and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true)
+				then
+					return { ok = false, error = tostring(resetError) .. "; " .. tostring(stopError) }
+				end
 			end
 			deviceSimulatorReadyAt = 0
-			deviceSimulationOwned = false
-			deviceSimulationOwnerGeneration = nil
-			return { ok = true, action = "stop", stopped = true, alreadyStopped = false }
+			return { ok = true, action = "stop", stopped = true, alreadyStopped = not before.simulating }
 		elseif action ~= "set" and action ~= "select" and action ~= "apply" then
 			return { ok = false, error = `Unknown device action '{action}'` }
 		end
@@ -1761,11 +1789,7 @@ updateMouse()
 		end
 
 		local simulationBefore = status()
-		local ownershipBefore = {
-			owned = deviceSimulationOwned,
-			generation = deviceSimulationOwnerGeneration,
-			readyAt = deviceSimulatorReadyAt,
-		}
+		local readyAtBefore = deviceSimulatorReadyAt
 		local configurationBefore = nil
 		if simulationBefore.simulating then
 			local okConfig, deviceId, resolution, previousOrientation, previousScalingMode, previousDensity = pcall(
@@ -1792,10 +1816,6 @@ updateMouse()
 		local okApply, resultOrError = xpcall(function()
 			if selectedDevice ~= nil then
 				service:SetDeviceAsync(selectedDevice.id)
-				if not simulationBefore.simulating then
-					deviceSimulationOwned = true
-					deviceSimulationOwnerGeneration = operationGeneration
-				end
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "device"
 			end
@@ -1863,9 +1883,7 @@ updateMouse()
 				service:SetPixelDensityAsync(configurationBefore.pixelDensity)
 			end
 		end)
-		deviceSimulationOwned = ownershipBefore.owned
-		deviceSimulationOwnerGeneration = ownershipBefore.generation
-		deviceSimulatorReadyAt = ownershipBefore.readyAt
+		deviceSimulatorReadyAt = readyAtBefore
 		if not okRestore then
 			error(tostring(resultOrError) .. "; device simulator rollback failed: " .. tostring(restoreError), 0)
 		end
@@ -2106,6 +2124,8 @@ updateMouse()
 		then
 			game:SetAttribute("__ReniumEditRuntimeId", nil)
 		end
+		playSession.mode = nil
+		playSession.launchNonce = nil
 		playSession.owned = false
 		playSession.ownerGeneration = nil
 		playSession.ownerRuntimeId = nil
@@ -2350,12 +2370,6 @@ updateMouse()
 		end
 		captureProbeGui = nil
 		captureProbeFrame = nil
-		local simulator = game:GetService("StudioDeviceSimulatorService")
-		if deviceSimulationOwned and deviceSimulationOwnerGeneration == cleanupGeneration then
-			pcall(simulator.StopSimulationAsync, simulator)
-			deviceSimulationOwned = false
-			deviceSimulationOwnerGeneration = nil
-		end
 		if matchingOwnedPlayLaunch(cleanupGeneration) then
 			if api.isPlayModeRunning() or playSession.active or playSession.starting then
 				pcall((StudioTestService :: any).EndTest, StudioTestService, true)

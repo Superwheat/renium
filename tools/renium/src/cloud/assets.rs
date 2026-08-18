@@ -149,7 +149,15 @@ fn append_query(url: &mut url::Url, name: &str, value: &Value) -> Result<(), Fai
     Ok(())
 }
 
-fn studio_user_id(bridge: &BridgeServer, next: &str) -> Result<u64, Failure> {
+fn studio_user_id(bridge: Option<&BridgeServer>, next: &str) -> Result<u64, Failure> {
+    let bridge = bridge.ok_or_else(|| {
+        failure(
+            "no_studio",
+            "User inventory search needs a connected Studio or an explicit userId",
+            false,
+            "studios",
+        )
+    })?;
     let result = bridge
         .call_for_target("getCreatorContext", json!({}), BridgeTarget::Edit)
         .map_err(|error| failure("no_studio", format!("{error:#}"), false, "studios"))?;
@@ -169,7 +177,7 @@ fn studio_user_id(bridge: &BridgeServer, next: &str) -> Result<u64, Failure> {
         })
 }
 
-pub(crate) fn search(parameters: &Value, bridge: &BridgeServer) -> Result<Value, Failure> {
+pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Result<Value, Failure> {
     let request: AssetSearch = serde_json::from_value(parameters.clone()).map_err(|error| {
         failure(
             "bad_req",
@@ -294,12 +302,12 @@ pub(crate) fn search(parameters: &Value, bridge: &BridgeServer) -> Result<Value,
     }
 }
 
-fn resolve_image_path(context: &BoundContext, path: &str) -> PathBuf {
+fn resolve_image_path(root: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
     if path.is_absolute() {
         path
     } else {
-        Path::new(&context.root).join(path)
+        root.join(path)
     }
 }
 
@@ -376,7 +384,7 @@ fn load_image(context: &BoundContext, source: &str) -> Result<(Vec<u8>, String),
         )?;
         return Ok((bytes, source.to_string()));
     }
-    let path = resolve_image_path(context, source);
+    let path = resolve_image_path(Path::new(&context.root), source);
     let file = fs::File::open(&path).map_err(|error| {
         failure(
             "bad_req",
@@ -401,7 +409,7 @@ struct ImageStore {
     path: String,
 }
 
-pub(crate) fn store_image(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
+pub(crate) fn store_image_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
     let request: ImageStore = serde_json::from_value(parameters.clone()).map_err(|error| {
         failure(
             "bad_req",
@@ -410,7 +418,7 @@ pub(crate) fn store_image(context: &BoundContext, parameters: &Value) -> Result<
             "image-store",
         )
     })?;
-    let path = resolve_image_path(context, &request.path);
+    let path = resolve_image_path(root, &request.path);
     let file = fs::File::open(&path).map_err(|error| {
         failure(
             "bad_req",
@@ -438,6 +446,10 @@ pub(crate) fn store_image(context: &BoundContext, parameters: &Value) -> Result<
         "mimeType": mime,
         "bytes": bytes.len(),
     }))
+}
+
+pub(crate) fn store_image(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
+    store_image_at(Path::new(&context.root), parameters)
 }
 
 fn multipart_body(metadata: &Value, name: &str, mime: &str, bytes: &[u8]) -> (String, Vec<u8>) {
@@ -529,7 +541,7 @@ pub(crate) fn upload(
     } else {
         let user_id = match request.user_id.filter(|id| *id > 0) {
             Some(id) => id,
-            None => studio_user_id(bridge, "image-upload")?,
+            None => studio_user_id(Some(bridge), "image-upload")?,
         };
         json!({ "userId": user_id.to_string() })
     };

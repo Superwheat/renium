@@ -67,14 +67,21 @@ fn run_checked_external_tool_strings(
             tail_text(&stderr, 4000)
         );
     }
-    Ok(json!({
+    let mut result = json!({
         "skipped": false,
         "command": command,
         "args": args,
         "status": status,
-        "stdoutTail": tail_text(&stdout, 2000),
-        "stderrTail": tail_text(&stderr, 2000),
-    }))
+    });
+    for (key, value) in [
+        ("stdoutTail", tail_text(&stdout, 2000)),
+        ("stderrTail", tail_text(&stderr, 2000)),
+    ] {
+        if !value.is_empty() {
+            result[key] = value.into();
+        }
+    }
+    Ok(result)
 }
 
 fn run_external_tool_output(

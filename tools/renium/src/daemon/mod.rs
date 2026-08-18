@@ -3,10 +3,11 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -112,6 +113,8 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         drop(lifecycle_lock);
         return run_stdio_proxy();
     }
+    #[cfg(windows)]
+    crate::studio::input::watch_auto_recovery_dialogs();
     let bridge_host = normalize_loopback_host(&args.bridge.host)?;
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, listen_metrics) =
@@ -368,6 +371,9 @@ pub(super) fn daemon_control_endpoints() -> Vec<std::net::SocketAddr> {
 
     if let Ok(raw) = std::env::var("RENIUM_DAEMON") {
         push_daemon_endpoint(&mut out, &mut seen, raw.trim());
+        if !out.is_empty() {
+            return out;
+        }
     }
 
     let env_host = std::env::var("RENIUM_DAEMON_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -375,6 +381,9 @@ pub(super) fn daemon_control_endpoints() -> Vec<std::net::SocketAddr> {
         && let Ok(port) = raw_port.trim().parse::<u16>()
     {
         push_daemon_endpoint(&mut out, &mut seen, &host_port(env_host.trim(), port));
+        if !out.is_empty() {
+            return out;
+        }
     }
 
     for path in daemon_discovery_paths() {
@@ -521,16 +530,7 @@ fn push_daemon_endpoint(
     }
 }
 
-pub(super) fn try_daemon_control_request(
-    operation: u16,
-    project_root: Option<&Path>,
-    mut parameters: Value,
-    approved: bool,
-) -> Result<Option<Value>> {
-    automation::opcode_by_id(operation)?;
-    let object = parameters
-        .as_object_mut()
-        .context("Daemon operation parameters must be a JSON object")?;
+fn try_bind_daemon_context(project_root: Option<&Path>) -> Result<Option<Value>> {
     let root = project_root
         .map_or_else(
             || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -552,10 +552,178 @@ pub(super) fn try_daemon_control_request(
         let error = bind.e.context("Daemon bind failed without an error")?;
         bail!("{}", error.m);
     }
-    let context_id = bind
-        .r
-        .as_ref()
-        .and_then(|result| result.get("id"))
+    bind.r
+        .context("Daemon bind response omitted its context")
+        .map(Some)
+}
+
+#[cfg(unix)]
+fn detach_daemon(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(unix)]
+fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io::Result<()> {
+    let mut command = Command::new(executable);
+    command
+        .arg("bridge-daemon")
+        .arg("--ports")
+        .arg(ports)
+        .arg("--wait-seconds")
+        .arg(wait_seconds.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_daemon(&mut command);
+    command.spawn().map(|_| ())
+}
+
+#[cfg(windows)]
+fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Start-Process -FilePath $env:RENIUM_DAEMON_EXECUTABLE -ArgumentList @('bridge-daemon','--ports',$env:RENIUM_DAEMON_PORTS,'--wait-seconds',$env:RENIUM_DAEMON_WAIT) -WindowStyle Hidden",
+        ])
+        .env("RENIUM_DAEMON_EXECUTABLE", executable)
+        .env("RENIUM_DAEMON_PORTS", ports)
+        .env("RENIUM_DAEMON_WAIT", wait_seconds.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("failed to start the shared Renium daemon"))
+    }
+}
+
+pub(crate) fn start_shared_daemon(ports: &str, wait_seconds: f64) -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    if spawn_shared_daemon(&executable, ports, wait_seconds).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if shared_daemon_available() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    shared_daemon_available()
+}
+
+pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<PathBuf>> {
+    try_bind_daemon_context(Some(project_root))?
+        .map(|context| {
+            context
+                .get("root")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .context("Daemon bind response omitted the project root")
+        })
+        .transpose()
+}
+
+pub(super) fn try_daemon_control_request(
+    operation: u16,
+    project_root: Option<&Path>,
+    mut parameters: Value,
+    approved: bool,
+) -> Result<Option<Value>> {
+    let opcode = automation::opcode_by_id(operation)?;
+    let bridge_wait_seconds = parameters
+        .get("bridgeWaitSeconds")
+        .and_then(Value::as_f64)
+        .unwrap_or(8.0)
+        .clamp(1.0, 30.0);
+    let bridge_ports = parameters
+        .get("bridgePorts")
+        .and_then(Value::as_str)
+        .unwrap_or("8781,8782")
+        .to_string();
+    let object = parameters
+        .as_object_mut()
+        .context("Daemon operation parameters must be a JSON object")?;
+    if operation == automation::op::STUDIOS {
+        let Some(response) = try_send_request(&automation::Request {
+            v: automation::PROTOCOL_VERSION,
+            id: current_millis().min(u128::from(u64::MAX)) as u64,
+            op: operation,
+            cx: None,
+            p: std::mem::take(&mut parameters),
+        })?
+        else {
+            return Ok(None);
+        };
+        if response.ok == 0 {
+            let error = response
+                .e
+                .context("Daemon request failed without an error")?;
+            bail!("{}", error.m);
+        }
+        return Ok(Some(response.r.unwrap_or_else(|| json!({}))));
+    }
+    let needs_runtime = opcode.runtime
+        || matches!(
+            operation,
+            automation::op::SET_PROPERTY | automation::op::REMOVE
+        ) && object.get("editor").and_then(Value::as_bool) == Some(true);
+    let mut context = try_bind_daemon_context(project_root)?;
+    let ready = |context: &Option<Value>| {
+        context.as_ref().is_some_and(|context| {
+            !needs_runtime || context.get("runtimeId").and_then(Value::as_str).is_some()
+        })
+    };
+    if needs_runtime && context.is_none() {
+        start_shared_daemon(&bridge_ports, bridge_wait_seconds);
+    }
+    if needs_runtime && !ready(&context) && shared_daemon_available() {
+        let deadline = Instant::now() + Duration::from_secs_f64(bridge_wait_seconds);
+        let mut bind_error = None;
+        while !ready(&context) && Instant::now() < deadline {
+            match try_bind_daemon_context(project_root) {
+                Ok(bound) => context = bound,
+                Err(error) => bind_error = Some(error),
+            }
+            if !ready(&context) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if !ready(&context) {
+            if let Some(error) = bind_error {
+                return Err(error);
+            }
+            bail!("No Studio runtime connected to this project within {bridge_wait_seconds:.1}s");
+        }
+    }
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let context_id = context
+        .get("id")
         .and_then(Value::as_u64)
         .context("Daemon bind response omitted the context ID")?;
     let requires_review =

@@ -19,15 +19,7 @@ if "%CLI%"=="" (
 
 set "RUNNER=%~dp0rbx-run.ps1"
 if not exist "%RUNNER%" if exist "%~dp0tools\renium\rbx-run.ps1" set "RUNNER=%~dp0tools\renium\rbx-run.ps1"
-
-if /I "%~1"=="l" (
-  if "%~2"=="" (
-    echo Usage: rbx l "print('hi')"
-    exit /b 2
-  )
-  "%CLI%" lx -e "%~2"
-  goto :exitcode
-)
+set "RENIUM_CLI=%CLI%"
 
 if /I "%~1"=="lf" (
   if "%~2"=="" (
@@ -38,18 +30,7 @@ if /I "%~1"=="lf" (
   goto :exitcode
 )
 
-if /I "%~1"=="lc" (
-  if "%~2"=="" (
-    echo Usage: rbx lc "print('hi')" [player]
-    exit /b 2
-  )
-  if "%~3"=="" (
-    "%CLI%" lx -c -e "%~2"
-  ) else (
-    "%CLI%" lx --player "%~3" -e "%~2"
-  )
-  goto :exitcode
-)
+if /I "%~1"=="wait" goto :wait
 
 if /I "%~1"=="r" (
   if "%~2"=="" (
@@ -146,6 +127,9 @@ if /I "%~1"=="lcf" (
   goto :exitcode
 )
 
+if /I "%~1"=="l" goto :luau
+if /I "%~1"=="lc" goto :luau_client
+
 if /I "%~1"=="c" (
   set "RENIUM_CLI=%CLI%"
   powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $cli = $env:RENIUM_CLI; $json = & $cli co -n 1 | ConvertFrom-Json; if ($json.entries.Count -gt 0) { [string]$json.entries[0].message -replace '\r?\n', ' | ' } }"
@@ -190,6 +174,45 @@ if /I "%~1"=="status" (
 )
 
 "%CLI%" %*
+goto :exitcode
+
+:luau
+if "%~2"=="" goto :luau_usage
+set "RENIUM_LUAU=%~2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& $env:RENIUM_CLI lx -e $env:RENIUM_LUAU"
+goto :exitcode
+
+:luau_client
+if "%~2"=="" goto :luau_client_usage
+set "RENIUM_LUAU=%~2"
+if "%~3"=="" goto :luau_default_client
+set "RENIUM_PLAYER=%~3"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& $env:RENIUM_CLI lx --player $env:RENIUM_PLAYER -e $env:RENIUM_LUAU"
+goto :exitcode
+
+:luau_default_client
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& $env:RENIUM_CLI lx -c -e $env:RENIUM_LUAU"
+goto :exitcode
+
+:luau_usage
+echo Usage: rbx l "return game.Name"
+exit /b 2
+
+:luau_client_usage
+echo Usage: rbx lc "return true" [player]
+exit /b 2
+
+:wait
+if "%~2"=="" goto :wait_usage
+set "WAIT_CONDITION=%~2"
+shift
+shift
+"%CLI%" wait-until "%WAIT_CONDITION%" %1 %2 %3 %4 %5 %6 %7 %8 %9
+goto :exitcode
+
+:wait_usage
+echo Usage: rbx wait "condition" [-c or --player NAME] [-t SECONDS] [--interval SECONDS]
+exit /b 2
 
 :exitcode
 exit /b %ERRORLEVEL%

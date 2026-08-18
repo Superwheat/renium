@@ -444,18 +444,18 @@ pub(crate) fn path_ordinals_match(candidate: &[usize], path_ordinals: &[usize]) 
     candidate == path_ordinals || candidate.ends_with(path_ordinals)
 }
 
-pub(crate) fn document_instance_index_by_path_unique(
+pub(crate) fn document_instance_index_by_path(
     document: &SettingsBytecode,
     path_segments: &[String],
     path_ordinals: &[usize],
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     if path_segments.is_empty() {
         bail!("Path selector cannot be empty");
     }
     let matches = document_instance_path_matches(document, path_segments, path_ordinals);
     match matches.len() {
-        0 => bail!("No matching instance path: {}", path_segments.join(".")),
-        1 => Ok(matches[0].0),
+        0 => Ok(None),
+        1 => Ok(Some(matches[0].0)),
         _ => {
             let candidates = matches
                 .iter()
@@ -474,6 +474,15 @@ pub(crate) fn document_instance_index_by_path_unique(
             );
         }
     }
+}
+
+pub(crate) fn document_instance_index_by_path_unique(
+    document: &SettingsBytecode,
+    path_segments: &[String],
+    path_ordinals: &[usize],
+) -> Result<usize> {
+    document_instance_index_by_path(document, path_segments, path_ordinals)?
+        .ok_or_else(|| anyhow::anyhow!("No matching instance path: {}", path_segments.join(".")))
 }
 
 pub(crate) fn infer_editor_source_path_spec(

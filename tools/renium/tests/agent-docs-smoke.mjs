@@ -100,7 +100,7 @@ try {
   await waitForControl();
   const commands = agents.split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line.startsWith("rbx a ") && !line.includes(" < "));
+    .filter((line) => line.startsWith("rbx a ") && !/<[A-Z_]+>/.test(line));
   let cx;
   for (const command of commands) {
     const parts = command.split(/\s+/).slice(2).map((part) => part === "CX" ? String(cx) : part);
@@ -111,6 +111,23 @@ try {
   }
   if (!Number.isInteger(cx)) {
     throw new Error("Generated bind example did not return a context");
+  }
+  const directRoot = path.join(root, "direct-project");
+  fs.mkdirSync(directRoot);
+  const directBind = invoke(["a", "bind", directRoot, "700010"]);
+  const directAdd = invoke(["a", "place-add", String(directBind.r.id), "700010", "Main Lobby", "--game-id", "800010", "--alias", "main"]);
+  if (directAdd.ok !== 1) {
+    throw new Error(`Direct place-add failed: ${JSON.stringify(directAdd)}`);
+  }
+  const directRebind = invoke(["a", "bind", directRoot, "700010"]);
+  const directRename = invoke(["a", "place-rename", String(directRebind.r.id), "700010", "lobby"]);
+  if (directRename.ok !== 1) {
+    throw new Error(`Direct place-rename failed: ${JSON.stringify(directRename)}`);
+  }
+  const reorderRebind = invoke(["a", "bind", directRoot, "700010"]);
+  const directReorder = invoke(["a", "place-reorder", String(reorderRebind.r.id), "700010"]);
+  if (directReorder.ok !== 1) {
+    throw new Error(`Direct place-reorder failed: ${JSON.stringify(directReorder)}`);
   }
   invoke(["a", "set-property", String(cx), "-J", "-"], JSON.stringify({
     editor: true,

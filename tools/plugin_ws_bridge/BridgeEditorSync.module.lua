@@ -2388,7 +2388,7 @@ local function validateMutationRequest(params: any, ctx: { [string]: any }): { s
 						pathSegments = entry.pathSegments,
 						pathOrdinals = entry.pathOrdinals,
 					}, serviceName, string.format("Editor instance entry %d", entryIndex))
-					if not isEngineManagedContainerEntry(serviceName, entry) then
+					if entry.anchorOnly ~= true and not isEngineManagedContainerEntry(serviceName, entry) then
 						validateCreatableClass(entry.className, classCache, "Editor instance entry")
 					end
 					if entry.matchProperties ~= nil then
@@ -3138,6 +3138,11 @@ function TransactionState.rollback(
 end
 
 local function rollbackTransactionSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
+	if session.mutated ~= true and session.nativeUndo == nil then
+		finishTransactionJournal(session, ctx)
+		session.changeJournal = nil
+		return {}
+	end
 	local ok, result = xpcall(function()
 		local initialRecords = drainTransactionJournal(session, ctx)
 		prepareTransactionJournalRollback(session, initialRecords, ctx)
@@ -3602,6 +3607,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			changedSourceInstances = changedSourceInstances,
 			instanceReplacements = {},
 			snapshot = snapshot,
+			mutated = false,
 			nativeImport = nativeImport,
 			postCommitPropertyChanges = params.postCommitPropertyChanges or {},
 			historyRecording = beginHistoryRecording("Sync from filesystem"),
@@ -3773,7 +3779,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
-		local phaseTimings = { started = os.clock() }
 		pruneExpiredSessions(binaryExports)
 		local exportId = tostring(params.exportId or "")
 		local partitioned = params.partitioned == true
@@ -3879,9 +3884,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			groups[#groups + 1] = group
 			groupByService[serviceName] = group
 		end
-		phaseTimings.services = os.clock()
-		phaseTimings.documents = phaseTimings.services
-		phaseTimings.states = phaseTimings.services
 		local session: { [string]: any } = {
 			groups = groups,
 			serviceNames = serviceNames,
@@ -3953,7 +3955,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				for _, entry in ipairs(ScriptDocumentState.capture(serviceNames)) do
 					scriptSourcesByInstance[entry.instance] = entry.source
 				end
-				phaseTimings.documents = os.clock()
 				local serializerWorkerCount = if partitioned
 					then math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
 					else 0
@@ -3990,7 +3991,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					task.spawn(runNativeSerializationJob, session, job)
 				end
-				phaseTimings.states = os.clock()
 			else
 				session.pendingPayloads = 0
 				session.serializationScheduleReady = true
@@ -4040,17 +4040,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					session.firstUnscheduledSerializationGroup
 				)
 			end
-			phaseTimings.complete = os.clock()
-			print(
-				string.format(
-					"[Renium profile] services=%.1f documents=%.1f states=%.1f finish=%.1f total=%.1f",
-					(phaseTimings.services - phaseTimings.started) * 1000,
-					(phaseTimings.documents - phaseTimings.services) * 1000,
-					(phaseTimings.states - phaseTimings.documents) * 1000,
-					(phaseTimings.complete - phaseTimings.states) * 1000,
-					(phaseTimings.complete - phaseTimings.started) * 1000
-				)
-			)
 			return {
 				ok = true,
 				exportId = exportId,
@@ -4747,12 +4736,34 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				local incoming = table.create(group.count)
 				local incomingByPayloadIndex = table.create(group.count)
+				for _, instance in ipairs(groupRoots) do
+					local prefix = "__ReniumImportRoot_"
+					local payloadIndex = if string.sub(instance.Name, 1, #prefix) == prefix
+						then tonumber(string.sub(instance.Name, #prefix + 1))
+						else nil
+					if
+						not payloadIndex
+						or payloadIndex < 1
+						or payloadIndex > group.count
+						or payloadIndex % 1 ~= 0
+						or incomingByPayloadIndex[payloadIndex] ~= nil
+					then
+						error("Native import returned an invalid payload index")
+					end
+					incomingByPayloadIndex[payloadIndex] = instance
+				end
 				for index = 1, group.count do
-					local instance = groupRoots[index]
+					local instance = incomingByPayloadIndex[index]
 					if instance == nil or instance.Parent ~= groupPayloadRoot or instance:IsA("Terrain") then
 						error("Native import returned an invalid root")
 					end
-					incomingByPayloadIndex[index] = instance
+					local descriptor = group.rootPaths[index]
+					local pathSegments = descriptor and descriptor.pathSegments
+					local originalName = if type(pathSegments) == "table" then pathSegments[#pathSegments] else nil
+					if type(originalName) ~= "string" then
+						error("Native import root path is invalid")
+					end
+					instance.Name = originalName
 					instance.Parent = nil
 					local protectedCamera = group.target == Workspace
 						and instance:IsA("Camera")
@@ -4791,6 +4802,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					packageRoots = group.packageRoots,
 				}
 			end
+			transaction.mutated = true
 			local retention = ReferenceOverlay.prepareRetained(prepared, ctx, session.externalReferencesPostApplied)
 			transaction.nativeUndo = {
 				prepared = prepared,
@@ -5106,6 +5118,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local instanceChanges = params.instanceChanges
+		if
+			outerTransaction ~= nil
+			and (
+				#(params.instanceChanges or {}) > 0
+				or #(params.sourceChanges or {}) > 0
+				or #(params.propertyChanges or {}) > 0
+			)
+		then
+			outerTransaction.mutated = true
+		end
 		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do

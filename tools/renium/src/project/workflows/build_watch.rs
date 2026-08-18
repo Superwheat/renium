@@ -733,10 +733,8 @@ fn project_watch_inputs_into(
         let source = absolute_path(&loaded.root.join(&adapter.source));
         inputs.files.insert(source.clone());
         nested.push(source);
-        if let Some(output) = adapter.output.as_deref() {
-            inputs
-                .ignored
-                .insert(absolute_path(&loaded.root.join(output)));
+        if let Some(output) = config::project_adapter_output_path(loaded, adapter)? {
+            inputs.ignored.insert(absolute_path(&output));
         }
     }
     if args.wally != ToolPolicy::Never {

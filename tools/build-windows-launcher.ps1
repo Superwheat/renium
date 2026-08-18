@@ -80,8 +80,8 @@ function Test-ReniumArchive {
             $names = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/').ToLowerInvariant() })
             return $names -contains "install.ps1" -and
                 $names -contains "renium.exe" -and
-                $names -contains "renium.rbxm" -and
-                @($names | Where-Object { $_ -like "renium-$Version-win32-*.vsix" }).Count -gt 0
+                $names -contains "rbx.cmd" -and
+                $names -contains "renium-agents.md"
         }
         finally {
             $archive.Dispose()

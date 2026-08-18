@@ -109,10 +109,10 @@ type CliSyncWallyPackagesResult = {
 type CliLinkApplyResult = {
   ok?: boolean;
   check?: boolean;
-  appliedTargets?: number;
-  driftedFiles?: number;
+  processedTargets?: number;
+  differenceCount?: number;
   changedPaths?: string[];
-  targetSettingsIds?: string[];
+  changedSettingsIds?: string[];
   warnings?: string[];
 };
 
@@ -343,6 +343,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
             runCfg.wallySync.devTargetName,
             "--realms",
             runCfg.wallySync.realms,
+            "--details",
           ];
           if (!runCfg.wallySync.runInstall) {
             args.push("--skip-install");
@@ -369,7 +370,8 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
           ) {
             throw new Error("Wally package sync returned results for a different Renium place.");
           }
-          const importedCount = Array.isArray(parsed.settingsIds) ? parsed.settingsIds.length : 0;
+          const importedIds = Array.isArray(parsed.targetSettingsIds) ? parsed.targetSettingsIds : parsed.settingsIds;
+          const importedCount = Array.isArray(importedIds) ? importedIds.length : 0;
           progress.report({ message: `Imported ${importedCount} package instance(s).` });
           this.host.output.appendLine(
             `[renium] Wally packages: imported ${importedCount} instance(s) into ${parsed.service ?? runCfg.wallySync.targetService}.${parsed.targetName ?? runCfg.wallySync.targetName}`,
@@ -667,11 +669,11 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       for (const warning of Array.isArray(parsed.warnings) ? parsed.warnings : []) {
         this.host.output.appendLine(`[renium] link warning: ${warning}`);
       }
-      const applied = parsed.appliedTargets ?? 0;
+      const processed = parsed.processedTargets ?? 0;
       if (!options.silent) {
         const warnCount = Array.isArray(parsed.warnings) ? parsed.warnings.length : 0;
         vscode.window.showInformationMessage(
-          `Applied ${applied} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
+          `Synced ${processed} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
         );
       }
     });
@@ -689,7 +691,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       if (changedPaths.length > 0) {
         this.host.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
         if (forceStudioAllowed) {
-          const targetSettingsIds = (Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : [])
+          const targetSettingsIds = (Array.isArray(result.changedSettingsIds) ? result.changedSettingsIds : [])
             .map((value) => String(value).trim())
             .filter((value) => value.length > 0);
           await this.host.pushEditorPathsNow(changedPaths, {
@@ -731,7 +733,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       }
     }
     try {
-      const targetSettingsIds = (Array.isArray(result.targetSettingsIds) ? result.targetSettingsIds : [])
+      const targetSettingsIds = (Array.isArray(result.changedSettingsIds) ? result.changedSettingsIds : [])
         .map((value) => String(value).trim())
         .filter((value) => value.length > 0);
       await this.host.pushEditorPathsNow(changedPaths, {
@@ -1068,7 +1070,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       if (link.isPackage !== true && !sourcePath.toLowerCase().endsWith(".renium")) {
         continue;
       }
-      if (Number(link.targetCount ?? 0) <= 0) {
+      if (Number(link.activeTargetCount ?? link.targetCount ?? 0) <= 0) {
         continue;
       }
       const key = filesystemPathKey(sourcePath);
@@ -1559,7 +1561,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       linkId,
     });
     logPackageDragDebug(
-      `packages.insertAtPath: link-apply ok changed=${Array.isArray(applyResult?.changedPaths) ? applyResult!.changedPaths!.length : 0} targets=${Array.isArray(applyResult?.targetSettingsIds) ? applyResult!.targetSettingsIds!.length : 0}`,
+      `packages.insertAtPath: link-apply ok changed=${Array.isArray(applyResult?.changedPaths) ? applyResult!.changedPaths!.length : 0} targets=${Array.isArray(applyResult?.changedSettingsIds) ? applyResult!.changedSettingsIds!.length : 0}`,
     );
     void this.pushLinkStateToExplorer().catch(() => undefined);
     await this.refreshFileExplorerServicesSafe([service]);
