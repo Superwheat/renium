@@ -1814,6 +1814,14 @@ appendPreserveKeys = function(target: { [string]: boolean }, change: { [string]:
 			end
 		end
 	end
+	for _, raw in ipairs(change.instances or {}) do
+		if type(raw) == "table" and raw.className == "PackageLink" then
+			local pathSegments = cloneArray(raw.pathSegments)
+			if #pathSegments > 1 and tostring(pathSegments[1]) == serviceName then
+				target[pathCacheKey(pathSegments, raw.pathOrdinals)] = true
+			end
+		end
+	end
 end
 
 local function applyInstanceReconcileChunk(
@@ -2388,7 +2396,11 @@ local function validateMutationRequest(params: any, ctx: { [string]: any }): { s
 						pathSegments = entry.pathSegments,
 						pathOrdinals = entry.pathOrdinals,
 					}, serviceName, string.format("Editor instance entry %d", entryIndex))
-					if entry.anchorOnly ~= true and not isEngineManagedContainerEntry(serviceName, entry) then
+					if
+						entry.anchorOnly ~= true
+						and entry.className ~= "PackageLink"
+						and not isEngineManagedContainerEntry(serviceName, entry)
+					then
 						validateCreatableClass(entry.className, classCache, "Editor instance entry")
 					end
 					if entry.matchProperties ~= nil then
@@ -2798,31 +2810,9 @@ local function restoreMutationSnapshot(
 	if beforeReplace ~= nil then
 		beforeReplace()
 	end
-	local removed = {}
-	local parented = {}
-	local okRestore, restoreError = pcall(function()
-		for groupIndex, group in ipairs(snapshot.groups) do
-			for _, child in ipairs(group.target:GetChildren()) do
-				if not group.preserved[child] then
-					setParentForSync(child, nil, ctx)
-					table.insert(removed, { instance = child, parent = group.target })
-				end
-			end
-			for _, instance in ipairs(incomingByGroup[groupIndex]) do
-				setParentForSync(instance, group.target, ctx)
-				table.insert(parented, instance)
-			end
-		end
+	local removed = BridgeInstanceSwap.replaceChildren(snapshot.groups, incomingByGroup, function(instance, parent)
+		setParentForSync(instance, parent, ctx)
 	end)
-	if not okRestore then
-		for _, instance in ipairs(parented) do
-			setParentForSync(instance, nil, ctx)
-		end
-		for _, entry in ipairs(removed) do
-			setParentForSync(entry.instance, entry.parent, ctx)
-		end
-		error(restoreError, 0)
-	end
 	local replacements = {}
 	for key, original in pairs(snapshot.originalByPath) do
 		local separator = string.find(key, PATH_SEPARATOR .. "ord" .. PATH_SEPARATOR, 1, true)

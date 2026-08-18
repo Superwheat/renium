@@ -12,6 +12,9 @@ Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has 
 - Don't read or edit `.renium` or `sourcemap.json` by hand; use `rbx`.
 - `.renium/editor-history` is expected local revert data, not project content; don't inspect or restore its timestamps.
 - Don't launch, close, or replace Studio as a fallback. Those actions require an explicit review receipt.
+- Run one mutation command at a time and inspect its result before the next. Never chain edits, deletes, pulls, pushes, Undo, or Redo in one shell command.
+- If a mutation fails, stop changing Studio. Verify the affected live roots before any pull, push, retry, Undo, Redo, package insertion, or recovery action.
+- Don't rename, delete, or replace a Roblox package root to work around a failed edit. Use `desync-package-link` only when removing the package relationship is the intended change.
 
 ## Projects and targeting
 
