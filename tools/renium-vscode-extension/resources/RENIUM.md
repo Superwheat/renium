@@ -12,6 +12,9 @@ Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has 
 - Don't read or edit `.renium` or `sourcemap.json` by hand; use `rbx`.
 - `.renium/editor-history` is expected local revert data, not project content; don't inspect or restore its timestamps.
 - Don't launch, close, or replace Studio as a fallback. Those actions require an explicit review receipt.
+- Run one mutation command at a time and inspect its result before the next. Never chain edits, deletes, pulls, pushes, Undo, or Redo in one shell command.
+- If a mutation fails, stop changing Studio. Verify the affected live roots before any pull, push, retry, Undo, Redo, package insertion, or recovery action.
+- Don't rename, delete, or replace a Roblox package root to work around a failed edit. Use `desync-package-link` only when removing the package relationship is the intended change.
 
 ## Projects and targeting
 
@@ -39,6 +42,7 @@ rbx ba Workspace -I editor:parent -n NewPart -c Part
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
 rbx move Workspace -i editor:id -I editor:parent
+rbx move StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
@@ -202,7 +206,7 @@ rbx wally --realms shared --force
 
 Wally sync needs a working `wally` command; Aftman users must declare Wally for the project first. Use `--force` to reinstall and reimport packages that are already current. Add `--details` only when the full changed-path and instance-ID lists are needed.
 
-`bem`/`bim` export and import model trees. `x` exports raw Studio snapshots; `im` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
+`bem`/`bim` export and import model trees. They copy instances; use `move --to-service` to reparent an existing project subtree across services without a temporary model or a separate remove. `x` exports raw Studio snapshots; `im` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
 
 Version control: run `rbx vc-init` once in a project to initialize Git and Renium's ignore, text-diff, and merge rules; rerunning it is safe. `rbx vc-textconv FILE.renium` renders one binary store as deterministic text. Git invokes `rbx vc-merge BASE OURS THEIRS` automatically for a conflicting `.renium` merge. Use normal or path-scoped `git status`; `--untracked-files=all` expands every generated package file.
 

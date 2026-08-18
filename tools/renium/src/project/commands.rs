@@ -29,6 +29,7 @@ use crate::project::config;
 use crate::project::layout::configured_project_layout;
 use crate::project::package_links::build_loaded_project_link_enforcement;
 use crate::project::sourcemap::{path_to_sourcemap_relative, write_project_sourcemap_with_updates};
+use crate::project::structural::move_instance_between_service_stores;
 use crate::rbx::model::{bytecode_export_model, bytecode_import_model};
 use crate::settings::bytecode::{SettingsBytecode, instance_settings_id};
 use crate::snapshot::export::ExportProjectStage;
@@ -328,7 +329,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
         structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let (source_file, target_file) = if let Some(loaded) = loaded_project.as_ref() {
         let stage = config::stage_project(loaded)?;
-        let (source_file, source_target, source_id) = projected_structural_store(
+        let (source_file, _, source_id) = projected_structural_store(
             loaded,
             &stage,
             &target.service,
@@ -336,7 +337,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             true,
             args.override_packages,
         )?;
-        let (target_file, target_parent, parent_id) = projected_structural_store(
+        let (target_file, _, parent_id) = projected_structural_store(
             loaded,
             &stage,
             &target_service,
@@ -345,10 +346,17 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             args.override_packages,
         )?;
         if source_file != target_file {
-            bail!(
-                "Moving '{}' to '{}' crosses projected owners; move the canonical files instead",
-                source_target.join("."),
-                target_parent.join(".")
+            return move_instance_between_service_stores(
+                &source_file,
+                &target.service,
+                source_id
+                    .as_deref()
+                    .context("Source instance has no canonical id")?,
+                &target_file,
+                &target_service,
+                parent_id
+                    .as_deref()
+                    .context("Target parent has no canonical id")?,
             );
         }
         return bytecode_set_property(metadata_property_change(
@@ -379,7 +387,14 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
     if !target_file.is_file() {
         bail!("Target service '{target_service}' has no Renium store");
     }
-    bail!("Cross-service moves are unavailable because Studio cannot apply them atomically")
+    move_instance_between_service_stores(
+        &source_file,
+        &target.service,
+        &target.settings_id,
+        &target_file,
+        &target_service,
+        &args.parent_settings_id,
+    )
 }
 
 pub(crate) fn rename_instance_command(

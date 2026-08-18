@@ -1710,8 +1710,9 @@ local function removeUnknownInstances(
 	desiredStableKeys: { [string]: boolean }
 )
 	local descendants = service:GetDescendants()
-	for index = #descendants, 1, -1 do
-		local instance = descendants[index]
+	local unknown = {}
+	local removedCount = 0
+	for _, instance in descendants do
 		local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
 		local key = if pathSegments then pathCacheKey(pathSegments, pathOrdinals) else ""
 		if
@@ -1730,10 +1731,16 @@ local function removeUnknownInstances(
 			)
 			and not isProtectedWorkspaceCameraInstance(instance)
 		then
-			removeInstanceForUndo(instance, ctx)
-			stats.instanceDeleted += 1
+			unknown[instance] = true
+			removedCount += 1
 		end
 	end
+	for instance in unknown do
+		if not unknown[instance.Parent] then
+			removeInstanceForUndo(instance, ctx)
+		end
+	end
+	stats.instanceDeleted += removedCount
 end
 
 local function applyInstanceReconcile(
