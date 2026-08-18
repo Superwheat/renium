@@ -13,6 +13,7 @@ $installRoot = Join-Path $env:LOCALAPPDATA "Renium\bin"
 $stableLauncherRoot = Join-Path $env:USERPROFILE ".renium\bin"
 $stableLauncher = Join-Path $stableLauncherRoot "rbx.cmd"
 $stableExecutable = Join-Path $stableLauncherRoot "rbx.exe"
+$stableReniumExecutable = Join-Path $stableLauncherRoot "renium.exe"
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathEntries = @($currentPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
@@ -36,7 +37,11 @@ function Install-ReniumCommandAliases {
         return
     }
     New-Item -ItemType Directory -Path $stableLauncherRoot -Force | Out-Null
-    foreach ($alias in @((Join-Path $installRoot "rbx.exe"), $stableExecutable)) {
+    foreach ($alias in @(
+        (Join-Path $installRoot "rbx.exe"),
+        $stableExecutable,
+        $stableReniumExecutable
+    )) {
         if (Test-Path -LiteralPath $alias -PathType Leaf) {
             Remove-Item -LiteralPath $alias -Force
         }
@@ -644,8 +649,10 @@ function Restore-ReniumInstallTransaction {
     if ($journal.CoreExisted) {
         Install-ReniumCommandAliases
     }
-    elseif (Test-Path -LiteralPath $stableExecutable -PathType Leaf) {
-        Remove-Item -LiteralPath $stableExecutable -Force
+    else {
+        @($stableExecutable, $stableReniumExecutable) |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Remove-Item -Force
     }
     foreach ($file in @(
         [pscustomobject]@{
@@ -756,6 +763,9 @@ try {
         }
         if (Test-Path -LiteralPath $stableExecutable -PathType Leaf) {
             Remove-Item -LiteralPath $stableExecutable -Force
+        }
+        if (Test-Path -LiteralPath $stableReniumExecutable -PathType Leaf) {
+            Remove-Item -LiteralPath $stableReniumExecutable -Force
         }
         if ((Test-Path -LiteralPath $stableLauncherRoot -PathType Container) -and
             @(Get-ChildItem -LiteralPath $stableLauncherRoot -Force).Count -eq 0) {
