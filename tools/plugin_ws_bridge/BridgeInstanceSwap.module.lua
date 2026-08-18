@@ -126,4 +126,59 @@ function BridgeInstanceSwap.replace(
 	return replacement
 end
 
+function BridgeInstanceSwap.replaceChildren(
+	groups: { any },
+	incomingByGroup: { { Instance } },
+	assignParent: (Instance, Instance?) -> ()
+): { any }
+	local outgoingByGroup = {}
+	for groupIndex, group in ipairs(groups) do
+		local outgoing = {}
+		for _, child in ipairs(group.target:GetChildren()) do
+			if not group.preserved[child] then
+				outgoing[#outgoing + 1] = child
+			end
+		end
+		outgoingByGroup[groupIndex] = outgoing
+	end
+
+	local removed = {}
+	local parented = {}
+	local ok, swapError = pcall(function()
+		for groupIndex, group in ipairs(groups) do
+			for _, instance in ipairs(incomingByGroup[groupIndex]) do
+				assignParent(instance, group.target)
+				parented[#parented + 1] = instance
+			end
+		end
+		for groupIndex, group in ipairs(groups) do
+			for _, child in ipairs(outgoingByGroup[groupIndex]) do
+				assignParent(child, nil)
+				removed[#removed + 1] = { instance = child, parent = group.target }
+			end
+		end
+	end)
+	if ok then
+		return removed
+	end
+
+	local rollbackError
+	for index = #removed, 1, -1 do
+		local restored, result = pcall(assignParent, removed[index].instance, removed[index].parent)
+		if not restored and rollbackError == nil then
+			rollbackError = result
+		end
+	end
+	for index = #parented, 1, -1 do
+		local restored, result = pcall(assignParent, parented[index], nil)
+		if not restored and rollbackError == nil then
+			rollbackError = result
+		end
+	end
+	if rollbackError ~= nil then
+		error(`{swapError}; rollback also failed: {rollbackError}`, 0)
+	end
+	error(swapError, 0)
+end
+
 return BridgeInstanceSwap

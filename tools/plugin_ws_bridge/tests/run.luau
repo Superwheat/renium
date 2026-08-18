@@ -307,6 +307,26 @@ equal(lockedReplacementOk, false, "locked sibling replacement rejected")
 equal(lockedChildren[1], lockedTarget, "locked sibling target retained")
 equal(lockedChildren[2], lockedSibling, "locked sibling retained")
 
+local rollbackParent = FakeInstance.new("Folder")
+local rollbackOld = FakeInstance.new("Folder")
+rollbackOld.Parent = rollbackParent
+local rollbackIncoming = FakeInstance.new("Folder")
+local incomingWasAttached = false
+local removed = InstanceSwap.replaceChildren(
+	{ { target = rollbackParent, preserved = {} } },
+	{ { rollbackIncoming } },
+	function(instance, parent)
+		if instance == rollbackOld and parent == nil then
+			incomingWasAttached = rollbackIncoming.Parent == rollbackParent
+		end
+		instance.Parent = parent
+	end
+)
+equal(incomingWasAttached, true, "rollback replacement order")
+equal(rollbackIncoming.Parent, rollbackParent, "rollback incoming parent")
+equal(rollbackOld.Parent, nil, "rollback outgoing parent")
+equal(removed[1].instance, rollbackOld, "rollback outgoing record")
+
 local nativeGroups = {}
 for _, serviceName in ipairs({ "Workspace", "ReplicatedStorage" }) do
 	local target = roblox.Instance.new("Folder")
