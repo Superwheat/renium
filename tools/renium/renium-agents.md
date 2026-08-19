@@ -46,15 +46,18 @@ rbx move StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
+Use `find SERVICE text` for a text search. `-n` is an exact name filter; don't add `*` wildcards.
+
 Property values use `--str`, `--num`, `--bool`, `--null`, or `-j` for another JSON value. `--null` removes the stored override; writing the Roblox default explicitly still stores an override. Automatic writes reject property names missing from the class. Use `--scope property` only for a real newer or hidden Roblox property absent from Renium's bundled schema, and `--scope attribute` to create an attribute.
 
 Set or clear an instance reference with `-j '{"_type":"Ref","settingsId":"editor:target"}'` or `--null`. Ref objects can also use `pathSegments` plus `pathOrdinals` when an ID is unavailable.
 
-Edit an existing project script file directly; don't run `bss` afterward. For a newly created temporary script, `bss --str` writes its source directly. Use `bss --source-file` to copy source from another file.
+Edit an existing project script file directly; don't run `bss` afterward. For a new script, use `ba` to create its Script, LocalScript, or ModuleScript entry, then edit the generated file. `bss --str` or `--source-file` can set its source in the same store operation.
 
 Selectors are `-i` for settings ID, `-x` for index, `-n` for name, `-c` for class, or `--path` with optional `--ords`. Use exactly one selector. Don't combine a path with another selector. Use a service name first; use `-f` only for one explicit store, never both.
 
 Mutation results list only files whose bytes or paths changed in `changedPaths`. An empty list is a successful no-op and needs no push.
+When a structural edit returns settings IDs, include them with `-i` in the next push along with its `changedPaths`. Don't push an entire changed service settings file without IDs unless you intend to reconcile that whole service.
 
 Batch related reads once. The compact response has one flat result per request in top-level `rs`; it doesn't nest one result inside another.
 In batch fields, `src` is the source-file path; use `prop:Source` for exact script text.
@@ -127,9 +130,11 @@ rbx pull
 rbx push --changed-path src/StarterGui/AuditClient.client.luau --no-review --yes
 ```
 
+Add `--verify` when checking an exact script push. Don't verify it through `Instance.Source` in `rbx l`; an open ScriptDocument can hold the current editor source separately.
+
 Run these from the active place folder. At an experience root with more than one place, add the global `--place <alias|placeId>` selector before the command. Renium starts or reuses the shared daemon and waits for the matching Studio runtime.
 
-The CLI doesn't watch files. After project edits, pass each returned `changedPaths` entry to `rbx push --changed-path`; repeat the flag for multiple files. After Studio edits, pull. Use an unfiltered push only for a full place replacement. `live-*` controls the editor's change tracker; agents normally need only `live-status` or `discard-pending`.
+The CLI doesn't watch files. After project edits, pass each returned `changedPaths` entry to `rbx push --changed-path`; repeat the flag for multiple files. After Studio edits, pull. Use an unfiltered push only for a full place replacement. Use `rbx st --no-start` to read live-sync state and `rbx st --clear-pending` only to discard queued Studio changes.
 
 ## Play and Luau
 
@@ -140,6 +145,7 @@ rbx play -s --players 2             # local server plus two clients
 rbx clients
 rbx l "print(game.PlaceId)"         # Play server during a test
 rbx lc "print(game.Players.LocalPlayer.Name)" 2
+rbx co --server -n 20
 rbx co --player 2 -n 20
 rbx play -x
 ```
@@ -148,6 +154,9 @@ Use ordinary Play unless the test needs a separate server runtime or multiple cl
 Ordinary Play still reports its internal `play-server` and `play-client` bridges; `mode: "play"` confirms it isn't a local-server test.
 
 Outside Play, `rbx l` runs in the edit plugin context. It has the edit DataModel but no normal Play-client `LocalPlayer` or `PlayerGui`. Start Play before requiring runtime client code. During Play, `rbx l` targets the server and `rbx lc ... <name|index>` targets one client. Luau compile errors, runtime errors, and timeouts return nonzero.
+Don't keep an `l` or `lc` command waiting while issuing another command; daemon operations run in order. Register any observer, return, perform the action, then read the recorded state.
+An `l` or `lc` runner is removed when the command returns. Its callbacks and threads can't persist across later commands; add a temporary source script when a test fixture must persist.
+In PowerShell, wrap Luau containing double quotes in single quotes; `\"` doesn't escape quotes there.
 
 ## UI, world, capture, and devices
 
@@ -173,6 +182,7 @@ Run `ui` first and reuse its `p` path exactly; paths are relative to `PlayerGui`
 `goto` finishes within eight studs of its target so nearby interaction is possible; its result includes the final distance.
 
 Input targets one Play window without moving the system cursor or taking focus. The orange native shield stops physical input from interrupting an active sequence. Screenshots and H.264 MP4 recordings capture only the selected Studio/client window.
+Roblox reserves Escape for CoreGui, so use the game's on-screen control or an alternate key.
 
 Use device simulation only for mobile, resolution, or safe-area checks. Configure or stop it in Edit mode, never during Play, and never use it to repair a hidden normal viewport.
 `device set` returns the resulting state, so don't call `device status` immediately afterward. Use `device status` to read existing state later. `device list` returns selection fields; use `device list --details` or `device status --details` only when native dimensions or density are needed.

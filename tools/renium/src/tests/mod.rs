@@ -224,6 +224,7 @@ fn studio_bridge_modules_parse_as_luau() {
         "BridgeContent.module.lua",
         "BridgeConnection.module.lua",
         "BridgeEditorSync.module.lua",
+        "BridgeTransactionUpload.module.lua",
         "BridgePluginRuntime.module.lua",
         "BridgeStudioChanges.module.lua",
     ] {
@@ -1946,7 +1947,7 @@ fn starter_player_script_containers_keep_real_classes() {
 }
 
 #[test]
-fn deleted_source_file_demotes_script_to_folder_without_deleting_subtree() {
+fn deleted_source_file_removes_leaf_but_demotes_init_script() {
     let project_root = temp_dir("deleted-source");
     let service_dir = project_root.join("src").join("ReplicatedFirst");
     fs::create_dir_all(service_dir.join("LoadingScreen")).unwrap();
@@ -2012,6 +2013,29 @@ fn deleted_source_file_demotes_script_to_folder_without_deleting_subtree() {
     assert_eq!(after.instances[1].class_name, "Folder");
     assert_eq!(after.instances[2].name, "Frame");
     assert_eq!(after.instances[2].parent_index, Some(1));
+
+    let service_dir = project_root.join("src").join("ServerScriptService");
+    fs::create_dir_all(&service_dir).unwrap();
+    let document = settings_document(vec![
+        settings_instance("root", "ServerScriptService", "ServerScriptService", None),
+        settings_instance("script", "Harness", "Script", Some(0)),
+    ]);
+    let settings_path = service_settings_path(&service_dir);
+    document.write_file(&settings_path).unwrap();
+    let changes = collect_and_apply_editor_changes(
+        &project_root,
+        vec![PathBuf::from("src/ServerScriptService/Harness.server.luau")],
+        BridgeConnectionArgs::local(1.0),
+    );
+
+    assert_eq!(changes.instance_changes.len(), 1);
+    assert_eq!(changes.instance_changes[0].mode, "deleteInstances");
+    assert_eq!(
+        changes.instance_changes[0].instances[0].settings_id,
+        "script"
+    );
+    let after = SettingsBytecode::read_file(&settings_path).unwrap();
+    assert_eq!(after.instances.len(), 1);
 
     let _ = fs::remove_dir_all(project_root);
 }

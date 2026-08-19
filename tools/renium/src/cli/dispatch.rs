@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::app::setup::setup_command;
 use crate::app::update;
 use crate::automation::client::automation_command;
+use crate::automation::op;
 use crate::automation::tools::{
     asset_insert_command, asset_search_command, generate_model_command, http_get_command,
     image_store_command, job_status_command, script_grep_command, script_read_command,
@@ -48,8 +49,8 @@ use crate::studio::automation::{
     click_command, editor_review_decision_command, execute_luau_command,
     get_console_output_command, goto_command, key_command, list_clients_command, press_command,
     record_end_command, record_start_command, shot_command, start_stop_play_command,
-    studio_change_state_command, studio_device_command, test_command, type_command, ui_command,
-    wait_until_command,
+    studio_change_state_command, studio_change_state_operation_command, studio_device_command,
+    test_command, type_command, ui_command, wait_until_command,
 };
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
@@ -125,6 +126,15 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::RecordEnd(args) => record_end_command(args),
         Commands::Setup(args) => setup_command(args),
         Commands::StudioChangeState(args) => studio_change_state_command(args),
+        Commands::LiveStart(args) => studio_change_state_operation_command(args, op::LIVE_START),
+        Commands::LiveStop(args) => studio_change_state_operation_command(args, op::LIVE_STOP),
+        Commands::LiveStatus(args) => studio_change_state_operation_command(args, op::LIVE_STATUS),
+        Commands::RetryPending(args) => {
+            studio_change_state_operation_command(args, op::RETRY_PENDING)
+        }
+        Commands::DiscardPending(args) => {
+            studio_change_state_operation_command(args, op::DISCARD_PENDING)
+        }
         Commands::PushEditorChanges(args) => push_editor_changes(args),
         Commands::ApplyEditorProperty(args) => apply_editor_property(args),
         Commands::ApplyEditorDelete(args) => apply_editor_delete(args),

@@ -7,11 +7,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[cfg(not(any(windows, target_os = "macos")))]
+use super::virtual_click_actions;
 #[cfg(any(windows, target_os = "macos"))]
 use super::{client_viewport_size, input_delta, resolve_player_window};
-use super::{ensure_plugin_api_ok, wait_for_player_bridge};
-#[cfg(not(any(windows, target_os = "macos")))]
-use super::{send_virtual_input, virtual_click_actions};
+use super::{ensure_plugin_api_ok, send_virtual_input, wait_for_player_bridge};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
 
@@ -73,6 +73,49 @@ enum MouseButton {
     Right,
 }
 
+fn semantic_click_batch(request: &InputRequest) -> Option<Vec<Value>> {
+    request
+        .actions
+        .iter()
+        .map(|action| match action.action {
+            InputActionKind::Click
+                if action.path.is_some()
+                    && !matches!(action.button, Some(MouseButton::Right))
+                    && action.x.is_none()
+                    && action.y.is_none() =>
+            {
+                Some(json!({
+                    "type": "click",
+                    "path": action.path,
+                    "holdMs": action.ms.unwrap_or(30).min(10_000),
+                }))
+            }
+            InputActionKind::Wait => {
+                Some(json!({ "type": "wait", "ms": action.ms.unwrap_or(0).min(10_000) }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn semantic_click_batch_result(
+    request: &InputRequest,
+    bridge: &BridgeServer,
+    player: Option<&str>,
+) -> Result<Option<Value>> {
+    let Some(actions) = semantic_click_batch(request) else {
+        return Ok(None);
+    };
+    let result = send_virtual_input(bridge, player, actions, None)?;
+    Ok(Some(json!({
+        "ok": true,
+        "action": "input",
+        "actions": request.actions.len(),
+        "verifiedClicks": result.get("verifiedClicks").cloned().unwrap_or(Value::Null),
+        "inputMethod": "virtual",
+    })))
+}
+
 fn action_position(
     action: &InputAction,
     bridge: &BridgeServer,
@@ -128,16 +171,21 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, 8.0)?;
     }
+    if let Some(result) = semantic_click_batch_result(&request, bridge, player)? {
+        return Ok(result);
+    }
     let (window, offset_x, offset_y) =
         resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-    #[cfg(any(windows, target_os = "macos"))]
     let _shield = input_inject::input_shield(&window)?;
     let mut position = None;
     let mut calibration = None;
+    let mut used_os = false;
+    let mut used_virtual = false;
 
     for action in &request.actions {
         match action.action {
             InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => {
+                used_os = true;
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
                     let (dx, dy) = *calibration
@@ -167,6 +215,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
                 }
             }
             InputActionKind::Text => {
+                used_os = true;
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
                     let (dx, dy) = *calibration
@@ -194,6 +243,26 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             | InputActionKind::Click
             | InputActionKind::ScrollUp
             | InputActionKind::ScrollDown => {
+                if matches!(action.action, InputActionKind::Click)
+                    && action.path.is_some()
+                    && !matches!(action.button, Some(MouseButton::Right))
+                {
+                    let (x, y) = action_position(action, bridge, player, position)?;
+                    send_virtual_input(
+                        bridge,
+                        player,
+                        vec![json!({
+                            "type": "click",
+                            "path": action.path,
+                            "holdMs": action.ms.unwrap_or(30).min(10_000),
+                        })],
+                        None,
+                    )?;
+                    used_virtual = true;
+                    position = Some((x, y));
+                    continue;
+                }
+                used_os = true;
                 let (x, y) = action_position(action, bridge, player, position)?;
                 let (dx, dy) =
                     *calibration.get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
@@ -232,10 +301,16 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             }
         }
     }
+    let input_method = match (used_os, used_virtual) {
+        (true, true) => "mixed",
+        (false, true) => "virtual",
+        _ => "os",
+    };
     Ok(json!({
         "ok": true,
         "action": "input",
         "actions": request.actions.len(),
+        "inputMethod": input_method,
         "window": window.label,
     }))
 }
@@ -250,6 +325,9 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, 8.0)?;
     }
+    if let Some(result) = semantic_click_batch_result(&request, bridge, player)? {
+        return Ok(result);
+    }
     let mut position = None;
     let mut commands = Vec::new();
     for action in &request.actions {
@@ -257,7 +335,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => {
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
-                    commands.extend(virtual_click_actions(x, y, false, 30));
+                    commands.extend(virtual_click_actions(x, y, false, 30, false));
                     position = Some((x, y));
                 }
                 let key = input_inject::resolve_key(
@@ -284,7 +362,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             InputActionKind::Text => {
                 if action.path.is_some() {
                     let (x, y) = action_position(action, bridge, player, position)?;
-                    commands.extend(virtual_click_actions(x, y, false, 30));
+                    commands.extend(virtual_click_actions(x, y, false, 30, false));
                     position = Some((x, y));
                 }
                 commands.push(json!({
@@ -322,6 +400,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
                         y,
                         button == "right",
                         action.ms.unwrap_or(30),
+                        true,
                     )),
                     InputActionKind::ScrollUp => commands.extend([
                         json!({ "type": "move", "x": x, "y": y }),
@@ -340,7 +419,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             }
         }
     }
-    send_virtual_input(bridge, player, commands)?;
+    send_virtual_input(bridge, player, commands, None)?;
     Ok(json!({
         "ok": true,
         "action": "input",

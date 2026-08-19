@@ -1399,17 +1399,6 @@ pub(crate) fn build_editor_binary_import(
     {
         return Ok(None);
     }
-    if changes
-        .source_changes
-        .iter()
-        .any(|change| !services.contains(&change.service))
-        || changes
-            .property_changes
-            .iter()
-            .any(|change| !services.contains(&change.service))
-    {
-        return Ok(None);
-    }
     let document_overrides = changes
         .settings_writes
         .iter()

@@ -95,12 +95,12 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     };
     validate_luau_syntax(&code)?;
     let client = args.client || args.player.is_some();
-    let timeout = args.timeout.clamp(0.1, 20.0);
+    let timeout = args.timeout.clamp(0.1, 120.0);
     let target = BridgeTarget::main_or_client(client);
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let result = bridge.call_for_selector(
+    let result = bridge.call_for_selector_with_timeout(
         "executeLuau",
         json!({
             "code": code,
@@ -110,6 +110,7 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
         }),
         target,
         args.player.as_deref(),
+        Some(Duration::from_secs_f64(timeout + 10.0)),
     )?;
     ensure_luau_api_ok(&result)?;
     Ok(result)
@@ -198,9 +199,57 @@ pub(crate) fn studio_device_result(
     if args.details {
         params.insert("details".to_string(), Value::Bool(true));
     }
+    let requested_params = params.clone();
     let result =
         bridge.call_for_target("deviceSimulator", Value::Object(params), BridgeTarget::Edit)?;
     ensure_plugin_api_ok(&result)?;
+    match args.action.to_ascii_lowercase().as_str() {
+        "stop" | "reset" => {
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
+                input_inject::close_device_emulator_toolbar(pid)?;
+            }
+            bridge.set_desired_device_request(json!({ "action": "stop" }));
+        }
+        "set" | "select" | "apply" => {
+            let mut request = Map::new();
+            request.insert("action".to_string(), Value::String("set".to_string()));
+            if let Some(device) = result["device"]["id"].as_str() {
+                request.insert("device".to_string(), Value::String(device.to_string()));
+            }
+            if let Some(orientation) = result["orientation"].as_str() {
+                request.insert(
+                    "orientation".to_string(),
+                    Value::String(orientation.to_string()),
+                );
+            }
+            if let Some(scaling_mode) = result["scalingMode"].as_str() {
+                request.insert(
+                    "scalingMode".to_string(),
+                    Value::String(scaling_mode.to_string()),
+                );
+            }
+            for key in [
+                "device",
+                "orientation",
+                "scalingMode",
+                "width",
+                "height",
+                "pixelDensity",
+            ] {
+                if let Some(value) = requested_params.get(key) {
+                    request.insert(key.to_string(), value.clone());
+                }
+            }
+            if args.device.is_some() {
+                bridge.set_desired_device_request(Value::Object(request));
+            } else {
+                bridge.merge_desired_device_request(Value::Object(request));
+            }
+        }
+        _ => {}
+    }
     Ok(result)
 }
 
@@ -251,6 +300,16 @@ pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result
     } else {
         op::LIVE_START
     };
+    studio_change_state_operation_command(args, operation)
+}
+
+pub(crate) fn studio_change_state_operation_command(
+    mut args: StudioChangeStateArgs,
+    operation: u16,
+) -> Result<()> {
+    args.stop = operation == op::LIVE_STOP;
+    args.no_start = operation == op::LIVE_STATUS;
+    args.clear_pending = operation == op::DISCARD_PENDING;
     let parameters = json!({
         "services": args.services,
         "reset": args.reset,
@@ -267,20 +326,14 @@ pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result
         "bridgePorts": args.bridge.ports,
     });
     if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-        println!(
-            "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ {}",
-            serde_json::to_string(&result)?
-        );
+        println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
     let result = studio_change_state_result(args, &bridge)?;
-    println!(
-        "__ROBLOX_SYNC_STUDIO_CHANGE_STATE__ {}",
-        serde_json::to_string(&result)?
-    );
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -385,10 +438,12 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
         "play"
     };
     let launch = new_play_launch(bridge, "play")?;
-    let existing = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
+    let mut device_simulation = studio_device_status(bridge)?;
+    let mut existing = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
     if existing.get("running").and_then(Value::as_bool) == Some(true)
         || existing.get("starting").and_then(Value::as_bool) == Some(true)
     {
+        existing["deviceSimulation"] = device_simulation;
         return Ok(existing);
     }
     let result = (|| -> Result<Value> {
@@ -422,12 +477,14 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                 .iter()
                 .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT);
             if server_ready && (plugin_mode == "run" || client_ready) {
+                device_simulation["playRunning"] = Value::Bool(true);
                 return Ok(json!({
                     "ok": true,
                     "action": "start",
                     "mode": plugin_mode,
                     "launchNonce": launch.nonce,
                     "editRuntimeId": launch.edit_runtime_id,
+                    "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));
             }
@@ -473,6 +530,7 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
         bail!("Multiplayer tests require between 1 and 8 players");
     }
     let launch = new_play_launch(bridge, "multi")?;
+    let mut device_simulation = studio_device_status(bridge)?;
     let existing = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
     if existing.get("running").and_then(Value::as_bool) == Some(true)
         || existing.get("starting").and_then(Value::as_bool) == Some(true)
@@ -521,11 +579,13 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
                 .count();
             let server_ready = clients.iter().any(|entry| entry["role"] == "play-server");
             if server_ready && client_count >= players as usize {
+                device_simulation["playRunning"] = Value::Bool(true);
                 return Ok(json!({
                     "ok": true,
                     "action": "start",
                     "mode": "multi",
                     "players": players,
+                    "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));
             }
@@ -596,16 +656,6 @@ fn recover_client_viewport(
     Ok(viewport)
 }
 
-#[cfg(target_os = "macos")]
-fn recover_client_viewport(
-    _bridge: &BridgeServer,
-    _player: Option<&str>,
-    _pid: u32,
-    viewport: Option<(i32, i32)>,
-) -> Result<Option<(i32, i32)>> {
-    Ok(viewport)
-}
-
 #[cfg(windows)]
 fn input_delta(
     _bridge: &BridgeServer,
@@ -668,12 +718,26 @@ fn input_delta(
     (0, 0)
 }
 
+#[cfg(target_os = "macos")]
+fn recover_client_viewport(
+    _bridge: &BridgeServer,
+    _player: Option<&str>,
+    _pid: u32,
+    viewport: Option<(i32, i32)>,
+) -> Result<Option<(i32, i32)>> {
+    Ok(viewport)
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn resolve_client_capture_window(
     bridge: &BridgeServer,
     player: Option<&str>,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
+    let edit_pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
+    if pid == edit_pid {
+        return resolve_edit_window(bridge, BridgeTarget::Client);
+    }
     let viewport = client_viewport_size(bridge, player);
     let viewport = recover_client_viewport(bridge, player, pid, viewport)?;
     input_inject::window_for_pid(pid, viewport)
@@ -687,11 +751,11 @@ fn resolve_client_capture_window(
     bail!("Studio screenshots are only supported on Windows and macOS")
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
 fn send_virtual_input(
     bridge: &BridgeServer,
     player: Option<&str>,
     actions: Vec<Value>,
+    expect_activated_id: Option<&str>,
 ) -> Result<Value> {
     #[cfg(target_os = "linux")]
     let _shield = {
@@ -699,38 +763,52 @@ fn send_virtual_input(
         let window = input_inject::window_for_pid(pid, client_viewport_size(bridge, player))?;
         input_inject::input_shield(&window)?
     };
-    let result = bridge.call_for_selector(
-        "sendVirtualInput",
-        json!({ "actions": actions }),
-        BridgeTarget::Client,
-        player,
+    let mut params = json!({ "actions": actions });
+    if let Some(id) = expect_activated_id {
+        params["expectActivatedId"] = Value::String(id.to_string());
+    }
+    let result =
+        bridge.call_for_selector("sendVirtualInput", params, BridgeTarget::Client, player)?;
+    ensure_plugin_api_ok(&result)?;
+    Ok(result)
+}
+
+fn virtual_click_actions(
+    x: i32,
+    y: i32,
+    right: bool,
+    hold_ms: u64,
+    move_pointer: bool,
+) -> Vec<Value> {
+    let button = if right { "right" } else { "left" };
+    let mut actions = Vec::with_capacity(if move_pointer { 6 } else { 4 });
+    if move_pointer {
+        actions.extend([
+            json!({ "type": "move", "x": x, "y": y }),
+            json!({ "type": "wait", "ms": 0 }),
+        ]);
+    }
+    actions.extend([
+        json!({ "type": "button", "x": x, "y": y, "button": button, "down": true }),
+        json!({ "type": "wait", "ms": hold_ms.min(10_000) }),
+        json!({ "type": "button", "x": x, "y": y, "button": button, "down": false }),
+        json!({ "type": "wait", "ms": 0 }),
+    ]);
+    actions
+}
+
+fn studio_device_status(bridge: &BridgeServer) -> Result<Value> {
+    let result = bridge.call_for_target(
+        "deviceSimulator",
+        json!({ "action": "capture-status", "details": true, "includeSettle": true }),
+        BridgeTarget::Edit,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-fn virtual_click_actions(x: i32, y: i32, right: bool, hold_ms: u64) -> Vec<Value> {
-    let button = if right { "right" } else { "left" };
-    vec![
-        json!({ "type": "move", "x": x, "y": y }),
-        json!({ "type": "button", "x": x, "y": y, "button": button, "down": true }),
-        json!({ "type": "wait", "ms": hold_ms.min(10_000) }),
-        json!({ "type": "button", "x": x, "y": y, "button": button, "down": false }),
-        json!({ "type": "wait", "ms": 0 }),
-    ]
-}
-
 fn studio_capture_status(bridge: &BridgeServer) -> Option<Value> {
-    let result = bridge
-        .call_for_target(
-            "deviceSimulator",
-            json!({ "action": "status", "includeSettle": true }),
-            BridgeTarget::Edit,
-        )
-        .ok()?;
-    ensure_plugin_api_ok(&result).ok()?;
-    Some(result)
+    studio_device_status(bridge).ok()
 }
 
 #[cfg(windows)]
@@ -823,6 +901,12 @@ fn gui_input_bounds(
     if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
         bail!("GUI element {subject} is not visible");
     }
+    if bounds.get("hitTest").and_then(Value::as_bool) == Some(false) {
+        if let Some(blocker) = bounds.get("blockedBy").and_then(Value::as_str) {
+            bail!("GUI element {subject} is covered by {blocker}");
+        }
+        bail!("GUI element {subject} is not receiving pointer input at its center");
+    }
     let x = bounds
         .get("x")
         .and_then(Value::as_f64)
@@ -909,6 +993,20 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         "viewportX": x,
         "viewportY": y,
     });
+    if !args.world && !args.right {
+        let id = bounds
+            .get("id")
+            .and_then(Value::as_str)
+            .context("The target GuiButton has no stable id")?;
+        send_virtual_input(
+            bridge,
+            player,
+            virtual_click_actions(x.round() as i32, y.round() as i32, false, args.hold, false),
+            Some(id),
+        )?;
+        result["inputMethod"] = json!("virtual");
+        return Ok(result);
+    }
     #[cfg(any(windows, target_os = "macos"))]
     {
         let viewport = match (
@@ -921,7 +1019,6 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
             _ => None,
         };
         let (window, offset_x, offset_y) = resolve_player_window(bridge, player, viewport)?;
-        #[cfg(any(windows, target_os = "macos"))]
         let _shield = input_inject::input_shield(&window)?;
         let (delta_x, delta_y) =
             input_delta(bridge, player, &window, x.round() as i32, y.round() as i32);
@@ -940,7 +1037,14 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         send_virtual_input(
             bridge,
             player,
-            virtual_click_actions(x.round() as i32, y.round() as i32, args.right, args.hold),
+            virtual_click_actions(
+                x.round() as i32,
+                y.round() as i32,
+                args.right,
+                args.hold,
+                true,
+            ),
+            None,
         )?;
         result["inputMethod"] = json!("virtual");
     }
@@ -962,7 +1066,6 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
     {
         let (window, offset_x, offset_y) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-        #[cfg(any(windows, target_os = "macos"))]
         let _shield = input_inject::input_shield(&window)?;
         let (delta_x, delta_y) = input_delta(bridge, player, &window, args.x, args.y);
         input_inject::post_mouse_click(
@@ -980,7 +1083,8 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         send_virtual_input(
             bridge,
             player,
-            virtual_click_actions(args.x, args.y, args.right, args.hold),
+            virtual_click_actions(args.x, args.y, args.right, args.hold, true),
+            None,
         )?;
         result["inputMethod"] = json!("virtual");
     }
@@ -1000,15 +1104,21 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         "key": key.name,
         "holdMs": hold_ms,
     });
+    #[cfg(any(windows, target_os = "linux"))]
+    if key.name == "Escape" {
+        bail!(
+            "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key"
+        );
+    }
     #[cfg(any(windows, target_os = "macos"))]
     {
         let (window, _, _) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-        #[cfg(any(windows, target_os = "macos"))]
         let _shield = input_inject::input_shield(&window)?;
         input_inject::post_key(&window, &key, hold_ms)?;
         result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
+        Ok(result)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -1020,10 +1130,11 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
                 json!({ "type": "wait", "ms": hold_ms }),
                 json!({ "type": "key", "key": key.name, "down": false }),
             ],
+            None,
         )?;
         result["inputMethod"] = json!("virtual");
+        Ok(result)
     }
-    Ok(result)
 }
 
 pub(crate) fn ui_result(args: &UiArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -1067,28 +1178,35 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     }
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let mut pressed = Value::Null;
-        if let Some(path) = args.path.as_ref() {
-            let press_args = PressArgs {
-                bridge: args.bridge.clone(),
-                path: Some(path.clone()),
-                id: None,
-                player: args.player.clone(),
-                right: false,
-                world: false,
-                hold: 30,
-            };
-            let press = press_result(&press_args, bridge)?;
-            pressed = press
-                .get("target")
-                .cloned()
-                .unwrap_or_else(|| Value::String(path.clone()));
+        let (pressed, click, viewport) = if let Some(path) = args.path.as_ref() {
+            let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+            if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
+                bail!("{path} is not a TextBox");
+            }
+            (
+                bounds
+                    .get("fullName")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(path.clone())),
+                Some((x.round() as i32, y.round() as i32)),
+                result_viewport_size(&bounds),
+            )
+        } else {
+            (Value::Null, None, client_viewport_size(bridge, player))
+        };
+        let (window, offset_x, offset_y) = resolve_player_window(bridge, player, viewport)?;
+        let _shield = input_inject::input_shield(&window)?;
+        if let Some((x, y)) = click {
+            let (delta_x, delta_y) = input_delta(bridge, player, &window, x, y);
+            input_inject::post_mouse_click(
+                &window,
+                x + offset_x + delta_x,
+                y + offset_y + delta_y,
+                false,
+                30,
+            )?;
             thread::sleep(Duration::from_millis(250));
         }
-        let (window, _, _) =
-            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-        #[cfg(any(windows, target_os = "macos"))]
-        let _shield = input_inject::input_shield(&window)?;
         input_inject::post_text(&window, &args.text)?;
         if args.enter {
             let enter = input_inject::resolve_key("Enter")?;
@@ -1110,6 +1228,9 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
         let mut actions = Vec::new();
         if let Some(path) = args.path.as_ref() {
             let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+            if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
+                bail!("{path} is not a TextBox");
+            }
             pressed = bounds
                 .get("fullName")
                 .cloned()
@@ -1119,6 +1240,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
                 y.round() as i32,
                 false,
                 30,
+                false,
             ));
         }
         actions.push(json!({ "type": "text", "text": args.text }));
@@ -1130,7 +1252,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
                 json!({ "type": "key", "key": "Return", "down": false }),
             ]);
         }
-        send_virtual_input(bridge, player, actions)?;
+        send_virtual_input(bridge, player, actions, None)?;
         Ok(json!({
             "ok": true,
             "action": "type",
@@ -1469,17 +1591,29 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let studio_status = if player.is_none() && !args.client {
-        studio_capture_status(bridge)
-    } else {
-        None
-    };
+    let studio_status = studio_capture_status(bridge);
     let simulated = studio_status
         .as_ref()
         .and_then(|status| status.get("simulating"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if simulated {
+    let play_running = studio_status
+        .as_ref()
+        .and_then(|status| status.get("playRunning"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    #[cfg(any(windows, target_os = "macos"))]
+    let selected_client_is_studio = player.is_none()
+        || bridge
+            .studio_pid_for_selector(BridgeTarget::Client, player)
+            .ok()
+            == bridge
+                .studio_pid_for_selector(BridgeTarget::Edit, None)
+                .ok();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let selected_client_is_studio = false;
+    let use_simulator = simulated && !args.client && selected_client_is_studio;
+    if use_simulator {
         let settle_seconds = studio_status
             .as_ref()
             .and_then(|status| status.get("settleSeconds"))
@@ -1493,8 +1627,8 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     let client_ready =
         bridge.channel_count_for_target(BridgeTarget::Client) >= bridge.expected_channel_count();
     let use_studio =
-        args.studio || (player.is_none() && !args.client && (simulated || !client_ready));
-    let probe_target = if client_ready {
+        args.studio || use_simulator || (player.is_none() && !args.client && !client_ready);
+    let probe_target = if play_running {
         BridgeTarget::Client
     } else {
         BridgeTarget::Edit
@@ -1566,7 +1700,7 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
         "height": height,
         "window": window.label,
         "target": target,
-        "deviceSimulation": simulated,
+        "deviceSimulation": use_simulator,
     }))
 }
 

@@ -432,6 +432,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		launchNonce = nil,
 	}
 	local deviceSimulatorReadyAt = os.clock() + 4
+	local deviceSimulatorStatusCache = nil
 	local captureProbeGui = nil
 	local captureProbeFrame = nil
 	local activeEditThreads = {}
@@ -856,21 +857,36 @@ end)
 	local function guiBoundsResult(current, root, matchedCount)
 		local absPos = current.AbsolutePosition
 		local absSize = current.AbsoluteSize
-		local insetX, insetY = 0, 0
-		local screenGui = current:FindFirstAncestorWhichIsA("ScreenGui")
-		if not screenGui or not screenGui.IgnoreGuiInset then
-			local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
-			if typeof(topLeft) == "Vector2" then
-				insetX = topLeft.X
-				insetY = topLeft.Y
+		local centerX = absPos.X + absSize.X / 2
+		local centerY = absPos.Y + absSize.Y / 2
+		local hitTest = false
+		local blockedBy
+		local playerGui = current:FindFirstAncestorOfClass("PlayerGui")
+		if playerGui then
+			for _, hit in ipairs(playerGui:GetGuiObjectsAtPosition(centerX, centerY)) do
+				if hit == current or hit:IsDescendantOf(current) then
+					hitTest = true
+					break
+				elseif
+					not current:IsDescendantOf(hit)
+					and (hit:IsA("GuiButton") or hit:IsA("TextBox") or hit.Active)
+				then
+					blockedBy = hit:GetFullName()
+					break
+				end
 			end
+		end
+		local insetX, insetY = 0, 0
+		local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
+		if typeof(topLeft) == "Vector2" then
+			insetX, insetY = topLeft.X, topLeft.Y
 		end
 		local camera = game:GetService("Workspace").CurrentCamera
 		local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
 		return {
 			ok = true,
-			x = absPos.X + insetX + absSize.X / 2,
-			y = absPos.Y + insetY + absSize.Y / 2,
+			x = centerX + insetX,
+			y = centerY + insetY,
 			left = absPos.X + insetX,
 			top = absPos.Y + insetY,
 			width = absSize.X,
@@ -879,10 +895,13 @@ end)
 			onScreen = guiCenterOnScreen(current, insetX, insetY),
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
+			className = current.ClassName,
 			fullName = current:GetFullName(),
 			ordinalPath = guiOrdinalPath(root, current),
 			id = getInstanceDebugId(current),
 			matchedCount = matchedCount,
+			hitTest = hitTest,
+			blockedBy = blockedBy,
 		}
 	end
 
@@ -1182,14 +1201,15 @@ end)
 		local includeOffscreen = params.includeOffscreen == true
 		for _, descendant in ipairs(playerGui:GetDescendants()) do
 			if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
-				local visible, screenGui = inventoryVisibility(descendant)
+				local visible = inventoryVisibility(descendant)
 				if not visible then
 					continue
 				end
-				local offX, offY = insetX, insetY
-				if screenGui and screenGui.IgnoreGuiInset then
-					offX, offY = 0, 0
+				local absSize = descendant.AbsoluteSize
+				if absSize.X <= 0 or absSize.Y <= 0 then
+					continue
 				end
+				local offX, offY = insetX, insetY
 				if not includeOffscreen and not inventoryOnScreen(descendant, offX, offY) then
 					continue
 				end
@@ -1198,7 +1218,6 @@ end)
 					break
 				end
 				local absPos = descendant.AbsolutePosition
-				local absSize = descendant.AbsoluteSize
 				local text = if descendant:IsA("TextButton") or descendant:IsA("TextBox")
 					then string.sub(descendant.Text, 1, 60)
 					else nil
@@ -1357,7 +1376,81 @@ updateMouse()
 		if type(actions) ~= "table" or #actions < 1 or #actions > 1024 then
 			return { ok = false, error = "Virtual input requires 1 through 1024 actions" }
 		end
+		local function findGuiButtonById(id)
+			local localPlayer = game:GetService("Players").LocalPlayer
+			local playerGui = if localPlayer then localPlayer:FindFirstChildOfClass("PlayerGui") else nil
+			if playerGui then
+				for _, descendant in ipairs(playerGui:GetDescendants()) do
+					if descendant:IsA("GuiButton") and getInstanceDebugId(descendant) == id then
+						return descendant
+					end
+				end
+			end
+			return nil
+		end
+
+		local activationId = tostring(params.expectActivatedId or "")
+		local activationCount = 0
+		local clickCount = 0
+		local activationConnection
+		local clickConnection
+		if activationId ~= "" then
+			local target = findGuiButtonById(activationId)
+			if target == nil then
+				return { ok = false, error = "The expected GuiButton is no longer available" }
+			end
+			activationConnection = target.Activated:Connect(function()
+				activationCount += 1
+			end)
+			clickConnection = target.MouseButton1Click:Connect(function()
+				clickCount += 1
+			end)
+		end
+
 		local virtualInput = game:GetService("UserInputService"):CreateVirtualInput()
+		local verifiedClicks = 0
+		local function sendVerifiedClick(action)
+			local bounds = api.getGuiBounds({ path = action.path, id = action.id, scroll = true })
+			if bounds.ok ~= true then
+				error(tostring(bounds.error or "GUI target could not be resolved"), 0)
+			end
+			if bounds.visible ~= true then
+				error(`GUI element {tostring(bounds.fullName)} is not visible`, 0)
+			end
+			if bounds.onScreen ~= true then
+				error(`GUI element {tostring(bounds.fullName)} is outside the viewport`, 0)
+			end
+			if bounds.hitTest ~= true then
+				local blocker = tostring(bounds.blockedBy or "another GUI element")
+				error(`GUI element {tostring(bounds.fullName)} is covered by {blocker}`, 0)
+			end
+			local target = findGuiButtonById(tostring(bounds.id or ""))
+			if target == nil then
+				error("The expected GuiButton is no longer available", 0)
+			end
+			local activated = 0
+			local clicked = 0
+			local activatedConnection = target.Activated:Connect(function()
+				activated += 1
+			end)
+			local clickedConnection = target.MouseButton1Click:Connect(function()
+				clicked += 1
+			end)
+			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
+			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
+			task.wait(math.clamp((tonumber(action.holdMs) or 30) / 1000, 0, 10))
+			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+			local deadline = os.clock() + 1
+			while (activated == 0 or clicked == 0) and os.clock() < deadline do
+				RunService.Heartbeat:Wait()
+			end
+			activatedConnection:Disconnect()
+			clickedConnection:Disconnect()
+			if activated ~= 1 or clicked ~= 1 then
+				error(`Expected one Activated and MouseButton1Click event, got {activated} and {clicked}`, 0)
+			end
+			verifiedClicks += 1
+		end
 		for _, action in actions do
 			local actionType = tostring(action.type or "")
 			if actionType == "wait" then
@@ -1370,6 +1463,8 @@ updateMouse()
 				virtualInput:SendKey(action.down == true, keyCode, action.repeated == true)
 			elseif actionType == "text" then
 				virtualInput:SendTextInput(tostring(action.text or ""))
+			elseif actionType == "click" then
+				sendVerifiedClick(action)
 			else
 				local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
 				if actionType == "move" then
@@ -1389,8 +1484,29 @@ updateMouse()
 				end
 			end
 		end
-		task.wait()
-		return { ok = true, actions = #actions }
+		if activationConnection then
+			local deadline = os.clock() + 1
+			while (activationCount == 0 or clickCount == 0) and os.clock() < deadline do
+				RunService.Heartbeat:Wait()
+			end
+			activationConnection:Disconnect()
+			clickConnection:Disconnect()
+			if activationCount ~= 1 or clickCount ~= 1 then
+				return {
+					ok = false,
+					error = `Expected one Activated and MouseButton1Click event, got {activationCount} and {clickCount}`,
+				}
+			end
+		else
+			task.wait()
+		end
+		return {
+			ok = true,
+			actions = #actions,
+			verifiedClicks = verifiedClicks,
+			activated = if activationId ~= "" then activationCount == 1 else nil,
+			clicked = if activationId ~= "" then clickCount == 1 else nil,
+		}
 	end
 
 	function api.getConsoleOutput(params)
@@ -1558,8 +1674,14 @@ updateMouse()
 		assertOperationOwnership(operationGeneration)
 		local action = string.lower(tostring(params.action or "status"))
 		local service = game:GetService("StudioDeviceSimulatorService")
-		if action ~= "list" and api.isPlayModeRunning() then
+		if action ~= "list" and action ~= "capture-status" and api.isPlayModeRunning() then
 			return { ok = false, error = "Stop Play before reading or changing device simulation" }
+		end
+		if params.waitForStartup == true then
+			while os.clock() < deviceSimulatorReadyAt do
+				RunService.Heartbeat:Wait()
+				assertOperationOwnership(operationGeneration)
+			end
 		end
 
 		local function enumName(value)
@@ -1598,11 +1720,16 @@ updateMouse()
 		end
 
 		local function status()
+			local function remember(result)
+				deviceSimulatorStatusCache = table.clone(result)
+				return result
+			end
 			local camera = workspace.CurrentCamera
 			local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
 			local inactive = {
 				ok = true,
 				action = "status",
+				playRunning = false,
 				simulating = false,
 				viewport = vectorSize(viewport),
 			}
@@ -1611,11 +1738,12 @@ updateMouse()
 				return { ok = false, error = tostring(deviceId) }
 			end
 			if type(deviceId) ~= "string" or deviceId == "" or deviceId == "default" then
-				return inactive
+				return remember(inactive)
 			end
 			local result = {
 				ok = true,
 				action = "status",
+				playRunning = false,
 				simulating = true,
 				viewport = vectorSize(viewport),
 			}
@@ -1645,6 +1773,22 @@ updateMouse()
 			else
 				result.device = { id = deviceId, name = deviceId }
 			end
+			return remember(result)
+		end
+
+		if action == "capture-status" then
+			if not api.isPlayModeRunning() then
+				return status()
+			end
+			local result = if deviceSimulatorStatusCache then table.clone(deviceSimulatorStatusCache) else {
+				ok = true,
+				action = "status",
+				simulating = false,
+			}
+			if params.includeSettle == true and result.simulating then
+				result.settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock())
+			end
+			result.playRunning = true
 			return result
 		end
 
@@ -1709,15 +1853,25 @@ updateMouse()
 			return status()
 		elseif action == "stop" or action == "reset" then
 			local before = status()
-			local okReset, resetError = pcall(service.SetDeviceAsync, service, "default")
-			if not okReset then
-				local okStop, stopError = pcall(service.StopSimulationAsync, service)
-				if
-					not okStop
-					and not string.find(string.lower(tostring(stopError)), "no device is active", 1, true)
-				then
-					return { ok = false, error = tostring(resetError) .. "; " .. tostring(stopError) }
-				end
+			if not before.ok then
+				return before
+			end
+			local okStop, stopError = pcall(service.StopSimulationAsync, service)
+			if not okStop and before.simulating then
+				return { ok = false, error = tostring(stopError) }
+			end
+			local after = status()
+			local deadline = os.clock() + 1
+			while after.ok and after.simulating and os.clock() < deadline do
+				RunService.Heartbeat:Wait()
+				assertOperationOwnership(operationGeneration)
+				after = status()
+			end
+			if not after.ok then
+				return after
+			end
+			if after.simulating then
+				return { ok = false, error = "Studio did not stop device simulation" }
 			end
 			deviceSimulatorReadyAt = 0
 			return { ok = true, action = "stop", stopped = true, alreadyStopped = not before.simulating }
@@ -1884,6 +2038,7 @@ updateMouse()
 			end
 		end)
 		deviceSimulatorReadyAt = readyAtBefore
+		status()
 		if not okRestore then
 			error(tostring(resultOrError) .. "; device simulator rollback failed: " .. tostring(restoreError), 0)
 		end
@@ -1897,7 +2052,7 @@ updateMouse()
 		if code == "" then
 			return { ok = false, error = "Missing Luau code" }
 		end
-		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 20)
+		local timeoutSeconds = math.clamp(tonumber(params.timeoutSeconds) or 10, 0.1, 120)
 		local backgroundLifetimeSeconds = BridgeValueCodec.decodeNumber(params.backgroundLifetimeSeconds)
 		backgroundLifetimeSeconds = if backgroundLifetimeSeconds
 			then math.clamp(backgroundLifetimeSeconds, 0.1, 610)

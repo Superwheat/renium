@@ -184,6 +184,7 @@ pub(crate) struct EditorSourcePathSpec {
     pub(crate) service: String,
     pub(crate) class_name: String,
     pub(crate) run_context: Option<String>,
+    pub(crate) is_init: bool,
     pub(crate) instance_name: String,
     pub(crate) instance_stem: String,
     pub(crate) parent_components: Vec<String>,
@@ -347,6 +348,10 @@ pub(crate) struct EditorBinaryImport {
 }
 
 impl EditorBinaryImport {
+    pub(crate) fn imports_service(&self, service: &str) -> bool {
+        self.groups.iter().any(|group| group.service == service)
+    }
+
     pub(crate) fn retains_path(
         &self,
         service: &str,

@@ -165,7 +165,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.2.0"
+	local BRIDGE_VERSION = "0.2.1"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -261,6 +261,7 @@ function BridgePluginRuntime.start(context)
 	local PropertySchemaModule = requireChildModule("BridgePropertySchema")
 	local StudioApiSchemaModule = requireChildModule("BridgeStudioApiSchema")
 	local EditorSyncModule = requireChildModule("BridgeEditorSync")
+	local TransactionUploadModule = requireChildModule("BridgeTransactionUpload")
 	local initialRuntimeSettings = SettingsModule.loadRuntimeSettings(plugin, SETTINGS_PREFIX)
 	local activeExclusiveSessionGeneration = nil
 	local editorSync
@@ -4723,6 +4724,13 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.cancelEditorReconcile = editorSync.cancelReconcile
 	Config.bridgeMethodHandlers.getEditorFilterCandidates = editorSync.getFilterCandidates
 	Config.bridgeMethodHandlers.getEditorServiceChangeGenerations = editorSync.getServiceChangeGenerations
+	Config.editorTransactionUploads = TransactionUploadModule.create(editorSync.beginTransaction, function(id, params)
+		transactionExpectations[id] = params
+	end)
+	Config.bridgeMethodHandlers.beginEditorTransactionUpload = Config.editorTransactionUploads.begin
+	Config.bridgeMethodHandlers.appendEditorTransactionUpload = Config.editorTransactionUploads.append
+	Config.bridgeMethodHandlers.finishEditorTransactionUpload = Config.editorTransactionUploads.finish
+	Config.bridgeMethodHandlers.cancelEditorTransactionUpload = Config.editorTransactionUploads.cancel
 	Config.bridgeMethodHandlers.beginEditorTransaction = function(p)
 		local result = editorSync.beginTransaction(p)
 		transactionExpectations[tostring(p.transactionId or "")] = p
@@ -4982,6 +4990,9 @@ function BridgePluginRuntime.start(context)
 		setExportOptions = true,
 		applyEditorChanges = true,
 		beginEditorTransaction = true,
+		beginEditorTransactionUpload = true,
+		finishEditorTransactionUpload = true,
+		cancelEditorTransactionUpload = true,
 		commitEditorTransaction = true,
 		rollbackEditorTransaction = true,
 		beginEditorBinaryImport = true,
@@ -5019,6 +5030,10 @@ function BridgePluginRuntime.start(context)
 		setExportOptions = true,
 		applyEditorChanges = true,
 		beginEditorTransaction = true,
+		beginEditorTransactionUpload = true,
+		appendEditorTransactionUpload = true,
+		finishEditorTransactionUpload = true,
+		cancelEditorTransactionUpload = true,
 		commitEditorTransaction = true,
 		rollbackEditorTransaction = true,
 		beginEditorBinaryImport = true,

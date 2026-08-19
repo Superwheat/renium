@@ -150,6 +150,7 @@ pub(super) fn console(parameters: &Value) -> Result<PluginConsoleOutputArgs> {
         from_oldest: boolean(object, "fromOldest")?,
         clear: boolean(object, "clear")?,
         client: boolean(object, "client")?,
+        server: boolean(object, "server")?,
         player: string(object, "player"),
         follow: boolean(object, "follow")?,
         grep: string(object, "grep"),

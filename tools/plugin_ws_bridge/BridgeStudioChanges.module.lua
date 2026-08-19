@@ -467,7 +467,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, target in ipairs(instances) do
 			if instance.Parent ~= nil then
 				tokens[#tokens + 1] =
-					expectInstanceEvent(state.expectedStructuralByInstance, target, "removed", nil, true, target.Parent)
+					expectInstanceEvent(state.expectedStructuralByInstance, target, "removed", nil, false, nil)
 			end
 			if nextParent ~= nil then
 				local expectedParent = if target == instance then nextParent else target.Parent
