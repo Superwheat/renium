@@ -58,10 +58,14 @@ function syncProjectSchema() {
 }
 
 function syncAgentInstructions() {
+  const source = path.join(repoRoot, "tools", "renium");
   fs.copyFileSync(
-    path.join(repoRoot, "tools", "renium", "renium-agents.md"),
+    path.join(source, "renium-agents.md"),
     path.join(extensionResources, "RENIUM.md"),
   );
+  const topics = path.join(extensionResources, "RENIUM");
+  fs.rmSync(topics, { recursive: true, force: true });
+  fs.cpSync(path.join(source, "renium-guides"), topics, { recursive: true });
   fs.rmSync(path.join(extensionResources, "AGENTS.md"), { force: true });
 }
 

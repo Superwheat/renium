@@ -129,6 +129,12 @@ jobs:
             if ($null -eq $archive.GetEntry("extension/bin/win32-x64/renium-agents.md")) {
               throw "VSIX is missing the Renium agent instructions"
             }
+            if ($null -eq $archive.GetEntry("extension/bin/win32-x64/renium-guides/advanced.md")) {
+              throw "VSIX is missing the Renium agent topic guides"
+            }
+            if ($null -eq $archive.GetEntry("extension/resources/RENIUM/opencloud.md")) {
+              throw "VSIX is missing its generated Renium topic guides"
+            }
             $stream = $pluginEntry.Open()
             $sha256 = [Security.Cryptography.SHA256]::Create()
             try {

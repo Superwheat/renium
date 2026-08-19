@@ -49,10 +49,20 @@ export function ensureReniumAgentInstructions(
   };
 
   const packagedGuide = path.join(extensionRoot, "resources", "RENIUM.md");
+  const packagedTopics = path.join(extensionRoot, "resources", "RENIUM");
+  const sourceRoot = path.resolve(extensionRoot, "..", "renium");
   const guideSource = fs.existsSync(packagedGuide)
     ? packagedGuide
-    : path.resolve(extensionRoot, "..", "renium", "renium-agents.md");
+    : path.join(sourceRoot, "renium-agents.md");
+  const topicSource = fs.existsSync(packagedTopics)
+    ? packagedTopics
+    : path.join(sourceRoot, "renium-guides");
   write(path.join(projectRoot, "RENIUM.md"), fs.readFileSync(guideSource));
+  const projectTopics = path.join(projectRoot, "RENIUM");
+  fs.mkdirSync(projectTopics, { recursive: true });
+  for (const name of fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort()) {
+    write(path.join(projectTopics, name), fs.readFileSync(path.join(topicSource, name)));
+  }
 
   const pointer = fs.readFileSync(path.join(extensionRoot, "resources", "RENIUM.pointer.md"), "utf8");
   for (const name of ["AGENTS.md", "CLAUDE.md"]) {

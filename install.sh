@@ -985,6 +985,9 @@ for support_file in rbx renium-agents.md; do
     cp "$(dirname "$cli")/$support_file" "$staged_install/$support_file"
   fi
 done
+if [ -d "$(dirname "$cli")/renium-guides" ]; then
+  cp -R "$(dirname "$cli")/renium-guides" "$staged_install/renium-guides"
+fi
 if [ -n "$plugin_source" ]; then
   cp "$plugin_source" "$staged_install/Renium.rbxm"
 fi

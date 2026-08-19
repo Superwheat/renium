@@ -24,6 +24,7 @@ const DEFAULT_UPDATE_MANIFEST: &str =
 const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
 const SHARED_CORE_LAUNCHERS: [&str; 3] = ["rbx", "rbx.cmd", "rbx-run.ps1"];
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
+const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
 
 #[path = "update/check.rs"]
 mod check;
@@ -1493,6 +1494,9 @@ fn shared_core_install_paths(target: &Path, core_root: &Path) -> Result<Vec<Path
     if core_root.join(AGENT_INSTRUCTIONS_FILE).is_file() {
         paths.push(root.join(AGENT_INSTRUCTIONS_FILE));
     }
+    if core_root.join(AGENT_GUIDES_DIRECTORY).is_dir() {
+        paths.push(root.join(AGENT_GUIDES_DIRECTORY));
+    }
     Ok(paths)
 }
 
@@ -1989,6 +1993,16 @@ fn install_shared_core_files(target: &Path, core_root: &Path) -> Result<()> {
                 |error| format!("Shared core rollback failed: {error:#}"),
             ));
         }
+    }
+    let agent_guides = core_root.join(AGENT_GUIDES_DIRECTORY);
+    if agent_guides.is_dir() {
+        let destination = root.join(AGENT_GUIDES_DIRECTORY);
+        if destination.is_dir() {
+            fs::remove_dir_all(&destination)?;
+        } else if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        copy_directory(&agent_guides, &destination)?;
     }
     Ok(())
 }
