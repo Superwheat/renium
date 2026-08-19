@@ -298,10 +298,10 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			error("A native import root cannot be a PackageLink")
 		end
 		local removed = 0
-		for _, instance in ipairs(root:GetDescendants()) do
-			if instance:IsA("PackageLink") then
-				removed += 1 + #instance:GetDescendants()
-				instance:Destroy()
+		for _, child in ipairs(root:GetChildren()) do
+			if child:IsA("PackageLink") then
+				removed += 1 + #child:GetDescendants()
+				child:Destroy()
 			end
 		end
 		if removed == 0 then
@@ -597,9 +597,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		local incoming = {}
 		local structuralErrors = {}
 		local function restoreParent(instance: Instance, parent: Instance?)
-			local ok, result = pcall(function()
-				instance.Parent = parent
-			end)
+			local ok, result = pcall(setParentForSync, instance, parent, ctx)
 			if not ok then
 				structuralErrors[#structuralErrors + 1] = tostring(result)
 			end
@@ -625,6 +623,23 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		end
 		if #structuralErrors > 0 then
 			error(`Could not roll back {#structuralErrors} native import roots: {structuralErrors[1]}`)
+		end
+		for _, group in ipairs(undo.prepared) do
+			for _, instance in ipairs(group.outgoing) do
+				if instance.Parent ~= group.target then
+					error(`Could not roll back native import root {instance.Name}`)
+				end
+			end
+			for _, instance in ipairs(group.retainedLiveRoots or {}) do
+				if instance.Parent ~= group.target then
+					error(`Retained package root {instance.Name} was lost during rollback`)
+				end
+			end
+			for _, instance in ipairs(group.incoming) do
+				if instance.Parent ~= nil then
+					error(`Incoming native import root {instance.Name} remained live after rollback`)
+				end
+			end
 		end
 		local reverseReplacements = {}
 		for original, replacement in pairs(undo.replacements) do

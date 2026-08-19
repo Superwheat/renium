@@ -184,6 +184,11 @@ pub(super) enum Commands {
     Setup(SetupArgs),
     #[command(alias = "st")]
     StudioChangeState(StudioChangeStateArgs),
+    LiveStart(StudioChangeStateArgs),
+    LiveStop(StudioChangeStateArgs),
+    LiveStatus(StudioChangeStateArgs),
+    RetryPending(StudioChangeStateArgs),
+    DiscardPending(StudioChangeStateArgs),
     #[command(alias = "push")]
     PushEditorChanges(PushEditorChangesArgs),
     #[command(alias = "prop")]
@@ -465,6 +470,8 @@ pub(super) struct PluginConsoleOutputArgs {
     pub(super) clear: bool,
     #[arg(long)]
     pub(super) client: bool,
+    #[arg(long, conflicts_with_all = ["client", "player"])]
+    pub(super) server: bool,
     #[arg(long, value_name = "NAME|N")]
     pub(super) player: Option<String>,
     #[arg(short, long)]

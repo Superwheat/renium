@@ -24,7 +24,7 @@ use crate::snapshot::export::{parse_bridge_chunk, validate_bridge_chunk, validat
 use crate::studio::automation::TestLaunch;
 use crate::studio::target::{place_filter, place_matches};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 
 pub(crate) const DEFAULT_EXPORT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -37,7 +37,7 @@ pub(crate) const BRIDGE_ROLE_PLAY_CLIENT: &str = "play-client";
 const BRIDGE_ROLE_UNKNOWN: &str = "unknown";
 const BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR: char = '#';
 const MIN_BRIDGE_CHUNK_BYTES: usize = 256;
-const MAX_BRIDGE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BRIDGE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
 const BRIDGE_CHANNEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,11 +46,32 @@ pub(crate) fn clamp_bridge_chunk_size(size: usize) -> usize {
     size.clamp(MIN_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_CHUNK_BYTES)
 }
 
+#[derive(Debug)]
+pub(crate) struct BridgeRequestTooLarge {
+    method: String,
+    bytes: usize,
+}
+
+impl std::fmt::Display for BridgeRequestTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Bridge request for {} is {} bytes, above the {MAX_BRIDGE_REQUEST_BYTES}-byte safety limit",
+            self.method, self.bytes
+        )
+    }
+}
+
+impl std::error::Error for BridgeRequestTooLarge {}
+
 fn bridge_response_timeout(method: &str) -> Duration {
     match method {
         "prepare"
         | "applyEditorChanges"
         | "beginEditorTransaction"
+        | "beginEditorTransactionUpload"
+        | "appendEditorTransactionUpload"
+        | "finishEditorTransactionUpload"
         | "commitEditorTransaction"
         | "rollbackEditorTransaction"
         | "appendEditorBinaryImport"
@@ -67,7 +88,9 @@ fn bridge_response_timeout(method: &str) -> Duration {
 
 fn bridge_channel_lock_timeout(method: &str) -> Duration {
     match method {
-        "appendEditorBinaryImport" | "appendEditorPushReview" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
+        "appendEditorBinaryImport" | "appendEditorPushReview" | "appendEditorTransactionUpload" => {
+            BRIDGE_SLOW_RESPONSE_TIMEOUT
+        }
         _ => BRIDGE_CHANNEL_LOCK_TIMEOUT,
     }
 }
@@ -188,8 +211,12 @@ pub(crate) struct BridgeChannel {
 struct BridgeAcceptState {
     alive: Arc<AtomicBool>,
     request_session_id: String,
-    #[cfg(any(windows, target_os = "macos"))]
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    desired_device_request: Arc<Mutex<Value>>,
+    device_reconciled_runtimes: Arc<Mutex<HashSet<String>>>,
+    all_channels: Arc<Mutex<Vec<Arc<BridgeChannel>>>>,
+    expected_channels: usize,
+    reconcile_device_on_connect: bool,
     #[cfg(any(windows, target_os = "macos"))]
     update_checked_runtimes: Arc<Mutex<HashSet<String>>>,
     #[cfg(any(windows, target_os = "macos"))]
@@ -206,6 +233,7 @@ pub(crate) struct BridgeServer {
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
     pub(crate) final_console_snapshots: Mutex<HashMap<String, FinalConsoleSnapshot>>,
+    desired_device_request: Arc<Mutex<Value>>,
 }
 
 pub(crate) struct FinalConsoleSnapshot {
@@ -280,20 +308,10 @@ fn normalize_bridge_role(role: &str) -> &'static str {
 }
 
 impl BridgeServer {
-    pub(crate) fn acquire_request_gate(&self, timeout: Duration) -> Result<MutexGuard<'_, ()>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.request_gate.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
-                    bail!(
-                        "Renium daemon is busy with another bridge request; retry after it completes"
-                    );
-                }
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
-            }
-        }
+    pub(crate) fn acquire_request_gate(&self) -> MutexGuard<'_, ()> {
+        self.request_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn listen(
@@ -334,6 +352,9 @@ impl BridgeServer {
         let bind_started = Instant::now();
         let alive = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(21335));
+        let desired_device_request = Arc::new(Mutex::new(json!({ "action": "stop" })));
+        let device_reconciled_runtimes = Arc::new(Mutex::new(HashSet::new()));
+        let all_channels = Arc::new(Mutex::new(Vec::with_capacity(ports.len())));
         #[cfg(any(windows, target_os = "macos"))]
         let update_checked_runtimes = Arc::new(Mutex::new(HashSet::new()));
         let mut channels: Vec<Arc<BridgeChannel>> = Vec::with_capacity(ports.len());
@@ -347,8 +368,12 @@ impl BridgeServer {
         let accept_state = BridgeAcceptState {
             alive: Arc::clone(&alive),
             request_session_id,
-            #[cfg(any(windows, target_os = "macos"))]
             next_id: Arc::clone(&next_id),
+            desired_device_request: Arc::clone(&desired_device_request),
+            device_reconciled_runtimes: Arc::clone(&device_reconciled_runtimes),
+            all_channels: Arc::clone(&all_channels),
+            expected_channels: ports.len(),
+            reconcile_device_on_connect: check_updates_on_connect,
             #[cfg(any(windows, target_os = "macos"))]
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
@@ -373,6 +398,10 @@ impl BridgeServer {
                 port: *port,
                 sockets: Mutex::new(HashMap::new()),
             });
+            all_channels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&channel));
             Self::spawn_accept_loop(
                 bind_host.clone(),
                 *port,
@@ -396,6 +425,7 @@ impl BridgeServer {
             request_gate: Mutex::new(()),
             runtime_pins: Mutex::new(HashMap::new()),
             final_console_snapshots: Mutex::new(HashMap::new()),
+            desired_device_request,
         };
 
         let required_channels = server.channels.len();
@@ -469,8 +499,12 @@ impl BridgeServer {
         let BridgeAcceptState {
             alive,
             request_session_id,
-            #[cfg(any(windows, target_os = "macos"))]
             next_id,
+            desired_device_request,
+            device_reconciled_runtimes,
+            all_channels,
+            expected_channels,
+            reconcile_device_on_connect,
             #[cfg(any(windows, target_os = "macos"))]
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
@@ -489,6 +523,9 @@ impl BridgeServer {
                             &request_session_id,
                         ) {
                             Ok(socket) => {
+                                let device_runtime = (reconcile_device_on_connect
+                                    && socket.role == BRIDGE_ROLE_EDIT)
+                                    .then(|| socket.bridge_info.runtime_id.clone());
                                 #[cfg(any(windows, target_os = "macos"))]
                                 let update_target = (check_updates_on_connect
                                     && socket.role == BRIDGE_ROLE_EDIT)
@@ -515,6 +552,41 @@ impl BridgeServer {
                                 }
                                 guard.insert(socket_key, socket);
                                 drop(guard);
+                                if let Some(runtime_id) = device_runtime {
+                                    let channels = all_channels
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone();
+                                    let ready = channels
+                                        .iter()
+                                        .filter(|channel| {
+                                            channel
+                                                .sockets
+                                                .lock()
+                                                .unwrap_or_else(PoisonError::into_inner)
+                                                .values()
+                                                .any(|socket| {
+                                                    socket.role == BRIDGE_ROLE_EDIT
+                                                        && socket.bridge_info.runtime_id
+                                                            == runtime_id
+                                                })
+                                        })
+                                        .count();
+                                    if ready >= expected_channels
+                                        && device_reconciled_runtimes
+                                            .lock()
+                                            .unwrap_or_else(PoisonError::into_inner)
+                                            .insert(runtime_id.clone())
+                                    {
+                                        Self::apply_desired_device_state(
+                                            runtime_id,
+                                            Arc::clone(&channel),
+                                            Arc::clone(&next_id),
+                                            Arc::clone(&desired_device_request),
+                                            Arc::clone(&device_reconciled_runtimes),
+                                        );
+                                    }
+                                }
                                 #[cfg(any(windows, target_os = "macos"))]
                                 if let Some(runtime_id) = update_target {
                                     Self::check_for_update(
@@ -546,6 +618,111 @@ impl BridgeServer {
                 }
             }
         });
+    }
+
+    fn apply_desired_device_state(
+        runtime_id: String,
+        channel: Arc<BridgeChannel>,
+        next_id: Arc<std::sync::atomic::AtomicU64>,
+        desired_device_request: Arc<Mutex<Value>>,
+        device_reconciled_runtimes: Arc<Mutex<HashSet<String>>>,
+    ) {
+        thread::spawn(move || {
+            let mut request = desired_device_request
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(request) = request.as_object_mut() {
+                request.insert("waitForStartup".to_string(), Value::Bool(true));
+            }
+            let mut sockets = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(socket) = sockets.values_mut().find(|socket| {
+                socket.role == BRIDGE_ROLE_EDIT && socket.bridge_info.runtime_id == runtime_id
+            }) else {
+                return;
+            };
+            #[cfg(any(windows, target_os = "macos"))]
+            let peer = socket.peer.clone();
+            let mut applied = {
+                let mut apply = |request: &Value| -> Result<()> {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let result = Self::call_on_socket_with_timeout(
+                        socket,
+                        id,
+                        "deviceSimulator",
+                        request,
+                        None,
+                    )?;
+                    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                        bail!(
+                            "{}",
+                            result
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Studio rejected the request")
+                        );
+                    }
+                    Ok(())
+                };
+                (|| -> Result<()> {
+                    if request.get("action").and_then(Value::as_str) == Some("set") {
+                        apply(&json!({ "action": "stop", "waitForStartup": true }))?;
+                    }
+                    apply(&request)
+                })()
+            };
+            drop(sockets);
+            #[cfg(any(windows, target_os = "macos"))]
+            if applied.is_ok() && request.get("action").and_then(Value::as_str) == Some("stop") {
+                applied = (|| -> Result<()> {
+                    let port = peer
+                        .rsplit(':')
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .with_context(|| format!("Could not parse peer port from '{peer}'"))?;
+                    let pid = pid_for_local_tcp_port(port).with_context(|| {
+                        format!("Could not map bridge connection {peer} to Studio")
+                    })?;
+                    input_inject::close_device_emulator_toolbar_when_visible(pid)?;
+                    Ok(())
+                })();
+            }
+            if let Err(error) = &applied {
+                eprintln!("[renium] failed to restore device simulator state: {error:#}");
+            }
+            if applied.is_err() {
+                device_reconciled_runtimes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&runtime_id);
+            }
+        });
+    }
+
+    pub(crate) fn set_desired_device_request(&self, request: Value) {
+        *self
+            .desired_device_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = request;
+    }
+
+    pub(crate) fn merge_desired_device_request(&self, request: Value) {
+        let mut desired = self
+            .desired_device_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (Some(current), Some(update)) = (desired.as_object_mut(), request.as_object()) else {
+            *desired = request;
+            return;
+        };
+        if current.get("action").and_then(Value::as_str) != Some("set") {
+            *desired = request;
+            return;
+        }
+        current.extend(update.clone());
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -698,7 +875,7 @@ impl BridgeServer {
         let socket_config = WebSocketConfig::default()
             .read_buffer_size(256 * 1024)
             .write_buffer_size(32 * 1024)
-            .max_write_buffer_size(4 * 1024 * 1024)
+            .max_write_buffer_size(MAX_BRIDGE_MESSAGE_BYTES)
             .max_message_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .accept_unmasked_frames(false);
@@ -1763,21 +1940,42 @@ impl BridgeServer {
                 let role = Self::bridge_role_key_base(role_key).to_string();
                 let info = &socket.bridge_info;
                 let existing = entries.iter_mut().find(|entry| {
-                    entry.runtime_id == info.runtime_id
-                        && entry.launch_nonce == info.launch_nonce
-                        && entry.launch_edit_runtime_id == info.launch_edit_runtime_id
-                        && entry.role == role
-                        && entry.player_name == info.player_name
-                        && entry.player_user_id == info.player_user_id
-                        && entry.place_id == info.place_id
-                        && entry.game_id == info.game_id
-                        && entry.place_name == info.place_name
+                    entry.role == role
+                        && if info.runtime_id.is_empty() {
+                            entry.runtime_id.is_empty()
+                                && entry.launch_nonce == info.launch_nonce
+                                && entry.launch_edit_runtime_id == info.launch_edit_runtime_id
+                                && entry.player_name == info.player_name
+                                && entry.player_user_id == info.player_user_id
+                                && entry.place_id == info.place_id
+                                && entry.game_id == info.game_id
+                        } else {
+                            entry.runtime_id == info.runtime_id
+                        }
                 });
                 match existing {
                     Some(entry) => {
                         if !entry.ports.contains(&socket.port) {
                             entry.ports.push(socket.port);
                         }
+                        if entry.launch_nonce.is_empty() {
+                            entry.launch_nonce.clone_from(&info.launch_nonce);
+                        }
+                        if entry.launch_edit_runtime_id.is_empty() {
+                            entry
+                                .launch_edit_runtime_id
+                                .clone_from(&info.launch_edit_runtime_id);
+                        }
+                        if entry.player_name.is_empty() {
+                            entry.player_name.clone_from(&info.player_name);
+                        }
+                        entry.player_user_id = entry.player_user_id.or(info.player_user_id);
+                        entry.place_id = entry.place_id.or(info.place_id);
+                        entry.game_id = entry.game_id.or(info.game_id);
+                        if entry.place_name.is_empty() {
+                            entry.place_name.clone_from(&info.place_name);
+                        }
+                        entry.build_unix = entry.build_unix.max(info.bridge_build_unix);
                     }
                     None => entries.push(ClientEntry {
                         runtime_id: info.runtime_id.clone(),
@@ -1984,10 +2182,10 @@ impl BridgeServer {
             params,
         })?;
         if payload.len() > MAX_BRIDGE_REQUEST_BYTES {
-            bail!(
-                "Bridge request for {method} is {} bytes, above the {MAX_BRIDGE_REQUEST_BYTES}-byte safety limit",
-                payload.len()
-            );
+            return Err(anyhow::Error::new(BridgeRequestTooLarge {
+                method: method.to_string(),
+                bytes: payload.len(),
+            }));
         }
 
         bridge_socket

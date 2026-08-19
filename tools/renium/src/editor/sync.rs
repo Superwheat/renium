@@ -53,8 +53,12 @@ use crate::project::package_links::{
 use crate::rbx::encode::rbx_model_property_descriptor;
 use crate::roblox::schema::{PropertySchemaMap, load_rbx_dom_property_schema};
 use crate::settings::bytecode::SettingsBytecode;
+use crate::settings::instance::remove_instances_at_indices;
 use crate::snapshot::export::parse_bridge_ports;
-use crate::studio::bridge::{BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE};
+use crate::studio::bridge::{
+    BridgeRequestTooLarge, BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE, MAX_BRIDGE_CHUNK_BYTES,
+    MAX_BRIDGE_REQUEST_BYTES,
+};
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
 };
@@ -71,22 +75,17 @@ struct EditorTransaction<'a> {
 }
 
 impl<'a> EditorTransaction<'a> {
-    fn begin(
-        bridge: &'a BridgeServer,
+    fn parameters(
         changes: &EditorChangeSet,
-        native_import: bool,
-    ) -> Result<Option<Self>> {
-        let mut services = changes.services().map(str::to_string).collect::<Vec<_>>();
-        services.sort();
-        services.dedup();
-        if services.is_empty() {
-            return Ok(None);
-        }
-        let id = format!(
-            "{}-{}",
-            current_millis(),
-            fnv1a_hex(services.join("\0").as_bytes())
-        );
+        binary_import: Option<&EditorBinaryImport>,
+        id: &str,
+        services: Vec<String>,
+    ) -> Value {
+        let native_import = binary_import.is_some();
+        let native_import_services = binary_import
+            .into_iter()
+            .flat_map(|import| import.groups.iter().map(|group| &group.service))
+            .collect::<BTreeSet<_>>();
         let source_changes = changes
             .source_changes
             .iter()
@@ -101,12 +100,57 @@ impl<'a> EditorTransaction<'a> {
                 })
             })
             .collect::<Vec<_>>();
+        let mut mutation_root_keys = BTreeSet::new();
+        let mut mutation_roots = Vec::new();
+        let mut add_mutation_root = |service: &str, path: &[String], ordinals: &[usize]| {
+            if path.len() < 2 {
+                return;
+            }
+            let ordinal = ordinals.get(1).copied().unwrap_or(1);
+            if mutation_root_keys.insert((service.to_string(), path[1].clone(), ordinal)) {
+                mutation_roots.push(json!({
+                    "service": service,
+                    "pathSegments": [&path[0], &path[1]],
+                    "pathOrdinals": [ordinals.first().copied().unwrap_or(1), ordinal],
+                }));
+            }
+        };
+        for change in &changes.source_changes {
+            add_mutation_root(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            );
+        }
+        for change in &changes.property_changes {
+            add_mutation_root(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            );
+        }
+        for change in &changes.instance_changes {
+            for instance in &change.instances {
+                add_mutation_root(
+                    &change.service,
+                    &instance.path_segments,
+                    &instance.path_ordinals,
+                );
+            }
+        }
         let has_instance_changes = !changes.instance_changes.is_empty();
+        let destructive_services = changes
+            .instance_changes
+            .iter()
+            .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
+            .map(|change| &change.service)
+            .collect::<BTreeSet<_>>();
         let mut post_commit_property_changes = changes
             .property_changes
             .iter()
             .filter_map(|change| {
-                (native_import && change.class_name == "Model")
+                (binary_import.is_some_and(|import| import.imports_service(&change.service))
+                    && change.class_name == "Model")
                     .then(|| change.properties.get("WorldPivot"))
                     .flatten()
                     .map(|value| {
@@ -126,20 +170,147 @@ impl<'a> EditorTransaction<'a> {
         let property_changes = changes
             .property_changes
             .iter()
-            .filter(|change| !native_import || property_change_needs_post_native_apply(change))
+            .filter(|change| {
+                !binary_import.is_some_and(|import| import.imports_service(&change.service))
+                    || property_change_needs_post_native_apply(change)
+            })
             .collect::<Vec<_>>();
+        json!({
+            "transactionId": id,
+            "services": services,
+            "hasInstanceChanges": has_instance_changes,
+            "destructiveServices": destructive_services,
+            "sourceChanges": source_changes,
+            "propertyChanges": property_changes,
+            "mutationRoots": mutation_roots,
+            "postCommitPropertyChanges": post_commit_property_changes,
+            "nativeImport": native_import,
+            "nativeImportServices": native_import_services,
+        })
+    }
+
+    fn upload(bridge: &BridgeServer, id: &str, mut parameters: Value) -> Result<()> {
+        let object = parameters
+            .as_object_mut()
+            .context("Editor transaction parameters must be an object")?;
+        let services = object
+            .remove("services")
+            .context("Editor transaction services are missing")?;
+        let has_instance_changes = object
+            .remove("hasInstanceChanges")
+            .unwrap_or(Value::Bool(false));
+        let destructive_services = object
+            .remove("destructiveServices")
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let native_import = object.remove("nativeImport").unwrap_or(Value::Bool(false));
+        let native_import_services = object
+            .remove("nativeImportServices")
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mutation_roots = object
+            .remove("mutationRoots")
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mut rows = Vec::new();
+        for (field, kind) in [
+            ("sourceChanges", "source"),
+            ("propertyChanges", "property"),
+            ("postCommitPropertyChanges", "postCommitProperty"),
+        ] {
+            let values = object
+                .remove(field)
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default();
+            rows.extend(
+                values
+                    .into_iter()
+                    .map(|change| json!({ "kind": kind, "change": change })),
+            );
+        }
+        let mut chunks = Vec::<Vec<Value>>::new();
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 2usize;
+        for row in rows {
+            let row_bytes = serde_json::to_vec(&row)?.len() + usize::from(!chunk.is_empty());
+            if row_bytes + 65536 > MAX_BRIDGE_REQUEST_BYTES {
+                bail!("One editor transaction row exceeds the bridge request limit");
+            }
+            if !chunk.is_empty() && chunk_bytes.saturating_add(row_bytes) > MAX_BRIDGE_CHUNK_BYTES {
+                chunks.push(std::mem::take(&mut chunk));
+                chunk_bytes = 2;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(row_bytes);
+            chunk.push(row);
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
         bridge.call(
-            "beginEditorTransaction",
+            "beginEditorTransactionUpload",
             json!({
-                "transactionId": &id,
+                "transactionId": id,
                 "services": services,
                 "hasInstanceChanges": has_instance_changes,
-                "sourceChanges": source_changes,
-                "propertyChanges": property_changes,
-                "postCommitPropertyChanges": post_commit_property_changes,
+                "destructiveServices": destructive_services,
                 "nativeImport": native_import,
+                "nativeImportServices": native_import_services,
+                "mutationRoots": mutation_roots,
+                "totalChunks": chunks.len(),
+                "rowCount": chunks.iter().map(Vec::len).sum::<usize>(),
             }),
         )?;
+        let result = (|| -> Result<()> {
+            for (index, rows) in chunks.iter().enumerate() {
+                bridge.call(
+                    "appendEditorTransactionUpload",
+                    json!({
+                        "transactionId": id,
+                        "index": index + 1,
+                        "rows": rows,
+                    }),
+                )?;
+            }
+            bridge.call(
+                "finishEditorTransactionUpload",
+                json!({ "transactionId": id }),
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = bridge.call(
+                "cancelEditorTransactionUpload",
+                json!({ "transactionId": id }),
+            );
+        }
+        result
+    }
+
+    fn begin(
+        bridge: &'a BridgeServer,
+        changes: &EditorChangeSet,
+        binary_import: Option<&EditorBinaryImport>,
+    ) -> Result<Option<Self>> {
+        let mut services = changes.services().map(str::to_string).collect::<Vec<_>>();
+        services.sort();
+        services.dedup();
+        if services.is_empty() {
+            return Ok(None);
+        }
+        let id = format!(
+            "{}-{}",
+            current_millis(),
+            fnv1a_hex(services.join("\0").as_bytes())
+        );
+        let upload_services = services.clone();
+        let parameters = Self::parameters(changes, binary_import, &id, services);
+        if let Err(error) = bridge.call("beginEditorTransaction", parameters) {
+            if !error.is::<BridgeRequestTooLarge>() {
+                return Err(error);
+            }
+            Self::upload(
+                bridge,
+                &id,
+                Self::parameters(changes, binary_import, &id, upload_services),
+            )?;
+        }
         Ok(Some(Self {
             bridge,
             id,
@@ -169,7 +340,9 @@ impl<'a> EditorTransaction<'a> {
             "rollbackEditorTransaction",
             json!({ "transactionId": &self.id }),
         );
-        self.active = false;
+        if result.is_ok() {
+            self.active = false;
+        }
         result.map(|_| ())
     }
 
@@ -1117,6 +1290,15 @@ fn push_editor_changes_with_collected(
     } else {
         build_editor_binary_import(&args, &changes, bridge)?
     };
+    if binary_import.is_none()
+        && !changes.files_to_studio_filters_active
+        && changes
+            .instance_changes
+            .iter()
+            .any(|change| change.mode == "reconcileService" && change.allow_deletes)
+    {
+        bail!("A full service replacement could not be staged; Studio was not changed");
+    }
     let mut history_transaction = if review_skipped || binary_import.is_some() {
         None
     } else {
@@ -1126,7 +1308,7 @@ fn push_editor_changes_with_collected(
     let mut transaction = if review_skipped {
         None
     } else {
-        EditorTransaction::begin(bridge, &changes, binary_import.is_some())?
+        EditorTransaction::begin(bridge, &changes, binary_import.as_ref())?
     };
     log_timing("native editor transaction begin", phase_started);
     let mut summary = if review_skipped {
@@ -1277,8 +1459,17 @@ fn push_editor_changes_with_collected(
             "protectedApplied".to_string(),
             Value::Number(serde_json::Number::from(protected_writes.len() as u64)),
         );
-    } else if let Some(transaction) = transaction.as_mut() {
-        transaction.commit()?;
+    } else if let Some(transaction) = transaction.as_mut()
+        && let Err(commit_error) = transaction.commit()
+    {
+        if let Err(rollback_error) = transaction.rollback() {
+            return Err(
+                commit_error.context(format!("Studio rollback also failed: {rollback_error:#}"))
+            );
+        }
+        return Err(
+            commit_error.context("Studio rejected the commit; its changes were rolled back")
+        );
     }
     log_timing("native editor transaction commit", phase_started);
     if let Some(settings_transaction) = settings_transaction {
@@ -1335,7 +1526,7 @@ fn apply_editor_change_with_warm_bridge(
         emit_editor_push_summary(&summary)?;
         return Ok(summary);
     }
-    let mut transaction = EditorTransaction::begin(bridge, &changes, false)?;
+    let mut transaction = EditorTransaction::begin(bridge, &changes, None)?;
     let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
     let summary =
         send_editor_change_batches(bridge, &changes, false, false, false, None, transaction_id)?;
@@ -1906,6 +2097,183 @@ struct EditorChangedServices {
     dirty: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct EditorPackageMutationTarget {
+    settings_id: Option<String>,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+}
+
+fn editor_package_mutation_index(
+    document: &SettingsBytecode,
+    paths: &[Option<crate::editor::types::EditorInstancePath>],
+    target: &EditorPackageMutationTarget,
+) -> Option<usize> {
+    if let Some(settings_id) = target.settings_id.as_deref()
+        && let Some(index) = document_instance_index_by_settings_id(document, settings_id)
+    {
+        return Some(index);
+    }
+
+    for length in (1..=target.path_segments.len()).rev() {
+        let segments = &target.path_segments[..length];
+        let ordinals = target
+            .path_ordinals
+            .get(..length)
+            .filter(|_| !target.path_ordinals.is_empty());
+        let mut matches = paths.iter().enumerate().filter_map(|(index, path)| {
+            let path = path.as_ref()?;
+            (path.path_segments == segments
+                && ordinals.is_none_or(|ordinals| path.path_ordinals == ordinals))
+            .then_some(index)
+        });
+        let Some(index) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_none() {
+            return Some(index);
+        }
+        return None;
+    }
+
+    None
+}
+
+fn desync_changed_package_roots(
+    changes: &mut EditorChangeSet,
+    documents: &mut HashMap<String, Option<SettingsBytecode>>,
+    services: &mut EditorChangedServices,
+) -> Result<()> {
+    let mut targets = HashMap::<String, Vec<EditorPackageMutationTarget>>::new();
+    let mut push_target = |service: &str,
+                           settings_id: Option<&str>,
+                           path_segments: &[String],
+                           path_ordinals: &[usize]| {
+        if !services.reconcile.contains(service) && path_segments.len() > 1 {
+            targets
+                .entry(service.to_string())
+                .or_default()
+                .push(EditorPackageMutationTarget {
+                    settings_id: settings_id.map(str::to_string),
+                    path_segments: path_segments.to_vec(),
+                    path_ordinals: path_ordinals.to_vec(),
+                });
+        }
+    };
+
+    for change in &changes.source_changes {
+        push_target(
+            &change.service,
+            change.settings_id.as_deref(),
+            &change.path_segments,
+            &change.path_ordinals,
+        );
+    }
+    for change in &changes.property_changes {
+        push_target(
+            &change.service,
+            change.settings_id.as_deref(),
+            &change.path_segments,
+            &change.path_ordinals,
+        );
+    }
+    for change in &changes.instance_changes {
+        if change.mode == "reconcileService" {
+            continue;
+        }
+        for instance in &change.instances {
+            if instance.class_name != "PackageLink" {
+                push_target(
+                    &change.service,
+                    Some(&instance.settings_id),
+                    &instance.path_segments,
+                    &instance.path_ordinals,
+                );
+            }
+        }
+    }
+
+    let mut deletes = Vec::new();
+    for (service, service_targets) in targets {
+        let Some(document) = documents.get_mut(&service).and_then(Option::as_mut) else {
+            continue;
+        };
+        let paths = build_editor_instance_paths(document, &service);
+        let mut children = vec![Vec::new(); document.instances.len()];
+        for (index, instance) in document.instances.iter().enumerate() {
+            if let Some(parent) = instance.parent_index
+                && let Some(siblings) = children.get_mut(parent)
+            {
+                siblings.push(index);
+            }
+        }
+
+        let mut package_links = HashSet::new();
+        for target in service_targets {
+            let Some(mut current) = editor_package_mutation_index(document, &paths, &target) else {
+                continue;
+            };
+            loop {
+                let direct_links = children
+                    .get(current)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        document
+                            .instances
+                            .get(*index)
+                            .is_some_and(|instance| instance.class_name == "PackageLink")
+                    })
+                    .collect::<Vec<_>>();
+                if !direct_links.is_empty() {
+                    package_links.extend(direct_links);
+                    break;
+                }
+                let Some(parent) = document.instances[current].parent_index else {
+                    break;
+                };
+                current = parent;
+            }
+        }
+        if package_links.is_empty() {
+            continue;
+        }
+
+        let mut package_links = package_links.into_iter().collect::<Vec<_>>();
+        package_links.sort_unstable();
+        let instances = package_links
+            .iter()
+            .filter_map(|index| {
+                let instance = document.instances.get(*index)?;
+                let path = paths.get(*index)?.as_ref()?;
+                Some(EditorInstanceDescriptor {
+                    settings_id: instance.settings_id.clone(),
+                    path_segments: path.path_segments.clone(),
+                    path_ordinals: path.path_ordinals.clone(),
+                    class_name: instance.class_name.clone(),
+                    ..EditorInstanceDescriptor::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        remove_instances_at_indices(document, &package_links, true)?;
+        services.dirty.insert(service.clone());
+        deletes.push(EditorInstanceChange {
+            mode: "deleteInstances".to_string(),
+            service,
+            allow_deletes: false,
+            instances,
+            preserve_instances: Vec::new(),
+        });
+    }
+
+    if !deletes.is_empty() {
+        deletes.append(&mut changes.instance_changes);
+        changes.instance_changes = deletes;
+    }
+    Ok(())
+}
+
 fn sorted_services(services: HashSet<String>) -> Vec<String> {
     let mut services = services.into_iter().collect::<Vec<_>>();
     services.sort();
@@ -1967,9 +2335,13 @@ fn finish_editor_change_collection(
         }
     }
     for service in sorted_services(services.reconcile) {
-        if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
-            append_editor_instance_reconcile(&mut changes, document, &service);
-        }
+        let document = documents
+            .get(&service)
+            .and_then(Option::as_ref)
+            .with_context(|| {
+                format!("Cannot reconcile {service}: its settings document is missing")
+            })?;
+        append_editor_instance_reconcile(&mut changes, document, &service);
     }
     for service in sorted_services(services.target_upsert) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
@@ -2191,23 +2563,41 @@ fn collect_editor_changes_with_link_enforcement(
                         source_key: Some(editor_source_key_from_target(target)),
                         settings_before: Some(settings_before),
                     });
-                    document.instances[index].class_name = "Folder".to_string();
                     changed_services.dirty.insert(service.clone());
                     changed_services.settings.insert(service.clone());
-                    let descriptor = editor_instance_descriptor_for_known_path(
-                        document,
-                        index,
-                        target.path_segments.clone(),
-                        target.path_ordinals.clone(),
-                    )
-                    .context("Failed to describe the replaced source instance")?;
-                    changes.instance_changes.push(EditorInstanceChange {
-                        mode: "replaceInstances".to_string(),
-                        service: service.clone(),
-                        allow_deletes: false,
-                        instances: vec![descriptor],
-                        preserve_instances: Vec::new(),
-                    });
+                    if inferred_spec.as_ref().is_some_and(|spec| spec.is_init) {
+                        document.instances[index].class_name = "Folder".to_string();
+                        let descriptor = editor_instance_descriptor_for_known_path(
+                            document,
+                            index,
+                            target.path_segments.clone(),
+                            target.path_ordinals.clone(),
+                        )
+                        .context("Failed to describe the replaced source instance")?;
+                        changes.instance_changes.push(EditorInstanceChange {
+                            mode: "replaceInstances".to_string(),
+                            service: service.clone(),
+                            allow_deletes: false,
+                            instances: vec![descriptor],
+                            preserve_instances: Vec::new(),
+                        });
+                    } else {
+                        let descriptor = editor_instance_descriptor_for_known_path(
+                            document,
+                            index,
+                            target.path_segments.clone(),
+                            target.path_ordinals.clone(),
+                        )
+                        .context("Failed to describe the deleted source instance")?;
+                        remove_instances_at_indices(document, &[index], true)?;
+                        changes.instance_changes.push(EditorInstanceChange {
+                            mode: "deleteInstances".to_string(),
+                            service: service.clone(),
+                            allow_deletes: false,
+                            instances: vec![descriptor],
+                            preserve_instances: Vec::new(),
+                        });
+                    }
                     source_maps.remove(&service);
                 }
             }
@@ -2263,6 +2653,7 @@ fn collect_editor_changes_with_link_enforcement(
         });
     }
 
+    desync_changed_package_roots(&mut changes, &mut documents, &mut changed_services)?;
     finish_editor_change_collection(
         changes,
         &documents,

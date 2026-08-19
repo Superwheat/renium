@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
@@ -6,6 +7,17 @@ use serde_json::Value;
 
 use crate::app::timing::current_millis;
 use crate::cli::Cli;
+
+#[derive(Debug)]
+pub(crate) struct ReportedFailure;
+
+impl fmt::Display for ReportedFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("command reported a structured failure")
+    }
+}
+
+impl std::error::Error for ReportedFailure {}
 
 #[derive(Clone, Copy)]
 pub(crate) enum OutputMode {

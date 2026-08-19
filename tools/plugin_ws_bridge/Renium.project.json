@@ -82,6 +82,9 @@
       "BridgeEditorSync": {
         "$path": "BridgeEditorSync.module.lua"
       },
+      "BridgeTransactionUpload": {
+        "$path": "BridgeTransactionUpload.module.lua"
+      },
       "BridgeStudioChanges": {
         "$path": "BridgeStudioChanges.module.lua"
       },

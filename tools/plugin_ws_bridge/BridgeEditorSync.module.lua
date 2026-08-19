@@ -260,6 +260,11 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
 	end
+	if instance.Parent ~= parent then
+		cancelExpectedEvent(ctx, token)
+		local target = if parent == nil then "nil" else parent:GetFullName()
+		error(`Roblox rejected parenting {instance:GetFullName()} to {target}`, 0)
+	end
 end
 
 local function setNameForSync(instance: Instance, name: string, ctx: { [string]: any }?)
@@ -293,6 +298,17 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 end
 
 local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?)
+	if instance:IsA("PackageLink") then
+		local token = if ctx ~= nil then ctx.expectParentChange(instance, nil) else nil
+		local ok, result = pcall(function()
+			instance:Destroy()
+		end)
+		if not ok then
+			cancelExpectedEvent(ctx, token)
+			error(result, 0)
+		end
+		return
+	end
 	setParentForSync(instance, nil, ctx)
 end
 
@@ -1471,6 +1487,65 @@ local function includeManagedInstance(ctx: { [string]: any }, serviceName: strin
 	return ctx.includeExportInstance(serviceName, instance)
 end
 
+local function desyncPackageAncestors(
+	instance: Instance,
+	service: Instance,
+	ctx: { [string]: any },
+	stats: { [string]: any }
+)
+	local transaction = ctx.editorTransaction
+	if transaction == nil or transaction.nativeImportServices[service.Name] then
+		return
+	end
+	local current = if instance:IsA("PackageLink") then instance.Parent else instance
+	local packageLinks = {}
+	local snapshotRoot = current
+	while current ~= nil and current ~= game do
+		for _, child in ipairs(current:GetChildren()) do
+			if child:IsA("PackageLink") and not transaction.desyncedPackageLinks[child] then
+				packageLinks[#packageLinks + 1] = child
+			end
+		end
+		if current == service then
+			break
+		end
+		if current.Parent == service then
+			snapshotRoot = current
+		end
+		current = current.Parent
+	end
+	if #packageLinks == 0 then
+		return
+	end
+	if not transaction.packageSnapshotRoots[snapshotRoot] then
+		error(`Package mutation was not captured for rollback: {snapshotRoot:GetFullName()}`)
+	end
+	for _, packageLink in ipairs(packageLinks) do
+		transaction.desyncedPackageLinks[packageLink] = true
+		removeInstanceForUndo(packageLink, ctx)
+		stats.instanceDeleted += 1
+	end
+end
+
+local function desyncPackagesForPath(
+	change: { [string]: any },
+	service: Instance,
+	ctx: { [string]: any },
+	stats: { [string]: any }
+)
+	local pathSegments = cloneArray(change.pathSegments)
+	local pathOrdinals = cloneArray(change.pathOrdinals)
+	while #pathSegments > 1 do
+		local instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
+		if instance ~= nil then
+			desyncPackageAncestors(instance, service, ctx, stats)
+			return
+		end
+		table.remove(pathSegments)
+		table.remove(pathOrdinals)
+	end
+end
+
 local function ensureSourceParentPath(
 	change: { [string]: any },
 	service: Instance,
@@ -1507,6 +1582,18 @@ local function ensureSourceParentPath(
 	return current
 end
 
+local function verifySourceWrite(instance: Instance, expectedSource: string)
+	local okRead, appliedSource = readScriptSource(instance)
+	if not okRead then
+		error(`Failed to verify Source for {instance:GetFullName()}: {appliedSource}`)
+	end
+	if appliedSource ~= expectedSource then
+		error(
+			`Source verification failed for {instance:GetFullName()}: expected {#expectedSource} bytes, got {#appliedSource} bytes`
+		)
+	end
+end
+
 local function applySourceChange(
 	change: { [string]: any },
 	ctx: { [string]: any },
@@ -1528,10 +1615,17 @@ local function applySourceChange(
 			if not ctx.luaSourceClass[instance.ClassName] then
 				error("Target is not a Lua source container: " .. instance:GetFullName())
 			end
+			local okRead, currentSource = readScriptSource(instance)
+			if okRead and currentSource == "" then
+				stats.noops += 1
+				return
+			end
+			desyncPackageAncestors(instance, service, ctx, stats)
 			local okWrite, err, writeMethod = setSource(instance, "", ctx)
 			if not okWrite then
 				error(`Failed to clear Source for {instance:GetFullName()}: {err}`)
 			end
+			verifySourceWrite(instance, "")
 			if writeMethod == "UpdateSourceAsync" then
 				stats.sourceUpdateAsync += 1
 			else
@@ -1549,6 +1643,7 @@ local function applySourceChange(
 			stats.noops += 1
 			return
 		end
+		desyncPackagesForPath(change, service, ctx, stats)
 		local parent = resolveParent(change, ctx.resolveCache) or ensureSourceParentPath(change, service, stats, ctx)
 		if parent == nil then
 			error("Cannot create source instance; parent path was not found")
@@ -1569,6 +1664,7 @@ local function applySourceChange(
 	end
 
 	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] then
+		desyncPackageAncestors(instance, service, ctx, stats)
 		local oldInstance = instance
 		instance = replaceInstanceClass(instance, tostring(change.className), stats, ctx.selectionReplacements, ctx)
 		rememberReplacementIdentity(serviceName, change.settingsId, oldInstance, instance, ctx)
@@ -1587,10 +1683,12 @@ local function applySourceChange(
 		return
 	end
 
+	desyncPackageAncestors(instance, service, ctx, stats)
 	local okWrite, err, writeMethod = setSource(instance, nextSource, ctx)
 	if not okWrite then
 		error(`Failed to write Source for {instance:GetFullName()}: {err}`)
 	end
+	verifySourceWrite(instance, nextSource)
 	if writeMethod == "UpdateSourceAsync" then
 		stats.sourceUpdateAsync += 1
 	else
@@ -1624,7 +1722,11 @@ local function sortedInstanceEntries(
 				if tostring(pathSegments[1]) ~= serviceName then
 					error("Instance path root does not match service: " .. pathKey(pathSegments))
 				end
-				if #pathSegments > 1 and className ~= serviceName and className ~= "PackageLink" then
+				if
+					#pathSegments > 1
+					and className ~= serviceName
+					and (className ~= "PackageLink" or change.mode == "deleteInstances")
+				then
 					entries[#entries + 1] = {
 						pathSegments = pathSegments,
 						pathOrdinals = cloneArray(raw.pathOrdinals),
@@ -1677,6 +1779,7 @@ local function syncDesiredEntry(
 		if parent == nil then
 			error("Cannot create instance; parent path was not found: " .. entry.key)
 		end
+		desyncPackageAncestors(parent, game:GetService(serviceName), ctx, stats)
 		local okCreate, created = pcall(Instance.new, entry.className)
 		if not okCreate or created == nil then
 			error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
@@ -1686,6 +1789,16 @@ local function syncDesiredEntry(
 		instance = created
 		stats.instanceCreated += 1
 	else
+		local parent = resolveEntryParent(entry, resolvedEntries)
+		if parent == nil then
+			error("Cannot place instance; parent path was not found: " .. tostring(entry.key))
+		end
+		local nextName = tostring(entry.pathSegments[#entry.pathSegments] or instance.Name)
+		if instance.Parent ~= parent or nextName ~= "" and instance.Name ~= nextName or instance.ClassName ~= entry.className then
+			local service = game:GetService(serviceName)
+			desyncPackageAncestors(instance, service, ctx, stats)
+			desyncPackageAncestors(parent, service, ctx, stats)
+		end
 		syncEntryPlacement(entry, instance, stats, resolvedEntries, ctx)
 		if instance.ClassName ~= entry.className then
 			local oldInstance = instance
@@ -1986,6 +2099,9 @@ local function applyInstanceDeletes(
 		end
 	end
 	for _, instance in ipairs(targets) do
+		if not instance:IsA("PackageLink") then
+			desyncPackageAncestors(instance, service, ctx, stats)
+		end
 		removeInstanceForUndo(instance, ctx)
 		stats.instanceDeleted += 1
 	end
@@ -2062,6 +2178,13 @@ local function applyPropertyChange(
 		stats.noops += 1
 		return
 	end
+	local packagePrepared = false
+	local function prepareMutation()
+		if not packagePrepared then
+			desyncPackageAncestors(instance, service, ctx, stats)
+			packagePrepared = true
+		end
+	end
 
 	local properties = change.properties
 	if type(properties) == "table" then
@@ -2093,10 +2216,32 @@ local function applyPropertyChange(
 				if instance.Name == nextName then
 					stats.noops += 1
 				else
+					prepareMutation()
 					setNameForSync(instance, nextName, ctx)
 					stats.propertyUpdated += 1
 				end
 			elseif propertyName == "Tags" then
+				local desired = {}
+				if type(rawValue) == "table" then
+					for _, tag in pairs(rawValue) do
+						if type(tag) == "string" and tag ~= "" then
+							desired[tag] = true
+						end
+					end
+				end
+				local differs = false
+				for _, tag in ipairs(CollectionService:GetTags(instance)) do
+					if not desired[tag] then
+						differs = true
+					end
+					desired[tag] = nil
+				end
+				if next(desired) then
+					differs = true
+				end
+				if differs then
+					prepareMutation()
+				end
 				applyTags(instance, rawValue, stats, ctx)
 			else
 				if not classHasProperty(instance, propertyName) then
@@ -2116,6 +2261,7 @@ local function applyPropertyChange(
 				if okRead and valuesEqual(current, decoded) then
 					stats.noops += 1
 				else
+					prepareMutation()
 					local okWrite, err = writePropertyForSync(instance, propertyName, decoded, ctx)
 					if not okWrite then
 						if propertyName == "MeshId" and instance:IsA("MeshPart") then
@@ -2127,7 +2273,8 @@ local function applyPropertyChange(
 							local errText = string.lower(tostring(err))
 							if
 								string.find(errText, "read only", 1, true)
-								or string.find(errText, "lacking capability robloxscript", 1, true)
+								or string.find(errText, "lacking capability", 1, true)
+								or string.find(errText, "not accessible", 1, true)
 								or string.find(errText, "not a valid member", 1, true)
 							then
 								recordProtectedWrite(stats, change, "property", propertyName, rawValue)
@@ -2161,6 +2308,7 @@ local function applyPropertyChange(
 			if current == nil then
 				stats.noops += 1
 			else
+				prepareMutation()
 				local okWrite, err = setAttributeForSync(instance, attributeName, nil, ctx)
 				if not okWrite then
 					local errText = string.lower(tostring(err))
@@ -2191,6 +2339,7 @@ local function applyPropertyChange(
 			if valuesEqual(current, decoded) then
 				stats.noops += 1
 			else
+				prepareMutation()
 				local okWrite, err = setAttributeForSync(instance, attributeName, decoded, ctx)
 				if not okWrite then
 					local errText = string.lower(tostring(err))
@@ -2493,7 +2642,11 @@ local function addSnapshotMetadataTarget(targets: { any }, seen: { [Instance]: b
 	end
 end
 
-local function mutationSnapshotLayout(serviceNames: { string }, ctx: { [string]: any })
+local function mutationSnapshotLayout(
+	serviceNames: { string },
+	ctx: { [string]: any },
+	packageSnapshotRoots: { [Instance]: boolean }?
+)
 	local groups = {}
 	local roots = {}
 	local metadataTargets = {}
@@ -2541,7 +2694,9 @@ local function mutationSnapshotLayout(serviceNames: { string }, ctx: { [string]:
 		local children = {}
 		for _, child in ipairs(service:GetChildren()) do
 			local included = includeManagedInstance(ctx, serviceName, child)
-			if not preserved[child] and included then
+			if containsPackageLink(child) and not (packageSnapshotRoots and packageSnapshotRoots[child]) then
+				preserved[child] = true
+			elseif not preserved[child] and included then
 				table.insert(children, child)
 			elseif not included then
 				preserved[child] = true
@@ -2562,6 +2717,47 @@ end
 
 local captureNativeExportFingerprint
 local nativeExportFingerprintMatches
+
+local function serializeSnapshotRoots(roots: { Instance }, nonArchivable: { Instance }, ctx: { [string]: any })
+	local changed = {}
+	if #nonArchivable > 0 then
+		ctx.beginStudioChangeSuppression(0)
+	end
+	local ok, payload = xpcall(function()
+		for _, instance in ipairs(nonArchivable) do
+			if instance.Parent ~= nil and not instance.Archivable then
+				local okWrite, writeError = writePropertyForSync(instance, "Archivable", true, ctx)
+				if not okWrite then
+					error(writeError, 0)
+				end
+				changed[#changed + 1] = instance
+			end
+		end
+		return SerializationService:SerializeInstancesAsync(roots)
+	end, debug.traceback)
+	local restoreError
+	for index = #changed, 1, -1 do
+		local restored, result = pcall(function()
+			local okWrite, writeError = writePropertyForSync(changed[index], "Archivable", false, ctx)
+			if not okWrite then
+				error(writeError, 0)
+			end
+		end)
+		if not restored and restoreError == nil then
+			restoreError = result
+		end
+	end
+	if #nonArchivable > 0 then
+		ctx.endStudioChangeSuppression(0)
+	end
+	if restoreError ~= nil then
+		error(restoreError, 0)
+	end
+	if not ok then
+		error(payload, 0)
+	end
+	return payload
+end
 
 local function captureMutationSnapshot(serviceNames: { string }, params: { [string]: any }, ctx: { [string]: any })
 	local sourceChanges = params.sourceChanges or {}
@@ -2584,10 +2780,20 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 				end
 			end
 		end
+		if not hasStructuralChanges then
+			for _, change in ipairs(params.propertyChanges or {}) do
+				local instance = resolveInstance(change, ctx, true)
+				if instance ~= nil and instance.ClassName ~= tostring(change.className or "") then
+					hasStructuralChanges = true
+					break
+				end
+			end
+		end
 	end
 	local groups, roots, metadataTargets, metadataSeen
 	if hasStructuralChanges then
-		groups, roots, metadataTargets, metadataSeen = mutationSnapshotLayout(serviceNames, ctx)
+		groups, roots, metadataTargets, metadataSeen =
+			mutationSnapshotLayout(serviceNames, ctx, params.packageSnapshotRoots)
 	else
 		groups, roots, metadataTargets, metadataSeen = {}, {}, {}, {}
 	end
@@ -2599,9 +2805,34 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 			generationsByService[serviceName] = ctx.studioChangeGeneration(serviceName)
 		end
 	end
+	local originalByPath = {}
+	local originalRoots = {}
+	local nonArchivable = {}
+	local instanceCount = 0
+	for _, group in ipairs(groups) do
+		for _, child in ipairs(group.target:GetChildren()) do
+			if not group.preserved[child] then
+				table.insert(originalRoots, child)
+				local instances = { child }
+				for _, descendant in ipairs(child:GetDescendants()) do
+					table.insert(instances, descendant)
+				end
+				for _, instance in ipairs(instances) do
+					instanceCount += 1
+					if not instance.Archivable then
+						nonArchivable[#nonArchivable + 1] = instance
+					end
+					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+					if pathSegments ~= nil then
+						originalByPath[pathCacheKey(pathSegments, pathOrdinals)] = instance
+					end
+				end
+			end
+		end
+	end
 	local payload = nil
 	if #roots > 0 then
-		local okSerialize, serialized = pcall(SerializationService.SerializeInstancesAsync, SerializationService, roots)
+		local okSerialize, serialized = pcall(serializeSnapshotRoots, roots, nonArchivable, ctx)
 		if not okSerialize then
 			error("Cannot create an editor rollback snapshot: " .. tostring(serialized))
 		end
@@ -2686,25 +2917,6 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 			tags = CollectionService:GetTags(instance),
 		}
 	end
-	local originalByPath = {}
-	local originalRoots = {}
-	for _, group in ipairs(groups) do
-		for _, child in ipairs(group.target:GetChildren()) do
-			if not group.preserved[child] then
-				table.insert(originalRoots, child)
-				local instances = { child }
-				for _, descendant in ipairs(child:GetDescendants()) do
-					table.insert(instances, descendant)
-				end
-				for _, instance in ipairs(instances) do
-					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
-					if pathSegments ~= nil then
-						originalByPath[pathCacheKey(pathSegments, pathOrdinals)] = instance
-					end
-				end
-			end
-		end
-	end
 	return {
 		groups = groups,
 		payload = payload,
@@ -2715,6 +2927,7 @@ local function captureMutationSnapshot(serviceNames: { string }, params: { [stri
 		unreadablePropertyNames = unreadablePropertyNames,
 		originalByPath = originalByPath,
 		originalRoots = originalRoots,
+		instanceCount = instanceCount,
 		currentCamera = Workspace.CurrentCamera,
 		scriptDocuments = ScriptDocumentState.capture(
 			serviceNames,
@@ -2799,6 +3012,15 @@ local function restoreMutationSnapshot(
 		else {}
 	if #roots ~= snapshot.rootCount then
 		error("Editor rollback snapshot returned an unexpected root count")
+	end
+	local instanceCount = 0
+	for _, root in ipairs(roots) do
+		instanceCount += 1 + #root:GetDescendants()
+	end
+	if instanceCount ~= snapshot.instanceCount then
+		error(
+			`Editor rollback snapshot is incomplete: expected {snapshot.instanceCount} instances, got {instanceCount}`
+		)
 	end
 	local incomingByGroup = {}
 	local rootIndex = 1
@@ -3135,6 +3357,8 @@ function TransactionState.rollback(
 end
 
 local function rollbackTransactionSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
+	finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
+	session.historyRecording = nil
 	if session.mutated ~= true and session.nativeUndo == nil then
 		finishTransactionJournal(session, ctx)
 		session.changeJournal = nil
@@ -3150,6 +3374,51 @@ local function rollbackTransactionSession(session: { [string]: any }, ctx: { [st
 		local replacements = TransactionState.rollback(session, ctx, preservePendingJournalChanges)
 		local records = finishTransactionJournal(session, ctx)
 		replayTransactionJournal(records, replacements, ctx)
+		if session.nativeUndo ~= nil then
+			local stableFrames = 0
+			local firstError
+			for _ = 1, 4 do
+				RunService.Heartbeat:Wait()
+				local stable = true
+				for _, group in ipairs(session.nativeUndo.prepared) do
+					for _, instance in ipairs(group.outgoing) do
+						if instance.Parent ~= group.target then
+							stable = false
+							local restored, restoreError = pcall(setParentForSync, instance, group.target, ctx)
+							if not restored then
+								firstError = firstError or restoreError
+							end
+						end
+					end
+					for _, instance in ipairs(group.retainedLiveRoots or {}) do
+						if instance.Parent ~= group.target then
+							stable = false
+							local restored, restoreError = pcall(setParentForSync, instance, group.target, ctx)
+							if not restored then
+								firstError = firstError or restoreError
+							end
+						end
+					end
+				end
+				if stable then
+					stableFrames += 1
+					if stableFrames == 2 then
+						break
+					end
+				else
+					stableFrames = 0
+				end
+			end
+			if stableFrames < 2 then
+				error(`Editor rollback did not stabilize native roots: {firstError or "roots remained detached"}`)
+			end
+		end
+		for _, originalRoot in ipairs(session.snapshot.originalRoots or {}) do
+			local restoredRoot = resolveReplacement(replacements[originalRoot], replacements)
+			if restoredRoot == nil or restoredRoot.Parent == nil then
+				error(`Editor rollback did not restore {originalRoot.Name}`)
+			end
+		end
 		session.changeJournal = nil
 		return replacements
 	end, debug.traceback)
@@ -3271,42 +3540,10 @@ local function runNativeSerializationJob(session: { [string]: any }, job: { [str
 		return
 	end
 	session.activeSerializations += 1
-	local changed = {}
 	local nonArchivableInstances = job.nonArchivableInstances or NO_INSTANCES
-	if #nonArchivableInstances > 0 then
-		session.ctx.beginStudioChangeSuppression(0)
-	end
 	local ok, payload = xpcall(function()
-		for _, instance in ipairs(nonArchivableInstances) do
-			if instance.Parent ~= nil and not instance.Archivable then
-				local okWrite, writeError = writePropertyForSync(instance, "Archivable", true, session.ctx)
-				if not okWrite then
-					error(writeError, 0)
-				end
-				changed[#changed + 1] = instance
-			end
-		end
-		return SerializationService:SerializeInstancesAsync(job.roots)
+		return serializeSnapshotRoots(job.roots, nonArchivableInstances, session.ctx)
 	end, debug.traceback)
-	local restoreError
-	for index = #changed, 1, -1 do
-		local restored, result = pcall(function()
-			local okWrite, writeError = writePropertyForSync(changed[index], "Archivable", false, session.ctx)
-			if not okWrite then
-				error(writeError, 0)
-			end
-		end)
-		if not restored and restoreError == nil then
-			restoreError = result
-		end
-	end
-	if #nonArchivableInstances > 0 then
-		session.ctx.endStudioChangeSuppression(0)
-	end
-	if restoreError ~= nil then
-		ok = false
-		payload = restoreError
-	end
 	session.activeSerializations -= 1
 	completeNativeSerializationPayload(session, job.payloadKey, ok, payload)
 	if session.snapshotCleanupPending and session.activeSerializations == 0 then
@@ -3575,6 +3812,20 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			includedServices[serviceName] = true
 			serviceNames[index] = serviceName
 		end
+		if params.nativeImport ~= true then
+			local destructiveAreArray = denseArrayLength(params.destructiveServices or {})
+			if not destructiveAreArray then
+				error("Invalid destructive editor transaction services")
+			end
+			for _, serviceName in ipairs(params.destructiveServices or {}) do
+				if
+					not includedServices[serviceName]
+					or game:GetService(serviceName):FindFirstChildWhichIsA("PackageLink", true) ~= nil
+				then
+					error(`A destructive {serviceName} change requires the staged Studio importer`)
+				end
+			end
+		end
 		local changedSourceKeys = {}
 		local changedSourceInstances = {}
 		for _, change in ipairs(params.sourceChanges or {}) do
@@ -3589,13 +3840,53 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		local nativeImport = params.nativeImport == true
-		local snapshot = captureMutationSnapshot(serviceNames, {
-			forceStructural = not nativeImport and params.hasInstanceChanges == true,
-			skipStructural = nativeImport,
+		local nativeImportServices = {}
+		for _, serviceName in ipairs(params.nativeImportServices or {}) do
+			if includedServices[serviceName] then
+				nativeImportServices[serviceName] = true
+			end
+		end
+		local mutationRootsAreArray = denseArrayLength(params.mutationRoots or {})
+		if not mutationRootsAreArray then
+			error("Invalid editor transaction mutation roots")
+		end
+		local packageSnapshotRoots = {}
+		for index, descriptor in ipairs(params.mutationRoots or {}) do
+			local serviceName = tostring(descriptor.service or "")
+			if not includedServices[serviceName] then
+				error("Invalid editor transaction mutation root service")
+			end
+			validateMutationPath(descriptor, serviceName, `Editor transaction mutation root {index}`)
+			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
+			if root ~= nil and root.Parent == game:GetService(serviceName) and containsPackageLink(root) then
+				packageSnapshotRoots[root] = true
+			end
+		end
+		local snapshotServices = {}
+		for _, serviceName in ipairs(serviceNames) do
+			if not nativeImportServices[serviceName] then
+				snapshotServices[#snapshotServices + 1] = serviceName
+			end
+		end
+		local snapshotSourceChanges = {}
+		for _, change in ipairs(params.sourceChanges or {}) do
+			if not nativeImportServices[tostring(change.service or "")] then
+				snapshotSourceChanges[#snapshotSourceChanges + 1] = change
+			end
+		end
+		local snapshotPropertyChanges = {}
+		for _, change in ipairs(params.propertyChanges or {}) do
+			if not nativeImportServices[tostring(change.service or "")] then
+				snapshotPropertyChanges[#snapshotPropertyChanges + 1] = change
+			end
+		end
+		local snapshot = captureMutationSnapshot(snapshotServices, {
+			forceStructural = not nativeImport and params.hasInstanceChanges == true or next(packageSnapshotRoots) ~= nil,
 			captureAllScriptDocuments = nativeImport,
 			instanceChanges = {},
-			sourceChanges = params.sourceChanges or {},
-			propertyChanges = params.propertyChanges or {},
+			sourceChanges = snapshotSourceChanges,
+			propertyChanges = snapshotPropertyChanges,
+			packageSnapshotRoots = packageSnapshotRoots,
 		}, ctx)
 		local session = {
 			transactionId = transactionId,
@@ -3606,6 +3897,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			snapshot = snapshot,
 			mutated = false,
 			nativeImport = nativeImport,
+			nativeImportServices = nativeImportServices,
+			packageSnapshotRoots = packageSnapshotRoots,
+			desyncedPackageLinks = {},
 			postCommitPropertyChanges = params.postCommitPropertyChanges or {},
 			historyRecording = beginHistoryRecording("Sync from filesystem"),
 			journalActive = false,
@@ -3620,8 +3914,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local ok, result = pcall(runWithStudioChangeSuppression, ctx, function()
 				return rollbackTransactionSession(session, ctx)
 			end)
-			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
-			session.historyRecording = nil
 			if not ok then
 				error(result, 0)
 			end
@@ -3631,7 +3923,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return { ok = true, transactionId = transactionId }
 	end
 
-	function api.commitTransaction(params: { [string]: any }): { [string]: any }
+	local function commitTransactionUnsafe(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(editorTransactions)
 		local profile = params.profile == true
 		local timings = {}
@@ -3749,22 +4041,46 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		}
 	end
 
+	function api.commitTransaction(params: { [string]: any }): { [string]: any }
+		local ok, result = xpcall(commitTransactionUnsafe, debug.traceback, params)
+		if ok then
+			return result
+		end
+		local transactionId = tostring(params.transactionId or "")
+		local session = editorTransactions[transactionId]
+		if type(session) == "table" then
+			local rollbackOk, rollbackResult = pcall(runWithStudioChangeSuppression, ctx, function()
+				return rollbackTransactionSession(session, ctx)
+			end)
+			if rollbackOk then
+				session.onExpire = nil
+				editorTransactions[transactionId] = nil
+				for _, serviceName in ipairs(session.serviceNames) do
+					ctx.invalidateService(serviceName)
+				end
+			else
+				armSessionExpiry(editorTransactions, transactionId, session)
+				error(`{result}\nEditor rollback also failed: {rollbackResult}`, 0)
+			end
+		end
+		error(result, 0)
+	end
+
 	function api.rollbackTransaction(params: { [string]: any }): { [string]: any }
 		local transactionId = tostring(params.transactionId or "")
 		local session = editorTransactions[transactionId]
 		if type(session) ~= "table" then
 			return { ok = true, found = false }
 		end
-		session.onExpire = nil
-		editorTransactions[transactionId] = nil
 		local ok, replacements = pcall(runWithStudioChangeSuppression, ctx, function()
 			return rollbackTransactionSession(session, ctx)
 		end)
-		finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
-		session.historyRecording = nil
 		if not ok then
+			armSessionExpiry(editorTransactions, transactionId, session)
 			error(replacements, 0)
 		end
+		session.onExpire = nil
+		editorTransactions[transactionId] = nil
 		for _, serviceName in ipairs(session.serviceNames) do
 			ctx.invalidateService(serviceName)
 		end
@@ -4761,7 +5077,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						error("Native import root path is invalid")
 					end
 					instance.Name = originalName
-					instance.Parent = nil
+					setParentForSync(instance, nil, ctx)
 					local protectedCamera = group.target == Workspace
 						and instance:IsA("Camera")
 						and (
@@ -5065,6 +5381,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local previousMeshPartApplyCount = ctx.meshPartApplyCount
 		local previousUnreadablePropertyNames = ctx.unreadablePropertyNames
 		local previousResolveStagedPath = ctx.resolveStagedPath
+		local previousEditorTransaction = ctx.editorTransaction
 		local explorerSelection = captureExplorerSelection()
 		local selectionReplacements = {}
 		ctx.resolveCache = {}
@@ -5075,6 +5392,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.readyMeshPartSources = nil
 		ctx.meshPartApplyCount = 0
 		ctx.resolveStagedPath = if outerTransaction ~= nil then outerTransaction.resolveStagedPath else nil
+		ctx.editorTransaction = outerTransaction
 		local activeSnapshot = if outerTransaction ~= nil then outerTransaction.snapshot else transactionSnapshot
 		ctx.unreadablePropertyNames = if activeSnapshot ~= nil then activeSnapshot.unreadablePropertyNames else nil
 		local historyRecording = if outerTransaction ~= nil
@@ -5157,6 +5475,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					stats.ok = false
 					stats.errors += 1
+					stats.error = tostring(err)
 					warn("[Renium] editor instance sync failed: " .. tostring(err))
 					aborted = true
 					break
@@ -5180,6 +5499,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if not ok then
 					stats.ok = false
 					stats.errors += 1
+					stats.error = tostring(err)
 					warn("[Renium] editor source sync failed: " .. tostring(err))
 					aborted = true
 					break
@@ -5199,6 +5519,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if not ok then
 				stats.ok = false
 				stats.errors += 1
+				stats.error = tostring(err)
 				warn("[Renium] editor reference sync failed: " .. tostring(err))
 				aborted = true
 			end
@@ -5250,6 +5571,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					if not ok then
 						stats.ok = false
 						stats.errors += 1
+						stats.error = tostring(err)
 						warn("[Renium] editor property sync failed: " .. tostring(err))
 						aborted = true
 						break
@@ -5346,6 +5668,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.meshPartApplyCount = previousMeshPartApplyCount
 		ctx.unreadablePropertyNames = previousUnreadablePropertyNames
 		ctx.resolveStagedPath = previousResolveStagedPath
+		ctx.editorTransaction = previousEditorTransaction
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
 		ctx.stats.lastAtUnix = os.time()
@@ -5386,8 +5709,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if not okRollback then
 				warn("[Renium] transaction cleanup failed: " .. tostring(rollbackError))
 			end
-			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
-			session.historyRecording = nil
 		end
 		local activeReconciles = {}
 		for _, session in pairs(reconcileSessions) do

@@ -28,6 +28,7 @@ use crate::editor::paths::{
 use crate::project::commands::load_structural_project;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
+use crate::rbx::encode::rbx_serialized_property_name_for_logical;
 use crate::roblox::services::{
     DEFAULT_SYNC_SERVICES, EXTRA_EXPLORER_SERVICES, explorer_service_order,
 };
@@ -380,6 +381,30 @@ fn requested_property_field(fields: Option<&HashSet<String>>, key: &str) -> bool
     })
 }
 
+fn requested_property_field_for_class(
+    fields: Option<&HashSet<String>>,
+    class_name: &str,
+    key: &str,
+) -> bool {
+    if requested_property_field(fields, key) {
+        return true;
+    }
+    let Some(fields) = fields else {
+        return false;
+    };
+    let Ok(database) = rbx_reflection_database::get() else {
+        return false;
+    };
+    fields.iter().any(|field| {
+        let requested = ["p:", "prop:", "property:"]
+            .iter()
+            .find_map(|prefix| field.strip_prefix(prefix))
+            .unwrap_or(field);
+        rbx_serialized_property_name_for_logical(database, class_name, requested)
+            .is_some_and(|name| name.eq_ignore_ascii_case(key))
+    })
+}
+
 fn requested_attribute_field(fields: Option<&HashSet<String>>, key: &str) -> bool {
     fields.is_some_and(|fields| {
         fields.iter().any(|field| {
@@ -419,6 +444,7 @@ fn filtered_record(
     fields: Option<&HashSet<String>>,
     include_all: bool,
     attribute_record: bool,
+    class_name: Option<&str>,
 ) -> Option<Value> {
     if include_all {
         return Some(Value::Object(record.clone()));
@@ -438,7 +464,9 @@ fn filtered_record(
             if attribute_record {
                 requested_attribute_field(Some(fields), name)
             } else {
-                requested_property_field(Some(fields), name)
+                class_name.is_some_and(|class_name| {
+                    requested_property_field_for_class(Some(fields), class_name, name)
+                })
             }
         })
         .map(|(name, value)| (name.clone(), value.clone()))
@@ -958,6 +986,7 @@ impl BytecodeNodeProjection<'_> {
             self.fields,
             matches!(self.mode, OutputMode::Full),
             false,
+            Some(&instance.class_name),
         );
         if requested_property_field(self.fields, "Source")
             && let Some(Some(source_path)) = self.source_paths_by_index.get(index)
@@ -989,6 +1018,7 @@ impl BytecodeNodeProjection<'_> {
             self.fields,
             matches!(self.mode, OutputMode::Full),
             true,
+            None,
         );
         if let Some(Value::Object(attributes)) = attributes.as_mut() {
             super::stabilize_reference_output(

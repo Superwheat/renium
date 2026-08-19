@@ -377,6 +377,50 @@ pub(crate) fn rbx_model_property_descriptor<'db>(
     rbx_serialized_property_descriptor(class, property)
 }
 
+pub(crate) fn rbx_serialized_property_name_for_logical<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+    property_name: &str,
+) -> Option<&'db str> {
+    let class_descriptor = database.classes.get(class_name)?;
+    let (class, property) = database
+        .superclasses_iter(class_descriptor)
+        .find_map(|class| {
+            class
+                .properties
+                .get(property_name)
+                .or_else(|| {
+                    class
+                        .properties
+                        .values()
+                        .find(|property| property.name.eq_ignore_ascii_case(property_name))
+                })
+                .map(|property| (class, property))
+        })?;
+    fn serialized_name<'db>(
+        class: &'db RbxClassDescriptor<'db>,
+        property: &'db RbxPropertyDescriptor<'db>,
+    ) -> Option<&'db str> {
+        match &property.kind {
+            RbxPropertyKind::Canonical { serialization } => match serialization {
+                RbxPropertySerialization::Serializes => Some(property.name),
+                RbxPropertySerialization::SerializesAs(name) => Some(name),
+                RbxPropertySerialization::Migrate(migration) => {
+                    let names = migration.new_property_names();
+                    (names.len() == 1).then(|| names[0])
+                }
+                _ => None,
+            },
+            RbxPropertyKind::Alias { alias_for } => class
+                .properties
+                .get(*alias_for)
+                .and_then(|canonical| serialized_name(class, canonical)),
+            _ => None,
+        }
+    }
+    serialized_name(class, property)
+}
+
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn rbx_canonical_property_descriptor_for_serialized_name<'db>(
     database: &'db ReflectionDatabase<'db>,

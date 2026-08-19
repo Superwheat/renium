@@ -13,7 +13,7 @@ pub(crate) mod edit;
 pub(crate) mod explorer;
 pub(crate) mod query;
 
-use crate::app::output::{OutputMode, print_json_output};
+use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
 use crate::bytecode::edit::bytecode_service_name;
 use crate::bytecode::explorer::{
@@ -42,7 +42,10 @@ use crate::project::config;
 use crate::project::layout::configured_project_layout;
 use crate::project::package_links::{LinkEnforcement, build_loaded_project_link_enforcement};
 use crate::rbx::decode::rbx_variant_to_settings_json;
-use crate::rbx::encode::{rbx_model_property_descriptor, rbx_property_descriptor};
+use crate::rbx::encode::{
+    rbx_model_property_descriptor, rbx_property_descriptor,
+    rbx_serialized_property_name_for_logical,
+};
 use crate::rbx::model::{
     BytecodeModelImportRefs, canonicalize_settings_reference_documents,
     source_structure_settings_document,
@@ -185,6 +188,31 @@ fn validate_auto_property_name(
     }
     bail!(
         "Property {property:?} does not exist on {class_name}; use --scope property only for an unlisted Roblox property"
+    )
+}
+
+fn canonical_stored_property_name(
+    document: &SettingsBytecode,
+    index: usize,
+    property: &str,
+    scope: PropertyScope,
+) -> Result<Option<String>> {
+    if !matches!(scope, PropertyScope::Auto | PropertyScope::Property)
+        || property.eq_ignore_ascii_case("source")
+    {
+        return Ok(None);
+    }
+    let instance = &document.instances[index];
+    if instance.properties.contains_key(property)
+        || (scope == PropertyScope::Auto && instance.attributes.contains_key(property))
+    {
+        return Ok(None);
+    }
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    Ok(
+        rbx_serialized_property_name_for_logical(database, &instance.class_name, property)
+            .map(str::to_string)
+            .filter(|name| name != property),
     )
 }
 
@@ -698,7 +726,8 @@ fn high_level_print_ambiguity(
         "matches",
         Value::Array(high_level_ambiguity_nodes(ctx, indices, mode)),
     );
-    print_json_output(&Value::Object(response), pretty)
+    print_json_output(&Value::Object(response), pretty)?;
+    Err(ReportedFailure.into())
 }
 
 fn high_level_resolve_path_candidates(
@@ -1100,9 +1129,15 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
             return print_json_output(&json!(source), args.pretty);
         }
     }
-    if let Some(value) =
-        instance_api::get_instance_property(&document, index, &args.property, scope)
-    {
+    let canonical_property =
+        canonical_stored_property_name(&document, index, &args.property, scope)?;
+    let value = instance_api::get_instance_property(&document, index, &args.property, scope)
+        .or_else(|| {
+            canonical_property.as_deref().and_then(|property| {
+                instance_api::get_instance_property(&document, index, property, scope)
+            })
+        });
+    if let Some(value) = value {
         let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
         let fallback_settings_ids;
         let canonical_settings_ids = if let Some(settings_ids) = canonical_settings_ids.as_ref() {
@@ -1200,6 +1235,9 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     )?;
     let index = resolved.index;
     validate_auto_property_name(&document, index, &args.property, scope)?;
+    let canonical_property =
+        canonical_stored_property_name(&document, index, &args.property, scope)?;
+    let property = canonical_property.as_deref().unwrap_or(&args.property);
     if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
         && matches!(args.property.as_str(), "ClassName" | "Parent")
         && is_protected_starter_player_container(&document, index)
@@ -1228,12 +1266,12 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             args.pretty,
         );
     }
-    let affects_source_path = property_affects_source_path(scope, &args.property);
+    let affects_source_path = property_affects_source_path(scope, property);
     let before_document = affects_source_path.then(|| document.clone());
     let source_paths_before = before_document
         .as_ref()
         .map(|document| build_editor_source_paths_by_index(document, &service, service_dir));
-    instance_api::set_instance_property(&mut document, index, &args.property, value, scope)?;
+    instance_api::set_instance_property(&mut document, index, property, value, scope)?;
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     if let (Some(before_document), Some(source_paths_before)) =
@@ -1281,9 +1319,12 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     let mut result = json!({
         "ok": true,
         "settingsFile": settings_file,
-        "property": args.property,
+        "property": property,
         "changedPaths": changed_paths,
     });
+    if canonical_property.is_some() {
+        result["requestedProperty"] = json!(args.property);
+    }
     if structural_reference_update {
         let instance = &document.instances[index];
         let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);

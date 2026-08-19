@@ -50,6 +50,7 @@ fn console_daemon_parameters(
         "fromOldest": from_oldest,
         "clear": clear,
         "client": args.client,
+        "server": args.server,
         "player": args.player,
         "grep": args.grep,
         "level": args.level,
@@ -62,7 +63,7 @@ pub(crate) fn get_console_output_result(
     args: &PluginConsoleOutputArgs,
     bridge: &BridgeServer,
 ) -> Result<Value> {
-    let client = args.client || args.player.is_some();
+    let client = !args.server && (args.client || args.player.is_some());
     let target = BridgeTarget::main_or_client(client);
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
@@ -143,6 +144,7 @@ fn follow_console_with_bridge(args: &PluginConsoleOutputArgs, bridge: &BridgeSer
             from_oldest: args.from_oldest || from_oldest,
             clear: clear_pending,
             client: args.client,
+            server: args.server,
             player: args.player.clone(),
             follow: false,
             grep: args.grep.clone(),

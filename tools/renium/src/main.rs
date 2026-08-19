@@ -78,6 +78,12 @@ fn main() -> ExitCode {
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if error
+                .downcast_ref::<app::output::ReportedFailure>()
+                .is_some()
+            {
+                return ExitCode::FAILURE;
+            }
             if app::output::global_json_output() {
                 eprintln!(
                     "{}",

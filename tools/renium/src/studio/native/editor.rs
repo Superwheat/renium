@@ -2339,38 +2339,46 @@ pub(crate) fn send_editor_change_batches(
         }
     }
 
+    let source_changes = changes
+        .source_changes
+        .iter()
+        .filter(|change| {
+            !binary_import.is_some_and(|import| import.imports_service(&change.service))
+        })
+        .collect::<Vec<_>>();
     summary.insert(
         "sourceSent".to_string(),
-        Value::Number(serde_json::Number::from(changes.source_changes.len() as u64)),
+        Value::Number(serde_json::Number::from(source_changes.len() as u64)),
     );
-    if binary_import.is_none() {
-        for source_batch in changes.source_changes.chunks(SOURCE_BATCH_SIZE) {
-            let result = bridge.call(
-                "applyEditorChanges",
-                json!({
-                    "probeEvents": probe_events,
-                    "instanceChanges": [],
-                    "sourceChanges": source_batch,
-                    "propertyChanges": [],
-                    "transactionId": transaction_id,
-                }),
-            )?;
-            merge_editor_summary_checked(&mut summary, &result)?;
-        }
+    for source_batch in source_changes.chunks(SOURCE_BATCH_SIZE) {
+        let result = bridge.call(
+            "applyEditorChanges",
+            json!({
+                "probeEvents": probe_events,
+                "instanceChanges": [],
+                "sourceChanges": source_batch,
+                "propertyChanges": [],
+                "transactionId": transaction_id,
+            }),
+        )?;
+        merge_editor_summary_checked(&mut summary, &result)?;
     }
 
     let mut property_changes = Vec::new();
     for change in &changes.property_changes {
-        if binary_import.is_some_and(|import| {
-            import.retains_path(
-                &change.service,
-                &change.path_segments,
-                &change.path_ordinals,
-            )
-        }) {
+        let imported = binary_import.is_some_and(|import| import.imports_service(&change.service));
+        if imported
+            && binary_import.is_some_and(|import| {
+                import.retains_path(
+                    &change.service,
+                    &change.path_segments,
+                    &change.path_ordinals,
+                )
+            })
+        {
             continue;
         }
-        let send_all = binary_import.is_none() || property_change_needs_post_native_apply(change);
+        let send_all = !imported || property_change_needs_post_native_apply(change);
         if send_all {
             property_changes.push(change.clone());
             continue;
@@ -2481,6 +2489,9 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
     merge_editor_summary(summary, result);
     let errors = result.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if result.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            bail!("Studio rejected or failed an editor push batch: {error}");
+        }
         bail!("Studio rejected or failed an editor push batch");
     }
     Ok(())

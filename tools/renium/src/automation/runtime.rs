@@ -18,9 +18,7 @@ use crate::cli::{
     BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, ExportSnapshotsArgs,
     ProjectSourceArgs, PushEditorChangesArgs,
 };
-use crate::daemon::transport::{
-    BoundedLineRead, DAEMON_CONTROL_QUEUE_TIMEOUT, MAX_DAEMON_LINE_BYTES, read_bounded_line,
-};
+use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::editor::review::studio_pid_for_bridge;
 use crate::editor::sync::{
@@ -1068,12 +1066,8 @@ fn automation_response(
     let result = if automation::opcode_by_id(request.op).is_ok_and(|operation| !operation.queued) {
         automation_execute_request(&request, state, bridge, bridge_wait_seconds)
     } else {
-        bridge
-            .acquire_request_gate(DAEMON_CONTROL_QUEUE_TIMEOUT)
-            .map_err(automation_failure)
-            .and_then(|_guard| {
-                automation_execute_request(&request, state, bridge, bridge_wait_seconds)
-            })
+        let _guard = bridge.acquire_request_gate();
+        automation_execute_request(&request, state, bridge, bridge_wait_seconds)
     };
     match result {
         Ok(result) => automation::Response::success(request.id, started, result),

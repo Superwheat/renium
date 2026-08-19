@@ -87,6 +87,16 @@ pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
     platform::recover_stalled_window_for_pid(pid)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+pub fn close_device_emulator_toolbar(pid: u32) -> Result<bool> {
+    platform::close_device_emulator_toolbar(pid)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn close_device_emulator_toolbar_when_visible(pid: u32) -> Result<bool> {
+    platform::close_device_emulator_toolbar_when_visible(pid)
+}
+
 #[cfg(windows)]
 pub fn watch_auto_recovery_dialogs() {
     platform::watch_auto_recovery_dialogs();
@@ -317,6 +327,16 @@ mod platform {
     use super::{StudioWindow, ThreadDpiAwareness, windows_shield};
     use anyhow::{Context, Result, bail};
 
+    use windows::Win32::Foundation::{HWND as AutomationHwnd, RPC_E_CHANGED_MODE};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
+        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_InvokePatternId,
+    };
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::System::Threading::{
@@ -350,6 +370,8 @@ mod platform {
         verified_frame: Option<(u32, u32, Vec<u8>)>,
         offset_x: i32,
         offset_y: i32,
+        scale_x: f64,
+        scale_y: f64,
     }
 
     pub type InputShield = windows_shield::InputShield;
@@ -658,6 +680,8 @@ mod platform {
                 "No Studio child window matches the client viewport {viewport_width}x{viewport_height}"
             )
         }
+        let (render_width, render_height) =
+            client_size(state.render as HWND).context("Studio viewport size is unavailable")?;
         Ok(WindowHandle {
             viewport: state.render,
             capture: state.render,
@@ -665,6 +689,8 @@ mod platform {
             verified_frame: None,
             offset_x: 0,
             offset_y: 0,
+            scale_x: render_width as f64 / viewport_width as f64,
+            scale_y: render_height as f64 / viewport_height as f64,
         })
     }
 
@@ -898,23 +924,6 @@ mod platform {
             })
     }
 
-    fn probe_frames_equivalent(a: &[u8], b: &[u8]) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        let different = a
-            .chunks_exact(4)
-            .zip(b.chunks_exact(4))
-            .filter(|(x, y)| {
-                x[0].abs_diff(y[0])
-                    .max(x[1].abs_diff(y[1]))
-                    .max(x[2].abs_diff(y[2]))
-                    > 2
-            })
-            .count();
-        different * 10_000 <= a.len() / 4
-    }
-
     fn windows_for_pid(pid: u32) -> Vec<(isize, u32, String)> {
         let mut state = EnumTopState {
             pids: vec![pid],
@@ -957,19 +966,125 @@ mod platform {
     }
 
     pub fn studio_window_title(pid: u32) -> Result<String> {
-        let windows = windows_for_pid(pid);
-        windows
-            .iter()
+        main_studio_window(pid).map(|(_, _, title)| title)
+    }
+
+    fn main_studio_window(pid: u32) -> Result<(isize, u32, String)> {
+        windows_for_pid(pid)
+            .into_iter()
             .find(|(hwnd, _, title)| {
                 window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
             })
             .or_else(|| {
-                windows
-                    .iter()
+                windows_for_pid(pid)
+                    .into_iter()
                     .find(|(hwnd, _, _)| window_class(*hwnd).starts_with("Qt"))
             })
-            .map(|(_, _, title)| title.clone())
             .with_context(|| format!("No Studio window found for process {pid}"))
+    }
+
+    struct ComGuard(bool);
+
+    impl ComGuard {
+        fn initialize() -> Result<Self> {
+            // SAFETY: this initializes COM for the current thread with no reserved pointer.
+            let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            if result.is_err() && result != RPC_E_CHANGED_MODE {
+                result
+                    .ok()
+                    .context("Could not initialize Windows UI Automation")?;
+            }
+            Ok(Self(result.is_ok()))
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: this thread successfully initialized COM in ComGuard::initialize.
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    fn device_emulator_close_button(
+        automation: &IUIAutomation,
+        top: isize,
+    ) -> Result<Option<IUIAutomationElement>> {
+        let root =
+            unsafe { automation.ElementFromHandle(AutomationHwnd(top as *mut core::ffi::c_void)) }
+                .context("Could not inspect the Studio window")?;
+        let device_list_condition = unsafe {
+            automation
+                .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("DeviceList"))
+        }
+        .context("Could not create the device toolbar query")?;
+        let Ok(device_list) =
+            (unsafe { root.FindFirst(TreeScope_Descendants, &device_list_condition) })
+        else {
+            return Ok(None);
+        };
+        let walker = unsafe { automation.ControlViewWalker() }
+            .context("Could not inspect the device toolbar")?;
+        let toolbar = unsafe { walker.GetParentElement(&device_list) }
+            .context("Could not locate the device toolbar")?;
+        let Ok(mut child) = (unsafe { walker.GetFirstChildElement(&toolbar) }) else {
+            return Ok(None);
+        };
+        loop {
+            if unsafe { child.CurrentAutomationId() }.is_ok_and(|id| id == "CloseButton") {
+                return Ok(Some(child));
+            }
+            let Ok(next) = (unsafe { walker.GetNextSiblingElement(&child) }) else {
+                break;
+            };
+            child = next;
+        }
+        Ok(None)
+    }
+
+    fn device_emulator_toolbar(pid: u32, close: bool) -> Result<bool> {
+        let (top, _, _) = main_studio_window(pid)?;
+        let _com = ComGuard::initialize()?;
+        // SAFETY: COM is initialized for this thread and CUIAutomation is an in-process COM class.
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .context("Could not start Windows UI Automation")?;
+        let Some(button) = device_emulator_close_button(&automation, top)? else {
+            return Ok(false);
+        };
+        if !close {
+            return Ok(true);
+        }
+        // SAFETY: the queried element advertises the Invoke pattern for its close action.
+        let invoke: IUIAutomationInvokePattern =
+            unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
+                .context("The device emulator close button is not invokable")?;
+        // SAFETY: invoking the accessibility action is equivalent to pressing the visible button.
+        unsafe { invoke.Invoke() }.context("Could not close the device emulator toolbar")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if device_emulator_close_button(&automation, top)?.is_none() {
+                return Ok(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        bail!("Studio did not close the device emulator toolbar");
+    }
+
+    pub fn close_device_emulator_toolbar(pid: u32) -> Result<bool> {
+        device_emulator_toolbar(pid, true)
+    }
+
+    pub fn close_device_emulator_toolbar_when_visible(pid: u32) -> Result<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if device_emulator_toolbar(pid, false)? {
+                return close_device_emulator_toolbar(pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(false)
     }
 
     fn restore_window_at_bottom(hwnd: isize) -> Result<()> {
@@ -993,12 +1108,7 @@ mod platform {
     }
 
     pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
-        let (hwnd, _, _) = windows_for_pid(pid)
-            .into_iter()
-            .find(|(hwnd, _, title)| {
-                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
-            })
-            .with_context(|| format!("No Studio window found for process {pid}"))?;
+        let (hwnd, _, _) = main_studio_window(pid)?;
         if unsafe { IsIconic(hwnd as HWND) } != 0 {
             restore_window_at_bottom(hwnd)?;
         }
@@ -1056,12 +1166,7 @@ mod platform {
     where
         F: FnMut(u8, &[u32]) -> Result<()>,
     {
-        let (hwnd, pid, title) = windows_for_pid(pid)
-            .into_iter()
-            .find(|(hwnd, _, title)| {
-                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
-            })
-            .with_context(|| format!("No visible Studio window found for process {pid}"))?;
+        let (hwnd, pid, title) = main_studio_window(pid)?;
         if unsafe { IsIconic(hwnd as HWND) } != 0 {
             restore_window_at_bottom(hwnd)?;
             std::thread::sleep(std::time::Duration::from_millis(400));
@@ -1122,22 +1227,10 @@ mod platform {
                 .map(|frame| frame.candidate)
                 .collect::<Vec<_>>(),
         );
-        let composite_hosts = baseline
+        let leaves = baseline
             .iter()
             .filter(|host| {
-                baseline.iter().any(|child| {
-                    child.candidate.hwnd != host.candidate.hwnd
-                        && unsafe {
-                            IsChild(host.candidate.hwnd as HWND, child.candidate.hwnd as HWND)
-                        } != 0
-                        && probe_frames_equivalent(&host.pixels, &child.pixels)
-                })
-            })
-            .collect::<Vec<_>>();
-        let leaves = composite_hosts
-            .iter()
-            .filter(|host| {
-                !composite_hosts.iter().any(|other| {
+                !baseline.iter().any(|other| {
                     other.candidate.hwnd != host.candidate.hwnd
                         && unsafe {
                             IsChild(host.candidate.hwnd as HWND, other.candidate.hwnd as HWND)
@@ -1146,9 +1239,7 @@ mod platform {
             })
             .collect::<Vec<_>>();
         if leaves.len() != 1 || leaves[0].candidate.hwnd == hwnd {
-            bail!(
-                "Studio exposed no unique probe-free composited viewport host; refusing to guess"
-            );
+            bail!("Studio exposed no unique probe-verified viewport child; refusing to guess");
         }
         let root = leaves[0];
         let candidate = root.candidate;
@@ -1163,6 +1254,8 @@ mod platform {
             )),
             offset_x: 0,
             offset_y: 0,
+            scale_x: 1.0,
+            scale_y: 1.0,
         };
         Ok(StudioWindow {
             label: format!("verified viewport for pid {pid}: {title}"),
@@ -1170,14 +1263,21 @@ mod platform {
         })
     }
 
+    fn mouse_position(handle: &WindowHandle, x: i32, y: i32) -> (i32, i32) {
+        (
+            (x as f64 * handle.scale_x).round() as i32 + handle.offset_x,
+            (y as f64 * handle.scale_y).round() as i32 + handle.offset_y,
+        )
+    }
+
     fn mouse_lparam(handle: &WindowHandle, x: i32, y: i32) -> LPARAM {
-        let x = x + handle.offset_x;
-        let y = y + handle.offset_y;
+        let (x, y) = mouse_position(handle, x, y);
         (((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32 as LPARAM
     }
 
     fn send(hwnd: isize, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
         ensure_input_unblocked(hwnd)?;
+        let _yield = windows_shield::yield_mouse(hwnd, msg);
         let mut result = 0;
         let ok = unsafe {
             SendMessageTimeoutW(
@@ -1217,10 +1317,8 @@ mod platform {
     }
 
     pub fn post_mouse_scroll(handle: &WindowHandle, x: i32, y: i32, delta: i32) -> Result<()> {
-        let mut point = POINT {
-            x: x + handle.offset_x,
-            y: y + handle.offset_y,
-        };
+        let (x, y) = mouse_position(handle, x, y);
+        let mut point = POINT { x, y };
         if unsafe { ClientToScreen(handle.viewport as HWND, &raw mut point) } == 0 {
             bail!("ClientToScreen failed for the target Studio window");
         }
@@ -1238,25 +1336,40 @@ mod platform {
         hold_ms: u64,
     ) -> Result<()> {
         let hold = std::time::Duration::from_millis(hold_ms.clamp(10, 2000));
-        send(handle.viewport, WM_MOUSEMOVE, 0, mouse_lparam(handle, x, y))?;
-        let (down, up, state) = if right {
-            (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON)
-        } else {
-            (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON)
-        };
-        send(handle.viewport, down, state, mouse_lparam(handle, x, y))?;
+        post_mouse_move(handle, x, y)?;
+        post_mouse_button(handle, x, y, right, true)?;
         std::thread::sleep(hold);
-        send(handle.viewport, up, 0, mouse_lparam(handle, x, y))
+        post_mouse_button(handle, x, y, right, false)
     }
 
     pub fn post_key_state(handle: &WindowHandle, key: &super::KeySpec, down: bool) -> Result<()> {
         let vk = key.platform_code as usize;
         let scan = unsafe { MapVirtualKeyW(key.platform_code as u32, MAPVK_VK_TO_VSC) } as usize;
-        let state = if down {
+        let mut state = if down {
             1usize
         } else {
             1usize | (1 << 30) | (1 << 31)
         };
+        if matches!(
+            key.platform_code,
+            0x21 | 0x22
+                | 0x23
+                | 0x24
+                | 0x25
+                | 0x26
+                | 0x27
+                | 0x28
+                | 0x2C
+                | 0x2D
+                | 0x2E
+                | 0x5B
+                | 0x5C
+                | 0x90
+                | 0xA3
+                | 0xA5
+        ) {
+            state |= 1 << 24;
+        }
         let message = if down { WM_KEYDOWN } else { WM_KEYUP };
         send(
             handle.viewport,
@@ -1309,7 +1422,7 @@ mod platform {
     type CFStringRef = *const c_void;
     type CFNumberRef = *const c_void;
     type CGEventRef = *mut c_void;
-
+    type AXUIElementRef = *const c_void;
     #[repr(C)]
 
     struct CGPoint {
@@ -1337,7 +1450,6 @@ mod platform {
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
     const K_CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
-
     const EVENT_MOUSE_MOVED: u32 = 5;
     const EVENT_LEFT_DOWN: u32 = 1;
     const EVENT_LEFT_UP: u32 = 2;
@@ -1438,7 +1550,20 @@ mod platform {
             encoding: u32,
         ) -> bool;
         fn CFNumberGetValue(number: CFNumberRef, number_type: isize, value: *mut c_void) -> bool;
+        fn CFRetain(value: CFTypeRef) -> CFTypeRef;
         fn CFRelease(value: CFTypeRef);
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+        fn AXUIElementCopyAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> i32;
+        fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
     }
 
     pub struct WindowHandle {
@@ -1504,6 +1629,147 @@ mod platform {
             .position(|&byte| byte == 0)
             .unwrap_or(bytes.len());
         Some(String::from_utf8_lossy(&bytes[..length]).into_owned())
+    }
+
+    fn ax_attribute(element: AXUIElementRef, name: &str) -> Option<CFTypeRef> {
+        let attribute = cf_string(name);
+        let mut value = std::ptr::null();
+        // SAFETY: element is a retained accessibility element and attribute is a valid CFString.
+        let result = unsafe { AXUIElementCopyAttributeValue(element, attribute, &raw mut value) };
+        // SAFETY: cf_string returned an owned Core Foundation object.
+        unsafe { CFRelease(attribute) };
+        (result == 0 && !value.is_null()).then_some(value)
+    }
+
+    fn ax_identifier(element: AXUIElementRef) -> Option<String> {
+        let value = ax_attribute(element, "AXIdentifier")?;
+        let identifier = cf_string_value(value);
+        // SAFETY: AXUIElementCopyAttributeValue returned an owned Core Foundation object.
+        unsafe { CFRelease(value) };
+        identifier
+    }
+
+    fn find_ax_identifier(
+        element: AXUIElementRef,
+        target: &str,
+        depth: usize,
+    ) -> Option<AXUIElementRef> {
+        if ax_identifier(element).as_deref() == Some(target) {
+            // SAFETY: element remains valid while retained for the caller.
+            return Some(unsafe { CFRetain(element) });
+        }
+        if depth == 0 {
+            return None;
+        }
+        let children = ax_attribute(element, "AXChildren")? as CFArrayRef;
+        // SAFETY: AXChildren is an owned CFArray whose entries remain valid while it is retained.
+        let count = unsafe { CFArrayGetCount(children) };
+        for index in 0..count {
+            // SAFETY: index is within the CFArray count read above.
+            let child = unsafe { CFArrayGetValueAtIndex(children, index) };
+            if let Some(found) = find_ax_identifier(child, target, depth - 1) {
+                // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+                unsafe { CFRelease(children) };
+                return Some(found);
+            }
+        }
+        // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+        unsafe { CFRelease(children) };
+        None
+    }
+
+    fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {
+        // SAFETY: this read-only system query has no preconditions.
+        if !unsafe { AXIsProcessTrusted() } {
+            bail!("Renium needs macOS Accessibility permission to inspect Studio controls");
+        }
+        // SAFETY: pid belongs to the connected Studio process.
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            bail!("Could not inspect the Studio accessibility tree");
+        }
+        let device_list = find_ax_identifier(application, "DeviceList", 32);
+        Ok((application, device_list))
+    }
+
+    fn device_emulator_toolbar_open(pid: u32) -> Result<bool> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        let (application, device_list) = device_emulator_elements(pid)?;
+        if let Some(element) = device_list {
+            // SAFETY: find_ax_identifier returned a retained accessibility element.
+            unsafe { CFRelease(element) };
+        }
+        // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+        unsafe { CFRelease(application) };
+        Ok(device_list.is_some())
+    }
+
+    pub fn close_device_emulator_toolbar(pid: u32) -> Result<bool> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        let (application, device_list) = device_emulator_elements(pid)?;
+        let Some(device_list) = device_list else {
+            // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+            unsafe { CFRelease(application) };
+            return Ok(false);
+        };
+        let mut ancestor = ax_attribute(device_list, "AXParent");
+        // SAFETY: find_ax_identifier returned a retained accessibility element.
+        unsafe { CFRelease(device_list) };
+        let mut close_button = None;
+        for _ in 0..4 {
+            let Some(current) = ancestor.take() else {
+                break;
+            };
+            close_button = find_ax_identifier(current, "CloseButton", 12);
+            if close_button.is_none() {
+                ancestor = ax_attribute(current, "AXParent");
+            }
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned accessibility element.
+            unsafe { CFRelease(current) };
+            if close_button.is_some() {
+                break;
+            }
+        }
+        if let Some(ancestor) = ancestor {
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned accessibility element.
+            unsafe { CFRelease(ancestor) };
+        }
+        let Some(close_button) = close_button else {
+            // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+            unsafe { CFRelease(application) };
+            bail!("Studio exposed a device emulator toolbar without its close button");
+        };
+        let action = cf_string("AXPress");
+        // SAFETY: close_button and action are valid retained accessibility objects.
+        let result = unsafe { AXUIElementPerformAction(close_button, action) };
+        // SAFETY: these Core Foundation objects are owned by this function.
+        unsafe {
+            CFRelease(action);
+            CFRelease(close_button);
+            CFRelease(application);
+        }
+        if result != 0 {
+            bail!("Could not close the device emulator toolbar (AXError {result})");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if !device_emulator_toolbar_open(pid as u32)? {
+                return Ok(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        bail!("Studio did not close the device emulator toolbar");
+    }
+
+    pub fn close_device_emulator_toolbar_when_visible(pid: u32) -> Result<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if device_emulator_toolbar_open(pid)? {
+                return close_device_emulator_toolbar(pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(false)
     }
 
     fn cf_rect(value: CFTypeRef) -> Option<CGRect> {
@@ -1720,8 +1986,7 @@ mod platform {
         post_mouse_move(handle, x, y)?;
         post_mouse_button(handle, x, y, right, true)?;
         std::thread::sleep(hold);
-        post_mouse_button(handle, x, y, right, false)?;
-        Ok(())
+        post_mouse_button(handle, x, y, right, false)
     }
 
     pub fn post_key_state(handle: &WindowHandle, key: &super::KeySpec, down: bool) -> Result<()> {

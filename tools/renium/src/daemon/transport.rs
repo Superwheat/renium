@@ -12,7 +12,6 @@ pub(crate) const MAX_DAEMON_CONTROL_CONNECTIONS: usize = 16;
 pub(crate) const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const DAEMON_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-pub(crate) const DAEMON_CONTROL_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const DAEMON_DISCOVERY_MAX_AGE_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS: u128 = 5 * 60 * 1000;
 

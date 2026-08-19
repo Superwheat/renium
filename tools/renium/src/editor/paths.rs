@@ -501,6 +501,7 @@ pub(crate) fn infer_editor_source_path_spec_in_service(
     let file_name = source_path.file_name()?.to_string_lossy();
     let naming = config::cached_script_naming(source_path.parent().unwrap_or(service_dir));
     let (class_name, leaf_name, run_context) = infer_source_script(&file_name, &naming)?;
+    let is_init = leaf_name.is_none();
     let run_context = run_context.map(str::to_string);
     let relative = source_path.strip_prefix(service_dir).ok()?;
     let mut components = relative
@@ -531,6 +532,7 @@ pub(crate) fn infer_editor_source_path_spec_in_service(
         service: service.to_string(),
         class_name: class_name.to_string(),
         run_context,
+        is_init,
         instance_name,
         instance_stem,
         parent_components,

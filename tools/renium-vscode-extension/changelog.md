@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-19
+
+### Syncing
+
+- Files-to-Studio pushes now stage the affected roots before editing and restore them if any batch or final verification fails, including package-backed trees.
+- Package edits desync only the package relationships on changed paths; unrelated packages, services, and descendants remain untouched.
+- Large editor transactions are streamed through the bridge in bounded chunks instead of failing at the WebSocket request limit.
+- Cross-service moves use one project transaction and preserve scripts, references, sibling order, and destination package links.
+- Script writes are verified against Studio's active script document, standalone deleted script files remove their instances, and deleted `init` scripts keep their children as folders.
+- Filtered native imports still apply independent source and property changes outside the imported services.
+- Property commands resolve Roblox aliases and case differences to the property name actually stored in project data.
+
+### Studio automation
+
+- GUI presses verify that the target is visible, unobstructed, and receives the expected Roblox button events before reporting success.
+- Input coordinates follow the real rendered viewport, including scaled and simulated views, while the input shield yields only to Renium's own pointer events.
+- Device simulation state is kept by the shared daemon and restored when a new Studio process connects; stopping simulation also closes Studio's remaining emulator toolbar on Windows and macOS.
+- Play and Studio status report active device simulation so automation doesn't silently test with mobile controls.
+- Ambiguous selectors and other already-reported command failures exit once without printing the same error twice.
+- Installed launchers keep pointing at the selected Renium version after an update.
+
 ## 0.2.0 - 2026-08-18
 
 ### Syncing
