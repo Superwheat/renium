@@ -30,7 +30,9 @@ const CLI_DOCS: &str = include_str!("../../../README.md");
 const AGENT_POINTER: &str =
     include_str!("../../../../renium-vscode-extension/resources/RENIUM.pointer.md");
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
+const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
 const PROJECT_INSTRUCTIONS_FILE: &str = "RENIUM.md";
+const PROJECT_GUIDES_DIRECTORY: &str = "RENIUM";
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -977,6 +979,11 @@ fn init_files(
         (root.join("CLAUDE.md"), claude_instructions),
         (root.join(PROJECT_FILE_NAME), project),
     ];
+    files.extend(
+        agent_guides()?
+            .into_iter()
+            .map(|(name, content)| (root.join(PROJECT_GUIDES_DIRECTORY).join(name), content)),
+    );
     let features = features.iter().copied().collect::<BTreeSet<_>>();
     if features.contains(&InitFeature::Git) {
         files.push((root.join(".gitignore"), b"build/\nnode_modules/\n".to_vec()));
@@ -1070,6 +1077,12 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     ] {
         write_bytes_if_changed(&path, &content)?;
     }
+    let destination = root.join(PROJECT_GUIDES_DIRECTORY);
+    fs::create_dir_all(&destination)
+        .with_context(|| format!("Failed to create {}", destination.display()))?;
+    for (name, content) in agent_guides()? {
+        write_bytes_if_changed(&destination.join(name), &content)?;
+    }
     Ok(())
 }
 
@@ -1085,6 +1098,36 @@ fn agent_instructions() -> Result<Vec<u8>> {
         .find(|path| path.is_file())
         .context("Renium is missing renium-agents.md; reinstall Renium")?;
     fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+fn agent_guides_directory() -> Result<PathBuf> {
+    let installed = env::current_exe()
+        .context("Failed to locate the Renium executable")?
+        .parent()
+        .context("The Renium executable has no parent directory")?
+        .join(AGENT_GUIDES_DIRECTORY);
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(AGENT_GUIDES_DIRECTORY);
+    [installed, source]
+        .into_iter()
+        .find(|path| path.is_dir())
+        .context("Renium is missing its agent topic guides; reinstall Renium")
+}
+
+fn agent_guides() -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let directory = agent_guides_directory()?;
+    let mut entries = fs::read_dir(&directory)
+        .with_context(|| format!("Failed to read {}", directory.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut guides = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(OsStr::to_str) == Some("md")
+        {
+            guides.push((PathBuf::from(entry.file_name()), fs::read(entry.path())?));
+        }
+    }
+    Ok(guides)
 }
 
 fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
@@ -1939,6 +1982,14 @@ mod tests {
             fs::read(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
             agent_instructions().unwrap()
         );
+        let guides = agent_guides().unwrap();
+        assert!(!guides.is_empty());
+        for (name, content) in guides {
+            assert_eq!(
+                fs::read(root.join(PROJECT_GUIDES_DIRECTORY).join(name)).unwrap(),
+                content
+            );
+        }
 
         fs::write(&agents, "# Project rules\n\nKeep this.\n").unwrap();
         fs::write(&claude, "# Claude rules\n").unwrap();

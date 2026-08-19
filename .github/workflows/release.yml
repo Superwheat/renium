@@ -87,6 +87,7 @@ jobs:
           $binary = if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" }
           Copy-Item "tools/renium/target/release/$binary" $stage
           Copy-Item tools/renium/renium-agents.md $stage
+          Copy-Item tools/renium/renium-guides $stage -Recurse
           $readme = (Get-Content tools/renium/RELEASE_README.md -Raw).Replace("{{VERSION}}", $version)
           [IO.File]::WriteAllText(
             (Join-Path $stage "README.md"),

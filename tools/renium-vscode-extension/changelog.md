@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.2 - 2026-08-20
+
+### Agent guidance
+
+- Agents now start with a compact Renium guide and open only the task-specific instructions they need, reducing context use without removing commands or safety rules.
+- New and existing projects receive the same topic guides whenever Renium creates or refreshes their instructions.
+
 ## 0.2.1 - 2026-08-19
 
 ### Syncing

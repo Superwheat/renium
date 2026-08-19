@@ -992,6 +992,10 @@ try {
             Copy-Item -LiteralPath $supportPath -Destination $stagedInstall
         }
     }
+    $guidePath = Join-Path $cli.DirectoryName "renium-guides"
+    if (Test-Path -LiteralPath $guidePath -PathType Container) {
+        Copy-Item -LiteralPath $guidePath -Destination $stagedInstall -Recurse
+    }
     Copy-Item -LiteralPath $plugin -Destination (Join-Path $stagedInstall "Renium.rbxm")
     $existingCli = Join-Path $installRoot "renium.exe"
     $stagedCli = Join-Path $stagedInstall "renium.exe"

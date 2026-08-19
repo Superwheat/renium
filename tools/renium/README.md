@@ -134,12 +134,12 @@ rbx init .\empty-project --preview
 ```
 
 Without `--with`, initialization creates a minimal `renium.project.jsonc`, an
-empty `src` directory, the current `RENIUM.md` agent guide, and one marked
-instruction in `AGENTS.md` and `CLAUDE.md`. Existing guidance in those two
-files is preserved, and repeated initialization doesn't duplicate or rewrite
-unchanged instructions. Preview lists each file action and directory without
-writing anything. A required path with the wrong file type stops the whole
-initialization before any project file is changed.
+empty `src` directory, a compact `RENIUM.md` topic router with its `RENIUM/`
+guides, and one marked instruction in `AGENTS.md` and `CLAUDE.md`. Existing
+guidance in those two files is preserved, and repeated initialization doesn't
+duplicate or rewrite unchanged instructions. Preview lists each file action
+and directory without writing anything. A required path with the wrong file
+type stops the whole initialization before any project file is changed.
 
 Adapters explicitly map non-Luau files into Roblox instances. TXT maps to
 `StringValue`, CSV maps to `LocalizationTable`, model JSON maps to an instance
@@ -522,8 +522,8 @@ context, and accepts several requests in one payload:
 ```
 
 `ROBLOX_API_KEY` must be set before the daemon starts. See the generated
-`RENIUM.md` for batched Creator Store and data-store recipes. API keys aren't
-accepted in payloads or command arguments.
+`RENIUM/opencloud.md` for batched Creator Store and data-store recipes. API
+keys aren't accepted in payloads or command arguments.
 
 The automation API also covers the plugin-accessible Creator features used by
 Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
@@ -647,7 +647,7 @@ empty list is a successful no-op and needs no push.
 
 Batched low-level reads go through `rbx bb` (one call, many queries). The op
 types are `counts`, `service`, `search`, `children`, `instance`, and `find`;
-see `RENIUM.md` for recipes and field presets.
+see `RENIUM/data.md` for recipes and field presets.
 
 Search and read saved scripts directly without a daemon or Studio:
 

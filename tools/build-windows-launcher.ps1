@@ -81,7 +81,8 @@ function Test-ReniumArchive {
             return $names -contains "install.ps1" -and
                 $names -contains "renium.exe" -and
                 $names -contains "rbx.cmd" -and
-                $names -contains "renium-agents.md"
+                $names -contains "renium-agents.md" -and
+                $names -contains "renium-guides/advanced.md"
         }
         finally {
             $archive.Dispose()

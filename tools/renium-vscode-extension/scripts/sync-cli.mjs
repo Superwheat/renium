@@ -38,6 +38,11 @@ fs.copyFileSync(
   path.join(repoRoot, "tools", "renium", "renium-agents.md"),
   path.join(destinationDir, "renium-agents.md"),
 );
+const guideDestination = path.join(destinationDir, "renium-guides");
+fs.rmSync(guideDestination, { recursive: true, force: true });
+fs.cpSync(path.join(repoRoot, "tools", "renium", "renium-guides"), guideDestination, {
+  recursive: true,
+});
 if (process.platform === "win32") {
   fs.copyFileSync(path.join(repoRoot, "rbx.cmd"), path.join(destinationDir, "rbx.cmd"));
   fs.copyFileSync(

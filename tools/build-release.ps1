@@ -432,17 +432,20 @@ Copy-Item -LiteralPath $cliBinary -Destination $releaseCliBinary
 $releaseReadme = Join-Path $releaseDirectory "README.md"
 $releaseLicense = Join-Path $releaseDirectory "LICENSE"
 $releaseAgentInstructions = Join-Path $releaseDirectory "renium-agents.md"
+$releaseAgentGuides = Join-Path $releaseDirectory "renium-guides"
 $releaseReadmeText = [IO.File]::ReadAllText(
     (Join-Path $repositoryRoot "tools\renium\RELEASE_README.md")
 ).Replace("{{VERSION}}", $cliVersion)
 [IO.File]::WriteAllText($releaseReadme, $releaseReadmeText, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\renium-agents.md") -Destination $releaseAgentInstructions
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\renium-guides") -Destination $releaseAgentGuides -Recurse
 $releaseSupportFiles = @(
     $releaseReadme,
     $releaseLicense,
     $releaseAgentInstructions
 )
+$releaseSupportFiles += Get-ChildItem -LiteralPath $releaseAgentGuides -File | ForEach-Object FullName
 if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
     $releaseRbxRunner = Join-Path $releaseDirectory "rbx-run.ps1"
@@ -529,6 +532,13 @@ try {
     $extensionAgentEntryPath = "extension/bin/$extensionPlatform-$extensionArchitecture/renium-agents.md"
     if ($null -eq $archive.GetEntry($extensionAgentEntryPath)) {
         throw "Packaged VSIX is missing $extensionAgentEntryPath"
+    }
+    $extensionGuideEntryPath = "extension/bin/$extensionPlatform-$extensionArchitecture/renium-guides/advanced.md"
+    if ($null -eq $archive.GetEntry($extensionGuideEntryPath)) {
+        throw "Packaged VSIX is missing $extensionGuideEntryPath"
+    }
+    if ($null -eq $archive.GetEntry("extension/resources/RENIUM/opencloud.md")) {
+        throw "Packaged VSIX is missing its generated Renium topic guides"
     }
     $pluginStream = $pluginEntry.Open()
     $sha256 = [Security.Cryptography.SHA256]::Create()

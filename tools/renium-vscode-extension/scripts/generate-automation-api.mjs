@@ -56,7 +56,7 @@ const operationLines = groups.flatMap(([label, first, last]) => {
   const operations = registry.operations.filter((operation) => operation.id >= first && operation.id <= last);
   return [`- ${label}: ${operations.map((operation) => `\`${operation.name}\``).join(", ")}`];
 });
-const agentsPath = path.join(repositoryRoot, "tools", "renium", "renium-agents.md");
+const agentsPath = path.join(repositoryRoot, "tools", "renium", "renium-guides", "advanced.md");
 const operationsStart = "<!-- automation-operations:start -->";
 const operationsEnd = "<!-- automation-operations:end -->";
 let agents = fs.readFileSync(agentsPath, "utf8");

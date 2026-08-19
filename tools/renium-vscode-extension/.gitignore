@@ -5,3 +5,5 @@ auto.ps1
 node_modules
 *.vsix
 resources/AGENTS.md
+resources/RENIUM.md
+resources/RENIUM/
