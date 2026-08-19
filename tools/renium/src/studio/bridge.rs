@@ -646,7 +646,7 @@ impl BridgeServer {
             };
             #[cfg(any(windows, target_os = "macos"))]
             let peer = socket.peer.clone();
-            let mut applied = {
+            let applied = {
                 let mut apply = |request: &Value| -> Result<()> {
                     let id = next_id.fetch_add(1, Ordering::Relaxed);
                     let result = Self::call_on_socket_with_timeout(
@@ -676,8 +676,10 @@ impl BridgeServer {
             };
             drop(sockets);
             #[cfg(any(windows, target_os = "macos"))]
-            if applied.is_ok() && request.get("action").and_then(Value::as_str) == Some("stop") {
-                applied = (|| -> Result<()> {
+            let applied = if applied.is_ok()
+                && request.get("action").and_then(Value::as_str) == Some("stop")
+            {
+                (|| -> Result<()> {
                     let port = peer
                         .rsplit(':')
                         .next()
@@ -688,8 +690,10 @@ impl BridgeServer {
                     })?;
                     input_inject::close_device_emulator_toolbar_when_visible(pid)?;
                     Ok(())
-                })();
-            }
+                })()
+            } else {
+                applied
+            };
             if let Err(error) = &applied {
                 eprintln!("[renium] failed to restore device simulator state: {error:#}");
             }
