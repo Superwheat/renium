@@ -189,3 +189,7 @@ pub(crate) fn resolve_experience_place(
     ))
     .into())
 }
+
+pub(crate) fn resolve_experience_game_id(start: &Path) -> Result<Option<i64>> {
+    Ok(load_experience(start)?.and_then(|layout| layout.game_id))
+}

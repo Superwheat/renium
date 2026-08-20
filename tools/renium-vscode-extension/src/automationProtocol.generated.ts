@@ -62,14 +62,12 @@ export const AUTOMATION_OP = {
   reviewPrepare: 80,
   reviewApply: 81,
   reviewReject: 82,
-  cloud: 90,
   assetSearch: 91,
   assetInsert: 92,
   generateModel: 93,
   jobStatus: 94,
   imageUpload: 95,
   imageStore: 96,
-  httpGet: 97,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([

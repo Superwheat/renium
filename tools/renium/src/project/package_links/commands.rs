@@ -43,15 +43,15 @@ use super::{
     RENIUM_STORE_EXTENSION, ResolvedLinkTarget, collect_project_settings_files,
     ensure_settings_document, is_global_link_path, is_package_path, link_lock_path,
     link_manifest_path, link_mirror_lock_key, link_slug, link_target_document_selector,
-    link_target_document_selector_parts, link_target_key, link_target_ordinals,
-    link_target_ref_key, link_target_segments, load_settings_documents,
+    link_target_document_selector_parts, link_target_from_settings_id, link_target_key,
+    link_target_ordinals, link_target_ref_key, link_target_segments, load_settings_documents,
     mark_manifest_target_broken, materialize_package_target, package_document_fingerprint,
-    package_lock_key, package_target_fingerprint, package_target_settings_ids, read_link_lock,
-    read_link_manifest, read_link_source_meta, referenced_settings_ids_outside,
-    renium_global_packages_dir, resolve_link_cache_dir, resolve_link_target_storage,
-    resolve_link_targets, resolve_local_link_path, selector_starts_with, serialize_link_lock,
-    serialize_link_manifest, stage_settings_document_writes, validate_link_target_ref,
-    write_link_manifest,
+    package_lock_key, package_target_fingerprint, package_target_matches,
+    package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
+    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
+    resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
+    selector_starts_with, serialize_link_lock, serialize_link_manifest,
+    stage_settings_document_writes, validate_link_target_ref, write_link_manifest,
 };
 
 fn load_link_project(
@@ -64,6 +64,123 @@ fn load_link_project(
     let manifest_path = link_manifest_path(&project_root, manifest);
     let manifest = read_link_manifest(&manifest_path)?;
     Ok((project_root, src_root, manifest_path, manifest))
+}
+
+fn migrate_link_target_lock(
+    entry: &mut LinkLockEntry,
+    old_service: &str,
+    old_segments: &[String],
+    old_ordinals: &[usize],
+    new_service: &str,
+    new_segments: &[String],
+    new_ordinals: &[usize],
+) -> bool {
+    let mut changed = false;
+    for prefix in ["package", "package-target"] {
+        let old_key = package_lock_key(prefix, old_service, old_segments, old_ordinals);
+        let new_key = package_lock_key(prefix, new_service, new_segments, new_ordinals);
+        if let Some(value) = entry.files.remove(&old_key) {
+            entry.files.insert(new_key, value);
+            changed = true;
+        }
+    }
+    let old_key = link_target_key(old_service, old_segments, old_ordinals);
+    let new_key = link_target_key(new_service, new_segments, new_ordinals);
+    if let Some(target) = entry.targets.remove(&old_key) {
+        entry.targets.insert(new_key, target);
+        changed = true;
+    }
+    changed
+}
+
+fn reconcile_package_target_names(
+    project_root: &Path,
+    src_root: &Path,
+    targets: &mut [ResolvedLinkTarget],
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    manifest: &mut LinkManifest,
+    lock: &mut super::LinkLock,
+) -> Result<bool> {
+    let mut changed = false;
+    for target in targets {
+        if target.package_source.is_none() || !target.resolved {
+            continue;
+        }
+        let Some(storage) = target.storage.as_ref() else {
+            continue;
+        };
+        let Some(settings_file) = storage.settings_file.as_ref() else {
+            continue;
+        };
+        let old_segments = target.target_segments.clone();
+        let old_ordinals = target.target_ordinals.clone();
+        let old_key = link_target_key(&target.service, &old_segments, &old_ordinals);
+        let Some(settings_id) = lock
+            .entries
+            .get(&target.link_id)
+            .and_then(|entry| entry.targets.get(&old_key))
+            .and_then(|target| target.settings_id.as_deref())
+        else {
+            continue;
+        };
+        let Some(document) = documents.get(settings_file) else {
+            continue;
+        };
+        let Some(actual) = link_target_from_settings_id(target, document, settings_id) else {
+            continue;
+        };
+        let new_segments = link_target_segments(&actual);
+        let new_ordinals = link_target_ordinals(&actual);
+        if old_segments == new_segments && old_ordinals == new_ordinals {
+            continue;
+        }
+        let new_ref_key = link_target_ref_key(&actual);
+        if manifest.links.iter().any(|link| {
+            link.targets
+                .iter()
+                .any(|candidate| link_target_ref_key(candidate) == new_ref_key)
+        }) {
+            bail!(
+                "Renamed link target {}.{} conflicts with another link target",
+                target.service,
+                new_segments.join(".")
+            );
+        }
+        let new_storage = resolve_link_target_storage(project_root, src_root, &actual, true, true)?;
+        let old_ref_key = link_target_key(&target.service, &old_segments, &old_ordinals);
+        let manifest_target = manifest
+            .links
+            .iter_mut()
+            .find(|link| link.id == target.link_id)
+            .and_then(|link| {
+                link.targets
+                    .iter_mut()
+                    .find(|candidate| link_target_ref_key(candidate) == old_ref_key)
+            })
+            .context("Renium link target disappeared while updating its name")?;
+        *manifest_target = actual;
+        manifest.broken.retain(|candidate| {
+            let key = link_target_ref_key(candidate);
+            key != old_ref_key && key != new_ref_key
+        });
+        if let Some(entry) = lock.entries.get_mut(&target.link_id) {
+            migrate_link_target_lock(
+                entry,
+                &target.service,
+                &old_segments,
+                &old_ordinals,
+                &target.service,
+                &new_segments,
+                &new_ordinals,
+            );
+        }
+        target.target_segments = new_segments;
+        target.target_ordinals = new_ordinals;
+        target.storage = Some(new_storage);
+        target.broken = false;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn parse_link_target(service: &str, path: &str, ordinals: &str) -> Result<LinkTargetRef> {
@@ -221,8 +338,15 @@ impl PackageLinkApply<'_> {
         } else {
             None
         };
-        let target_matches_package =
-            target_fingerprint.as_deref() == Some(package_fingerprint.as_str());
+        let target_matches_package = target_exists
+            && package_target_matches(
+                document,
+                document_service,
+                document_segments,
+                document_ordinals,
+                &package_doc,
+                &package_fingerprint,
+            )?;
         if !target_exists && lock_entry.files.contains_key(&lock_key) && !target_forced {
             changes.mark_deleted_target(manifest, target, args.check, true);
             return Ok(());
@@ -321,6 +445,16 @@ impl PackageLinkApply<'_> {
             document_ordinals,
         );
         let root_settings_id = settings_ids.first().cloned();
+        lock_entry
+            .targets
+            .entry(link_target_key(
+                &target.service,
+                &target.target_segments,
+                &target.target_ordinals,
+            ))
+            .or_default()
+            .settings_id
+            .clone_from(&root_settings_id);
         changes.link_results.push(json!({
             "id": target.link_id,
             "service": target.service,
@@ -544,7 +678,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         wally_path: args.wally_path.clone(),
         cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
     };
-    let targets = resolve_link_targets(&project_root, &src_root, &manifest, &options);
+    let mut targets = resolve_link_targets(&project_root, &src_root, &manifest, &options);
     let settings_files = collect_project_settings_files(
         &src_root,
         targets
@@ -581,7 +715,18 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         );
     }
     let mut lock = read_link_lock(&project_root)?;
-    let mut changes = LinkApplyChanges::default();
+    let manifest_changed = reconcile_package_target_names(
+        &project_root,
+        &src_root,
+        &mut targets,
+        &documents,
+        &mut manifest,
+        &mut lock,
+    )?;
+    let mut changes = LinkApplyChanges {
+        manifest_changed,
+        ..Default::default()
+    };
 
     let forced_targets: Vec<LinkTargetRef> = args
         .force_target
@@ -1353,28 +1498,15 @@ pub(crate) fn link_move_target(args: LinkMoveTargetArgs) -> Result<()> {
     let mut lock_changed = false;
     for link_id in &moved_link_ids {
         if let Some(entry) = lock.entries.get_mut(link_id) {
-            for prefix in ["package", "package-target"] {
-                let old_key = package_lock_key(
-                    prefix,
-                    &old_target.service,
-                    &old_segments,
-                    &link_target_ordinals(&old_target),
-                );
-                let new_key = package_lock_key(
-                    prefix,
-                    &new_target.service,
-                    &new_segments,
-                    &link_target_ordinals(&new_target),
-                );
-                if let Some(value) = entry.files.remove(&old_key) {
-                    entry.files.insert(new_key, value);
-                    lock_changed = true;
-                }
-            }
-            if let Some(target) = entry.targets.remove(&old_key) {
-                entry.targets.insert(new_key.clone(), target);
-                lock_changed = true;
-            }
+            lock_changed |= migrate_link_target_lock(
+                entry,
+                &old_target.service,
+                &old_segments,
+                &link_target_ordinals(&old_target),
+                &new_target.service,
+                &new_segments,
+                &link_target_ordinals(&new_target),
+            );
         }
     }
     let mut writes = BTreeMap::from([(
@@ -1839,7 +1971,17 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
                     && link_target_ordinals(existing) == default_ordinals
             })
         });
-    let files = &mut lock.entries.entry(id.clone()).or_default().files;
+    let lock_entry = lock.entries.entry(id.clone()).or_default();
+    lock_entry
+        .targets
+        .entry(link_target_key(
+            &args.target.service,
+            &segments_after_service,
+            &target_ordinals,
+        ))
+        .or_default()
+        .settings_id = Some(document.instances[root_index].settings_id.clone());
+    let files = &mut lock_entry.files;
     if target_ordinals != default_ordinals && !default_target_exists {
         files.remove(&package_lock_key(
             "package",

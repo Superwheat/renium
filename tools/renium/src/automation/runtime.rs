@@ -875,14 +875,8 @@ fn automation_execute_request(
                     automation::Failure::new("internal", error.to_string(), false, "bind")
                 });
             }
-            if operation.id == op::CLOUD {
-                return crate::cloud::execute(&context, &request.p);
-            }
             if operation.id == op::IMAGE_STORE {
                 return crate::cloud::assets::store_image(&context, &request.p);
-            }
-            if operation.id == op::HTTP_GET {
-                return crate::automation::tools::http_get(&request.p);
             }
             if !context.initialized
                 && !matches!(operation.id, op::PROJECT_INIT | op::PROJECT_VALIDATE)
@@ -909,7 +903,11 @@ fn automation_execute_request(
                     ensure_plugin_api_ok(&result).map_err(automation_failure)?;
                     Ok(result)
                 } else {
-                    crate::cloud::assets::upload(&context, &request.p, bridge)
+                    crate::cloud::assets::upload(
+                        std::path::Path::new(&context.root),
+                        &request.p,
+                        Some(bridge),
+                    )
                 };
             }
             match operation.id {

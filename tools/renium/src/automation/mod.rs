@@ -322,14 +322,13 @@ mod tests {
     #[test]
     fn registry_is_unique_and_complete() {
         let operations = registry();
-        assert_eq!(operations.len(), 69);
+        assert_eq!(operations.len(), 67);
         assert_eq!(opcode_by_name("bb").unwrap().id, op::BATCH);
         assert!(opcode_by_id(op::SET_PROPERTY).unwrap().review);
         assert_eq!(
             opcode_by_id(op::REVIEW_REJECT).unwrap().name,
             "review-reject"
         );
-        assert_eq!(opcode_by_name("oc").unwrap().id, op::CLOUD);
     }
 
     #[test]

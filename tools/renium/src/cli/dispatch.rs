@@ -7,9 +7,8 @@ use crate::app::update;
 use crate::automation::client::automation_command;
 use crate::automation::op;
 use crate::automation::tools::{
-    asset_insert_command, asset_search_command, generate_model_command, http_get_command,
-    image_store_command, job_status_command, script_grep_command, script_read_command,
-    script_search_command,
+    asset_insert_command, asset_search_command, generate_model_command, image_store_command,
+    job_status_command, script_grep_command, script_read_command, script_search_command,
 };
 use crate::bytecode::edit::{
     bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
@@ -73,6 +72,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::Studio(args) => workflows::run_studio(args, project),
         Commands::Upload(args) => workflows::run_upload(args, project),
         Commands::Update(args) => update::run_update(args),
+        Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
         Commands::UpdateHelper(args) => update::run_update_helper(args),
         Commands::Syncback(args) => syncback_command(args, project),
         Commands::ImportPath(args) => import_path_command(args, project),
@@ -107,7 +107,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::GenerateModel(args) => generate_model_command(args, project),
         Commands::JobStatus(args) => job_status_command(args, project),
         Commands::ImageStore(args) => image_store_command(args, project),
-        Commands::HttpGet(args) => http_get_command(args),
         Commands::ScriptSearch(args) => script_search_command(args, project),
         Commands::ScriptGrep(args) => script_grep_command(args, project),
         Commands::ScriptRead(args) => script_read_command(args, project),

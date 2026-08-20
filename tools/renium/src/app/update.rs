@@ -1914,12 +1914,22 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
         .context("USERPROFILE is unavailable")?;
     let stable_root = home.join(".renium").join("bin");
     fs::create_dir_all(&stable_root)?;
-    for alias in [target_root.join("rbx.exe"), stable_root.join("rbx.exe")] {
-        if alias.is_file() {
-            fs::remove_file(&alias)?;
+    let alias = target_root.join("rbx.exe");
+    if alias.is_file() {
+        fs::remove_file(&alias)?;
+    }
+    if fs::hard_link(&cli, &alias).is_err() {
+        fs::copy(&cli, &alias)?;
+    }
+    for stale in [stable_root.join("rbx.exe"), stable_root.join("renium.exe")] {
+        if stale.is_file() {
+            fs::remove_file(stale)?;
         }
-        if fs::hard_link(&cli, &alias).is_err() {
-            fs::copy(&cli, &alias)?;
+    }
+    for name in ["rbx.cmd", "rbx-run.ps1"] {
+        let source = target_root.join(name);
+        if source.is_file() {
+            fs::copy(source, stable_root.join(name))?;
         }
     }
     Ok(())

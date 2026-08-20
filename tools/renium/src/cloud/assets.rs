@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::ensure_plugin_api_ok;
 use crate::automation::{BoundContext, Failure};
-use crate::cloud::{API_ROOT, agent, read_response, required_key};
+use crate::cloud::{API_ROOT, CloudAuth, agent, read_response};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 
 const MAX_STORED_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
@@ -39,6 +39,7 @@ struct AssetSearch {
     audio_max_duration: Option<f64>,
     #[serde(default = "default_key_env")]
     key_env: String,
+    oauth_env: Option<String>,
     #[serde(default)]
     options: Map<String, Value>,
 }
@@ -55,6 +56,7 @@ struct ImageUpload {
     description: String,
     #[serde(default = "default_key_env")]
     key_env: String,
+    oauth_env: Option<String>,
     #[serde(default = "default_upload_wait")]
     wait_seconds: f64,
     #[serde(rename = "via")]
@@ -249,7 +251,12 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
                 Some(id) if id > 0 => id,
                 _ => studio_user_id(bridge, "asset-search")?,
             };
-            let key = required_key(&request.key_env, "asset-search")?;
+            let auth = CloudAuth::from_env(
+                false,
+                &request.key_env,
+                request.oauth_env.as_deref(),
+                "asset-search",
+            )?;
             let mut url = url::Url::parse(&format!(
                 "{API_ROOT}/cloud/v2/users/{user_id}/inventory-items"
             ))
@@ -267,10 +274,8 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
             if let Some(filter) = filter {
                 url.query_pairs_mut().append_pair("filter", &filter);
             }
-            let body = checked_response(
-                agent().get(url.as_str()).set("x-api-key", &key).call(),
-                "asset-search",
-            )?;
+            let body =
+                checked_response(auth.apply(agent().get(url.as_str())).call(), "asset-search")?;
             let mut results = body
                 .get("inventoryItems")
                 .and_then(Value::as_array)
@@ -355,7 +360,7 @@ fn read_bounded(
     Ok(bytes)
 }
 
-fn load_image(context: &BoundContext, source: &str) -> Result<(Vec<u8>, String), Failure> {
+fn load_image(root: &Path, source: &str) -> Result<(Vec<u8>, String), Failure> {
     if source.starts_with("https://") || source.starts_with("http://") {
         let response = match agent().get(source).call() {
             Ok(response) => response,
@@ -384,7 +389,7 @@ fn load_image(context: &BoundContext, source: &str) -> Result<(Vec<u8>, String),
         )?;
         return Ok((bytes, source.to_string()));
     }
-    let path = resolve_image_path(Path::new(&context.root), source);
+    let path = resolve_image_path(root, source);
     let file = fs::File::open(&path).map_err(|error| {
         failure(
             "bad_req",
@@ -472,15 +477,12 @@ fn operation_path(body: &Value) -> Option<&str> {
         .filter(|path| path.starts_with("operations/"))
 }
 
-fn wait_for_upload(path: &str, key: &str, wait_seconds: f64) -> Result<Value, Failure> {
+fn wait_for_upload(path: &str, auth: &CloudAuth, wait_seconds: f64) -> Result<Value, Failure> {
     let operation_id = path.trim_start_matches("operations/");
     let url = format!("{API_ROOT}/assets/v1/operations/{operation_id}");
     let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.clamp(0.0, 120.0));
     loop {
-        let operation = checked_response(
-            agent().get(&url).set("x-api-key", key).call(),
-            "image-upload",
-        )?;
+        let operation = checked_response(auth.apply(agent().get(&url)).call(), "image-upload")?;
         if operation.get("done").and_then(Value::as_bool) == Some(true) {
             if let Some(error) = operation.get("error") {
                 return Err(failure(
@@ -500,9 +502,9 @@ fn wait_for_upload(path: &str, key: &str, wait_seconds: f64) -> Result<Value, Fa
 }
 
 pub(crate) fn upload(
-    context: &BoundContext,
+    root: &Path,
     parameters: &Value,
-    bridge: &BridgeServer,
+    bridge: Option<&BridgeServer>,
 ) -> Result<Value, Failure> {
     let request: ImageUpload = serde_json::from_value(parameters.clone()).map_err(|error| {
         failure(
@@ -541,14 +543,19 @@ pub(crate) fn upload(
     } else {
         let user_id = match request.user_id.filter(|id| *id > 0) {
             Some(id) => id,
-            None => studio_user_id(Some(bridge), "image-upload")?,
+            None => studio_user_id(bridge, "image-upload")?,
         };
         json!({ "userId": user_id.to_string() })
     };
-    let key = required_key(&request.key_env, "image-upload")?;
+    let auth = CloudAuth::from_env(
+        false,
+        &request.key_env,
+        request.oauth_env.as_deref(),
+        "image-upload",
+    )?;
     let mut results = Vec::with_capacity(request.images.len());
     for (index, source) in request.images.iter().enumerate() {
-        let (bytes, label) = load_image(context, source)?;
+        let (bytes, label) = load_image(root, source)?;
         let (mime, extension) = image_type(&bytes, &label).ok_or_else(|| {
             failure(
                 "bad_req",
@@ -577,9 +584,7 @@ pub(crate) fn upload(
         let filename = format!("image-{}.{}", index + 1, extension);
         let (boundary, body) = multipart_body(&metadata, &filename, mime, &bytes);
         let created = checked_response(
-            agent()
-                .post(&format!("{API_ROOT}/assets/v1/assets"))
-                .set("x-api-key", &key)
+            auth.apply(agent().post(&format!("{API_ROOT}/assets/v1/assets")))
                 .set(
                     "Content-Type",
                     &format!("multipart/form-data; boundary={boundary}"),
@@ -588,7 +593,7 @@ pub(crate) fn upload(
             "image-upload",
         )?;
         let operation = match operation_path(&created) {
-            Some(path) => wait_for_upload(path, &key, request.wait_seconds)?,
+            Some(path) => wait_for_upload(path, &auth, request.wait_seconds)?,
             None => created,
         };
         let asset_id = operation

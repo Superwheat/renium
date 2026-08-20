@@ -17,6 +17,7 @@ use walkdir::WalkDir;
 
 use crate::cli::{ProjectSourceArgs, SyncWallyPackagesArgs};
 use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
+use crate::project::experience::resolve_experience_place;
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
     exact_path_key as path_text, write_bytes_if_changed,
@@ -144,6 +145,8 @@ pub struct UploadArgs {
     pub universe_id: Option<u64>,
     #[arg(long, default_value = "ROBLOX_API_KEY")]
     pub api_key_env: String,
+    #[arg(long, value_name = "ENV")]
+    pub oauth_env: Option<String>,
     #[arg(long)]
     pub project: Option<PathBuf>,
 }
@@ -820,18 +823,30 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
 }
 
 pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()> {
+    let loaded = config::load_project(args.project.as_deref().or(global_project), None)?;
+    let inferred = if args.place_id.is_none() || args.universe_id.is_none() {
+        resolve_experience_place(
+            &loaded.root,
+            crate::app::context::place_selector().as_deref(),
+        )?
+    } else {
+        None
+    };
     let place_id = args
         .place_id
-        .context("--place-id is required for Open Cloud place publishing")?;
+        .or_else(|| inferred.as_ref()?.place_id?.try_into().ok())
+        .context("No place ID is available; pass --place-id or publish this Renium place")?;
     let universe_id = args
         .universe_id
-        .context("--universe-id is required for Open Cloud place publishing")?;
-    let api_key =
-        env::var(&args.api_key_env).with_context(|| format!("{} is not set", args.api_key_env))?;
-    if api_key.trim().is_empty() {
-        bail!("{} is empty", args.api_key_env);
-    }
-    let loaded = config::load_project(args.project.as_deref().or(global_project), None)?;
+        .or_else(|| inferred.as_ref()?.game_id?.try_into().ok())
+        .context("No universe ID is available; pass --universe-id or configure the experience")?;
+    let auth = crate::cloud::CloudAuth::from_env(
+        false,
+        &args.api_key_env,
+        args.oauth_env.as_deref(),
+        "upload-place",
+    )
+    .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
     validate_experience_upload(&loaded.root, universe_id, place_id)?;
     let temporary = loaded
         .root
@@ -870,7 +885,7 @@ pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()>
     let url = format!(
         "https://apis.roblox.com/universes/v1/{universe_id}/places/{place_id}/versions?versionType=Published"
     );
-    let response = crate::cloud::upload_file(&url, api_key.trim(), content_type, &input);
+    let response = crate::cloud::upload_file(&url, &auth, content_type, &input);
     if input == temporary {
         let _ = fs::remove_file(&temporary);
     }

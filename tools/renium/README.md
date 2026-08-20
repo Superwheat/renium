@@ -513,17 +513,31 @@ $env:ROBLOX_API_KEY = "..."
 rbx --project .\renium.project.jsonc upload-place --universe-id 123 --place-id 456
 ```
 
-Agents can use the bound automation context for any JSON Open Cloud endpoint.
-The daemon reuses one HTTPS client, fills `{universe}` and `{place}` from the
-context, and accepts several requests in one payload:
+OAuth access tokens can be read from a named environment variable instead:
 
 ```powershell
-'{"requests":[{"method":"GET","path":"/cloud/v2/universes/{universe}/data-stores","query":{"maxPageSize":25}}]}' | rbx a cloud CX -J -
+rbx upload-place --oauth-env ROBLOX_OAUTH_TOKEN
 ```
 
-`ROBLOX_API_KEY` must be set before the daemon starts. See the generated
-`RENIUM/opencloud.md` for batched Creator Store and data-store recipes. API
-keys aren't accepted in payloads or command arguments.
+Open Cloud commands run in the current `rbx` process. They don't start a daemon,
+wait for Studio, or require a bound automation context. `{universe}` and
+`{place}` come from the current Renium project when available:
+
+```powershell
+rbx cloud request get /cloud/v2/universes/{universe}/data-stores --query maxPageSize=25
+rbx cloud product create "Refresh Daily Rewards" --price 27 --for-sale --regional-pricing
+```
+
+Set `ROBLOX_API_KEY` in the environment. On Windows, Renium also checks the
+current user's saved environment when the parent application has stale values.
+Use `--oauth-env ENV` to send a bearer token stored in another environment
+variable. Credentials aren't accepted in payloads or command arguments.
+Developer product create and update use
+Roblox's multipart API and read the product back after a successful mutation.
+The generic request command supports JSON fields, query parameters, multipart
+text/JSON/file parts, URL-encoded fields, raw file bodies, endpoint-specific
+headers, conditional headers, explicit path parameters, and binary response
+files. Nested or batched requests can be piped to `rbx cloud batch -J -`.
 
 The automation API also covers the plugin-accessible Creator features used by
 Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
@@ -537,30 +551,20 @@ rbx asset-insert 182451181 --parent Workspace --name AuditCrate
 rbx generate-model "small wooden crate" --parent Workspace --name GeneratedCrate --size 4,4,4 --max-triangles 2000
 rbx job-status JOB_ID --wait-seconds 30
 rbx image-store assets/reference.png
-rbx http-get "https://create.roblox.com/docs/reference/engine/classes/StudioDeviceSimulatorService" --query GetResolutionAsync --limit 1
+rbx cloud image-upload assets/reference.png --user USER_ID --name Reference
 ```
 
 Asset insertion returns the inserted path, name, class, and asset ID. Insertion
 and generation change the live Edit runtime; pull or save to persist them.
 Generation returns a `jobId`; `job-status` can wait up to 120 seconds and returns
 `running`, `succeeded`, or `failed`. An expired wait returns `running` with exit 0.
-Filtered `http-get` lines include readable-document line numbers, and its counts
-refer to matching lines. `image-store` only validates a local PNG, JPEG, BMP, or
-TGA up to 5 MiB; it does not upload anything.
+`image-store` only validates a local PNG, JPEG, BMP, or TGA up to 5 MiB; it does
+not upload anything. Use normal web tooling for Roblox documentation instead of
+routing documentation requests through Renium.
 
-Variable Open Cloud and image-upload payloads use stdin instead of temporary
-files. Open Cloud request entries accept `method`, `path`, and optional `query`,
-`body`, `pathParams`, `ifMatch`, and `ifNoneMatch`. Uploading creates assets in
-the user's Roblox account and should be run only as an explicit write:
-
-Bound `{universe}` and `{place}` values require a published project with nonzero
-game and place IDs. For an unpublished project, provide explicit numeric path
-parameters instead.
-
-```powershell
-'{"images":["https://example.com/image.png"],"name":"Reference"}' | rbx a image-upload CX -J -
-'{"images":["assets/reference.png"],"userId":123,"via":"open-cloud","waitSeconds":30}' | rbx a image-upload CX -J -
-```
+Image upload requires an explicit user or group owner and creates assets in that
+Roblox account. Run it only as an explicit write. For unpublished projects, pass
+`--universe`, `--place-id`, or custom `--param name=value` values as needed.
 
 `generate-model` uses the public `GenerationService:GenerateModelAsync` plugin
 API. Material generation and Roblox's internal primitive `ProceduralModel`
@@ -726,6 +730,10 @@ package. `rbx link-delete-package --action delete-unused` removes an unused
 package, `delete-uses` also removes its active trees, and `unlink-uses` keeps
 those trees as ordinary editable instances. Bare `rbx bpack` repacks service
 stores and local project packages; pass explicit paths to limit it.
+
+Linked model instances may be renamed, moved, and rotated independently. An
+updated source keeps that local root name and world transform while refreshing
+the model's contents.
 
 In VS Code/Cursor, linked files show an `L` badge and open read-only;
 right-click for **Break Link** / **Reveal Link Source**.
@@ -973,12 +981,10 @@ Protocol version: `1`
 | 80 | `review-prepare` | - | no | no |
 | 81 | `review-apply` | - | no | no |
 | 82 | `review-reject` | - | no | no |
-| 90 | `cloud` | oc | no | no |
 | 91 | `asset-search` | - | no | no |
 | 92 | `asset-insert` | - | no | yes |
 | 93 | `generate-model` | - | no | yes |
 | 94 | `job-status` | - | no | yes |
 | 95 | `image-upload` | - | no | no |
 | 96 | `image-store` | - | no | no |
-| 97 | `http-get` | - | no | no |
 <!-- automation-opcodes:end -->

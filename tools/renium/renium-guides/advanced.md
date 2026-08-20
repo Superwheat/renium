@@ -12,7 +12,7 @@ Read `RENIUM.md` first. Use `rbx a` only when the direct surface doesn't cover t
 - Input and capture: `ui`, `press`, `click`, `key`, `type`, `wait`, `goto`, `input`, `record-start`, `record-end`
 - Project: `project-init`, `project-validate`, `place-add`, `place-rename`, `place-reorder`
 - Review: `review-prepare`, `review-apply`, `review-reject`
-- Roblox Cloud and creator assets: `cloud`, `asset-search`, `asset-insert`, `generate-model`, `job-status`, `image-upload`, `image-store`, `http-get`
+- Roblox Cloud and creator assets: `asset-search`, `asset-insert`, `generate-model`, `job-status`, `image-upload`, `image-store`
 <!-- automation-operations:end -->
 
 Common structured payload fields follow their names: selectors use `service` plus one of `settingsId`, `index`, `name`, `className`, or `pathSegments`/`pathOrdinals`; file operations use `model`, `output`, or `changedPaths`; client operations use `player`. Batch accepts an `ops` array.
