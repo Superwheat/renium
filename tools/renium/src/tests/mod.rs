@@ -826,10 +826,8 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
         .iter()
         .position(|instance| instance.settings_id == "script")
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(moved_paths[moved_script_index].as_ref().unwrap()).unwrap(),
-        "return 1\n"
-    );
+    let moved_script_path = moved_paths[moved_script_index].as_ref().unwrap();
+    assert_eq!(fs::read_to_string(moved_script_path).unwrap(), "return 1\n");
     let internal_ref = moved.instances[moved_script_index].properties["Adornee"]
         .as_object()
         .unwrap();
@@ -841,6 +839,26 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
     assert_eq!(
         internal_ref.get("instanceIndex"),
         Some(&json!(target_index + 1))
+    );
+
+    fs::write(moved_script_path, "return 2\n").unwrap();
+    let changes = collect_and_apply_editor_changes(
+        &project_root,
+        vec![moved_script_path.clone()],
+        BridgeConnectionArgs::local(1.0),
+    );
+    assert!(changes.instance_changes.iter().all(|change| {
+        change
+            .instances
+            .iter()
+            .all(|instance| instance.class_name != "PackageLink")
+    }));
+    let updated = SettingsBytecode::read_file(&target_file).unwrap();
+    assert!(
+        updated
+            .instances
+            .iter()
+            .any(|instance| instance.class_name == "PackageLink")
     );
 
     let _ = fs::remove_dir_all(project_root);

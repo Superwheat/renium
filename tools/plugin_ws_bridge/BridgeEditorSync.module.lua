@@ -1487,65 +1487,6 @@ local function includeManagedInstance(ctx: { [string]: any }, serviceName: strin
 	return ctx.includeExportInstance(serviceName, instance)
 end
 
-local function desyncPackageAncestors(
-	instance: Instance,
-	service: Instance,
-	ctx: { [string]: any },
-	stats: { [string]: any }
-)
-	local transaction = ctx.editorTransaction
-	if transaction == nil or transaction.nativeImportServices[service.Name] then
-		return
-	end
-	local current = if instance:IsA("PackageLink") then instance.Parent else instance
-	local packageLinks = {}
-	local snapshotRoot = current
-	while current ~= nil and current ~= game do
-		for _, child in ipairs(current:GetChildren()) do
-			if child:IsA("PackageLink") and not transaction.desyncedPackageLinks[child] then
-				packageLinks[#packageLinks + 1] = child
-			end
-		end
-		if current == service then
-			break
-		end
-		if current.Parent == service then
-			snapshotRoot = current
-		end
-		current = current.Parent
-	end
-	if #packageLinks == 0 then
-		return
-	end
-	if not transaction.packageSnapshotRoots[snapshotRoot] then
-		error(`Package mutation was not captured for rollback: {snapshotRoot:GetFullName()}`)
-	end
-	for _, packageLink in ipairs(packageLinks) do
-		transaction.desyncedPackageLinks[packageLink] = true
-		removeInstanceForUndo(packageLink, ctx)
-		stats.instanceDeleted += 1
-	end
-end
-
-local function desyncPackagesForPath(
-	change: { [string]: any },
-	service: Instance,
-	ctx: { [string]: any },
-	stats: { [string]: any }
-)
-	local pathSegments = cloneArray(change.pathSegments)
-	local pathOrdinals = cloneArray(change.pathOrdinals)
-	while #pathSegments > 1 do
-		local instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
-		if instance ~= nil then
-			desyncPackageAncestors(instance, service, ctx, stats)
-			return
-		end
-		table.remove(pathSegments)
-		table.remove(pathOrdinals)
-	end
-end
-
 local function ensureSourceParentPath(
 	change: { [string]: any },
 	service: Instance,
@@ -1620,7 +1561,6 @@ local function applySourceChange(
 				stats.noops += 1
 				return
 			end
-			desyncPackageAncestors(instance, service, ctx, stats)
 			local okWrite, err, writeMethod = setSource(instance, "", ctx)
 			if not okWrite then
 				error(`Failed to clear Source for {instance:GetFullName()}: {err}`)
@@ -1643,7 +1583,6 @@ local function applySourceChange(
 			stats.noops += 1
 			return
 		end
-		desyncPackagesForPath(change, service, ctx, stats)
 		local parent = resolveParent(change, ctx.resolveCache) or ensureSourceParentPath(change, service, stats, ctx)
 		if parent == nil then
 			error("Cannot create source instance; parent path was not found")
@@ -1664,7 +1603,6 @@ local function applySourceChange(
 	end
 
 	if instance.ClassName == "Folder" and ctx.luaSourceClass[tostring(change.className or "")] then
-		desyncPackageAncestors(instance, service, ctx, stats)
 		local oldInstance = instance
 		instance = replaceInstanceClass(instance, tostring(change.className), stats, ctx.selectionReplacements, ctx)
 		rememberReplacementIdentity(serviceName, change.settingsId, oldInstance, instance, ctx)
@@ -1683,7 +1621,6 @@ local function applySourceChange(
 		return
 	end
 
-	desyncPackageAncestors(instance, service, ctx, stats)
 	local okWrite, err, writeMethod = setSource(instance, nextSource, ctx)
 	if not okWrite then
 		error(`Failed to write Source for {instance:GetFullName()}: {err}`)
@@ -1779,7 +1716,6 @@ local function syncDesiredEntry(
 		if parent == nil then
 			error("Cannot create instance; parent path was not found: " .. entry.key)
 		end
-		desyncPackageAncestors(parent, game:GetService(serviceName), ctx, stats)
 		local okCreate, created = pcall(Instance.new, entry.className)
 		if not okCreate or created == nil then
 			error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
@@ -1792,12 +1728,6 @@ local function syncDesiredEntry(
 		local parent = resolveEntryParent(entry, resolvedEntries)
 		if parent == nil then
 			error("Cannot place instance; parent path was not found: " .. tostring(entry.key))
-		end
-		local nextName = tostring(entry.pathSegments[#entry.pathSegments] or instance.Name)
-		if instance.Parent ~= parent or nextName ~= "" and instance.Name ~= nextName or instance.ClassName ~= entry.className then
-			local service = game:GetService(serviceName)
-			desyncPackageAncestors(instance, service, ctx, stats)
-			desyncPackageAncestors(parent, service, ctx, stats)
 		end
 		syncEntryPlacement(entry, instance, stats, resolvedEntries, ctx)
 		if instance.ClassName ~= entry.className then
@@ -1830,6 +1760,7 @@ local function removeUnknownInstances(
 		local key = if pathSegments then pathCacheKey(pathSegments, pathOrdinals) else ""
 		if
 			key ~= ""
+			and not instance:IsA("PackageLink")
 			and not preserveKeys[key]
 			and includeManagedInstance(ctx, serviceName, instance)
 			and not shouldKeepInstanceByDesiredEntry(
@@ -2099,9 +2030,6 @@ local function applyInstanceDeletes(
 		end
 	end
 	for _, instance in ipairs(targets) do
-		if not instance:IsA("PackageLink") then
-			desyncPackageAncestors(instance, service, ctx, stats)
-		end
 		removeInstanceForUndo(instance, ctx)
 		stats.instanceDeleted += 1
 	end
@@ -2178,14 +2106,6 @@ local function applyPropertyChange(
 		stats.noops += 1
 		return
 	end
-	local packagePrepared = false
-	local function prepareMutation()
-		if not packagePrepared then
-			desyncPackageAncestors(instance, service, ctx, stats)
-			packagePrepared = true
-		end
-	end
-
 	local properties = change.properties
 	if type(properties) == "table" then
 		local unreadableNames = if type(ctx.unreadablePropertyNames) == "table"
@@ -2216,7 +2136,6 @@ local function applyPropertyChange(
 				if instance.Name == nextName then
 					stats.noops += 1
 				else
-					prepareMutation()
 					setNameForSync(instance, nextName, ctx)
 					stats.propertyUpdated += 1
 				end
@@ -2239,9 +2158,6 @@ local function applyPropertyChange(
 				if next(desired) then
 					differs = true
 				end
-				if differs then
-					prepareMutation()
-				end
 				applyTags(instance, rawValue, stats, ctx)
 			else
 				if not classHasProperty(instance, propertyName) then
@@ -2261,7 +2177,6 @@ local function applyPropertyChange(
 				if okRead and valuesEqual(current, decoded) then
 					stats.noops += 1
 				else
-					prepareMutation()
 					local okWrite, err = writePropertyForSync(instance, propertyName, decoded, ctx)
 					if not okWrite then
 						if propertyName == "MeshId" and instance:IsA("MeshPart") then
@@ -2308,7 +2223,6 @@ local function applyPropertyChange(
 			if current == nil then
 				stats.noops += 1
 			else
-				prepareMutation()
 				local okWrite, err = setAttributeForSync(instance, attributeName, nil, ctx)
 				if not okWrite then
 					local errText = string.lower(tostring(err))
@@ -2339,7 +2253,6 @@ local function applyPropertyChange(
 			if valuesEqual(current, decoded) then
 				stats.noops += 1
 			else
-				prepareMutation()
 				local okWrite, err = setAttributeForSync(instance, attributeName, decoded, ctx)
 				if not okWrite then
 					local errText = string.lower(tostring(err))
@@ -3899,7 +3812,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			nativeImport = nativeImport,
 			nativeImportServices = nativeImportServices,
 			packageSnapshotRoots = packageSnapshotRoots,
-			desyncedPackageLinks = {},
 			postCommitPropertyChanges = params.postCommitPropertyChanges or {},
 			historyRecording = beginHistoryRecording("Sync from filesystem"),
 			journalActive = false,
@@ -3920,7 +3832,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		editorTransactions[transactionId] = session
 		armSessionExpiry(editorTransactions, transactionId, session)
-		return { ok = true, transactionId = transactionId }
+		return {
+			ok = true,
+			transactionId = transactionId,
+			packageMutation = next(packageSnapshotRoots) ~= nil,
+		}
 	end
 
 	local function commitTransactionUnsafe(params: { [string]: any }): { [string]: any }

@@ -36,7 +36,7 @@ use crate::editor::review::{
     is_externally_managed_protected_write, is_user_facing_protected_write,
     local_place_path_for_bridge, protected_root_write_rows_with_live_values,
     protected_write_matches_previous, protected_write_rows_with_previous_values,
-    request_editor_push_review, request_protected_write_review,
+    request_editor_push_review, request_protected_write_review, studio_pid_for_bridge,
 };
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
@@ -72,6 +72,7 @@ struct EditorTransaction<'a> {
     bridge: &'a BridgeServer,
     id: String,
     active: bool,
+    package_mutation: bool,
 }
 
 impl<'a> EditorTransaction<'a> {
@@ -189,7 +190,7 @@ impl<'a> EditorTransaction<'a> {
         })
     }
 
-    fn upload(bridge: &BridgeServer, id: &str, mut parameters: Value) -> Result<()> {
+    fn upload(bridge: &BridgeServer, id: &str, mut parameters: Value) -> Result<Value> {
         let object = parameters
             .as_object_mut()
             .context("Editor transaction parameters must be an object")?;
@@ -257,7 +258,7 @@ impl<'a> EditorTransaction<'a> {
                 "rowCount": chunks.iter().map(Vec::len).sum::<usize>(),
             }),
         )?;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Value> {
             for (index, rows) in chunks.iter().enumerate() {
                 bridge.call(
                     "appendEditorTransactionUpload",
@@ -271,8 +272,7 @@ impl<'a> EditorTransaction<'a> {
             bridge.call(
                 "finishEditorTransactionUpload",
                 json!({ "transactionId": id }),
-            )?;
-            Ok(())
+            )
         })();
         if result.is_err() {
             let _ = bridge.call(
@@ -301,20 +301,23 @@ impl<'a> EditorTransaction<'a> {
         );
         let upload_services = services.clone();
         let parameters = Self::parameters(changes, binary_import, &id, services);
-        if let Err(error) = bridge.call("beginEditorTransaction", parameters) {
-            if !error.is::<BridgeRequestTooLarge>() {
-                return Err(error);
-            }
-            Self::upload(
+        let result = match bridge.call("beginEditorTransaction", parameters) {
+            Ok(result) => result,
+            Err(error) if error.is::<BridgeRequestTooLarge>() => Self::upload(
                 bridge,
                 &id,
                 Self::parameters(changes, binary_import, &id, upload_services),
-            )?;
-        }
+            )?,
+            Err(error) => return Err(error),
+        };
         Ok(Some(Self {
             bridge,
             id,
             active: true,
+            package_mutation: result
+                .get("packageMutation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }))
     }
 
@@ -332,6 +335,14 @@ impl<'a> EditorTransaction<'a> {
             eprintln!("[renium] native editor commit profile: {profile}");
         }
         self.active = false;
+        if self.package_mutation {
+            let dialog_result = studio_pid_for_bridge(self.bridge).and_then(|pid| {
+                crate::studio::input::accept_package_changes_dialog_when_visible(pid)
+            });
+            if let Err(error) = dialog_result {
+                eprintln!("[renium] package changes dialog remains open: {error:#}");
+            }
+        }
         Ok(())
     }
 
@@ -2097,183 +2108,6 @@ struct EditorChangedServices {
     dirty: HashSet<String>,
 }
 
-#[derive(Clone)]
-struct EditorPackageMutationTarget {
-    settings_id: Option<String>,
-    path_segments: Vec<String>,
-    path_ordinals: Vec<usize>,
-}
-
-fn editor_package_mutation_index(
-    document: &SettingsBytecode,
-    paths: &[Option<crate::editor::types::EditorInstancePath>],
-    target: &EditorPackageMutationTarget,
-) -> Option<usize> {
-    if let Some(settings_id) = target.settings_id.as_deref()
-        && let Some(index) = document_instance_index_by_settings_id(document, settings_id)
-    {
-        return Some(index);
-    }
-
-    for length in (1..=target.path_segments.len()).rev() {
-        let segments = &target.path_segments[..length];
-        let ordinals = target
-            .path_ordinals
-            .get(..length)
-            .filter(|_| !target.path_ordinals.is_empty());
-        let mut matches = paths.iter().enumerate().filter_map(|(index, path)| {
-            let path = path.as_ref()?;
-            (path.path_segments == segments
-                && ordinals.is_none_or(|ordinals| path.path_ordinals == ordinals))
-            .then_some(index)
-        });
-        let Some(index) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_none() {
-            return Some(index);
-        }
-        return None;
-    }
-
-    None
-}
-
-fn desync_changed_package_roots(
-    changes: &mut EditorChangeSet,
-    documents: &mut HashMap<String, Option<SettingsBytecode>>,
-    services: &mut EditorChangedServices,
-) -> Result<()> {
-    let mut targets = HashMap::<String, Vec<EditorPackageMutationTarget>>::new();
-    let mut push_target = |service: &str,
-                           settings_id: Option<&str>,
-                           path_segments: &[String],
-                           path_ordinals: &[usize]| {
-        if !services.reconcile.contains(service) && path_segments.len() > 1 {
-            targets
-                .entry(service.to_string())
-                .or_default()
-                .push(EditorPackageMutationTarget {
-                    settings_id: settings_id.map(str::to_string),
-                    path_segments: path_segments.to_vec(),
-                    path_ordinals: path_ordinals.to_vec(),
-                });
-        }
-    };
-
-    for change in &changes.source_changes {
-        push_target(
-            &change.service,
-            change.settings_id.as_deref(),
-            &change.path_segments,
-            &change.path_ordinals,
-        );
-    }
-    for change in &changes.property_changes {
-        push_target(
-            &change.service,
-            change.settings_id.as_deref(),
-            &change.path_segments,
-            &change.path_ordinals,
-        );
-    }
-    for change in &changes.instance_changes {
-        if change.mode == "reconcileService" {
-            continue;
-        }
-        for instance in &change.instances {
-            if instance.class_name != "PackageLink" {
-                push_target(
-                    &change.service,
-                    Some(&instance.settings_id),
-                    &instance.path_segments,
-                    &instance.path_ordinals,
-                );
-            }
-        }
-    }
-
-    let mut deletes = Vec::new();
-    for (service, service_targets) in targets {
-        let Some(document) = documents.get_mut(&service).and_then(Option::as_mut) else {
-            continue;
-        };
-        let paths = build_editor_instance_paths(document, &service);
-        let mut children = vec![Vec::new(); document.instances.len()];
-        for (index, instance) in document.instances.iter().enumerate() {
-            if let Some(parent) = instance.parent_index
-                && let Some(siblings) = children.get_mut(parent)
-            {
-                siblings.push(index);
-            }
-        }
-
-        let mut package_links = HashSet::new();
-        for target in service_targets {
-            let Some(mut current) = editor_package_mutation_index(document, &paths, &target) else {
-                continue;
-            };
-            loop {
-                let direct_links = children
-                    .get(current)
-                    .map_or(&[][..], Vec::as_slice)
-                    .iter()
-                    .copied()
-                    .filter(|index| {
-                        document
-                            .instances
-                            .get(*index)
-                            .is_some_and(|instance| instance.class_name == "PackageLink")
-                    })
-                    .collect::<Vec<_>>();
-                if !direct_links.is_empty() {
-                    package_links.extend(direct_links);
-                    break;
-                }
-                let Some(parent) = document.instances[current].parent_index else {
-                    break;
-                };
-                current = parent;
-            }
-        }
-        if package_links.is_empty() {
-            continue;
-        }
-
-        let mut package_links = package_links.into_iter().collect::<Vec<_>>();
-        package_links.sort_unstable();
-        let instances = package_links
-            .iter()
-            .filter_map(|index| {
-                let instance = document.instances.get(*index)?;
-                let path = paths.get(*index)?.as_ref()?;
-                Some(EditorInstanceDescriptor {
-                    settings_id: instance.settings_id.clone(),
-                    path_segments: path.path_segments.clone(),
-                    path_ordinals: path.path_ordinals.clone(),
-                    class_name: instance.class_name.clone(),
-                    ..EditorInstanceDescriptor::default()
-                })
-            })
-            .collect::<Vec<_>>();
-        remove_instances_at_indices(document, &package_links, true)?;
-        services.dirty.insert(service.clone());
-        deletes.push(EditorInstanceChange {
-            mode: "deleteInstances".to_string(),
-            service,
-            allow_deletes: false,
-            instances,
-            preserve_instances: Vec::new(),
-        });
-    }
-
-    if !deletes.is_empty() {
-        deletes.append(&mut changes.instance_changes);
-        changes.instance_changes = deletes;
-    }
-    Ok(())
-}
-
 fn sorted_services(services: HashSet<String>) -> Vec<String> {
     let mut services = services.into_iter().collect::<Vec<_>>();
     services.sort();
@@ -2653,7 +2487,6 @@ fn collect_editor_changes_with_link_enforcement(
         });
     }
 
-    desync_changed_package_roots(&mut changes, &mut documents, &mut changed_services)?;
     finish_editor_change_collection(
         changes,
         &documents,

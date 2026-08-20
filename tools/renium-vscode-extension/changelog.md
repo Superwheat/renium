@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.3 - 2026-08-20
+
+### Package editing
+
+- Editing scripts, properties, attributes, or children inside a Roblox package no longer removes its `PackageLink`.
+- Renium accepts Studio's package-edit warning without taking over keyboard or mouse input on Windows and macOS.
+
+### Studio plugin
+
+- The Studio toolbar shows the Renium icon again.
+
 ## 0.2.2 - 2026-08-20
 
 ### Agent guidance
