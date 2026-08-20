@@ -36,7 +36,6 @@ use crate::roblox::schema::{
     MATERIAL_SERVICE_CLASS, PropertySchemaEntry, PropertySchemaMap, USE_2022_MATERIALS_PROPERTY,
 };
 use crate::studio::bridge::BridgeServer;
-#[cfg(any(windows, target_os = "macos"))]
 use crate::studio::bridge::BridgeTarget;
 #[cfg(windows)]
 use crate::studio::input as input_inject;
@@ -887,11 +886,10 @@ pub(crate) fn protected_root_write_rows_with_live_values(
     Err(rows)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn studio_pid_for_bridge(bridge: &BridgeServer) -> Result<u32> {
     #[cfg(windows)]
     let target = BridgeTarget::Main;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(windows))]
     let target = BridgeTarget::Edit;
     bridge.studio_pid_for_selector(target, None)
 }
