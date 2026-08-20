@@ -1067,7 +1067,7 @@ fn automation_response(
         let _guard = bridge.acquire_request_gate();
         automation_execute_request(&request, state, bridge, bridge_wait_seconds)
     };
-    match result {
+    let response = match result {
         Ok(result) => automation::Response::success(request.id, started, result),
         Err(failure) => {
             let response = automation::Response::failure(request.id, started, failure);
@@ -1079,7 +1079,8 @@ fn automation_response(
             }
             response
         }
-    }
+    };
+    response.with_update(state.available_update())
 }
 
 pub(crate) fn automation_parse_response(

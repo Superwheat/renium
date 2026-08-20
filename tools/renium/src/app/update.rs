@@ -32,7 +32,7 @@ mod check;
 #[derive(Args)]
 pub struct UpdateArgs {
     #[command(subcommand)]
-    pub command: UpdateCommand,
+    pub command: Option<UpdateCommand>,
 }
 
 #[derive(Subcommand)]
@@ -61,6 +61,19 @@ pub struct UpdateApplyArgs {
     pub extension_root: Option<PathBuf>,
     #[arg(long, requires = "extension_root")]
     pub editor_cli: Option<PathBuf>,
+}
+
+impl Default for UpdateApplyArgs {
+    fn default() -> Self {
+        Self {
+            manifest: DEFAULT_UPDATE_MANIFEST.to_string(),
+            component: Vec::new(),
+            dry_run: false,
+            force: false,
+            extension_root: None,
+            editor_cli: None,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -525,7 +538,10 @@ fn validate_update_helper_reservation_for_current_process() -> Result<()> {
 }
 
 pub fn run_update(args: UpdateArgs) -> Result<()> {
-    match args.command {
+    match args
+        .command
+        .unwrap_or_else(|| UpdateCommand::Apply(UpdateApplyArgs::default()))
+    {
         UpdateCommand::Check(args) => {
             let manifest = check::manifest(&args.manifest)?;
             let current = Version::parse(crate::app::build::VERSION).with_context(|| {
@@ -683,12 +699,20 @@ fn parse_manifest(bytes: &[u8]) -> Result<SignedUpdateManifest> {
     Ok(manifest)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn latest_release_version() -> Result<String> {
     let manifest = check::manifest(DEFAULT_UPDATE_MANIFEST)?;
     Version::parse(&manifest.payload.version)
         .with_context(|| format!("Invalid release version {}", manifest.payload.version))?;
     Ok(manifest.payload.version)
+}
+
+pub(crate) fn available_release_version() -> Result<Option<String>> {
+    let current = Version::parse(crate::app::build::VERSION)
+        .with_context(|| format!("Invalid current version {}", crate::app::build::VERSION))?;
+    let latest = latest_release_version()?;
+    let parsed =
+        Version::parse(&latest).with_context(|| format!("Invalid release version {latest}"))?;
+    Ok((parsed > current).then_some(latest))
 }
 
 fn verify_manifest(manifest: &SignedUpdateManifest) -> Result<()> {

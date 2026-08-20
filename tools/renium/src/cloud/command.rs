@@ -33,6 +33,66 @@ pub(crate) struct OpenCloudArgs {
 
 #[derive(Subcommand)]
 enum OpenCloudCommand {
+    #[command(about = "Show the active API key's scopes and resource limits")]
+    Key,
+    #[command(about = "List native Open Cloud operations")]
+    Routes(super::routes::RoutesArgs),
+    #[command(about = "Manage persistent data stores")]
+    Data(super::routes::RouteArgs),
+    #[command(about = "Manage ordered data stores")]
+    Ordered(super::routes::RouteArgs),
+    #[command(about = "Manage queues and sorted memory maps")]
+    Memory(super::routes::RouteArgs),
+    #[command(about = "Read or update the current universe")]
+    Universe(super::routes::RouteArgs),
+    #[command(about = "Read or update the current place")]
+    Place(super::routes::RouteArgs),
+    #[command(about = "Manage user restrictions")]
+    Restriction(super::routes::RouteArgs),
+    #[command(about = "Manage universe secrets")]
+    Secret(super::routes::RouteArgs),
+    #[command(about = "Send experience notifications")]
+    Notification(super::routes::RouteArgs),
+    #[command(about = "Manage advertising campaigns")]
+    Advertising(super::routes::RouteArgs),
+    #[command(about = "Query experience analytics")]
+    Analytics(super::routes::RouteArgs),
+    #[command(about = "Generate user avatar thumbnails")]
+    Avatar(super::routes::RouteArgs),
+    #[command(about = "Manage experience badges")]
+    Badge(super::routes::RouteArgs),
+    #[command(about = "Manage experience experiments")]
+    Experiment(super::routes::RouteArgs),
+    #[command(about = "Manage experience events")]
+    Event(super::routes::RouteArgs),
+    #[command(about = "Use Roblox generative services")]
+    Ai(super::routes::RouteArgs),
+    #[command(about = "Manage matchmaking configuration")]
+    Matchmaking(super::routes::RouteArgs),
+    #[command(about = "Manage personalized thumbnails")]
+    Thumbnail(super::routes::RouteArgs),
+    #[command(about = "Read users, inventories, and subscriptions")]
+    User(super::routes::RouteArgs),
+    #[command(about = "Manage groups and memberships")]
+    Group(super::routes::RouteArgs),
+    #[command(about = "Manage localized experience content")]
+    Localization(super::routes::RouteArgs),
+    #[command(about = "Manage followed experiences")]
+    Interaction(super::routes::RouteArgs),
+    #[command(about = "Manage Team Create")]
+    Team(super::routes::RouteArgs),
+    #[command(about = "Manage uploaded assets")]
+    Asset(super::routes::RouteArgs),
+    #[command(name = "creator-store", about = "Manage Creator Store products")]
+    CreatorStore(super::routes::RouteArgs),
+    #[command(about = "Manage game passes")]
+    Pass(super::routes::RouteArgs),
+    #[command(about = "Manage experience configuration repositories")]
+    Config(super::routes::RouteArgs),
+    #[command(about = "Run Open Cloud Luau tasks")]
+    Luau(super::routes::RouteArgs),
+    #[command(about = "Manage live experience servers")]
+    Server(super::routes::RouteArgs),
     #[command(about = "Call any Roblox Open Cloud endpoint")]
     Request(Box<OpenCloudRequestArgs>),
     #[command(about = "Run a batch from JSON on stdin or disk")]
@@ -125,7 +185,55 @@ struct ImageUploadArgs {
 
 pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
     let identity = discover_identity(project, args.universe, args.place_id)?;
+    let key_env = args.key_env.clone();
+    let oauth_env = args.oauth_env.clone();
+    let anonymous = args.anonymous;
+    let native = |category, route| {
+        run_route(
+            category,
+            identity,
+            &key_env,
+            oauth_env.as_deref(),
+            anonymous,
+            route,
+        )
+    };
     let result = match args.command {
+        OpenCloudCommand::Key => {
+            if anonymous || oauth_env.is_some() {
+                bail!("cloud key requires an API key");
+            }
+            super::introspect_key(&key_env).map_err(cloud_error)?
+        }
+        OpenCloudCommand::Routes(routes) => super::routes::list(routes)?,
+        OpenCloudCommand::Data(route) => native("data", route)?,
+        OpenCloudCommand::Ordered(route) => native("ordered", route)?,
+        OpenCloudCommand::Memory(route) => native("memory", route)?,
+        OpenCloudCommand::Universe(route) => native("universe", route)?,
+        OpenCloudCommand::Place(route) => native("place", route)?,
+        OpenCloudCommand::Restriction(route) => native("restriction", route)?,
+        OpenCloudCommand::Secret(route) => native("secret", route)?,
+        OpenCloudCommand::Notification(route) => native("notification", route)?,
+        OpenCloudCommand::Advertising(route) => native("advertising", route)?,
+        OpenCloudCommand::Analytics(route) => native("analytics", route)?,
+        OpenCloudCommand::Avatar(route) => native("avatar", route)?,
+        OpenCloudCommand::Badge(route) => native("badge", route)?,
+        OpenCloudCommand::Experiment(route) => native("experiment", route)?,
+        OpenCloudCommand::Event(route) => native("event", route)?,
+        OpenCloudCommand::Ai(route) => native("ai", route)?,
+        OpenCloudCommand::Matchmaking(route) => native("matchmaking", route)?,
+        OpenCloudCommand::Thumbnail(route) => native("thumbnail", route)?,
+        OpenCloudCommand::User(route) => native("user", route)?,
+        OpenCloudCommand::Group(route) => native("group", route)?,
+        OpenCloudCommand::Localization(route) => native("localization", route)?,
+        OpenCloudCommand::Interaction(route) => native("interaction", route)?,
+        OpenCloudCommand::Team(route) => native("team", route)?,
+        OpenCloudCommand::Asset(route) => native("asset", route)?,
+        OpenCloudCommand::CreatorStore(route) => native("creator-store", route)?,
+        OpenCloudCommand::Pass(route) => native("pass", route)?,
+        OpenCloudCommand::Config(route) => native("config", route)?,
+        OpenCloudCommand::Luau(route) => native("luau", route)?,
+        OpenCloudCommand::Server(route) => native("server", route)?,
         OpenCloudCommand::Request(request) => request_command(
             identity,
             &args.key_env,
@@ -185,6 +293,20 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
         }
     };
     app::output::print_json_output(&result, true)
+}
+
+fn run_route(
+    category: &str,
+    identity: CloudIdentity,
+    key_env: &str,
+    oauth_env: Option<&str>,
+    anonymous: bool,
+    route: super::routes::RouteArgs,
+) -> Result<Value> {
+    if anonymous {
+        bail!("Native Open Cloud commands require API key or OAuth authentication");
+    }
+    super::routes::run(category, identity, key_env, oauth_env, route)
 }
 
 fn discover_identity(

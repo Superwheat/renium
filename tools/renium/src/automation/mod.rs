@@ -134,6 +134,8 @@ pub struct Response {
     pub ok: u8,
     pub ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub u: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub r: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub e: Option<ProtocolError>,
@@ -146,6 +148,7 @@ impl Response {
             id,
             ok: 1,
             ms: started.elapsed().as_secs_f64() * 1000.0,
+            u: None,
             r: Some(result),
             e: None,
         }
@@ -157,9 +160,15 @@ impl Response {
             id,
             ok: 0,
             ms: started.elapsed().as_secs_f64() * 1000.0,
+            u: None,
             r: None,
             e: Some(failure.0),
         }
+    }
+
+    pub fn with_update(mut self, version: Option<String>) -> Self {
+        self.u = version;
+        self
     }
 }
 
@@ -213,6 +222,7 @@ pub struct State {
     next_review: AtomicU64,
     contexts: Mutex<HashMap<u64, BoundContext>>,
     reviews: Mutex<HashMap<String, Review>>,
+    available_update: Mutex<Option<String>>,
 }
 
 impl Default for State {
@@ -222,11 +232,26 @@ impl Default for State {
             next_review: AtomicU64::new(1),
             contexts: Mutex::new(HashMap::new()),
             reviews: Mutex::new(HashMap::new()),
+            available_update: Mutex::new(None),
         }
     }
 }
 
 impl State {
+    pub fn set_available_update(&self, version: Option<String>) {
+        *self
+            .available_update
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = version;
+    }
+
+    pub fn available_update(&self) -> Option<String> {
+        self.available_update
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn insert_context(&self, mut context: BoundContext) -> BoundContext {
         let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = contexts
@@ -339,6 +364,11 @@ mod tests {
         assert_eq!(value["ok"], 1);
         assert!(value.get("command").is_none());
         assert!(value.get("elapsedMs").is_none());
+        assert!(value.get("u").is_none());
+
+        let response =
+            Response::success(7, Instant::now(), json!({})).with_update(Some("0.3.0".to_string()));
+        assert_eq!(serde_json::to_value(response).unwrap()["u"], "0.3.0");
     }
 
     #[test]

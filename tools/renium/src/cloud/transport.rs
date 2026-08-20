@@ -277,6 +277,38 @@ pub(crate) fn execute_one(
         })
 }
 
+pub(crate) fn introspect_key(key_env: &str) -> Result<Value, Failure> {
+    let key = required_secret(key_env, "cloud key")?;
+    let result = agent()
+        .post(&format!("{API_ROOT}/api-keys/v1/introspect"))
+        .send_json(json!({ "apiKey": key }));
+    let response = match result {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => read_response(response)
+            .map_err(|message| Failure::new("cloud_http", message, false, "cloud key"))?,
+        Err(ureq::Error::Transport(error)) => {
+            return Err(Failure::new(
+                "cloud_http",
+                format!("Open Cloud key introspection failed: {error}"),
+                true,
+                "cloud key",
+            ));
+        }
+    };
+    if !(200..300).contains(&response.status) {
+        return Err(Failure::new(
+            "cloud_auth",
+            format!(
+                "Open Cloud key introspection returned HTTP {}",
+                response.status
+            ),
+            false,
+            "cloud key",
+        )
+        .detail(json!({ "status": response.status, "body": response.body })));
+    }
+    Ok(response.body)
+}
+
 pub(crate) fn upload_file(
     url: &str,
     auth: &CloudAuth,
@@ -350,9 +382,9 @@ fn execute_request(
             "cloud request {index} has more than one body type"
         )));
     }
-    if request.content_type.is_some() && request.raw_file.is_none() {
+    if request.content_type.is_some() && request.raw_file.is_none() && request.body.is_none() {
         return Err(bad_request(format!(
-            "cloud request {index} uses contentType without rawFile"
+            "cloud request {index} uses contentType without a body"
         )));
     }
     let multipart =
@@ -378,6 +410,16 @@ fn execute_request(
         .map(|path| raw_body(path, request.content_type.as_deref()))
         .transpose()
         .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?;
+    let custom_json = request
+        .body
+        .as_ref()
+        .zip(request.content_type.as_deref())
+        .map(|(body, content_type)| {
+            serde_json::to_vec(body)
+                .map(|body| (content_type, body))
+                .map_err(|error| bad_request(format!("cloud request {index}: {error}")))
+        })
+        .transpose()?;
     let headers = request
         .headers
         .iter()
@@ -423,21 +465,30 @@ fn execute_request(
         for (name, value) in &headers {
             outgoing = outgoing.set(name, value);
         }
-        match (&request.body, &multipart, &url_encoded, &raw) {
-            (Some(body), _, _, _) => outgoing.send_json(body.clone()),
-            (None, Some((boundary, body)), _, _) => outgoing
+        match (
+            &request.body,
+            &multipart,
+            &url_encoded,
+            &raw,
+            custom_json.as_ref(),
+        ) {
+            (Some(_), _, _, _, Some((content_type, body))) => {
+                outgoing.set("Content-Type", content_type).send_bytes(body)
+            }
+            (Some(body), _, _, _, None) => outgoing.send_json(body.clone()),
+            (None, Some((boundary, body)), _, _, _) => outgoing
                 .set(
                     "Content-Type",
                     &format!("multipart/form-data; boundary={boundary}"),
                 )
                 .send_bytes(body),
-            (None, None, Some(body), _) => outgoing
+            (None, None, Some(body), _, _) => outgoing
                 .set("Content-Type", "application/x-www-form-urlencoded")
                 .send_bytes(body),
-            (None, None, None, Some((content_type, body))) => {
+            (None, None, None, Some((content_type, body)), _) => {
                 outgoing.set("Content-Type", content_type).send_bytes(body)
             }
-            (None, None, None, None) => outgoing.call(),
+            (None, None, None, None, _) => outgoing.call(),
         }
         .map_err(Box::new)
     };

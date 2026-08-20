@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,8 @@ use crate::daemon::transport::{
     DAEMON_CONTROL_RESPONSE_TIMEOUT, MAX_DAEMON_LINE_BYTES, read_bounded_line,
 };
 use crate::system::files::absolutize_for_daemon;
+
+static UPDATE_NOTICE_PRINTED: AtomicBool = AtomicBool::new(false);
 
 fn transport_failure(id: u64, error: anyhow::Error) -> super::Response {
     super::Response::failure(
@@ -343,7 +346,18 @@ fn send_on_stream_with_timeout(
         BoundedLineRead::Eof => bail!("Renium daemon closed the connection before responding"),
         BoundedLineRead::TooLong => bail!("Renium daemon response exceeded the protocol limit"),
     }
-    serde_json::from_str(line.trim()).context("Invalid Renium daemon response")
+    let response = serde_json::from_str(line.trim()).context("Invalid Renium daemon response")?;
+    print_update_notice(&response);
+    Ok(response)
+}
+
+fn print_update_notice(response: &super::Response) {
+    let Some(version) = response.u.as_deref() else {
+        return;
+    };
+    if !UPDATE_NOTICE_PRINTED.swap(true, Ordering::Relaxed) {
+        eprintln!("[renium] update available: {version}; run `rbx update` to install it");
+    }
 }
 
 pub(crate) fn shared_daemon_available() -> bool {

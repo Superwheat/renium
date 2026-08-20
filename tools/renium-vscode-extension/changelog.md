@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.5 - 2026-08-20
+
+### Updates
+
+- Agent commands report when a newer Renium version is available and include the command that installs it.
+
+### Roblox Open Cloud
+
+- Persistent and ordered data, memory stores, universes, places, messages, servers, restrictions, secrets, notifications, users, inventories, groups, social interactions, Team Create, assets, passes, Creator Store, localization, configs, analytics, ads, experiments, events, matchmaking, thumbnails, and speech generation have direct `rbx cloud` commands.
+- Open Cloud work no longer requires endpoint paths or temporary JSON payload files for supported operations.
+- API-key scopes and resource limits can be checked without exposing the key, including user-owned, dedicated group-automation, and resource-restricted keys.
+
 ## 0.2.4 - 2026-08-20
 
 ### Roblox Open Cloud

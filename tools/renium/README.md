@@ -466,6 +466,7 @@ release components from a signed manifest:
 rbx setup --status
 rbx setup --repair
 rbx setup --uninstall
+rbx update
 rbx update check
 rbx update apply --component all --dry-run
 rbx doctor --json
@@ -524,20 +525,32 @@ wait for Studio, or require a bound automation context. `{universe}` and
 `{place}` come from the current Renium project when available:
 
 ```powershell
-rbx cloud request get /cloud/v2/universes/{universe}/data-stores --query maxPageSize=25
+rbx cloud key
+rbx cloud data stores --limit 25
+rbx cloud data get PlayerData user-42
+rbx cloud universe message updates refresh
+rbx cloud user inventory 42 --limit 25
 rbx cloud product create "Refresh Daily Rewards" --price 27 --for-sale --regional-pricing
+rbx cloud place publish place.rbxl
 ```
 
 Set `ROBLOX_API_KEY` in the environment. On Windows, Renium also checks the
 current user's saved environment when the parent application has stale values.
 Use `--oauth-env ENV` to send a bearer token stored in another environment
 variable. Credentials aren't accepted in payloads or command arguments.
-Developer product create and update use
-Roblox's multipart API and read the product back after a successful mutation.
-The generic request command supports JSON fields, query parameters, multipart
-text/JSON/file parts, URL-encoded fields, raw file bodies, endpoint-specific
-headers, conditional headers, explicit path parameters, and binary response
-files. Nested or batched requests can be piped to `rbx cloud batch -J -`.
+`rbx cloud key` reports the active API key's scopes and allowed resource targets
+without printing the credential. User-owned keys, keys stored for dedicated
+group automation accounts, and resource-restricted keys use the same commands;
+Roblox enforces their owner permissions, scopes, and target restrictions. Use
+`--key-env ENV` to select another stored API key.
+Native resource commands cover data and memory stores, universes and places,
+messages and servers, restrictions, secrets, notifications, users and
+inventories, groups, social interactions, Team Create, assets, passes, Creator
+Store, localization, configs, Luau tasks, analytics, advertising, experiments,
+events, matchmaking, avatar and asset thumbnails, speech generation, and
+thumbnail personalization. `rbx cloud routes [CATEGORY]` lists their short
+operations. The generic request and batch commands remain available for Roblox
+endpoints introduced after the installed Renium version.
 
 The automation API also covers the plugin-accessible Creator features used by
 Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
