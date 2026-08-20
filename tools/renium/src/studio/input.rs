@@ -1,5 +1,9 @@
 use anyhow::{Result, bail};
 
+#[cfg(any(windows, target_os = "macos"))]
+const PACKAGE_CHANGES_MESSAGE: &str =
+    "Modifying packages disables auto-update until you publish or revert the changes";
+
 #[cfg(windows)]
 #[path = "input/windows_shield.rs"]
 mod windows_shield;
@@ -95,6 +99,16 @@ pub fn close_device_emulator_toolbar(pid: u32) -> Result<bool> {
 #[cfg(any(windows, target_os = "macos"))]
 pub fn close_device_emulator_toolbar_when_visible(pid: u32) -> Result<bool> {
     platform::close_device_emulator_toolbar_when_visible(pid)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
+    platform::accept_package_changes_dialog_when_visible(pid)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn accept_package_changes_dialog_when_visible(_pid: u32) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -324,7 +338,7 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 
 #[cfg(windows)]
 mod platform {
-    use super::{StudioWindow, ThreadDpiAwareness, windows_shield};
+    use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, windows_shield};
     use anyhow::{Context, Result, bail};
 
     use windows::Win32::Foundation::{HWND as AutomationHwnd, RPC_E_CHANGED_MODE};
@@ -335,7 +349,7 @@ mod platform {
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_InvokePatternId,
+        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_InvokePatternId, UIA_NamePropertyId,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
@@ -362,7 +376,6 @@ mod platform {
 
     const MK_LBUTTON: WPARAM = 0x0001;
     const MK_RBUTTON: WPARAM = 0x0002;
-
     pub struct WindowHandle {
         viewport: isize,
         capture: isize,
@@ -1043,6 +1056,46 @@ mod platform {
         Ok(None)
     }
 
+    fn package_changes_ok_button(
+        automation: &IUIAutomation,
+        top: isize,
+    ) -> Result<Option<IUIAutomationElement>> {
+        let message_condition = unsafe {
+            automation
+                .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("Message"))
+        }
+        .context("Could not create the package dialog message query")?;
+        let ok_condition =
+            unsafe { automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from("OK")) }
+                .context("Could not create the package dialog button query")?;
+        for (dialog, title) in modal_dialogs(top) {
+            if title != "Roblox Studio" {
+                continue;
+            }
+            let root = unsafe {
+                automation.ElementFromHandle(AutomationHwnd(dialog as *mut core::ffi::c_void))
+            }
+            .context("Could not inspect a Studio dialog")?;
+            let Ok(message) =
+                (unsafe { root.FindFirst(TreeScope_Descendants, &message_condition) })
+            else {
+                continue;
+            };
+            let Ok(message) = (unsafe { message.CurrentName() }) else {
+                continue;
+            };
+            if message != PACKAGE_CHANGES_MESSAGE {
+                continue;
+            }
+            let Ok(button) = (unsafe { root.FindFirst(TreeScope_Descendants, &ok_condition) })
+            else {
+                continue;
+            };
+            return Ok(Some(button));
+        }
+        Ok(None)
+    }
+
     fn device_emulator_toolbar(pid: u32, close: bool) -> Result<bool> {
         let (top, _, _) = main_studio_window(pid)?;
         let _com = ComGuard::initialize()?;
@@ -1083,6 +1136,32 @@ mod platform {
                 return close_device_emulator_toolbar(pid);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(false)
+    }
+
+    pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
+        let (top, _, _) = main_studio_window(pid)?;
+        let _com = ComGuard::initialize()?;
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .context("Could not start Windows UI Automation")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if let Some(button) = package_changes_ok_button(&automation, top)? {
+                let invoke: IUIAutomationInvokePattern =
+                    unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
+                        .context("The package changes OK button is not invokable")?;
+                unsafe { invoke.Invoke() }.context("Could not accept package changes")?;
+                while std::time::Instant::now() < deadline {
+                    if package_changes_ok_button(&automation, top)?.is_none() {
+                        return Ok(true);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                bail!("Studio did not close the package changes dialog")
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(false)
     }
@@ -1412,7 +1491,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::StudioWindow;
+    use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow};
     use anyhow::{Result, bail};
     use std::ffi::c_void;
 
@@ -1549,6 +1628,8 @@ mod platform {
             buffer_size: isize,
             encoding: u32,
         ) -> bool;
+        fn CFGetTypeID(value: CFTypeRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
         fn CFNumberGetValue(number: CFNumberRef, number_type: isize, value: *mut c_void) -> bool;
         fn CFRetain(value: CFTypeRef) -> CFTypeRef;
         fn CFRelease(value: CFTypeRef);
@@ -1613,7 +1694,12 @@ mod platform {
         if value.is_null() {
             return None;
         }
+        // SAFETY: value is a valid Core Foundation object returned by a copy/query API.
+        if unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+            return None;
+        }
         let mut bytes = [0u8; 256];
+        // SAFETY: the type check above proves that value is a CFString.
         unsafe {
             if !CFStringGetCString(
                 value,
@@ -1642,19 +1728,23 @@ mod platform {
     }
 
     fn ax_identifier(element: AXUIElementRef) -> Option<String> {
-        let value = ax_attribute(element, "AXIdentifier")?;
-        let identifier = cf_string_value(value);
-        // SAFETY: AXUIElementCopyAttributeValue returned an owned Core Foundation object.
-        unsafe { CFRelease(value) };
-        identifier
+        ax_string_attribute(element, "AXIdentifier")
     }
 
-    fn find_ax_identifier(
+    fn ax_string_attribute(element: AXUIElementRef, name: &str) -> Option<String> {
+        let value = ax_attribute(element, name)?;
+        let string = cf_string_value(value);
+        // SAFETY: AXUIElementCopyAttributeValue returned an owned Core Foundation object.
+        unsafe { CFRelease(value) };
+        string
+    }
+
+    fn find_ax_element(
         element: AXUIElementRef,
-        target: &str,
         depth: usize,
+        matches: &impl Fn(AXUIElementRef) -> bool,
     ) -> Option<AXUIElementRef> {
-        if ax_identifier(element).as_deref() == Some(target) {
+        if matches(element) {
             // SAFETY: element remains valid while retained for the caller.
             return Some(unsafe { CFRetain(element) });
         }
@@ -1667,7 +1757,7 @@ mod platform {
         for index in 0..count {
             // SAFETY: index is within the CFArray count read above.
             let child = unsafe { CFArrayGetValueAtIndex(children, index) };
-            if let Some(found) = find_ax_identifier(child, target, depth - 1) {
+            if let Some(found) = find_ax_element(child, depth - 1, matches) {
                 // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
                 unsafe { CFRelease(children) };
                 return Some(found);
@@ -1678,7 +1768,36 @@ mod platform {
         None
     }
 
-    fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {
+    fn find_ax_identifier(
+        element: AXUIElementRef,
+        target: &str,
+        depth: usize,
+    ) -> Option<AXUIElementRef> {
+        find_ax_element(element, depth, &|element| {
+            ax_identifier(element).as_deref() == Some(target)
+        })
+    }
+
+    fn find_ax_text(element: AXUIElementRef, target: &str, depth: usize) -> Option<AXUIElementRef> {
+        find_ax_element(element, depth, &|element| {
+            ax_string_attribute(element, "AXValue").as_deref() == Some(target)
+                || ax_string_attribute(element, "AXTitle").as_deref() == Some(target)
+                || ax_string_attribute(element, "AXDescription").as_deref() == Some(target)
+        })
+    }
+
+    fn find_ax_button(
+        element: AXUIElementRef,
+        title: &str,
+        depth: usize,
+    ) -> Option<AXUIElementRef> {
+        find_ax_element(element, depth, &|element| {
+            ax_string_attribute(element, "AXRole").as_deref() == Some("AXButton")
+                && ax_string_attribute(element, "AXTitle").as_deref() == Some(title)
+        })
+    }
+
+    fn ax_application(pid: i32) -> Result<AXUIElementRef> {
         // SAFETY: this read-only system query has no preconditions.
         if !unsafe { AXIsProcessTrusted() } {
             bail!("Renium needs macOS Accessibility permission to inspect Studio controls");
@@ -1688,6 +1807,11 @@ mod platform {
         if application.is_null() {
             bail!("Could not inspect the Studio accessibility tree");
         }
+        Ok(application)
+    }
+
+    fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {
+        let application = ax_application(pid)?;
         let device_list = find_ax_identifier(application, "DeviceList", 32);
         Ok((application, device_list))
     }
@@ -1768,6 +1892,91 @@ mod platform {
                 return close_device_emulator_toolbar(pid);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(false)
+    }
+
+    fn package_changes_message(application: AXUIElementRef) -> Option<AXUIElementRef> {
+        let windows = ax_attribute(application, "AXWindows")? as CFArrayRef;
+        // SAFETY: AXWindows is an owned CFArray whose entries remain valid while it is retained.
+        let count = unsafe { CFArrayGetCount(windows) };
+        for index in 0..count {
+            // SAFETY: index is within the CFArray count read above.
+            let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
+            if let Some(message) = find_ax_text(window, PACKAGE_CHANGES_MESSAGE, 16) {
+                // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+                unsafe { CFRelease(windows) };
+                return Some(message);
+            }
+        }
+        // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+        unsafe { CFRelease(windows) };
+        None
+    }
+
+    fn package_changes_ok_button(pid: i32) -> Result<Option<AXUIElementRef>> {
+        let application = ax_application(pid)?;
+        let Some(message) = package_changes_message(application) else {
+            // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+            unsafe { CFRelease(application) };
+            return Ok(None);
+        };
+        let mut ancestor = ax_attribute(message, "AXParent");
+        // SAFETY: find_ax_text returned a retained accessibility element.
+        unsafe { CFRelease(message) };
+        let mut button = None;
+        for _ in 0..8 {
+            let Some(current) = ancestor.take() else {
+                break;
+            };
+            let role = ax_string_attribute(current, "AXRole");
+            let dialog_root = matches!(role.as_deref(), Some("AXDialog" | "AXSheet" | "AXWindow"));
+            button = find_ax_button(current, "OK", 12);
+            if button.is_none() && !dialog_root {
+                ancestor = ax_attribute(current, "AXParent");
+            }
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned accessibility element.
+            unsafe { CFRelease(current) };
+            if button.is_some() || dialog_root {
+                break;
+            }
+        }
+        if let Some(ancestor) = ancestor {
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned accessibility element.
+            unsafe { CFRelease(ancestor) };
+        }
+        // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+        unsafe { CFRelease(application) };
+        Ok(button)
+    }
+
+    pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if let Some(button) = package_changes_ok_button(pid)? {
+                let action = cf_string("AXPress");
+                // SAFETY: button and action are valid retained accessibility objects.
+                let result = unsafe { AXUIElementPerformAction(button, action) };
+                // SAFETY: these Core Foundation objects are owned by this function.
+                unsafe {
+                    CFRelease(action);
+                    CFRelease(button);
+                }
+                if result != 0 {
+                    bail!("Could not accept package changes (AXError {result})");
+                }
+                while std::time::Instant::now() < deadline {
+                    let Some(button) = package_changes_ok_button(pid)? else {
+                        return Ok(true);
+                    };
+                    // SAFETY: package_changes_ok_button returned a retained accessibility element.
+                    unsafe { CFRelease(button) };
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                bail!("Studio did not close the package changes dialog")
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Ok(false)
     }
