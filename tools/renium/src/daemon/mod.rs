@@ -115,12 +115,13 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     }
     #[cfg(windows)]
     crate::studio::input::watch_auto_recovery_dialogs();
+    let automation_state = Arc::new(automation::State::default());
+    check_for_available_update(Arc::clone(&automation_state));
     let bridge_host = normalize_loopback_host(&args.bridge.host)?;
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, listen_metrics) =
         BridgeServer::listen_daemon(&bridge_host, &ports, args.bridge.wait_seconds)?;
     let bridge = Arc::new(bridge);
-    let automation_state = Arc::new(automation::State::default());
     spawn_daemon_control_server(
         &bridge_host,
         args.control_port,
@@ -150,6 +151,18 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     bridge.alive.store(false, Ordering::Relaxed);
     println!("[renium] daemon stopped");
     Ok(())
+}
+
+fn check_for_available_update(state: Arc<automation::State>) {
+    thread::spawn(move || match update::available_release_version() {
+        Ok(version) => {
+            if let Some(version) = version.as_deref() {
+                eprintln!("[renium] update available: {version}; run `rbx update` to install it");
+            }
+            state.set_available_update(version);
+        }
+        Err(error) => eprintln!("[renium] update check failed: {error:#}"),
+    });
 }
 
 fn spawn_daemon_control_server(

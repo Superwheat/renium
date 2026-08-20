@@ -23,6 +23,7 @@ Read only the relevant guides. Read several when a task crosses categories. Don'
 ## Rules
 
 - Use direct `rbx` commands for normal work. They reuse the editor daemon or connect to Studio themselves.
+- When Renium reports an available update, tell the user. Run `rbx update` only when the user asks to install it.
 - Don't start `rbx bd`, inspect daemon state, inspect CLI usage, or bind a context before a direct command.
 - Don't create JSON payload files. Use direct flags; pipe JSON to `rbx a ... -J -` only for structured operations without a direct command.
 - Read an existing target before changing it. Don't preflight a uniquely named temporary file or instance; create it, then reuse successful writes and returned IDs or paths without rereading them. Pull creates a new snapshot, so find existing IDs again afterward.
