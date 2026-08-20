@@ -118,6 +118,10 @@ fn write_script_package_settings(service_dir: &Path, source: &str) -> PathBuf {
     settings_path
 }
 
+fn test_cframe(components: [f64; 12]) -> Value {
+    json!({ "_type": "CFrame", "components": components })
+}
+
 fn setup_package_delete(name: &str, source: &str) -> (PathBuf, PathBuf) {
     let dir = temp_dir(name);
     let service_dir = dir.join("src").join("ReplicatedStorage");
@@ -774,6 +778,106 @@ fn link_apply_writable_package_target_preserves_local_edits() {
         "local edit inside writable package target must survive link-apply"
     );
 
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn linked_model_keeps_renamed_root_and_world_transform() {
+    let dir = temp_dir("linked-model-placement");
+    let src_root = dir.join("src");
+    let service_dir = src_root.join("ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    let package_dir = dir.join("links");
+    fs::create_dir_all(&package_dir).unwrap();
+    let package_path = package_dir.join("pkg.renium");
+    let source_pivot = test_cframe([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let source_part = test_cframe([1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    settings_document(vec![
+        SettingsBytecodeInstance {
+            settings_id: "model".into(),
+            name: "Pkg".into(),
+            class_name: "Model".into(),
+            parent_index: None,
+            properties: Map::from_iter([("WorldPivot".into(), source_pivot)]),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "part".into(),
+            name: "Part".into(),
+            class_name: "Part".into(),
+            parent_index: Some(0),
+            properties: Map::from_iter([("CFrame".into(), source_part)]),
+            attributes: Map::new(),
+        },
+    ])
+    .write_file(&package_path)
+    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+
+    let settings_path = service_settings_path(&service_dir);
+    let mut document = SettingsBytecode::read_file(&settings_path).unwrap();
+    let model = resolve_editor_instance_by_path_ordinals(
+        &document,
+        "ReplicatedStorage",
+        &["Pkg".into()],
+        &[1],
+    )
+    .unwrap();
+    let part = document
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index == Some(model) && instance.name == "Part")
+        .unwrap();
+    let moved_pivot = test_cframe([
+        10.0, 20.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    let moved_part = test_cframe([
+        10.0, 21.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    document.instances[model].name = "Renamed".into();
+    document.instances[model]
+        .properties
+        .insert("WorldPivot".into(), moved_pivot.clone());
+    document.instances[part]
+        .properties
+        .insert("CFrame".into(), moved_part.clone());
+    document.write_file(&settings_path).unwrap();
+
+    let mut package = SettingsBytecode::read_file(&package_path).unwrap();
+    package.instances[1]
+        .properties
+        .insert("Transparency".into(), json!(0.5));
+    package.write_file(&package_path).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+
+    let document = SettingsBytecode::read_file(&settings_path).unwrap();
+    let model = resolve_editor_instance_by_path_ordinals(
+        &document,
+        "ReplicatedStorage",
+        &["Renamed".into()],
+        &[1],
+    )
+    .unwrap();
+    let part = document
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index == Some(model) && instance.name == "Part")
+        .unwrap();
+    assert_eq!(
+        document.instances[model].properties["WorldPivot"],
+        moved_pivot
+    );
+    assert_eq!(document.instances[part].properties["CFrame"], moved_part);
+    assert_eq!(
+        document.instances[part].properties["Transparency"],
+        json!(0.5)
+    );
+    let manifest = read_link_manifest(&dir.join("renium-link.json")).unwrap();
+    assert_eq!(
+        link_target_segments(&manifest.links[0].targets[0]),
+        ["Renamed"]
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

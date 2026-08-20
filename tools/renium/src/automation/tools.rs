@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,17 +7,14 @@ use walkdir::WalkDir;
 
 use crate::automation::{BoundContext, Failure, op};
 use crate::cli::{
-    AssetInsertArgs, AssetSearchArgs, GenerateModelArgs, HttpGetArgs, ImageStoreArgs,
-    JobStatusArgs, ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
+    AssetInsertArgs, AssetSearchArgs, GenerateModelArgs, ImageStoreArgs, JobStatusArgs,
+    ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
 };
-use crate::cloud::{agent, read_response};
 use crate::daemon::try_daemon_control_request;
 use crate::project::config;
 use crate::system::files::canonical_path;
 
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_HTTP_MATCHES: usize = 3;
-const MAX_HTTP_SNIPPET_CHARS: usize = 320;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,22 +43,6 @@ struct ScriptGrep {
     #[serde(default)]
     case_insensitive: bool,
     limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct HttpGet {
-    url: String,
-    query: Option<String>,
-    #[serde(default = "default_context_lines", alias = "context_lines")]
-    context_lines: usize,
-    max_matches: Option<usize>,
-    #[serde(default, alias = "return_full")]
-    return_full: bool,
-}
-
-fn default_context_lines() -> usize {
-    3
 }
 
 pub(crate) fn asset_search_command(args: AssetSearchArgs) -> anyhow::Result<()> {
@@ -219,19 +199,6 @@ pub(crate) fn image_store_command(
     Ok(())
 }
 
-pub(crate) fn http_get_command(args: HttpGetArgs) -> anyhow::Result<()> {
-    let result = http_get(&json!({
-        "url": args.url,
-        "query": args.query,
-        "contextLines": args.context_lines,
-        "maxMatches": args.limit,
-        "returnFull": args.full,
-    }))
-    .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
-}
-
 fn script_roots(project: Option<&Path>) -> anyhow::Result<(PathBuf, PathBuf)> {
     let loaded = config::load_project(project, None)?;
     let source = loaded.root.join(&loaded.project.source_root);
@@ -285,179 +252,6 @@ pub(crate) fn script_read_command(
             "endLine": args.end_line,
         }),
     ))
-}
-
-fn http_snippet_line(line: &str, needle: &str) -> String {
-    let chars = line.chars().collect::<Vec<_>>();
-    if chars.len() <= MAX_HTTP_SNIPPET_CHARS {
-        return line.to_string();
-    }
-    let match_start = line
-        .to_lowercase()
-        .find(needle)
-        .map(|index| {
-            line.char_indices()
-                .take_while(|(offset, _)| *offset < index)
-                .count()
-        })
-        .unwrap_or_default();
-    let start = match_start
-        .saturating_sub(MAX_HTTP_SNIPPET_CHARS / 3)
-        .min(chars.len() - MAX_HTTP_SNIPPET_CHARS);
-    let end = start + MAX_HTTP_SNIPPET_CHARS;
-    format!(
-        "{}{}{}",
-        if start == 0 { "" } else { "…" },
-        chars[start..end].iter().collect::<String>(),
-        if end == chars.len() { "" } else { "…" }
-    )
-}
-
-fn html_entity(name: &str) -> Option<char> {
-    match name {
-        "amp" => Some('&'),
-        "apos" | "#39" => Some('\''),
-        "gt" => Some('>'),
-        "lt" => Some('<'),
-        "nbsp" => Some(' '),
-        "quot" => Some('"'),
-        _ if name.starts_with("#x") || name.starts_with("#X") => {
-            u32::from_str_radix(&name[2..], 16)
-                .ok()
-                .and_then(char::from_u32)
-        }
-        _ if name.starts_with('#') => name[1..].parse().ok().and_then(char::from_u32),
-        _ => None,
-    }
-}
-
-fn push_document_break(output: &mut String) {
-    while output.ends_with(' ') {
-        output.pop();
-    }
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
-}
-
-fn push_document_char(output: &mut String, character: char) {
-    if character.is_whitespace() {
-        if !output.is_empty() && !matches!(output.chars().last(), Some(' ' | '\n')) {
-            output.push(' ');
-        }
-    } else {
-        output.push(character);
-    }
-}
-
-fn html_to_text(source: &str) -> String {
-    let mut output = String::with_capacity(source.len() / 4);
-    let mut characters = source.chars().peekable();
-    let mut skipped = None::<String>;
-    while let Some(character) = characters.next() {
-        if character == '<' {
-            let mut tag = String::new();
-            for character in characters.by_ref() {
-                if character == '>' {
-                    break;
-                }
-                tag.push(character);
-            }
-            let trimmed = tag.trim();
-            let closing = trimmed.starts_with('/');
-            let name = trimmed
-                .trim_start_matches('/')
-                .split(|character: char| character.is_ascii_whitespace() || character == '/')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if skipped.as_deref() == Some(name.as_str()) && closing {
-                skipped = None;
-                push_document_break(&mut output);
-            } else if skipped.is_none()
-                && !closing
-                && matches!(name.as_str(), "script" | "style" | "noscript" | "svg")
-            {
-                skipped = Some(name);
-            } else if skipped.is_none()
-                && matches!(
-                    name.as_str(),
-                    "article"
-                        | "br"
-                        | "dd"
-                        | "details"
-                        | "div"
-                        | "dl"
-                        | "dt"
-                        | "footer"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "header"
-                        | "li"
-                        | "main"
-                        | "ol"
-                        | "p"
-                        | "section"
-                        | "summary"
-                        | "table"
-                        | "tr"
-                        | "ul"
-                )
-            {
-                push_document_break(&mut output);
-            }
-            continue;
-        }
-        if skipped.is_some() {
-            continue;
-        }
-        if character == '&' {
-            let mut lookahead = characters.clone();
-            let mut name = String::new();
-            let mut found = false;
-            for _ in 0..12 {
-                let Some(next) = lookahead.next() else {
-                    break;
-                };
-                if next == ';' {
-                    found = true;
-                    break;
-                }
-                if next.is_whitespace() || next == '<' || next == '&' {
-                    break;
-                }
-                name.push(next);
-            }
-            if found && let Some(decoded) = html_entity(&name) {
-                for _ in 0..=name.chars().count() {
-                    characters.next();
-                }
-                push_document_char(&mut output, decoded);
-                continue;
-            }
-        }
-        push_document_char(&mut output, character);
-    }
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn readable_document(source: &str) -> Cow<'_, str> {
-    let prefix = source.trim_start().chars().take(64).collect::<String>();
-    let prefix = prefix.to_ascii_lowercase();
-    if prefix.starts_with("<!doctype html") || prefix.starts_with("<html") {
-        Cow::Owned(html_to_text(source))
-    } else {
-        Cow::Borrowed(source)
-    }
 }
 
 fn failure(message: impl Into<String>, next: &str) -> Failure {
@@ -702,120 +496,4 @@ pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<
         Path::new(&context.source),
         parameters,
     )
-}
-
-pub(crate) fn http_get(parameters: &Value) -> Result<Value, Failure> {
-    let request: HttpGet = serde_json::from_value(parameters.clone())
-        .map_err(|error| failure(format!("Invalid http-get payload: {error}"), "http-get"))?;
-    let url = url::Url::parse(&request.url)
-        .map_err(|error| failure(format!("Invalid documentation URL: {error}"), "http-get"))?;
-    let allowed = url.scheme() == "https"
-        && matches!(
-            url.host_str(),
-            Some("create.roblox.com" | "github.com" | "raw.githubusercontent.com")
-        )
-        && (url.host_str() == Some("create.roblox.com")
-            || url.path().contains("/Roblox/creator-docs/"));
-    if !allowed {
-        return Err(failure(
-            "http-get only accepts HTTPS Roblox Creator documentation URLs",
-            "http-get",
-        ));
-    }
-    let response = match agent().get(url.as_str()).call() {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => read_response(response)
-            .map_err(|message| Failure::new("cloud_http", message, false, "http-get"))?,
-        Err(ureq::Error::Transport(error)) => {
-            return Err(Failure::new(
-                "cloud_http",
-                format!("Documentation request failed: {error}"),
-                true,
-                "http-get",
-            ));
-        }
-    };
-    if !(200..300).contains(&response.status) {
-        return Err(Failure::new(
-            "cloud_http",
-            format!("Documentation request returned HTTP {}", response.status),
-            matches!(response.status, 429 | 500..=599),
-            "http-get",
-        )
-        .detail(json!({ "status": response.status, "body": response.body })));
-    }
-    let Some(query) = request.query.filter(|query| !query.is_empty()) else {
-        return Ok(
-            json!({ "url": url.as_str(), "status": response.status, "body": response.body }),
-        );
-    };
-    let raw = response
-        .body
-        .as_str()
-        .ok_or_else(|| failure("http-get query requires a text response", "http-get"))?;
-    let text = readable_document(raw);
-    let needle = query.to_lowercase();
-    let lines = text.lines().collect::<Vec<_>>();
-    let matching = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| line.to_lowercase().contains(&needle).then_some(index))
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        return Ok(json!({
-            "url": url.as_str(),
-            "status": response.status,
-            "query": query,
-            "totalMatches": 0,
-            "returnedMatches": 0,
-            "body": "",
-        }));
-    }
-    if request.return_full {
-        return Ok(json!({
-            "url": url.as_str(),
-            "status": response.status,
-            "query": query,
-            "totalMatches": matching.len(),
-            "returnedMatches": matching.len(),
-            "body": text.as_ref(),
-        }));
-    }
-    let context = request.context_lines.min(50);
-    let mut ranges = Vec::<(usize, usize)>::new();
-    let max_matches = request.max_matches.unwrap_or(MAX_HTTP_MATCHES).clamp(1, 20);
-    for index in matching.iter().copied().take(max_matches) {
-        let start = index.saturating_sub(context);
-        let end = (index + context + 1).min(lines.len());
-        match ranges.last_mut() {
-            Some((_, previous_end)) if start <= *previous_end => *previous_end = end,
-            _ => ranges.push((start, end)),
-        }
-    }
-    let body = ranges
-        .into_iter()
-        .map(|(start, end)| {
-            lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, line)| {
-                    format!(
-                        "{}: {}",
-                        start + offset + 1,
-                        http_snippet_line(line, &needle)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .collect::<Vec<_>>()
-        .join("\n---\n");
-    Ok(json!({
-        "url": url.as_str(),
-        "status": response.status,
-        "query": query,
-        "totalMatches": matching.len(),
-        "returnedMatches": matching.len().min(max_matches),
-        "truncated": matching.len() > max_matches,
-        "body": body,
-    }))
 }

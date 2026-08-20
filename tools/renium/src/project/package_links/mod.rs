@@ -20,6 +20,7 @@ use crate::editor::paths::{
     build_editor_source_paths_by_index, infer_source_script,
 };
 use crate::project::config;
+use crate::rbx::decode::rbx_reflection_class_is_a;
 use crate::rbx::encode::settings_root_indices;
 use crate::rbx::model::canonicalize_settings_reference_documents;
 use crate::settings::bytecode::{
@@ -184,6 +185,8 @@ struct LinkLockEntry {
 
 #[derive(Serialize, Deserialize, Default)]
 struct LinkTargetLockEntry {
+    #[serde(rename = "settingsId", skip_serializing_if = "Option::is_none")]
+    settings_id: Option<String>,
     files: BTreeMap<String, String>,
 }
 
@@ -1082,6 +1085,51 @@ fn link_target_document_selector(
         storage,
         document,
     )
+}
+
+fn link_target_from_settings_id(
+    target: &ResolvedLinkTarget,
+    document: &SettingsBytecode,
+    settings_id: &str,
+) -> Option<LinkTargetRef> {
+    let storage = target.storage.as_ref()?;
+    let root = document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())?
+        .name
+        .clone();
+    let index = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)?;
+    let paths = build_editor_instance_paths(document, &root);
+    let actual = paths.get(index)?.as_ref()?;
+
+    let mut previous_path = vec![target.service.clone()];
+    previous_path.extend(target.target_segments.iter().cloned());
+    let mut previous_ordinals = vec![1];
+    previous_ordinals.extend(target.target_ordinals.iter().copied());
+    let prefix_len = storage.consumed_segments.checked_sub(1)?;
+    if prefix_len > previous_path.len() || prefix_len > previous_ordinals.len() {
+        return None;
+    }
+
+    let mut path = previous_path[..prefix_len].to_vec();
+    path.extend(actual.path_segments.iter().cloned());
+    if path.first().map(String::as_str) != Some(target.service.as_str()) {
+        return None;
+    }
+    let mut ords = previous_ordinals[..prefix_len].to_vec();
+    ords.extend(actual.path_ordinals.iter().copied());
+    if ords.iter().all(|ordinal| *ordinal == 1) {
+        ords.clear();
+    }
+    Some(LinkTargetRef {
+        service: target.service.clone(),
+        path,
+        ords,
+    })
 }
 
 fn link_target_document_selector_parts(
@@ -2004,6 +2052,7 @@ fn materialize_package_target(
     let mut removed_target = Value::Null;
     let mut planned_removals = Vec::new();
     let mut identity = PackageIdentityMatches::default();
+    let mut placement = None;
     let same_name_children = document
         .instances
         .iter()
@@ -2028,6 +2077,7 @@ fn materialize_package_target(
             .map(|(_, instance)| instance.settings_id.clone())
     });
     if let Some(existing) = existing {
+        placement = model_placement_delta(document, existing, &package, package_root)?;
         let source_paths_before =
             build_editor_source_paths_by_index(document, service, service_dir);
         let paths_by_index = build_editor_instance_paths(document, service);
@@ -2169,6 +2219,10 @@ fn materialize_package_target(
         remap_internal_clone_refs_in_record(&mut instance.properties, &refs);
         remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
     }
+    if let Some(placement) = placement {
+        let indexes = new_index_by_pkg.values().copied().collect::<Vec<_>>();
+        transform_linked_model(document, &indexes, placement, false)?;
+    }
 
     if let Some(anchor) = insertion_anchor {
         let inserted = new_settings_ids.iter().cloned().collect::<HashSet<_>>();
@@ -2217,6 +2271,280 @@ fn materialize_package_target(
     }
 
     Ok((planned_removals, new_settings_ids, removed_target))
+}
+
+#[derive(Clone, Copy)]
+struct LinkCFrame {
+    position: [f64; 3],
+    rotation: [[f64; 3]; 3],
+}
+
+impl LinkCFrame {
+    fn from_json(value: &Value) -> Option<Self> {
+        let components = value
+            .as_array()
+            .or_else(|| value.as_object()?.get("components")?.as_array())?;
+        if components.len() != 12 {
+            return None;
+        }
+        let numbers = components
+            .iter()
+            .map(Value::as_f64)
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            position: [numbers[0], numbers[1], numbers[2]],
+            rotation: [
+                [numbers[3], numbers[4], numbers[5]],
+                [numbers[6], numbers[7], numbers[8]],
+                [numbers[9], numbers[10], numbers[11]],
+            ],
+        })
+    }
+
+    fn inverse(self) -> Self {
+        let rotation = [
+            [
+                self.rotation[0][0],
+                self.rotation[1][0],
+                self.rotation[2][0],
+            ],
+            [
+                self.rotation[0][1],
+                self.rotation[1][1],
+                self.rotation[2][1],
+            ],
+            [
+                self.rotation[0][2],
+                self.rotation[1][2],
+                self.rotation[2][2],
+            ],
+        ];
+        let rotated = multiply_vector(rotation, self.position);
+        Self {
+            position: [-rotated[0], -rotated[1], -rotated[2]],
+            rotation,
+        }
+    }
+
+    fn then(self, other: Self) -> Self {
+        let rotated = multiply_vector(self.rotation, other.position);
+        Self {
+            position: [
+                rotated[0] + self.position[0],
+                rotated[1] + self.position[1],
+                rotated[2] + self.position[2],
+            ],
+            rotation: multiply_rotation(self.rotation, other.rotation),
+        }
+    }
+
+    fn to_json(self, quantize: bool) -> Value {
+        let normalize = |value: f64| {
+            let value = value as f32 as f64;
+            if quantize {
+                (value * 10_000.0).round() / 10_000.0
+            } else {
+                value
+            }
+        };
+        json!({
+            "_type": "CFrame",
+            "components": [
+                normalize(self.position[0]),
+                normalize(self.position[1]),
+                normalize(self.position[2]),
+                normalize(self.rotation[0][0]),
+                normalize(self.rotation[0][1]),
+                normalize(self.rotation[0][2]),
+                normalize(self.rotation[1][0]),
+                normalize(self.rotation[1][1]),
+                normalize(self.rotation[1][2]),
+                normalize(self.rotation[2][0]),
+                normalize(self.rotation[2][1]),
+                normalize(self.rotation[2][2]),
+            ],
+        })
+    }
+}
+
+fn multiply_vector(rotation: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    [
+        rotation[0][0] * vector[0] + rotation[0][1] * vector[1] + rotation[0][2] * vector[2],
+        rotation[1][0] * vector[0] + rotation[1][1] * vector[1] + rotation[1][2] * vector[2],
+        rotation[2][0] * vector[0] + rotation[2][1] * vector[1] + rotation[2][2] * vector[2],
+    ]
+}
+
+fn multiply_rotation(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut output = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            output[row][column] = (0..3)
+                .map(|index| left[row][index] * right[index][column])
+                .sum();
+        }
+    }
+    output
+}
+
+fn linked_model_property(class_name: &str) -> Result<Option<&'static str>> {
+    let database =
+        rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
+    Ok(
+        if rbx_reflection_class_is_a(database, class_name, "BasePart") {
+            Some("CFrame")
+        } else if rbx_reflection_class_is_a(database, class_name, "Model") {
+            Some("WorldPivot")
+        } else {
+            None
+        },
+    )
+}
+
+fn instance_link_cframe(instance: &SettingsBytecodeInstance) -> Result<Option<LinkCFrame>> {
+    let Some(property) = linked_model_property(&instance.class_name)? else {
+        return Ok(None);
+    };
+    Ok(instance
+        .properties
+        .get(property)
+        .and_then(LinkCFrame::from_json))
+}
+
+fn model_placement_delta(
+    document: &SettingsBytecode,
+    existing_root: usize,
+    package: &SettingsBytecode,
+    package_root: usize,
+) -> Result<Option<LinkCFrame>> {
+    let database =
+        rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
+    if !rbx_reflection_class_is_a(
+        database,
+        &document.instances[existing_root].class_name,
+        "Model",
+    ) || !rbx_reflection_class_is_a(
+        database,
+        &package.instances[package_root].class_name,
+        "Model",
+    ) {
+        return Ok(None);
+    }
+
+    let direct = instance_link_cframe(&document.instances[existing_root])?
+        .zip(instance_link_cframe(&package.instances[package_root])?);
+    let anchors = if direct.is_some() {
+        direct
+    } else {
+        let existing = subtree_relative_indices(document, existing_root);
+        let incoming = subtree_relative_indices(package, package_root);
+        let mut keys = incoming.keys().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.into_iter().find_map(|key| {
+            let package_index = incoming[key];
+            let existing_index = *existing.get(key)?;
+            instance_link_cframe(&document.instances[existing_index])
+                .ok()
+                .flatten()
+                .zip(
+                    instance_link_cframe(&package.instances[package_index])
+                        .ok()
+                        .flatten(),
+                )
+        })
+    };
+    Ok(anchors.map(|(existing, source)| existing.then(source.inverse())))
+}
+
+fn transform_linked_model(
+    document: &mut SettingsBytecode,
+    indexes: &[usize],
+    transform: LinkCFrame,
+    quantize: bool,
+) -> Result<()> {
+    for index in indexes {
+        let Some(instance) = document.instances.get_mut(*index) else {
+            continue;
+        };
+        let Some(property) = linked_model_property(&instance.class_name)? else {
+            continue;
+        };
+        let Some(current) = instance
+            .properties
+            .get(property)
+            .and_then(LinkCFrame::from_json)
+        else {
+            continue;
+        };
+        instance.properties.insert(
+            property.to_string(),
+            transform.then(current).to_json(quantize),
+        );
+    }
+    Ok(())
+}
+
+fn quantize_linked_model(document: &mut SettingsBytecode, indexes: &[usize]) -> Result<()> {
+    let identity = LinkCFrame {
+        position: [0.0; 3],
+        rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    };
+    transform_linked_model(document, indexes, identity, true)
+}
+
+fn package_target_matches(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+    package: &SettingsBytecode,
+    package_fingerprint: &str,
+) -> Result<bool> {
+    if package_target_fingerprint(document, service, target_segments, target_ordinals)?.as_deref()
+        == Some(package_fingerprint)
+    {
+        return Ok(true);
+    }
+    let Some(existing_root) = resolve_editor_instance_by_path_ordinals(
+        document,
+        service,
+        target_segments,
+        target_ordinals,
+    ) else {
+        return Ok(false);
+    };
+    let package_roots = settings_root_indices(package);
+    if package_roots.len() != 1 {
+        return Ok(false);
+    }
+    let Some(placement) =
+        model_placement_delta(document, existing_root, package, package_roots[0])?
+    else {
+        return Ok(false);
+    };
+
+    let mut normalized_target = document.clone();
+    let children = settings_children_by_parent(&normalized_target);
+    let mut target_subtree = Vec::new();
+    collect_settings_subtree_preorder(&children, existing_root, &mut target_subtree);
+    transform_linked_model(
+        &mut normalized_target,
+        &target_subtree,
+        placement.inverse(),
+        true,
+    )?;
+
+    let mut normalized_package = package.clone();
+    let package_indexes = (0..normalized_package.instances.len()).collect::<Vec<_>>();
+    quantize_linked_model(&mut normalized_package, &package_indexes)?;
+    Ok(package_target_fingerprint(
+        &normalized_target,
+        service,
+        target_segments,
+        target_ordinals,
+    )?
+    .as_deref()
+        == Some(package_document_fingerprint(&normalized_package)?.as_str()))
 }
 
 struct PackageFingerprintRefs {

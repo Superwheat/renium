@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.2.4 - 2026-08-20
+
+### Roblox Open Cloud
+
+- Open Cloud commands work directly without Roblox Studio, a Renium connection, or a running daemon.
+- Developer products can be listed, read, created, and updated from `rbx cloud product`.
+- Any Open Cloud endpoint can be called with API-key or OAuth authentication, including JSON, form, file, and raw uploads and binary downloads.
+- Newly saved Roblox credentials on Windows are available without restarting the editor.
+
+### Renium Link
+
+- Linked models can be renamed, moved, and rotated without losing their link.
+- Updating a linked model preserves its local name, position, and orientation while refreshing its contents.
+
+### Installation
+
+- Windows updates keep `renium` and `rbx` pointed at one current installation instead of leaving stale executable copies behind.
+
 ## 0.2.3 - 2026-08-20
 
 ### Package editing

@@ -276,14 +276,12 @@ pub(super) fn bind(
             "project-validate",
         )
     })?;
-    workflows::refresh_agent_instructions(&project_root).map_err(|error| {
-        Failure::new(
-            "internal",
-            format!("Failed to refresh Renium project instructions: {error:#}"),
-            false,
-            "bind",
-        )
-    })?;
+    if let Err(error) = workflows::refresh_agent_instructions(&project_root) {
+        eprintln!(
+            "[renium] warning: could not refresh project instructions in {}: {error:#}",
+            project_root.display()
+        );
+    }
     let identity = resolve_experience_place(&project_root, None).map_err(|error| {
         Failure::new(
             "no_project",

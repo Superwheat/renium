@@ -93,6 +93,8 @@ pub(super) enum Commands {
     #[command(name = "upload-place", alias = "upload")]
     Upload(workflows::UploadArgs),
     Update(update::UpdateArgs),
+    #[command(name = "cloud", alias = "opencloud")]
+    OpenCloud(crate::cloud::command::OpenCloudArgs),
     #[command(hide = true)]
     UpdateHelper(update::UpdateHelperArgs),
     Syncback(SyncbackArgs),
@@ -147,8 +149,6 @@ pub(super) enum Commands {
         about = "Validate a local image for Roblox upload"
     )]
     ImageStore(ImageStoreArgs),
-    #[command(name = "http-get", about = "Read Roblox Creator documentation")]
-    HttpGet(HttpGetArgs),
     #[command(
         name = "script-search",
         about = "Find saved script files containing every keyword"
@@ -612,19 +612,6 @@ pub(super) struct JobStatusArgs {
 #[derive(Parser)]
 pub(super) struct ImageStoreArgs {
     pub(super) path: PathBuf,
-}
-
-#[derive(Parser)]
-pub(super) struct HttpGetArgs {
-    pub(super) url: String,
-    #[arg(short, long)]
-    pub(super) query: Option<String>,
-    #[arg(long, default_value_t = 0)]
-    pub(super) context_lines: usize,
-    #[arg(short, long, default_value_t = 3)]
-    pub(super) limit: usize,
-    #[arg(long)]
-    pub(super) full: bool,
 }
 
 #[derive(Parser)]

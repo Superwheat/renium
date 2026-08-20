@@ -1,6 +1,6 @@
 # Renium automation
 
-Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has an old `PATH`, use `%USERPROFILE%\.renium\bin\rbx.exe` on Windows or `~/.renium/bin/rbx` on macOS and Linux. Never search editor extension folders.
+Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has an old `PATH`, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS and Linux. Never search editor extension folders.
 
 ## Guide hierarchy
 
@@ -15,7 +15,7 @@ This file contains the rules and targeting behavior required for every Renium ta
 | Discover UI, press, type, click, move, wait, or interact with the world | `RENIUM/input.md` |
 | Take screenshots, record clips, or control device simulation | `RENIUM/capture-device.md` |
 | Import/export models or places, manage links/packages, or configure version control | `RENIUM/projects.md` |
-| Use Creator Store, Open Cloud, images, generated models, or documentation HTTP reads | `RENIUM/opencloud.md` |
+| Use Creator Store, Open Cloud, images, or generated models | `RENIUM/opencloud.md` |
 | Use `rbx a`, contexts, reviews, or an operation without a direct command | `RENIUM/advanced.md` |
 
 Read only the relevant guides. Read several when a task crosses categories. Don't guess a command from memory when its guide hasn't been read. A broad Renium audit may require every guide; ordinary work shouldn't.
