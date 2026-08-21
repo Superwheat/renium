@@ -22,7 +22,7 @@ const STRING_CONFIG_KEYS = new Set([
 const BOOLEAN_CONFIG_KEYS = new Set([
   "yes", "backtrace", "verifyEditorPushSources", "adaptiveThrottle",
   "autoSyncOnSave", "editorLiveSyncEnabled",
-  "studioLiveSyncEnabled", "liveSync.overridePackages", "runImport", "modifiedDefaultBypass",
+  "studioLiveSyncEnabled", "liveSync.overridePackages", "modifiedDefaultBypass",
   "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",
   "gitSync.requireCleanWorktreeBeforePull", "wallySync.runInstall", "link.offline",
   "link.autoApplyOnManifestChange",

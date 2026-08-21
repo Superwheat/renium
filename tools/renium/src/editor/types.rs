@@ -16,7 +16,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorSourceChange {
     pub(crate) service: String,

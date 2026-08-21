@@ -55,7 +55,7 @@ use crate::studio::bridge::{
 };
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use crate::system::files::{
-    OnDrop, create_unique_directory, current_unix_ts, read_json_file,
+    OnDrop, create_unique_directory, current_unix_ts, fnv1a, read_json_file,
     resolve_existing_project_root, sanitize_name, sha256_hex, write_json_file,
 };
 
@@ -436,8 +436,7 @@ pub(crate) struct ExportProjectStage {
     pub(crate) import_project_root: PathBuf,
     pub(crate) import_src_dir: PathBuf,
     publish_paths: Vec<PathBuf>,
-    publish_baseline: Option<BTreeMap<PathBuf, PublishEntryState>>,
-    move_staged_paths: bool,
+    publish_baseline: BTreeMap<PathBuf, PublishEntryState>,
     pub(crate) loaded: Option<config::LoadedProject>,
     pub(crate) projection: Option<config::ProjectionStage>,
     active: bool,
@@ -582,8 +581,7 @@ impl ExportProjectStage {
             import_project_root,
             import_src_dir,
             publish_paths,
-            publish_baseline: Some(publish_baseline),
-            move_staged_paths: false,
+            publish_baseline,
             loaded: staged_loaded,
             projection,
             active: true,
@@ -649,22 +647,16 @@ impl ExportProjectStage {
         Ok(operations)
     }
 
-    pub(crate) fn publish(mut self, project_root: &Path) -> Result<Vec<PathBuf>> {
+    pub(crate) fn publish(mut self, project_root: &Path) -> Result<PublishedProjectChanges> {
         let started = Instant::now();
-        let current = self
-            .publish_baseline
-            .as_ref()
-            .map(|_| collect_publish_hashes(project_root, &self.publish_paths))
-            .transpose()?;
-        if let (Some(current), Some(baseline)) = (&current, &self.publish_baseline)
-            && current != baseline
-        {
+        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
+        if current != self.publish_baseline {
             let changed = current
                 .keys()
-                .chain(baseline.keys())
+                .chain(self.publish_baseline.keys())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .filter(|path| current.get(*path) != baseline.get(*path))
+                .filter(|path| current.get(*path) != self.publish_baseline.get(*path))
                 .take(10)
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>();
@@ -676,13 +668,19 @@ impl ExportProjectStage {
         let backup_root = self.container.join("previous");
         fs::create_dir_all(&backup_root)
             .with_context(|| format!("Failed to create {}", backup_root.display()))?;
-        let operation_paths = if let Some(current) = current.as_ref() {
-            let staged_state = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
-            publish_operation_paths(current, &staged_state)
-        } else {
-            self.publish_paths.clone()
-        };
-        let changed_paths = operation_paths.clone();
+        let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
+        let operation_paths = publish_operation_paths(&current, &staged);
+        let expected = current
+            .keys()
+            .chain(staged.keys())
+            .filter(|path| {
+                operation_paths
+                    .iter()
+                    .any(|root| *path == root || path.starts_with(root))
+            })
+            .map(|path| (path.clone(), staged.get(path).cloned()))
+            .collect();
+        let changed_roots = operation_paths.clone();
         let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
         let publish_result = (|| -> Result<()> {
             for relative in operation_paths {
@@ -705,15 +703,9 @@ impl ExportProjectStage {
                 };
                 published.push((destination.clone(), backup));
                 if fs::symlink_metadata(&staged).is_ok() {
-                    if self.move_staged_paths {
-                        fs::rename(&staged, &destination).with_context(|| {
-                            format!("Failed to publish staged path {}", relative.display())
-                        })?;
-                    } else {
-                        copy_isolated_path(&staged, &destination).with_context(|| {
-                            format!("Failed to publish staged path {}", relative.display())
-                        })?;
-                    }
+                    copy_isolated_path(&staged, &destination).with_context(|| {
+                        format!("Failed to publish staged path {}", relative.display())
+                    })?;
                 }
             }
             Ok(())
@@ -770,7 +762,10 @@ impl ExportProjectStage {
             });
         let _ = fs::remove_dir_all(&self.container);
         log_timing_ms("export project stage publish", elapsed_ms(started));
-        Ok(changed_paths)
+        Ok(PublishedProjectChanges {
+            changed_roots,
+            expected,
+        })
     }
 }
 
@@ -897,10 +892,20 @@ fn collect_nested_project_paths(
     Ok(())
 }
 
-#[derive(PartialEq)]
+#[derive(Default)]
+pub(crate) struct PublishedProjectChanges {
+    pub(crate) changed_roots: Vec<PathBuf>,
+    pub(crate) expected: BTreeMap<PathBuf, Option<PublishEntryState>>,
+}
+
+#[derive(Clone, PartialEq)]
 pub(crate) enum PublishEntryState {
     Directory,
-    File(String),
+    File {
+        sha256: String,
+        length: u64,
+        hash: u64,
+    },
     Symlink(PathBuf),
 }
 
@@ -922,9 +927,14 @@ pub(crate) fn collect_publish_hashes(
             continue;
         }
         if metadata.is_file() {
+            let bytes = fs::read(&path)?;
             entries.insert(
                 relative.clone(),
-                PublishEntryState::File(sha256_hex(&fs::read(&path)?)),
+                PublishEntryState::File {
+                    sha256: sha256_hex(&bytes),
+                    length: bytes.len() as u64,
+                    hash: fnv1a(&bytes),
+                },
             );
             continue;
         }
@@ -939,7 +949,12 @@ pub(crate) fn collect_publish_hashes(
             } else if entry.file_type().is_dir() {
                 PublishEntryState::Directory
             } else if entry.file_type().is_file() {
-                PublishEntryState::File(sha256_hex(&fs::read(entry.path())?))
+                let bytes = fs::read(entry.path())?;
+                PublishEntryState::File {
+                    sha256: sha256_hex(&bytes),
+                    length: bytes.len() as u64,
+                    hash: fnv1a(&bytes),
+                }
             } else {
                 continue;
             };
@@ -1187,6 +1202,7 @@ pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
         all_channels_connected_to_bridge_info_ms,
         ExportBridgeMode::Cold,
     )
+    .map(|_| ())
 }
 
 pub(crate) fn pull_from_studio(mut args: ExportSnapshotsArgs) -> Result<()> {
@@ -1204,7 +1220,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     bridge_info: &BridgeInfoPayload,
     bridge_info_refresh_ms: f64,
     prepare_next_run: bool,
-) -> Result<()> {
+) -> Result<PublishedProjectChanges> {
     let prelude = export_snapshots_prelude(&args)?;
     println!(
         "[renium] persistent warm bridge: channels={}/{}, cached_bridge_info={}, per_export_handshake_ms={:.1}",
@@ -1615,7 +1631,7 @@ fn export_snapshots_core(
     bridge_listen_metrics: BridgeListenMetrics,
     all_channels_connected_to_bridge_info_ms: f64,
     mode: ExportBridgeMode,
-) -> Result<()> {
+) -> Result<PublishedProjectChanges> {
     let ExportPrelude {
         total_started,
         performance_mode,
@@ -1732,10 +1748,12 @@ fn export_snapshots_core(
         &mut direct_import_dispatcher,
         sourcemap_writer,
     )?;
-    if let Some(stage) = project_stage.take() {
+    let published = if let Some(stage) = project_stage.take() {
         stage.finish_projection(!direct_import_mode)?;
-        stage.publish(&project_root)?;
-    }
+        stage.publish(&project_root)?
+    } else {
+        PublishedProjectChanges::default()
+    };
     if tune_updated {
         write_adaptive_tune_cache(&project_root, &adaptive_tune_cache);
     }
@@ -1784,7 +1802,7 @@ fn export_snapshots_core(
         prepare_bridge_for_next_run(bridge);
     }
     println!("[renium] export done");
-    Ok(())
+    Ok(published)
 }
 
 pub(crate) fn parse_bridge_ports(raw: &str) -> Result<Vec<u16>> {

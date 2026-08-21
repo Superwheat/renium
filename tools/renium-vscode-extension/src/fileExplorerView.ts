@@ -1860,83 +1860,100 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     const historyRoot = editorHistoryRoot(config);
     const changedPaths: string[] = [];
     const changedServices = new Set<string>();
+    await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+      fileWrites: "pause",
+    });
+    try {
+      for (const id of ids) {
+        const data = this.readHistoryManifest(id);
+        if (!data) {
+          continue;
+        }
+        const manifest = data.manifest;
+        const service = String(manifest.service ?? "").trim();
+        const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
+        const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
+        if (!service || (!sourcePath && !settingsId)) {
+          continue;
+        }
+        changedServices.add(service);
 
-    for (const id of ids) {
-      const data = this.readHistoryManifest(id);
-      if (!data) {
-        continue;
-      }
-      const manifest = data.manifest;
-      const service = String(manifest.service ?? "").trim();
-      const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
-      const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
-      if (!service || (!sourcePath && !settingsId)) {
-        continue;
-      }
-      changedServices.add(service);
+        if (typeof manifest.settingsBackup === "string") {
+          const configuredSettingsFile = typeof manifest.settingsFile === "string"
+            ? manifest.settingsFile
+            : settingsFileForService(config, service);
+          const destination = path.isAbsolute(configuredSettingsFile)
+            ? path.normalize(configuredSettingsFile)
+            : path.normalize(path.join(config.projectRoot, configuredSettingsFile));
+          const restored = this.restoreHistoryFile(
+            config,
+            historyRoot,
+            data.entryDir,
+            manifest.settingsBackup,
+            destination,
+          );
+          if (restored) {
+            changedPaths.push(restored);
+          }
+        }
 
-      if (typeof manifest.settingsBackup === "string") {
-        const configuredSettingsFile = typeof manifest.settingsFile === "string"
-          ? manifest.settingsFile
-          : settingsFileForService(config, service);
-        const destination = path.isAbsolute(configuredSettingsFile)
-          ? path.normalize(configuredSettingsFile)
-          : path.normalize(path.join(config.projectRoot, configuredSettingsFile));
-        const restored = this.restoreHistoryFile(
-          config,
-          historyRoot,
-          data.entryDir,
-          manifest.settingsBackup,
-          destination,
-        );
-        if (restored) {
-          changedPaths.push(restored);
+        if (typeof manifest.sourceBackup === "string" && sourcePath) {
+          const destination = path.isAbsolute(sourcePath)
+            ? path.normalize(sourcePath)
+            : path.normalize(path.join(config.projectRoot, sourcePath));
+          const restored = this.restoreHistoryFile(
+            config,
+            historyRoot,
+            data.entryDir,
+            manifest.sourceBackup,
+            destination,
+          );
+          if (restored) {
+            changedPaths.push(restored);
+          }
         }
       }
 
-      if (typeof manifest.sourceBackup === "string" && sourcePath) {
-        const destination = path.isAbsolute(sourcePath)
-          ? path.normalize(sourcePath)
-          : path.normalize(path.join(config.projectRoot, sourcePath));
-        const restored = this.restoreHistoryFile(
-          config,
-          historyRoot,
-          data.entryDir,
-          manifest.sourceBackup,
-          destination,
-        );
-        if (restored) {
-          changedPaths.push(restored);
+      for (const service of this.model.servicesFromSettingsFiles(changedPaths)) {
+        changedServices.add(service);
+      }
+      const services = Array.from(changedServices);
+      if (services.length > 0) {
+        await this.backend.reloadServices(services);
+        if (this.searchBackend.hasInitialized()) {
+          await this.searchBackend.reloadServices(services).catch(() => undefined);
+        }
+        await this.propertiesProvider.refreshCurrentForServices(services);
+        await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
+      }
+      this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", id: completionId, groupId: isGroup ? completionId : undefined });
+      vscode.window.showInformationMessage(isGroup ? "History session restored locally." : "History entry restored locally.");
+
+      if (changedPaths.length > 0) {
+        const uniqueChangedPaths = Array.from(new Set(changedPaths));
+        try {
+          await vscode.commands.executeCommand("renium.pushEditorPathsNow", uniqueChangedPaths, {
+            projectRoot: config.projectRoot,
+            taskName: "History restore -> Studio sync",
+          });
+        } catch (error) {
+          vscode.window.showErrorMessage(`Failed to push restored history. ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-    }
-
-    for (const service of this.model.servicesFromSettingsFiles(changedPaths)) {
-      changedServices.add(service);
-    }
-    const services = Array.from(changedServices);
-    if (services.length > 0) {
-      await this.backend.reloadServices(services);
-      if (this.searchBackend.hasInitialized()) {
-        await this.searchBackend.reloadServices(services).catch(() => undefined);
+      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+        fileWrites: "resume",
+      });
+    } catch (error) {
+      try {
+        await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+          fileWrites: "resume",
+        });
+      } catch (resumeError) {
+        const original = error instanceof Error ? error.message : String(error);
+        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
       }
-      await this.propertiesProvider.refreshCurrentForServices(services);
-      await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
-    }
-    this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", id: completionId, groupId: isGroup ? completionId : undefined });
-    vscode.window.showInformationMessage(isGroup ? "History session restored locally." : "History entry restored locally.");
-
-    if (changedPaths.length > 0) {
-      const uniqueChangedPaths = Array.from(new Set(changedPaths));
-      void vscode.commands.executeCommand("renium.pushEditorPathsNow", uniqueChangedPaths, {
-        projectRoot: config.projectRoot,
-        pendingServices: [...changedServices],
-        skipChangeFilter: true,
-        taskName: "History restore -> Studio sync",
-      }).then(
-        undefined,
-        (error) => vscode.window.showErrorMessage(`Failed to push restored history. ${error instanceof Error ? error.message : String(error)}`),
-      );
+      throw error;
     }
   }
 

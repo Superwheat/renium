@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -613,11 +613,6 @@
           "default": "prompt",
           "description": "How to resolve overlapping concurrent edits to the same script during live sync, when the same lines changed in both Studio and your editor. Non-overlapping concurrent edits are always merged automatically. Conflict markers are never written into your scripts; both sides are always backed up under .renium/conflicts. The Studio plugin's setting, when chosen there, overrides this."
         },
-        "renium.runImport": {
-          "type": "boolean",
-          "default": true,
-          "description": "Run import stage so src and sourcemap.json are updated"
-        },
         "renium.importMode": {
           "type": "string",
           "enum": [
@@ -863,7 +858,7 @@
     "refresh-studio-assets": "node scripts/sync-assets.mjs --refresh-studio-api",
     "compile": "tsc -p .",
     "test:compile": "tsc -p tsconfig.test.json",
-    "test": "npm run test:compile && node --test out-test/test/agentInstructions.test.js out-test/test/cliResolution.test.js out-test/test/conflictMerge.test.js out-test/test/editorLiveSyncCache.test.js out-test/test/gitSync.test.js out-test/test/pluginDistribution.test.js",
+    "test": "npm run test:compile && node --test out-test/test/agentInstructions.test.js out-test/test/cliResolution.test.js out-test/test/conflictMerge.test.js out-test/test/gitSync.test.js out-test/test/pluginDistribution.test.js",
     "verify": "npm run compile && npm run test",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run generate-automation-api && npm run sync-assets && npm run sync-cli && npm run compile",

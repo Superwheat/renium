@@ -379,8 +379,12 @@ pub(super) fn resolve(
         .context(id)
         .ok_or_else(|| Failure::new("stale_cx", "Context is no longer valid", false, "bind"))?;
     let fingerprint = fingerprint(Path::new(&context.project), Path::new(&context.experience))
-        .map_err(|_| Failure::new("stale_cx", "Project identity changed", false, "bind"))?;
+        .map_err(|_| {
+            state.live_sync().cancel(id);
+            Failure::new("stale_cx", "Project identity changed", false, "bind")
+        })?;
     if fingerprint != context.fingerprint {
+        state.live_sync().cancel(id);
         return Err(Failure::new(
             "stale_cx",
             "Project identity changed",
@@ -393,6 +397,7 @@ pub(super) fn resolve(
             .into_iter()
             .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id))
             .ok_or_else(|| {
+                state.live_sync().cancel(id);
                 Failure::new(
                     "stale_cx",
                     "The selected Studio runtime disconnected",
@@ -401,6 +406,7 @@ pub(super) fn resolve(
                 )
             })?;
         if candidate.get("bridgeBuildUnix").and_then(Value::as_i64) != context.plugin_build {
+            state.live_sync().cancel(id);
             return Err(Failure::new(
                 "stale_cx",
                 "The selected Studio plugin build changed",

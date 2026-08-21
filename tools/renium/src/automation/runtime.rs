@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -26,7 +27,7 @@ use crate::editor::sync::{
     push_editor_changes_with_warm_bridge,
 };
 use crate::project::workflows;
-use crate::snapshot::export::export_snapshots_with_warm_bridge;
+use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
     click_result, editor_review_decision_result, execute_luau_result, get_console_output_result,
@@ -102,7 +103,17 @@ fn automation_bridge(
     Ok(bridge)
 }
 
-fn automation_failure(error: anyhow::Error) -> automation::Failure {
+pub(super) fn automation_failure(error: anyhow::Error) -> automation::Failure {
+    automation_failure_ref(&error)
+}
+
+pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failure {
+    if let Some(verification) =
+        error.downcast_ref::<crate::editor::sync::EditorSourceVerificationError>()
+    {
+        return automation::Failure::new("conflict", verification.to_string(), false, "context")
+            .detail(json!({ "sourceVerifyErrors": verification.details }));
+    }
     let message = format!("{error:#}")
         .lines()
         .filter(|line| !line.contains("--help"))
@@ -126,6 +137,7 @@ fn automation_failure(error: anyhow::Error) -> automation::Failure {
     if lower.contains("no studio runtime")
         || lower.contains("no connected")
         || lower.contains("no plugin bridge")
+        || lower.contains("pinned studio runtime disconnected")
     {
         return automation::Failure::new("no_studio", message, false, "studios");
     }
@@ -169,7 +181,7 @@ fn automation_string_list(value: &Value) -> Option<String> {
         .or_else(|| value.as_str().map(str::to_string))
 }
 
-fn automation_pull_args(
+pub(super) fn automation_pull_args(
     context: &automation::BoundContext,
     parameters: &Value,
     import: bool,
@@ -212,7 +224,7 @@ fn automation_pull_args(
     })
 }
 
-fn automation_push_args(
+pub(super) fn automation_push_args(
     context: &automation::BoundContext,
     parameters: &Value,
     reviewed: bool,
@@ -411,7 +423,7 @@ fn pending_change_ack(bridge: &BridgeServer, services: &[String]) -> Result<Opti
     Ok(Some((seq, runtime_id)))
 }
 
-fn acknowledge_pulled_changes(
+pub(super) fn acknowledge_pulled_changes(
     bridge: &BridgeServer,
     services: &[String],
     seq: u64,
@@ -430,14 +442,6 @@ fn acknowledge_pulled_changes(
 }
 
 fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map<String, Value> {
-    let is_non_empty = |value: &Value| match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_none_or(|value| value != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    };
     let mut result = Map::new();
     result.insert(
         "ok".to_string(),
@@ -447,19 +451,7 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "direction".to_string(),
         Value::String("files-to-studio".to_string()),
     );
-    let filtered = [
-        "changedPaths",
-        "changedPathsFiles",
-        "targetSettingsIds",
-        "targetSettingsIdFiles",
-        "targetProperties",
-    ]
-    .into_iter()
-    .any(|key| parameters.get(key).is_some_and(&is_non_empty))
-        || parameters
-            .get("upsertInstancesOnly")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    let filtered = push_is_filtered(parameters);
     result.insert(
         "selection".to_string(),
         Value::String(if filtered { "filtered" } else { "full" }.to_string()),
@@ -476,11 +468,69 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "protectedApplied",
     ] {
         let value = parameters.get(key).or_else(|| summary.get(key));
-        if let Some(value) = value.filter(|value| is_non_empty(value)) {
+        if let Some(value) = value.filter(|value| automation_value_is_non_empty(value)) {
             result.insert(key.to_string(), value.clone());
         }
     }
     result
+}
+
+fn automation_value_is_non_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_none_or(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn push_is_filtered(parameters: &Value) -> bool {
+    [
+        "changedPaths",
+        "changedPathsFiles",
+        "targetSettingsIds",
+        "targetSettingsIdFiles",
+        "targetProperties",
+    ]
+    .into_iter()
+    .any(|key| {
+        parameters
+            .get(key)
+            .is_some_and(automation_value_is_non_empty)
+    }) || parameters
+        .get("upsertInstancesOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn automation_pull_operation(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> Result<(Value, PublishedProjectChanges)> {
+    let target = BridgeTarget::Main;
+    bridge.wait_for_target(bridge_wait_seconds, target)?;
+    let info = bridge.cached_bridge_info_for_target(target)?;
+    let args = automation_pull_args(context, parameters, true)?;
+    let services = args.services.clone();
+    let parsed_services = parse_services(&services)?;
+    let pending_ack = pending_change_ack(bridge, &parsed_services)?;
+    let acknowledged_pending = pending_ack.is_some();
+    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+    if let Some((seq, runtime_id)) = pending_ack {
+        acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
+    }
+    Ok((
+        json!({
+            "direction": "studio-to-files",
+            "services": parsed_services,
+            "pendingChangesAcknowledged": acknowledged_pending,
+        }),
+        published,
+    ))
 }
 
 fn automation_dispatch_operation(
@@ -497,32 +547,15 @@ fn automation_dispatch_operation(
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
     match operation {
-        op::PULL | op::EXPORT_SNAPSHOTS => {
+        op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
+            .map(|(result, _)| result),
+        op::EXPORT_SNAPSHOTS => {
             let target = BridgeTarget::Main;
             bridge.wait_for_target(bridge_wait_seconds, target)?;
             let info = bridge.cached_bridge_info_for_target(target)?;
-            let args = automation_pull_args(context, parameters, operation == op::PULL)?;
-            let services = args.services.clone();
-            let parsed_services = parse_services(&services)?;
-            let pending_ack = if operation == op::PULL {
-                pending_change_ack(bridge, &parsed_services)?
-            } else {
-                None
-            };
-            let acknowledged_pending = pending_ack.is_some();
+            let args = automation_pull_args(context, parameters, false)?;
             export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
-            if let Some((seq, runtime_id)) = pending_ack {
-                acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
-            }
-            Ok(if operation == op::PULL {
-                json!({
-                    "direction": "studio-to-files",
-                    "services": parsed_services,
-                    "pendingChangesAcknowledged": acknowledged_pending,
-                })
-            } else {
-                json!({ "direction": "snapshots" })
-            })
+            Ok(json!({ "direction": "snapshots" }))
         }
         op::PUSH => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
@@ -844,10 +877,346 @@ fn automation_dispatch_with_retry(
     }
 }
 
+fn automation_dispatch_managed(
+    operation: u16,
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+    reviewed: bool,
+) -> std::result::Result<Value, automation::Failure> {
+    let writes_project = matches!(
+        operation,
+        op::PULL
+            | op::SET_SOURCE
+            | op::ADD
+            | op::CLONE
+            | op::MOVE
+            | op::REVERT
+            | op::IMPORT_MODEL
+            | op::IMPORT_SNAPSHOTS
+            | op::PROJECT_INIT
+            | op::PLACE_ADD
+            | op::PLACE_RENAME
+            | op::PLACE_REORDER
+    ) || matches!(operation, op::SET_PROPERTY | op::REMOVE)
+        && parameters.get("editor").and_then(Value::as_bool) != Some(true);
+    let pauses_file_watcher = writes_project || operation == op::PUSH;
+    if pauses_file_watcher {
+        state.live_sync().pause(context.id);
+    }
+    let push_capture = if operation == op::PUSH {
+        let changed_paths = parameters
+            .get("changedPaths")
+            .map(|value| match value {
+                Value::Array(values) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(PathBuf::from)
+                    .collect(),
+                Value::String(value) => value.split(',').map(PathBuf::from).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        let capture_paths = if push_is_filtered(parameters) {
+            (!changed_paths.is_empty()).then_some(changed_paths.as_slice())
+        } else {
+            None
+        };
+        if push_is_filtered(parameters) && capture_paths.is_none() {
+            None
+        } else {
+            match state.live_sync().capture(context, capture_paths) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    state
+                        .live_sync()
+                        .resume(context.id, std::iter::empty::<PathBuf>());
+                    return Err(automation_failure(error));
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let mut published = None;
+    let result = if operation == op::PULL {
+        let first = automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
+            .map_err(automation_failure);
+        let pulled = match first {
+            Err(failure) if failure.0.rt == 1 => {
+                automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
+                    .map_err(automation_failure)
+            }
+            result => result,
+        };
+        pulled.map(|(result, changes)| {
+            published = Some(changes);
+            result
+        })
+    } else {
+        automation_dispatch_with_retry(
+            operation,
+            context,
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            reviewed,
+        )
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if pauses_file_watcher {
+                state
+                    .live_sync()
+                    .resume(context.id, std::iter::empty::<PathBuf>());
+            }
+            return Err(error);
+        }
+    };
+    if result.get("ok").and_then(Value::as_bool) != Some(false) {
+        let paths = result
+            .get("changedPaths")
+            .or_else(|| parameters.get("changedPaths"))
+            .map(|value| match value {
+                Value::Array(values) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                Value::String(value) => value.split(',').map(str::to_string).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        if writes_project {
+            if operation == op::PULL {
+                let published = published
+                    .context("Pull did not return published project changes")
+                    .map_err(automation_failure)?;
+                state
+                    .live_sync()
+                    .reconcile_then_resume(context.id, published)
+                    .map_err(automation_failure)?;
+            } else {
+                state.live_sync().resume(context.id, std::iter::empty());
+            }
+        } else if operation == op::PUSH {
+            if let Some(captured) = push_capture {
+                state
+                    .live_sync()
+                    .rebase_then_resume(context.id, captured)
+                    .map_err(automation_failure)?;
+            } else {
+                state.live_sync().resume(context.id, std::iter::empty());
+            }
+        } else if !paths.is_empty() {
+            state.live_sync().settle(context.id, paths);
+        }
+    } else if pauses_file_watcher {
+        state
+            .live_sync()
+            .resume(context.id, std::iter::empty::<PathBuf>());
+    }
+    Ok(result)
+}
+
+fn automation_live_operation(
+    operation: u16,
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Value, automation::Failure> {
+    let object = automation_object(parameters)?;
+    let manage_files = automation_bool(object, "manageFiles", true).map_err(automation_failure)?;
+    let files_only = automation_bool(object, "filesOnly", false).map_err(automation_failure)?;
+    let files_paused = automation_bool(object, "filesPaused", false).map_err(automation_failure)?;
+    let reset_files_paused =
+        automation_bool(object, "resetFilesPaused", false).map_err(automation_failure)?;
+    let pull_changes = object
+        .get("pullChanges")
+        .map(|_| automation_bool(object, "pullChanges", true).map_err(automation_failure))
+        .transpose()?;
+    let settle_paths = automation_strings(object, "settlePaths")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let queue_paths = automation_strings(object, "queuePaths")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if manage_files
+        && operation == op::LIVE_STATUS
+        && let Some(file_writes) = object.get("fileWrites").and_then(Value::as_str)
+    {
+        let daemon = match file_writes {
+            "pause" => state.live_sync().pause(context.id),
+            "resume" if settle_paths.is_empty() => {
+                state.live_sync().resume(context.id, std::iter::empty())
+            }
+            "resume" => {
+                let captured = match state.live_sync().capture(context, Some(&settle_paths)) {
+                    Ok(Some(captured)) => captured,
+                    Ok(None) => {
+                        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+                    }
+                    Err(error) => {
+                        state
+                            .live_sync()
+                            .resume(context.id, std::iter::empty::<PathBuf>());
+                        return Err(automation_failure(error));
+                    }
+                };
+                state
+                    .live_sync()
+                    .rebase_then_resume(context.id, captured)
+                    .map_err(automation_failure)?
+            }
+            _ => {
+                return Err(automation::Failure::new(
+                    "bad_req",
+                    "p.fileWrites must be pause or resume",
+                    false,
+                    "live-status",
+                ));
+            }
+        };
+        return Ok(json!({ "daemon": daemon }));
+    }
+    if manage_files && operation == op::LIVE_STATUS && !settle_paths.is_empty() {
+        state.live_sync().settle(context.id, settle_paths);
+        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+    }
+    if manage_files && operation == op::LIVE_STATUS && !queue_paths.is_empty() {
+        return Ok(json!({
+            "daemon": state.live_sync().queue(context.id, queue_paths)
+        }));
+    }
+
+    if manage_files && matches!(operation, op::RETRY_PENDING | op::DISCARD_PENDING) {
+        let plugin = {
+            let _gate = bridge.acquire_request_gate();
+            automation_dispatch_with_retry(
+                operation,
+                context,
+                parameters,
+                bridge,
+                bridge_wait_seconds,
+                false,
+            )?
+        };
+        let daemon = if operation == op::RETRY_PENDING {
+            state.live_sync().retry(context.id)
+        } else {
+            state
+                .live_sync()
+                .discard(context)
+                .map_err(automation_failure)?
+        };
+        return Ok(merge_live_status(plugin, daemon));
+    }
+
+    if manage_files && files_only && operation == op::LIVE_STATUS {
+        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+    }
+
+    if manage_files && operation == op::LIVE_STOP {
+        let plugin = {
+            let _gate = bridge.acquire_request_gate();
+            automation_dispatch_with_retry(
+                operation,
+                context,
+                parameters,
+                bridge,
+                bridge_wait_seconds,
+                false,
+            )
+        };
+        let daemon = state.live_sync().stop(context.id);
+        return plugin.map(|plugin| merge_live_status(plugin, daemon));
+    }
+
+    let daemon = match operation {
+        op::LIVE_START if manage_files => {
+            let plugin = {
+                let _gate = bridge.acquire_request_gate();
+                automation_dispatch_with_retry(
+                    operation,
+                    context,
+                    parameters,
+                    bridge,
+                    bridge_wait_seconds,
+                    false,
+                )?
+            };
+            let daemon = match state.live_sync().start(
+                context.clone(),
+                Arc::clone(bridge),
+                pull_changes,
+                files_paused,
+                reset_files_paused,
+            ) {
+                Ok(daemon) => daemon,
+                Err(error) => {
+                    let cleanup = {
+                        let _gate = bridge.acquire_request_gate();
+                        automation_dispatch_with_retry(
+                            op::LIVE_STOP,
+                            context,
+                            parameters,
+                            bridge,
+                            bridge_wait_seconds,
+                            false,
+                        )
+                    };
+                    let mut failure = automation_failure(error);
+                    if let Err(cleanup) = cleanup {
+                        failure
+                            .0
+                            .m
+                            .push_str("; Studio live mode also failed to stop: ");
+                        failure.0.m.push_str(&cleanup.0.m);
+                    }
+                    return Err(failure);
+                }
+            };
+            return Ok(merge_live_status(plugin, daemon));
+        }
+        _ => state.live_sync().status(context.id),
+    };
+    let plugin = {
+        let _gate = bridge.acquire_request_gate();
+        automation_dispatch_with_retry(
+            operation,
+            context,
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            false,
+        )?
+    };
+    Ok(merge_live_status(plugin, daemon))
+}
+
+fn merge_live_status(plugin: Value, daemon: Value) -> Value {
+    let mut result = plugin
+        .as_object()
+        .cloned()
+        .unwrap_or_else(|| Map::from_iter([("plugin".to_string(), plugin)]));
+    result.insert("daemon".to_string(), daemon);
+    Value::Object(result)
+}
+
 fn automation_execute_request(
     request: &automation::Request,
     state: &automation::State,
-    bridge: &BridgeServer,
+    bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let operation = request.validate()?;
@@ -869,6 +1238,26 @@ fn automation_execute_request(
             if operation.id == op::UNBIND {
                 return Ok(json!({ "removed": state.remove_context(context_id) }));
             }
+            if operation.id == op::LIVE_STATUS
+                && request.p.get("filesOnly").and_then(Value::as_bool) == Some(true)
+            {
+                let context = state.context(context_id).ok_or_else(|| {
+                    automation::Failure::new(
+                        "stale_cx",
+                        "Context is no longer valid",
+                        false,
+                        "bind",
+                    )
+                })?;
+                return automation_live_operation(
+                    operation.id,
+                    &context,
+                    &request.p,
+                    state,
+                    bridge,
+                    bridge_wait_seconds,
+                );
+            }
             let context = bound_context::resolve(state, bridge, context_id)?;
             if operation.id == op::CONTEXT {
                 return serde_json::to_value(context).map_err(|error| {
@@ -887,6 +1276,23 @@ fn automation_execute_request(
                     false,
                     "project-init",
                 ));
+            }
+            if matches!(
+                operation.id,
+                op::LIVE_START
+                    | op::LIVE_STOP
+                    | op::LIVE_STATUS
+                    | op::RETRY_PENDING
+                    | op::DISCARD_PENDING
+            ) {
+                return automation_live_operation(
+                    operation.id,
+                    &context,
+                    &request.p,
+                    state,
+                    bridge,
+                    bridge_wait_seconds,
+                );
             }
             if matches!(operation.id, op::ASSET_SEARCH | op::IMAGE_UPLOAD) {
                 let _selection = bound_context::select(&context);
@@ -1022,10 +1428,11 @@ fn automation_execute_request(
                         "review-prepare",
                     ));
                 }
-                return automation_dispatch_with_retry(
+                return automation_dispatch_managed(
                     review.operation,
                     &context,
                     &review.parameters,
+                    state,
                     bridge,
                     bridge_wait_seconds,
                     true,
@@ -1042,10 +1449,11 @@ fn automation_execute_request(
                     "review-prepare",
                 ));
             }
-            automation_dispatch_with_retry(
+            automation_dispatch_managed(
                 operation.id,
                 &context,
                 &request.p,
+                state,
                 bridge,
                 bridge_wait_seconds,
                 false,
@@ -1057,7 +1465,7 @@ fn automation_execute_request(
 fn automation_response(
     request: automation::Request,
     state: &automation::State,
-    bridge: &BridgeServer,
+    bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> automation::Response {
     let started = Instant::now();
@@ -1086,7 +1494,7 @@ fn automation_response(
 pub(crate) fn automation_parse_response(
     text: &str,
     state: &automation::State,
-    bridge: &BridgeServer,
+    bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> automation::Response {
     let started = Instant::now();
@@ -1119,7 +1527,7 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 }
 
 pub(crate) fn run_automation_stdio(
-    bridge: &BridgeServer,
+    bridge: &Arc<BridgeServer>,
     state: &automation::State,
     bridge_wait_seconds: f64,
 ) -> Result<()> {

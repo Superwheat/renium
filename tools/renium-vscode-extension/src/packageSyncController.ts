@@ -148,7 +148,6 @@ type CliLinkDeletePackageResult = {
 
 type PackagePushOptions = {
   force?: boolean;
-  skipChangeFilter?: boolean;
   taskName?: string;
   targetSettingsIds?: string[];
 };
@@ -184,8 +183,8 @@ type PackageSyncControllerHost<TConfig extends PackageSyncControllerConfig> = {
   pushEditorDeleteNow: (request: PackageDeleteRequest) => Promise<unknown>;
   noteProgrammaticEditorWrite: (request: {
     paths?: string[] | string;
-    durationMs?: number;
-  }) => void;
+    fileWrites?: "pause" | "resume" | "queue";
+  }) => Promise<void>;
   isEditorLiveSyncActive: () => boolean;
   executeCommandBestEffort: (command: string, ...args: unknown[]) => Promise<void>;
 };
@@ -213,6 +212,33 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
   public readonly onLinksChanged = this.linkChangeEmitter.event;
 
   public constructor(private readonly host: PackageSyncControllerHost<TConfig>) {}
+
+  private async withPausedProjectWrite<T>(
+    write: () => Promise<T>,
+    finish: (result: T) => Promise<string[]>,
+  ): Promise<T> {
+    await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
+    try {
+      const result = await write();
+      const settledPaths = await finish(result);
+      await this.host.noteProgrammaticEditorWrite({
+        paths: settledPaths,
+        fileWrites: "resume",
+      });
+      return result;
+    } catch (error) {
+      try {
+        await this.host.noteProgrammaticEditorWrite({
+          fileWrites: "resume",
+        });
+      } catch (resumeError) {
+        const original = error instanceof Error ? error.message : String(error);
+        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
+      }
+      throw error;
+    }
+  }
 
   public dispose(): void {
     this.pausePendingSources();
@@ -353,30 +379,33 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
           this.host.output.show(false);
           this.host.logResolvedConfig(runCfg);
           this.host.output.appendLine(`[renium] Wally packages command: ${command} ${renderCommandArgs(args)}`);
-          const result = await this.host.runCommand(command, args, runCfg.projectRoot, "wally-packages", runCfg.progressHeartbeatSeconds);
-          if (result.code !== 0) {
-            throw new Error(this.wallySyncFailureMessage(result));
-          }
-
-          const parsed = parseCliJsonObject<CliSyncWallyPackagesResult>(result.output);
-          if (!parsed || parsed.ok === false) {
-            throw new Error("Wally package sync didn't finish. Check the Renium output panel for details.");
-          }
-          if (
-            typeof parsed.projectRoot !== "string"
-            || filesystemPathKey(parsed.projectRoot) !== requestedRoot
-            || this.host.experienceGeneration() !== requestedGeneration
-            || filesystemPathKey(this.host.getConfig().projectRoot) !== requestedRoot
-          ) {
-            throw new Error("Wally package sync returned results for a different Renium place.");
-          }
-          const importedIds = Array.isArray(parsed.targetSettingsIds) ? parsed.targetSettingsIds : parsed.settingsIds;
-          const importedCount = Array.isArray(importedIds) ? importedIds.length : 0;
-          progress.report({ message: `Imported ${importedCount} package instance(s).` });
-          this.host.output.appendLine(
-            `[renium] Wally packages: imported ${importedCount} instance(s) into ${parsed.service ?? runCfg.wallySync.targetService}.${parsed.targetName ?? runCfg.wallySync.targetName}`,
-          );
-          await this.applyWallyPackagesToStudio(parsed, runCfg);
+          await this.withPausedProjectWrite(async () => {
+            const result = await this.host.runCommand(command, args, runCfg.projectRoot, "wally-packages", runCfg.progressHeartbeatSeconds);
+            if (result.code !== 0) {
+              throw new Error(this.wallySyncFailureMessage(result));
+            }
+            const parsed = parseCliJsonObject<CliSyncWallyPackagesResult>(result.output);
+            if (!parsed || parsed.ok === false) {
+              throw new Error("Wally package sync didn't finish. Check the Renium output panel for details.");
+            }
+            if (
+              typeof parsed.projectRoot !== "string"
+              || filesystemPathKey(parsed.projectRoot) !== requestedRoot
+              || this.host.experienceGeneration() !== requestedGeneration
+              || filesystemPathKey(this.host.getConfig().projectRoot) !== requestedRoot
+            ) {
+              throw new Error("Wally package sync returned results for a different Renium place.");
+            }
+            return parsed;
+          }, async (parsed) => {
+            const importedIds = Array.isArray(parsed.targetSettingsIds) ? parsed.targetSettingsIds : parsed.settingsIds;
+            const importedCount = Array.isArray(importedIds) ? importedIds.length : 0;
+            progress.report({ message: `Imported ${importedCount} package instance(s).` });
+            this.host.output.appendLine(
+              `[renium] Wally packages: imported ${importedCount} instance(s) into ${parsed.service ?? runCfg.wallySync.targetService}.${parsed.targetName ?? runCfg.wallySync.targetName}`,
+            );
+            return this.applyWallyPackagesToStudio(parsed, runCfg);
+          });
         });
       },
     );
@@ -453,7 +482,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
     return base || "project";
   }
 
-  private async applyWallyPackagesToStudio(result: CliSyncWallyPackagesResult, cfg: TConfig): Promise<void> {
+  private async applyWallyPackagesToStudio(result: CliSyncWallyPackagesResult, cfg: TConfig): Promise<string[]> {
     const mode = cfg.wallySync.applyToStudio;
 
     const settingsFiles: string[] = [];
@@ -496,7 +525,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
 
     if (mode === "never" || (changedPaths.length === 0 && removedTargets.length === 0)) {
       vscode.window.showInformationMessage(`Synced Wally packages to ${summaryTarget}.`);
-      return;
+      return changedPaths;
     }
 
     let shouldApply = mode === "always";
@@ -510,12 +539,12 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       shouldApply = picked === apply;
     }
     if (!shouldApply) {
-      return;
+      return changedPaths;
     }
     if (!this.host.canUseStudioPushPipeline()) {
       this.host.noteStudioPushSkipped("serve/live sync is not active");
       vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
-      return;
+      return changedPaths;
     }
 
     try {
@@ -536,21 +565,22 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
           : [];
         const pushed = await this.host.pushEditorPathsNow(changedPaths, {
           force: true,
-          skipChangeFilter: true,
           taskName: "Wally packages -> Studio",
           targetSettingsIds,
         });
         if (!pushed) {
           vscode.window.showInformationMessage(`Synced Wally packages locally (${summaryTarget}). Start Serve or live sync before applying to Studio.`);
-          return;
+          return changedPaths;
         }
       }
       vscode.window.showInformationMessage(`Applied Wally packages to Studio (${summaryTarget}).`);
+      return [];
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.host.output.appendLine(`[renium] Wally packages Studio apply failed: ${message}`);
       this.host.output.show(true);
       vscode.window.showWarningMessage(`Wally packages synced locally, but Studio apply failed. ${message}`);
+      return [];
     }
   }
 
@@ -605,121 +635,142 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
   public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean; expectedProjectRoot?: string; expectedGeneration?: number } = {}): Promise<CliLinkApplyResult | undefined> {
     let result: CliLinkApplyResult | undefined;
     let executed = false;
-    await this.host.enqueue("Apply packages", async () => {
-      const cfg = this.host.getConfig();
-      if (
-        (options.expectedGeneration !== undefined && options.expectedGeneration !== this.host.experienceGeneration())
-        || (
-          options.expectedProjectRoot
-          && filesystemPathKey(options.expectedProjectRoot) !== filesystemPathKey(cfg.projectRoot)
-        )
-      ) {
-        throw new Error("The active project changed before package apply.");
-      }
-      executed = true;
-      const manifestPath = this.linkManifestPath(cfg);
-      if (!fs.existsSync(manifestPath)) {
+    await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
+    try {
+      await this.host.enqueue("Apply packages", async () => {
+        const cfg = this.host.getConfig();
+        if (
+          (options.expectedGeneration !== undefined && options.expectedGeneration !== this.host.experienceGeneration())
+          || (
+            options.expectedProjectRoot
+            && filesystemPathKey(options.expectedProjectRoot) !== filesystemPathKey(cfg.projectRoot)
+          )
+        ) {
+          throw new Error("The active project changed before package apply.");
+        }
+        executed = true;
+        const manifestPath = this.linkManifestPath(cfg);
+        if (!fs.existsSync(manifestPath)) {
+          if (!options.silent) {
+            vscode.window.showInformationMessage(
+              `No link manifest found at ${manifestPath}. Use "Add Link" first.`,
+            );
+          }
+          return;
+        }
+        const command = cfg.cliPath;
+        ensureFileExists(command);
+        const args = this.linkCommandArgs(cfg, "link-apply");
+        args.push(
+          "--git-path",
+          cfg.linkSync.gitPath,
+          "--wally-path",
+          cfg.linkSync.wallyPath,
+        );
+        if (cfg.linkSync.offline) {
+          args.push("--offline");
+        }
+        const linkId = typeof options.linkId === "string" ? options.linkId.trim() : "";
+        if (linkId.length > 0) {
+          args.push("--link", linkId);
+        }
+        if (cfg.linkSync.cacheDir.length > 0) {
+          args.push("--cache-dir", cfg.linkSync.cacheDir);
+        }
+        if (options.forceTargets === true || options.forceStudio === true) {
+          args.push("--force-targets");
+        }
+        for (const targetPath of options.forceTargetPaths ?? []) {
+          if (Array.isArray(targetPath) && targetPath.length > 0) {
+            args.push("--force-target", JSON.stringify({
+              service: targetPath[0],
+              path: targetPath,
+              ords: [],
+            }));
+          }
+        }
+        const run = await this.host.runCommand(command, args, cfg.projectRoot, "link-apply", cfg.progressHeartbeatSeconds, { quietLog: true });
+        if (run.code !== 0) {
+          throw new Error("Couldn't apply packages. Check the Renium output panel for details.");
+        }
+        const parsed = parseCliJsonObject<CliLinkApplyResult>(run.output);
+        if (!parsed || parsed.ok === false) {
+          throw new Error("Applying packages didn't finish. Check the Renium output panel for details.");
+        }
+        result = parsed;
+        for (const warning of Array.isArray(parsed.warnings) ? parsed.warnings : []) {
+          this.host.output.appendLine(`[renium] link warning: ${warning}`);
+        }
+        const processed = parsed.processedTargets ?? 0;
         if (!options.silent) {
+          const warnCount = Array.isArray(parsed.warnings) ? parsed.warnings.length : 0;
           vscode.window.showInformationMessage(
-            `No link manifest found at ${manifestPath}. Use "Add Link" first.`,
+            `Synced ${processed} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
           );
         }
-        return;
+      });
+      if ((options.expectedProjectRoot || options.expectedGeneration !== undefined) && !executed) {
+        throw new Error("Package apply was cancelled before it started.");
       }
-      const command = cfg.cliPath;
-      ensureFileExists(command);
-      const args = this.linkCommandArgs(cfg, "link-apply");
-      args.push(
-        "--git-path",
-        cfg.linkSync.gitPath,
-        "--wally-path",
-        cfg.linkSync.wallyPath,
-      );
-      if (cfg.linkSync.offline) {
-        args.push("--offline");
+      this.invalidateLinkStatusCache();
+      const forceStudioAllowed = options.forceStudio === true && this.host.canUseStudioPushPipeline();
+      if (options.forceStudio === true && !forceStudioAllowed) {
+        this.host.noteStudioPushSkipped("serve/live sync is not active");
       }
-      const linkId = typeof options.linkId === "string" ? options.linkId.trim() : "";
-      if (linkId.length > 0) {
-        args.push("--link", linkId);
-      }
-      if (cfg.linkSync.cacheDir.length > 0) {
-        args.push("--cache-dir", cfg.linkSync.cacheDir);
-      }
-      if (options.forceTargets === true || options.forceStudio === true) {
-        args.push("--force-targets");
-      }
-      for (const targetPath of options.forceTargetPaths ?? []) {
-        if (Array.isArray(targetPath) && targetPath.length > 0) {
-          args.push("--force-target", JSON.stringify({
-            service: targetPath[0],
-            path: targetPath,
-            ords: [],
-          }));
-        }
-      }
-      const run = await this.host.runCommand(command, args, cfg.projectRoot, "link-apply", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't apply packages. Check the Renium output panel for details.");
-      }
-      const parsed = parseCliJsonObject<CliLinkApplyResult>(run.output);
-      if (!parsed || parsed.ok === false) {
-        throw new Error("Applying packages didn't finish. Check the Renium output panel for details.");
-      }
-      result = parsed;
-      for (const warning of Array.isArray(parsed.warnings) ? parsed.warnings : []) {
-        this.host.output.appendLine(`[renium] link warning: ${warning}`);
-      }
-      const processed = parsed.processedTargets ?? 0;
-      if (!options.silent) {
-        const warnCount = Array.isArray(parsed.warnings) ? parsed.warnings.length : 0;
-        vscode.window.showInformationMessage(
-          `Synced ${processed} link target(s)${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}.`,
-        );
-      }
-    });
-    if ((options.expectedProjectRoot || options.expectedGeneration !== undefined) && !executed) {
-      throw new Error("Package apply was cancelled before it started.");
-    }
-    this.invalidateLinkStatusCache();
-    const forceStudioAllowed = options.forceStudio === true && this.host.canUseStudioPushPipeline();
-    if (options.forceStudio === true && !forceStudioAllowed) {
-      this.host.noteStudioPushSkipped("serve/live sync is not active");
-    }
-    if (result && options.skipStudio !== true && (forceStudioAllowed || (this.host.isEditorLiveSyncActive() && this.host.getConfig().linkSync.applyToStudio !== "never"))) {
-      const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
-        .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-      if (changedPaths.length > 0) {
-        this.host.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
-        if (forceStudioAllowed) {
-          const targetSettingsIds = (Array.isArray(result.changedSettingsIds) ? result.changedSettingsIds : [])
-            .map((value) => String(value).trim())
-            .filter((value) => value.length > 0);
-          await this.host.pushEditorPathsNow(changedPaths, {
-            force: true,
-            skipChangeFilter: true,
-            taskName: options.taskName ?? "Link -> Studio",
-            targetSettingsIds,
-          });
+      let settledPaths: string[] = [];
+      if (result) {
+        const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
+          .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
+        const shouldConsiderStudio = options.skipStudio !== true
+          && (forceStudioAllowed || (this.host.isEditorLiveSyncActive() && this.host.getConfig().linkSync.applyToStudio !== "never"));
+        if (changedPaths.length > 0 && shouldConsiderStudio) {
+          if (forceStudioAllowed) {
+            const targetSettingsIds = (Array.isArray(result.changedSettingsIds) ? result.changedSettingsIds : [])
+              .map((value) => String(value).trim())
+              .filter((value) => value.length > 0);
+            await this.host.pushEditorPathsNow(changedPaths, {
+              force: true,
+              taskName: options.taskName ?? "Link -> Studio",
+              targetSettingsIds,
+            });
+          } else {
+            settledPaths = await this.applyLinksToStudio(result, { silent: options.silent === true });
+          }
         } else {
-          await this.applyLinksToStudio(result, { silent: options.silent === true });
+          settledPaths = changedPaths;
         }
       }
+      await this.host.noteProgrammaticEditorWrite({
+        paths: settledPaths,
+        fileWrites: "resume",
+      });
+      if (options.refreshExplorer !== false) {
+        await this.refreshFileExplorerSafe();
+      }
+      return result;
+    } catch (error) {
+      try {
+        await this.host.noteProgrammaticEditorWrite({
+          fileWrites: "resume",
+        });
+      } catch (resumeError) {
+        const original = error instanceof Error ? error.message : String(error);
+        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
+      }
+      throw error;
     }
-    if (options.refreshExplorer !== false) {
-      await this.refreshFileExplorerSafe();
-    }
-    return result;
   }
 
-  private async applyLinksToStudio(result: CliLinkApplyResult, options: { silent?: boolean } = {}): Promise<void> {
+  private async applyLinksToStudio(result: CliLinkApplyResult, options: { silent?: boolean } = {}): Promise<string[]> {
     const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
       .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
     if (changedPaths.length === 0) {
-      return;
+      return [];
     }
     const mode = this.host.getConfig().linkSync.applyToStudio;
     if (mode === "never") {
-      return;
+      return changedPaths;
     }
     if (mode === "ask") {
       const apply = "Apply links to Studio";
@@ -729,7 +780,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
         apply,
       );
       if (picked !== apply) {
-        return;
+        return changedPaths;
       }
     }
     try {
@@ -738,16 +789,17 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
         .filter((value) => value.length > 0);
       await this.host.pushEditorPathsNow(changedPaths, {
         force: true,
-        skipChangeFilter: true,
         taskName: "Link -> Studio",
         targetSettingsIds,
       });
+      return [];
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.host.output.appendLine(`[renium] link Studio push failed: ${message}`);
       if (!options.silent) {
         vscode.window.showWarningMessage(`Link applied to the project files, but the Studio push failed. ${message}`);
       }
+      return [];
     }
   }
 
@@ -1622,43 +1674,48 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       }
     }
 
-    let result: CliLinkDeletePackageResult | undefined;
-    await this.host.enqueue("Delete link package", async () => {
-      const cfg = this.host.getConfig();
-      const command = cfg.cliPath;
-      ensureFileExists(command);
-      const args = this.linkCommandArgs(cfg, "link-delete-package");
-      args.push(
-        "--id",
-        fresh.id ?? "",
-        "--action",
-        action,
-      );
-      const run = await this.host.runCommand(command, args, cfg.projectRoot, "link-delete-package", cfg.progressHeartbeatSeconds, { quietLog: true });
-      if (run.code !== 0) {
-        throw new Error("Couldn't delete the package. Check the Renium output panel for details.");
+    const result = await this.withPausedProjectWrite(async () => {
+      let deleted: CliLinkDeletePackageResult | undefined;
+      await this.host.enqueue("Delete link package", async () => {
+        const cfg = this.host.getConfig();
+        const command = cfg.cliPath;
+        ensureFileExists(command);
+        const args = this.linkCommandArgs(cfg, "link-delete-package");
+        args.push(
+          "--id",
+          fresh.id ?? "",
+          "--action",
+          action,
+        );
+        const run = await this.host.runCommand(command, args, cfg.projectRoot, "link-delete-package", cfg.progressHeartbeatSeconds, { quietLog: true });
+        if (run.code !== 0) {
+          throw new Error("Couldn't delete the package. Check the Renium output panel for details.");
+        }
+        const parsed = parseCliJsonObject<CliLinkDeletePackageResult>(run.output);
+        if (!parsed || parsed.ok === false) {
+          throw new Error("Package delete did not return a valid Renium result.");
+        }
+        deleted = parsed;
+      });
+      if (!deleted) {
+        throw new Error("Package delete did not return a result.");
       }
-      const parsed = parseCliJsonObject<CliLinkDeletePackageResult>(run.output);
-      if (!parsed || parsed.ok === false) {
-        throw new Error("Package delete did not return a valid Renium result.");
+      return deleted;
+    }, async (deleted) => {
+      this.invalidateLinkStatusCache();
+      const removedSourcePaths = (Array.isArray(deleted.removedSourcePaths) ? deleted.removedSourcePaths : [])
+        .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
+      await this.closeFileTabs(removedSourcePaths);
+      const changedPaths = (Array.isArray(deleted.changedPaths) ? deleted.changedPaths : [])
+        .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
+      if (changedPaths.length > 0 && this.host.isEditorLiveSyncActive()) {
+        await this.host.pushEditorPathsNow(changedPaths, { force: true });
+        return [];
       }
-      result = parsed;
+      return changedPaths;
     });
 
-    this.invalidateLinkStatusCache();
-    const removedSourcePaths = (Array.isArray(result?.removedSourcePaths) ? result!.removedSourcePaths! : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    await this.closeFileTabs(removedSourcePaths);
-    const changedPaths = (Array.isArray(result?.changedPaths) ? result!.changedPaths! : [])
-      .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
-    if (changedPaths.length > 0 && this.host.isEditorLiveSyncActive()) {
-      this.host.noteProgrammaticEditorWrite({ paths: changedPaths, durationMs: 5000 });
-      await this.host.pushEditorPathsNow(changedPaths, {
-        force: true,
-        skipChangeFilter: true,
-      });
-    }
-    const services = (Array.isArray(result?.services) ? result!.services! : [])
+    const services = (Array.isArray(result.services) ? result.services : [])
       .filter((service): service is string => typeof service === "string" && service.length > 0);
     if (services.length > 0) {
       await this.refreshFileExplorerServicesSafe(services);
@@ -1667,8 +1724,8 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
     }
     await this.pushLinkStateToExplorer();
     void vscode.commands.executeCommand("renium.packages.refresh");
-    const deleted = Array.isArray(result?.deletedTargets) ? result!.deletedTargets!.length : 0;
-    const unlinked = Array.isArray(result?.unlinkedTargets) ? result!.unlinkedTargets!.length : 0;
+    const deleted = Array.isArray(result.deletedTargets) ? result.deletedTargets.length : 0;
+    const unlinked = Array.isArray(result.unlinkedTargets) ? result.unlinkedTargets.length : 0;
     const suffix = deleted > 0 ? ` Deleted ${deleted} use${deleted === 1 ? "" : "s"}.`
       : unlinked > 0 ? ` Unlinked ${unlinked} use${unlinked === 1 ? "" : "s"}.`
         : "";

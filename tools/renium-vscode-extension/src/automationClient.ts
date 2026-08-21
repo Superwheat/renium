@@ -69,6 +69,9 @@ export function editorBridgeWaitSeconds(config: AutomationClientConfig): number 
 }
 
 function operationRequiresRuntime(op: number, parameters: Record<string, unknown>): boolean {
+  if (op === AUTOMATION_OP.liveStatus && parameters.filesOnly === true) {
+    return false;
+  }
   return AUTOMATION_RUNTIME_OPS.has(op)
     || ((op === AUTOMATION_OP.setProperty || op === AUTOMATION_OP.remove) && parameters.editor === true);
 }
@@ -86,10 +89,12 @@ export class AutomationClient {
   private stopPromise: Promise<void> | undefined;
   private pending = new Map<number, PendingRequest>();
   private context: { key: string; id: number } | undefined;
+  private generation = 0;
 
   public constructor(
     private readonly output: vscode.OutputChannel,
     private readonly ownerRoot: () => string,
+    private readonly onProcessStopped?: () => void,
   ) {}
 
   public isRunning(): boolean {
@@ -97,6 +102,10 @@ export class AutomationClient {
       && !this.process.killed
       && this.process.exitCode === null
       && this.process.signalCode === null;
+  }
+
+  public processGeneration(): number {
+    return this.generation;
   }
 
   public async runOperation(
@@ -173,6 +182,7 @@ export class AutomationClient {
     ], config.projectRoot);
     this.closePromise = closed;
     this.process = child;
+    this.generation += 1;
     this.processKey = key;
     this.outputBuffer = "";
     this.ready = false;
@@ -288,14 +298,6 @@ export class AutomationClient {
         }
         await delay(50);
       }
-      await this.send(
-        config,
-        "unbind",
-        AUTOMATION_OP.unbind,
-        id,
-        {},
-        { quietWait: true, timeoutMs: 1_000 },
-      );
       if (!runtimeConnected) {
         throw new Error("No Studio runtime is connected to this project.");
       }
@@ -551,6 +553,7 @@ export class AutomationClient {
     this.readyReject = undefined;
     this.closePromise = undefined;
     this.context = undefined;
+    this.onProcessStopped?.();
   }
 
   private async stopProcess(reason: Error): Promise<void> {

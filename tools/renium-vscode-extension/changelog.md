@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.2.6 - 2026-08-21
+
+### Live sync
+
+- Live sync now watches project files in the shared Renium daemon, so editor commands and direct `rbx` use the same pending work, retries, and Studio connection.
+- File edits made while Studio or the editor is disconnected remain pending across daemon restarts and are sent when live sync starts against the matching place again.
+- Nearby saves, directory changes, renames, deletions, new source roots, nested projects, and project configuration changes are collected into complete pushes instead of partial or repeated syncs.
+- Transient connection failures retry with a bounded delay, while permanent failures keep the affected files pending until they are edited or explicitly retried.
+- Starting live sync clears a pause left by an interrupted editor session, and stopping it also stops file watching when Studio's live-mode cleanup fails.
+- Sync on save sends the saved files to Studio even when continuous live sync is off.
+- Pulls, manual pushes, Git changes, package updates, link updates, history restores, and generated file writes coordinate with the watcher so their own writes aren't pushed back as new edits.
+- Live-sync state files stay under `.renium` and are ignored by version control in new and existing projects.
+
+### Script syncing
+
+- Script batches that span multiple services are checked against Studio's current Script Editor content, and only scripts that didn't apply are retried.
+- A script that still differs remains pending with its exact verification error instead of making the rest of the batch repeat or silently reporting success.
+- Files edited during a Studio pull are kept as local pending changes instead of being consumed by the pull.
+
+### Editor
+
+- Git branch changes pause file mirroring and resume from the final worktree without stopping and rebuilding the whole live-sync session.
+- Live-sync status shows daemon-side pending files and failures without running a second editor-side filesystem watcher.
+- The obsolete **Run Import** setting is gone; pulling from Studio always updates the project files required by the operation.
+
 ## 0.2.5 - 2026-08-20
 
 ### Updates

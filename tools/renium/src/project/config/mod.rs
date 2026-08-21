@@ -916,6 +916,77 @@ pub fn project_source_roots(loaded: &LoadedProject) -> Result<Vec<PathBuf>> {
     Ok(roots.into_iter().collect())
 }
 
+#[derive(Default)]
+pub(crate) struct ProjectWatchInputs {
+    pub(crate) files: BTreeSet<PathBuf>,
+    pub(crate) directories: BTreeSet<PathBuf>,
+    pub(crate) full_push: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn project_watch_inputs(loaded: &LoadedProject) -> Result<ProjectWatchInputs> {
+    let mut inputs = ProjectWatchInputs::default();
+    project_watch_inputs_into(loaded, &mut inputs, &mut BTreeSet::new())?;
+    Ok(inputs)
+}
+
+fn project_watch_inputs_into(
+    loaded: &LoadedProject,
+    inputs: &mut ProjectWatchInputs,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let project_path = absolute_path(&loaded.path);
+    if !visited.insert(project_path.clone()) {
+        return Ok(());
+    }
+    inputs.files.insert(project_path.clone());
+    inputs.full_push.insert(project_path);
+    let source_root = absolute_path(&loaded.root.join(&loaded.project.source_root));
+    inputs.directories.insert(source_root.clone());
+    inputs.full_push.insert(source_root);
+
+    let tree_sources = project_tree_nodes(&loaded.project.tree)
+        .into_iter()
+        .filter_map(|(_, node)| node.path);
+    let mount_sources = loaded
+        .project
+        .mounts
+        .iter()
+        .map(|mount| mount.source.clone());
+    for source in tree_sources.chain(mount_sources) {
+        let path = absolute_path(&loaded.root.join(source));
+        record_project_watch_input(inputs, &path);
+        if is_nested_project_path(&path) {
+            inputs.full_push.insert(path.clone());
+            if path.is_file() {
+                project_watch_inputs_into(&load_nested_project(&path)?, inputs, visited)?;
+            }
+        }
+    }
+    for adapter in &loaded.project.adapters {
+        if adapter.direction == AdapterDirection::FromProject {
+            continue;
+        }
+        let source = absolute_path(&loaded.root.join(&adapter.source));
+        record_project_watch_input(inputs, &source);
+        if adapter_format(adapter)? == AdapterFormat::NestedProject {
+            inputs.full_push.insert(source.clone());
+            if source.is_file() {
+                project_watch_inputs_into(&load_nested_project(&source)?, inputs, visited)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_project_watch_input(inputs: &mut ProjectWatchInputs, path: &Path) {
+    if path.is_dir() || (!path.exists() && path.extension().is_none()) {
+        inputs.directories.insert(path.to_path_buf());
+        inputs.full_push.insert(path.to_path_buf());
+    } else {
+        inputs.files.insert(path.to_path_buf());
+    }
+}
+
 pub(crate) fn project_adapter_output_path(
     loaded: &LoadedProject,
     adapter: &AdapterSpec,

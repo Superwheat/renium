@@ -44,12 +44,10 @@ export class FileExplorerModel {
   private readonly nodesById = new Map<string, FileExplorerNode>();
   private readonly loadedServices = new Set<string>();
   private rootIds: string[] = [];
-  private studioMutationChain: Promise<void> = Promise.resolve();
   private projectGeneration = 0;
 
   public resetProjectState(): void {
     this.projectGeneration += 1;
-    this.studioMutationChain = Promise.resolve();
     this.nodesById.clear();
     this.loadedServices.clear();
     this.rootIds = [];
@@ -59,13 +57,42 @@ export class FileExplorerModel {
     return generation === this.projectGeneration;
   }
 
-  public async prepareProjectSwitch(): Promise<void> {
-    await this.studioMutationChain.catch(() => undefined);
+  public prepareProjectSwitch(): Promise<void> {
+    return Promise.resolve();
   }
 
   private requireProjectGeneration(generation: number): void {
     if (!this.isProjectGenerationCurrent(generation)) {
       throw new Error("The active Renium project changed while the operation was running.");
+    }
+  }
+
+  private async withPausedProjectWrite<T>(
+    write: () => Promise<T>,
+    finish: (result: T) => Promise<string[]>,
+  ): Promise<T> {
+    await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+      fileWrites: "pause",
+    });
+    try {
+      const result = await write();
+      const settledPaths = await finish(result);
+      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+        paths: settledPaths,
+        fileWrites: "resume",
+      });
+      return result;
+    } catch (error) {
+      try {
+        await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+          fileWrites: "resume",
+        });
+      } catch (resumeError) {
+        const original = error instanceof Error ? error.message : String(error);
+        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
+      }
+      throw error;
     }
   }
 
@@ -660,11 +687,39 @@ export class FileExplorerModel {
       propertyName = "Disabled";
       parsedValue = !(parsedValue === true);
     }
-    if (options.skipStudioPush) {
+    let fileWritesPaused = false;
+    const resumeFileWrites = async (paths: string[]): Promise<void> => {
+      if (!fileWritesPaused) {
+        return;
+      }
       await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths: loaded.settingsFile ? [loaded.settingsFile] : [],
-        durationMs: 5000,
+        paths,
+        fileWrites: "resume",
       });
+      fileWritesPaused = false;
+    };
+    const fail = async (error: unknown): Promise<never> => {
+      try {
+        if (fileWritesPaused) {
+          await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+            fileWrites: "resume",
+          });
+          fileWritesPaused = false;
+        }
+      } catch (resumeError) {
+        const original = error instanceof Error ? error.message : String(error);
+        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
+      }
+      throw error;
+    };
+    try {
+      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
+        fileWrites: "pause",
+      });
+      fileWritesPaused = true;
+    } catch (error) {
+      return fail(error);
     }
     const batchDir = path.join(config.projectRoot, ".renium", "editor-property-batches");
     fs.mkdirSync(batchDir, { recursive: true });
@@ -698,19 +753,18 @@ export class FileExplorerModel {
         "--direction",
         "files-to-studio",
       ]);
+    } catch (error) {
+      return fail(error);
     } finally {
       try {
         fs.unlinkSync(batchPath);
       } catch {
       }
     }
-    if (generation !== this.projectGeneration) {
-      throw new Error("The active Renium project changed while the edit was being applied.");
-    }
     if (batchResult.applied !== 1) {
-      throw new Error(batchResult.filtered === 1
+      return fail(new Error(batchResult.filtered === 1
         ? "This field is excluded by the project filters."
-        : "The project did not apply this property edit.");
+        : "The project did not apply this property edit."));
     }
     const changedPaths = Array.from(new Set([
       ...(batchResult.changedPaths ?? []),
@@ -718,46 +772,46 @@ export class FileExplorerModel {
         .map((entry) => entry.path)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     ]));
-    if (options.skipStudioPush) {
-      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths: changedPaths,
-        durationMs: 5000,
-      });
-    }
-    if (scope === "metadata") {
-      if (name === "Parent") {
-        const oldParent = oldParentTreeId ? this.nodesById.get(oldParentTreeId) : undefined;
-        if (oldParent) {
-          await this.loadChildren(oldParent);
-        }
-        const newParent = newParentSettingsId
-          ? this.nodesById.get(normalizeId(loaded.service, newParentSettingsId))
-          : undefined;
-        if (newParent) {
-          await this.loadChildren(newParent);
+    try {
+      if (generation !== this.projectGeneration) {
+        throw new Error("The active Renium project changed while the edit was being applied.");
+      }
+      if (scope === "metadata") {
+        if (name === "Parent") {
+          const oldParent = oldParentTreeId ? this.nodesById.get(oldParentTreeId) : undefined;
+          if (oldParent) {
+            await this.loadChildren(oldParent);
+          }
+          const newParent = newParentSettingsId
+            ? this.nodesById.get(normalizeId(loaded.service, newParentSettingsId))
+            : undefined;
+          if (newParent) {
+            await this.loadChildren(newParent);
+          } else {
+            await this.loadService(loaded.service);
+          }
         } else {
-          await this.loadService(loaded.service);
+          await this.reloadParentChildren(loaded);
         }
       } else {
-        await this.reloadParentChildren(loaded);
+        if (scope === "property") {
+          loaded.properties[propertyName] = parsedValue;
+        } else {
+          loaded.attributes[propertyName] = parsedValue;
+        }
+        loaded.detailsLoaded = true;
       }
-    } else {
-      if (scope === "property") {
-        loaded.properties[propertyName] = parsedValue;
-      } else {
-        loaded.attributes[propertyName] = parsedValue;
+      if (!options.skipStudioPush) {
+        await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
+          projectRoot: config.projectRoot,
+          taskName: "Explorer -> Studio sync",
+          targetSettingsId: loaded.settingsId,
+          targetProperty: propertyName,
+        });
       }
-      loaded.detailsLoaded = true;
-    }
-    if (!options.skipStudioPush) {
-      await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
-        projectRoot: config.projectRoot,
-        pendingServices: [loaded.service],
-        skipChangeFilter: true,
-        taskName: "Explorer -> Studio sync",
-        targetSettingsId: loaded.settingsId,
-        targetProperty: propertyName,
-      });
+      await resumeFileWrites(options.skipStudioPush ? changedPaths : []);
+    } catch (error) {
+      return fail(error);
     }
     return changedPaths;
   }
@@ -888,15 +942,24 @@ export class FileExplorerModel {
     ];
     appendRecordAssignments(args, "-p", properties);
     appendRecordAssignments(args, "-a", attributes);
-    const result = await runJsonCli<{ settingsId?: string; changedPaths?: string[]; sourceWrites?: string[] }>(config, args);
-    this.requireProjectGeneration(generation);
-    await this.loadChildren(loadedParent);
-    this.requireProjectGeneration(generation);
+    const result = await this.withPausedProjectWrite(
+      () => runJsonCli<{ settingsId?: string; changedPaths?: string[]; sourceWrites?: string[] }>(config, args),
+      async (written) => {
+        this.requireProjectGeneration(generation);
+        await this.loadChildren(loadedParent);
+        this.requireProjectGeneration(generation);
+        const changedPaths = written.changedPaths ?? written.sourceWrites ?? [];
+        if (pushToStudio) {
+          await this.pushChangedPathsToStudio(
+            changedPaths,
+            written.settingsId ? [written.settingsId] : undefined,
+          );
+          return [];
+        }
+        return changedPaths;
+      },
+    );
     if (pushToStudio) {
-      await this.pushChangedPathsToStudio(
-        result.changedPaths ?? result.sourceWrites ?? [],
-        result.settingsId ? [result.settingsId] : undefined,
-      );
       this.requireProjectGeneration(generation);
     }
     return result.settingsId ? this.nodesById.get(normalizeId(loadedParent.service, result.settingsId)) : undefined;
@@ -930,14 +993,19 @@ export class FileExplorerModel {
       "-I",
       loadedParent.settingsId ?? "",
     ];
-    const result = await runJsonCli<CliCloneInstanceResult>(config, args);
-    this.requireProjectGeneration(generation);
-    await this.loadChildren(loadedParent);
-    this.requireProjectGeneration(generation);
+    const result = await this.withPausedProjectWrite(
+      () => runJsonCli<CliCloneInstanceResult>(config, args),
+      async (written) => {
+        this.requireProjectGeneration(generation);
+        await this.loadChildren(loadedParent);
+        this.requireProjectGeneration(generation);
+        await this.pushChangedPathsToStudio(written.changedPaths ?? [], written.settingsIds);
+        return [];
+      },
+    );
     const current = result.rootSettingsId
       ? this.nodesById.get(normalizeId(loadedParent.service, result.rootSettingsId))
       : undefined;
-    await this.pushChangedPathsToStudio(result.changedPaths ?? [], result.settingsIds);
     this.requireProjectGeneration(generation);
     return current;
   }
@@ -982,19 +1050,24 @@ export class FileExplorerModel {
       "-I",
       loadedParent.settingsId ?? "",
     ];
-    const result = await runJsonCli<CliImportModelResult>(config, args);
-    this.requireProjectGeneration(generation);
-    await this.loadChildren(loadedParent);
-    this.requireProjectGeneration(generation);
+    const result = await this.withPausedProjectWrite(
+      () => runJsonCli<CliImportModelResult>(config, args),
+      async (written) => {
+        this.requireProjectGeneration(generation);
+        await this.loadChildren(loadedParent);
+        this.requireProjectGeneration(generation);
+        await this.pushChangedPathsToStudio(
+          written.changedPaths ?? (written.sourceWrites ?? [])
+            .map((write) => write.path)
+            .filter((writePath): writePath is string => typeof writePath === "string" && writePath.length > 0),
+          written.settingsIds,
+        );
+        return [];
+      },
+    );
     const created = result.rootSettingsIds?.[0]
       ? this.nodesById.get(normalizeId(loadedParent.service, result.rootSettingsIds[0]))
       : undefined;
-    await this.pushChangedPathsToStudio(
-      result.changedPaths ?? (result.sourceWrites ?? [])
-        .map((write) => write.path)
-        .filter((writePath): writePath is string => typeof writePath === "string" && writePath.length > 0),
-      result.settingsIds,
-    );
     this.requireProjectGeneration(generation);
     return created;
   }
@@ -1037,39 +1110,40 @@ export class FileExplorerModel {
       properties: { ...loaded.properties },
       attributes: { ...loaded.attributes },
     };
-    let result: CliRemoveInstanceResult | undefined;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        result = await runJsonCli<CliRemoveInstanceResult>(config, [
-          "remove",
-          loaded.service,
-          "-r",
-          config.projectRoot,
-          "-i",
-          loaded.settingsId,
-        ]);
-        this.requireProjectGeneration(generation);
-        break;
-      } catch (error) {
-        if (attempt >= 2 || !isSettingsLockTimeout(error)) {
-          throw error;
+    const result = await this.withPausedProjectWrite(async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const removed = await runJsonCli<CliRemoveInstanceResult>(config, [
+            "remove",
+            loaded.service,
+            "-r",
+            config.projectRoot,
+            "-i",
+            loaded.settingsId ?? "",
+          ]);
+          this.requireProjectGeneration(generation);
+          return removed;
+        } catch (error) {
+          if (attempt >= 2 || !isSettingsLockTimeout(error)) {
+            throw error;
+          }
+          await delay(150 * (attempt + 1));
         }
-        await delay(150 * (attempt + 1));
       }
-    }
-    this.removeSubtree(loaded.treeId);
-    if (parent) {
-      parent.children = parent.children.filter((childId) => childId !== loaded.treeId);
-      parent.hasChildren = parent.children.length > 0;
-    }
-    this.queueStudioMutation(async () => {
+    }, async (removed) => {
+      this.removeSubtree(loaded.treeId);
+      if (parent) {
+        parent.children = parent.children.filter((childId) => childId !== loaded.treeId);
+        parent.hasChildren = parent.children.length > 0;
+      }
       try {
-        await this.pushDeleteToStudio(studioDeleteTarget, result?.changedPaths ?? []);
+        await this.pushDeleteToStudio(studioDeleteTarget, removed.changedPaths ?? []);
       } catch {
-        await this.pushChangedPathsToStudio(result?.changedPaths ?? []);
+        await this.pushChangedPathsToStudio(removed.changedPaths ?? []);
       }
-    }, "delete instance");
-    return result ?? {};
+      return [];
+    });
+    return result;
   }
 
   public async desyncPackageLink(node: FileExplorerNode): Promise<CliDesyncPackageLinkResult> {
@@ -1083,16 +1157,18 @@ export class FileExplorerModel {
       throw new Error("Selected instance has no bytecode id.");
     }
     const config = getExplorerConfig();
-    const result = await runJsonCli<CliDesyncPackageLinkResult>(config, [
-      "desync-package-link",
-      loaded.service,
-      "-r",
-      config.projectRoot,
-      "-i",
-      loaded.settingsId,
-    ]);
+    const result = await this.withPausedProjectWrite(
+      () => runJsonCli<CliDesyncPackageLinkResult>(config, [
+        "desync-package-link",
+        loaded.service,
+        "-r",
+        config.projectRoot,
+        "-i",
+        loaded.settingsId ?? "",
+      ]),
+      async (written) => {
     this.requireProjectGeneration(generation);
-    const removedLinks = Array.isArray(result.removedPackageLinks) ? result.removedPackageLinks : [];
+    const removedLinks = Array.isArray(written.removedPackageLinks) ? written.removedPackageLinks : [];
     const studioDeleteTargets = removedLinks.map((link, offset) => {
       const treeId = link.settingsId ? normalizeId(loaded.service, link.settingsId) : `${loaded.treeId}:PackageLink:${offset}`;
       const existing = this.nodesById.get(treeId);
@@ -1148,12 +1224,12 @@ export class FileExplorerModel {
     }
     try {
       for (const target of studioDeleteTargets) {
-        await this.pushDeleteToStudio(target, [result.settingsFile ?? loaded.settingsFile]);
+        await this.pushDeleteToStudio(target, [written.settingsFile ?? loaded.settingsFile]);
         this.requireProjectGeneration(generation);
       }
     } catch {
       this.requireProjectGeneration(generation);
-      await this.pushSettingsToStudio(result.settingsFile ?? loaded.settingsFile);
+      await this.pushSettingsToStudio(written.settingsFile ?? loaded.settingsFile);
       this.requireProjectGeneration(generation);
     }
     if (loaded.className === "PackageLink") {
@@ -1165,6 +1241,9 @@ export class FileExplorerModel {
     } else {
       await this.loadChildren(loaded);
     }
+    return [];
+      },
+    );
     return result;
   }
 
@@ -1190,7 +1269,6 @@ export class FileExplorerModel {
     }
     await vscode.commands.executeCommand("renium.pushEditorPathsNow", paths, {
       projectRoot: getExplorerConfig().projectRoot,
-      skipChangeFilter: true,
       taskName: "Explorer -> Studio sync",
       targetSettingsIds,
     });
@@ -1203,7 +1281,6 @@ export class FileExplorerModel {
     }
     await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
       projectRoot: getExplorerConfig().projectRoot,
-      skipChangeFilter: true,
       taskName: "Explorer -> Studio sync",
       targetSettingsIds,
     });
@@ -1233,8 +1310,7 @@ export class FileExplorerModel {
       if (outcome !== "applied") {
         await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
           paths: changedPaths,
-          durationMs: 5000,
-          forcePending: true,
+          fileWrites: "queue",
         });
         return "skipped";
       }
@@ -1242,8 +1318,7 @@ export class FileExplorerModel {
     } catch (error) {
       await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
         paths: changedPaths,
-        durationMs: 5000,
-        forcePending: true,
+        fileWrites: "queue",
       });
       throw error;
     }
@@ -1269,22 +1344,6 @@ export class FileExplorerModel {
       "renium.pushEditorDeleteNow",
       this.editorMutationTarget(node, changedPaths),
     );
-  }
-
-  private queueStudioMutation(task: () => Promise<void>, label: string): void {
-    const generation = this.projectGeneration;
-    this.studioMutationChain = this.studioMutationChain
-      .catch(() => undefined)
-      .then(async () => {
-        if (generation === this.projectGeneration) {
-          await task();
-        }
-      })
-      .catch((error) => {
-        vscode.window.showErrorMessage(
-          `Failed to ${label} in Studio. ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
   }
 
 }

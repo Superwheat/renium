@@ -229,7 +229,7 @@ fn spawn_daemon_control_server(
 
 fn handle_daemon_control_connection(
     stream: TcpStream,
-    bridge: &BridgeServer,
+    bridge: &Arc<BridgeServer>,
     state: &automation::State,
     bridge_wait_seconds: f64,
 ) -> Result<()> {

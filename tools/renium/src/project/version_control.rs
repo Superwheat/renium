@@ -115,6 +115,18 @@ fn append_missing_lines<'a>(
     Ok(missing)
 }
 
+pub(crate) fn ensure_renium_local_state_ignored(project_root: &Path) -> Result<()> {
+    let renium_dir = project_root.join(".renium");
+    fs::create_dir_all(&renium_dir)
+        .with_context(|| format!("Failed to create {}", renium_dir.display()))?;
+    append_missing_lines(
+        &renium_dir.join(".gitignore"),
+        None,
+        RENIUM_DIR_GITIGNORE.lines(),
+    )?;
+    Ok(())
+}
+
 pub(crate) fn vc_init(args: VcInitArgs) -> Result<()> {
     let project_root = resolve_link_project_root(&args.project_root)?;
 

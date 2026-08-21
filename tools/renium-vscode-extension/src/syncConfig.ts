@@ -60,7 +60,6 @@ export type SyncConfig = {
   logLevel: ReniumLogLevel;
   overridePackages: boolean;
   conflictResolution: ConflictPolicy;
-  runImport: boolean;
   importMode: "direct" | "snapshot";
   performanceMode: "throughput" | "balanced" | "smooth";
   modifiedDefaultBypass: boolean;
@@ -200,7 +199,6 @@ export class SyncConfigResolver {
       logLevel: this.configuredLogLevel(studioRuntimeSettings),
       overridePackages: boolean("liveSync.overridePackages", false),
       conflictResolution: normalizeConflictPolicy(read("liveSync.conflictResolution", "prompt")),
-      runImport: boolean("runImport", true),
       importMode,
       performanceMode,
       modifiedDefaultBypass: boolean("modifiedDefaultBypass", false),
