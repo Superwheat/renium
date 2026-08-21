@@ -313,6 +313,7 @@ impl State {
             .cloned()
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn clear_context_runtime(&self, id: u64) {
         if let Some(context) = self
             .contexts
@@ -338,6 +339,7 @@ impl State {
         Some(context.clone())
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
         self.studio_reopen_targets
             .lock()

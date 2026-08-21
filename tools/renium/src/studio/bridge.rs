@@ -2142,7 +2142,7 @@ impl BridgeServer {
         Self::studio_pid_for_peer(&peer)
     }
 
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn studio_pid_for_runtime(
         &self,
         target: BridgeTarget,
