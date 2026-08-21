@@ -37,7 +37,7 @@ use crate::roblox::schema::{
 };
 use crate::studio::bridge::BridgeServer;
 use crate::studio::bridge::BridgeTarget;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 use crate::studio::native::editor::wait_for_editor_review_decision;
 #[cfg(windows)]
@@ -947,11 +947,6 @@ pub(crate) fn local_place_path_for_pid(pid: u32) -> Option<PathBuf> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn local_place_path_for_bridge(_bridge: &BridgeServer) -> Option<PathBuf> {
-    None
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-pub(crate) fn local_place_path_for_pid(_pid: u32) -> Option<PathBuf> {
     None
 }
 

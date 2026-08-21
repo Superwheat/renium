@@ -243,7 +243,7 @@ fn begin_editor_binary_export_for_runtime(
             bail!("Studio native export omitted its property schema");
         }
         Ok(EditorBinaryExport {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             bytes: Vec::new(),
             groups,
             serialization_batches,

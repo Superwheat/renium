@@ -329,7 +329,7 @@ pub(crate) struct EditorBinarySerializationBatch {
 }
 
 pub(crate) struct EditorBinaryExport {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) bytes: Vec<u8>,
     pub(crate) groups: Vec<EditorBinaryExportGroup>,
     pub(crate) serialization_batches: Vec<EditorBinarySerializationBatch>,

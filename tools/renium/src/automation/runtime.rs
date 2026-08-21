@@ -538,6 +538,7 @@ fn automation_pull_operation(
     ))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Clone)]
 struct ConnectedStudio {
     pid: u32,
