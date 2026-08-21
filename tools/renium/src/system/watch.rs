@@ -59,11 +59,25 @@ impl FileWatcher {
                 .and_modify(|current| *current |= recursive)
                 .or_insert(recursive);
         }
+        let covered = roots
+            .keys()
+            .filter(|root| {
+                roots.iter().any(|(ancestor, recursive)| {
+                    *recursive && ancestor != *root && root.starts_with(ancestor)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for root in covered {
+            roots.remove(&root);
+        }
         for (root, recursive) in &self.roots {
             if roots.get(root) != Some(recursive) {
                 let _ = self.watcher.unwatch(root);
             }
         }
+        self.roots
+            .retain(|root, recursive| roots.get(root) == Some(recursive));
         for (root, recursive) in &roots {
             if self.roots.get(root) == Some(recursive) {
                 continue;
@@ -78,8 +92,8 @@ impl FileWatcher {
                     },
                 )
                 .with_context(|| format!("Failed to watch {}", root.display()))?;
+            self.roots.insert(root.clone(), *recursive);
         }
-        self.roots = roots;
         Ok(())
     }
 

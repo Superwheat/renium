@@ -31,7 +31,7 @@ off with `renium.automaticUpdateChecks`.
 - `Renium: Push Files to Studio`
 - `Renium: Export Snapshots Only`
 - `Renium: Sync Wally Packages`
-- `Renium: Start Live Sync (Editor -> Studio)`
+- `Renium: Start Live Sync`
 - `Renium: Stop Live Sync`
 - `Renium: Git`
 
@@ -124,7 +124,7 @@ The **Git** tab lives inside the main Renium panel alongside the existing Explor
 - Redacts credentials/tokens before remote URLs are shown in the UI or output
 - Uses the configured project source folder as the default Git sync scope for staging/status
 - Blocks pull when the worktree is dirty if `renium.gitSync.requireCleanWorktreeBeforePull` is enabled
-- Stops live sync before pull so branch updates do not race with editor/Studio mirroring
+- Pauses file mirroring while pull or branch checkout rewrites the worktree, then resumes from the final files
 - Uses fast-forward-only pull to avoid creating merge commits silently
 - Blocks commit/push when files are already staged, to avoid publishing unintended index state
 - Excludes untracked files by default unless `renium.gitSync.includeUntracked` is enabled
@@ -192,7 +192,6 @@ before Marketplace publication.
 
 - `renium.cliPath` (optional CLI override; blank uses the bundled CLI)
 - `renium.projectRoot` (default: `${workspaceFolder}`)
-- `renium.runImport` (default: `true`)
 - `renium.autoSyncOnSave` (default: `false`)
 - `renium.autoSyncDebounceMs` (default: `800`)
 - `renium.editorLiveSyncEnabled` (default: `false`)

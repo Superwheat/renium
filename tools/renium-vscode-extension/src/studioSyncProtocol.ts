@@ -36,6 +36,16 @@ export type StudioEditorAction = {
   version?: string;
 };
 
+export type DaemonLiveSyncState = {
+  running?: boolean;
+  pullChanges?: boolean;
+  paused?: boolean;
+  pendingPaths?: string[];
+  pushes?: number;
+  pulls?: number;
+  error?: string;
+};
+
 export type StudioChangeState = {
   ok?: boolean;
   tracking?: boolean;
@@ -56,6 +66,7 @@ export type StudioChangeState = {
   runtimeSettingChanges?: Record<string, unknown>;
   runtimeSettingsSeq?: number;
   conflictResolution?: string;
+  daemon?: DaemonLiveSyncState;
 };
 
 function parseObject(value: string): Record<string, unknown> | undefined {
@@ -131,6 +142,7 @@ function looksLikeStudioChangeState(record: Record<string, unknown>): boolean {
 }
 
 function studioChangeState(record: Record<string, unknown>): StudioChangeState {
+  const daemon = recordValue(record.daemon);
   return {
     ok: typeof record.ok === "boolean" ? record.ok : undefined,
     tracking: typeof record.tracking === "boolean" ? record.tracking : undefined,
@@ -185,6 +197,15 @@ function studioChangeState(record: Record<string, unknown>): StudioChangeState {
       ? record.runtimeSettingsSeq
       : undefined,
     conflictResolution: typeof record.conflictResolution === "string" ? record.conflictResolution : undefined,
+    daemon: daemon ? {
+      running: typeof daemon.running === "boolean" ? daemon.running : undefined,
+      pullChanges: typeof daemon.pullChanges === "boolean" ? daemon.pullChanges : undefined,
+      paused: typeof daemon.paused === "boolean" ? daemon.paused : undefined,
+      pendingPaths: stringArray(daemon.pendingPaths),
+      pushes: typeof daemon.pushes === "number" ? daemon.pushes : undefined,
+      pulls: typeof daemon.pulls === "number" ? daemon.pulls : undefined,
+      error: typeof daemon.error === "string" ? daemon.error : undefined,
+    } : undefined,
   };
 }
 

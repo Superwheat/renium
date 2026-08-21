@@ -76,11 +76,12 @@ type GitControllerHost<TConfig extends GitControllerConfig> = {
   isProjectSourcePath: (filePath: string, config: TConfig) => boolean;
   pushEditorPathsNow: (
     paths: string[],
-    options: { force: boolean; skipChangeFilter: boolean; taskName: string },
+    options: { force: boolean; taskName: string },
   ) => Promise<boolean>;
-  isLiveSyncActiveOrStarting: () => boolean;
-  stopLiveSync: () => Promise<void>;
-  startLiveSync: () => Promise<void>;
+  noteProgrammaticEditorWrite: (request: {
+    paths?: string[];
+    fileWrites?: "pause" | "resume" | "queue";
+  }) => Promise<void>;
   pullFromStudio: (config: TConfig) => Promise<void>;
 };
 
@@ -234,7 +235,8 @@ export class GitController<TConfig extends GitControllerConfig> {
         throw new Error("Pull is blocked because the branch has diverged. Resolve with VS Code Source Control or git manually.");
       }
 
-      const resumeLiveSync = await this.ensureLiveSyncStoppedForGitPull();
+      let settledPaths: string[] = [];
+      await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
       try {
         this.gitConfigForToken(token);
         const oldHead = await this.gitOutput(cfg, repoRoot, ["rev-parse", "HEAD"], "read HEAD");
@@ -245,20 +247,16 @@ export class GitController<TConfig extends GitControllerConfig> {
           ? await this.gitChangedFilesBetween(cfg, repoRoot, oldHead, newHead)
           : [];
         await this.refreshExplorerForGitPaths(repoRoot, changedFiles, cfg);
-        await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
+        settledPaths = await this.maybeApplyPulledPathsToStudio(repoRoot, changedFiles, cfg);
         state = await this.inspectGitRepo(cfg, { fetch: false });
         this.logGitState(state);
         await this.refreshView();
         vscode.window.showInformationMessage(`Pulled ${remote}/${branch}.`);
-      } catch (error) {
-        if (
-          resumeLiveSync
-          && this.host.experienceGeneration() === token.generation
-          && filesystemPathKey(this.host.getConfig().projectRoot) === token.projectRoot
-        ) {
-          await this.host.startLiveSync();
-        }
-        throw error;
+      } finally {
+        await this.host.noteProgrammaticEditorWrite({
+          paths: settledPaths,
+          fileWrites: "resume",
+        });
       }
     });
   }
@@ -368,10 +366,15 @@ export class GitController<TConfig extends GitControllerConfig> {
     }
     await this.host.enqueue("Git checkout branch", async () => {
       const runCfg = this.gitConfigForToken(token);
-      const result = await this.runGitCommand(runCfg, repoRoot, ["switch", branchName], "checkout branch");
-      this.ensureGitSuccess(result, "checkout branch");
-      await this.refreshView();
-      vscode.window.showInformationMessage(`Checked out ${branchName}.`);
+      await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
+      try {
+        const result = await this.runGitCommand(runCfg, repoRoot, ["switch", branchName], "checkout branch");
+        this.ensureGitSuccess(result, "checkout branch");
+        await this.refreshView();
+        vscode.window.showInformationMessage(`Checked out ${branchName}.`);
+      } finally {
+        await this.host.noteProgrammaticEditorWrite({ fileWrites: "resume" });
+      }
     });
   }
 
@@ -765,12 +768,19 @@ export class GitController<TConfig extends GitControllerConfig> {
     await vscode.commands.executeCommand("renium.fileExplorer.refreshServices", Array.from(services));
   }
 
-  private async maybeApplyPulledPathsToStudio(repoRoot: string, changedFiles: GitNameStatusEntry[], cfg: TConfig): Promise<void> {
+  private async maybeApplyPulledPathsToStudio(
+    repoRoot: string,
+    changedFiles: GitNameStatusEntry[],
+    cfg: TConfig,
+  ): Promise<string[]> {
     const srcPaths = nameStatusAffectedPaths(changedFiles)
       .map((affectedPath) => path.join(repoRoot, affectedPath))
       .filter((filePath) => this.host.isProjectSourcePath(filePath, cfg));
-    if (srcPaths.length === 0 || cfg.gitSync.applyPulledChangesToStudio === "never") {
-      return;
+    if (srcPaths.length === 0) {
+      return [];
+    }
+    if (cfg.gitSync.applyPulledChangesToStudio === "never") {
+      return srcPaths;
     }
     let apply = cfg.gitSync.applyPulledChangesToStudio === "always";
     if (!apply) {
@@ -782,28 +792,14 @@ export class GitController<TConfig extends GitControllerConfig> {
       apply = picked === "Apply to Studio";
     }
     if (!apply) {
-      return;
+      return srcPaths;
     }
-    const pushed = await this.host.pushEditorPathsNow(srcPaths, { force: true, skipChangeFilter: true, taskName: "Git pull -> Studio sync" });
+    const pushed = await this.host.pushEditorPathsNow(srcPaths, { force: true, taskName: "Git pull -> Studio sync" });
     if (!pushed) {
       vscode.window.showInformationMessage("Pulled changes stayed local. Start Serve or live sync before applying to Studio.");
+      return [];
     }
-  }
-
-  private async ensureLiveSyncStoppedForGitPull(): Promise<boolean> {
-    if (!this.host.isLiveSyncActiveOrStarting()) {
-      return false;
-    }
-    const picked = await vscode.window.showWarningMessage(
-      "Git pull can rewrite project source files. Stop Renium live sync before pulling?",
-      { modal: true },
-      "Stop Live Sync",
-    );
-    if (picked !== "Stop Live Sync") {
-      throw new Error("Git pull cancelled because live sync is active.");
-    }
-    await this.host.stopLiveSync();
-    return true;
+    return srcPaths;
   }
 
   private async maybePullFromStudioBeforeGitPush(cfg: TConfig, forced: boolean): Promise<void> {

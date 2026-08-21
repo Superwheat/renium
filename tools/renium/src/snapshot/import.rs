@@ -661,8 +661,9 @@ fn import_snapshots_inner(
         args.src_dir.clone_from(&stage.import_src_dir);
         import_snapshots_inner(args, false)?;
         stage.finish_projection(true)?;
-        return stage.publish(&project_root).map(|paths| {
-            paths
+        return stage.publish(&project_root).map(|published| {
+            published
+                .changed_roots
                 .into_iter()
                 .map(|path| project_root.join(path))
                 .collect()

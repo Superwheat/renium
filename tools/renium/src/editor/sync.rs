@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use crate::cli::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs,
     PushEditorChangesArgs,
 };
-use crate::daemon::{bridge_fetch_source, try_daemon_control_request};
+use crate::daemon::try_daemon_control_request;
 use crate::editor::diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
     append_editor_target_inline_source_changes, append_editor_target_instance_upserts,
@@ -56,8 +56,7 @@ use crate::settings::bytecode::SettingsBytecode;
 use crate::settings::instance::remove_instances_at_indices;
 use crate::snapshot::export::parse_bridge_ports;
 use crate::studio::bridge::{
-    BridgeRequestTooLarge, BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE, MAX_BRIDGE_CHUNK_BYTES,
-    MAX_BRIDGE_REQUEST_BYTES,
+    BridgeRequestTooLarge, BridgeServer, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REQUEST_BYTES,
 };
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
@@ -1358,7 +1357,27 @@ fn push_editor_changes_with_collected(
         }
     }
     if args.verify_sources && !review_skipped {
-        let verification = verify_editor_source_changes(bridge, &changes)?;
+        let mut verification = verify_editor_source_changes(bridge, &changes)?;
+        if !verification.failed_indexes.is_empty() {
+            let retry_changes = EditorChangeSet {
+                source_changes: verification
+                    .failed_indexes
+                    .iter()
+                    .map(|index| changes.source_changes[*index].clone())
+                    .collect(),
+                ..EditorChangeSet::default()
+            };
+            send_editor_change_batches(
+                bridge,
+                &retry_changes,
+                false,
+                false,
+                false,
+                None,
+                transaction.as_ref().map(|value| value.id.as_str()),
+            )?;
+            verification = verify_editor_source_changes(bridge, &changes)?;
+        }
         summary.insert(
             "sourceVerified".to_string(),
             Value::Number(serde_json::Number::from(verification.verified as u64)),
@@ -1380,10 +1399,10 @@ fn push_editor_changes_with_collected(
                 ),
             );
             emit_editor_push_summary(&summary)?;
-            bail!(
-                "Studio source verification failed for {} script(s)",
-                verification.failed.len()
-            );
+            return Err(EditorSourceVerificationError {
+                details: verification.failed,
+            }
+            .into());
         }
     }
     let phase_started = Instant::now();
@@ -1824,48 +1843,168 @@ fn reject_direct_read_only_package_change(
 #[derive(Default)]
 struct EditorSourceVerification {
     verified: usize,
+    failed_indexes: Vec<usize>,
     failed: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EditorSourceVerificationError {
+    pub(crate) details: Vec<String>,
+}
+
+impl std::fmt::Display for EditorSourceVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Studio source verification failed for {} script(s): {}",
+            self.details.len(),
+            self.details.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for EditorSourceVerificationError {}
+
+#[derive(Deserialize)]
+struct LiveSourceBatch {
+    rows: Vec<LiveSourceRow>,
+}
+
+#[derive(Deserialize)]
+struct LiveSourceRow {
+    index: usize,
+    source: Option<String>,
+    error: Option<String>,
+}
+
+fn fetch_live_editor_sources(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    indexes: &[usize],
+) -> Result<HashMap<usize, std::result::Result<String, String>>> {
+    let mut sources = HashMap::with_capacity(indexes.len());
+    for batch in indexes.chunks(16) {
+        let selectors = batch
+            .iter()
+            .map(|index| {
+                let change = &changes.source_changes[*index];
+                json!({
+                    "index": index,
+                    "pathSegments": &change.path_segments,
+                    "pathOrdinals": &change.path_ordinals,
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = bridge
+            .call("getLiveSourceBatch", json!({ "selectors": selectors }))
+            .and_then(|value| {
+                serde_json::from_value::<LiveSourceBatch>(value)
+                    .context("Studio returned an invalid live source batch")
+            })?;
+        let batch_indexes = batch.iter().copied().collect::<HashSet<_>>();
+        for row in response.rows {
+            if !batch_indexes.contains(&row.index) || sources.contains_key(&row.index) {
+                continue;
+            }
+            let value = match (row.source, row.error) {
+                (Some(source), _) => Ok(source),
+                (None, Some(error)) => Err(error),
+                (None, None) => Err("Studio did not return the script Source".to_string()),
+            };
+            sources.insert(row.index, value);
+        }
+        for index in batch {
+            sources
+                .entry(*index)
+                .or_insert_with(|| Err("Studio did not return the script Source".to_string()));
+        }
+    }
+    Ok(sources)
 }
 
 fn verify_editor_source_changes(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
 ) -> Result<EditorSourceVerification> {
-    let mut verification = EditorSourceVerification::default();
-    for change in &changes.source_changes {
-        if change.deleted {
-            continue;
+    let mut pending = changes
+        .source_changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, change)| (!change.deleted && change.source.is_some()).then_some(index))
+        .collect::<Vec<_>>();
+    let verified = pending.len();
+    let mut failures = HashMap::<usize, String>::with_capacity(verified);
+    let retry_delays = [
+        Duration::ZERO,
+        Duration::from_millis(20),
+        Duration::from_millis(80),
+    ];
+
+    for (attempt, delay) in retry_delays.into_iter().enumerate() {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
         }
-        let Some(expected) = change.source.as_ref() else {
-            continue;
+        let sources = match fetch_live_editor_sources(bridge, changes, &pending) {
+            Ok(sources) => sources,
+            Err(error) if attempt + 1 < retry_delays.len() => {
+                crate::log_global(
+                    3,
+                    format_args!("Studio source verification read will retry: {error:#}"),
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
         };
-        let source_key = editor_source_key(change);
-        let actual = bridge_fetch_source(
-            bridge,
-            &change.service,
-            &source_key,
-            DEFAULT_EXPORT_CHUNK_SIZE,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to fetch Studio Source for {} ({source_key})",
-                change.path_segments.join(".")
-            )
-        })?;
-        verification.verified += 1;
-        if &actual != expected {
-            verification.failed.push(format!(
-                "{} source mismatch: editor_len={} studio_len={} editor_hash={} studio_hash={} key={}",
-                change.path_segments.join("."),
-                expected.len(),
-                actual.len(),
-                fnv1a_hex(expected.as_bytes()),
-                fnv1a_hex(actual.as_bytes()),
-                source_key,
-            ));
+        pending.retain(|index| {
+            let change = &changes.source_changes[*index];
+            let expected = change.source.as_deref().unwrap_or_default();
+            let source_key = editor_source_key(change);
+            let failure = match sources.get(index) {
+                Some(Ok(actual)) if actual == expected => None,
+                Some(Ok(actual)) => Some(format!(
+                    "{} source mismatch: editor_len={} studio_len={} editor_hash={} studio_hash={} key={}",
+                    change.path_segments.join("."),
+                    expected.len(),
+                    actual.len(),
+                    fnv1a_hex(expected.as_bytes()),
+                    fnv1a_hex(actual.as_bytes()),
+                    source_key,
+                )),
+                Some(Err(error)) => Some(format!(
+                    "{} source could not be read: {} key={}",
+                    change.path_segments.join("."),
+                    error,
+                    source_key,
+                )),
+                None => Some(format!(
+                    "{} source was omitted by Studio: key={}",
+                    change.path_segments.join("."),
+                    source_key,
+                )),
+            };
+            if let Some(failure) = failure {
+                failures.insert(*index, failure);
+                true
+            } else {
+                failures.remove(index);
+                false
+            }
+        });
+        if pending.is_empty() {
+            break;
         }
     }
-    Ok(verification)
+
+    let failed_indexes = pending;
+    let failed = failed_indexes
+        .iter()
+        .filter_map(|index| failures.remove(index))
+        .collect();
+    Ok(EditorSourceVerification {
+        verified,
+        failed_indexes,
+        failed,
+    })
 }
 
 fn editor_source_key(change: &EditorSourceChange) -> String {

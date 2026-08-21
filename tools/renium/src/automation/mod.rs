@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 pub(crate) mod client;
 pub(crate) mod context;
+pub(crate) mod live;
 pub(crate) mod local;
 pub(crate) mod places;
 pub(crate) mod runtime;
@@ -202,7 +203,6 @@ impl BoundContext {
             && self.source == other.source
             && self.place_id == other.place_id
             && self.game_id == other.game_id
-            && self.selector == other.selector
             && self.runtime_id == other.runtime_id
             && self.plugin_build == other.plugin_build
             && self.fingerprint == other.fingerprint
@@ -223,6 +223,7 @@ pub struct State {
     contexts: Mutex<HashMap<u64, BoundContext>>,
     reviews: Mutex<HashMap<String, Review>>,
     available_update: Mutex<Option<String>>,
+    live_sync: live::Manager,
 }
 
 impl Default for State {
@@ -233,6 +234,7 @@ impl Default for State {
             contexts: Mutex::new(HashMap::new()),
             reviews: Mutex::new(HashMap::new()),
             available_update: Mutex::new(None),
+            live_sync: live::Manager::default(),
         }
     }
 }
@@ -260,6 +262,16 @@ impl State {
         {
             return existing.clone();
         }
+        let removed = contexts
+            .iter()
+            .filter_map(|(id, existing)| {
+                (existing.root == context.root
+                    && (existing.fingerprint != context.fingerprint
+                        || existing.runtime_id == context.runtime_id
+                            && existing.plugin_build != context.plugin_build))
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
         contexts.retain(|_, existing| {
             existing.root != context.root
                 || existing.fingerprint == context.fingerprint
@@ -268,6 +280,10 @@ impl State {
         });
         context.id = self.next_context.fetch_add(1, Ordering::Relaxed);
         contexts.insert(context.id, context.clone());
+        drop(contexts);
+        for id in removed {
+            self.live_sync.stop(id);
+        }
         context
     }
 
@@ -280,11 +296,20 @@ impl State {
     }
 
     pub fn remove_context(&self, id: u64) -> bool {
-        self.contexts
+        let removed = self
+            .contexts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id)
-            .is_some()
+            .is_some();
+        if removed {
+            self.live_sync.stop(id);
+        }
+        removed
+    }
+
+    pub(crate) fn live_sync(&self) -> &live::Manager {
+        &self.live_sync
     }
 
     pub fn prepare_review(
