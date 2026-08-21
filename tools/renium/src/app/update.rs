@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,8 @@ pub struct UpdateApplyArgs {
     pub extension_root: Option<PathBuf>,
     #[arg(long, requires = "extension_root")]
     pub editor_cli: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "ask")]
+    pub local_places: LocalPlaceUpdateBehavior,
 }
 
 impl Default for UpdateApplyArgs {
@@ -72,6 +74,27 @@ impl Default for UpdateApplyArgs {
             force: false,
             extension_root: None,
             editor_cli: None,
+            local_places: LocalPlaceUpdateBehavior::Ask,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+pub enum LocalPlaceUpdateBehavior {
+    #[default]
+    Ask,
+    LeaveOpen,
+    SaveAndClose,
+    Terminate,
+}
+
+impl LocalPlaceUpdateBehavior {
+    fn protocol_value(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::LeaveOpen => "leaveOpen",
+            Self::SaveAndClose => "saveAndClose",
+            Self::Terminate => "terminate",
         }
     }
 }
@@ -175,6 +198,18 @@ struct DeferredUpdatePlan {
     plugin: Option<DeferredFileInstall>,
     extension_installs: Vec<DeferredExtensionInstall>,
     components: Vec<UpdateComponent>,
+    #[serde(default)]
+    studio_reopen_targets: Vec<crate::automation::StudioReopenTarget>,
+    #[serde(default)]
+    local_studios_left_open: usize,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioUpdatePreparation {
+    reopen_targets: Vec<crate::automation::StudioReopenTarget>,
+    local_places: usize,
+    left_open: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -601,15 +636,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
             cleanup_orphaned_update_stages()?;
             let manifest = fetch_manifest(&args.manifest)?;
             verify_manifest(&manifest)?;
-            apply_update(
-                manifest,
-                &args.component,
-                args.dry_run,
-                args.force,
-                args.extension_root.as_deref(),
-                args.editor_cli.as_deref(),
-                &lifecycle_lock,
-            )
+            apply_update(manifest, &args, &lifecycle_lock)
         }
     }
 }
@@ -641,6 +668,12 @@ fn delegate_extension_owned_update(args: &UpdateApplyArgs) -> Result<bool> {
     if let Some(cli) = args.editor_cli.as_deref() {
         command.arg("--editor-cli").arg(cli);
     }
+    command.arg("--local-places").arg(
+        args.local_places
+            .to_possible_value()
+            .expect("value enum")
+            .get_name(),
+    );
     let status = command
         .status()
         .with_context(|| format!("Failed to start {}", cli.display()))?;
@@ -674,6 +707,46 @@ fn find_user_wide_cli(current: &Path) -> Option<PathBuf> {
                 !paths_equal(&candidate, &current) && !cli_is_extension_owned(&candidate)
             })
     })
+}
+
+fn prepare_connected_studios_for_update(
+    behavior: LocalPlaceUpdateBehavior,
+) -> Result<StudioUpdatePreparation> {
+    let request = crate::automation::Request {
+        v: crate::automation::PROTOCOL_VERSION,
+        id: current_millis().min(u128::from(u64::MAX)) as u64,
+        op: crate::automation::op::UPDATE_STUDIOS,
+        cx: None,
+        p: json!({ "localAction": behavior.protocol_value() }),
+    };
+    let Some(response) = crate::automation::client::try_send_request(&request)? else {
+        return Ok(StudioUpdatePreparation::default());
+    };
+    if response.ok == 0 {
+        let error = response
+            .e
+            .map(|error| error.m)
+            .unwrap_or_else(|| "The Renium daemon could not prepare Studio for update".to_string());
+        bail!("{error}");
+    }
+    serde_json::from_value(
+        response
+            .r
+            .context("The Renium daemon returned no Studio update result")?,
+    )
+    .context("The Renium daemon returned an invalid Studio update result")
+}
+
+fn reopen_studios(targets: &[crate::automation::StudioReopenTarget]) {
+    for target in targets {
+        if let Err(error) = crate::project::workflows::launch_exact_studio(
+            target.file.as_deref(),
+            target.game_id,
+            target.place_id,
+        ) {
+            eprintln!("[renium] warning: could not reopen Studio after update: {error:#}");
+        }
+    }
 }
 
 fn fetch_manifest(source: &str) -> Result<SignedUpdateManifest> {
@@ -737,13 +810,18 @@ fn verify_manifest(manifest: &SignedUpdateManifest) -> Result<()> {
 
 fn apply_update(
     manifest: SignedUpdateManifest,
-    requested: &[String],
-    dry_run: bool,
-    force: bool,
-    extension_root: Option<&Path>,
-    editor_cli: Option<&Path>,
+    args: &UpdateApplyArgs,
     _lifecycle_lock: &LifecycleLock,
 ) -> Result<()> {
+    let UpdateApplyArgs {
+        component: requested,
+        dry_run,
+        force,
+        extension_root,
+        editor_cli,
+        local_places,
+        ..
+    } = args;
     let platform = platform_key();
     let components = manifest
         .payload
@@ -889,7 +967,7 @@ fn apply_update(
             );
         }
     }
-    if dry_run {
+    if *dry_run {
         return crate::app::output::emit_global_output(
             &json!({
                 "ok": true,
@@ -997,10 +1075,6 @@ fn apply_update(
     if let Some(bytes) = plugin_bytes.as_deref() {
         crate::app::setup::validate_rbxm_version(bytes, &manifest.payload.version)?;
     }
-    if let Err(error) = crate::project::workflows::stop_all_daemons_for_update() {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
     let target = env::current_exe().context("Failed to locate the running Renium CLI")?;
     let mut plan = DeferredUpdatePlan {
         transaction_id: format!("{}-{}", std::process::id(), current_millis()),
@@ -1017,6 +1091,8 @@ fn apply_update(
         }),
         extension_installs: staged_extensions,
         components: requested.clone(),
+        studio_reopen_targets: Vec::new(),
+        local_studios_left_open: 0,
     };
     plan.originals = match prepare_update_originals(&plan) {
         Ok(originals) => Some(originals),
@@ -1025,10 +1101,31 @@ fn apply_update(
             return Err(error);
         }
     };
+    let studio_preparation = if update_plugin {
+        match prepare_connected_studios_for_update(*local_places) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&stage);
+                return Err(error);
+            }
+        }
+    } else {
+        StudioUpdatePreparation::default()
+    };
+    plan.studio_reopen_targets = studio_preparation.reopen_targets;
+    plan.local_studios_left_open = studio_preparation.left_open;
+    if let Err(error) = crate::project::workflows::stop_all_daemons_for_update() {
+        reopen_studios(&plan.studio_reopen_targets);
+        let _ = fs::remove_dir_all(&stage);
+        return Err(error);
+    }
     plan.phase = "prepared".to_string();
     #[cfg(windows)]
     {
-        schedule_windows_update(&plan, plan.core_stage.as_deref())?;
+        if let Err(error) = schedule_windows_update(&plan, plan.core_stage.as_deref()) {
+            reopen_studios(&plan.studio_reopen_targets);
+            return Err(error);
+        }
         let result_path = deferred_update_result_path()?;
         crate::app::output::emit_global_output(
             &json!({
@@ -1039,6 +1136,8 @@ fn apply_update(
                 "scheduled": requested,
                 "restartRequired": true,
                 "resultPath": result_path,
+                "localStudios": studio_preparation.local_places,
+                "localStudiosLeftOpen": plan.local_studios_left_open,
             }),
             &format!(
                 "Scheduled the Renium {} update; it will finish after this process exits",
@@ -1056,7 +1155,10 @@ fn apply_update(
             Ok((plan.components.clone(), Vec::new()))
         })();
         let (applied, scheduled) = match result {
-            Ok(value) => value,
+            Ok(value) => {
+                reopen_studios(&plan.studio_reopen_targets);
+                value
+            }
             Err(error) => {
                 let rollback = plan
                     .originals
@@ -1064,10 +1166,12 @@ fn apply_update(
                     .context("The update transaction has no original-state baseline")
                     .and_then(restore_update_originals);
                 if let Err(rollback_error) = rollback {
+                    reopen_studios(&plan.studio_reopen_targets);
                     return Err(error).context(format!(
                         "Update rollback was incomplete: {rollback_error:#}"
                     ));
                 }
+                reopen_studios(&plan.studio_reopen_targets);
                 clear_pending_update_transaction()?;
                 let _ = fs::remove_dir_all(&stage);
                 return Err(error);
@@ -1106,6 +1210,8 @@ fn apply_update(
                 "applied": applied,
                 "scheduled": scheduled,
                 "restartRequired": restart_required,
+                "localStudios": studio_preparation.local_places,
+                "localStudiosLeftOpen": plan.local_studios_left_open,
             }),
             &text,
         )
@@ -2173,16 +2279,19 @@ fn recover_pending_update_transaction(lifecycle_lock: &LifecycleLock) -> Result<
                 .as_ref()
                 .context("The interrupted update has no original-state baseline")?,
         ) {
+            reopen_studios(&plan.studio_reopen_targets);
             return Err(error).context(format!(
                 "Interrupted update rollback was incomplete: {rollback_error:#}"
             ));
         }
+        reopen_studios(&plan.studio_reopen_targets);
         clear_pending_update_transaction()?;
         return Err(error).context(format!(
             "Could not finish the interrupted Renium {} update; the original installation was restored",
             plan.version
         ));
     }
+    reopen_studios(&plan.studio_reopen_targets);
     plan.phase = "applied".to_string();
     write_pending_update_transaction(&plan)?;
     clear_pending_update_transaction()?;
@@ -2368,12 +2477,15 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
                     .as_ref()
                     .context("The deferred update has no original-state baseline")?,
             ) {
+                reopen_studios(&plan.studio_reopen_targets);
                 return Err(error).context(format!(
                     "Deferred update rollback was incomplete: {rollback_error:#}"
                 ));
             }
+            reopen_studios(&plan.studio_reopen_targets);
             return Err(error);
         }
+        reopen_studios(&plan.studio_reopen_targets);
         plan.phase = "applied".to_string();
         write_pending_update_transaction(&plan)?;
         clear_pending_update_transaction()?;

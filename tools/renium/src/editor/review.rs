@@ -921,12 +921,37 @@ fn local_place_path_from_studio_title(title: &str) -> Option<PathBuf> {
 #[cfg(windows)]
 pub(crate) fn local_place_path_for_bridge(bridge: &BridgeServer) -> Option<PathBuf> {
     let pid = studio_pid_for_bridge(bridge).ok()?;
+    local_place_path_for_pid(pid)
+}
+
+#[cfg(windows)]
+pub(crate) fn local_place_path_for_pid(pid: u32) -> Option<PathBuf> {
     let title = input_inject::studio_window_title(pid).ok()?;
     local_place_path_from_studio_title(&title)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(crate) fn local_place_path_for_bridge(bridge: &BridgeServer) -> Option<PathBuf> {
+    let pid = studio_pid_for_bridge(bridge).ok()?;
+    local_place_path_for_pid(pid)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn local_place_path_for_pid(pid: u32) -> Option<PathBuf> {
+    input_inject::studio_document_path(pid).ok().filter(|path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "rbxl" | "rbxlx"))
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn local_place_path_for_bridge(_bridge: &BridgeServer) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn local_place_path_for_pid(_pid: u32) -> Option<PathBuf> {
     None
 }
 

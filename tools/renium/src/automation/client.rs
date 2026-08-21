@@ -210,14 +210,14 @@ fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<
             }))?,
         ));
     }
-    if operation.id == op::STUDIOS {
+    if matches!(operation.id, op::STUDIOS | op::UPDATE_STUDIOS) {
         let payload = match args {
             [] => json!({}),
             [flag, source] if flag == "-J" || flag == "--json-file" => read_json(source)?,
-            _ => bail!("Expected: rbx a studios [-J FILE]"),
+            _ => bail!("Expected: rbx a {} [-J FILE]", operation.name),
         };
         if !payload.is_object() {
-            bail!("studios payload must be a JSON object");
+            bail!("{} payload must be a JSON object", operation.name);
         }
         return Ok((None, payload));
     }
@@ -276,6 +276,16 @@ fn cli_parameters(operation: &super::Opcode, args: &[String]) -> Result<(Option<
             })
             .collect::<Result<Vec<_>>>()?;
         return Ok((Some(cx), json!({ "order": order })));
+    }
+    if operation.id == op::STUDIO_CLOSE {
+        let local_action = match remaining {
+            [flag] if flag == "--save" => "saveAndClose",
+            [flag] if flag == "--terminate" => "terminate",
+            _ => "",
+        };
+        if !local_action.is_empty() {
+            return Ok((Some(cx), json!({ "localAction": local_action })));
+        }
     }
     let (service, source) = match remaining {
         [flag, source] if flag == "-J" || flag == "--json-file" => (None, source),

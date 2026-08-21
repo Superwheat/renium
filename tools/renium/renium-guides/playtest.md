@@ -7,8 +7,8 @@ rbx play -s                         # ordinary Play; default for one-client chec
 rbx play -s --players 1             # local server plus one separate client
 rbx play -s --players 2             # local server plus two clients
 rbx clients
-rbx l "print(game.PlaceId)"         # Play server during a test
-rbx lc "print(game.Players.LocalPlayer.Name)" 2
+rbx l "return game.PlaceId"         # Play server during a test
+rbx lc "return game.Players.LocalPlayer.Name" 2
 rbx co --server -n 20
 rbx co --player 2 -n 20
 rbx play -x
@@ -17,6 +17,8 @@ rbx play -x
 Use ordinary Play unless the test needs a separate server runtime or multiple clients. `--players 1` is still a local-server test, not ordinary one-player Play. Ordinary Play still reports its internal `play-server` and `play-client` bridges; `mode: "play"` confirms it isn't a local-server test.
 
 Outside Play, `rbx l` runs in the edit plugin context. It has the edit DataModel but no normal Play-client `LocalPlayer` or `PlayerGui`. Start Play before requiring runtime client code. During Play, `rbx l` targets the server and `rbx lc ... <name|index>` targets one client. Luau compile errors, runtime errors, and timeouts return nonzero.
+
+Return values from `l` and `lc`; don't print values just to read them. Renium returns captured `print` and `warn` output directly without adding it to Studio's Output. Use `co` only for messages produced by the game or Studio itself.
 
 Don't keep an `l` or `lc` command waiting while issuing another command; daemon operations run in order. Register any observer, return, perform the action, then read the recorded state.
 

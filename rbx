@@ -1,5 +1,6 @@
 #!/bin/sh
 set -u
+export RENIUM_AGENT_CLI=1
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 

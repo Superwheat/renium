@@ -34,6 +34,8 @@ const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
 const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
 const PROJECT_INSTRUCTIONS_FILE: &str = "RENIUM.md";
 const PROJECT_GUIDES_DIRECTORY: &str = "RENIUM";
+const AGENT_VERSION_PREFIX: &str = "<!-- renium-version: ";
+const AGENT_VERSION_SUFFIX: &str = " -->";
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -807,19 +809,64 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
-    Command::new(&executable)
-        .arg(&file)
+    let mut command = Command::new(&executable);
+    command.arg(&file);
+    let pid = spawn_studio(command, &executable)?;
+    Ok(json!({
+        "ok": true,
+        "pid": pid,
+        "executable": executable,
+        "file": file,
+        "exists": file.is_file(),
+    }))
+}
+
+pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
+    if game_id <= 0 || place_id <= 0 {
+        bail!("Published Studio places require positive universe and place IDs");
+    }
+    let executable = studio_executable()?;
+    let mut command = Command::new(&executable);
+    command.args([
+        "--task",
+        "EditPlace",
+        "--placeId",
+        &place_id.to_string(),
+        "--universeId",
+        &game_id.to_string(),
+    ]);
+    let pid = spawn_studio(command, &executable)?;
+    Ok(json!({
+        "ok": true,
+        "pid": pid,
+        "executable": executable,
+        "gameId": game_id,
+        "placeId": place_id,
+    }))
+}
+
+pub fn launch_exact_studio(
+    file: Option<&Path>,
+    game_id: Option<i64>,
+    place_id: Option<i64>,
+) -> Result<Value> {
+    if let Some(file) = file {
+        return launch_studio(Some(file), None);
+    }
+    match (game_id, place_id) {
+        (Some(game_id), Some(place_id)) => launch_published_studio(game_id, place_id),
+        _ => bail!("Studio reopen target has neither a local file nor published place IDs"),
+    }
+}
+
+fn spawn_studio(mut command: Command, executable: &Path) -> Result<u32> {
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Failed to launch {}", executable.display()))?;
-    Ok(json!({
-        "ok": true,
-        "executable": executable,
-        "file": file,
-        "exists": file.is_file(),
-    }))
+    Ok(child.id())
 }
 
 pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()> {
@@ -1101,6 +1148,31 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn ensure_agent_instructions(root: &Path) -> Result<()> {
+    if root.join(PROJECT_INSTRUCTIONS_FILE).is_file() {
+        return Ok(());
+    }
+    refresh_agent_instructions(root)
+}
+
+pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Result<bool> {
+    let current = env::current_dir().context("Failed to locate the current directory")?;
+    let Some(loaded) = config::try_load_project(project, Some(&current))? else {
+        return Ok(false);
+    };
+    let root = resolve_experience_place(&loaded.root, None)?
+        .map_or(loaded.root, |place| place.experience_root);
+    let path = root.join(PROJECT_INSTRUCTIONS_FILE);
+    let version = fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| agent_instruction_version(&contents).map(str::to_string));
+    if version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+        return Ok(false);
+    }
+    refresh_agent_instructions(&root)?;
+    Ok(true)
+}
+
 fn agent_instructions() -> Result<Vec<u8>> {
     let installed = env::current_exe()
         .context("Failed to locate the Renium executable")?
@@ -1112,7 +1184,31 @@ fn agent_instructions() -> Result<Vec<u8>> {
         .into_iter()
         .find(|path| path.is_file())
         .context("Renium is missing renium-agents.md; reinstall Renium")?;
-    fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
+    let contents = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text = std::str::from_utf8(&contents)
+        .with_context(|| format!("{} is not UTF-8", path.display()))?;
+    let version = agent_instruction_version(text).with_context(|| {
+        format!(
+            "{} is missing its Renium version marker; reinstall Renium",
+            path.display()
+        )
+    })?;
+    if version != env!("CARGO_PKG_VERSION") {
+        bail!(
+            "{} contains Renium guide version {version}, but this executable is version {}; reinstall Renium",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(contents)
+}
+
+fn agent_instruction_version(contents: &str) -> Option<&str> {
+    contents
+        .lines()
+        .next()?
+        .strip_prefix(AGENT_VERSION_PREFIX)?
+        .strip_suffix(AGENT_VERSION_SUFFIX)
 }
 
 fn agent_guides_directory() -> Result<PathBuf> {

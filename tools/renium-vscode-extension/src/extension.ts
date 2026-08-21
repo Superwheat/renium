@@ -186,7 +186,11 @@ type BridgeClientInfo = {
   placeId?: number;
   gameId?: number;
   placeName?: string;
+  localFile?: string;
+  pid?: number;
 };
+
+type LocalPlaceUpdateBehavior = "ask" | "leaveOpen" | "saveAndClose" | "terminate";
 
 type ConnectedStudioPlace = {
   runtimeId?: string;
@@ -506,7 +510,11 @@ class RobloxSyncController {
     if (!isReniumProjectRoot(cfg.experienceRoot)) {
       throw new Error("Open a Renium project before creating agent instructions.");
     }
-    const written = this.ensureAgentInstructions(cfg.experienceRoot);
+    const written = ensureReniumAgentInstructions(
+      this.context.extensionPath,
+      cfg.experienceRoot,
+      true,
+    );
     vscode.window.showInformationMessage(
       written.length > 0
         ? "Updated Renium agent instructions."
@@ -2276,6 +2284,77 @@ class RobloxSyncController {
     throw new Error(`Renium ${version} did not finish installing within 30 seconds.`);
   }
 
+  private async connectedLocalStudioCount(): Promise<number | undefined> {
+    if (!this.isBridgeDaemonRunning()) {
+      return 0;
+    }
+    const result = await this.runCommand(
+      this.updateCli(),
+      ["a", "studios"],
+      this.context.extensionPath,
+      "update-studios",
+      2,
+      { quietLog: true, timeoutMs: 2_000 },
+    );
+    if (result.code !== 0) {
+      return undefined;
+    }
+    const response = parseCliJsonObject<{
+      ok?: number;
+      r?: { clients?: BridgeClientInfo[] };
+    }>(result.output);
+    const clients = response?.r?.clients;
+    if (!Array.isArray(clients)) {
+      return undefined;
+    }
+    return clients.filter((client) =>
+      client.role === "edit"
+      && (Boolean(client.localFile) || !(Number(client.gameId) > 0 && Number(client.placeId) > 0))
+    ).length;
+  }
+
+  private async chooseLocalPlaceUpdateBehavior(): Promise<{
+    behavior: Exclude<LocalPlaceUpdateBehavior, "ask">;
+    localCount?: number;
+  } | undefined> {
+    const configured = vscode.workspace.getConfiguration("renium")
+      .get<LocalPlaceUpdateBehavior>("localPlaceUpdateBehavior", "ask");
+    const localCount = await this.connectedLocalStudioCount();
+    if (localCount === 0) {
+      return { behavior: "leaveOpen", localCount };
+    }
+    if (configured !== "ask") {
+      return { behavior: configured, localCount };
+    }
+    const count = localCount === undefined ? "A connected local Studio place may be open" :
+      `${localCount} connected local Studio place${localCount === 1 ? " is" : "s are"} open`;
+    const choice = await vscode.window.showWarningMessage(
+      `${count}. What should Renium do while updating the Studio plugin?`,
+      "Leave Open",
+      "Save and Close",
+      "Terminate Without Saving",
+    );
+    const behavior = choice === "Leave Open" ? "leaveOpen" :
+      choice === "Save and Close" ? "saveAndClose" :
+        choice === "Terminate Without Saving" ? "terminate" : undefined;
+    if (!behavior) {
+      return undefined;
+    }
+    const remember = await vscode.window.showInformationMessage(
+      "Use this choice automatically for future Renium updates?",
+      "Always",
+      "Just Once",
+    );
+    if (remember === "Always") {
+      await vscode.workspace.getConfiguration("renium").update(
+        "localPlaceUpdateBehavior",
+        behavior,
+        vscode.ConfigurationTarget.Global,
+      );
+    }
+    return { behavior, localCount };
+  }
+
   private async installUpdate(status: ReniumUpdateStatus, requestedByStudio = false): Promise<void> {
     if (this.updateInstallPromise) {
       return this.updateInstallPromise;
@@ -2285,6 +2364,10 @@ class RobloxSyncController {
       vscode.window.showInformationMessage("Renium is up to date.");
       return;
     }
+    const localPlaces = await this.chooseLocalPlaceUpdateBehavior();
+    if (!localPlaces) {
+      return;
+    }
     this.updateInstallPromise = Promise.resolve(vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: `Installing Renium ${version}`,
@@ -2292,7 +2375,7 @@ class RobloxSyncController {
       await this.stopConsoleFollow();
       await this.disposeLiveSyncRuntime();
       this.bridgeServeRequested = false;
-      await this.stopBridgeDaemon();
+      this.stopStudioActionPolling();
       const result = await this.runCommand(
         this.updateCli(),
         [
@@ -2300,6 +2383,8 @@ class RobloxSyncController {
           "update", "apply",
           "--extension-root", path.dirname(this.context.extensionPath),
           "--editor-cli", this.currentEditorCli(),
+          "--local-places", localPlaces.behavior === "leaveOpen" ? "leave-open" :
+            localPlaces.behavior === "saveAndClose" ? "save-and-close" : "terminate",
         ],
         this.context.extensionPath,
         "update-apply",
@@ -2319,8 +2404,11 @@ class RobloxSyncController {
     } finally {
       this.updateInstallPromise = undefined;
     }
+    const studioNote = localPlaces.behavior === "leaveOpen" && localPlaces.localCount !== 0
+      ? " Local Studio windows were left open; restart them when you want to load the updated plugin."
+      : "";
     const choice = await vscode.window.showInformationMessage(
-      `Renium ${version} is installed. Reload the editor and restart Studio to use it.`,
+      `Renium ${version} is installed. Reload the editor to use it.${studioNote}`,
       "Reload Editor",
     );
     if (choice === "Reload Editor") {

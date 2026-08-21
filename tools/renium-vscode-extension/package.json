@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -534,6 +534,19 @@
           "type": "boolean",
           "default": true,
           "description": "Check GitHub Releases when the editor opens and offer to install matching Renium extension and Studio plugin updates."
+        },
+        "renium.localPlaceUpdateBehavior": {
+          "type": "string",
+          "enum": ["ask", "leaveOpen", "saveAndClose", "terminate"],
+          "enumDescriptions": [
+            "Ask what to do with connected local Studio places before updating the plugin.",
+            "Leave connected local Studio places open. They keep the old plugin until restarted.",
+            "Save connected local place files, close Studio without its save dialog, then reopen them after the update.",
+            "Terminate connected local Studio places without saving, then reopen files that already have a path."
+          ],
+          "default": "ask",
+          "scope": "machine",
+          "description": "How Renium handles connected local Studio places while updating the Studio plugin."
         },
         "renium.autoSyncDebounceMs": {
           "type": "number",

@@ -67,6 +67,7 @@
     { "id": 93, "name": "generate-model", "runtime": true },
     { "id": 94, "name": "job-status", "runtime": true },
     { "id": 95, "name": "image-upload" },
-    { "id": 96, "name": "image-store", "queued": false }
+    { "id": 96, "name": "image-store", "queued": false },
+    { "id": 97, "name": "update-studios", "runtime": true }
   ]
 }

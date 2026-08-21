@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.2.7 - 2026-08-21
+
+### Updates
+
+- Updating the Studio plugin now asks how to handle each connected local place: leave it open, save and close it, or terminate it without saving. The choice can be remembered for later updates.
+- Places closed for an update reopen at the same local file or published universe and place after the update succeeds or rolls back.
+- Saving a local place before an update includes its live unsaved changes without opening Studio's save dialog or taking keyboard and mouse input.
+- Direct Studio close commands require an explicit save or terminate choice instead of guessing what to do with local work.
+
+### Studio automation
+
+- Luau commands, waits, and movement return their results through Renium without adding automation messages to Studio's Output.
+- Project instructions refresh when the installed Renium version changes, and agent commands stop once to request a reread before continuing with changed instructions.
+
 ## 0.2.6 - 2026-08-21
 
 ### Live sync

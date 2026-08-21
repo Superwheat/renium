@@ -21,7 +21,9 @@ use crate::cli::{
 };
 use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
 #[cfg(any(windows, target_os = "macos"))]
-use crate::editor::review::studio_pid_for_bridge;
+use crate::editor::review::{
+    local_place_path_for_bridge, local_place_path_for_pid, studio_pid_for_bridge,
+};
 use crate::editor::sync::{
     apply_editor_delete_with_warm_bridge, apply_editor_property_with_warm_bridge,
     push_editor_changes_with_warm_bridge,
@@ -156,6 +158,9 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
         || lower.starts_with("stop play before ")
     {
         return automation::Failure::new("conflict", message, false, "context");
+    }
+    if lower.contains("need a close choice") {
+        return automation::Failure::new("rejected", message, false, "update-studios");
     }
     if lower.contains("invalid")
         || lower.contains("requires")
@@ -533,6 +538,287 @@ fn automation_pull_operation(
     ))
 }
 
+#[derive(Clone)]
+struct ConnectedStudio {
+    pid: u32,
+    runtime_id: String,
+    local: bool,
+    target: automation::StudioReopenTarget,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn connected_edit_studios(bridge: &BridgeServer) -> Vec<ConnectedStudio> {
+    let mut studios = Vec::new();
+    for client in bridge.list_bridge_clients() {
+        if client.get("role").and_then(Value::as_str) != Some("edit") {
+            continue;
+        }
+        let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
+            continue;
+        };
+        if studios
+            .iter()
+            .any(|studio: &ConnectedStudio| studio.pid == pid)
+        {
+            continue;
+        }
+        let file = local_place_path_for_pid(pid).filter(|path| path.is_file());
+        let game_id = client
+            .get("gameId")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0);
+        let place_id = client
+            .get("placeId")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0);
+        studios.push(ConnectedStudio {
+            pid,
+            runtime_id: runtime_id.to_string(),
+            local: file.is_some() || game_id.is_none() || place_id.is_none(),
+            target: automation::StudioReopenTarget {
+                file,
+                game_id,
+                place_id,
+            },
+        });
+    }
+    studios
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn studio_clients(bridge: &BridgeServer) -> Vec<Value> {
+    let mut clients = bridge.list_bridge_clients();
+    for client in &mut clients {
+        if client.get("role").and_then(Value::as_str) != Some("edit") {
+            continue;
+        }
+        let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
+            continue;
+        };
+        let Some(object) = client.as_object_mut() else {
+            continue;
+        };
+        object.insert("pid".to_string(), json!(pid));
+        if let Some(file) = local_place_path_for_pid(pid).filter(|path| path.is_file()) {
+            object.insert("localFile".to_string(), json!(file));
+        }
+    }
+    clients
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn studio_clients(bridge: &BridgeServer) -> Vec<Value> {
+    bridge.list_bridge_clients()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn save_local_studio(studio: &ConnectedStudio, bridge: &BridgeServer) -> Result<()> {
+    let file = studio
+        .target
+        .file
+        .as_deref()
+        .context("The local Studio place has no saved file path")?;
+    let staging = crate::system::files::sibling_temp_path(file);
+    let saved = crate::studio::native::editor::write_connected_editor_place_snapshot(
+        bridge,
+        &studio.runtime_id,
+        &staging,
+        file,
+    )
+    .with_context(|| {
+        format!(
+            "Could not save the local Studio place to {}",
+            file.display()
+        )
+    });
+    if let Err(error) = saved {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) =
+        crate::system::files::replace_file_with_backup(&staging, file, "saved Studio place")
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn prepare_studios_for_update(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
+    let local_action = parameters
+        .get("localAction")
+        .and_then(Value::as_str)
+        .unwrap_or("ask");
+    if !matches!(
+        local_action,
+        "ask" | "leaveOpen" | "saveAndClose" | "terminate"
+    ) {
+        bail!("localAction must be ask, leaveOpen, saveAndClose, or terminate");
+    }
+    let runtime_ids = parameters
+        .get("runtimeIds")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    let studios = connected_edit_studios(bridge)
+        .into_iter()
+        .filter(|studio| {
+            runtime_ids
+                .as_ref()
+                .is_none_or(|runtime_ids| runtime_ids.contains(&studio.runtime_id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    let local_count = studios.iter().filter(|studio| studio.local).count();
+    if local_action == "ask" && local_count > 0 {
+        bail!(
+            "{local_count} connected local Studio place(s) need a close choice before the plugin can be updated"
+        );
+    }
+    if local_action == "saveAndClose" {
+        for studio in studios.iter().filter(|studio| studio.local) {
+            if studio.target.file.is_none() {
+                bail!(
+                    "A connected local Studio place has no saved file path; leave it open or terminate it without saving"
+                );
+            }
+            save_local_studio(studio, bridge)?;
+        }
+    }
+    let mut targets: Vec<automation::StudioReopenTarget> = Vec::new();
+    let mut left_open = 0usize;
+    for studio in studios {
+        if studio.local && local_action == "leaveOpen" {
+            left_open += 1;
+            continue;
+        }
+        if studio.local && local_action == "ask" {
+            unreachable!("local Studio ask mode is rejected above");
+        }
+        if let Err(error) = input_inject::terminate_studio_process(studio.pid) {
+            for target in &targets {
+                let _ = workflows::launch_exact_studio(
+                    target.file.as_deref(),
+                    target.game_id,
+                    target.place_id,
+                );
+            }
+            return Err(error);
+        }
+        if studio.target.file.is_some()
+            || studio.target.game_id.is_some() && studio.target.place_id.is_some()
+        {
+            targets.push(studio.target);
+        }
+    }
+    Ok(json!({
+        "reopenTargets": targets,
+        "localPlaces": local_count,
+        "leftOpen": left_open,
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn prepare_studios_for_update(_parameters: &Value, _bridge: &BridgeServer) -> Result<Value> {
+    Ok(json!({ "reopenTargets": [], "localPlaces": 0, "leftOpen": 0 }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn close_studio(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> Result<Value> {
+    bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let file = local_place_path_for_bridge(bridge).filter(|path| path.is_file());
+    let game_id = info.game_id.filter(|id| *id > 0).or(context.game_id);
+    let place_id = info.place_id.filter(|id| *id > 0).or(context.place_id);
+    let local_action = parameters.get("localAction").and_then(Value::as_str);
+    let unpublished = !matches!(
+        (game_id, place_id),
+        (Some(game), Some(place)) if game > 0 && place > 0
+    );
+    if file.is_none() && unpublished && local_action != Some("terminate") {
+        bail!("Renium could not determine how to reopen this Studio place, so it was not closed");
+    }
+    let target = automation::StudioReopenTarget {
+        file,
+        game_id,
+        place_id,
+    };
+    let pid = studio_pid_for_bridge(bridge)?;
+    if target.file.is_some() || unpublished {
+        match local_action {
+            Some("saveAndClose") => save_local_studio(
+                &ConnectedStudio {
+                    pid,
+                    runtime_id: info.runtime_id,
+                    local: true,
+                    target: target.clone(),
+                },
+                bridge,
+            )?,
+            Some("terminate") => {}
+            _ => bail!(
+                "Closing a local Studio place requires --save or --terminate so Renium never guesses whether to keep unsaved work"
+            ),
+        }
+    }
+    state.remember_studio_target(context, target.clone());
+    input_inject::terminate_studio_process(pid)?;
+    state.clear_context_runtime(context.id);
+    Ok(json!({ "closed": true, "pid": pid, "reopenTarget": target }))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn close_studio(
+    _context: &automation::BoundContext,
+    _parameters: &Value,
+    _state: &automation::State,
+    _bridge: &BridgeServer,
+    _bridge_wait_seconds: f64,
+) -> Result<Value> {
+    bail!("Studio close is unsupported on this platform")
+}
+
+fn open_studio(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+) -> Result<Value> {
+    if let Some(file) = parameters
+        .get("file")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    {
+        let file = bound_context::path(context, file);
+        return workflows::launch_studio(Some(&file), None);
+    }
+    let target = state
+        .studio_target(context)
+        .unwrap_or(automation::StudioReopenTarget {
+            file: None,
+            game_id: context.game_id,
+            place_id: context.place_id,
+        });
+    if target.file.is_some() || target.game_id.is_some() && target.place_id.is_some() {
+        return workflows::launch_exact_studio(
+            target.file.as_deref(),
+            target.game_id,
+            target.place_id,
+        );
+    }
+    workflows::launch_studio(None, Some(Path::new(&context.project)))
+}
+
 fn automation_dispatch_operation(
     operation: u16,
     context: &automation::BoundContext,
@@ -614,25 +900,6 @@ fn automation_dispatch_operation(
         | op::SOURCEMAP
         | op::PROJECT_INIT
         | op::PROJECT_VALIDATE => local::execute(operation, context, parameters),
-        op::STUDIO_OPEN => {
-            let file = parameters
-                .get("file")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-                .map(|file| bound_context::path(context, file));
-            workflows::launch_studio(file.as_deref(), Some(Path::new(&context.project)))
-        }
-        op::STUDIO_CLOSE => {
-            #[cfg(any(windows, target_os = "macos"))]
-            {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
-                let pid = studio_pid_for_bridge(bridge)?;
-                input_inject::terminate_studio_process(pid)?;
-                Ok(json!({ "closed": true, "pid": pid }))
-            }
-            #[cfg(not(any(windows, target_os = "macos")))]
-            bail!("Studio close is unsupported on this platform")
-        }
         op::BATCH => automation_batch(context, parameters),
         op::STUDIO_STATUS => {
             let clients = bridge.list_bridge_clients();
@@ -886,6 +1153,13 @@ fn automation_dispatch_managed(
     bridge_wait_seconds: f64,
     reviewed: bool,
 ) -> std::result::Result<Value, automation::Failure> {
+    if operation == op::STUDIO_CLOSE {
+        return close_studio(context, parameters, state, bridge, bridge_wait_seconds)
+            .map_err(automation_failure);
+    }
+    if operation == op::STUDIO_OPEN {
+        return open_studio(context, parameters, state).map_err(automation_failure);
+    }
     let writes_project = matches!(
         operation,
         op::PULL
@@ -1224,12 +1498,15 @@ fn automation_execute_request(
         op::CAP => automation::capabilities().map_err(automation_failure),
         op::BIND => bound_context::bind(state, bridge, &request.p),
         op::STUDIOS => {
-            let clients = bridge.list_bridge_clients();
+            let clients = studio_clients(bridge);
             Ok(json!({
                 "studios": bound_context::studio_candidates_from(&clients, ""),
                 "clients": clients,
                 "selected": Value::Null,
             }))
+        }
+        op::UPDATE_STUDIOS => {
+            prepare_studios_for_update(&request.p, bridge).map_err(automation_failure)
         }
         _ => {
             let context_id = request
@@ -1258,7 +1535,22 @@ fn automation_execute_request(
                     bridge_wait_seconds,
                 );
             }
-            let context = bound_context::resolve(state, bridge, context_id)?;
+            let disconnected_open = operation.id == op::STUDIO_OPEN
+                || operation.id == op::REVIEW_PREPARE
+                    && request.p.get("op").and_then(Value::as_u64)
+                        == Some(u64::from(op::STUDIO_OPEN))
+                || operation.id == op::REVIEW_APPLY
+                    && request
+                        .p
+                        .get("reviewId")
+                        .and_then(Value::as_str)
+                        .and_then(|id| state.review_operation(id))
+                        == Some(op::STUDIO_OPEN);
+            let context = if disconnected_open {
+                bound_context::resolve_project(state, context_id)?
+            } else {
+                bound_context::resolve(state, bridge, context_id)?
+            };
             if operation.id == op::CONTEXT {
                 return serde_json::to_value(context).map_err(|error| {
                     automation::Failure::new("internal", error.to_string(), false, "bind")

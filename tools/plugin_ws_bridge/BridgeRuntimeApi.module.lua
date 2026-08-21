@@ -577,8 +577,6 @@ if resultEvent == nil then return end
 local output = {}
 local outputBytes = 0
 local outputTruncated = false
-local basePrint = print
-local baseWarn = warn
 local function truncate(text, maxBytes)
 	if #text <= maxBytes then return text end
 	local suffix = "\n[Renium truncated this message.]"
@@ -601,7 +599,6 @@ local function capture(kind, ...)
 			output[#output + 1] = { type = kind, message = message }
 		end
 	end
-	if kind == "print" then basePrint(...) else baseWarn(...) end
 end
 local print = function(...) capture("print", ...) end
 local warn = function(...) capture("warn", ...) end
@@ -2146,11 +2143,9 @@ updateMouse()
 		env.delay = trackedTask.delay
 		env.print = function(...)
 			capture("print", ...)
-			print(...)
 		end
 		env.warn = function(...)
 			capture("warn", ...)
-			warn(...)
 		end
 		env._G = env
 		env.getfenv = function(target)

@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+set "RENIUM_AGENT_CLI=1"
 set "CLI="
 
 if not "%RENIUM_CLI%"=="" if exist "%RENIUM_CLI%" set "CLI=%RENIUM_CLI%"

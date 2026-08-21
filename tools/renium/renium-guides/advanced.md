@@ -12,12 +12,14 @@ Read `RENIUM.md` first. Use `rbx a` only when the direct surface doesn't cover t
 - Input and capture: `ui`, `press`, `click`, `key`, `type`, `wait`, `goto`, `input`, `record-start`, `record-end`
 - Project: `project-init`, `project-validate`, `place-add`, `place-rename`, `place-reorder`
 - Review: `review-prepare`, `review-apply`, `review-reject`
-- Roblox Cloud and creator assets: `asset-search`, `asset-insert`, `generate-model`, `job-status`, `image-upload`, `image-store`
+- Roblox Cloud and creator assets: `asset-search`, `asset-insert`, `generate-model`, `job-status`, `image-upload`, `image-store`, `update-studios`
 <!-- automation-operations:end -->
 
 Common structured payload fields follow their names: selectors use `service` plus one of `settingsId`, `index`, `name`, `className`, or `pathSegments`/`pathOrdinals`; file operations use `model`, `output`, or `changedPaths`; client operations use `player`. Batch accepts an `ops` array.
 
 Project creation and place management use `project-init`, `project-validate`, `place-add`, `place-rename`, and `place-reorder`; reorder uses published place IDs. Studio open/close, protected-property fallback, and destructive replacement use `review-prepare` and the returned receipt. Never retry a permanent error with a different operation.
+
+`studio-close` records the connected local file path and its universe/place IDs before closing. `studio-open` reuses that target, preferring the exact local file and otherwise opening the published place. Local files require `--save` or `--terminate`; neither route opens Studio's save dialog. Plugin updates offer leave open, save and close, or terminate without saving, and can remember the choice. Only connected Studio processes are affected.
 
 ```powershell
 rbx a bind . --bootstrap
