@@ -276,12 +276,6 @@ pub(super) fn bind(
             "project-validate",
         )
     })?;
-    if let Err(error) = workflows::refresh_agent_instructions(&project_root) {
-        eprintln!(
-            "[renium] warning: could not refresh project instructions in {}: {error:#}",
-            project_root.display()
-        );
-    }
     let identity = resolve_experience_place(&project_root, None).map_err(|error| {
         Failure::new(
             "no_project",
@@ -294,6 +288,12 @@ pub(super) fn bind(
         || project_root.clone(),
         |place| place.experience_root.clone(),
     );
+    if let Err(error) = workflows::ensure_agent_instructions(&experience) {
+        eprintln!(
+            "[renium] warning: could not refresh project instructions in {}: {error:#}",
+            experience.display()
+        );
+    }
     let manifest_game_id = identity.as_ref().and_then(|place| place.game_id);
     let manifest_place_id = identity.as_ref().and_then(|place| place.place_id);
     let alias = identity.as_ref().map(|place| place.alias.clone());
@@ -370,9 +370,8 @@ pub(super) fn bind(
         .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))
 }
 
-pub(super) fn resolve(
+pub(super) fn resolve_project(
     state: &State,
-    bridge: &BridgeServer,
     id: u64,
 ) -> std::result::Result<BoundContext, Failure> {
     let context = state
@@ -392,6 +391,15 @@ pub(super) fn resolve(
             "bind",
         ));
     }
+    Ok(context)
+}
+
+pub(super) fn resolve(
+    state: &State,
+    bridge: &BridgeServer,
+    id: u64,
+) -> std::result::Result<BoundContext, Failure> {
+    let mut context = resolve_project(state, id)?;
     if let Some(runtime_id) = context.runtime_id.as_deref() {
         let candidate = studio_candidates(bridge, &context.selector)
             .into_iter()
@@ -413,6 +421,22 @@ pub(super) fn resolve(
                 false,
                 "bind",
             ));
+        }
+    } else {
+        let candidates = studio_candidates(bridge, &context.selector);
+        if candidates.len() > 1 {
+            return Err(ambiguous_studios(&candidates));
+        }
+        if let Some(candidate) = candidates.first()
+            && let Some(runtime_id) = candidate.get("runtimeId").and_then(Value::as_str)
+        {
+            context = state
+                .attach_context_runtime(
+                    id,
+                    runtime_id.to_string(),
+                    candidate.get("bridgeBuildUnix").and_then(Value::as_i64),
+                )
+                .unwrap_or(context);
         }
     }
     Ok(context)

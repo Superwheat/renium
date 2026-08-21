@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{automation_token, ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
+use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
 use crate::app::timing::current_millis;
 use crate::automation::op;
 use crate::cli::{
@@ -1276,140 +1276,75 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     }
     let timeout = args.timeout.clamp(0.1, 600.0);
     let interval = args.interval.clamp(0.05, 10.0);
-    let token = automation_token("__RENIUM_WAIT");
     let code = format!(
-        "task.spawn(function()\n\
-         \tlocal deadline = os.clock() + {timeout}\n\
+        "local deadline = os.clock() + {timeout}\n\
+         local detail = nil\n\
          \twhile true do\n\
          \t\tlocal ok, value = pcall(function() return ({condition}) end)\n\
-         \t\tif ok and value then print('{token}_TRUE') return end\n\
-         \t\tif os.clock() >= deadline then print('{token}_END ' .. tostring(value)) return end\n\
+         \t\tdetail = value\n\
+         \t\tif ok and value then return true, tostring(value) end\n\
+         \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
          \t\ttask.wait({interval})\n\
-         \tend\n\
-         end)",
+         \tend",
         condition = args.condition,
     );
-    match run_console_task(bridge, target, player, client, &code, &token, timeout + 5.0)? {
-        ConsoleTaskOutcome::True { elapsed, .. } => Ok(json!({
+    let outcome = run_luau_task(bridge, target, player, client, &code, timeout + 5.0)?;
+    if outcome.success {
+        Ok(json!({
             "ok": true,
             "action": "wait",
             "condition": args.condition,
-            "elapsedSeconds": elapsed,
-        })),
-        ConsoleTaskOutcome::End(detail) => {
-            bail!("Timed out after {timeout}s waiting for condition (last value:{detail})")
-        }
+            "elapsedSeconds": outcome.elapsed,
+        }))
+    } else {
+        bail!(
+            "Timed out after {timeout}s waiting for condition (last value: {})",
+            outcome.detail
+        )
     }
 }
 
-enum ConsoleTaskOutcome {
-    True { elapsed: f64, detail: String },
-    End(String),
+struct LuauTaskOutcome {
+    success: bool,
+    detail: Value,
+    elapsed: f64,
 }
 
-fn run_console_task(
+fn run_luau_task(
     bridge: &BridgeServer,
     target: BridgeTarget,
     player: Option<&str>,
     client_context: bool,
     code: &str,
-    token: &str,
-    poll_timeout: f64,
-) -> Result<ConsoleTaskOutcome> {
-    let seed = bridge.call_for_selector(
-        "getConsoleOutput",
-        json!({ "cursorOnly": true }),
-        target,
-        player,
-    )?;
-    ensure_plugin_api_ok(&seed)?;
-    let mut since_seq = seed.get("nextSeq").and_then(Value::as_u64).unwrap_or(0);
-    let exec = bridge.call_for_selector(
+    timeout: f64,
+) -> Result<LuauTaskOutcome> {
+    let started = Instant::now();
+    let result = bridge.call_for_selector_with_timeout(
         "executeLuau",
         json!({
             "code": code,
             "chunkName": "ReniumTask",
             "context": if client_context { "client" } else { "plugin" },
-            "backgroundLifetimeSeconds": poll_timeout,
+            "timeoutSeconds": timeout,
         }),
         target,
         player,
+        Some(Duration::from_secs_f64(timeout + 2.0)),
     )?;
-    ensure_plugin_api_ok(&exec)?;
-    let execution_id = exec
-        .get("executionId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let outcome = (|| -> Result<ConsoleTaskOutcome> {
-        let true_marker = format!("{token}_TRUE");
-        let true_prefix = format!("{true_marker} ");
-        let end_marker = format!("{token}_END");
-        let end_prefix = format!("{end_marker} ");
-        let started = Instant::now();
-        let deadline = started + Duration::from_secs_f64(poll_timeout);
-        loop {
-            let console = bridge.call_for_selector(
-                "getConsoleOutput",
-                json!({ "limit": 100, "sinceSeq": since_seq }),
-                target,
-                player,
-            )?;
-            ensure_plugin_api_ok(&console)?;
-            if console
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                bail!("Task output was overwritten before Renium could read its completion marker");
-            }
-            since_seq = console
-                .get("nextSeq")
-                .and_then(Value::as_u64)
-                .unwrap_or(since_seq);
-            if let Some(entries) = console.get("entries").and_then(Value::as_array) {
-                for entry in entries {
-                    let Some(message) = entry.get("message").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let message = message.trim();
-                    if message == true_marker {
-                        return Ok(ConsoleTaskOutcome::True {
-                            elapsed: started.elapsed().as_secs_f64(),
-                            detail: String::new(),
-                        });
-                    }
-                    if let Some(rest) = message.strip_prefix(&true_prefix) {
-                        return Ok(ConsoleTaskOutcome::True {
-                            elapsed: started.elapsed().as_secs_f64(),
-                            detail: rest.trim_end().to_string(),
-                        });
-                    }
-                    if let Some(rest) = message.strip_prefix(&end_prefix) {
-                        return Ok(ConsoleTaskOutcome::End(rest.trim_end().to_string()));
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "Task runner produced no result within {poll_timeout}s; the injected code may \
-                     have a syntax error (check the client console)"
-                );
-            }
-            thread::sleep(
-                Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        }
-    })();
-    if let Some(execution_id) = execution_id {
-        let _ = bridge.call_for_selector(
-            "cancelLuauExecution",
-            json!({ "executionId": execution_id }),
-            target,
-            player,
-        );
-    }
-    outcome
+    ensure_luau_api_ok(&result)?;
+    let results = result
+        .get("results")
+        .and_then(Value::as_array)
+        .context("Luau task returned no results")?;
+    let success = results
+        .first()
+        .and_then(Value::as_bool)
+        .context("Luau task returned an invalid status")?;
+    Ok(LuauTaskOutcome {
+        success,
+        detail: results.get(1).cloned().unwrap_or(Value::Null),
+        elapsed: started.elapsed().as_secs_f64(),
+    })
 }
 
 pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -1477,13 +1412,11 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
     }
     let timeout = args.timeout.clamp(1.0, 300.0);
     let speed_multiplier = args.speed_multiplier.clamp(0.1, 10.0);
-    let token = automation_token("__RENIUM_GOTO");
     let movement = if args.tp {
         format!(
             "\tch:PivotTo(CFrame.new(targetPos + Vector3.new(0, 4, 0)))\n\
              \tlocal dist = (ch:GetPivot().Position - targetPos).Magnitude\n\
-             \tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
-             \tprint('{token}_END dist=' .. tostring(math.floor(dist + 0.5)))"
+             \treturn dist < {ARRIVAL_RADIUS}, dist"
         )
     } else {
         format!(
@@ -1494,7 +1427,7 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
              \tlocal PathfindingService = game:GetService('PathfindingService')\n\
              \twhile os.clock() < deadline do\n\
              \t\tlocal dist = distance()\n\
-             \t\tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
+             \t\tif dist < {ARRIVAL_RADIUS} then return true, dist end\n\
              \t\tlocal path = PathfindingService:CreatePath()\n\
              \t\tlocal okCompute = pcall(function()\n\
              \t\t\tpath:ComputeAsync(ch:GetPivot().Position, targetPos)\n\
@@ -1517,41 +1450,38 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
              \t\ttask.wait(0.2)\n\
              \tend\n\
              \tlocal dist = distance()\n\
-             \tif dist < {ARRIVAL_RADIUS} then print('{token}_TRUE dist=' .. tostring(dist)) return end\n\
-             \tprint('{token}_END dist=' .. tostring(math.floor(dist + 0.5)))"
+             \treturn dist < {ARRIVAL_RADIUS}, dist"
         )
     };
     let code = format!(
-        "task.spawn(function()\n\
-         \tlocal targetPos = Vector3.new({x}, {y}, {z})\n\
+        "local targetPos = Vector3.new({x}, {y}, {z})\n\
          \tlocal lp = game:GetService('Players').LocalPlayer\n\
          \tlocal ch = lp.Character or lp.CharacterAdded:Wait()\n\
          \tlocal hum = ch:FindFirstChildOfClass('Humanoid')\n\
-         \tif hum == nil then print('{token}_END no humanoid') return end\n\
+         \tif hum == nil then return false, 'no humanoid' end\n\
          \tlocal originalSpeed = hum.WalkSpeed\n\
          \thum.WalkSpeed = originalSpeed * {speed_multiplier}\n\
-         \tlocal ok, err = pcall(function()\n\
+         \tlocal ok, reached, detail = pcall(function()\n\
          {movement}\n\
          \tend)\n\
          \thum.WalkSpeed = originalSpeed\n\
-         \tif not ok then error(err) end\n\
-         end)"
+         \tif not ok then error(reached) end\n\
+         \treturn reached, detail"
     );
-    match run_console_task(
+    let outcome = run_luau_task(
         bridge,
         BridgeTarget::Client,
         player,
         true,
         &code,
-        &token,
         timeout + 5.0,
-    )? {
-        ConsoleTaskOutcome::True { elapsed, detail } => {
-            let final_distance = detail
-                .strip_prefix("dist=")
-                .and_then(|value| value.parse::<f64>().ok())
-                .context("Goto returned a malformed final distance")?;
-            Ok(json!({
+    )?;
+    if outcome.success {
+        let final_distance = outcome
+            .detail
+            .as_f64()
+            .context("Goto returned a malformed final distance")?;
+        Ok(json!({
             "ok": true,
             "action": if args.tp { "teleport" } else { "goto" },
             "target": label,
@@ -1559,13 +1489,13 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
             "arrivalRadius": ARRIVAL_RADIUS,
             "finalDistance": final_distance,
             "speedMultiplier": speed_multiplier,
-            "elapsedSeconds": elapsed,
-            }))
-        }
-        ConsoleTaskOutcome::End(detail) => bail!(
+            "elapsedSeconds": outcome.elapsed,
+        }))
+    } else {
+        bail!(
             "Character did not reach {label} within {timeout}s ({})",
-            detail.trim()
-        ),
+            outcome.detail
+        )
     }
 }
 

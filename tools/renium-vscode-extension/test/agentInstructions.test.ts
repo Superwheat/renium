@@ -16,7 +16,10 @@ test("Renium guide uses one marked pointer in project instructions", () => {
   fs.mkdirSync(project);
   fs.writeFileSync(path.join(project, "renium.project.jsonc"), "{\"schemaVersion\":1}\n");
   fs.writeFileSync(path.join(extension, "resources", "RENIUM.pointer.md"), pointer);
-  fs.writeFileSync(path.join(extension, "resources", "RENIUM.md"), "# Current guide\n");
+  fs.writeFileSync(
+    path.join(extension, "resources", "RENIUM.md"),
+    "<!-- renium-version: 0.2.6 -->\n# Current guide\n",
+  );
   fs.writeFileSync(path.join(extension, "resources", "RENIUM", "data.md"), "# Data guide\n");
 
   const agents = path.join(project, "AGENTS.md");
@@ -28,7 +31,10 @@ test("Renium guide uses one marked pointer in project instructions", () => {
     path.join(project, "RENIUM", "data.md"),
     agents,
   ]);
-  assert.equal(fs.readFileSync(path.join(project, "RENIUM.md"), "utf8"), "# Current guide\n");
+  assert.equal(
+    fs.readFileSync(path.join(project, "RENIUM.md"), "utf8"),
+    "<!-- renium-version: 0.2.6 -->\n# Current guide\n",
+  );
   assert.equal(fs.readFileSync(path.join(project, "RENIUM", "data.md"), "utf8"), "# Data guide\n");
   assert.equal(fs.readFileSync(agents, "utf8"), pointer);
   assert.equal(fs.readFileSync(claude, "utf8"), "Read and follow AgEnTs.Md.\n");

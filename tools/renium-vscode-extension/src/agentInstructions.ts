@@ -11,6 +11,11 @@ const PROJECT_MARKERS = [
 ] as const;
 
 const OLD_AGENT_MARKER = /^renium-\d+\.\d+\.\d+$/;
+const GUIDE_VERSION = /^<!-- renium-version: ([^ ]+) -->$/;
+
+function guideVersion(contents: Buffer): string | undefined {
+  return contents.toString("utf8").split(/\r?\n/, 1)[0]?.match(GUIDE_VERSION)?.[1];
+}
 
 function agentInstructions(pointer: string, current = ""): string {
   if (current.includes(pointer.trimEnd())) {
@@ -32,6 +37,7 @@ export function isReniumProjectRoot(projectRoot: string): boolean {
 export function ensureReniumAgentInstructions(
   extensionRoot: string,
   projectRoot: string,
+  force = false,
 ): string[] {
   if (!fs.existsSync(projectRoot)
     || !fs.statSync(projectRoot).isDirectory()
@@ -57,11 +63,21 @@ export function ensureReniumAgentInstructions(
   const topicSource = fs.existsSync(packagedTopics)
     ? packagedTopics
     : path.join(sourceRoot, "renium-guides");
-  write(path.join(projectRoot, "RENIUM.md"), fs.readFileSync(guideSource));
-  const projectTopics = path.join(projectRoot, "RENIUM");
-  fs.mkdirSync(projectTopics, { recursive: true });
-  for (const name of fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort()) {
-    write(path.join(projectTopics, name), fs.readFileSync(path.join(topicSource, name)));
+  const projectGuide = path.join(projectRoot, "RENIUM.md");
+  const packagedGuideContents = fs.readFileSync(guideSource);
+  const packagedVersion = guideVersion(packagedGuideContents);
+  if (!packagedVersion) {
+    throw new Error("The packaged RENIUM.md is missing its version marker.");
+  }
+  const deferUpdate = !force && fs.existsSync(projectGuide)
+    && guideVersion(fs.readFileSync(projectGuide)) !== packagedVersion;
+  if (!deferUpdate) {
+    write(projectGuide, packagedGuideContents);
+    const projectTopics = path.join(projectRoot, "RENIUM");
+    fs.mkdirSync(projectTopics, { recursive: true });
+    for (const name of fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort()) {
+      write(path.join(projectTopics, name), fs.readFileSync(path.join(topicSource, name)));
+    }
   }
 
   const pointer = fs.readFileSync(path.join(extensionRoot, "resources", "RENIUM.pointer.md"), "utf8");

@@ -1,3 +1,4 @@
+<!-- renium-version: 0.2.7 -->
 # Renium automation
 
 Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has an old `PATH`, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS and Linux. Never search editor extension folders.
@@ -23,6 +24,7 @@ Read only the relevant guides. Read several when a task crosses categories. Don'
 ## Rules
 
 - Use direct `rbx` commands for normal work. They reuse the editor daemon or connect to Studio themselves.
+- If `rbx` reports that Renium instructions were updated, reread this file and the guides required for the current task before retrying the command.
 - When Renium reports an available update, tell the user. Run `rbx update` only when the user asks to install it.
 - Don't start `rbx bd`, inspect daemon state, inspect CLI usage, or bind a context before a direct command.
 - Don't create JSON payload files. Use direct flags; pipe JSON to `rbx a ... -J -` only for structured operations without a direct command.

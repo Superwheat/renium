@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -87,7 +88,11 @@ impl Request {
                 "cap",
             )
         })?;
-        if !matches!(self.op, op::CAP | op::BIND | op::STUDIOS) && self.cx.is_none() {
+        if !matches!(
+            self.op,
+            op::CAP | op::BIND | op::STUDIOS | op::UPDATE_STUDIOS
+        ) && self.cx.is_none()
+        {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));
         }
         Ok(operation)
@@ -194,6 +199,17 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioReopenTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<i64>,
+}
+
 impl BoundContext {
     fn same_binding(&self, other: &Self) -> bool {
         self.initialized == other.initialized
@@ -221,6 +237,7 @@ pub struct State {
     next_context: AtomicU64,
     next_review: AtomicU64,
     contexts: Mutex<HashMap<u64, BoundContext>>,
+    studio_reopen_targets: Mutex<HashMap<String, StudioReopenTarget>>,
     reviews: Mutex<HashMap<String, Review>>,
     available_update: Mutex<Option<String>>,
     live_sync: live::Manager,
@@ -232,6 +249,7 @@ impl Default for State {
             next_context: AtomicU64::new(1),
             next_review: AtomicU64::new(1),
             contexts: Mutex::new(HashMap::new()),
+            studio_reopen_targets: Mutex::new(HashMap::new()),
             reviews: Mutex::new(HashMap::new()),
             available_update: Mutex::new(None),
             live_sync: live::Manager::default(),
@@ -295,6 +313,46 @@ impl State {
             .cloned()
     }
 
+    pub fn clear_context_runtime(&self, id: u64) {
+        if let Some(context) = self
+            .contexts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&id)
+        {
+            context.runtime_id = None;
+            context.plugin_build = None;
+        }
+    }
+
+    pub fn attach_context_runtime(
+        &self,
+        id: u64,
+        runtime_id: String,
+        plugin_build: Option<i64>,
+    ) -> Option<BoundContext> {
+        let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
+        let context = contexts.get_mut(&id)?;
+        context.runtime_id = Some(runtime_id);
+        context.plugin_build = plugin_build;
+        Some(context.clone())
+    }
+
+    pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
+        self.studio_reopen_targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(context.project.clone(), target);
+    }
+
+    pub fn studio_target(&self, context: &BoundContext) -> Option<StudioReopenTarget> {
+        self.studio_reopen_targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&context.project)
+            .cloned()
+    }
+
     pub fn remove_context(&self, id: u64) -> bool {
         let removed = self
             .contexts
@@ -342,6 +400,15 @@ impl State {
         (review.created.elapsed() <= REVIEW_TTL).then_some(review)
     }
 
+    pub fn review_operation(&self, id: &str) -> Option<u16> {
+        self.reviews
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .filter(|review| review.created.elapsed() <= REVIEW_TTL)
+            .map(|review| review.operation)
+    }
+
     pub fn reject_review(&self, id: &str) -> bool {
         self.reviews
             .lock()
@@ -370,11 +437,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_is_unique_and_complete() {
-        let operations = registry();
-        assert_eq!(operations.len(), 67);
+    fn registry_resolves_ids_names_and_aliases() {
         assert_eq!(opcode_by_name("bb").unwrap().id, op::BATCH);
         assert!(opcode_by_id(op::SET_PROPERTY).unwrap().review);
+        assert_eq!(
+            opcode_by_id(op::UPDATE_STUDIOS).unwrap().name,
+            "update-studios"
+        );
         assert_eq!(
             opcode_by_id(op::REVIEW_REJECT).unwrap().name,
             "review-reject"

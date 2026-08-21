@@ -19,9 +19,9 @@ use rbx_reflection::ReflectionDatabase;
 use serde_json::{Map, Value, json};
 
 use crate::bytecode::edit::instance_path_parts_key;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::bytecode::edit::{insert_unique_rbx_path, instance_path_key};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::cli::PushEditorChangesArgs;
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::editor::review::is_externally_managed_editor_property;
@@ -40,23 +40,23 @@ use crate::rbx::decode::{
     overlay_property_names_value, rbx_model_primary_part_is_set,
     rbx_properties_to_native_settings_records,
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::rbx::encode::collect_rbx_subtree_preorder;
 use crate::rbx::encode::json_i64;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::encode::json_to_rbx_property_variant;
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::encode::rbx_canonical_property_descriptor_for_serialized_name;
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::encode::{rbx_model_property_descriptor, rbx_model_top_level_refs};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::model::BytecodeModelExportRefs;
 use crate::rbx::model::BytecodeModelImportRefs;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::rbx::model::RbxPlaceFormat;
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::model::rbx_dom_path_import_refs;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::rbx::model::{RbxPlaceBuild, build_rbx_place, rbx_dom_instance_path_parts};
 use crate::roblox::schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
@@ -77,7 +77,7 @@ use crate::studio::bridge::{
 #[cfg(any(windows, target_os = "macos"))]
 use crate::system::files::sanitize_name;
 use crate::system::files::{OnDrop, fnv1a_hex};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::system::files::{
     absolutize_under, path_extension_is, resolve_project_root_if_present, service_settings_path,
 };
@@ -102,7 +102,7 @@ pub(crate) fn property_change_needs_post_native_apply(change: &EditorPropertyCha
                     ))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn write_rbx_place_build(
     output_path: &Path,
     build: &RbxPlaceBuild,
@@ -123,18 +123,44 @@ pub(crate) fn begin_editor_binary_export(
     service_filter: Option<&[String]>,
     metadata_only: bool,
 ) -> Result<EditorBinaryExport> {
+    begin_editor_binary_export_for_runtime(
+        bridge,
+        partitioned,
+        service_order,
+        service_filter,
+        metadata_only,
+        None,
+    )
+}
+
+fn begin_editor_binary_export_for_runtime(
+    bridge: &BridgeServer,
+    partitioned: bool,
+    service_order: Option<&[String]>,
+    service_filter: Option<&[String]>,
+    metadata_only: bool,
+    runtime_id: Option<&str>,
+) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
-    let begin = bridge.call(
-        "beginEditorBinaryExport",
-        json!({
-            "exportId": &export_id,
-            "partitioned": partitioned,
-            "serviceOrder": service_order,
-            "serviceFilter": service_filter,
-            "serializationWorkers": partitioned.then_some(2),
-            "metadataOnly": metadata_only,
-        }),
-    )?;
+    let parameters = json!({
+        "exportId": &export_id,
+        "partitioned": partitioned,
+        "serviceOrder": service_order,
+        "serviceFilter": service_filter,
+        "serializationWorkers": partitioned.then_some(2),
+        "metadataOnly": metadata_only,
+    });
+    let begin = if let Some(runtime_id) = runtime_id {
+        bridge.call_for_runtime_with_timeout(
+            "beginEditorBinaryExport",
+            parameters,
+            crate::studio::bridge::BridgeTarget::Edit,
+            runtime_id,
+            None,
+        )?
+    } else {
+        bridge.call("beginEditorBinaryExport", parameters)?
+    };
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -299,23 +325,46 @@ pub(crate) fn receive_editor_binary_export_bytes(
     service: Option<&str>,
     serialization_complete: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
+    receive_editor_binary_export_bytes_for_runtime(
+        bridge,
+        export_id,
+        service,
+        serialization_complete,
+        None,
+    )
+}
+
+fn receive_editor_binary_export_bytes_for_runtime(
+    bridge: &BridgeServer,
+    export_id: &str,
+    service: Option<&str>,
+    serialization_complete: Option<&AtomicBool>,
+    runtime_id: Option<&str>,
+) -> Result<Vec<u8>> {
     const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
     let service_label = service.map_or(String::new(), |value| format!("{value} "));
     let raw_chunk_bytes = native_binary_chunk_bytes();
     let read_started = Instant::now();
-    let first = bridge.call_chunk(
-        "readEditorBinaryExport",
-        json!({
-            "exportId": export_id,
-            "service": service,
-            "offset": 0,
-            "length": raw_chunk_bytes,
-            "clampLength": true,
-            "waitForReady": true,
-            "timeoutSeconds": 80,
-            "rawBase64": true,
-        }),
-    )?;
+    let first_parameters = json!({
+        "exportId": export_id,
+        "service": service,
+        "offset": 0,
+        "length": raw_chunk_bytes,
+        "clampLength": true,
+        "waitForReady": true,
+        "timeoutSeconds": 80,
+        "rawBase64": true,
+    });
+    let first = if let Some(runtime_id) = runtime_id {
+        bridge.call_chunk_for_runtime(
+            "readEditorBinaryExport",
+            first_parameters,
+            crate::studio::bridge::BridgeTarget::Edit,
+            runtime_id,
+        )?
+    } else {
+        bridge.call_chunk("readEditorBinaryExport", first_parameters)?
+    };
     observe_native_serialization_complete(&first, serialization_complete);
     let total_bytes = first.total;
     if total_bytes == 0 || total_bytes > MAX_EXPORT_BYTES {
@@ -348,16 +397,23 @@ pub(crate) fn receive_editor_binary_export_bytes(
         .map(|(chunk_index, target)| -> Result<()> {
             let offset = first_length + chunk_index * raw_chunk_bytes;
             let length = target.len();
-            let response = bridge.call_chunk(
-                "readEditorBinaryExport",
-                json!({
-                    "exportId": export_id,
-                    "service": service,
-                    "offset": offset,
-                    "length": length,
-                    "rawBase64": true,
-                }),
-            )?;
+            let parameters = json!({
+                "exportId": export_id,
+                "service": service,
+                "offset": offset,
+                "length": length,
+                "rawBase64": true,
+            });
+            let response = if let Some(runtime_id) = runtime_id {
+                bridge.call_chunk_for_runtime(
+                    "readEditorBinaryExport",
+                    parameters,
+                    crate::studio::bridge::BridgeTarget::Edit,
+                    runtime_id,
+                )?
+            } else {
+                bridge.call_chunk("readEditorBinaryExport", parameters)?
+            };
             observe_native_serialization_complete(&response, serialization_complete);
             if response.start != offset + 1
                 || response.next_start != offset + length + 1
@@ -573,7 +629,7 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExport> {
     let mut export = begin_editor_binary_export(bridge, false, None, None, false)?;
     let _finish_guard = EditorBinaryExportFinishGuard {
@@ -589,6 +645,38 @@ fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExp
         None,
         None,
     )?;
+    Ok(export)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn receive_editor_binary_export_for_runtime(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+) -> Result<EditorBinaryExport> {
+    let mut export =
+        begin_editor_binary_export_for_runtime(bridge, false, None, None, false, Some(runtime_id))?;
+    let result = receive_editor_binary_export_bytes_for_runtime(
+        bridge,
+        export
+            .export_id
+            .as_deref()
+            .context("Native export id is missing")?,
+        None,
+        None,
+        Some(runtime_id),
+    );
+    let finish = bridge.call_for_runtime_with_timeout(
+        "finishEditorBinaryExport",
+        json!({
+            "exportId": export.export_id.as_deref(),
+            "recordSyncCompletion": false,
+        }),
+        crate::studio::bridge::BridgeTarget::Edit,
+        runtime_id,
+        None,
+    );
+    export.bytes = result?;
+    finish?;
     Ok(export)
 }
 
@@ -1616,7 +1704,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
     Ok(finish_guard)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs {
     let mut refs_preorder = Vec::new();
     for referent in rbx_model_top_level_refs(dom) {
@@ -1858,7 +1946,7 @@ pub(crate) fn merge_live_service_root_property_values(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn encode_service_root_property_values(
     service: &str,
     values: &Map<String, Value>,
@@ -1875,15 +1963,43 @@ pub(crate) fn encode_service_root_property_values(
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn write_live_editor_place_snapshot(
     bridge: &BridgeServer,
     args: &PushEditorChangesArgs,
     output_path: &Path,
     existing_place: Option<&Path>,
 ) -> Result<usize> {
-    #[cfg(any(windows, target_os = "macos"))]
-    if path_extension_is(output_path, &["rbxl"]) {
+    write_editor_place_snapshot(bridge, Some(args), output_path, existing_place, None, true)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn write_connected_editor_place_snapshot(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    output_path: &Path,
+    existing_place: &Path,
+) -> Result<usize> {
+    write_editor_place_snapshot(
+        bridge,
+        None,
+        output_path,
+        Some(existing_place),
+        Some(runtime_id),
+        false,
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn write_editor_place_snapshot(
+    bridge: &BridgeServer,
+    args: Option<&PushEditorChangesArgs>,
+    output_path: &Path,
+    existing_place: Option<&Path>,
+    runtime_id: Option<&str>,
+    try_native: bool,
+) -> Result<usize> {
+    if try_native && path_extension_is(output_path, &["rbxl"]) {
         let pid = studio_pid_for_bridge(bridge)?;
         let title = studio_title_for_bridge(bridge, pid)?;
         match serializer::write_live_place(pid, &title, output_path) {
@@ -1911,7 +2027,10 @@ pub(crate) fn write_live_editor_place_snapshot(
             }
         }
     }
-    let export = receive_editor_binary_export(bridge)?;
+    let export = match runtime_id {
+        Some(runtime_id) => receive_editor_binary_export_for_runtime(bridge, runtime_id)?,
+        None => receive_editor_binary_export(bridge)?,
+    };
     let mut dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
         .context("Studio returned an invalid native place snapshot")?;
     let roots = dom.root().children().to_vec();
@@ -1923,8 +2042,6 @@ pub(crate) fn write_live_editor_place_snapshot(
     if roots.len() != expected_roots {
         bail!("Studio native place snapshot has the wrong root count");
     }
-    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_names = export
         .groups
         .iter()
@@ -1937,18 +2054,22 @@ pub(crate) fn write_live_editor_place_snapshot(
     } else {
         HashMap::new()
     };
-    let project_services = service_names
-        .iter()
-        .filter(|service| !root_property_values.contains_key(*service))
-        .filter(|service| service_settings_path(&src_root.join(service)).exists())
-        .cloned()
-        .collect::<Vec<_>>();
-    if !project_services.is_empty() {
-        let base = build_rbx_place(&src_root, project_services, None, false, false, false)?;
-        for (service, values) in
-            rbx_dom_service_root_property_values(&base.dom, &service_name_set, database)
-        {
-            root_property_values.entry(service).or_insert(values);
+    if let Some(args) = args {
+        let project_root = resolve_project_root_if_present(&args.project.project_root)?;
+        let src_root = absolutize_under(&project_root, &args.project.src_root);
+        let project_services = service_names
+            .iter()
+            .filter(|service| !root_property_values.contains_key(*service))
+            .filter(|service| service_settings_path(&src_root.join(service)).exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !project_services.is_empty() {
+            let base = build_rbx_place(&src_root, project_services, None, false, false, false)?;
+            for (service, values) in
+                rbx_dom_service_root_property_values(&base.dom, &service_name_set, database)
+            {
+                root_property_values.entry(service).or_insert(values);
+            }
         }
     }
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
@@ -2019,7 +2140,8 @@ pub(crate) fn write_live_editor_place_snapshot(
         omitted_properties_by_class: HashMap::new(),
         logical_properties_by_ref: HashMap::new(),
     };
-    write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(output_path)?)?;
+    let format_path = existing_place.unwrap_or(output_path);
+    write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(format_path)?)?;
     Ok(build.total_instances)
 }
 

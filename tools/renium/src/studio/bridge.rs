@@ -2091,6 +2091,36 @@ impl BridgeServer {
         )
     }
 
+    pub(crate) fn call_chunk_for_runtime(
+        &self,
+        method: &str,
+        params: Value,
+        target: BridgeTarget,
+        runtime_id: &str,
+    ) -> Result<BridgeChunk> {
+        let runtime_pin = RuntimePin {
+            runtime_id: runtime_id.to_string(),
+        };
+        let (id, start) = self.next_call()?;
+        let call_context = BridgeCallContext {
+            id,
+            method,
+            params: &params,
+            target,
+            player: None,
+            runtime_pin: &runtime_pin,
+            start,
+            response_deadline: None,
+        };
+
+        self.call_pinned_socket(
+            &call_context,
+            false,
+            Self::call_on_socket_chunk,
+            "Bridge chunk call",
+        )
+    }
+
     fn next_call(&self) -> Result<(u64, usize)> {
         let total = self.channels.len();
         if total == 0 {
@@ -2109,6 +2139,34 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Result<u32> {
         let peer = self.peer_for_selector(target, player)?;
+        Self::studio_pid_for_peer(&peer)
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    pub(crate) fn studio_pid_for_runtime(
+        &self,
+        target: BridgeTarget,
+        runtime_id: &str,
+    ) -> Result<u32> {
+        let pin = RuntimePin {
+            runtime_id: runtime_id.to_string(),
+        };
+        for channel in &self.channels {
+            let guard = match channel.sockets.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
+            if let Some(role) = Self::select_role_for_selector_with_pin(&guard, target, None, &pin)
+                && let Some(socket) = guard.get(&role)
+            {
+                return Self::studio_pid_for_peer(&socket.peer);
+            }
+        }
+        bail!("No connected Studio bridge found for runtime {runtime_id}")
+    }
+
+    fn studio_pid_for_peer(peer: &str) -> Result<u32> {
         let port = peer
             .rsplit(':')
             .next()

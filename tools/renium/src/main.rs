@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{CommandFactory, FromArgMatches};
 use serde_json::json;
 
@@ -136,6 +138,41 @@ fn run_cli() -> Result<()> {
     if !matches!(&cli.command, Commands::UpdateHelper(_)) {
         update::report_pending_update_result();
     }
+    if is_agent_launcher()
+        && checks_agent_instructions(&cli.command)
+        && project::workflows::refresh_outdated_agent_instructions(cli.project.as_deref())?
+    {
+        bail!(
+            "Renium instructions were outdated and have been updated. Reread RENIUM.md, then run the command again"
+        );
+    }
 
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
+}
+
+fn is_agent_launcher() -> bool {
+    if std::env::var_os("RENIUM_AGENT_CLI").is_some_and(|value| value != "0") {
+        return true;
+    }
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|argument| Path::new(argument).file_stem())
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("rbx"))
+}
+
+fn checks_agent_instructions(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Init(_)
+            | Commands::Update(_)
+            | Commands::UpdateHelper(_)
+            | Commands::Setup(_)
+            | Commands::Daemon(_)
+            | Commands::BridgeDaemon(_)
+            | Commands::ExplorerDaemon(_)
+            | Commands::BridgeGetSource(_)
+            | Commands::CursorPoll(_)
+    )
 }

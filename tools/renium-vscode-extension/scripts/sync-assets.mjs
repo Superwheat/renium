@@ -8,6 +8,7 @@ import { generateRobloxPropertiesMetadata } from "./generate-properties-metadata
 
 const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(extensionRoot, "..", "..");
+const extensionPackage = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
 const extensionAssets = path.join(extensionRoot, "assets");
 const extensionResources = path.join(extensionRoot, "resources");
 const logoFiles = [
@@ -59,10 +60,12 @@ function syncProjectSchema() {
 
 function syncAgentInstructions() {
   const source = path.join(repoRoot, "tools", "renium");
-  fs.copyFileSync(
-    path.join(source, "renium-agents.md"),
-    path.join(extensionResources, "RENIUM.md"),
-  );
+  const guide = fs.readFileSync(path.join(source, "renium-agents.md"), "utf8");
+  const marker = `<!-- renium-version: ${extensionPackage.version} -->`;
+  if (guide.split(/\r?\n/, 1)[0] !== marker) {
+    throw new Error(`renium-agents.md must start with ${marker}`);
+  }
+  fs.writeFileSync(path.join(extensionResources, "RENIUM.md"), guide);
   const topics = path.join(extensionResources, "RENIUM");
   fs.rmSync(topics, { recursive: true, force: true });
   fs.cpSync(path.join(source, "renium-guides"), topics, { recursive: true });

@@ -86,6 +86,11 @@ pub fn studio_window_title(pid: u32) -> Result<String> {
     platform::studio_window_title(pid)
 }
 
+#[cfg(target_os = "macos")]
+pub fn studio_document_path(pid: u32) -> Result<std::path::PathBuf> {
+    platform::studio_document_path(pid)
+}
+
 #[cfg(windows)]
 pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
     platform::recover_stalled_window_for_pid(pid)
@@ -124,7 +129,7 @@ pub fn terminate_studio_process(pid: u32) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn terminate_studio_process(pid: u32) -> Result<()> {
     let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
@@ -1492,7 +1497,7 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow};
-    use anyhow::{Result, bail};
+    use anyhow::{Context, Result, bail};
     use std::ffi::c_void;
 
     type CFTypeRef = *const c_void;
@@ -1628,6 +1633,8 @@ mod platform {
             buffer_size: isize,
             encoding: u32,
         ) -> bool;
+        fn CFStringGetLength(string: CFStringRef) -> isize;
+        fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
         fn CFGetTypeID(value: CFTypeRef) -> usize;
         fn CFStringGetTypeID() -> usize;
         fn CFNumberGetValue(number: CFNumberRef, number_type: isize, value: *mut c_void) -> bool;
@@ -1698,13 +1705,19 @@ mod platform {
         if unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
             return None;
         }
-        let mut bytes = [0u8; 256];
+        // SAFETY: the type check above proves that value is a CFString.
+        let length = unsafe { CFStringGetLength(value) };
+        // SAFETY: length came from this CFString and UTF-8 is a valid Core Foundation encoding.
+        let capacity =
+            unsafe { CFStringGetMaximumSizeForEncoding(length, K_CF_STRING_ENCODING_UTF8) }
+                .checked_add(1)?;
+        let mut bytes = vec![0u8; usize::try_from(capacity).ok()?];
         // SAFETY: the type check above proves that value is a CFString.
         unsafe {
             if !CFStringGetCString(
                 value,
                 bytes.as_mut_ptr(),
-                bytes.len() as isize,
+                capacity,
                 K_CF_STRING_ENCODING_UTF8,
             ) {
                 return None;
@@ -1808,6 +1821,25 @@ mod platform {
             bail!("Could not inspect the Studio accessibility tree");
         }
         Ok(application)
+    }
+
+    pub fn studio_document_path(pid: u32) -> Result<std::path::PathBuf> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        let application = ax_application(pid)?;
+        let window = ax_attribute(application, "AXMainWindow")
+            .or_else(|| ax_attribute(application, "AXFocusedWindow"));
+        let document = window.and_then(|window| {
+            let document = ax_string_attribute(window, "AXDocument");
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned accessibility element.
+            unsafe { CFRelease(window) };
+            document
+        });
+        // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+        unsafe { CFRelease(application) };
+        let document = document.context("Studio did not expose its local document path")?;
+        let url = url::Url::parse(&document).context("Studio returned an invalid document URL")?;
+        url.to_file_path()
+            .map_err(|_| anyhow::anyhow!("Studio document is not a local file: {document}"))
     }
 
     fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {

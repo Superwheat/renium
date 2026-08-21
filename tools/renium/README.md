@@ -487,7 +487,11 @@ cache expires, it sends the saved ETag so GitHub returns no manifest body when
 the release is unchanged. The update prompt installs the matching extension and
 Studio plugin together. The Studio plugin shows the same update in its
 notification card and sends the install request to the connected editor. Reload
-the editor and restart Studio after installation.
+the editor after installation. When the Studio plugin changes, Renium asks how
+to handle connected local place files: leave them open, save and close them, or
+terminate them without saving. The choice can be remembered. Closed local files
+and published places reopen at the same target after the update; Renium never
+opens Studio's save dialog.
 
 Named daemons are selected with the global `--daemon` flag:
 
@@ -1000,4 +1004,5 @@ Protocol version: `1`
 | 94 | `job-status` | - | no | yes |
 | 95 | `image-upload` | - | no | no |
 | 96 | `image-store` | - | no | no |
+| 97 | `update-studios` | - | no | yes |
 <!-- automation-opcodes:end -->
