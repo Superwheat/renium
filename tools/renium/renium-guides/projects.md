@@ -7,7 +7,7 @@ rbx bem Workspace -i editor:id -o model.rbxm
 rbx bim Workspace --model model.rbxm --parent-settings-id editor:parent
 rbx bep -o place.rbxl
 rbx x -d snapshots --no-run-import
-rbx im --snapshot-dir snapshots --project-root .
+rbx si --snapshot-dir snapshots --project-root .
 rbx sm
 rbx sm --stdout
 rbx bpack
@@ -17,9 +17,9 @@ rbx wally --realms shared --force
 
 Wally sync needs a working `wally` command; Aftman users must declare Wally for the project first. Use `--force` to reinstall and reimport packages that are already current. Add `--details` only when the full changed-path and instance-ID lists are needed.
 
-`bem`/`bim` export and import model trees. They copy instances; use `move --to-service` to reparent an existing project subtree across services without a temporary model or a separate remove. `x` exports raw Studio snapshots; `im` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
+`bem`/`bim` export and import model trees. They copy instances; use `mv --to-service` to reparent an existing project subtree across services without a temporary model or a separate remove. `x` exports raw Studio snapshots; `si` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
 
-Version control: run `rbx vc-init` once in a project to initialize Git and Renium's ignore, text-diff, and merge rules; rerunning it is safe. `rbx vc-textconv FILE.renium` renders one binary store as deterministic text. Git invokes `rbx vc-merge BASE OURS THEIRS` automatically for a conflicting `.renium` merge. Use normal or path-scoped `git status`; `--untracked-files=all` expands every generated package file.
+Version control: run `rbx vci` once in a project to initialize Git and Renium's ignore, text-diff, and merge rules; rerunning it is safe. `rbx vct FILE.renium` renders one binary store as deterministic text. Git invokes `rbx vcm BASE OURS THEIRS` automatically for a conflicting `.renium` merge. Use normal or path-scoped `git status`; `--untracked-files=all` expands every generated package file.
 
 Mirror one local source into a project target:
 

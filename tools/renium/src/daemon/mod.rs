@@ -570,6 +570,16 @@ fn try_bind_daemon_context(project_root: Option<&Path>) -> Result<Option<Value>>
         .map(Some)
 }
 
+pub(crate) fn daemon_project_root(project: Option<&Path>) -> Option<&Path> {
+    project.map(|path| {
+        if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        }
+    })
+}
+
 #[cfg(unix)]
 fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -589,7 +599,7 @@ fn detach_daemon(command: &mut Command) {
 fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io::Result<()> {
     let mut command = Command::new(executable);
     command
-        .arg("bridge-daemon")
+        .arg("bd")
         .arg("--ports")
         .arg(ports)
         .arg("--wait-seconds")
@@ -614,7 +624,7 @@ fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io:
             "-WindowStyle",
             "Hidden",
             "-Command",
-            "Start-Process -FilePath $env:RENIUM_DAEMON_EXECUTABLE -ArgumentList @('bridge-daemon','--ports',$env:RENIUM_DAEMON_PORTS,'--wait-seconds',$env:RENIUM_DAEMON_WAIT) -WindowStyle Hidden",
+            "Start-Process -FilePath $env:RENIUM_DAEMON_EXECUTABLE -ArgumentList @('bd','--ports',$env:RENIUM_DAEMON_PORTS,'--wait-seconds',$env:RENIUM_DAEMON_WAIT) -WindowStyle Hidden",
         ])
         .env("RENIUM_DAEMON_EXECUTABLE", executable)
         .env("RENIUM_DAEMON_PORTS", ports)
@@ -677,6 +687,10 @@ pub(super) fn try_daemon_control_request(
         .and_then(Value::as_str)
         .unwrap_or("8781,8782")
         .to_string();
+    let image_upload_needs_runtime = operation == automation::op::IMAGE_UPLOAD
+        && (crate::cloud::assets::studio_upload(&parameters)
+            || parameters.get("userId").and_then(Value::as_u64).is_none()
+                && parameters.get("groupId").and_then(Value::as_u64).is_none());
     let object = parameters
         .as_object_mut()
         .context("Daemon operation parameters must be a JSON object")?;
@@ -700,6 +714,7 @@ pub(super) fn try_daemon_control_request(
         return Ok(Some(response.r.unwrap_or_else(|| json!({}))));
     }
     let needs_runtime = opcode.runtime
+        || image_upload_needs_runtime
         || matches!(
             operation,
             automation::op::SET_PROPERTY | automation::op::REMOVE

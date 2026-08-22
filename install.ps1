@@ -1004,7 +1004,7 @@ try {
     }
     New-Item -ItemType Directory -Path $stagedInstall | Out-Null
     Copy-Item -LiteralPath $cli.FullName -Destination (Join-Path $stagedInstall "renium.exe")
-    foreach ($supportFile in @("rbx.cmd", "rbx-run.ps1", "renium-agents.md")) {
+    foreach ($supportFile in @("rbx.cmd", "renium-agents.md")) {
         $supportPath = Join-Path $cli.DirectoryName $supportFile
         if (Test-Path -LiteralPath $supportPath -PathType Leaf) {
             Copy-Item -LiteralPath $supportPath -Destination $stagedInstall
@@ -1038,9 +1038,8 @@ try {
         }
         New-Item -ItemType Directory -Path $stableLauncherRoot -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $installRoot "rbx.cmd") -Destination $stableLauncher -Force
-        $runner = Join-Path $installRoot "rbx-run.ps1"
-        if (Test-Path -LiteralPath $runner -PathType Leaf) {
-            Copy-Item -LiteralPath $runner -Destination $stableRunner -Force
+        if (Test-Path -LiteralPath $stableRunner -PathType Leaf) {
+            Remove-Item -LiteralPath $stableRunner -Force
         }
         Install-ReniumCommandAliases
         if (-not ($pathEntries | Where-Object {

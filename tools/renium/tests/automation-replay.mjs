@@ -126,7 +126,10 @@ try {
   const bootstrapRead = await send({ v: 1, id: 10, op: 20, cx: bootstrapCx, p: { service: "Workspace" } });
   expect(bootstrapRead.ok === 0 && bootstrapRead.e.c === "no_project", "bootstrap context escaped its operation limit");
   const initialized = await send({ v: 1, id: 11, op: 70, cx: bootstrapCx, p: {} });
-  expect(initialized.ok === 1 && fs.existsSync(path.join(newProjectRoot, "renium.project.jsonc")), "project-init failed through a bootstrap context");
+  expect(
+    initialized.ok === 1 && fs.existsSync(path.join(newProjectRoot, "renium.project.jsonc")),
+    `project-init failed through a bootstrap context: ${JSON.stringify(initialized)}`,
+  );
   const initializedFiles = fs.readdirSync(newProjectRoot, { recursive: true });
   expect(fs.existsSync(path.join(newProjectRoot, "src")), "project-init did not create the source directory");
   expect(!initializedFiles.some((file) => /\.lua(u)?$/i.test(file)), "project-init generated starter source");

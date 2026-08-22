@@ -6,7 +6,7 @@ Read `RENIUM.md` first.
 rbx play -s                         # ordinary Play; default for one-client checks
 rbx play -s --players 1             # local server plus one separate client
 rbx play -s --players 2             # local server plus two clients
-rbx clients
+rbx cs
 rbx l "return game.PlaceId"         # Play server during a test
 rbx lc "return game.Players.LocalPlayer.Name" 2
 rbx co --server -n 20

@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
 use crate::app::timing::current_millis;
-use crate::automation::op;
+use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
     ListClientsArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs, StartStopPlayArgs,
@@ -1802,7 +1802,7 @@ pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
 }
 
 pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
-    let result = try_daemon_control_request(
+    let result = daemon_result(
         op::RECORD_START,
         None,
         json!({
@@ -1815,8 +1815,8 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
             "quality": args.quality,
         }),
         false,
-    )?
-    .context("Recording requires an active Renium daemon")?;
+        None,
+    )?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -1885,7 +1885,7 @@ pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> 
         "bridgePorts": args.bridge.ports,
     });
     let result = try_daemon_control_request(op::REVIEW_APPLY, None, parameters, false)?
-        .context("No Renium daemon is running; start `rbx bd` first")?;
+        .context("No Renium review is active")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -2075,8 +2075,7 @@ pub(crate) fn test_command(args: TestArgs) -> Result<()> {
         "failOnError": args.fail_on_error,
         "player": args.player,
     });
-    let result = try_daemon_control_request(op::PLAY_START, None, parameters, false)?
-        .context("No Renium daemon is running; start `rbx bd` first")?;
+    let result = daemon_result(op::PLAY_START, None, parameters, false, None)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let count = result

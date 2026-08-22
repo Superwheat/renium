@@ -411,7 +411,7 @@ fn batch_command(
     execute_with_identity(identity, &batch).map_err(cloud_error)
 }
 
-fn cloud_error(failure: Failure) -> anyhow::Error {
+pub(crate) fn cloud_error(failure: Failure) -> anyhow::Error {
     match failure.0.d {
         Some(detail) => anyhow::anyhow!("{}\n{}", failure.0.m, detail),
         None => anyhow::anyhow!(failure.0.m),

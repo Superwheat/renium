@@ -50,9 +50,9 @@ rbx.cmd   renium.exe        (Windows; or bin\renium.exe)
 rbx       renium            (macOS and Linux; chmod +x both)
 ```
 
-`rbx` is the short launcher used in every example below. It finds the CLI in
-this order: `RENIUM_CLI` env var → `PATH` → next to the launcher → `bin\` next
-to the launcher → source-repo build folder. macOS support is implemented but
+`rbx` is the launcher used in every example below. It finds the CLI in
+this order: `RENIUM_CLI` env var → next to the launcher → `bin\` next to the
+launcher → the installed Renium directory → `PATH`. macOS support is implemented but
 not yet live-verified. Input and capture use Quartz and need Accessibility and
 Screen Recording permissions.
 
@@ -62,10 +62,10 @@ Screen Recording permissions.
    local bridge daemon on ports 8781–8782.
 
    ```powershell
-   rbx setup
+   rbx setup-renium
    ```
 
-   `setup` installs `Renium.rbxm` into your Roblox Plugins folder — from
+   `setup-renium` installs `Renium.rbxm` into your Roblox Plugins folder — from
    a copy next to the exe if present, otherwise downloading the latest GitHub
    release (`--file <path>` and `--dir <plugins dir>` override both). On macOS,
    it also prepares `~/Applications/Renium Studio.app`. Open that app instead
@@ -87,7 +87,7 @@ Screen Recording permissions.
 3. Check the connection any time:
 
    ```powershell
-   rbx status
+   rbx studio-status
    ```
 
 The daemon is found automatically by later commands (env vars
@@ -95,10 +95,27 @@ The daemon is found automatically by later commands (env vars
 `RENIUM_DAEMON_FILE`, then `%LOCALAPPDATA%\Renium\daemon.json`, then the
 default local endpoint).
 
-`rbx bd` is an optional standalone long-running process. Direct commands start
+`rbx bridge-daemon` is an optional standalone long-running process. Direct commands start
 or reuse the shared daemon automatically. `--editor-stdio` is reserved for the
 VS Code extension's owned child process: it reads daemon requests from stdin
 and exits when its owner closes stdin.
+
+Agent instructions use compact command names. The descriptive aliases below are
+equivalent and are intended for people reading this reference:
+
+| Short | Descriptive alias |
+|---|---|
+| `pl` / `ps` | `pull` / `push` |
+| `lon` / `lof` / `lst` | `live-start` / `live-stop` / `live-status` |
+| `f` / `tr` / `in` | `find` / `tree` / `inspect` |
+| `l` / `lc` / `co` | `luau` / `execute-client-luau` / `console` |
+| `sc` / `rs` / `re` | `screenshot` / `record-start` / `record-end` |
+| `pr` / `clk` / `ky` / `ty` / `go` | `press` / `click` / `key` / `type` / `goto` |
+| `dev` / `cs` | `device` / `clients` |
+| `oc` | `cloud` |
+
+Running `rbx` without a command lists only the compact names. Both forms call
+the same implementation; there is no separate automation command layer.
 
 ## Projects, adapters, and builds
 
@@ -290,22 +307,21 @@ rbx config export -o effective-renium-config.json
 Play testing:
 
 ```powershell
-rbx ps          # start Play
-rbx ps 2        # start a multiplayer test with 2 clients
-rbx px          # stop Play
-rbx pl          # play, wait 3 seconds, stop
-rbx status      # play/edit status
+rbx play -s                         # ordinary Play
+rbx play -s --players 2             # local server with 2 clients
+rbx play -x                         # stop Play
+rbx studio-status                   # play/edit status
 rbx clients     # list connected Studio instances (edit/server/clients)
 ```
 
 Run Luau in Studio:
 
 ```powershell
-rbx l "print('hello')"           # server context
-rbx l "return game.PlaceId"      # expressions return values
-rbx lc "warn('client hi')"       # client context during Play
-rbx lc "print('p2')" Player2     # a specific client in a multiplayer test
-rbx lf .\script.luau             # from a file
+rbx luau "print('hello')"                         # server context
+rbx luau "return game.PlaceId"                    # expressions return values
+rbx execute-client-luau "warn('client hi')"       # client context during Play
+rbx execute-client-luau "print('p2')" Player2     # one multiplayer client
+rbx luau --file .\script.luau                     # from a file
 ```
 
 Control Studio's built-in device simulator through the plugin API:
@@ -316,7 +332,7 @@ rbx device set "iPhone 16 Pro" --orientation portrait
 rbx device set --scaling fit
 rbx device set --resolution 1179x2556 --pixel-density 460
 rbx device status
-rbx shot --studio -o iphone-16-pro.png
+rbx screenshot --studio -o iphone-16-pro.png
 rbx device stop
 ```
 
@@ -325,9 +341,8 @@ rbx device stop
 The command accepts catalog names or stable ids and requires no keyboard,
 mouse, focus, coordinates, or ribbon interaction. Notched devices reproduce
 Studio's actual safe-area behavior for `DeviceSafeInsets`,
-`ClipToDeviceSafeArea`, and `SafeAreaCompatibility`. Daemon clients can call
-the same surface with command `device` and the CLI arguments in `args`. While
-emulation is active, `rbx shot` automatically targets the simulated Studio
+`ClipToDeviceSafeArea`, and `SafeAreaCompatibility`. While
+emulation is active, `rbx screenshot` automatically targets the simulated Studio
 viewport. Use `--studio` to force it or `--client` to force the latest Play
 client.
 
@@ -344,7 +359,7 @@ rbx press "PlayerGui.Shop.BuyButton" -p 2   # press a GUI button by path
 rbx click 450 323 -p 1                      # click at viewport coordinates
 rbx key E -p 2                              # key press; --hold-ms to hold
 rbx type "hello" --path "PlayerGui.Menu.SearchBox" --enter
-rbx shot -o client.png -p 2                 # screenshot the client viewport (unfocused ok; minimized windows are briefly restored without focus, then re-minimized)
+rbx screenshot -o client.png -p 2           # capture the client viewport
 renium wait-until "workspace:GetAttribute('Ready') == true" -c -t 20
 ```
 
@@ -391,9 +406,9 @@ a transparent native overlay; it never adds Roblox UI or project instances.
 Read Studio console output:
 
 ```powershell
-rbx c           # latest message
-rbx cl 10       # last 10 messages
-rbx co --follow --level error
+rbx console -n 1
+rbx console -n 10
+rbx console --follow --level error
 rbx test --mode play --players 2 --timeout 30 --fail-on-error
 ```
 
@@ -433,7 +448,7 @@ Export Studio to files:
 
 ```powershell
 rbx pull                                      # Studio -> project files
-rbx x -r . -d snapshots --no-run-import    # snapshots only
+rbx export-snapshots -r . -d snapshots --no-run-import    # snapshots only
 ```
 
 Friendly structural commands edit the canonical store by stable id:
@@ -463,9 +478,9 @@ The CLI can inspect, repair, or remove the Studio plugin and can update matched
 release components from a signed manifest:
 
 ```powershell
-rbx setup --status
-rbx setup --repair
-rbx setup --uninstall
+rbx setup-renium --status
+rbx setup-renium --repair
+rbx setup-renium --uninstall
 rbx update
 rbx update check
 rbx update apply --component all --dry-run
@@ -496,7 +511,7 @@ opens Studio's save dialog.
 Named daemons are selected with the global `--daemon` flag:
 
 ```powershell
-rbx --daemon playtest bd
+rbx --daemon playtest bridge-daemon
 rbx daemon list
 rbx daemon status playtest
 rbx daemon stop playtest
@@ -524,8 +539,8 @@ OAuth access tokens can be read from a named environment variable instead:
 rbx upload-place --oauth-env ROBLOX_OAUTH_TOKEN
 ```
 
-Open Cloud commands run in the current `rbx` process. They don't start a daemon,
-wait for Studio, or require a bound automation context. `{universe}` and
+Open Cloud commands run in the current `rbx` process. They don't start a daemon
+or wait for Studio. `{universe}` and
 `{place}` come from the current Renium project when available:
 
 ```powershell
@@ -556,7 +571,7 @@ thumbnail personalization. `rbx cloud routes [CATEGORY]` lists their short
 operations. The generic request and batch commands remain available for Roblox
 endpoints introduced after the installed Renium version.
 
-The automation API also covers the plugin-accessible Creator features used by
+Renium also covers the plugin-accessible Creator features used by
 Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
 AI model generation jobs, local image validation, and Open Cloud image upload.
 
@@ -568,7 +583,7 @@ rbx asset-insert 182451181 --parent Workspace --name AuditCrate
 rbx generate-model "small wooden crate" --parent Workspace --name GeneratedCrate --size 4,4,4 --max-triangles 2000
 rbx job-status JOB_ID --wait-seconds 30
 rbx image-store assets/reference.png
-rbx cloud image-upload assets/reference.png --user USER_ID --name Reference
+rbx image-upload assets/reference.png --user USER_ID --name Reference --open-cloud
 ```
 
 Asset insertion returns the inserted path, name, class, and asset ID. Insertion
@@ -592,8 +607,9 @@ HTTP image uploads use the locally installed plugin's prompt-free
 `AssetService:CreateAssetAsync` API. Local files and explicit user/group
 ownership use Open Cloud instead.
 
-Ordered mouse and keyboard sequences use `rbx a input CX -J -` with the payload
-piped through stdin.
+Ordered mouse and keyboard sequences use the direct `input` command, for example
+`rbx input --player 1 click "Shop.BuyButton" wait 100 key E`. Actions and their
+targets are read from left to right; no payload file is needed.
 Windows posts events to the exact target window handle and macOS posts Quartz
 events to the exact target process. Neither implementation moves the system
 cursor, sends global input, or activates another application. Linux sends the
@@ -638,12 +654,12 @@ instead of guessing; retry with `--id`, a fuller `--path`, or `--ords`.
 Edit the store directly with the `b*` (bytecode) commands, then `rbx push`:
 
 ```powershell
-rbx bs  Workspace -i editor:id -p DisplayName --str "VIP Man"   # set property
-rbx bss Workspace -i editor:script-id --source-file big.luau    # set source
-rbx ba  Workspace -n NewModel -c Model                          # add
-rbx bcl Workspace -i editor:source-id -I editor:parent-id       # clone
-rbx br  Workspace -i editor:id                                  # remove
-rbx bg  Workspace -i editor:script-id -p Source                 # get property
+rbx set-property Workspace -i editor:id -p DisplayName --str "VIP Man"
+rbx set-source Workspace -i editor:script-id --source-file big.luau
+rbx add Workspace -n NewModel -c Model
+rbx bytecode-clone-instance Workspace -i editor:source-id -I editor:parent-id
+rbx bytecode-remove-instance Workspace -i editor:id
+rbx get-property Workspace -i editor:script-id -p Source
 ```
 
 Selector rules that prevent surprises:
@@ -694,12 +710,12 @@ explicit override.
 Export/import whole models and places:
 
 ```powershell
-rbx bem Workspace -i editor:id -o model.rbxm    # store subtree -> .rbxm
-rbx bim model.rbxm --service Workspace          # .rbxm -> store
-rbx bep -o place.rbxl                           # whole place file
+rbx bytecode-export-model Workspace -i editor:id -o model.rbxm
+rbx bytecode-import-model model.rbxm --service Workspace
+rbx export-place -o place.rbxl
 rbx view model.rbxm --json                      # inspect a model without importing it
-rbx sm --stdout                                 # print the complete sourcemap
-rbx bpack                                       # repack outdated stores and packages
+rbx sourcemap --stdout                          # print the complete sourcemap
+rbx bytecode-repack                             # repack outdated stores and packages
 ```
 
 `sm` without `--stdout` writes `sourcemap.json`. Repacking leaves files that
@@ -828,44 +844,70 @@ PowerShell 5.1 strips embedded double quotes when calling native executables,
 so `-j '[{"type":"counts"}]'` arrives mangled. On 5.1 either escape:
 
 ```powershell
-rbx bb Workspace -j '[{\"type\":\"counts\"}]'
-```
-
-or use an ops file:
-
-```powershell
-'{"ops":[{"type":"counts"}]}' | Set-Content ops.json -Encoding ascii
-rbx bb Workspace -J ops.json
+'{"ops":[{"type":"counts"}]}' | rbx batch Workspace -J -
 ```
 
 ## Command aliases
 
-```text
-bd   bridge-daemon            bg   bytecode-get-property
-x    export-snapshots         bs   bytecode-set-property
-ed   explorer-daemon          bss  bytecode-set-source
-src  bridge-get-source        bb   bytecode-explorer-batch
-co   get-console-output       bt   bytecode-editor-targets
-lx   execute-luau             ba   bytecode-add-instance
-dev  studio-device
-play start-stop-play          bcl  bytecode-clone-instance
-st   studio-change-state      br   bytecode-remove-instance
-push push-editor-changes      bep  bytecode-export-place
-review editor-review-decision
-prop apply-editor-property    bim  bytecode-import-model
-del  apply-editor-delete      bpack bytecode-repack
-rev  editor-revert            wally sync-wally-packages
-im   import-snapshots         lk   link-apply
-ims  import-service           lkb  link-break
-sm   generate-sourcemap       lks  link-status
-vci  vc-init                  lka  link-add
-vct  vc-textconv              lkp  link-pack
-vcm  vc-merge                 v    view
-```
+| Short | Descriptive alias | Short | Descriptive alias |
+|---|---|---|---|
+| `fmt` | `fmt-project` | `pv` | `project-validate` |
+| `xp` | `explain-path` | `cfg` | `config` |
+| `ad` | `adapters` | `ir` | `import-rojo` |
+| `init` | `project-init` | `build` | `build-project` |
+| `dr` | `doctor` | `docs` | `open-docs` |
+| `dm` | `daemon` | `bd` | `bridge-daemon` |
+| `so` | `studio` | `ro` | `studio-open` |
+| `sx` | `studio-close` | `status` | `studio-status` |
+| `up` | `upload-place` | `upd` | `update` |
+| `oc` | `cloud` | `sb` | `syncback` |
+| `ip` | `import-path` | `cr` | `create` |
+| `cp` | `clone` | `mv` | `move` |
+| `rn` | `rename` | `rm` | `remove` |
+| `dpl` | `desync-package-link` | `mip` | `import-model` |
+| `mep` | `export-model` | `tst` | `test` |
+| `x` | `export-snapshots` | `pl` | `pull` |
+| `ps` | `push` | `lon` | `live-start` |
+| `lof` | `live-stop` | `lst` | `live-status` |
+| `rp` | `retry-pending` | `dp` | `discard-pending` |
+| `ed` | `explorer-daemon` | `src` | `bridge-get-source` |
+| `f` | `find` | `tr` | `tree` |
+| `in` | `inspect` | `bb` | `batch` |
+| `bg` | `get-property` | `bs` | `set-property` |
+| `bss` | `set-source` | `ba` | `add` |
+| `bcl` | `bytecode-clone-instance` | `br` | `bytecode-remove-instance` |
+| `bt` | `bytecode-editor-targets` | `bdp` | `bytecode-desync-package-link` |
+| `bem` | `bytecode-export-model` | `bim` | `bytecode-import-model` |
+| `bep` | `export-place` | `pdp` | `place-desync-package-link` |
+| `bpack` | `bytecode-repack` | `ims` | `import-service` |
+| `ss` | `script-search` | `sg` | `script-grep` |
+| `sr` | `script-read` | `me` | `multi-edit` |
+| `l` | `luau` | `lc` | `execute-client-luau` |
+| `co` | `console` | `cs` | `clients` |
+| `play` | `playtest` | `dev` | `device` |
+| `sc` | `screenshot` | `pr` | `press` |
+| `clk` | `click` | `ky` | `key` |
+| `ui` | `user-interface` | `ty` | `type` |
+| `wait` | `wait-until` | `go` | `goto` |
+| `inp` | `input` | `rs` | `record-start` |
+| `re` | `record-end` | `rv` | `review` |
+| `st` | `studio-change-state` | `prop` | `apply-editor-property` |
+| `del` | `apply-editor-delete` | `rev` | `editor-revert` |
+| `setup` | `setup-renium` | `as` | `asset-search` |
+| `ai` | `asset-insert` | `gm` | `generate-model` |
+| `js` | `job-status` | `iu` | `image-upload` |
+| `is` | `image-store` | `si` | `import-snapshots` |
+| `sm` | `sourcemap` | `v` | `view` |
+| `vci` | `vc-init` | `vct` | `vc-textconv` |
+| `vcm` | `vc-merge` | `wally` | `sync-wally-packages` |
+| `lk` | `link-apply` | `lkb` | `link-break` |
+| `lks` | `link-status` | `lka` | `link-add` |
+| `lkp` | `link-pack` | `lkd` | `link-delete-package` |
+| `pa` | `place-add` | `pn` | `place-rename` |
+| `po` | `place-reorder` |  |  |
 
-Plus the `rbx.cmd`-level shortcuts: `rbx l/lf/lc/lcf` (Luau), `rbx c/cl`
-(console), `rbx ps/px/pl` (play), `rbx status`. Anything else passes through
-to `renium.exe` unchanged.
+`rbx.cmd` and `rbx` only locate Renium and forward arguments. Command parsing
+lives in the Rust CLI on every platform.
 
 ## Building from source
 
@@ -929,80 +971,3 @@ a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
   stops with an error instead of replacing them with empty content.
 - Infinity, negative Infinity, and NaN use Renium's tagged float transport and
   round-trip without being converted to finite JSON numbers.
-
-## Automation opcode registry
-
-<!-- automation-opcodes:start -->
-Protocol version: `1`
-
-| ID | Operation | Aliases | Review | Studio |
-|---:|---|---|:---:|:---:|
-| 0 | `cap` | - | no | no |
-| 1 | `bind` | - | no | no |
-| 2 | `context` | - | no | no |
-| 3 | `unbind` | - | no | no |
-| 10 | `pull` | - | yes | yes |
-| 11 | `push` | - | yes | yes |
-| 12 | `live-start` | - | no | yes |
-| 13 | `live-stop` | - | no | yes |
-| 14 | `live-status` | - | no | yes |
-| 15 | `retry-pending` | - | no | yes |
-| 16 | `discard-pending` | - | no | yes |
-| 20 | `find` | - | no | no |
-| 21 | `tree` | - | no | no |
-| 22 | `inspect` | - | no | no |
-| 23 | `batch` | bb | no | no |
-| 24 | `script-search` | - | no | no |
-| 25 | `script-read` | - | no | no |
-| 26 | `script-grep` | - | no | no |
-| 30 | `get-property` | - | no | no |
-| 31 | `set-property` | - | yes | no |
-| 32 | `set-source` | - | no | no |
-| 33 | `add` | - | no | no |
-| 34 | `clone` | - | no | no |
-| 35 | `move` | - | no | no |
-| 36 | `remove` | - | no | no |
-| 37 | `revert` | - | no | no |
-| 38 | `multi-edit` | - | no | yes |
-| 40 | `import-model` | - | no | no |
-| 41 | `export-model` | - | no | no |
-| 42 | `export-place` | - | no | no |
-| 43 | `import-snapshots` | - | no | no |
-| 44 | `export-snapshots` | - | no | yes |
-| 45 | `sourcemap` | - | no | no |
-| 50 | `studios` | - | no | no |
-| 51 | `studio-status` | - | no | no |
-| 52 | `studio-open` | - | yes | no |
-| 53 | `studio-close` | - | yes | yes |
-| 54 | `luau` | - | no | yes |
-| 55 | `console` | - | no | yes |
-| 56 | `play-start` | - | no | yes |
-| 57 | `play-stop` | - | no | yes |
-| 58 | `shot` | - | no | yes |
-| 59 | `device` | - | no | yes |
-| 60 | `ui` | - | no | yes |
-| 61 | `press` | - | no | yes |
-| 62 | `click` | - | no | yes |
-| 63 | `key` | - | no | yes |
-| 64 | `type` | - | no | yes |
-| 65 | `wait` | - | no | yes |
-| 66 | `goto` | - | no | yes |
-| 67 | `input` | - | no | yes |
-| 68 | `record-start` | - | no | yes |
-| 69 | `record-end` | - | no | no |
-| 70 | `project-init` | - | no | no |
-| 71 | `project-validate` | - | no | no |
-| 72 | `place-add` | - | no | no |
-| 73 | `place-rename` | - | no | no |
-| 74 | `place-reorder` | - | no | no |
-| 80 | `review-prepare` | - | no | no |
-| 81 | `review-apply` | - | no | no |
-| 82 | `review-reject` | - | no | no |
-| 91 | `asset-search` | - | no | no |
-| 92 | `asset-insert` | - | no | yes |
-| 93 | `generate-model` | - | no | yes |
-| 94 | `job-status` | - | no | yes |
-| 95 | `image-upload` | - | no | no |
-| 96 | `image-store` | - | no | no |
-| 97 | `update-studios` | - | no | yes |
-<!-- automation-opcodes:end -->

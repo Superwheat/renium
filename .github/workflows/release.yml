@@ -97,7 +97,6 @@ jobs:
           Copy-Item LICENSE $stage
           if ("${{ runner.os }}" -eq "Windows") {
             Copy-Item rbx.cmd $stage
-            Copy-Item tools/renium/rbx-run.ps1 $stage
             Copy-Item install.ps1 $stage
             ./tools/build-windows-launcher.ps1 `
               -InstallerScript (Join-Path $stage "install.ps1") `

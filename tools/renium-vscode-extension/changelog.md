@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.2.9 - 2026-08-22
+
+### Agent commands
+
+- Every automation operation is available as a direct top-level `rbx` command. Context IDs, the `rbx a` layer, command payload files, and manual daemon setup are no longer part of normal agent workflows.
+- Short command names are the canonical agent interface, while descriptive names remain available for people using the CLI directly.
+- Command help includes short examples for every operation and keeps descriptive aliases pointed at the same examples.
+- Studio commands start or reuse the shared connection, select the project and place, and handle required workflow confirmation themselves.
+- Image uploads with an explicit user or group owner can use Open Cloud directly without opening Studio.
+
+### Updates
+
+- Every agent command checks for a newer Renium version through one shared five-minute cache and prints a short update command when one is available.
+- Failed update checks also respect the five-minute cache instead of retrying on every command.
+- Generated agent instructions recommend keeping Renium current and rereading the instructions after an update.
+
 ## 0.2.8 - 2026-08-22
 
 ### Live sync

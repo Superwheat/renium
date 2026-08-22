@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,9 +23,10 @@ use crate::system::files::read_file_if_present;
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
 const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
-const SHARED_CORE_LAUNCHERS: [&str; 3] = ["rbx", "rbx.cmd", "rbx-run.ps1"];
+const SHARED_CORE_LAUNCHERS: [&str; 2] = ["rbx", "rbx.cmd"];
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
 const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
+static UPDATE_NOTICE_PRINTED: AtomicBool = AtomicBool::new(false);
 
 #[path = "update/check.rs"]
 mod check;
@@ -786,6 +788,18 @@ pub(crate) fn available_release_version() -> Result<Option<String>> {
     let parsed =
         Version::parse(&latest).with_context(|| format!("Invalid release version {latest}"))?;
     Ok((parsed > current).then_some(latest))
+}
+
+pub(crate) fn check_agent_update() {
+    if let Ok(Some(version)) = available_release_version() {
+        report_update_notice(&version);
+    }
+}
+
+pub(crate) fn report_update_notice(version: &str) {
+    if !UPDATE_NOTICE_PRINTED.swap(true, Ordering::Relaxed) {
+        eprintln!("[renium] update available: {version}; run `rbx update`");
+    }
 }
 
 fn verify_manifest(manifest: &SignedUpdateManifest) -> Result<()> {
@@ -2051,16 +2065,19 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
     if fs::hard_link(&cli, &alias).is_err() {
         fs::copy(&cli, &alias)?;
     }
-    for stale in [stable_root.join("rbx.exe"), stable_root.join("renium.exe")] {
+    for stale in [
+        target_root.join("rbx-run.ps1"),
+        stable_root.join("rbx-run.ps1"),
+        stable_root.join("rbx.exe"),
+        stable_root.join("renium.exe"),
+    ] {
         if stale.is_file() {
             fs::remove_file(stale)?;
         }
     }
-    for name in ["rbx.cmd", "rbx-run.ps1"] {
-        let source = target_root.join(name);
-        if source.is_file() {
-            fs::copy(source, stable_root.join(name))?;
-        }
+    let launcher = target_root.join("rbx.cmd");
+    if launcher.is_file() {
+        fs::copy(launcher, stable_root.join("rbx.cmd"))?;
     }
     Ok(())
 }

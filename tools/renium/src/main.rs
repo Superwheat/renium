@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
-use clap::{CommandFactory, FromArgMatches};
+use clap::FromArgMatches;
 use serde_json::json;
 
 #[global_allocator]
@@ -105,7 +105,7 @@ fn main() -> ExitCode {
 
 fn run_cli() -> Result<()> {
     app::crash::install_hook();
-    let matches = Cli::command().get_matches();
+    let matches = cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     app::output::prime_mode(&cli.output_mode);
     if cli.backtrace {
@@ -138,6 +138,9 @@ fn run_cli() -> Result<()> {
     if !matches!(&cli.command, Commands::UpdateHelper(_)) {
         update::report_pending_update_result();
     }
+    if is_agent_launcher() && checks_agent_update(&cli.command) {
+        update::check_agent_update();
+    }
     if is_agent_launcher()
         && checks_agent_instructions(&cli.command)
         && project::workflows::refresh_outdated_agent_instructions(cli.project.as_deref())?
@@ -148,6 +151,17 @@ fn run_cli() -> Result<()> {
     }
 
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
+}
+
+fn checks_agent_update(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::UpdateHelper(_)
+            | Commands::BridgeDaemon(_)
+            | Commands::ExplorerDaemon(_)
+            | Commands::BridgeGetSource(_)
+            | Commands::CursorPoll(_)
+    )
 }
 
 fn is_agent_launcher() -> bool {

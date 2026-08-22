@@ -150,31 +150,9 @@ fn generate_operations(out_dir: &Path) {
         let id = u16::try_from(id).expect("opcode id must fit in u16");
         assert!(ids.insert(id), "duplicate opcode {id}");
         assert!(names.insert(name), "duplicate operation name {name}");
-        for alias in operation
-            .get("aliases")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let alias = alias.as_str().expect("opcode alias must be a string");
-            assert!(names.insert(alias), "duplicate operation name {alias}");
-        }
         let constant = name.replace('-', "_").to_ascii_uppercase();
         writeln!(constants, "pub const {constant}: u16 = {id};")
             .expect("failed to generate opcode");
-        let aliases = operation
-            .get("aliases")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|alias| {
-                format!(
-                    "{:?}",
-                    alias.as_str().expect("opcode alias must be a string")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
         let review = operation
             .get("review")
             .and_then(serde_json::Value::as_bool)
@@ -189,7 +167,7 @@ fn generate_operations(out_dir: &Path) {
             .unwrap_or(true);
         writeln!(
             entries,
-            "    super::Opcode {{ id: {id}, name: {name:?}, aliases: &[{aliases}], review: {review}, runtime: {runtime}, queued: {queued} }},"
+            "    super::Opcode {{ id: {id}, name: {name:?}, review: {review}, runtime: {runtime}, queued: {queued} }},"
         )
         .expect("failed to generate opcode metadata");
     }

@@ -3,10 +3,10 @@
 Read `RENIUM.md` first.
 
 ```powershell
-rbx find Workspace -n Door --limit 5
-rbx find ServerScriptService -c Script --limit 5
-rbx tree Workspace Door --depth 2 --limit 100
-rbx inspect Workspace -i editor:id
+rbx f Workspace -n Door --limit 5
+rbx f ServerScriptService -c Script --limit 5
+rbx tr Workspace Door --depth 2 --limit 100
+rbx in Workspace -i editor:id
 rbx bg Workspace -i editor:id -p Name
 rbx bs Workspace -i editor:id -p DisplayName --str "VIP Man"
 rbx bs Workspace -i editor:id -p Transparency --num 0.5
@@ -16,12 +16,12 @@ rbx ba Workspace -n NewModel -c Model
 rbx ba Workspace -I editor:parent -n NewPart -c Part
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
-rbx move Workspace -i editor:id -I editor:parent
-rbx move StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
+rbx mv Workspace -i editor:id -I editor:parent
+rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
-Use `find SERVICE text` for a text search. `-n` is an exact name filter; don't add `*` wildcards.
+Use `f SERVICE text` for a text search. `-n` is an exact name filter; don't add `*` wildcards.
 
 Property values use `--str`, `--num`, `--bool`, `--null`, or `-j` for another JSON value. `--null` removes the stored override; writing the Roblox default explicitly still stores an override. Automatic writes reject property names missing from the class. Use `--scope property` only for a real newer or hidden Roblox property absent from Renium's bundled schema, and `--scope attribute` to create an attribute.
 
@@ -44,20 +44,20 @@ Field presets: `lookup=id,n,c,path`, `tree=id,n,c,cc,ch`, `brief=id,n,c,path,cc`
 Inspect models without importing them:
 
 ```powershell
-rbx view model.rbxm --json
-rbx view model.rbxmx --json
+rbx v model.rbxm --json
+rbx v model.rbxmx --json
 ```
 
-Use `--json` when exact script source and stable references are required. Plain model view summarizes source text. `view` accepts `.renium`, `.rbxm`, and `.rbxmx`, not place files; verify place contents from `bep`'s manifest and `sm --stdout` before comparing exported hashes.
+Use `--json` when exact script source and stable references are required. Plain model view summarizes source text. `v` accepts `.renium`, `.rbxm`, and `.rbxmx`, not place files; verify place contents from `bep`'s manifest and `sm --stdout` before comparing exported hashes.
 
-RBXM is columnar, so decoding it can materialize a Roblox class default for an instance that never stored that property. Requested `bb` properties also return class defaults. Use `rbx view <store>.renium --json` to distinguish stored overrides before comparing model formats.
+RBXM is columnar, so decoding it can materialize a Roblox class default for an instance that never stored that property. Requested `bb` properties also return class defaults. Use `rbx v <store>.renium --json` to distinguish stored overrides before comparing model formats.
 
 Search saved script files without asking Studio to read them again:
 
 ```powershell
-rbx script-search DataStoreService UpdateAsync --limit 20
-rbx script-grep RemoteEvent --limit 100
-rbx script-read src/ServerScriptService/Main.server.luau --start-line 40 --end-line 80
+rbx ss DataStoreService UpdateAsync --limit 20
+rbx sg RemoteEvent --limit 100
+rbx sr src/ServerScriptService/Main.server.luau --start-line 40 --end-line 80
 ```
 
-`script-search` matches files containing every keyword, without case sensitivity, and reports file counts. `script-grep` matches literal source text, is case-sensitive unless `--case-insensitive` is used, and reports line counts. Limits cap returned results while totals still cover the full project.
+`ss` matches files containing every keyword, without case sensitivity, and reports file counts. `sg` matches literal source text, is case-sensitive unless `--case-insensitive` is used, and reports line counts. Limits cap returned results while totals still cover the full project.
