@@ -501,6 +501,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		return {
 			referenceOverlay = referenceOverlay,
 			replacements = replacements,
+			needsReferenceRetarget = #incomingScanRoots > 0 and #outgoingScanRoots > 0,
 			resolveStagedPath = resolveStagedPath,
 			retainedDuplicates = retainedDuplicates,
 			retainedDuplicateInstanceCount = retainedDuplicateInstanceCount,
@@ -536,32 +537,38 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				excludedRoots[instance] = true
 			end
 		end
-		local scanRoots = {}
-		for serviceName, allowed in pairs(ctx.allowedServices) do
-			if allowed then
-				scanRoots[#scanRoots + 1] = game:GetService(serviceName)
+		local updated = 0
+		local contentUpdated = 0
+		if undo.needsReferenceRetarget then
+			local scanRoots = {}
+			for serviceName, allowed in pairs(ctx.allowedServices) do
+				if allowed then
+					scanRoots[#scanRoots + 1] = game:GetService(serviceName)
+				end
 			end
-		end
-		local updated, failed, failures = BridgeReferenceRetarget.apply(
-			scanRoots,
-			undo.replacements,
-			RbxDomModule.getReferencePropertyNames,
-			readProperty,
-			function(instance, propertyName, value)
-				return writePropertyForSync(instance, propertyName, value, ctx)
-			end,
-			excludedRoots
-		)
-		if failed > 0 then
-			local first = failures[1]
-			error(
-				`Could not retarget {failed} native import references; first failure: {first.instance:GetFullName()}.{first.propertyName}: {first.error}`
+			local failed, failures
+			updated, failed, failures = BridgeReferenceRetarget.apply(
+				scanRoots,
+				undo.replacements,
+				RbxDomModule.getReferencePropertyNames,
+				readProperty,
+				function(instance, propertyName, value)
+					return writePropertyForSync(instance, propertyName, value, ctx)
+				end,
+				excludedRoots
 			)
-		end
-		local contentUpdated, contentFailed =
-			ReferenceOverlay.retargetPreservedContent(scanRoots, undo.replacements, ctx, excludedRoots)
-		if contentFailed > 0 then
-			error(`Could not retarget {contentFailed} native import content references`)
+			if failed > 0 then
+				local first = failures[1]
+				error(
+					`Could not retarget {failed} native import references; first failure: {first.instance:GetFullName()}.{first.propertyName}: {first.error}`
+				)
+			end
+			local contentFailed
+			contentUpdated, contentFailed =
+				ReferenceOverlay.retargetPreservedContent(scanRoots, undo.replacements, ctx, excludedRoots)
+			if contentFailed > 0 then
+				error(`Could not retarget {contentFailed} native import content references`)
+			end
 		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.incoming) do

@@ -165,7 +165,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.2.7"
+	local BRIDGE_VERSION = "0.2.8"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1783875358
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -4813,6 +4813,11 @@ function BridgePluginRuntime.start(context)
 		changeState.runtimeSettingsSeq = runtimeSettingsSeq
 		changeState.editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
 		return changeState
+	end
+
+	Config.bridgeMethodHandlers.cancelStudioChangeWait = function()
+		Config.studioChanges.cancelWait()
+		return { ok = true }
 	end
 
 	Config.bridgeMethodHandlers.setConflictResolution = function(p)

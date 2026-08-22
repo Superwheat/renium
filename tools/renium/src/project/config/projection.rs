@@ -2601,7 +2601,7 @@ pub fn project_target_is_declarative(loaded: &LoadedProject, target: &[String]) 
         .any(|owner| owner.target == target))
 }
 
-pub fn project_structural_store(loaded: &LoadedProject, target: &[String]) -> Result<PathBuf> {
+pub fn project_structural_store_path(loaded: &LoadedProject, target: &[String]) -> Result<PathBuf> {
     let relative = target.iter().collect::<PathBuf>();
     let resolution = resolve_project_write_path(loaded, &relative)?;
     if resolution.source_root.is_file() {
@@ -2617,12 +2617,19 @@ pub fn project_structural_store(loaded: &LoadedProject, target: &[String]) -> Re
             resolution.source_root.display()
         );
     }
-    let settings = service_settings_path(&resolution.source_root);
+    Ok(service_settings_path(&resolution.source_root))
+}
+
+pub fn project_structural_store(loaded: &LoadedProject, target: &[String]) -> Result<PathBuf> {
+    let settings = project_structural_store_path(loaded, target)?;
     if !settings.is_file() {
         bail!(
             "Projected path '{}' is owned by '{}' but it has no Renium settings store",
             target.join("."),
-            resolution.source_root.display()
+            settings
+                .parent()
+                .map_or(settings.as_path(), |parent| parent)
+                .display()
         );
     }
     Ok(settings)

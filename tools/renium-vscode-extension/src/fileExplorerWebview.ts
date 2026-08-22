@@ -1826,7 +1826,7 @@ tree.addEventListener('click',function(e){
   if(addBtn){
     e.preventDefault();
     e.stopPropagation();
-    applySelection(id,true);
+    applySelection(id,false);
     showClassPickerForButton(addBtn,id);
     finishPointerRenameCleanup();
     return;

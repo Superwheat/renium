@@ -32,7 +32,9 @@ use crate::rbx::encode::rbx_serialized_property_name_for_logical;
 use crate::roblox::services::{
     DEFAULT_SYNC_SERVICES, EXTRA_EXPLORER_SERVICES, explorer_service_order,
 };
-use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
+use crate::settings::bytecode::{
+    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+};
 use crate::settings::instance::{self as instance_api, InstanceQuery};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::snapshot::import::parse_services;
@@ -518,10 +520,19 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         let staged = config::stage_project(&loaded)?;
         let service = canonical_explorer_service_name(&args.service);
         let staged_settings = service_settings_path(&staged.root().join(&service));
-        if !staged_settings.is_file() {
-            bail!("Projected service '{service}' has no Renium store");
-        }
-        let document = SettingsBytecode::read_file(&staged_settings)?;
+        let document = if staged_settings.is_file() {
+            SettingsBytecode::read_file(&staged_settings)?
+        } else {
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![SettingsBytecodeInstance::new(
+                    format!("service:{service}"),
+                    service.clone(),
+                    service.clone(),
+                    None,
+                )],
+            }
+        };
         let display_settings =
             service_settings_path(&loaded.root.join(&loaded.project.source_root).join(&service));
         loaded_project = Some(loaded);
@@ -1772,6 +1783,32 @@ impl ExplorerDaemonState {
     }
 
     fn details(&self, request_id: u64, node_id: &str) -> Value {
+        if let Some(service) = node_id.strip_prefix("service:") {
+            let Some(state) = self.service_states.get(service) else {
+                return explorer_error(request_id, "not_found", "Service not found");
+            };
+            if state.root_index.is_none() {
+                return json!({
+                    "type": "details",
+                    "requestId": request_id,
+                    "snapshotVersion": self.snapshot_version,
+                    "details": {
+                        "id": node_id,
+                        "settingsFile": service_settings_path(&self.src_root.join(service)),
+                        "kind": "service",
+                        "service": service,
+                        "name": service,
+                        "className": service,
+                        "parentId": Value::Null,
+                        "pathSegments": [service],
+                        "pathOrdinals": [1],
+                        "childCount": 0,
+                        "properties": {},
+                        "attributes": {},
+                    },
+                });
+            }
+        }
         let Some((service, index)) = self.resolve_node_index(node_id) else {
             return explorer_error(request_id, "not_found", "Node not found");
         };

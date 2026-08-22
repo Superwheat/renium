@@ -28,7 +28,7 @@ use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::system::files::{atomic_write_file, fnv1a};
 use crate::system::watch::FileWatcher;
 
-const EVENT_DEBOUNCE: Duration = Duration::from_millis(75);
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(10);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -977,17 +977,14 @@ fn queue_changed(
     pending: &mut BTreeSet<PathBuf>,
     blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
     paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<(bool, bool)> {
+) -> Result<bool> {
     let mut changed = false;
-    let mut rescan = false;
     for path in paths {
         let path = absolute(path, &project.root);
         if !relevant(project, &path) {
             continue;
         }
         let current = stamp(&path)?;
-        rescan |= current.is_some_and(|stamp| stamp.directory)
-            || baseline.get(&path).is_some_and(|stamp| stamp.directory);
         if baseline.get(&path).copied() != current {
             let added = pending.insert(path.clone());
             let edited_after_failure = blocked
@@ -1002,7 +999,7 @@ fn queue_changed(
             blocked.remove(&path);
         }
     }
-    Ok((changed, rescan))
+    Ok(changed)
 }
 
 fn queue_scan_changes(
@@ -1062,7 +1059,7 @@ fn pull_studio_changes(
     bridge.clear_runtime_pins();
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({ "services": [], "start": true }),
+        json!({ "start": true }),
         BridgeTarget::Main,
         runtime_id,
         Some(Duration::from_secs(1)),
@@ -1184,15 +1181,18 @@ fn run(
     control.update_pending(&pending);
 
     while !control.stop.load(Ordering::Acquire) && bridge.alive.load(Ordering::Acquire) {
-        match project
-            .watcher
-            .receiver()
-            .recv_timeout(Duration::from_millis(50))
-        {
+        let receive_timeout = if push_ready {
+            EVENT_DEBOUNCE
+                .max(push_retry_delay)
+                .saturating_sub(last_event.elapsed())
+                .min(Duration::from_millis(50))
+        } else {
+            Duration::from_millis(50)
+        };
+        match project.watcher.receiver().recv_timeout(receive_timeout) {
             Ok(Ok(event)) => {
                 match queue_changed(&project, &baseline, &mut pending, &mut blocked, event.paths) {
-                    Ok((changed, directory_event)) => {
-                        rescan_pending |= directory_event;
+                    Ok(changed) => {
                         if changed {
                             unblock_full_push(&project, &mut blocked);
                             last_event = Instant::now();

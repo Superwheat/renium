@@ -68,6 +68,7 @@ export const AUTOMATION_OP = {
   jobStatus: 94,
   imageUpload: 95,
   imageStore: 96,
+  updateStudios: 97,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([
@@ -99,4 +100,5 @@ export const AUTOMATION_RUNTIME_OPS = new Set<number>([
   92,
   93,
   94,
+  97,
 ]);
