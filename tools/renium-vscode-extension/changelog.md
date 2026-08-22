@@ -18,6 +18,14 @@
 - Failed update checks also respect the five-minute cache instead of retrying on every command.
 - Generated agent instructions recommend keeping Renium current and rereading the instructions after an update.
 
+### Open Cloud
+
+- Native Open Cloud commands use Roblox's current request formats for assets, passes, badges, localization, servers, thumbnails, memory stores, Creator Store, advertising, experiments, events, and configuration.
+- Pagination uses the correct token and limit fields for each Roblox endpoint.
+- Creator Store search supports current page tokens, verified-creator filtering, price limits, and audio-duration filters.
+- Multipart uploads and asset-version rollbacks send files and form fields in the formats Roblox expects.
+- Public read operations can use `--anonymous`; authenticated permission failures remain visible instead of silently retrying under a different identity.
+
 ## 0.2.8 - 2026-08-22
 
 ### Live sync
