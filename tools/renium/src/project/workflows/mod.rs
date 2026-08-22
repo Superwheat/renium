@@ -1142,7 +1142,21 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     let destination = root.join(PROJECT_GUIDES_DIRECTORY);
     fs::create_dir_all(&destination)
         .with_context(|| format!("Failed to create {}", destination.display()))?;
-    for (name, content) in agent_guides()? {
+    let guides = agent_guides()?;
+    let expected = guides
+        .iter()
+        .map(|(name, _)| name.as_os_str())
+        .collect::<BTreeSet<_>>();
+    for entry in fs::read_dir(&destination)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(OsStr::to_str) == Some("md")
+            && !expected.contains(entry.file_name().as_os_str())
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    for (name, content) in guides {
         write_bytes_if_changed(&destination.join(name), &content)?;
     }
     Ok(())
@@ -1162,11 +1176,10 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     };
     let root = resolve_experience_place(&loaded.root, None)?
         .map_or(loaded.root, |place| place.experience_root);
-    let path = root.join(PROJECT_INSTRUCTIONS_FILE);
-    let version = fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| agent_instruction_version(&contents).map(str::to_string));
-    if version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+    let expected_instructions = agent_instructions()?;
+    let instructions_match = fs::read(root.join(PROJECT_INSTRUCTIONS_FILE))
+        .is_ok_and(|contents| contents == expected_instructions);
+    if instructions_match {
         return Ok(false);
     }
     refresh_agent_instructions(&root)?;
@@ -1200,6 +1213,17 @@ fn agent_instructions() -> Result<Vec<u8>> {
             env!("CARGO_PKG_VERSION")
         );
     }
+    let mut contents = contents;
+    if !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    contents.extend_from_slice(
+        format!(
+            "<!-- renium-instructions: {} -->\n",
+            env!("RENIUM_INSTRUCTIONS_REVISION")
+        )
+        .as_bytes(),
+    );
     Ok(contents)
 }
 
@@ -2095,12 +2119,38 @@ mod tests {
         );
         let guides = agent_guides().unwrap();
         assert!(!guides.is_empty());
-        for (name, content) in guides {
+        for (name, content) in &guides {
             assert_eq!(
                 fs::read(root.join(PROJECT_GUIDES_DIRECTORY).join(name)).unwrap(),
-                content
+                *content
             );
         }
+
+        fs::write(
+            root.join(PROJECT_INSTRUCTIONS_FILE),
+            [agent_instructions().unwrap(), b"\nchanged\n".to_vec()].concat(),
+        )
+        .unwrap();
+        fs::write(
+            root.join(PROJECT_GUIDES_DIRECTORY).join(&guides[0].0),
+            "outdated",
+        )
+        .unwrap();
+        let removed = root.join(PROJECT_GUIDES_DIRECTORY).join("removed.md");
+        fs::write(&removed, "old guide").unwrap();
+        assert!(refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME))).unwrap());
+        assert_eq!(
+            fs::read(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
+            agent_instructions().unwrap()
+        );
+        for (name, content) in &guides {
+            assert_eq!(
+                fs::read(root.join(PROJECT_GUIDES_DIRECTORY).join(name)).unwrap(),
+                *content
+            );
+        }
+        assert!(!removed.exists());
+        assert!(!refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME))).unwrap());
 
         fs::write(&agents, "# Project rules\n\nKeep this.\n").unwrap();
         fs::write(&claude, "# Claude rules\n").unwrap();

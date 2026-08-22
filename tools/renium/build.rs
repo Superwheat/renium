@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 fn run(command: &mut Command, label: &str) {
     let status = command
         .status()
@@ -124,6 +126,29 @@ fn emit_build_metadata() {
     println!("cargo:rustc-env=BUILD_TIMESTAMP_UNIX={build_timestamp}");
 }
 
+fn emit_instruction_revision() {
+    let mut paths = vec![PathBuf::from("renium-agents.md")];
+    let mut guides = std::fs::read_dir("renium-guides")
+        .expect("failed to read agent guides")
+        .map(|entry| entry.expect("failed to read an agent guide").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .collect::<Vec<_>>();
+    guides.sort();
+    paths.extend(guides);
+
+    let mut hash = Sha256::new();
+    for path in paths {
+        hash.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        hash.update([0]);
+        hash.update(std::fs::read(&path).expect("failed to read agent instructions"));
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!(
+        "cargo:rustc-env=RENIUM_INSTRUCTIONS_REVISION={:x}",
+        hash.finalize()
+    );
+}
+
 fn generate_operations(out_dir: &Path) {
     let path = Path::new("protocol").join("opcodes.json");
     let text = std::fs::read_to_string(&path).expect("failed to read opcode registry");
@@ -203,6 +228,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     emit_build_metadata();
+    emit_instruction_revision();
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is missing");
     let host = env::var("HOST").expect("HOST is missing");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));

@@ -452,19 +452,7 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "ok".to_string(),
         summary.get("ok").cloned().unwrap_or(Value::Bool(true)),
     );
-    result.insert(
-        "direction".to_string(),
-        Value::String("files-to-studio".to_string()),
-    );
-    let filtered = push_is_filtered(parameters);
-    result.insert(
-        "selection".to_string(),
-        Value::String(if filtered { "filtered" } else { "full" }.to_string()),
-    );
     for key in [
-        "changedPaths",
-        "targetSettingsIds",
-        "targetProperties",
         "skippedByReview",
         "sourceVerified",
         "sourceVerifyFailed",
@@ -1418,6 +1406,10 @@ fn automation_live_operation(
     }
 
     if manage_files && operation == op::LIVE_STOP {
+        state
+            .live_sync()
+            .set_enabled(context, false)
+            .map_err(automation_failure)?;
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1435,6 +1427,10 @@ fn automation_live_operation(
 
     let daemon = match operation {
         op::LIVE_START if manage_files => {
+            state
+                .live_sync()
+                .set_enabled(context, true)
+                .map_err(automation_failure)?;
             let plugin = {
                 let _gate = bridge.acquire_request_gate();
                 automation_dispatch_with_retry(
@@ -1514,6 +1510,27 @@ fn automation_live_operation(
             false,
         )?
     };
+    let daemon = if manage_files
+        && operation == op::LIVE_STATUS
+        && should_restore_file_watcher(&plugin, &daemon, state.live_sync().is_enabled(context))
+    {
+        state
+            .live_sync()
+            .set_enabled(context, true)
+            .map_err(automation_failure)?;
+        state
+            .live_sync()
+            .start(
+                context.clone(),
+                Arc::clone(bridge),
+                pull_changes,
+                files_paused,
+                reset_files_paused,
+            )
+            .map_err(automation_failure)?
+    } else {
+        daemon
+    };
     Ok(merge_live_status(plugin, daemon))
 }
 
@@ -1524,6 +1541,11 @@ fn merge_live_status(plugin: Value, daemon: Value) -> Value {
         .unwrap_or_else(|| Map::from_iter([("plugin".to_string(), plugin)]));
     result.insert("daemon".to_string(), daemon);
     Value::Object(result)
+}
+
+fn should_restore_file_watcher(plugin: &Value, daemon: &Value, enabled: bool) -> bool {
+    daemon["running"].as_bool() != Some(true)
+        && (enabled || plugin["twoWaySyncEnabled"].as_bool() == Some(true))
 }
 
 fn automation_execute_request(
@@ -1899,4 +1921,47 @@ pub(crate) fn run_automation_stdio(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omits_echoed_push_arguments_but_keeps_verification() {
+        let parameters = json!({
+            "changedPaths": ["src/ReplicatedStorage/Test.luau"],
+            "targetSettingsIds": ["test-id"]
+        });
+        let summary = json!({
+            "ok": true,
+            "changedPaths": ["src/ReplicatedStorage/Test.luau"],
+            "targetSettingsIds": ["test-id"]
+        });
+        assert_eq!(
+            Value::Object(compact_push_summary(
+                summary.as_object().unwrap(),
+                &parameters
+            )),
+            json!({ "ok": true })
+        );
+
+        let verified = json!({ "ok": true, "sourceVerified": true });
+        assert_eq!(
+            Value::Object(compact_push_summary(
+                verified.as_object().unwrap(),
+                &parameters
+            )),
+            json!({ "ok": true, "sourceVerified": true })
+        );
+    }
+
+    #[test]
+    fn restores_file_watcher_from_plugin_setting() {
+        assert!(should_restore_file_watcher(
+            &json!({ "twoWaySyncEnabled": true }),
+            &json!({ "running": false }),
+            false
+        ));
+    }
 }

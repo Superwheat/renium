@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { generateRobloxPropertiesMetadata } from "./generate-properties-metadata.mjs";
@@ -60,7 +61,17 @@ function syncProjectSchema() {
 
 function syncAgentInstructions() {
   const source = path.join(repoRoot, "tools", "renium");
-  const guide = fs.readFileSync(path.join(source, "renium-agents.md"), "utf8");
+  const guidePath = path.join(source, "renium-agents.md");
+  const topicSource = path.join(source, "renium-guides");
+  const topicNames = fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort();
+  const instructionFiles = [guidePath, ...topicNames.map((name) => path.join(topicSource, name))];
+  const hash = createHash("sha256");
+  for (const file of instructionFiles) {
+    hash.update(path.relative(source, file).replaceAll(path.sep, "/"));
+    hash.update(Buffer.from([0]));
+    hash.update(fs.readFileSync(file));
+  }
+  const guide = `${fs.readFileSync(guidePath, "utf8").trimEnd()}\n<!-- renium-instructions: ${hash.digest("hex")} -->\n`;
   const marker = `<!-- renium-version: ${extensionPackage.version} -->`;
   if (guide.split(/\r?\n/, 1)[0] !== marker) {
     throw new Error(`renium-agents.md must start with ${marker}`);
@@ -68,7 +79,7 @@ function syncAgentInstructions() {
   fs.writeFileSync(path.join(extensionResources, "RENIUM.md"), guide);
   const topics = path.join(extensionResources, "RENIUM");
   fs.rmSync(topics, { recursive: true, force: true });
-  fs.cpSync(path.join(source, "renium-guides"), topics, { recursive: true });
+  fs.cpSync(topicSource, topics, { recursive: true });
   fs.rmSync(path.join(extensionResources, "AGENTS.md"), { force: true });
 }
 

@@ -39,6 +39,17 @@ test("Renium guide uses one marked pointer in project instructions", () => {
   assert.equal(fs.readFileSync(agents, "utf8"), pointer);
   assert.equal(fs.readFileSync(claude, "utf8"), "Read and follow AgEnTs.Md.\n");
 
+  const dataGuide = path.join(project, "RENIUM", "data.md");
+  const removedGuide = path.join(project, "RENIUM", "removed.md");
+  fs.writeFileSync(path.join(extension, "resources", "RENIUM", "data.md"), "# Updated data guide\n");
+  fs.writeFileSync(removedGuide, "# Removed guide\n");
+  assert.deepEqual(new Set(ensureReniumAgentInstructions(extension, project)), new Set([
+    removedGuide,
+    dataGuide,
+  ]));
+  assert.equal(fs.readFileSync(dataGuide, "utf8"), "# Updated data guide\n");
+  assert.equal(fs.existsSync(removedGuide), false);
+
   fs.writeFileSync(agents, "# Project rules\n");
   fs.writeFileSync(claude, "# Claude rules\n");
   assert.deepEqual(ensureReniumAgentInstructions(extension, project), [agents, claude]);

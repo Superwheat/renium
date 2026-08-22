@@ -35,7 +35,7 @@ pub(crate) fn command() -> clap::Command {
 #[command(
     author,
     version,
-    after_help = "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps --changed-path src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png"
+    after_help = "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png"
 )]
 pub(super) struct Cli {
     #[arg(
@@ -1197,6 +1197,8 @@ pub(super) struct PushEditorChangesArgs {
     pub(super) project: ProjectSourceArgs,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(value_name = "PATH")]
+    pub(super) paths: Vec<PathBuf>,
     #[arg(
         short = 'p',
         long = "changed-path",
@@ -1250,6 +1252,7 @@ impl PushEditorChangesArgs {
         Self {
             project,
             bridge,
+            paths: Vec::new(),
             changed_paths: Vec::new(),
             changed_paths_files: Vec::new(),
             target_settings_ids: Vec::new(),

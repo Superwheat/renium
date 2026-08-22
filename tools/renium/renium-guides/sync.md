@@ -4,7 +4,7 @@ Read `RENIUM.md` first. `pl` means Studio to files. `ps` means files to Studio. 
 
 ```powershell
 rbx pl
-rbx ps --changed-path src/StarterGui/AuditClient.client.luau --no-review --yes
+rbx ps src/StarterGui/AuditClient.client.luau
 rbx lon
 rbx lst
 rbx lof
@@ -16,4 +16,6 @@ Run these from the active place folder. At an experience root with more than one
 
 For sustained edits, start live sync once and edit files normally. Renium batches nearby file saves, verifies script writes, retries one transient transport failure, and keeps permanent failures pending. Use `rbx rp` after fixing the cause or `rbx dp` only when those pending file edits should not reach Studio.
 
-Use a one-off filtered push when live sync isn't running. Repeat `--changed-path` for multiple files; Renium handles one batch across services. Use an unfiltered push only for an intentional full place replacement.
+`rbx lst` restores an enabled Live Sync watcher after a daemon replacement. If it reports `daemon.running: true`, edit the files and let Live Sync send them; don't follow the edit with a manual push.
+
+Use a one-off filtered push when live sync isn't running. List multiple paths after `rbx ps`; Renium handles one batch across services. Use an unfiltered push only for an intentional full place replacement.
