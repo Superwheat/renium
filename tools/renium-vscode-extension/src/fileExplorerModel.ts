@@ -802,12 +802,16 @@ export class FileExplorerModel {
         loaded.detailsLoaded = true;
       }
       if (!options.skipStudioPush) {
-        await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
+        const pushed = await vscode.commands.executeCommand<boolean>("renium.pushEditorPathsNow", changedPaths, {
+          force: true,
           projectRoot: config.projectRoot,
           taskName: "Explorer -> Studio sync",
           targetSettingsId: loaded.settingsId,
           targetProperty: propertyName,
         });
+        if (pushed !== true) {
+          throw new Error("Studio did not apply the Explorer edit.");
+        }
       }
       await resumeFileWrites(options.skipStudioPush ? changedPaths : []);
     } catch (error) {
@@ -924,7 +928,7 @@ export class FileExplorerModel {
     const generation = this.projectGeneration;
     const loadedParent = await this.ensureLoaded(parent);
     this.requireProjectGeneration(generation);
-    if (!loadedParent.settingsId) {
+    if (loadedParent.kind !== "service" && !loadedParent.settingsId) {
       throw new Error("Parent instance has no bytecode id.");
     }
     const config = getExplorerConfig();
@@ -933,13 +937,11 @@ export class FileExplorerModel {
       loadedParent.service,
       "-r",
       config.projectRoot,
-      "-I",
-      loadedParent.settingsId ?? "",
-      "-c",
-      className,
-      "-n",
-      name,
     ];
+    if (loadedParent.kind !== "service") {
+      args.push("-I", loadedParent.settingsId ?? "");
+    }
+    args.push("-c", className, "-n", name);
     appendRecordAssignments(args, "-p", properties);
     appendRecordAssignments(args, "-a", attributes);
     const result = await this.withPausedProjectWrite(
@@ -1267,11 +1269,15 @@ export class FileExplorerModel {
         paths.push(extraPath);
       }
     }
-    await vscode.commands.executeCommand("renium.pushEditorPathsNow", paths, {
+    const pushed = await vscode.commands.executeCommand<boolean>("renium.pushEditorPathsNow", paths, {
+      force: true,
       projectRoot: getExplorerConfig().projectRoot,
       taskName: "Explorer -> Studio sync",
       targetSettingsIds,
     });
+    if (pushed !== true) {
+      throw new Error("Studio did not apply the Explorer edit.");
+    }
   }
 
   private async pushChangedPathsToStudio(paths: string[], targetSettingsIds?: string[]): Promise<void> {
@@ -1279,11 +1285,15 @@ export class FileExplorerModel {
     if (changedPaths.length === 0) {
       throw new Error("The project mutation returned no changed source paths.");
     }
-    await vscode.commands.executeCommand("renium.pushEditorPathsNow", changedPaths, {
+    const pushed = await vscode.commands.executeCommand<boolean>("renium.pushEditorPathsNow", changedPaths, {
+      force: true,
       projectRoot: getExplorerConfig().projectRoot,
       taskName: "Explorer -> Studio sync",
       targetSettingsIds,
     });
+    if (pushed !== true) {
+      throw new Error("Studio did not apply the Explorer edit.");
+    }
   }
 
   public async pushPropertyToStudio(
@@ -1302,6 +1312,7 @@ export class FileExplorerModel {
         "renium.pushEditorPropertyNow",
         {
           ...this.editorMutationTarget(node, changedPaths),
+          force: true,
           scope,
           property: targetProperty,
           value,
@@ -1340,10 +1351,13 @@ export class FileExplorerModel {
   }
 
   public async pushDeleteToStudio(node: FileExplorerNode, changedPaths: string[] = [node.settingsFile]): Promise<void> {
-    await vscode.commands.executeCommand(
+    const outcome = await vscode.commands.executeCommand<"applied" | "skipped">(
       "renium.pushEditorDeleteNow",
-      this.editorMutationTarget(node, changedPaths),
+      { ...this.editorMutationTarget(node, changedPaths), force: true },
     );
+    if (outcome !== "applied") {
+      throw new Error("Studio did not apply the Explorer deletion.");
+    }
   }
 
 }

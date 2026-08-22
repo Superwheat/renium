@@ -146,6 +146,7 @@ type State = {
 	tagConnections: { [string]: { RBXScriptConnection } },
 	taggedInstancesByTag: { [string]: { [Instance]: boolean } },
 	changeEvent: BindableEvent,
+	waitGeneration: number,
 	suppressUntil: number,
 	suppressDepth: number,
 	propertyNamesByClass: PropertyNameSetByClass?,
@@ -261,6 +262,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		tagConnections = {},
 		taggedInstancesByTag = {},
 		changeEvent = Instance.new("BindableEvent"),
+		waitGeneration = 0,
 		suppressUntil = 0,
 		suppressDepth = 0,
 		propertyNamesByClass = nil,
@@ -622,15 +624,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and config.hasPendingBridgeSettingChanges()
 	end
 
-	local function waitForDirtyServices(services: { string }, waitSeconds: number?): boolean
+	local function waitForDirtyServices(services: { string }, waitSeconds: number?): (boolean, boolean)
 		local duration = tonumber(waitSeconds) or 0
 		if duration <= 0 then
-			return hasPendingChanges(services)
+			return hasPendingChanges(services), false
 		end
 		if hasPendingChanges(services) then
-			return true
+			return true, false
 		end
 		duration = math.min(duration, 25)
+		local waitGeneration = state.waitGeneration
 
 		local wakeEvent = Instance.new("BindableEvent")
 		local done = false
@@ -653,14 +656,20 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end)
 
-		while not timedOut and os.clock() < deadline and not hasPendingChanges(services) do
+		while
+			state.started
+			and state.waitGeneration == waitGeneration
+			and not timedOut
+			and os.clock() < deadline
+			and not hasPendingChanges(services)
+		do
 			wakeEvent.Event:Wait()
 		end
 
 		done = true
 		connection:Disconnect()
 		wakeEvent:Destroy()
-		return hasPendingChanges(services)
+		return hasPendingChanges(services), state.waitGeneration ~= waitGeneration
 	end
 
 	local function pathToString(pathSegments: { string }?): string?
@@ -1967,6 +1976,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(state.taggedInstancesByTag)
 		state.itemChangedAvailable = false
 		state.tagSignalsAvailable = false
+		signalChange()
 	end
 
 	local function ensureTracking(services: { string })
@@ -2321,6 +2331,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local waitSeconds = tonumber(params.waitSeconds)
 		local waitedForChange = false
 		local waitTimedOut = false
+		local waitCancelled = false
 		if
 			waitSeconds
 			and waitSeconds > 0
@@ -2329,7 +2340,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and params.ackSeq == nil
 		then
 			waitedForChange = true
-			waitTimedOut = not waitForDirtyServices(services, waitSeconds)
+			local changed
+			changed, waitCancelled = waitForDirtyServices(services, waitSeconds)
+			waitTimedOut = not changed and not waitCancelled
 		end
 
 		local response = buildStateResponse(services)
@@ -2337,8 +2350,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			response.eventDriven = true
 			response.waitSeconds = math.min(waitSeconds or 0, 25)
 			response.waitTimedOut = waitTimedOut
+			response.waitCancelled = waitCancelled
 		end
 		return response
+	end
+
+	function api.cancelWait()
+		state.waitGeneration += 1
+		signalChange()
 	end
 
 	function api.pendingChangeCount(): number

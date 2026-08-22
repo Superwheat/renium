@@ -42,8 +42,8 @@ use projection::{
 };
 pub use projection::{
     compiled_files_to_studio_filters, compiled_files_to_studio_ignore_unknown_targets,
-    project_requires_temporary_stage, project_structural_store, project_target_is_declarative,
-    stage_project, stage_project_cached,
+    project_requires_temporary_stage, project_structural_store, project_structural_store_path,
+    project_target_is_declarative, stage_project, stage_project_cached,
 };
 use syncback::{
     build_adapters, is_nested_project_path, plan_adapter_syncback, projection_instance_paths,

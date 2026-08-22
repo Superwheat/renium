@@ -1,4 +1,4 @@
-<!-- renium-version: 0.2.7 -->
+<!-- renium-version: 0.2.8 -->
 # Renium automation
 
 Use `rbx`; the installer adds `rbx` and `renium` to `PATH`. If this process has an old `PATH`, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS and Linux. Never search editor extension folders.

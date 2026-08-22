@@ -101,11 +101,11 @@ fn projected_structural_target(
     settings_id: Option<&str>,
 ) -> Result<(Vec<String>, Vec<usize>)> {
     let settings = service_settings_path(&stage.root().join(service));
-    if !settings.is_file() {
-        bail!("Projected service '{service}' has no Renium store");
-    }
     if settings_id.is_none() {
         return Ok((vec![service.to_string()], vec![1]));
+    }
+    if !settings.is_file() {
+        bail!("Projected service '{service}' has no Renium store");
     }
     let document = SettingsBytecode::read_file(&settings)?;
     let settings_id = settings_id.unwrap_or_default();
@@ -153,7 +153,11 @@ fn projected_structural_store(
             target.join(".")
         );
     }
-    let store = config::project_structural_store(loaded, &target)?;
+    let store = if settings_id.is_none() {
+        config::project_structural_store_path(loaded, &target)?
+    } else {
+        config::project_structural_store(loaded, &target)?
+    };
     let canonical_id = settings_id
         .map(|settings_id| {
             if let Some((source, canonical_id)) = stage.canonical_identity(settings_id) {
@@ -181,7 +185,12 @@ fn projected_structural_store(
             }
         })
         .transpose()?;
-    Ok((canonical_path(&store)?, target, canonical_id))
+    let store = if store.exists() {
+        canonical_path(&store)?
+    } else {
+        store
+    };
+    Ok((store, target, canonical_id))
 }
 
 fn projected_instance_store(
@@ -239,6 +248,7 @@ pub(crate) fn create_instance_command(
         )?;
         return bytecode_add_instance(BytecodeAddInstanceArgs {
             input: BytecodeFileArgs::settings_file(settings_file),
+            service_hint: Some(args.service),
             name: args.name,
             class_name: args.class_name,
             settings_id: None,
@@ -264,6 +274,7 @@ pub(crate) fn create_instance_command(
     }
     bytecode_add_instance(BytecodeAddInstanceArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
+        service_hint: Some(args.service),
         name: args.name,
         class_name: args.class_name,
         settings_id: None,

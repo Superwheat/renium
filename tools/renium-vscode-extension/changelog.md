@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.2.8 - 2026-08-22
+
+### Live sync
+
+- Studio edits wake live sync immediately instead of waiting for a polling interval.
+- Files-to-Studio creates and deletions reach Studio sooner without scanning unrelated instances.
+- Long Studio change waits leave the other bridge channel available, so Explorer edits and automation commands can run while live sync is idle.
+- Pulls and pushes wait for the complete Studio connection and cancel stale change waits when needed instead of failing during a partial reconnect.
+- Auto-connect keeps using its fast retry period after an unexpected disconnect.
+
+### Explorer
+
+- Creating, editing, or deleting an instance from the editor starts or reuses the Studio connection and reports an error if Studio did not apply the edit.
+- Empty service roots accept their first child, and deleting the last child keeps the service ready for later edits.
+- Multiple instances with the same default name remain separate and sync in creation order.
+- Opening the add-instance menu no longer changes the selected node's expanded state.
+
+### Project state
+
+- Importing snapshots rebases the live watcher to the imported files instead of treating the import as new editor work.
+
 ## 0.2.7 - 2026-08-21
 
 ### Updates

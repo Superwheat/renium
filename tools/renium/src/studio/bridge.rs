@@ -1131,10 +1131,11 @@ impl BridgeServer {
         let mut matching_socket_count = 0usize;
 
         for channel in &self.channels {
-            let mut guard = channel
-                .sockets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = match channel.sockets.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
             Self::ensure_place_unambiguous(&mut guard, target, player)?;
             for (role_key, socket) in guard.iter() {
                 if !Self::socket_matches_selector(role_key, socket, target, player) {
@@ -1194,10 +1195,11 @@ impl BridgeServer {
     fn player_runtime_ids(&self) -> Vec<String> {
         let mut players = Vec::new();
         for channel in &self.channels {
-            let guard = channel
-                .sockets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = match channel.sockets.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
             for (role_key, socket) in guard.iter() {
                 let runtime_id = socket.bridge_info.runtime_id.trim();
                 if !runtime_id.is_empty()
@@ -1238,19 +1240,27 @@ impl BridgeServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .cloned();
-        if let Some(pin) = existing
-            && self.channels.iter().any(|channel| {
-                let guard = channel
-                    .sockets
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.iter().any(|(role, socket)| {
+        if let Some(pin) = existing {
+            let mut busy = false;
+            for channel in &self.channels {
+                let guard = match channel.sockets.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => {
+                        busy = true;
+                        continue;
+                    }
+                };
+                if guard.iter().any(|(role, socket)| {
                     Self::socket_matches_selector(role, socket, target, player)
                         && Self::socket_matches_runtime_pin(socket, &pin)
-                })
-            })
-        {
-            return Ok(pin);
+                }) {
+                    return Ok(pin);
+                }
+            }
+            if busy {
+                return Ok(pin);
+            }
         }
         self.runtime_pins
             .lock()
@@ -1332,8 +1342,12 @@ impl BridgeServer {
         }
     }
 
-    pub(crate) fn wait_for_target(&self, wait_seconds: f64, target: BridgeTarget) -> Result<()> {
-        let required_channels = self.expected_channel_count();
+    fn wait_for_target_channels(
+        &self,
+        wait_seconds: f64,
+        target: BridgeTarget,
+        required_channels: usize,
+    ) -> Result<()> {
         let ready_channels = self.wait_for_ready_channels_for_target(
             required_channels,
             Duration::from_secs_f64(wait_seconds.max(1.0)),
@@ -1352,6 +1366,30 @@ impl BridgeServer {
             );
         }
         validate_bridge_info(&self.cached_bridge_info_for_target(target)?)
+    }
+
+    pub(crate) fn wait_for_target(&self, wait_seconds: f64, target: BridgeTarget) -> Result<()> {
+        self.wait_for_target_channels(wait_seconds, target, 1)
+    }
+
+    pub(crate) fn wait_for_all_target(
+        &self,
+        wait_seconds: f64,
+        target: BridgeTarget,
+    ) -> Result<()> {
+        let required_channels = self.expected_channel_count();
+        if self.max_runtime_channel_coverage(target, None) < required_channels
+            && self.missing_ports_for_target(target).is_empty()
+        {
+            let _ = self.call_for_selector_with_timeout(
+                "cancelStudioChangeWait",
+                json!({}),
+                target,
+                None,
+                Some(Duration::from_secs(1)),
+            );
+        }
+        self.wait_for_target_channels(wait_seconds, target, required_channels)
     }
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -1419,10 +1457,11 @@ impl BridgeServer {
             return;
         };
         for channel in &self.channels {
-            let mut guard = channel
-                .sockets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = match channel.sockets.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
             for (role_key, socket) in guard.iter_mut() {
                 if Self::socket_matches_selector(role_key, socket, target, None)
                     && Self::socket_matches_runtime_pin(socket, &runtime_pin)

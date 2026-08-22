@@ -565,7 +565,7 @@ function BridgeConnection.create(context)
 		local now = os.clock()
 		local channelCount = math.max(#channels, 1)
 		local failures = math.max(0, tonumber(channel.reconnectFailureCount) or 0)
-		local period = if failures == 0 and channel.fastReconnectUntil > now
+		local period = if channel.fastReconnectUntil > now
 			then context.fastReconnectSeconds
 			else math.min((tonumber(context.reconnectSeconds) or 0.5) * 2 ^ math.max(failures - 1, 0), 8)
 		local target = channel.forcedReconnectAt

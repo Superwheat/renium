@@ -3,6 +3,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -392,6 +393,7 @@ pub(crate) fn run_stdio_proxy() -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
+    let stdout_gate = Arc::new(Mutex::new(()));
     loop {
         match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)? {
             BoundedLineRead::Eof => break,
@@ -400,26 +402,38 @@ pub(crate) fn run_stdio_proxy() -> Result<()> {
                 if trimmed.is_empty() {
                     continue;
                 }
-                let response = match serde_json::from_str::<super::Request>(trimmed) {
-                    Ok(request) => try_send_request(&request)?.unwrap_or_else(|| {
-                        transport_failure(
-                            request.id,
-                            anyhow::anyhow!("Renium daemon is not running"),
-                        )
-                    }),
-                    Err(error) => super::Response::failure(
-                        0,
-                        Instant::now(),
-                        super::Failure::new(
-                            "bad_req",
-                            format!("Invalid request JSON: {error}"),
-                            false,
-                            "cap",
+                let request = trimmed.to_string();
+                let stdout_gate = Arc::clone(&stdout_gate);
+                std::thread::spawn(move || {
+                    let response = match serde_json::from_str::<super::Request>(&request) {
+                        Ok(request) => match try_send_request(&request) {
+                            Ok(Some(response)) => response,
+                            Ok(None) => transport_failure(
+                                request.id,
+                                anyhow::anyhow!("Renium daemon is not running"),
+                            ),
+                            Err(error) => transport_failure(request.id, error),
+                        },
+                        Err(error) => super::Response::failure(
+                            0,
+                            Instant::now(),
+                            super::Failure::new(
+                                "bad_req",
+                                format!("Invalid request JSON: {error}"),
+                                false,
+                                "cap",
+                            ),
                         ),
-                    ),
-                };
-                std::println!("{}", serde_json::to_string(&response)?);
-                io::stdout().flush()?;
+                    };
+                    let Ok(response) = serde_json::to_string(&response) else {
+                        return;
+                    };
+                    let _guard = stdout_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::println!("{response}");
+                    let _ = io::stdout().flush();
+                });
             }
             BoundedLineRead::TooLong => {
                 let response = super::runtime::oversized_automation_request_response();

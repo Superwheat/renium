@@ -62,6 +62,7 @@ export type StudioChangeState = {
   eventDriven?: boolean;
   waitSeconds?: number;
   waitTimedOut?: boolean;
+  waitCancelled?: boolean;
   twoWaySyncEnabled?: boolean;
   runtimeSettingChanges?: Record<string, unknown>;
   runtimeSettingsSeq?: number;
@@ -138,7 +139,8 @@ function looksLikeStudioChangeState(record: Record<string, unknown>): boolean {
     || typeof record.trackedServices === "number"
     || typeof record.itemChangedAvailable === "boolean"
     || typeof record.eventDriven === "boolean"
-    || typeof record.waitTimedOut === "boolean";
+    || typeof record.waitTimedOut === "boolean"
+    || typeof record.waitCancelled === "boolean";
 }
 
 function studioChangeState(record: Record<string, unknown>): StudioChangeState {
@@ -191,6 +193,7 @@ function studioChangeState(record: Record<string, unknown>): StudioChangeState {
     eventDriven: typeof record.eventDriven === "boolean" ? record.eventDriven : undefined,
     waitSeconds: typeof record.waitSeconds === "number" ? record.waitSeconds : undefined,
     waitTimedOut: typeof record.waitTimedOut === "boolean" ? record.waitTimedOut : undefined,
+    waitCancelled: typeof record.waitCancelled === "boolean" ? record.waitCancelled : undefined,
     twoWaySyncEnabled: typeof record.twoWaySyncEnabled === "boolean" ? record.twoWaySyncEnabled : undefined,
     runtimeSettingChanges: recordValue(record.runtimeSettingChanges),
     runtimeSettingsSeq: typeof record.runtimeSettingsSeq === "number"

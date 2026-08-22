@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -517,7 +517,7 @@ fn automation_pull_operation(
     bridge_wait_seconds: f64,
 ) -> Result<(Value, PublishedProjectChanges)> {
     let target = BridgeTarget::Main;
-    bridge.wait_for_target(bridge_wait_seconds, target)?;
+    bridge.wait_for_all_target(bridge_wait_seconds, target)?;
     let info = bridge.cached_bridge_info_for_target(target)?;
     let args = automation_pull_args(context, parameters, true)?;
     let services = args.services.clone();
@@ -838,14 +838,14 @@ fn automation_dispatch_operation(
             .map(|(result, _)| result),
         op::EXPORT_SNAPSHOTS => {
             let target = BridgeTarget::Main;
-            bridge.wait_for_target(bridge_wait_seconds, target)?;
+            bridge.wait_for_all_target(bridge_wait_seconds, target)?;
             let info = bridge.cached_bridge_info_for_target(target)?;
             let args = automation_pull_args(context, parameters, false)?;
             export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
             Ok(json!({ "direction": "snapshots" }))
         }
         op::PUSH => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
+            bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let summary = push_editor_changes_with_warm_bridge(
                 automation_push_args(context, parameters, reviewed)?,
                 bridge,
@@ -1277,6 +1277,22 @@ fn automation_dispatch_managed(
                     .live_sync()
                     .reconcile_then_resume(context.id, published)
                     .map_err(automation_failure)?;
+            } else if operation == op::IMPORT_SNAPSHOTS {
+                match state.live_sync().capture(context, Some(&paths)) {
+                    Ok(Some(captured)) => {
+                        state
+                            .live_sync()
+                            .rebase_then_resume(context.id, captured)
+                            .map_err(automation_failure)?;
+                    }
+                    Ok(None) => {
+                        state.live_sync().resume(context.id, std::iter::empty());
+                    }
+                    Err(error) => {
+                        state.live_sync().resume(context.id, std::iter::empty());
+                        return Err(automation_failure(error));
+                    }
+                }
             } else {
                 state.live_sync().resume(context.id, std::iter::empty());
             }
@@ -1465,12 +1481,34 @@ fn automation_live_operation(
         }
         _ => state.live_sync().status(context.id),
     };
-    let plugin = {
+    let event_wait_seconds = object
+        .get("eventWaitSeconds")
+        .and_then(Value::as_f64)
+        .filter(|seconds| *seconds > 0.0);
+    let waits_for_change = matches!(operation, op::LIVE_START | op::LIVE_STATUS)
+        && event_wait_seconds.is_some()
+        && bridge.channel_count_for_target(BridgeTarget::Main) > 1;
+    let limited_parameters = event_wait_seconds.filter(|_| !waits_for_change).map(|_| {
+        let mut parameters = parameters.clone();
+        parameters["eventWaitSeconds"] = json!(0.15);
+        parameters
+    });
+    let dispatch_parameters = limited_parameters.as_ref().unwrap_or(parameters);
+    let plugin = if waits_for_change {
+        automation_dispatch_with_retry(
+            operation,
+            context,
+            dispatch_parameters,
+            bridge,
+            bridge_wait_seconds,
+            false,
+        )?
+    } else {
         let _gate = bridge.acquire_request_gate();
         automation_dispatch_with_retry(
             operation,
             context,
-            parameters,
+            dispatch_parameters,
             bridge,
             bridge_wait_seconds,
             false,
@@ -1821,12 +1859,13 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 
 pub(crate) fn run_automation_stdio(
     bridge: &Arc<BridgeServer>,
-    state: &automation::State,
+    state: &Arc<automation::State>,
     bridge_wait_seconds: f64,
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
+    let stdout_gate = Arc::new(Mutex::new(()));
     loop {
         match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)? {
             BoundedLineRead::Eof => break,
@@ -1835,10 +1874,22 @@ pub(crate) fn run_automation_stdio(
                 if trimmed.is_empty() {
                     continue;
                 }
-                let response =
-                    automation_parse_response(trimmed, state, bridge, bridge_wait_seconds);
-                std::println!("{}", serde_json::to_string(&response)?);
-                io::stdout().flush()?;
+                let request = trimmed.to_string();
+                let bridge = Arc::clone(bridge);
+                let state = Arc::clone(state);
+                let stdout_gate = Arc::clone(&stdout_gate);
+                std::thread::spawn(move || {
+                    let response =
+                        automation_parse_response(&request, &state, &bridge, bridge_wait_seconds);
+                    let Ok(response) = serde_json::to_string(&response) else {
+                        return;
+                    };
+                    let _guard = stdout_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::println!("{response}");
+                    let _ = io::stdout().flush();
+                });
             }
             BoundedLineRead::TooLong => {
                 let response = oversized_automation_request_response();

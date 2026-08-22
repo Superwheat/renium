@@ -298,7 +298,7 @@ function existingReniumSettingsFile(projectRoot: string, srcDir: string, service
   return path.join(serviceDir, SETTINGS_FILE_NAME);
 }
 const CLI_BINARY = reniumBinaryName();
-const MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS = 150;
+const MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS = 25_000;
 const MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS = 2000;
 const MAX_STUDIO_LIVE_SYNC_ERROR_POLL_MS = 5000;
 const STUDIO_LIVE_SYNC_POLL_BACKOFF_MULTIPLIER = 1.75;
@@ -2922,7 +2922,6 @@ class RobloxSyncController {
     }
     try {
       if (this.studioLiveSyncStarted) {
-        this.scheduleStudioLiveSyncPoll(cfg, this.resetStudioLiveSyncPollDelay(cfg));
         return;
       }
       const generation = ++this.studioLiveSyncGeneration;
@@ -2968,7 +2967,7 @@ class RobloxSyncController {
       }
       this.scheduleStudioLiveSyncPoll(
         runtimeCfg,
-        this.resetStudioLiveSyncPollDelay(runtimeCfg),
+        0,
         generation,
       );
     } catch (err) {
@@ -3056,10 +3055,6 @@ class RobloxSyncController {
     return currentDelayMs;
   }
 
-  private studioLiveSyncWaitSeconds(delayMs: number): number {
-    return Math.max(0.05, Math.min(MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS / 1000, delayMs / 1000));
-  }
-
   private scheduleStudioLiveSyncPoll(
     cfg: SyncConfig,
     delayMs: number,
@@ -3078,7 +3073,7 @@ class RobloxSyncController {
     ) {
       return;
     }
-    this.studioLiveSyncTimer = setTimeout(() => {
+    const run = (): void => {
       this.studioLiveSyncTimer = undefined;
       if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
         return;
@@ -3093,7 +3088,12 @@ class RobloxSyncController {
         this.output.appendLine(`[renium] Studio -> editor live sync failed: ${message}`);
         this.scheduleStudioLiveSyncPoll(latestCfg, nextDelayMs, generation);
       });
-    }, Math.max(MIN_STUDIO_LIVE_SYNC_POLL_MS, delayMs));
+    };
+    if (delayMs <= 0) {
+      queueMicrotask(run);
+    } else {
+      this.studioLiveSyncTimer = setTimeout(run, Math.max(MIN_STUDIO_LIVE_SYNC_POLL_MS, delayMs));
+    }
   }
 
   private async pollStudioLiveSync(generation: number): Promise<void> {
@@ -3116,10 +3116,9 @@ class RobloxSyncController {
     this.studioLiveSyncInFlightGenerations.add(generation);
     let nextDelayMs = this.studioLiveSyncBasePollDelayMs(cfg);
     try {
-      const idleWaitMs = this.nextStudioLiveSyncPollDelay(cfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       const state = await this.getStudioChangeState(cfg, cfg.services, {
-        start: true,
-        waitSeconds: this.studioLiveSyncWaitSeconds(idleWaitMs),
+        start: false,
+        waitSeconds: MAX_STUDIO_LIVE_SYNC_EVENT_WAIT_MS / 1000,
       });
       if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
         return;
@@ -3153,7 +3152,7 @@ class RobloxSyncController {
         (state.editorActions ?? []).map((action) => action.id ?? "").sort(),
       ]);
       if (importableServices.length > 0) {
-        nextDelayMs = this.resetStudioLiveSyncPollDelay(runtimeCfg);
+        nextDelayMs = state.eventDriven === true ? 0 : this.resetStudioLiveSyncPollDelay(runtimeCfg);
         const ackObservedDirty = studioChangeAckOptions(observedSeq, state.runtimeId);
         let propertyImport: "applied" | "fallback" | "pending" = "fallback";
         try {
@@ -3169,6 +3168,7 @@ class RobloxSyncController {
           this.output.appendLine(`[renium] Studio -> editor property fast path failed: ${message}`);
         }
         if (propertyImport === "pending") {
+          nextDelayMs = this.nextStudioLiveSyncPollDelay(runtimeCfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
           return;
         }
         if (generation !== this.studioLiveSyncGeneration || !this.studioLiveSyncStarted) {
@@ -3189,7 +3189,7 @@ class RobloxSyncController {
         nextDelayMs = this.nextStudioLiveSyncPollDelay(runtimeCfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       } else {
         nextDelayMs = state.eventDriven === true
-          ? MIN_STUDIO_LIVE_SYNC_POLL_MS
+          ? state.waitCancelled === true ? 50 : 0
           : this.nextStudioLiveSyncPollDelay(runtimeCfg, MAX_STUDIO_LIVE_SYNC_IDLE_POLL_MS);
       }
     } catch (err) {
@@ -3274,11 +3274,14 @@ class RobloxSyncController {
         ...(typeof options.suppressSeconds === "number" && Number.isFinite(options.suppressSeconds) && options.suppressSeconds > 0
           ? { suppressSeconds: Math.max(0.05, options.suppressSeconds) }
           : {}),
-        ...(useEventWait ? { waitSeconds: Math.max(0.05, Math.min(25, options.waitSeconds ?? 0)) } : {}),
-        manageFiles: operation === AUTOMATION_OP.liveStart && this.daemonFileSyncEnabled,
+        ...(useEventWait ? { eventWaitSeconds: Math.max(0.05, Math.min(25, options.waitSeconds ?? 0)) } : {}),
+        manageFiles: false,
         contextBound: true,
       },
-      { quietWait: true },
+      {
+        quietWait: true,
+        ...(useEventWait ? { timeoutMs: Math.ceil((options.waitSeconds ?? 0) * 1000) + 3_000 } : {}),
+      },
     );
     if (result.code !== 0) {
       throw new Error(`Studio change state exited with code ${result.code}`);
@@ -3451,10 +3454,6 @@ class RobloxSyncController {
     const cfg = this.tryGetConfig();
     if (!cfg || this.experienceChangeInProgress) {
       this.scheduleDaemonFileSyncStatusPoll();
-      return;
-    }
-    if (cfg.studioLiveSyncEnabled && this.studioLiveSyncStarted) {
-      this.scheduleDaemonFileSyncStatusPoll(2000);
       return;
     }
     this.daemonFileSyncStatusInFlight = true;
@@ -5193,6 +5192,9 @@ class RobloxSyncController {
     if (filesystemPathKey(projectRoot) !== filesystemPathKey(cfg.projectRoot)) {
       return false;
     }
+    if (options.force === true && !this.canUseStudioPushPipeline()) {
+      await this.serve({ silent: true });
+    }
     if (!options.force && !this.isEditorLiveSyncActive()) {
       this.disposeLiveSyncRuntime();
       this.updateStatusBar();
@@ -5314,6 +5316,9 @@ class RobloxSyncController {
   }
 
   public async pushEditorPropertyNow(request: EditorPropertyPushRequest): Promise<EditorPushOutcome> {
+    if (request.force === true && !this.canUseStudioPushPipeline()) {
+      await this.serve({ silent: true });
+    }
     const context = this.prepareDirectEditorPush(request);
     if (!context) {
       return "skipped";
@@ -5372,6 +5377,9 @@ class RobloxSyncController {
   }
 
   public async pushEditorDeleteNow(request: EditorDeletePushRequest): Promise<EditorPushOutcome> {
+    if (request.force === true && !this.canUseStudioPushPipeline()) {
+      await this.serve({ silent: true });
+    }
     const context = this.prepareDirectEditorPush(request);
     if (!context) {
       return "skipped";
@@ -5940,6 +5948,7 @@ class RobloxSyncController {
       {
         snapshotDir: snapshotPath,
         services: selectedServices,
+        noProjectWrite: true,
       },
       { quietWait: quietLog },
     );

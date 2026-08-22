@@ -253,7 +253,7 @@ export class AutomationClient {
     if (this.context?.key === key) {
       return this.context.id;
     }
-    const deadline = Date.now() + editorBridgeWaitSeconds(config) * 1_000;
+    const deadline = Date.now() + editorBridgeWaitSeconds(config) * 1_000 + 2_000;
     while (true) {
       const bound = await this.send(
         config,
@@ -389,7 +389,10 @@ export class AutomationClient {
   ): number {
     if (op === AUTOMATION_OP.liveStatus) {
       const bridgeWaitMs = (Math.max(1, Number(config.bridgeWaitSeconds) || 1) + 3) * 1000;
-      return Math.max(5_000, Math.min(MAX_CHANNEL_WAIT_MS, bridgeWaitMs));
+      return Math.max(
+        5_000,
+        Math.min(MAX_CHANNEL_WAIT_MS, Math.max(bridgeWaitMs, Math.floor(requestedTimeoutMs ?? 0))),
+      );
     }
     return Math.max(
       1_000,

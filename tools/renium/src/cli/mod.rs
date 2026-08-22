@@ -1456,6 +1456,8 @@ pub(super) struct BytecodeExplorerBatchOp {
 pub(super) struct BytecodeAddInstanceArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
+    #[arg(skip)]
+    pub(super) service_hint: Option<String>,
     #[arg(short, long)]
     pub(super) name: String,
     #[arg(short, long, alias = "class")]

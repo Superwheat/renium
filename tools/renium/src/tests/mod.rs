@@ -2675,7 +2675,7 @@ fn missing_store_lock_error_is_actionable() {
 }
 
 #[test]
-fn bytecode_remove_instance_removes_source_files_and_empty_dirs() {
+fn bytecode_remove_instance_removes_source_files_and_keeps_service_store() {
     let dir = temp_dir("remove-source-files");
     let service_dir = dir.join("src").join("ReplicatedStorage");
     fs::create_dir_all(&service_dir).unwrap();
@@ -2703,8 +2703,9 @@ fn bytecode_remove_instance_removes_source_files_and_empty_dirs() {
 
     assert!(!source_path.exists());
     assert!(!service_dir.join("Pkg").exists());
-    assert!(!settings_path.exists());
-    assert!(!service_dir.exists());
+    let remaining = SettingsBytecode::read_file(&settings_path).unwrap();
+    assert_eq!(remaining.instances.len(), 1);
+    assert_eq!(remaining.instances[0].name, "ReplicatedStorage");
     fs::remove_dir_all(dir).unwrap();
 }
 

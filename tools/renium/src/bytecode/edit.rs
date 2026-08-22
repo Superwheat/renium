@@ -28,14 +28,14 @@ use crate::settings::bytecode::{
     encode_settings_bytecode, settings_reference_index, strict_reference_path,
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
-use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
+use crate::settings::tree::settings_children_by_parent;
 use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key, path_key};
 
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
-        None,
+        args.service_hint.as_deref(),
     )?;
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
@@ -859,9 +859,7 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     removals.sort_by_key(|path| path_key(path));
     removals.dedup_by(|left, right| path_key(left) == path_key(right));
     let removed_source_paths = removals.clone();
-    let removed_settings_file = document.instances.is_empty()
-        || (document.instances.len() == 1
-            && editor_service_root_index(&document, &service).is_some());
+    let removed_settings_file = document.instances.is_empty();
     if removed_settings_file {
         removals.push(settings_file.clone());
     } else {
