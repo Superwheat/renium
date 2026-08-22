@@ -411,6 +411,7 @@ fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer
 }
 
 pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
+    args.changed_paths.append(&mut args.paths);
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let incremental = !args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()

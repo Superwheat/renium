@@ -112,10 +112,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("lst", "Examples:\n  rbx lst"),
     ("rp", "Examples:\n  rbx rp"),
     ("dp", "Examples:\n  rbx dp"),
-    (
-        "ps",
-        "Examples:\n  rbx ps --changed-path src/StarterGui/Menu.client.luau",
-    ),
+    ("ps", "Examples:\n  rbx ps src/StarterGui/Menu.client.luau"),
     (
         "prop",
         "Examples:\n  rbx prop --service Workspace --path-segments-json '[\"Door\"]' --property Name --value-json '\"Gate\"'",

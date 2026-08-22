@@ -75,7 +75,14 @@ export function ensureReniumAgentInstructions(
     write(projectGuide, packagedGuideContents);
     const projectTopics = path.join(projectRoot, "RENIUM");
     fs.mkdirSync(projectTopics, { recursive: true });
-    for (const name of fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort()) {
+    const topicNames = fs.readdirSync(topicSource).filter((name) => name.endsWith(".md")).sort();
+    for (const name of fs.readdirSync(projectTopics).filter((name) => name.endsWith(".md"))) {
+      if (!topicNames.includes(name)) {
+        fs.rmSync(path.join(projectTopics, name));
+        written.push(path.join(projectTopics, name));
+      }
+    }
+    for (const name of topicNames) {
       write(path.join(projectTopics, name), fs.readFileSync(path.join(topicSource, name)));
     }
   }

@@ -35,6 +35,7 @@ const STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STATE_VERSION: u8 = 1;
 const STATE_FILE: &str = "live-watch-state.rmp.zst";
 const STATE_JOURNAL_FILE: &str = "live-watch-state.journal";
+const ENABLED_FILE: &str = "live-watch-state.enabled";
 const STATE_JOURNAL_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +517,25 @@ impl Manager {
             .map_or_else(|| json!({ "running": false }), |control| control.snapshot())
     }
 
+    pub(crate) fn is_enabled(&self, context: &BoundContext) -> bool {
+        enabled_path(context).is_file()
+    }
+
+    pub(crate) fn set_enabled(&self, context: &BoundContext, enabled: bool) -> Result<()> {
+        let path = enabled_path(context);
+        if enabled {
+            atomic_write_file(&path, b"1")
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("Failed to remove {}", path.display()))
+                }
+            }
+        }
+    }
+
     pub(crate) fn retry(&self, context_id: u64) -> Value {
         if let Some(control) = self.control(context_id) {
             control.retry();
@@ -651,6 +671,10 @@ impl Manager {
     pub(crate) fn cancel(&self, context_id: u64) {
         self.stop(context_id);
     }
+}
+
+fn enabled_path(context: &BoundContext) -> PathBuf {
+    Path::new(&context.root).join(".renium").join(ENABLED_FILE)
 }
 
 struct WatchProject {

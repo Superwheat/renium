@@ -26,6 +26,14 @@
 - Multipart uploads and asset-version rollbacks send files and form fields in the formats Roblox expects.
 - Public read operations can use `--anonymous`; authenticated permission failures remain visible instead of silently retrying under a different identity.
 
+### Live Sync and agent commands
+
+- Live Sync remains enabled when the shared daemon is replaced and resumes when the project is used again.
+- Agents can rely on Live Sync after an edit instead of sending the same change with a separate push command.
+- One-off file pushes accept paths directly, such as `rbx ps src/StarterGui/Menu.client.luau`.
+- Successful push commands return only useful results instead of repeating paths, targets, direction, and selection details from the command.
+- Project agent guides refresh when their contents change, including changes published under the same Renium version.
+
 ## 0.2.8 - 2026-08-22
 
 ### Live sync
