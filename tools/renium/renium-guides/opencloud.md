@@ -10,6 +10,8 @@ rbx oc key
 
 Use `--key-env ENV` when a task needs a different key. A dedicated group key is normally stored in its own environment variable. Renium doesn't widen a key's access or retry with another credential.
 
+Public reads can skip credentials with `--anonymous`, for example `rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Model`. Renium never falls back from authenticated to anonymous access.
+
 The universe and place come from the current Renium project. Outside one, add `--universe ID` and, when needed, `--place-id ID` before the resource name.
 
 ## Native Open Cloud operations

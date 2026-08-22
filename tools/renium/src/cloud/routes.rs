@@ -64,7 +64,7 @@ enum Target {
 #[derive(Clone, Copy)]
 enum BodyMode {
     Json(Option<&'static str>),
-    Multipart(&'static str),
+    Multipart(Option<&'static str>),
     Raw(&'static str),
 }
 
@@ -174,7 +174,7 @@ const fn path_body(
     }
 }
 
-const fn asset_version(
+const fn asset_version_form(
     label: &'static str,
     asset_parameter: &'static str,
     field: &'static str,
@@ -231,8 +231,26 @@ macro_rules! route {
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], page $limit:literal, $cursor:literal) => {
         route!(@make $category, $action, $method, $path, [$($operand),*], [], Some($limit), Some($cursor), BodyMode::Json(None))
     };
+    ($category:literal, $action:literal, $method:literal, $path:literal, limit $limit:literal) => {
+        route!(@make $category, $action, $method, $path, [], [], Some($limit), None, BodyMode::Json(None))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], limit $limit:literal) => {
+        route!(@make $category, $action, $method, $path, [$($operand),*], [], Some($limit), None, BodyMode::Json(None))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, cursor $cursor:literal) => {
+        route!(@make $category, $action, $method, $path, [], [], None, Some($cursor), BodyMode::Json(None))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], cursor $cursor:literal) => {
+        route!(@make $category, $action, $method, $path, [$($operand),*], [], None, Some($cursor), BodyMode::Json(None))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, multipart) => {
+        route!(@make $category, $action, $method, $path, [], [], None, None, BodyMode::Multipart(None))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], multipart) => {
+        route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Multipart(None))
+    };
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], multipart $part:literal) => {
-        route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Multipart($part))
+        route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Multipart(Some($part)))
     };
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], json $content_type:literal) => {
         route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Json(Some($content_type)))
@@ -405,7 +423,7 @@ static ROUTES: &[Route] = &[
         "/cloud/v2/universes/{universe}/memory-store/queues/{queue_id}/items",
         [path("QUEUE", "queue_id"), body("VALUE", "data")]
     ),
-    route!("memory", "queue-read", "GET", "/cloud/v2/universes/{universe}/memory-store/queues/{queue_id}/items:read", [path("QUEUE", "queue_id")], page "count", "pageToken"),
+    route!("memory", "queue-read", "GET", "/cloud/v2/universes/{universe}/memory-store/queues/{queue_id}/items:read", [path("QUEUE", "queue_id")], limit "count"),
     route!(
         "memory",
         "queue-discard",
@@ -694,7 +712,8 @@ static ROUTES: &[Route] = &[
         "advertising",
         "billing",
         "GET",
-        "/ads-management/v1/billing-accounts"
+        "/ads-management/v1/billing-accounts",
+        page "maxPageSize", "pageToken"
     ),
     route!(
         "advertising",
@@ -713,7 +732,8 @@ static ROUTES: &[Route] = &[
         "advertising",
         "campaigns",
         "GET",
-        "/ads-management/v1/campaigns"
+        "/ads-management/v1/campaigns",
+        page "maxPageSize", "pageToken"
     ),
     route!(
         "advertising",
@@ -745,7 +765,8 @@ static ROUTES: &[Route] = &[
         "advertising",
         "creatives",
         "GET",
-        "/ads-management/v1/creatives"
+        "/ads-management/v1/creatives",
+        page "maxPageSize", "pageToken"
     ),
     route!(
         "analytics",
@@ -798,7 +819,8 @@ static ROUTES: &[Route] = &[
         "badge",
         "create",
         "POST",
-        "/legacy-badges/v1/universes/{universe}/badges"
+        "/legacy-badges/v1/universes/{universe}/badges",
+        multipart
     ),
     route!(
         "badge",
@@ -812,13 +834,15 @@ static ROUTES: &[Route] = &[
         "icon",
         "POST",
         "/legacy-publish/v1/badges/{badgeId}/icon",
-        [path("BADGE", "badgeId"), file("FILE", "Files")]
+        [path("BADGE", "badgeId"), file("FILE", "Files")],
+        multipart
     ),
     route!(
         "experiment",
         "list",
         "GET",
-        "/creator-configs-public-api/v1/experimentation/universes/{universe}/experiments"
+        "/creator-configs-public-api/v1/experimentation/universes/{universe}/experiments",
+        limit "maxPageSize"
     ),
     route!(
         "experiment",
@@ -892,7 +916,8 @@ static ROUTES: &[Route] = &[
         "event",
         "list",
         "GET",
-        "/virtual-events/v3/universes/{universe}/game-events"
+        "/virtual-events/v3/universes/{universe}/game-events",
+        page "pageSize", "pageToken"
     ),
     route!(
         "event",
@@ -978,7 +1003,8 @@ static ROUTES: &[Route] = &[
         "matchmaking",
         "shutdown-all",
         "POST",
-        "/matchmaking-api/v1/game-instances/shutdown-all"
+        "/matchmaking-api/v1/game-instances/shutdown-all",
+        multipart
     ),
     route!(
         "matchmaking",
@@ -1132,7 +1158,8 @@ static ROUTES: &[Route] = &[
         "thumbnail",
         "personalization",
         "GET",
-        "/thumbnail-personalization-api/v1/universes/{universe}/personalization"
+        "/thumbnail-personalization-api/v1/universes/{universe}/personalization",
+        page "limit", "cursor"
     ),
     route!(
         "thumbnail",
@@ -1150,7 +1177,8 @@ static ROUTES: &[Route] = &[
         "thumbnail",
         "list",
         "GET",
-        "/thumbnail-personalization-api/v1/universes/{universe}/thumbnails"
+        "/thumbnail-personalization-api/v1/universes/{universe}/thumbnails",
+        page "limit", "nextCursor"
     ),
     route!(
         "thumbnail",
@@ -1162,7 +1190,9 @@ static ROUTES: &[Route] = &[
         "thumbnail",
         "upload",
         "POST",
-        "/thumbnail-personalization-api/v1/universes/{universe}/thumbnails/uploads"
+        "/thumbnail-personalization-api/v1/universes/{universe}/thumbnails/uploads",
+        [file("FILE", "files")],
+        multipart
     ),
     route!(
         "thumbnail",
@@ -1190,7 +1220,8 @@ static ROUTES: &[Route] = &[
         "asset-quotas",
         "GET",
         "/cloud/v2/users/{user_id}/asset-quotas",
-        [path("USER", "user_id")]
+        [path("USER", "user_id")],
+        page "maxPageSize", "pageToken"
     ),
     route!(
         "user",
@@ -1425,7 +1456,8 @@ static ROUTES: &[Route] = &[
             path("BADGE", "badge_id"),
             path("LANGUAGE", "language"),
             file("FILE", "Files")
-        ]
+        ],
+        multipart
     ),
     route!(
         "localization",
@@ -1498,7 +1530,8 @@ static ROUTES: &[Route] = &[
             path("PRODUCT", "product_id"),
             path("LANGUAGE", "language"),
             file("FILE", "Files")
-        ]
+        ],
+        multipart
     ),
     route!(
         "localization",
@@ -1571,7 +1604,8 @@ static ROUTES: &[Route] = &[
             path("PASS", "pass_id"),
             path("LANGUAGE", "language"),
             file("FILE", "Files")
-        ]
+        ],
+        multipart
     ),
     route!(
         "localization",
@@ -1628,7 +1662,8 @@ static ROUTES: &[Route] = &[
         "game-icon-set",
         "POST",
         "/legacy-game-internationalization/v1/game-icon/games/{universe}/language-codes/{language}",
-        [path("LANGUAGE", "language"), file("FILE", "Files")]
+        [path("LANGUAGE", "language"), file("FILE", "Files")],
+        multipart
     ),
     route!(
         "localization",
@@ -1653,7 +1688,8 @@ static ROUTES: &[Route] = &[
         "thumbnail-image",
         "POST",
         "/legacy-game-internationalization/v1/game-thumbnails/games/{universe}/language-codes/{language}/image",
-        [path("LANGUAGE", "language"), file("FILE", "Files")]
+        [path("LANGUAGE", "language"), file("FILE", "Files")],
+        multipart
     ),
     route!(
         "localization",
@@ -1766,7 +1802,7 @@ static ROUTES: &[Route] = &[
         "/legacy-localization-tables/v1/localization-table/tables/{table_id}",
         [path("TABLE", "table_id")]
     ),
-    route!("localization", "entries", "GET", "/legacy-localization-tables/v1/localization-table/tables/{table_id}/entries", [path("TABLE", "table_id")], page "limit", "cursor"),
+    route!("localization", "entries", "GET", "/legacy-localization-tables/v1/localization-table/tables/{table_id}/entries", [path("TABLE", "table_id")], cursor "cursor"),
     route!(
         "localization",
         "entry-history",
@@ -1846,8 +1882,9 @@ static ROUTES: &[Route] = &[
         "/assets/v1/assets/{assetId}/versions:rollback",
         [
             path("ASSET", "assetId"),
-            asset_version("VERSION", "assetId", "assetVersion")
-        ]
+            asset_version_form("VERSION", "assetId", "assetVersion")
+        ],
+        multipart
     ),
     route!(
         "asset",
@@ -1874,7 +1911,8 @@ static ROUTES: &[Route] = &[
         "asset",
         "search",
         "GET",
-        "/toolbox-service/v2/assets:search"
+        "/toolbox-service/v2/assets:search",
+        page "maxPageSize", "pageToken"
     ),
     route!(
         "asset",
@@ -1910,7 +1948,7 @@ static ROUTES: &[Route] = &[
         "/cloud/v2/creator-store-products/{creator_store_product_id}",
         [path("PRODUCT", "creator_store_product_id")]
     ),
-    route!("creator-store", "saves", "GET", "/toolbox-service/v1/saves"),
+    route!("creator-store", "saves", "GET", "/toolbox-service/v1/saves", limit "limit"),
     route!(
         "creator-store",
         "save-create",
@@ -1948,14 +1986,16 @@ static ROUTES: &[Route] = &[
         "create",
         "POST",
         "/game-passes/v1/universes/{universe}/game-passes",
-        [form("NAME", "name")]
+        [form("NAME", "name")],
+        multipart
     ),
     route!(
         "pass",
         "update",
         "PATCH",
         "/game-passes/v1/universes/{universe}/game-passes/{gamePassId}",
-        [path("PASS", "gamePassId")]
+        [path("PASS", "gamePassId")],
+        multipart
     ),
     route!(
         "config",
@@ -2006,7 +2046,7 @@ static ROUTES: &[Route] = &[
         "/creator-configs-public-api/v1/configs/universes/{universe}/repositories/{repository}/publish",
         [path("REPOSITORY", "repository")]
     ),
-    route!("config", "revisions", "GET", "/creator-configs-public-api/v1/configs/universes/{universe}/repositories/{repository}/revisions", [path("REPOSITORY", "repository")], page "limit", "cursor"),
+    route!("config", "revisions", "GET", "/creator-configs-public-api/v1/configs/universes/{universe}/repositories/{repository}/revisions", [path("REPOSITORY", "repository")], limit "MaxPageSize"),
     route!(
         "config",
         "restore",
@@ -2048,7 +2088,12 @@ static ROUTES: &[Route] = &[
         ]
     ),
     route!("luau", "logs", "GET", "/cloud/v2/universes/{universe}/places/{place}/versions/{version_id}/luau-execution-sessions/{session_id}/tasks/{task_id}/logs", [path("VERSION", "version_id"), path("SESSION", "session_id"), path("TASK", "task_id")], page "maxPageSize", "pageToken"),
-    route!("server", "restarts", "GET", "/server-management/v1/universes/{universe}/restarts", page "pageSize", "pageToken"),
+    route!(
+        "server",
+        "restarts",
+        "GET",
+        "/server-management/v1/universes/{universe}/restarts"
+    ),
     route!(
         "server",
         "restart",
@@ -2067,8 +2112,8 @@ static ROUTES: &[Route] = &[
         "GET",
         "/server-management/v1/universes/{universe}/places/{place}/game-servers:filter-options"
     ),
-    route!("server", "list", "GET", "/server-management/v1/universes/{universe}/places/{place}/versions/{version}/game-servers", [path("VERSION", "version")], page "pageSize", "pageToken"),
-    route!("server", "logs", "GET", "/server-management/v1/universes/{universe}/places/{place}/versions/{version}/game-servers/{job}/logs", [path("VERSION", "version"), path("JOB", "job")], page "pageSize", "pageToken"),
+    route!("server", "list", "GET", "/server-management/v1/universes/{universe}/places/{place}/versions/{version}/game-servers", [path("VERSION", "version")], page "MaxPageSize", "PageToken"),
+    route!("server", "logs", "GET", "/server-management/v1/universes/{universe}/places/{place}/versions/{version}/game-servers/{job}/logs", [path("VERSION", "version"), path("JOB", "job")], page "MaxPageSize", "PageToken"),
 ];
 
 pub(super) fn run(
@@ -2076,11 +2121,12 @@ pub(super) fn run(
     identity: CloudIdentity,
     key_env: &str,
     oauth_env: Option<&str>,
+    anonymous: bool,
     args: RouteArgs,
 ) -> Result<Value> {
     let request = build_request(category, identity, args)?;
     let response =
-        execute_one(identity, key_env, oauth_env, false, request).map_err(cloud_error)?;
+        execute_one(identity, key_env, oauth_env, anonymous, request).map_err(cloud_error)?;
     compact_response(response)
 }
 
@@ -2097,7 +2143,7 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
             .collect::<Vec<_>>()
             .join(" ");
         bail!(
-            "Expected: rbx cloud {} {}{}",
+            "Expected: rbx oc {} {}{}",
             route.category,
             route.action,
             if usage.is_empty() {
@@ -2174,9 +2220,15 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
         parts.query.insert(name.to_string(), Value::String(cursor));
     }
     if let Some(filter) = args.filter {
-        parts
-            .query
-            .insert("filter".to_string(), Value::String(filter));
+        parts.query.insert(
+            if route.category == "server" {
+                "Filter"
+            } else {
+                "filter"
+            }
+            .to_string(),
+            Value::String(filter),
+        );
     }
     parts.files.extend(assignments(&args.file)?);
     for value in parts.files.values_mut() {
@@ -2220,7 +2272,11 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
                 bail!("This operation requires multipart files, not a raw file");
             }
             let mut json_parts = Map::new();
-            json_parts.insert(part.to_string(), Value::Object(parts.body));
+            if let Some(part) = part {
+                json_parts.insert(part.to_string(), Value::Object(parts.body));
+            } else if !parts.body.is_empty() {
+                bail!("This operation uses --form and --file, not --field");
+            }
             (None, json_parts, None)
         }
         BodyMode::Raw(content_type) => {
@@ -2356,11 +2412,10 @@ fn assign_target(target: Target, value: Value, parts: &mut RequestParts) -> Resu
                 .with_context(|| format!("{asset_parameter} must be supplied first"))?;
             let version = scalar_string(value);
             let version = version.as_str().context("asset version must be a scalar")?;
-            insert_nested(
-                &mut parts.body,
-                field,
+            parts.form.insert(
+                field.to_string(),
                 Value::String(format!("assets/{asset}/versions/{version}")),
-            )?;
+            );
         }
     }
     Ok(())
@@ -2509,6 +2564,33 @@ mod tests {
                     route.action
                 );
             }
+
+            let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            let values = route
+                .operands
+                .iter()
+                .map(|operand| match operand.target {
+                    Target::File(_) | Target::RawFile => file.display().to_string(),
+                    Target::RootBody => "true".to_string(),
+                    _ => "1".to_string(),
+                })
+                .collect::<Vec<_>>();
+            let mut request = args(route.action, &[]);
+            request.values = values;
+            build_request(
+                route.category,
+                CloudIdentity {
+                    game_id: Some(1),
+                    place_id: Some(1),
+                },
+                request,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} {} could not build: {error:#}",
+                    route.category, route.action
+                )
+            });
         }
     }
 
@@ -2571,9 +2653,51 @@ mod tests {
         );
 
         let request = build_request("asset", identity, args("rollback", &["99", "3"])).unwrap();
+        assert_eq!(request["body"], Value::Null);
+        assert_eq!(request["form"]["assetVersion"], "assets/99/versions/3");
+
+        let mut search = args("search", &[]);
+        search.limit = Some(25);
+        search.cursor = Some("next".to_string());
+        let request = build_request("asset", identity, search).unwrap();
         assert_eq!(
-            request["body"],
-            json!({"assetVersion":"assets/99/versions/3"})
+            request["query"],
+            json!({"maxPageSize":25,"pageToken":"next"})
+        );
+
+        let mut servers = args("list", &["7"]);
+        servers.limit = Some(10);
+        servers.cursor = Some("page".to_string());
+        servers.filter = Some("State=Running".to_string());
+        let request = build_request("server", identity, servers).unwrap();
+        assert_eq!(
+            request["query"],
+            json!({"MaxPageSize":10,"PageToken":"page","Filter":"State=Running"})
+        );
+
+        let mut revisions = args("revisions", &["flags"]);
+        revisions.limit = Some(20);
+        let request = build_request("config", identity, revisions).unwrap();
+        assert_eq!(request["query"], json!({"MaxPageSize":20}));
+
+        let mut queue = args("queue-read", &["jobs"]);
+        queue.limit = Some(30);
+        let request = build_request("memory", identity, queue).unwrap();
+        assert_eq!(request["query"], json!({"count":30}));
+
+        let mut badge = args("create", &[]);
+        badge.form = vec!["name=Example".to_string()];
+        let request = build_request("badge", identity, badge).unwrap();
+        assert_eq!(request["form"], json!({"name":"Example"}));
+        assert_eq!(request["body"], Value::Null);
+
+        let mut badge = args("create", &[]);
+        badge.field = vec!["name=Example".to_string()];
+        assert!(
+            build_request("badge", identity, badge)
+                .unwrap_err()
+                .to_string()
+                .contains("--form and --file")
         );
 
         let mut permissions = args("permissions", &[]);

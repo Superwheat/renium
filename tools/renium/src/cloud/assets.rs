@@ -34,9 +34,8 @@ struct AssetSearch {
     verified_creators_only: Option<bool>,
     min_price_cents: Option<u64>,
     max_price_cents: Option<u64>,
-    price_filter: Option<String>,
-    audio_min_duration: Option<f64>,
-    audio_max_duration: Option<f64>,
+    audio_min_duration: Option<u32>,
+    audio_max_duration: Option<u32>,
     #[serde(default = "default_key_env")]
     key_env: String,
     oauth_env: Option<String>,
@@ -201,7 +200,7 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
                 .append_pair("query", &request.query)
                 .append_pair("maxPageSize", &max_results.to_string());
             if let Some(cursor) = request.cursor.as_deref() {
-                url.query_pairs_mut().append_pair("cursor", cursor);
+                url.query_pairs_mut().append_pair("pageToken", cursor);
             }
             for facet in &request.facets {
                 url.query_pairs_mut().append_pair("facets", facet);
@@ -211,7 +210,7 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
             }
             for (name, value) in [
                 (
-                    "verifiedCreatorsOnly",
+                    "includeOnlyVerifiedCreators",
                     request.verified_creators_only.map(Value::Bool),
                 ),
                 (
@@ -222,13 +221,12 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
                     "maxPriceCents",
                     request.max_price_cents.map(|value| json!(value)),
                 ),
-                ("priceFilter", request.price_filter.map(Value::String)),
                 (
-                    "audioMinDuration",
+                    "audioMinDurationSeconds",
                     request.audio_min_duration.map(|value| json!(value)),
                 ),
                 (
-                    "audioMaxDuration",
+                    "audioMaxDurationSeconds",
                     request.audio_max_duration.map(|value| json!(value)),
                 ),
             ] {

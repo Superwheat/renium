@@ -303,10 +303,7 @@ fn run_route(
     anonymous: bool,
     route: super::routes::RouteArgs,
 ) -> Result<Value> {
-    if anonymous {
-        bail!("Native Open Cloud commands require API key or OAuth authentication");
-    }
-    super::routes::run(category, identity, key_env, oauth_env, route)
+    super::routes::run(category, identity, key_env, oauth_env, anonymous, route)
 }
 
 fn discover_identity(

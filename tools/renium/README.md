@@ -561,7 +561,9 @@ variable. Credentials aren't accepted in payloads or command arguments.
 without printing the credential. User-owned keys, keys stored for dedicated
 group automation accounts, and resource-restricted keys use the same commands;
 Roblox enforces their owner permissions, scopes, and target restrictions. Use
-`--key-env ENV` to select another stored API key.
+`--key-env ENV` to select another stored API key. Public reads can use
+`--anonymous`; Renium doesn't fall back to anonymous access after an authenticated
+request is denied.
 Native resource commands cover data and memory stores, universes and places,
 messages and servers, restrictions, secrets, notifications, users and
 inventories, groups, social interactions, Team Create, assets, passes, Creator
