@@ -13,9 +13,9 @@ Prefer this order:
 
 ```powershell
 # High-level first.
-rbx find Workspace -c Script --limit 5
-rbx tree Workspace Name --depth 2
-rbx inspect Workspace -i editor:id
+rbx f Workspace -c Script --limit 5
+rbx tr Workspace Name --depth 2
+rbx in Workspace -i editor:id
 
 # Low-level (bb).
 rbx bb Workspace -j '{"ops":[{"type":"counts"},{"type":"search","q":"text","limit":5,"fields":"lookup"},{"type":"children","id":"editor:id","fields":"tree"}]}'
@@ -23,9 +23,9 @@ rbx bb Workspace -j '{"ops":[{"type":"instance","id":"editor:id","fields":"brief
 ```
 
 ```text
-find    = locate ids by name/class
-tree    = browse descendants
-inspect = one high-level node read
+f       = locate ids by name/class
+tr      = browse descendants
+in      = one high-level node read
 bb      = low-level reads, properties, duplicate paths, batches
 write   = only after stable id/path
 ```
@@ -43,18 +43,15 @@ rbx bb Workspace -j '{"ops":[{"type":"instance","path":["Workspace","A"],"ords":
 rbx bb Workspace -j '{"ops":[{"type":"instance","id":"editor:id","fields":"brief,prop:Name,attr:Tags"}]}'
 
 # Locate -> read -> mutate.
-rbx find Workspace -n VipMan --limit 5
+rbx f Workspace -n VipMan --limit 5
 rbx bb Workspace -j '{"ops":[{"type":"instance","id":"editor:id","fields":"brief,prop:Name"}]}'
 rbx bs Workspace -i editor:id -p DisplayName --str "VIP Man"
 ```
 
-Messy JSON quoting: temp ops file.
+For a larger batch, pipe the query instead of creating a payload file.
 
 ```powershell
-@'
-{"ops":[{"type":"counts"},{"type":"search","q":"text","limit":5,"fields":"lookup"}]}
-'@ | Set-Content .\ai-ops.json
-rbx bb Workspace -J .\ai-ops.json
+'{"ops":[{"type":"counts"},{"type":"search","q":"text","limit":5,"fields":"lookup"}]}' | rbx bb Workspace -J -
 ```
 
 Fields:
@@ -82,7 +79,7 @@ Op aliases: `type|op`, `requestId|rid`, `q|query`, `limit|l`, `id|settingsId`,
 
 ```powershell
 rbx play -s --players 2        # 1 server + 2 clients
-rbx clients                    # list bridges (role, player, place)
+rbx cs                         # list bridges (role, player, place)
 rbx lx --player 2 -e "code"    # run on one client (name|index)
 rbx co --player 2 -n 20        # client console
 rbx play -x                    # end test
@@ -96,16 +93,16 @@ Luau execution returns values and captured output; compile errors, runtime error
 Use Studio's plugin-level simulator directly. No keyboard, mouse, focus, coordinates, or ribbon interaction is needed.
 
 ```powershell
-rbx device list
-rbx device set "iPhone 16 Pro" --orientation portrait
-rbx device set --scaling fit
-rbx device set --resolution 1179x2556 --pixel-density 460
-rbx device status
-rbx shot --studio -o iphone-16-pro.png
-rbx device stop
+rbx dev list
+rbx dev set "iPhone 16 Pro" --orientation portrait
+rbx dev set --scaling fit
+rbx dev set --resolution 1179x2556 --pixel-density 460
+rbx dev status
+rbx sc --studio -o iphone-16-pro.png
+rbx dev stop
 ```
 
-Notched phones reproduce Studio's real safe-area behavior for `DeviceSafeInsets`, `ClipToDeviceSafeArea`, and `SafeAreaCompatibility` validation. Device names and stable ids from `rbx device list` are both accepted. With emulation active, `rbx shot` automatically captures the simulated Studio viewport; `--studio` makes that target explicit and `--client` forces the latest Play client instead.
+Notched phones reproduce Studio's real safe-area behavior for `DeviceSafeInsets`, `ClipToDeviceSafeArea`, and `SafeAreaCompatibility` validation. Device names and stable ids from `rbx dev list` are both accepted. With emulation active, `rbx sc` automatically captures the simulated Studio viewport; `--studio` makes that target explicit and `--client` forces the latest Play client instead.
 
 2+ games open = cmds refuse and list places; pin with `PLACE=<name|id>`
 (substring ok).
@@ -121,7 +118,7 @@ rbx clk 450 323 -p 1                     # raw click
 rbx ky E -p 2                            # key (A-Z 0-9 Space Enter Escape Tab arrows Shift Ctrl Alt)
 rbx ty "hi" --path "PlayerGui.P.Box" --enter -p 2   # focus TextBox + type
 rbx sc -o shot.png -p 2                  # screenshot (unfocused/minimized ok)
-renium wait-until "workspace:GetAttribute('Ready') == true" -c -t 20   # poll until truthy
+rbx wait "workspace:GetAttribute('Ready') == true" -c -t 20   # poll until truthy
 ```
 
 Ambiguous path = fails listing candidates; one visible match = auto-picked.
@@ -140,8 +137,7 @@ rbx ky E -p 2                            # ProximityPrompt after goto
 clicks (engine limit) — use ProximityPrompts or UIS/raycast. `pr` auto-scrolls
 ScrollingFrames. `ui` = on-screen only (`--all` for rest). `--hold <ms>` on pr/clk.
 
-Gotchas: `==` in args breaks rbx.cmd (use renium.exe or `~= nil`). Each `l`/`lc`
-kills threads spawned by the previous one (persist state server-side).
+Each `l`/`lc` kills threads spawned by the previous one; persist state server-side.
 
 ## Play / Luau
 
@@ -179,7 +175,7 @@ rbx br Workspace -i editor:id
 ## Rules
 
 ```text
-find an id first
+use `f` to get an id first
 use service name first
 use -f only if needed
 never use both service and -f

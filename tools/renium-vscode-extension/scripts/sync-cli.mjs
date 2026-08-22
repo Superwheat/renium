@@ -45,10 +45,7 @@ fs.cpSync(path.join(repoRoot, "tools", "renium", "renium-guides"), guideDestinat
 });
 if (process.platform === "win32") {
   fs.copyFileSync(path.join(repoRoot, "rbx.cmd"), path.join(destinationDir, "rbx.cmd"));
-  fs.copyFileSync(
-    path.join(repoRoot, "tools", "renium", "rbx-run.ps1"),
-    path.join(destinationDir, "rbx-run.ps1"),
-  );
+  fs.rmSync(path.join(destinationDir, "rbx-run.ps1"), { force: true });
 } else {
   const launcher = path.join(destinationDir, "rbx");
   fs.copyFileSync(path.join(repoRoot, "rbx"), launcher);

@@ -15,7 +15,7 @@
     { "id": 20, "name": "find" },
     { "id": 21, "name": "tree" },
     { "id": 22, "name": "inspect" },
-    { "id": 23, "name": "batch", "aliases": ["bb"] },
+    { "id": 23, "name": "batch" },
     { "id": 24, "name": "script-search", "queued": false },
     { "id": 25, "name": "script-read", "queued": false },
     { "id": 26, "name": "script-grep", "queued": false },

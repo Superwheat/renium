@@ -1,14 +1,19 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use serde::Deserialize;
 
 pub(crate) mod args;
 pub(crate) mod config;
 pub(crate) mod dispatch;
+mod examples;
 
 use crate::app::update;
+use crate::automation::commands::{
+    ImageUploadArgs, InputArgs, MultiEditArgs, PlaceAddArgs, PlaceRenameArgs, PlaceReorderArgs,
+    StudioCloseArgs, StudioReopenArgs, StudioStatusArgs,
+};
 use crate::cli::args::{
     CursorPollArgs, GenerateSourcemapArgs, ImportServiceArgs, ImportSnapshotsArgs, VcInitArgs,
     VcMergeArgs, VcTextconvArgs, ViewArgs,
@@ -18,8 +23,20 @@ use crate::project::config as project_config;
 use crate::project::workflows;
 use crate::studio::bridge::DEFAULT_EXPORT_CHUNK_SIZE;
 
+pub(crate) fn command() -> clap::Command {
+    examples::COMMAND_EXAMPLES
+        .iter()
+        .fold(Cli::command(), |command, (name, examples)| {
+            command.mut_subcommand(*name, |subcommand| subcommand.after_help(*examples))
+        })
+}
+
 #[derive(Parser)]
-#[command(author, version)]
+#[command(
+    author,
+    version,
+    after_help = "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps --changed-path src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png"
+)]
 pub(super) struct Cli {
     #[arg(
         help = "Pin bridge commands to one Studio place by name, placeId, or gameId:placeId (env: RENIUM_PLACE)",
@@ -75,205 +92,293 @@ pub(super) struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Commands {
-    #[command(name = "a", alias = "automation")]
-    Automation(AutomationArgs),
+    #[command(name = "fmt", alias = "fmt-project")]
     FmtProject(project_config::FmtProjectArgs),
-    #[command(name = "project-validate", alias = "validate-project")]
+    #[command(name = "pv", alias = "project-validate", alias = "validate-project")]
     ProjectValidate(project_config::AdapterProjectArgs),
+    #[command(name = "xp", alias = "explain-path")]
     ExplainPath(project_config::ExplainPathArgs),
+    #[command(name = "cfg", alias = "config")]
     Config(project_config::ConfigArgs),
+    #[command(name = "ad", alias = "adapters")]
     Adapters(project_config::AdaptersArgs),
+    #[command(name = "ir", alias = "import-rojo")]
     ImportRojo(project_config::ImportRojoArgs),
+    #[command(name = "init", alias = "project-init")]
     Init(workflows::InitArgs),
+    #[command(name = "build", alias = "build-project")]
     Build(workflows::BuildArgs),
+    #[command(name = "dr", alias = "doctor")]
     Doctor(workflows::DoctorArgs),
+    #[command(name = "docs", alias = "open-docs")]
     Docs(workflows::DocsArgs),
+    #[command(name = "dm", alias = "daemon")]
     Daemon(workflows::DaemonArgs),
+    #[command(name = "so", alias = "studio", alias = "open-studio")]
     Studio(workflows::StudioArgs),
-    #[command(name = "upload-place", alias = "upload")]
+    #[command(name = "ro", alias = "studio-open", alias = "reopen-studio")]
+    StudioReopen(StudioReopenArgs),
+    #[command(name = "sx", alias = "studio-close", alias = "close-studio")]
+    StudioClose(StudioCloseArgs),
+    #[command(name = "status", alias = "studio-status")]
+    StudioStatus(StudioStatusArgs),
+    #[command(name = "up", alias = "upload-place", alias = "upload")]
     Upload(workflows::UploadArgs),
+    #[command(name = "upd", alias = "update")]
     Update(update::UpdateArgs),
-    #[command(name = "cloud", alias = "opencloud")]
+    #[command(name = "oc", alias = "cloud", alias = "opencloud")]
     OpenCloud(crate::cloud::command::OpenCloudArgs),
     #[command(hide = true)]
     UpdateHelper(update::UpdateHelperArgs),
+    #[command(name = "sb", alias = "syncback")]
     Syncback(SyncbackArgs),
+    #[command(name = "ip", alias = "import-path")]
     ImportPath(ImportPathArgs),
+    #[command(name = "cr", alias = "create")]
     Create(CreateInstanceArgs),
+    #[command(name = "cp", alias = "clone")]
     Clone(CloneInstanceCommandArgs),
+    #[command(name = "mv", alias = "move")]
     Move(MoveInstanceArgs),
+    #[command(name = "rn", alias = "rename")]
     Rename(RenameInstanceArgs),
+    #[command(name = "rm", alias = "remove")]
     Remove(RemoveInstanceCommandArgs),
+    #[command(name = "dpl", alias = "desync-package-link")]
     DesyncPackageLink(DesyncPackageLinkCommandArgs),
+    #[command(name = "mip", alias = "import-model")]
     ImportModel(ImportModelCommandArgs),
+    #[command(name = "mep", alias = "export-model")]
     ExportModel(ExportModelCommandArgs),
+    #[command(name = "tst", alias = "test")]
     Test(TestArgs),
-    #[command(alias = "x")]
+    #[command(name = "x", alias = "export-snapshots")]
     ExportSnapshots(ExportSnapshotsArgs),
-    #[command(about = "Pull the connected Studio place into project files")]
+    #[command(name = "pl", alias = "pull", about = "Pull Studio into project files")]
     Pull(ExportSnapshotsArgs),
-    #[command(alias = "bd")]
+    #[command(name = "bd", alias = "bridge-daemon")]
     BridgeDaemon(BridgeDaemonArgs),
-    #[command(alias = "ed")]
+    #[command(name = "ed", alias = "explorer-daemon")]
     ExplorerDaemon(ExplorerDaemonArgs),
-    #[command(alias = "src")]
+    #[command(name = "src", alias = "bridge-get-source")]
     BridgeGetSource(BridgeGetSourceArgs),
-    #[command(alias = "co")]
+    #[command(name = "co", alias = "get-console-output", alias = "console")]
     GetConsoleOutput(PluginConsoleOutputArgs),
-    #[command(alias = "lx", alias = "l")]
+    #[command(name = "l", alias = "lx", alias = "execute-luau", alias = "luau")]
     ExecuteLuau(ExecuteLuauArgs),
-    #[command(name = "lc", hide = true)]
+    #[command(name = "lc", alias = "execute-client-luau")]
     ExecuteClientLuau(ExecuteClientLuauArgs),
     #[command(
+        name = "dev",
         alias = "device",
-        alias = "dev",
+        alias = "studio-device",
         about = "Control Studio's built-in device simulator"
     )]
     StudioDevice(StudioDeviceArgs),
-    #[command(name = "asset-search", about = "Search the public Creator Store")]
+    #[command(
+        name = "as",
+        alias = "asset-search",
+        about = "Search the Creator Store"
+    )]
     AssetSearch(AssetSearchArgs),
     #[command(
-        name = "asset-insert",
-        about = "Insert a Creator Store asset into Studio"
+        name = "ai",
+        alias = "asset-insert",
+        about = "Insert a Creator Store asset"
     )]
     AssetInsert(AssetInsertArgs),
-    #[command(
-        name = "generate-model",
-        about = "Start an AI model generation job in Studio"
-    )]
+    #[command(name = "gm", alias = "generate-model", about = "Generate a model")]
     GenerateModel(GenerateModelArgs),
-    #[command(name = "job-status", about = "Read or wait for a creator job")]
+    #[command(name = "js", alias = "job-status", about = "Read a creator job")]
     JobStatus(JobStatusArgs),
     #[command(
-        name = "image-store",
-        about = "Validate a local image for Roblox upload"
+        name = "is",
+        alias = "image-store",
+        about = "Validate an image for upload"
     )]
     ImageStore(ImageStoreArgs),
+    #[command(name = "iu", alias = "image-upload")]
+    ImageUpload(ImageUploadArgs),
     #[command(
-        name = "script-search",
-        about = "Find saved script files containing every keyword"
+        name = "ss",
+        alias = "script-search",
+        about = "Find scripts containing keywords"
     )]
     ScriptSearch(ScriptSearchArgs),
-    #[command(name = "script-grep", about = "Find literal text in saved scripts")]
+    #[command(name = "sg", alias = "script-grep", about = "Find text in scripts")]
     ScriptGrep(ScriptGrepArgs),
-    #[command(name = "script-read", about = "Read a saved script or line range")]
+    #[command(name = "sr", alias = "script-read", about = "Read a script")]
     ScriptRead(ScriptReadArgs),
-    #[command(alias = "play")]
+    #[command(name = "play", alias = "playtest", alias = "start-stop-play")]
     StartStopPlay(StartStopPlayArgs),
-    #[command(alias = "clients", alias = "studios")]
+    #[command(
+        name = "cs",
+        alias = "clients",
+        alias = "studios",
+        alias = "list-clients"
+    )]
     ListClients(ListClientsArgs),
-    #[command(alias = "review")]
+    #[command(name = "rv", alias = "review", alias = "editor-review-decision")]
     EditorReviewDecision(EditorReviewDecisionArgs),
-    #[command(alias = "pr")]
+    #[command(name = "pr", alias = "press")]
     Press(PressArgs),
-    #[command(alias = "clk")]
+    #[command(name = "clk", alias = "click")]
     Click(ClickArgs),
-    #[command(alias = "ky")]
+    #[command(name = "ky", alias = "key")]
     Key(KeyArgs),
+    #[command(name = "ui", alias = "user-interface")]
     Ui(UiArgs),
-    #[command(alias = "ty")]
+    #[command(name = "ty", alias = "type")]
     Type(TypeArgs),
-    #[command(alias = "wait")]
+    #[command(name = "wait", alias = "wait-until")]
     WaitUntil(WaitUntilArgs),
-    #[command(alias = "go")]
+    #[command(name = "go", alias = "goto")]
     Goto(GotoArgs),
-    #[command(alias = "sc")]
+    #[command(name = "sc", alias = "shot", alias = "screenshot")]
     Shot(ShotArgs),
+    #[command(name = "inp", alias = "input")]
+    Input(InputArgs),
+    #[command(name = "rs", alias = "record-start")]
     RecordStart(RecordStartArgs),
+    #[command(name = "re", alias = "record-end")]
     RecordEnd(RecordEndArgs),
+    #[command(name = "setup", alias = "setup-renium")]
     Setup(SetupArgs),
-    #[command(alias = "st")]
+    #[command(name = "st", alias = "studio-change-state")]
     StudioChangeState(StudioChangeStateArgs),
+    #[command(name = "lon", alias = "live-start")]
     LiveStart(StudioChangeStateArgs),
+    #[command(name = "lof", alias = "live-stop")]
     LiveStop(StudioChangeStateArgs),
+    #[command(name = "lst", alias = "live-status")]
     LiveStatus(StudioChangeStateArgs),
+    #[command(name = "rp", alias = "retry-pending")]
     RetryPending(StudioChangeStateArgs),
+    #[command(name = "dp", alias = "discard-pending")]
     DiscardPending(StudioChangeStateArgs),
-    #[command(alias = "push")]
+    #[command(name = "ps", alias = "push", alias = "push-editor-changes")]
     PushEditorChanges(PushEditorChangesArgs),
-    #[command(alias = "prop")]
+    #[command(name = "prop", alias = "apply-editor-property")]
     ApplyEditorProperty(ApplyEditorPropertyArgs),
-    #[command(alias = "del")]
+    #[command(name = "del", alias = "apply-editor-delete")]
     ApplyEditorDelete(ApplyEditorDeleteArgs),
-    #[command(alias = "rev")]
+    #[command(name = "rev", alias = "editor-revert")]
     EditorRevert(EditorRevertArgs),
+    #[command(name = "me", alias = "multi-edit")]
+    MultiEdit(MultiEditArgs),
+    #[command(name = "f", alias = "find")]
     Find(FindArgs),
+    #[command(name = "tr", alias = "tree")]
     Tree(TreeArgs),
+    #[command(name = "in", alias = "inspect")]
     Inspect(InspectArgs),
-    #[command(alias = "bg")]
+    #[command(name = "bg", alias = "bytecode-get-property", alias = "get-property")]
     BytecodeGetProperty(BytecodeGetPropertyArgs),
-    #[command(alias = "bs")]
+    #[command(name = "bs", alias = "bytecode-set-property", alias = "set-property")]
     BytecodeSetProperty(BytecodeSetPropertyArgs),
     #[command(hide = true)]
     BytecodeApplyPropertyBatch(BytecodeApplyPropertyBatchArgs),
-    #[command(alias = "bss")]
+    #[command(name = "bss", alias = "bytecode-set-source", alias = "set-source")]
     BytecodeSetSource(BytecodeSetSourceArgs),
-    #[command(alias = "bb")]
+    #[command(name = "bb", alias = "bytecode-explorer-batch", alias = "batch")]
     BytecodeExplorerBatch(BytecodeExplorerBatchArgs),
-    #[command(alias = "bt")]
+    #[command(name = "bt", alias = "bytecode-editor-targets")]
     BytecodeEditorTargets(BytecodeEditorTargetsArgs),
-    #[command(alias = "ba")]
+    #[command(name = "ba", alias = "bytecode-add-instance", alias = "add")]
     BytecodeAddInstance(BytecodeAddInstanceArgs),
-    #[command(alias = "bcl")]
+    #[command(name = "bcl", alias = "bytecode-clone-instance")]
     BytecodeCloneInstance(BytecodeCloneInstanceArgs),
-    #[command(alias = "br")]
+    #[command(name = "br", alias = "bytecode-remove-instance")]
     BytecodeRemoveInstance(BytecodeRemoveInstanceArgs),
-    #[command(alias = "bdp")]
+    #[command(name = "bdp", alias = "bytecode-desync-package-link")]
     BytecodeDesyncPackageLink(BytecodeDesyncPackageLinkArgs),
-    #[command(alias = "bem")]
+    #[command(name = "bem", alias = "bytecode-export-model")]
     BytecodeExportModel(BytecodeExportModelArgs),
-    #[command(alias = "bep")]
+    #[command(name = "bep", alias = "bytecode-export-place", alias = "export-place")]
     BytecodeExportPlace(BytecodeExportPlaceArgs),
-    #[command(alias = "pdp")]
+    #[command(name = "pdp", alias = "place-desync-package-link")]
     PlaceDesyncPackageLink(PlaceDesyncPackageLinkArgs),
-    #[command(alias = "bim")]
+    #[command(name = "bim", alias = "bytecode-import-model")]
     BytecodeImportModel(BytecodeImportModelArgs),
-    #[command(alias = "wally")]
+    #[command(name = "wally", alias = "sync-wally-packages")]
     SyncWallyPackages(SyncWallyPackagesArgs),
-    #[command(alias = "lk")]
+    #[command(name = "lk", alias = "link-apply")]
     LinkApply(LinkApplyArgs),
-    #[command(alias = "lkb")]
+    #[command(name = "lkb", alias = "link-break")]
     LinkBreak(LinkBreakArgs),
-    #[command(alias = "lks")]
+    #[command(name = "lks", alias = "link-status")]
     LinkStatus(LinkStatusArgs),
-    #[command(alias = "lka")]
+    #[command(name = "lka", alias = "link-add")]
     LinkAdd(LinkAddArgs),
-    #[command(alias = "lkm", hide = true)]
+    #[command(name = "lkm", alias = "link-move-target", hide = true)]
     LinkMoveTarget(LinkMoveTargetArgs),
-    #[command(alias = "lkp")]
+    #[command(
+        name = "lkp",
+        alias = "link-pack",
+        about = "Pack an instance subtree as a reusable link package"
+    )]
     LinkPack(LinkPackArgs),
-    #[command(alias = "lkd")]
+    #[command(
+        name = "lkd",
+        alias = "link-delete-package",
+        about = "Delete a link package and handle its existing uses"
+    )]
     LinkDeletePackage(LinkDeletePackageArgs),
-    #[command(alias = "bpack")]
+    #[command(name = "bpack", alias = "bytecode-repack")]
     BytecodeRepack(BytecodeRepackArgs),
-    #[command(alias = "im")]
+    #[command(name = "si", alias = "im", alias = "import-snapshots")]
     ImportSnapshots(ImportSnapshotsArgs),
-    #[command(alias = "ims")]
+    #[command(name = "ims", alias = "import-service")]
     ImportService(ImportServiceArgs),
-    #[command(alias = "sm")]
+    #[command(name = "sm", alias = "generate-sourcemap", alias = "sourcemap")]
     GenerateSourcemap(GenerateSourcemapArgs),
-    #[command(alias = "vci")]
+    #[command(
+        name = "vci",
+        alias = "vc-init",
+        about = "Configure Git for .renium files"
+    )]
     VcInit(VcInitArgs),
-    #[command(alias = "vct")]
+    #[command(
+        name = "vct",
+        alias = "vc-textconv",
+        about = "Render a .renium file as text"
+    )]
     VcTextconv(VcTextconvArgs),
-    #[command(alias = "v")]
+    #[command(name = "v", alias = "view", about = "View a .renium or model file")]
     View(ViewArgs),
-    #[command(alias = "vcm")]
+    #[command(name = "vcm", alias = "vc-merge", about = "Merge .renium files")]
     VcMerge(VcMergeArgs),
-    #[command(alias = "cpoll", hide = true)]
+    #[command(name = "cpoll", alias = "cursor-poll", hide = true)]
     CursorPoll(CursorPollArgs),
+    #[command(name = "pa", alias = "place-add")]
+    PlaceAdd(PlaceAddArgs),
+    #[command(name = "pn", alias = "place-rename")]
+    PlaceRename(PlaceRenameArgs),
+    #[command(name = "po", alias = "place-reorder")]
+    PlaceReorder(PlaceReorderArgs),
 }
 
-#[derive(Parser)]
-pub(super) struct AutomationArgs {
-    #[arg(value_name = "OP")]
-    pub(super) operation: String,
-    #[arg(
-        value_name = "ARG",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    pub(super) args: Vec<String>,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_visible_command_has_a_short_example() {
+        for subcommand in command()
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let examples = subcommand
+                .get_after_help()
+                .unwrap_or_else(|| panic!("{} has no examples", subcommand.get_name()))
+                .to_string();
+            assert!(
+                examples.contains(&format!("rbx {}", subcommand.get_name())),
+                "{} does not use its short name in examples",
+                subcommand.get_name()
+            );
+        }
+    }
 }
 
 #[derive(Clone, clap::Args)]

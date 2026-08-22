@@ -7,12 +7,13 @@ use walkdir::WalkDir;
 
 use crate::automation::{BoundContext, Failure, op};
 use crate::cli::{
-    AssetInsertArgs, AssetSearchArgs, GenerateModelArgs, ImageStoreArgs, JobStatusArgs,
-    ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
+    AssetInsertArgs, AssetSearchArgs, BridgeConnectionArgs, GenerateModelArgs, ImageStoreArgs,
+    JobStatusArgs, ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
 };
-use crate::daemon::try_daemon_control_request;
 use crate::project::config;
 use crate::system::files::canonical_path;
+
+use super::commands::run_daemon;
 
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -84,32 +85,20 @@ pub(crate) fn asset_search_command(args: AssetSearchArgs) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn daemon_project_root(project: Option<&Path>) -> Option<&Path> {
-    project.map(|path| {
-        if path.is_file() {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        }
-    })
-}
-
 fn creator_command(
     operation: u16,
     project: Option<&Path>,
     parameters: Value,
+    bridge: Option<&BridgeConnectionArgs>,
 ) -> anyhow::Result<()> {
-    let result =
-        try_daemon_control_request(operation, daemon_project_root(project), parameters, false)?
-            .ok_or_else(|| anyhow::anyhow!("Renium daemon is not running"))?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    run_daemon(operation, project, parameters, false, bridge)
 }
 
 pub(crate) fn asset_insert_command(
     args: AssetInsertArgs,
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let bridge = args.bridge;
     creator_command(
         op::ASSET_INSERT,
         project,
@@ -118,9 +107,8 @@ pub(crate) fn asset_insert_command(
             "parentPath": args.parent,
             "name": args.name,
             "assetType": args.asset_type,
-            "bridgeWaitSeconds": args.bridge.wait_seconds,
-            "bridgePorts": args.bridge.ports,
         }),
+        Some(&bridge),
     )
 }
 
@@ -151,6 +139,7 @@ pub(crate) fn generate_model_command(
     {
         anyhow::bail!("--max-triangles must be from 12 through 20000");
     }
+    let bridge = args.bridge;
     creator_command(
         op::GENERATE_MODEL,
         project,
@@ -165,9 +154,8 @@ pub(crate) fn generate_model_command(
             "parts": args.parts,
             "segmentation": args.segmentation,
             "anchored": args.unanchored.then_some(false),
-            "bridgeWaitSeconds": args.bridge.wait_seconds,
-            "bridgePorts": args.bridge.ports,
         }),
+        Some(&bridge),
     )
 }
 
@@ -185,6 +173,7 @@ pub(crate) fn job_status_command(
             "jobId": args.job_id,
             "waitSeconds": args.wait_seconds,
         }),
+        None,
     )
 }
 

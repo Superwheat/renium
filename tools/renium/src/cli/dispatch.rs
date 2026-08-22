@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::app::setup::setup_command;
 use crate::app::update;
-use crate::automation::client::automation_command;
+use crate::automation::commands;
 use crate::automation::op;
 use crate::automation::tools::{
     asset_insert_command, asset_search_command, generate_model_command, image_store_command,
@@ -54,10 +54,6 @@ use crate::studio::automation::{
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
     match command {
-        Commands::Automation(args) => {
-            automation_command(args);
-            Ok(())
-        }
         Commands::FmtProject(args) => config::run_fmt_project(args, project),
         Commands::ProjectValidate(args) => config::run_validate_project(args, project),
         Commands::ExplainPath(args) => config::run_explain_path(args, project),
@@ -70,6 +66,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::Docs(args) => workflows::run_docs(args),
         Commands::Daemon(args) => workflows::run_daemon(args),
         Commands::Studio(args) => workflows::run_studio(args, project),
+        Commands::StudioReopen(args) => commands::studio_reopen(args, project),
+        Commands::StudioClose(args) => commands::studio_close(args, project),
+        Commands::StudioStatus(args) => commands::studio_status(args, project),
         Commands::Upload(args) => workflows::run_upload(args, project),
         Commands::Update(args) => update::run_update(args),
         Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
@@ -107,6 +106,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::GenerateModel(args) => generate_model_command(args, project),
         Commands::JobStatus(args) => job_status_command(args, project),
         Commands::ImageStore(args) => image_store_command(args, project),
+        Commands::ImageUpload(args) => commands::image_upload(args, project),
         Commands::ScriptSearch(args) => script_search_command(args, project),
         Commands::ScriptGrep(args) => script_grep_command(args, project),
         Commands::ScriptRead(args) => script_read_command(args, project),
@@ -121,6 +121,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::WaitUntil(args) => wait_until_command(args),
         Commands::Goto(args) => goto_command(args),
         Commands::Shot(args) => shot_command(args),
+        Commands::Input(args) => commands::input(args, project),
         Commands::RecordStart(args) => record_start_command(args),
         Commands::RecordEnd(args) => record_end_command(args),
         Commands::Setup(args) => setup_command(args),
@@ -138,6 +139,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ApplyEditorProperty(args) => apply_editor_property(args),
         Commands::ApplyEditorDelete(args) => apply_editor_delete(args),
         Commands::EditorRevert(args) => editor_revert(args),
+        Commands::MultiEdit(args) => commands::multi_edit(args, project),
         Commands::Find(args) => find_command(args),
         Commands::Tree(args) => tree_command(args),
         Commands::Inspect(args) => inspect_command(args),
@@ -172,5 +174,8 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::View(args) => view_command(args),
         Commands::VcMerge(args) => vc_merge(args),
         Commands::CursorPoll(args) => cursor_poll(args),
+        Commands::PlaceAdd(args) => commands::place_add(args, project),
+        Commands::PlaceRename(args) => commands::place_rename(args, project),
+        Commands::PlaceReorder(args) => commands::place_reorder(args, project),
     }
 }

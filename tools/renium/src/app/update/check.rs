@@ -28,7 +28,10 @@ struct Cache {
     checked_at_unix_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
-    manifest: SignedUpdateManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest: Option<SignedUpdateManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 enum ManifestResponse {
@@ -106,10 +109,18 @@ fn cache_path() -> Result<PathBuf> {
 
 fn read_cache() -> Option<Cache> {
     let cache: Cache = serde_json::from_slice(&fs::read(cache_path().ok()?).ok()?).ok()?;
-    if cache.schema_version != 1 || verify_manifest(&cache.manifest).is_err() {
+    if !matches!(cache.schema_version, 1 | 2)
+        || cache
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| verify_manifest(manifest).is_err())
+        || cache.manifest.is_none() && cache.error.is_none()
+    {
         return None;
     }
-    Version::parse(&cache.manifest.payload.version).ok()?;
+    if let Some(manifest) = cache.manifest.as_ref() {
+        Version::parse(&manifest.payload.version).ok()?;
+    }
     Some(cache)
 }
 
@@ -120,6 +131,14 @@ fn is_fresh(cache: &Cache) -> bool {
 
 fn write_cache(cache: &Cache) -> Result<()> {
     install_bytes(&cache_path()?, &serde_json::to_vec(cache)?)
+}
+
+fn cached_manifest(cache: Cache) -> Result<SignedUpdateManifest> {
+    cache.manifest.with_context(|| {
+        cache
+            .error
+            .unwrap_or_else(|| "The last Renium update check failed".to_string())
+    })
 }
 
 fn acquire_lock() -> Result<Lock> {
@@ -177,17 +196,33 @@ pub(super) fn manifest(source: &str) -> Result<SignedUpdateManifest> {
         return Ok(manifest);
     }
     if let Some(cache) = read_cache().filter(is_fresh) {
-        return Ok(cache.manifest);
+        return cached_manifest(cache);
     }
     let _lock = acquire_lock()?;
     let previous = match read_cache() {
-        Some(cache) if is_fresh(&cache) => return Ok(cache.manifest),
+        Some(cache) if is_fresh(&cache) => return cached_manifest(cache),
         cache => cache,
     };
     let response = fetch_https_manifest(
         DEFAULT_UPDATE_MANIFEST,
         previous.as_ref().and_then(|cache| cache.etag.as_deref()),
-    )?;
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let cache = Cache {
+                schema_version: 2,
+                checked_at_unix_ms: current_millis(),
+                etag: previous.as_ref().and_then(|cache| cache.etag.clone()),
+                manifest: previous.and_then(|cache| cache.manifest),
+                error: Some(format!("{error:#}")),
+            };
+            if let Err(cache_error) = write_cache(&cache) {
+                eprintln!("[renium] warning: failed to cache update check: {cache_error:#}");
+            }
+            return cached_manifest(cache);
+        }
+    };
     let (manifest, etag) = match response {
         ManifestResponse::Modified { manifest, etag } => {
             verify_manifest(&manifest)?;
@@ -195,17 +230,23 @@ pub(super) fn manifest(source: &str) -> Result<SignedUpdateManifest> {
         }
         ManifestResponse::NotModified => {
             let cache = previous.context("GitHub returned 304 without a cached update manifest")?;
-            (cache.manifest, cache.etag)
+            (
+                cache
+                    .manifest
+                    .context("GitHub returned 304 without a cached update manifest")?,
+                cache.etag,
+            )
         }
     };
     let cache = Cache {
-        schema_version: 1,
+        schema_version: 2,
         checked_at_unix_ms: current_millis(),
         etag,
-        manifest,
+        manifest: Some(manifest),
+        error: None,
     };
     if let Err(error) = write_cache(&cache) {
         eprintln!("[renium] warning: failed to cache update check: {error:#}");
     }
-    Ok(cache.manifest)
+    cached_manifest(cache)
 }

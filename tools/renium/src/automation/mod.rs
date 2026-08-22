@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) mod client;
+pub(crate) mod commands;
 pub(crate) mod context;
 pub(crate) mod live;
 pub(crate) mod local;
@@ -27,7 +28,6 @@ const REVIEW_TTL: Duration = Duration::from_secs(300);
 pub struct Opcode {
     pub id: u16,
     pub name: &'static str,
-    pub aliases: &'static [&'static str],
     pub review: bool,
     pub runtime: bool,
     pub queued: bool,
@@ -42,13 +42,6 @@ pub fn opcode_by_id(id: u16) -> Result<&'static Opcode> {
         .iter()
         .find(|operation| operation.id == id)
         .with_context(|| format!("Unknown opcode {id}"))
-}
-
-pub fn opcode_by_name(name: &str) -> Result<&'static Opcode> {
-    registry()
-        .iter()
-        .find(|operation| operation.name == name || operation.aliases.contains(&name))
-        .with_context(|| format!("Unknown operation {name}"))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -426,7 +419,6 @@ pub fn capabilities() -> Result<Value> {
         "ops": registry().iter().map(|operation| json!({
             "id": operation.id,
             "name": operation.name,
-            "aliases": operation.aliases,
             "review": operation.review,
             "runtime": operation.runtime,
             "queued": operation.queued,
@@ -439,8 +431,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_resolves_ids_names_and_aliases() {
-        assert_eq!(opcode_by_name("bb").unwrap().id, op::BATCH);
+    fn registry_resolves_ids_and_metadata() {
         assert!(opcode_by_id(op::SET_PROPERTY).unwrap().review);
         assert_eq!(
             opcode_by_id(op::UPDATE_STUDIOS).unwrap().name,

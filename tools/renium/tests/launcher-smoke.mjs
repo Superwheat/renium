@@ -5,7 +5,7 @@ import path from "node:path";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "renium-launcher-smoke-"));
-const expected = "a|cap";
+const expected = "f|Workspace";
 
 const run = (command, args, env) => {
   const output = childProcess.execFileSync(command, args, {
@@ -14,7 +14,7 @@ const run = (command, args, env) => {
     encoding: "utf8",
   }).trim();
   if (output !== expected) {
-    throw new Error(`${command} did not forward automation arguments: ${output}`);
+    throw new Error(`${command} did not forward CLI arguments: ${output}`);
   }
 };
 
@@ -36,19 +36,19 @@ try {
     const stub = path.join(temporary, "renium-stub.cmd");
     fs.writeFileSync(stub, "@echo off\r\necho %1^|%2\r\n");
     const launcher = path.join(repository, "rbx.cmd");
-    run("cmd.exe", ["/d", "/c", "rbx.cmd a cap"], { RENIUM_CLI: stub });
-    run("powershell.exe", ["-NoProfile", "-Command", `& '${launcher}' a cap`], { RENIUM_CLI: stub });
+    run("cmd.exe", ["/d", "/c", "rbx.cmd f Workspace"], { RENIUM_CLI: stub });
+    run("powershell.exe", ["-NoProfile", "-Command", `& '${launcher}' f Workspace`], { RENIUM_CLI: stub });
     if (hasCommand("pwsh.exe")) {
-      run("pwsh.exe", ["-NoProfile", "-Command", `& '${launcher}' a cap`], { RENIUM_CLI: stub });
+      run("pwsh.exe", ["-NoProfile", "-Command", `& '${launcher}' f Workspace`], { RENIUM_CLI: stub });
     }
   } else {
     const stub = path.join(temporary, "renium");
     fs.writeFileSync(stub, "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\"\n");
     fs.chmodSync(stub, 0o755);
     const launcher = path.join(repository, "rbx");
-    run("bash", [launcher, "a", "cap"], { RENIUM_CLI: stub });
+    run("bash", [launcher, "f", "Workspace"], { RENIUM_CLI: stub });
     if (hasCommand("zsh")) {
-      run("zsh", [launcher, "a", "cap"], { RENIUM_CLI: stub });
+      run("zsh", [launcher, "f", "Workspace"], { RENIUM_CLI: stub });
     }
   }
 } finally {
