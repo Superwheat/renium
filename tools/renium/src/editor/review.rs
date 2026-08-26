@@ -845,11 +845,16 @@ pub(crate) fn protected_root_write_rows_with_live_values(
     let Ok(database) = rbx_reflection_database::get() else {
         return Err(rows);
     };
-    let Ok(serialized_values) =
-        read_live_service_root_property_values(bridge, MATERIAL_SERVICE_CLASS, database)
-    else {
-        return Err(rows);
-    };
+    let serialized_values =
+        match read_live_service_root_property_values(bridge, MATERIAL_SERVICE_CLASS, database) {
+            Ok(values) => values,
+            Err(error) => {
+                if crate::app::output::global_log_enabled(5) {
+                    eprintln!("[renium] MaterialService root read failed: {error:#}");
+                }
+                return Err(rows);
+            }
+        };
     let mut values = Map::new();
     merge_live_service_root_property_values(
         MATERIAL_SERVICE_CLASS,
@@ -947,6 +952,25 @@ pub(crate) fn local_place_path_for_pid(pid: u32) -> Option<PathBuf> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn local_place_path_for_bridge(_bridge: &BridgeServer) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn local_place_path_for_runtime(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+) -> Option<PathBuf> {
+    let pid = bridge
+        .studio_pid_for_runtime(BridgeTarget::Edit, runtime_id)
+        .ok()?;
+    local_place_path_for_pid(pid)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn local_place_path_for_runtime(
+    _bridge: &BridgeServer,
+    _runtime_id: &str,
+) -> Option<PathBuf> {
     None
 }
 
@@ -1054,10 +1078,14 @@ pub(crate) fn apply_protected_writes_offline(
     let pid = studio_pid_for_bridge(bridge)?;
     let executable = input_inject::process_executable_path(pid)?;
     let title = input_inject::studio_window_title(pid)?;
-    let original_path = local_place_path_from_studio_title(&title);
+    let original_path = local_place_path_from_studio_title(&title).with_context(|| {
+        format!(
+            "Protected property writes require a local place file; the published Studio place was not changed: {}",
+            serde_json::to_string(rows).unwrap_or_default()
+        )
+    })?;
     let extension = original_path
-        .as_ref()
-        .and_then(|path| path.extension())
+        .extension()
         .and_then(|value| value.to_str())
         .filter(|value| matches!(value.to_ascii_lowercase().as_str(), "rbxl" | "rbxlx"))
         .unwrap_or("rbxl");
@@ -1068,16 +1096,14 @@ pub(crate) fn apply_protected_writes_offline(
         extension
     );
     let snapshot = original_path
-        .as_ref()
-        .and_then(|path| path.parent())
+        .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map_or_else(
             || std::env::temp_dir().join(&snapshot_name),
             |parent| parent.join(&snapshot_name),
         );
-    let local_file = original_path.is_some();
     let exported_instances =
-        match write_live_editor_place_snapshot(bridge, args, &snapshot, original_path.as_deref()) {
+        match write_live_editor_place_snapshot(bridge, args, &snapshot, Some(&original_path)) {
             Ok(count) => count,
             Err(error) => {
                 let _ = fs::remove_file(&snapshot);
@@ -1092,56 +1118,55 @@ pub(crate) fn apply_protected_writes_offline(
         }
     };
     input_inject::terminate_studio_process(pid)?;
-    let reopen_path = if let Some(original_path) = original_path {
-        let file_name = original_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("place.rbxl");
-        let backup = original_path.with_file_name(format!(
-            ".{file_name}.renium-backup-{}-{}",
-            pid,
-            current_millis()
-        ));
-        if let Err(error) = fs::rename(&original_path, &backup) {
+    let file_name = original_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("place.rbxl");
+    let backup = original_path.with_file_name(format!(
+        ".{file_name}.renium-backup-{}-{}",
+        pid,
+        current_millis()
+    ));
+    if let Err(error) = fs::rename(&original_path, &backup) {
+        let _ = Command::new(&executable).arg(&original_path).spawn();
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to prepare {} for protected snapshot replacement",
+                original_path.display()
+            )
+        });
+    }
+    if let Err(error) = fs::rename(&snapshot, &original_path) {
+        let restore = fs::rename(&backup, &original_path);
+        if restore.is_ok() {
             let _ = Command::new(&executable).arg(&original_path).spawn();
+        }
+        if let Err(restore_error) = restore {
             return Err(error).with_context(|| {
                 format!(
-                    "Failed to prepare {} for protected snapshot replacement",
-                    original_path.display()
+                    "Failed to replace {} and failed to restore {}: {restore_error}",
+                    original_path.display(),
+                    backup.display()
                 )
             });
         }
-        if let Err(error) = fs::rename(&snapshot, &original_path) {
-            let restore = fs::rename(&backup, &original_path);
-            if restore.is_ok() {
-                let _ = Command::new(&executable).arg(&original_path).spawn();
-            }
-            if let Err(restore_error) = restore {
-                return Err(error).with_context(|| {
-                    format!(
-                        "Failed to replace {} and failed to restore {}: {restore_error}",
-                        original_path.display(),
-                        backup.display()
-                    )
-                });
-            }
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to replace {} with protected snapshot",
-                    original_path.display()
-                )
-            });
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to replace {} with protected snapshot",
+                original_path.display()
+            )
+        });
+    }
+    if let Err(error) = Command::new(&executable).arg(&original_path).spawn() {
+        let preserve = fs::rename(&original_path, &snapshot);
+        let restore = preserve
+            .as_ref()
+            .map_err(|value| io::Error::other(format!("not attempted: {value}")))
+            .and_then(|_| fs::rename(&backup, &original_path));
+        if restore.is_ok() && preserve.is_ok() {
+            let _ = Command::new(&executable).arg(&original_path).spawn();
         }
-        if let Err(error) = Command::new(&executable).arg(&original_path).spawn() {
-            let preserve = fs::rename(&original_path, &snapshot);
-            let restore = preserve
-                .as_ref()
-                .map_err(|value| io::Error::other(format!("not attempted: {value}")))
-                .and_then(|_| fs::rename(&backup, &original_path));
-            if restore.is_ok() && preserve.is_ok() {
-                let _ = Command::new(&executable).arg(&original_path).spawn();
-            }
-            return Err(error).with_context(|| {
+        return Err(error).with_context(|| {
                 format!(
                     "Failed to reopen Studio; replacement preservation: {}; original restoration: {}; backup: {}",
                     preserve
@@ -1151,27 +1176,20 @@ pub(crate) fn apply_protected_writes_offline(
                     backup.display()
                 )
             });
-        }
-        if let Err(error) = fs::remove_file(&backup) {
-            eprintln!(
-                "[renium] warning: could not remove protected-write backup {}: {error}",
-                backup.display()
-            );
-        }
-        original_path
-    } else {
-        Command::new(&executable)
-            .arg(&snapshot)
-            .spawn()
-            .with_context(|| format!("Failed to reopen Studio from {}", executable.display()))?;
-        snapshot
-    };
+    }
+    if let Err(error) = fs::remove_file(&backup) {
+        eprintln!(
+            "[renium] warning: could not remove protected-write backup {}: {error}",
+            backup.display()
+        );
+    }
+    let reopen_path = original_path;
     Ok(json!({
         "ok": true,
         "applied": applied,
         "exportedInstances": exported_instances,
         "reopenedPath": reopen_path,
-        "localFile": local_file,
+        "localFile": true,
         "cloudSaved": false,
         "nativeSnapshot": true,
     }))

@@ -9,7 +9,8 @@ local RUNTIME_DEFAULTS = {
 	twoWaySync = true,
 	syncbackProperties = true,
 	onlyCodeMode = false,
-	initialSyncPriority = "studio",
+	initialSyncPriority = "reconcile",
+	initialConflictPreference = "none",
 	diffLinesLimit = 3000,
 	displayPrompts = "always",
 	changesThreshold = 5,
@@ -32,9 +33,13 @@ local RUNTIME_BOOLEAN_KEYS = {
 
 local RUNTIME_ENUMS = {
 	initialSyncPriority = {
+		reconcile = true,
+		verify = true,
+	},
+	initialConflictPreference = {
+		none = true,
 		studio = true,
 		editor = true,
-		none = true,
 	},
 	displayPrompts = {
 		always = true,
@@ -185,6 +190,13 @@ function BridgeSettings.loadRuntimeSettings(plugin, prefix)
 				out[key] = normalized
 			end
 		end
+	end
+	local legacy = plugin:GetSetting(prefix .. "initialSyncPriority")
+	if legacy == "studio" or legacy == "editor" or legacy == "none" then
+		out.initialSyncPriority = if legacy == "none" then "verify" else "reconcile"
+		out.initialConflictPreference = if legacy == "editor" then "editor" else "none"
+		plugin:SetSetting(prefix .. "initialSyncPriority", out.initialSyncPriority)
+		plugin:SetSetting(prefix .. "initialConflictPreference", out.initialConflictPreference)
 	end
 	return out
 end

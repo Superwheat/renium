@@ -553,17 +553,6 @@ export class FileExplorerController implements vscode.Disposable {
     return undefined;
   }
 
-  private isPackageControlledNode(node: FileExplorerNode): boolean {
-    let current: FileExplorerNode | undefined = node;
-    while (current && current.kind !== "service") {
-      if (current.hasPackageLink === true || current.className === "PackageLink") {
-        return true;
-      }
-      current = current.parentTreeId ? this.model.getNode(current.parentTreeId) : undefined;
-    }
-    return false;
-  }
-
   private async showReadonlyScriptDocument(node: FileExplorerNode, sourcePath: string, content: string): Promise<void> {
     const uri = this.readonlyScriptProvider.uriFor(node, sourcePath, content);
     const document = await vscode.workspace.openTextDocument(uri);
@@ -581,7 +570,7 @@ export class FileExplorerController implements vscode.Disposable {
     const loaded = await this.model.loadDetails(await this.model.ensureLoaded(node));
     const sourcePath = loaded.sourcePath || `${loaded.name}.luau`;
     const inlineSource = typeof loaded.properties.Source === "string" ? loaded.properties.Source : undefined;
-    const controlledByRenium = this.isPackageControlledNode(loaded) || this.inheritedLinkState(loaded) === "linked";
+    const controlledByRenium = this.inheritedLinkState(loaded) === "linked";
     if (controlledByRenium) {
       try {
         const opened = await vscode.commands.executeCommand<boolean>("renium.packages.openLinkedScriptPreview", {

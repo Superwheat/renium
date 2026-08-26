@@ -618,9 +618,9 @@ fn multipart_body(
     let mut body = Vec::new();
     for (name, value) in fields {
         validate_part_name(name)?;
-        let value = scalar(value)
-            .ok_or_else(|| format!("form.{name} must be a string, number, or boolean"))?;
-        push_part(&mut body, &boundary, name, None, None, value.as_bytes());
+        for value in scalar_values("form", name, value)? {
+            push_part(&mut body, &boundary, name, None, None, value.as_bytes());
+        }
     }
     for (name, value) in json_parts {
         validate_part_name(name)?;
@@ -637,42 +637,41 @@ fn multipart_body(
     }
     for (name, value) in files {
         validate_part_name(name)?;
-        let path = value
-            .as_str()
-            .ok_or_else(|| format!("files.{name} must be a file path string"))?;
-        let path = Path::new(path);
-        let metadata = fs::metadata(path)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!("{} is not a file", path.display()));
+        for path in file_values(name, value)? {
+            let path = Path::new(path);
+            let metadata = fs::metadata(path)
+                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            if metadata.len() > MAX_MULTIPART_FILE_BYTES {
+                return Err(format!(
+                    "{} exceeds the {} MiB multipart limit",
+                    path.display(),
+                    MAX_MULTIPART_FILE_BYTES / 1024 / 1024
+                ));
+            }
+            let bytes = fs::read(path)
+                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+            let filename = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("file");
+            if filename
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n' | '"'))
+            {
+                return Err(format!("{} has an unsupported file name", path.display()));
+            }
+            push_part(
+                &mut body,
+                &boundary,
+                name,
+                Some(filename),
+                Some(file_content_type(path)),
+                &bytes,
+            );
         }
-        if metadata.len() > MAX_MULTIPART_FILE_BYTES {
-            return Err(format!(
-                "{} exceeds the {} MiB multipart limit",
-                path.display(),
-                MAX_MULTIPART_FILE_BYTES / 1024 / 1024
-            ));
-        }
-        let bytes = fs::read(path)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        let filename = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("file");
-        if filename
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n' | '"'))
-        {
-            return Err(format!("{} has an unsupported file name", path.display()));
-        }
-        push_part(
-            &mut body,
-            &boundary,
-            name,
-            Some(filename),
-            Some(file_content_type(path)),
-            &bytes,
-        );
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     Ok((boundary, body))
@@ -839,19 +838,39 @@ fn expand_path(
 }
 
 fn query_values(name: &str, value: &Value) -> Result<Vec<String>, String> {
+    scalar_values("query", name, value)
+}
+
+fn scalar_values(kind: &str, name: &str, value: &Value) -> Result<Vec<String>, String> {
     match value {
         Value::Null => Ok(Vec::new()),
         Value::Array(values) => values
             .iter()
             .map(|value| {
                 scalar(value).ok_or_else(|| {
-                    format!("query.{name} must contain only strings, numbers, or booleans")
+                    format!("{kind}.{name} must contain only strings, numbers, or booleans")
                 })
             })
             .collect(),
         value => scalar(value)
             .map(|value| vec![value])
-            .ok_or_else(|| format!("query.{name} must be a string, number, boolean, or array")),
+            .ok_or_else(|| format!("{kind}.{name} must be a string, number, boolean, or array")),
+    }
+}
+
+fn file_values<'a>(name: &str, value: &'a Value) -> Result<Vec<&'a str>, String> {
+    match value {
+        Value::String(path) => Ok(vec![path]),
+        Value::Array(paths) => paths
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .ok_or_else(|| format!("files.{name} must contain only file path strings"))
+            })
+            .collect(),
+        _ => Err(format!(
+            "files.{name} must be a file path string or an array of paths"
+        )),
     }
 }
 
@@ -908,5 +927,22 @@ mod tests {
             .unwrap(),
             "/cloud/v2/universes/123/data-stores/Player%20Data/entries/user%2F1"
         );
+    }
+
+    #[test]
+    fn multipart_arrays_emit_every_form_and_file_part() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let fields = Map::from_iter([("tag".to_string(), json!(["first", "second"]))]);
+        let files = Map::from_iter([(
+            "files".to_string(),
+            json!([file.display().to_string(), file.display().to_string()]),
+        )]);
+
+        let (_, body) = multipart_body(&fields, &Map::new(), &files).unwrap();
+        let body = String::from_utf8(body).unwrap();
+
+        assert_eq!(body.matches("name=\"tag\"").count(), 2);
+        assert_eq!(body.matches("name=\"files\"").count(), 2);
+        assert_eq!(body.matches("filename=\"Cargo.toml\"").count(), 2);
     }
 }

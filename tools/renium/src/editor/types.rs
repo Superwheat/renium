@@ -277,8 +277,6 @@ pub(crate) struct EditorBinaryImportGroup {
     pub(crate) retained_roots: Vec<EditorBinaryRetainedRoot>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) package_roots: Vec<EditorBinaryPackageRoot>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) strip_package_payloads: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) change_generation: Option<u64>,
 }
@@ -363,7 +361,8 @@ impl EditorBinaryImport {
             .filter(|group| group.service == service)
             .flat_map(|group| &group.retained_roots)
             .any(|root| {
-                segments.starts_with(&root.path_segments)
+                root.payload_omitted
+                    && segments.starts_with(&root.path_segments)
                     && ordinals.starts_with(&root.path_ordinals)
             })
     }
@@ -371,6 +370,7 @@ impl EditorBinaryImport {
 
 pub(crate) struct EditorSettingsWrite {
     pub(crate) path: PathBuf,
+    pub(crate) expected_hash: Option<[u8; 32]>,
     pub(crate) document: SettingsBytecode,
 }
 

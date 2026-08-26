@@ -1,21 +1,39 @@
 # Sync
 
-Read `RENIUM.md` first. `pl` means Studio to files. `ps` means files to Studio. Live sync runs both directions in the shared Renium daemon, so Cursor and agents reuse one watcher and one Studio connection.
+`pl` is Studio → files; `ps` is files → Studio. Live Sync uses one shared connection.
 
 ```powershell
 rbx pl
 rbx ps src/StarterGui/AuditClient.client.luau
 rbx lon
 rbx lst
+rbx lst --wait 10
+rbx lst --details
 rbx lof
 ```
 
-Add `--verify` when checking an exact script push. Don't verify it through `Instance.Source` in `rbx l`; an open ScriptDocument can hold the current editor source separately.
+Use `--verify` for exact script pushes. Don't verify through `Instance.Source`; an open ScriptDocument may differ.
 
-Run these from the active place folder. At an experience root with more than one place, add the global `--place <alias|placeId>` selector before the command. Renium starts or reuses the shared daemon and waits for the matching Studio runtime.
+Run from the place folder. At a multi-place experience root, put `--place <alias|placeId>` before the command. Renium handles the daemon and runtime.
 
-For sustained edits, start live sync once and edit files normally. Renium batches nearby file saves, verifies script writes, retries one transient transport failure, and keeps permanent failures pending. Use `rbx rp` after fixing the cause or `rbx dp` only when those pending file edits should not reach Studio.
+For sustained edits, start Live Sync once. Renium batches saves and keeps failed edits pending. After fixing the cause, use `rbx rp`; use `rbx dp` only to discard them.
 
-`rbx lst` restores an enabled Live Sync watcher after a daemon replacement. If it reports `daemon.running: true`, edit the files and let Live Sync send them; don't follow the edit with a manual push.
+On first connection, Live Sync compares Studio and the project against their last common Renium state. Independent edits are merged. Conflicting edits remain pending without changing either side. `reconcile` is the default; `verify` only reports differences. An optional Studio or editor preference resolves ordinary conflicts, but never direct PackageLink edits.
 
-Use a one-off filtered push when live sync isn't running. List multiple paths after `rbx ps`; Renium handles one batch across services. Use an unfiltered push only for an intentional full place replacement.
+The editor asks which side to keep only when both sides changed the same content, then finishes starting Live Sync automatically. `rbx lon` reports the conflict and both commands that resolve it; no Studio inspection is needed.
+
+```powershell
+rbx cfg get liveSync.initialSyncPriority
+rbx cfg set liveSync.initialSyncPriority reconcile
+rbx cfg set liveSync.initialConflictPreference none
+```
+
+Conflict preferences are `none`, `studio`, and `editor` (project files).
+
+`rbx lst` restores an enabled watcher after a daemon restart. If `daemon.running` is true, don't repeat edits with a manual push.
+
+`rbx lst --wait 10` waits up to 10 seconds for file edits to finish syncing.
+
+Status is compact by default; `--details` includes retained change records.
+
+Without Live Sync, list files or directories after `rbx ps`. Renium expands directories and batches services. `--verify` checks selected scripts. Use an unfiltered push only to replace the full place.

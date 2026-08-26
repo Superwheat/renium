@@ -45,8 +45,8 @@ equal(ports[2], 8782, "second port")
 equal(Settings.parsePortsCsv("0,8781"), nil, "invalid port rejection")
 equal(Settings.normalizeRuntimeSetting("changesThreshold", -3), 0, "number minimum")
 equal(Settings.normalizeRuntimeSetting("diffLinesLimit", 2000000), 1000000, "number maximum")
-equal(Settings.normalizeRuntimeSetting("initialSyncPriority", " EDITOR "), "editor", "enum normalization")
-equal(Settings.normalizeRuntimeSetting("initialSyncPriority", "bad"), "studio", "enum fallback")
+equal(Settings.normalizeRuntimeSetting("initialSyncPriority", " RECONCILE "), "reconcile", "enum normalization")
+equal(Settings.normalizeRuntimeSetting("initialSyncPriority", "bad"), "reconcile", "enum fallback")
 equal(Update.isNewer("v0.1.4", "0.1.3"), true, "newer release")
 equal(Update.isNewer("0.1.3", "0.1.3"), false, "same release")
 equal(Update.isNewer("invalid", "0.1.3"), false, "invalid release")
@@ -350,6 +350,10 @@ local nativeOverlay = ReferenceOverlay.create({
 	captureExplorerSelection = function()
 		return {}
 	end,
+	containsPackageLink = function(instance)
+		return instance:IsA("PackageLink") or instance:FindFirstChildWhichIsA("PackageLink", true) ~= nil
+	end,
+	pathCacheKey = Identity.pathCacheKey,
 	removeInstanceForUndo = function(instance)
 		for _, group in ipairs(nativeGroups) do
 			allIncomingAttachedBeforeRemoval = allIncomingAttachedBeforeRemoval
@@ -382,6 +386,20 @@ for _, group in ipairs(nativeGroups) do
 	equal(group.incoming[1].Parent, group.target, "native replacement retained")
 	equal(group.outgoing[1].Parent, nil, "native original detached")
 end
+
+local packageRoot = roblox.Instance.new("Folder")
+packageRoot.Name = "Package"
+local packageTarget = roblox.Instance.new("Folder")
+packageRoot.Parent = packageTarget
+local packageLink = roblox.Instance.new("PackageLink")
+packageLink.Parent = packageRoot
+local duplicateRoot = roblox.Instance.new("Folder")
+duplicateRoot.Name = "Package"
+local packageMerges = {}
+nativeOverlay.preparePackageMerge(packageRoot, duplicateRoot, { "Package" }, { 1 }, {}, packageMerges, {})
+equal(#packageMerges, 1, "package merge prepared")
+equal(#packageMerges[1].outgoing, 0, "package link excluded from outgoing content")
+equal(packageLink.Parent, packageRoot, "missing package link preserved")
 
 equal(Content.serializeSource("None", nil), "", "empty content")
 equal(Content.serializeSource("Uri", "rbxassetid://123"), "rbxassetid://123", "URI content")

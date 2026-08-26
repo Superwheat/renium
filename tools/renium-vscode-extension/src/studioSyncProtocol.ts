@@ -38,11 +38,13 @@ export type StudioEditorAction = {
 
 export type DaemonLiveSyncState = {
   running?: boolean;
+  mode?: "reconcile" | "verify";
   pullChanges?: boolean;
   paused?: boolean;
   pendingPaths?: string[];
   pushes?: number;
   pulls?: number;
+  resolutionRequired?: boolean;
   error?: string;
 };
 
@@ -202,11 +204,15 @@ function studioChangeState(record: Record<string, unknown>): StudioChangeState {
     conflictResolution: typeof record.conflictResolution === "string" ? record.conflictResolution : undefined,
     daemon: daemon ? {
       running: typeof daemon.running === "boolean" ? daemon.running : undefined,
+      mode: daemon.mode === "reconcile" || daemon.mode === "verify" ? daemon.mode : undefined,
       pullChanges: typeof daemon.pullChanges === "boolean" ? daemon.pullChanges : undefined,
       paused: typeof daemon.paused === "boolean" ? daemon.paused : undefined,
       pendingPaths: stringArray(daemon.pendingPaths),
       pushes: typeof daemon.pushes === "number" ? daemon.pushes : undefined,
       pulls: typeof daemon.pulls === "number" ? daemon.pulls : undefined,
+      resolutionRequired: typeof daemon.resolutionRequired === "boolean"
+        ? daemon.resolutionRequired
+        : undefined,
       error: typeof daemon.error === "string" ? daemon.error : undefined,
     } : undefined,
   };

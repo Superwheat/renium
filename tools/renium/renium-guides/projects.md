@@ -1,6 +1,6 @@
 # Models, places, links, packages, and version control
 
-Read `RENIUM.md` first. Read `RENIUM/data.md` too before selecting or editing saved instances.
+Also read `RENIUM/data.md` before editing saved instances.
 
 ```powershell
 rbx bem Workspace -i editor:id -o model.rbxm
@@ -10,16 +10,17 @@ rbx x -d snapshots --no-run-import
 rbx si --snapshot-dir snapshots --project-root .
 rbx sm
 rbx sm --stdout
+rbx sm --cached --stdout --filter "*Tutorial*"
 rbx bpack
 rbx wally --realms shared
 rbx wally --realms shared --force
 ```
 
-Wally sync needs a working `wally` command; Aftman users must declare Wally for the project first. Use `--force` to reinstall and reimport packages that are already current. Add `--details` only when the full changed-path and instance-ID lists are needed.
+Wally sync needs `wally`; Aftman projects must declare it. `--force` reinstalls current packages. `--details` includes full path and ID lists.
 
-`bem`/`bim` export and import model trees. They copy instances; use `mv --to-service` to reparent an existing project subtree across services without a temporary model or a separate remove. `x` exports raw Studio snapshots; `si` imports them into project files. `bep` builds a place from project data. `sm` writes the sourcemap for all mapped instances, not only scripts; use `sm --stdout` when its contents are needed without creating a file. `bpack` rewrites project stores in the current format and reports which files changed; already-current files remain untouched.
+`bem`/`bim` copy model trees. Use `mv --to-service` to move an existing subtree across services. `x` exports Studio snapshots; `si` imports them. Both snapshot export and pull need the same bridge. `bep` builds a place. `sm` maps every instance; `--cached --stdout --filter GLOB` queries the existing map. `bpack` updates old stores only.
 
-Version control: run `rbx vci` once in a project to initialize Git and Renium's ignore, text-diff, and merge rules; rerunning it is safe. `rbx vct FILE.renium` renders one binary store as deterministic text. Git invokes `rbx vcm BASE OURS THEIRS` automatically for a conflicting `.renium` merge. Use normal or path-scoped `git status`; `--untracked-files=all` expands every generated package file.
+Run `rbx vci` once to set up Git ignore, diff, and merge rules; reruns are safe. `vct` renders a store as text. Git calls `vcm` for conflicting `.renium` merges. Avoid `--untracked-files=all` on generated packages.
 
 Mirror one local source into a project target:
 
@@ -30,9 +31,9 @@ rbx lks
 rbx lkb --service ReplicatedStorage --path '["ReplicatedStorage","Shared","Logger"]' --remove
 ```
 
-`lka` adds the target, `lk` materializes current source, and `lks` reports total and active target counts. Plain `lkb` temporarily detaches a target; `lkb --remove` also removes its link record. Both keep the target editable and externalize scripts embedded by a package. Local source paths are relative to the project root. Mirrors are read-only unless added with `--writable`; reuse each `rootSettingsId` returned by `lk` for the subtree root and `settingsIds` for its instances, and push returned `changedPaths` only when Studio also needs the update.
+`lka` adds a target, `lk` applies it, and `lks` reports status. `lkb` detaches a target; `--remove` also deletes its record. Detached targets remain editable. Local sources are project-relative. Links are read-only unless `--writable`. Live Sync sends returned paths; otherwise push only when Studio needs the update.
 
-For a Git source, replace the source arguments with `--source-type git --source REPOSITORY --ref BRANCH_OR_COMMIT --subpath PATH`. Renium caches the repository and refreshes the requested ref on `lk`; use `lk --offline` only after that source has been cached.
+For Git, use `--source-type git --source REPOSITORY --ref REF --subpath PATH`. `lk` refreshes the cached ref; `--offline` requires an existing cache.
 
 Pack an existing subtree into a reusable project package, insert it elsewhere, then remove the package while keeping both materialized trees:
 
@@ -43,4 +44,4 @@ rbx lk --link shared-widget
 rbx lkd --id shared-widget --action unlink-uses
 ```
 
-`lkp` writes `packages/shared-widget.renium` and registers the packed subtree as its first target. `lka` can reuse that link id without repeating its source. `lkd --action delete-unused` refuses active uses, `delete-uses` removes them, and `unlink-uses` keeps them as ordinary editable project instances. All three delete the package and link.
+`lkp` writes the package and registers its source subtree. Reuse its ID with `lka`. `lkd` can refuse active uses (`delete-unused`), remove them (`delete-uses`), or keep editable copies (`unlink-uses`). Each action deletes the package and link.

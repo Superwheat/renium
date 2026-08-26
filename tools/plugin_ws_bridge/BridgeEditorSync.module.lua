@@ -252,6 +252,9 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 	if instance.Parent == parent then
 		return
 	end
+	if instance:IsA("PackageLink") then
+		error("PackageLink instances cannot be reparented")
+	end
 	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent) else nil
 	local ok, result = pcall(function()
 		instance.Parent = parent
@@ -270,6 +273,9 @@ end
 local function setNameForSync(instance: Instance, name: string, ctx: { [string]: any }?)
 	if instance.Name == name then
 		return
+	end
+	if instance:IsA("PackageLink") then
+		error("PackageLink instances cannot be renamed")
 	end
 	local token = if instance:IsDescendantOf(game) and ctx ~= nil
 		then ctx.expectPropertyEvent(instance, "Name", name)
@@ -299,15 +305,7 @@ end
 
 local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?)
 	if instance:IsA("PackageLink") then
-		local token = if ctx ~= nil then ctx.expectParentChange(instance, nil) else nil
-		local ok, result = pcall(function()
-			instance:Destroy()
-		end)
-		if not ok then
-			cancelExpectedEvent(ctx, token)
-			error(result, 0)
-		end
-		return
+		error(`PackageLink instances cannot be removed directly: {instance:GetFullName()}`)
 	end
 	setParentForSync(instance, nil, ctx)
 end
@@ -1135,6 +1133,9 @@ local function writePropertyForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
+	if instance:IsA("PackageLink") then
+		return false, "PackageLink properties are read-only"
+	end
 	local token = if instance:IsDescendantOf(game) and ctx ~= nil
 		then ctx.expectPropertyEvent(instance, propertyName, value)
 		else nil
@@ -1151,6 +1152,9 @@ local function setAttributeForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
+	if instance:IsA("PackageLink") then
+		return false, "PackageLink attributes are read-only"
+	end
 	local token = if instance:IsDescendantOf(game) and ctx ~= nil
 		then ctx.expectAttributeEvent(instance, attributeName, value)
 		else nil
@@ -1344,6 +1348,9 @@ local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [stri
 end
 
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
+	if instance:IsA("PackageLink") then
+		error("PackageLink tags are read-only")
+	end
 	local token = if instance:IsDescendantOf(game) then ctx.expectTagChange(instance, tag, added) else nil
 	local ok, result = pcall(function()
 		if added then
@@ -1397,6 +1404,9 @@ local function replaceInstanceClass(
 	if instance.ClassName == className then
 		stats.noops += 1
 		return instance
+	end
+	if containsPackageLink(instance) then
+		error(`Ordinary sync cannot replace package-bearing instance {instance:GetFullName()}`)
 	end
 
 	local replacement = BridgeInstanceSwap.replace(
@@ -1457,6 +1467,7 @@ local ScriptDocumentState = BridgeScriptDocuments
 local ReferenceOverlay = BridgeReferenceOverlay.create({
 	BridgeIdentity = BridgeIdentity,
 	BridgeReferenceRetarget = BridgeReferenceRetarget,
+	CollectionService = CollectionService,
 	RbxDomModule = RbxDomModule,
 	captureExplorerSelection = captureExplorerSelection,
 	containsPackageLink = containsPackageLink,
@@ -1466,8 +1477,11 @@ local ReferenceOverlay = BridgeReferenceOverlay.create({
 	resolveOrdinalChild = resolveOrdinalChild,
 	resolvePathSegments = resolvePathSegments,
 	restoreExplorerSelection = restoreExplorerSelection,
+	setAttributeForSync = setAttributeForSync,
 	setCurrentCameraForSync = setCurrentCameraForSync,
 	setParentForSync = setParentForSync,
+	setTagForSync = setTagForSync,
+	valuesEqual = valuesEqual,
 	writePropertyForSync = writePropertyForSync,
 })
 
@@ -2024,6 +2038,8 @@ local function applyInstanceDeletes(
 		end
 		if instance == nil or isProtectedWorkspaceCameraInstance(instance) or seenTargets[instance] then
 			stats.noops += 1
+		elseif instance:IsA("PackageLink") then
+			error(`PackageLink instances cannot be removed directly: {instance:GetFullName()}`)
 		else
 			seenTargets[instance] = true
 			targets[#targets + 1] = instance
@@ -2088,8 +2104,7 @@ local function applyPropertyChange(
 	local serviceName, service = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
 	if tostring(change.className or "") == "PackageLink" then
-		stats.noops += 1
-		return
+		error("PackageLink instances are read-only")
 	end
 
 	local instance = resolveInstance(change, ctx)
@@ -2465,6 +2480,9 @@ local function validateMutationRequest(params: any, ctx: { [string]: any }): { s
 						pathSegments = entry.pathSegments,
 						pathOrdinals = entry.pathOrdinals,
 					}, serviceName, string.format("Editor instance entry %d", entryIndex))
+					if entry.className == "PackageLink" and mode ~= "reconcileService" then
+						error("PackageLink instances cannot be created, replaced, or removed directly")
+					end
 					if
 						entry.anchorOnly ~= true
 						and entry.className ~= "PackageLink"
@@ -2479,6 +2497,8 @@ local function validateMutationRequest(params: any, ctx: { [string]: any }): { s
 						validateObjectTable(entry.matchAttributes, "Editor instance matchAttributes")
 					end
 				end
+			elseif kind == "property" and change.className == "PackageLink" then
+				error("PackageLink instances are read-only")
 			elseif kind == "source" then
 				local className = validateCreatableClass(change.className, classCache, "Editor source change")
 				if not ctx.luaSourceClass[className] then
@@ -3876,7 +3896,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
 		if #postCommitPropertyChanges > 0 then
 			local updated = 0
-			local packageSkipped = 0
 			RunService.Heartbeat:Wait()
 			for _, change in ipairs(postCommitPropertyChanges) do
 				local instance = resolvePathSegments(change.pathSegments, nil, change.pathOrdinals)
@@ -3895,26 +3914,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				local okRead, current = readProperty(instance, "WorldPivot")
 				if not okRead or current ~= value then
-					local ancestor: Instance? = instance
-					while ancestor ~= nil and ancestor ~= game do
-						if ancestor:FindFirstChildWhichIsA("PackageLink") ~= nil then
-							break
-						end
-						ancestor = ancestor.Parent
+					local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
+					if not okWrite then
+						error(`Failed to write WorldPivot on {instance:GetFullName()}: {writeError}`)
 					end
-					if ancestor ~= nil and ancestor ~= game then
-						packageSkipped += 1
-					else
-						local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
-						if not okWrite then
-							error(`Failed to write WorldPivot on {instance:GetFullName()}: {writeError}`)
-						end
-						updated += 1
-					end
+					updated += 1
 				end
 			end
 			timings.postCommitPropertyUpdated = updated
-			timings.postCommitPackageSkipped = packageSkipped
 		end
 		timings.postCommitPropertiesMs = (os.clock() - phaseStarted) * 1000
 		phaseStarted = os.clock()
@@ -3934,6 +3941,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		session.onExpire = nil
 		session.changeJournal = nil
 		if session.nativeUndo ~= nil then
+			for _, merge in ipairs(session.nativeUndo.packageMerges or {}) do
+				for _, instance in ipairs(merge.outgoing) do
+					if instance.Parent == nil then
+						instance:Destroy()
+					end
+				end
+			end
 			for _, group in ipairs(session.nativeUndo.prepared) do
 				for _, instance in ipairs(group.outgoing) do
 					if instance.Parent == nil then
@@ -4765,29 +4779,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				targetPath,
 				count
 			)
-			local stripPackagePayloads = {}
-			local stripPackagePayloadIndexes = {}
-			if rawGroup.stripPackagePayloads ~= nil then
-				local stripsAreArray, stripCount = denseArrayLength(rawGroup.stripPackagePayloads)
-				if not stripsAreArray or stripCount > count then
-					error("Invalid native import package payloads")
-				end
-				for _, rawIndex in ipairs(rawGroup.stripPackagePayloads) do
-					local payloadIndex = tonumber(rawIndex)
-					if
-						not payloadIndex
-						or payloadIndex < 1
-						or payloadIndex > count
-						or payloadIndex % 1 ~= 0
-						or retainedPayloadIndexes[payloadIndex]
-						or stripPackagePayloadIndexes[payloadIndex]
-					then
-						error("Invalid native import package payload")
-					end
-					stripPackagePayloadIndexes[payloadIndex] = true
-					stripPackagePayloads[#stripPackagePayloads + 1] = payloadIndex
-				end
-			end
 			local changeGeneration = tonumber(rawGroup.changeGeneration)
 			if
 				(#retainedRoots > 0 or #packageRoots > 0)
@@ -4805,7 +4796,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				rootPaths = rootPaths,
 				retainedRoots = retainedRoots,
 				packageRoots = packageRoots,
-				stripPackagePayloads = stripPackagePayloads,
 				changeGeneration = changeGeneration,
 			}
 		end
@@ -5010,13 +5000,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						detachedRoots[#detachedRoots + 1] = instance
 					end
 				end
-				for _, payloadIndex in ipairs(group.stripPackagePayloads) do
-					local root = incomingByPayloadIndex[payloadIndex]
-					if root == nil or root.Parent ~= nil then
-						error("Native import package payload was not detached")
-					end
-					skippedIncomingInstanceCount += ReferenceOverlay.stripIncomingPackages(root)
-				end
 				groupPayloadRoot:Destroy()
 				prepared[#prepared + 1] = {
 					serviceName = group.serviceName,
@@ -5040,6 +5023,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				resolveStagedPath = retention.resolveStagedPath,
 				referenceUpdates = retention.referenceUpdates,
 				retainedDuplicates = retention.retainedDuplicates,
+				packageAliases = retention.packageAliases,
+				packageMerges = retention.packageMerges,
+				packageStatePairs = retention.packageStatePairs,
 				generationsByService = generationsByService,
 				guard = transaction.nativeGuard,
 			}
@@ -5082,22 +5068,31 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		endSessionOperation(binaryImports, importId, session)
 		endSessionOperation(editorTransactions, transactionId, transaction)
 		if not okFinish then
+			local rollbackError = nil
 			if transaction.nativeUndo ~= nil then
 				local undo = transaction.nativeUndo
-				transaction.nativeUndo = nil
-				pcall(ReferenceOverlay.rollbackNative, undo, ctx)
+				local rolledBack, result = pcall(ReferenceOverlay.rollbackNative, undo, ctx)
+				if rolledBack then
+					transaction.nativeUndo = nil
+				else
+					rollbackError = tostring(result)
+				end
 			end
 			ReferenceOverlay.finishNativeGuard(transaction.nativeGuard)
 			transaction.nativeGuard = nil
-			for _, root in ipairs(roots) do
-				if root.Parent == nil then
-					root:Destroy()
+			if rollbackError == nil then
+				for _, root in ipairs(roots) do
+					if root.Parent == nil then
+						root:Destroy()
+					end
 				end
-			end
-			for _, root in ipairs(detachedRoots) do
-				if root.Parent == nil then
-					root:Destroy()
+				for _, root in ipairs(detachedRoots) do
+					if root.Parent == nil then
+						root:Destroy()
+					end
 				end
+			else
+				error(`{responseOrError}\nNative import rollback failed: {rollbackError}`, 0)
 			end
 			error(responseOrError, 0)
 		end

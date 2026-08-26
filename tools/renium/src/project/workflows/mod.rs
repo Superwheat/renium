@@ -605,7 +605,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
         write_doctor_bundle(&bundle, &result, bundle_project.as_deref())?;
     }
     if args.json {
-        crate::emit_global_output(&result, &serde_json::to_string_pretty(&result)?)?;
+        crate::app::output::print_json_output(&result, false)?;
     } else {
         let text = checks
             .iter()
@@ -1179,7 +1179,11 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     let expected_instructions = agent_instructions()?;
     let instructions_match = fs::read(root.join(PROJECT_INSTRUCTIONS_FILE))
         .is_ok_and(|contents| contents == expected_instructions);
-    if instructions_match {
+    let guides_match = agent_guides()?.into_iter().all(|(name, contents)| {
+        fs::read(root.join(PROJECT_GUIDES_DIRECTORY).join(name))
+            .is_ok_and(|current| current == contents)
+    });
+    if instructions_match && guides_match {
         return Ok(false);
     }
     refresh_agent_instructions(&root)?;
@@ -1653,7 +1657,7 @@ fn stop_named_daemon(name: &str, force: bool) -> Result<String> {
 #[cfg(windows)]
 fn terminate_recorded_daemon(pid: u32) -> Result<()> {
     let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .args(["/PID", &pid.to_string(), "/F"])
         .status()
         .context("Failed to run taskkill")?;
     if !status.success() {

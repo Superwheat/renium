@@ -2,7 +2,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("fmt", "Examples:\n  rbx fmt ."),
     ("pv", "Examples:\n  rbx pv"),
     ("xp", "Examples:\n  rbx xp src/Workspace/Door"),
-    ("cfg", "Examples:\n  rbx cfg list"),
+    (
+        "cfg",
+        "Examples:\n  rbx cfg list\n  rbx cfg get liveSync.initialSyncPriority\n  rbx cfg set liveSync.initialSyncPriority reconcile",
+    ),
     ("ad", "Examples:\n  rbx ad validate"),
     ("ir", "Examples:\n  rbx ir --project default.project.json"),
     ("init", "Examples:\n  rbx init ."),
@@ -19,7 +22,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx up --place-id 123456 --universe-id 654321",
     ),
     ("upd", "Examples:\n  rbx upd"),
-    ("oc", "Examples:\n  rbx oc key"),
+    (
+        "oc",
+        "Examples:\n  rbx oc key\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10\n  rbx oc experiment list --limit 25\n  rbx oc thumbnail personalization --limit 10",
+    ),
     ("sb", "Examples:\n  rbx sb --dry-run"),
     (
         "ip",
@@ -107,9 +113,12 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("re", "Examples:\n  rbx re"),
     ("setup", "Examples:\n  rbx setup"),
     ("st", "Examples:\n  rbx st --event-wait-seconds 1"),
-    ("lon", "Examples:\n  rbx lon"),
+    (
+        "lon",
+        "Examples:\n  rbx lon\n  rbx lon --prefer studio\n  rbx lon --prefer editor",
+    ),
     ("lof", "Examples:\n  rbx lof"),
-    ("lst", "Examples:\n  rbx lst"),
+    ("lst", "Examples:\n  rbx lst\n  rbx lst --wait 10"),
     ("rp", "Examples:\n  rbx rp"),
     ("dp", "Examples:\n  rbx dp"),
     ("ps", "Examples:\n  rbx ps src/StarterGui/Menu.client.luau"),

@@ -14,6 +14,7 @@ pub(crate) mod context;
 pub(crate) mod live;
 pub(crate) mod local;
 pub(crate) mod places;
+pub(crate) mod reconcile;
 pub(crate) mod runtime;
 pub(crate) mod studio_args;
 pub(crate) mod tools;

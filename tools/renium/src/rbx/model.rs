@@ -37,6 +37,7 @@ use crate::editor::paths::{
     build_editor_source_paths_by_index, build_editor_source_paths_by_index_with_children,
     editor_run_context_value, infer_source_script, merge_editor_source_files_into_document,
 };
+use crate::editor::sync::settings_file_hash;
 use crate::editor::types::{EditorInstancePath, EditorSettingsWrite};
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -1384,8 +1385,10 @@ pub(crate) fn build_rbx_place(
         .filter(|(_, _, _, _, _, _, _, _, changed)| *changed)
         .map(
             |(service, _, _, document, _, _, _, _, _)| -> Result<EditorSettingsWrite> {
+                let path = service_settings_path(&src_root.join(service));
                 Ok(EditorSettingsWrite {
-                    path: service_settings_path(&src_root.join(service)),
+                    expected_hash: settings_file_hash(&path)?,
+                    path,
                     document: document.clone(),
                 })
             },
@@ -1491,6 +1494,14 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         &args.model,
         target_parent_index,
     )?;
+    if document.instances[before_document.instances.len()..]
+        .iter()
+        .any(|instance| instance.class_name == "PackageLink")
+    {
+        bail!(
+            "Models containing PackageLink instances cannot be imported; desync the package first"
+        );
+    }
 
     let mut writes = outcome.source_files.clone();
     let mut removals = Vec::new();

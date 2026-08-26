@@ -49,7 +49,6 @@ struct PendingEditorBinaryGroup {
 struct EditorPackageGroupPlan {
     retained_roots: Vec<EditorBinaryRetainedRoot>,
     package_roots: Vec<EditorBinaryPackageRoot>,
-    strip_package_payloads: Vec<usize>,
     change_generation: Option<u64>,
 }
 
@@ -189,7 +188,6 @@ struct CanonicalRbxSubtree<'a> {
 
 struct CanonicalRbxSubtreePair {
     desired_root: RbxRef,
-    live_root: RbxRef,
     entries: Vec<(RbxRef, RbxRef)>,
 }
 
@@ -267,7 +265,6 @@ fn canonical_rbx_subtree_pair(
     }
     Ok(Some(CanonicalRbxSubtreePair {
         desired_root: desired.root,
-        live_root: live.root,
         entries,
     }))
 }
@@ -687,7 +684,7 @@ fn package_preflight_overlay_schema(
     available: &PropertySchemaMap,
 ) -> Result<PropertySchemaMap> {
     let mut schema = PropertySchemaMap::new();
-    let mut unresolved = Vec::new();
+    let mut unavailable = Vec::new();
     for (class_name, names) in requested {
         let mut found = HashSet::new();
         if let Some(entries) = available.get(&class_name) {
@@ -701,18 +698,18 @@ fn package_preflight_overlay_schema(
                 }
             }
         }
-        unresolved.extend(
+        unavailable.extend(
             names
                 .difference(&found)
                 .map(|name| format!("{class_name}.{name}")),
         );
     }
-    if !unresolved.is_empty() {
-        unresolved.sort();
-        unresolved.truncate(12);
-        bail!(
-            "Studio cannot read package preflight properties: {}",
-            unresolved.join(", ")
+    if verbose_timing_logs() && !unavailable.is_empty() {
+        unavailable.sort();
+        unavailable.truncate(12);
+        eprintln!(
+            "[renium] package preflight will replace roots with unreadable properties: {}",
+            unavailable.join(", ")
         );
     }
     Ok(schema)
@@ -863,6 +860,22 @@ fn capture_editor_package_preflight_live<'a>(
     required_reference_services: Option<&HashSet<String>>,
     force_full_snapshot: bool,
 ) -> Result<EditorPackagePreflightLive<'a>> {
+    capture_editor_package_preflight_live_attempt(
+        bridge,
+        service_names,
+        required_reference_services,
+        force_full_snapshot,
+        0,
+    )
+}
+
+fn capture_editor_package_preflight_live_attempt<'a>(
+    bridge: &'a BridgeServer,
+    service_names: &[String],
+    required_reference_services: Option<&HashSet<String>>,
+    force_full_snapshot: bool,
+    attempt: u8,
+) -> Result<EditorPackagePreflightLive<'a>> {
     let started = Instant::now();
     let first = editor_service_change_generations(bridge, service_names)?;
     log_timing("package preflight generation read", started);
@@ -900,7 +913,7 @@ fn capture_editor_package_preflight_live<'a>(
         });
     let started = Instant::now();
     let export = begin_editor_binary_export(bridge, false, None, service_filter.as_deref(), false)?;
-    let finish_guard = EditorBinaryExportFinishGuard {
+    let mut finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
     };
@@ -939,6 +952,34 @@ fn capture_editor_package_preflight_live<'a>(
             dom.transfer_within(child_ref, marker_ref);
         }
     }
+    let mismatch = export.groups.iter().find_map(|group| {
+        let marker =
+            rbx_dom_instance_by_path_unique(&dom, std::slice::from_ref(&group.service), &[1])
+                .ok()?;
+        let mut preorder = Vec::new();
+        collect_rbx_subtree_preorder(&dom, marker, &mut preorder);
+        (preorder.len() != group.instance_count).then(|| {
+            format!(
+                "Studio package preflight index for {} contains {} instances; expected {}",
+                group.service,
+                preorder.len(),
+                group.instance_count
+            )
+        })
+    });
+    if let Some(message) = mismatch {
+        finish_guard.finish(false)?;
+        if attempt < 2 {
+            return capture_editor_package_preflight_live_attempt(
+                bridge,
+                service_names,
+                required_reference_services,
+                force_full_snapshot,
+                attempt + 1,
+            );
+        }
+        bail!(message);
+    }
     log_timing("package preflight plugin snapshot", started);
     let captured_services = export
         .groups
@@ -975,14 +1016,6 @@ fn plan_editor_package_root_retention(
         return groups
             .iter()
             .map(|group| {
-                let strip_package_payloads = group
-                    .roots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, root)| {
-                        desired_package_roots.contains(root).then_some(index + 1)
-                    })
-                    .collect();
                 let change_generation = live_generations
                     .get(&group.service)
                     .copied()
@@ -995,7 +1028,6 @@ fn plan_editor_package_root_retention(
                 Ok(EditorPackageGroupPlan {
                     retained_roots: Vec::new(),
                     package_roots: Vec::new(),
-                    strip_package_payloads,
                     change_generation: Some(change_generation),
                 })
             })
@@ -1040,6 +1072,15 @@ fn plan_editor_package_root_retention(
             if !live_package_roots.contains(&live_root) {
                 continue;
             }
+            let desired_instance = desired_dom
+                .get_by_ref(*desired_root)
+                .context("Package-bearing project root is missing")?;
+            let live_instance = live_dom
+                .get_by_ref(live_root)
+                .context("Package-bearing Studio root is missing")?;
+            if desired_instance.class != live_instance.class {
+                continue;
+            }
             package_pairs.push((*desired_root, live_root));
         }
     }
@@ -1053,6 +1094,7 @@ fn plan_editor_package_root_retention(
         log_timing("package preflight canonical paths", started);
         (Some(desired_refs), Some(live_refs))
     };
+    let package_pairs_by_root = package_pairs.iter().copied().collect::<HashMap<_, _>>();
     let started = Instant::now();
     let canonical_package_pairs = package_pairs
         .par_iter()
@@ -1181,14 +1223,6 @@ fn plan_editor_package_root_retention(
         ) {
             Ok(target) => target,
             Err(_) if !captured_services.contains(&group.service) => {
-                let strip_package_payloads = group
-                    .roots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, root)| {
-                        desired_package_roots.contains(root).then_some(index + 1)
-                    })
-                    .collect();
                 let change_generation = live_generations
                     .get(&group.service)
                     .copied()
@@ -1201,7 +1235,6 @@ fn plan_editor_package_root_retention(
                 plans.push(EditorPackageGroupPlan {
                     retained_roots: Vec::new(),
                     package_roots: Vec::new(),
-                    strip_package_payloads,
                     change_generation: Some(change_generation),
                 });
                 continue;
@@ -1234,7 +1267,53 @@ fn plan_editor_package_root_retention(
             });
         }
         let mut retained_roots = Vec::new();
-        let mut strip_package_payloads = Vec::new();
+        let retained_root = |desired_root: RbxRef,
+                             live_root: RbxRef,
+                             payload_index: usize,
+                             payload_omitted: bool|
+         -> Result<EditorBinaryRetainedRoot> {
+            let desired_instance = desired_dom
+                .get_by_ref(desired_root)
+                .context("Package-bearing project root is missing")?;
+            let (path_segments, _) = rbx_dom_instance_path_parts(desired_dom, desired_root);
+            let desired_matches = group
+                .roots
+                .iter()
+                .filter_map(|referent| desired_dom.get_by_ref(*referent))
+                .filter(|instance| {
+                    instance.name == desired_instance.name
+                        && instance.class == desired_instance.class
+                })
+                .count();
+            let live_matches = live_target_instance
+                .children()
+                .iter()
+                .filter_map(|referent| live_dom.get_by_ref(*referent))
+                .filter(|instance| {
+                    editor_binary_group_includes_root(&group.service, &group.target_path, instance)
+                        && instance.name == desired_instance.name
+                        && instance.class == desired_instance.class
+                })
+                .count();
+            if desired_matches != 1 || live_matches != 1 {
+                bail!(
+                    "Package root {} cannot be matched uniquely between the project and Studio",
+                    path_segments.join(".")
+                );
+            }
+            let mut subtree = Vec::new();
+            collect_rbx_subtree_preorder(desired_dom, desired_root, &mut subtree);
+            let (live_path_segments, live_path_ordinals) =
+                rbx_dom_instance_path_parts(&live_dom, live_root);
+            Ok(EditorBinaryRetainedRoot {
+                path_segments: live_path_segments,
+                path_ordinals: live_path_ordinals,
+                class_name: desired_instance.class.to_string(),
+                payload_index: payload_index + 1,
+                instance_count: subtree.len(),
+                payload_omitted,
+            })
+        };
         for (payload_index, desired_root) in group.roots.iter().copied().enumerate() {
             let (path_segments, path_ordinals) =
                 rbx_dom_instance_path_parts(desired_dom, desired_root);
@@ -1245,92 +1324,74 @@ fn plan_editor_package_root_retention(
             if !desired_has_package && !live_has_package {
                 continue;
             }
-            let mut unchanged = false;
-            if desired_has_package
-                && live_has_package
-                && canonical_package_pairs_by_root.contains_key(&desired_root)
-            {
-                let pair = canonical_package_pairs_by_root
-                    .get(&desired_root)
-                    .context("Package-bearing canonical pair is missing")?;
-                let live_root = pair.live_root;
+            if live_has_package && !desired_has_package {
+                let live_root = live_root.context("Studio package root is missing")?;
                 let desired_instance = desired_dom
                     .get_by_ref(desired_root)
-                    .context("Package-bearing project root is missing")?;
-                let desired_matches = group
-                    .roots
-                    .iter()
-                    .filter_map(|referent| desired_dom.get_by_ref(*referent))
-                    .filter(|instance| {
-                        instance.name == desired_instance.name
-                            && instance.class == desired_instance.class
-                    })
-                    .count();
-                let live_matches = live_target_instance
-                    .children()
-                    .iter()
-                    .filter_map(|referent| live_dom.get_by_ref(*referent))
-                    .filter(|instance| {
-                        editor_binary_group_includes_root(
-                            &group.service,
-                            &group.target_path,
-                            instance,
-                        ) && instance.name == desired_instance.name
-                            && instance.class == desired_instance.class
-                    })
-                    .count();
-                if desired_matches != 1 || live_matches != 1 {
-                    bail!(
-                        "Package root {} cannot be matched uniquely between the project and Studio",
-                        path_segments.join(".")
-                    );
+                    .context("Project package root is missing")?;
+                let live_instance = live_dom
+                    .get_by_ref(live_root)
+                    .context("Studio package root is missing")?;
+                if desired_instance.class == live_instance.class {
+                    retained_roots.push(retained_root(
+                        desired_root,
+                        live_root,
+                        payload_index,
+                        false,
+                    )?);
                 }
-                unchanged = canonical_rbx_subtrees_equal(
-                    CanonicalRbxSubtree {
-                        dom: desired_dom,
-                        root: desired_root,
-                        refs: desired_refs
-                            .as_ref()
-                            .context("Desired package paths were not prepared")?,
-                        logical_properties: Some(logical_properties_by_ref),
-                        json_properties: None,
-                    },
-                    CanonicalRbxSubtree {
-                        dom: &live_dom,
-                        root: live_root,
-                        refs: live_refs
-                            .as_ref()
-                            .context("Live package paths were not prepared")?,
-                        logical_properties: None,
-                        json_properties: Some(&live_properties_by_ref),
-                    },
-                    &pair.entries,
-                    database,
-                    &package_property_filters,
-                )?;
-                if unchanged {
-                    let mut subtree = Vec::new();
-                    collect_rbx_subtree_preorder(desired_dom, desired_root, &mut subtree);
-                    let instance = desired_dom
-                        .get_by_ref(desired_root)
-                        .context("Package-bearing import root is missing")?;
-                    let (live_path_segments, live_path_ordinals) =
-                        rbx_dom_instance_path_parts(&live_dom, live_root);
-                    retained_roots.push(EditorBinaryRetainedRoot {
-                        path_segments: live_path_segments,
-                        path_ordinals: live_path_ordinals,
-                        class_name: instance.class.to_string(),
-                        payload_index: payload_index + 1,
-                        instance_count: subtree.len(),
-                        payload_omitted: true,
-                    });
-                }
-            }
-            if unchanged {
                 continue;
             }
-            if desired_has_package {
-                strip_package_payloads.push(payload_index + 1);
+            if desired_has_package && !live_has_package {
+                bail!(
+                    "Project package root {} has no matching package in Studio; ordinary push cannot create or replace package relationships",
+                    path_segments.join(".")
+                );
+            }
+            if desired_has_package && live_has_package {
+                let live_root = package_pairs_by_root
+                    .get(&desired_root)
+                    .copied()
+                    .with_context(|| {
+                        format!(
+                            "Package root {} cannot be preserved safely",
+                            path_segments.join(".")
+                        )
+                    })?;
+                let unchanged =
+                    if let Some(pair) = canonical_package_pairs_by_root.get(&desired_root) {
+                        canonical_rbx_subtrees_equal(
+                            CanonicalRbxSubtree {
+                                dom: desired_dom,
+                                root: desired_root,
+                                refs: desired_refs
+                                    .as_ref()
+                                    .context("Desired package paths were not prepared")?,
+                                logical_properties: Some(logical_properties_by_ref),
+                                json_properties: None,
+                            },
+                            CanonicalRbxSubtree {
+                                dom: &live_dom,
+                                root: live_root,
+                                refs: live_refs
+                                    .as_ref()
+                                    .context("Live package paths were not prepared")?,
+                                logical_properties: None,
+                                json_properties: Some(&live_properties_by_ref),
+                            },
+                            &pair.entries,
+                            database,
+                            &package_property_filters,
+                        )?
+                    } else {
+                        false
+                    };
+                retained_roots.push(retained_root(
+                    desired_root,
+                    live_root,
+                    payload_index,
+                    unchanged,
+                )?);
             }
         }
         let change_generation = Some(live_generations.get(&group.service).copied().with_context(
@@ -1344,7 +1405,6 @@ fn plan_editor_package_root_retention(
         plans.push(EditorPackageGroupPlan {
             retained_roots,
             package_roots,
-            strip_package_payloads,
             change_generation,
         });
     }
@@ -1673,6 +1733,7 @@ fn build_editor_binary_import_for_services(
         let omitted_payloads = package_plan
             .retained_roots
             .iter()
+            .filter(|root| root.payload_omitted)
             .map(|root| root.payload_index)
             .collect::<HashSet<_>>();
         for (index, referent) in pending.roots.iter().enumerate() {
@@ -1708,7 +1769,6 @@ fn build_editor_binary_import_for_services(
             root_paths,
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,
-            strip_package_payloads: package_plan.strip_package_payloads,
             change_generation: package_plan.change_generation,
         });
     }

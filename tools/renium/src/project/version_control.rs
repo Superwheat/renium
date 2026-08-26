@@ -570,7 +570,8 @@ fn vc_render_short(value: Option<&Value>) -> String {
 }
 
 struct VcMergeContext<'a> {
-    prefer: Option<bool>,
+    value_prefer: Option<bool>,
+    structural_prefer: Option<bool>,
     path: &'a str,
     conflicts: &'a mut Vec<VcMergeConflict>,
 }
@@ -592,7 +593,7 @@ impl VcMergeContext<'_> {
         if Some(theirs) == base {
             return ours.clone();
         }
-        match self.prefer {
+        match self.structural_prefer {
             Some(true) => ours.clone(),
             Some(false) => theirs.clone(),
             None => {
@@ -631,7 +632,7 @@ impl VcMergeContext<'_> {
             } else if t == b {
                 o.cloned()
             } else {
-                match self.prefer {
+                match self.value_prefer {
                     Some(true) => o.cloned(),
                     Some(false) => t.cloned(),
                     None => {
@@ -798,6 +799,16 @@ pub(crate) fn merge_settings_documents(
     theirs: &SettingsBytecode,
     prefer: Option<bool>,
 ) -> (SettingsBytecode, Vec<VcMergeConflict>) {
+    merge_settings_documents_with_policy(base, ours, theirs, prefer, prefer)
+}
+
+pub(crate) fn merge_settings_documents_with_policy(
+    base: &SettingsBytecode,
+    ours: &SettingsBytecode,
+    theirs: &SettingsBytecode,
+    value_prefer: Option<bool>,
+    structural_prefer: Option<bool>,
+) -> (SettingsBytecode, Vec<VcMergeConflict>) {
     let PreparedSettingsMerge {
         base,
         ours,
@@ -827,7 +838,8 @@ pub(crate) fn merge_settings_documents(
                 let base_inst = &base.instances[base_index];
                 let theirs_inst = &theirs.instances[theirs_index];
                 let mut merge_context = VcMergeContext {
-                    prefer,
+                    value_prefer,
+                    structural_prefer,
                     path: &inst_path,
                     conflicts: &mut conflicts,
                 };
@@ -883,7 +895,7 @@ pub(crate) fn merge_settings_documents(
                 if vc_instance_equal(base, base_index, ours, ours_index) {
                     continue;
                 }
-                match prefer {
+                match structural_prefer {
                     Some(false) => {}
                     Some(true) => {
                         merged.push(merged_instance_from(ours, ours_index));
@@ -933,7 +945,7 @@ pub(crate) fn merge_settings_documents(
             if vc_instance_equal(base, base_index, theirs, theirs_index) {
                 continue;
             }
-            match prefer {
+            match structural_prefer {
                 Some(true) => continue,
                 Some(false) => {
                     let mut properties = instance.properties.clone();
@@ -982,7 +994,7 @@ pub(crate) fn merge_settings_documents(
         );
     }
 
-    finish_settings_merge(merged, prefer, version, conflicts)
+    finish_settings_merge(merged, structural_prefer, version, conflicts)
 }
 
 fn stabilize_settings_document_references(document: &mut SettingsBytecode) {

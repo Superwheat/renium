@@ -1,6 +1,6 @@
 # Less common operations
 
-Read `RENIUM.md` first. These commands are direct: don't bind a context, start a daemon, or create a payload file.
+Run these directly; don't prepare a daemon, context, or payload file.
 
 ```powershell
 rbx status
@@ -15,12 +15,12 @@ rbx me src/ServerScriptService/Main.server.luau oldText newText
 rbx inp -p 1 click "Shop.BuyButton" wait 100 key E
 ```
 
-`status` reads the selected Studio state. `ro` reopens the exact connected local file or published place Renium remembered; an explicit file overrides that target. `sx` closes the selected Studio. A local file requires either `--save` or `--terminate`, so Renium never chooses what happens to unsaved local work.
+`status` reads Studio state. `ro` reopens the remembered local file or published place; a file argument overrides it. `sx` closes Studio. Local files require `--save` or `--terminate`.
 
-Place order uses published place IDs, not aliases. `pa`, `pn`, and `po` update the project and invalidate any old internal binding automatically.
+Place order uses published IDs. `pa`, `pn`, and `po` invalidate old bindings automatically.
 
-`me FILE OLD NEW [OLD NEW ...]` applies several exact source edits in one operation. Add `--all` to replace every match and `--class` when creating a missing script file requires an explicit Roblox script class.
+`me FILE OLD NEW [OLD NEW ...]` applies exact source edits. `--all` replaces every match; `--class` sets the class of a new script.
 
-`inp` executes ordered input pairs. Supported actions are `click`, `right`, `move`, `down`, `up`, `right-down`, `right-up`, `scroll-up`, `scroll-down`, `key`, `kd`, `ku`, `text`, and `wait`. Mouse targets are a UI path or `x,y`; waits are milliseconds. Put `-p` before the action list.
+`inp` runs ordered action/value pairs: `click`, `right`, `move`, `down`, `up`, `right-down`, `right-up`, `scroll-up`, `scroll-down`, `key`, `kd`, `ku`, `text`, and `wait`. Mouse targets use a UI path or `x,y`; waits use milliseconds. Put `-p` first.
 
-Renium selects and binds the project/runtime itself. Ambiguity returns candidates instead of guessing. Correct a permanent error rather than trying a different command; Renium retries one transient connection failure internally.
+Renium selects the project and runtime. Ambiguity returns candidates. Fix permanent errors; Renium retries one transient connection failure.

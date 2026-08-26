@@ -1,7 +1,5 @@
 # Saved project data
 
-Read `RENIUM.md` first.
-
 ```powershell
 rbx f Workspace -n Door --limit 5
 rbx f ServerScriptService -c Script --limit 5
@@ -21,25 +19,26 @@ rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
-Use `f SERVICE text` for a text search. `-n` is an exact name filter; don't add `*` wildcards.
+`f SERVICE text` searches text. `-n` matches an exact name; don't add wildcards.
 
-Property values use `--str`, `--num`, `--bool`, `--null`, or `-j` for another JSON value. `--null` removes the stored override; writing the Roblox default explicitly still stores an override. Automatic writes reject property names missing from the class. Use `--scope property` only for a real newer or hidden Roblox property absent from Renium's bundled schema, and `--scope attribute` to create an attribute.
+Values use `--str`, `--num`, `--bool`, `--null`, or `-j`. `--null` removes an override; writing the default stores one. Unknown class properties are rejected. Use `--scope property` for a real property missing from Renium's schema and `--scope attribute` for attributes.
 
-Set or clear an instance reference with `-j '{"_type":"Ref","settingsId":"editor:target"}'` or `--null`. Ref objects can also use `pathSegments` plus `pathOrdinals` when an ID is unavailable.
+Set references with `-j '{"_type":"Ref","settingsId":"editor:target"}'`; clear with `--null`. Without an ID, use `pathSegments` and `pathOrdinals`.
 
-Edit an existing project script file directly; don't run `bss` afterward. For a new script, use `ba` to create its Script, LocalScript, or ModuleScript entry, then edit the generated file. `bss --str` or `--source-file` can set its source in the same store operation.
+Edit existing script files directly; don't run `bss` afterward. For a new script, create its entry with `ba`, then edit its file. `bss --str` or `--source-file` sets source in one store operation.
 
-Selectors are `-i` for settings ID, `-x` for index, `-n` for name, `-c` for class, or `--path` with optional `--ords`. Use exactly one selector. Don't combine a path with another selector. Use a service name first; use `-f` only for one explicit store, never both.
+Select once with `-i`, `-x`, `-n`, `-c`, or `--path` plus optional `--ords`. Use a service name or `-f` for one store, never both.
 
-Mutation results list only files whose bytes or paths changed in `changedPaths`. An empty list is a successful no-op and needs no push. When a structural edit returns settings IDs, include them with `-i` in the next push along with its `changedPaths`. Don't push an entire changed service settings file without IDs unless you intend to reconcile that whole service.
+`changedPaths` lists real file changes; an empty list is a no-op. Live Sync sends those paths automatically. Without Live Sync, push returned paths with returned settings IDs. Don't push a whole service store without IDs unless full-service reconciliation is intended.
 
-Batch related reads once. The compact response has one flat result per request in top-level `rs`; it doesn't nest one result inside another. In batch fields, `src` is the source-file path; use `prop:Source` for exact script text.
+Batch related reads. Results are flat in top-level `rs`. In fields, `src` is the source path; `prop:Source` is exact script text.
 
 ```powershell
 '{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup"},{"type":"counts"}]}' | rbx bb Workspace -J -
+'{"ops":[{"type":"counts","id":"editor:folder"},{"type":"search","id":"editor:folder","q":"Door","limit":5,"fields":"lookup"}]}' | rbx bb Workspace -J -
 ```
 
-Field presets: `lookup=id,n,c,path`, `tree=id,n,c,cc,ch`, `brief=id,n,c,path,cc`; request one property with `prop:Name` or attribute with `attr:Tags`. Requested properties omitted from a `bb` node aren't serialized overrides; they use the Roblox class default.
+Limit `counts` or `search` with `id`, `path`, `index`, `name`, or `className`. Presets: `lookup=id,n,c,path`, `tree=id,n,c,cc,ch`, `brief=id,n,c,path,cc`. Request fields with `prop:Name` or `attr:Tags`. A requested property absent from a node uses the class default.
 
 Inspect models without importing them:
 
@@ -48,16 +47,17 @@ rbx v model.rbxm --json
 rbx v model.rbxmx --json
 ```
 
-Use `--json` when exact script source and stable references are required. Plain model view summarizes source text. `v` accepts `.renium`, `.rbxm`, and `.rbxmx`, not place files; verify place contents from `bep`'s manifest and `sm --stdout` before comparing exported hashes.
+Use `--json` for exact source and references. `v` accepts `.renium`, `.rbxm`, and `.rbxmx`, not places. Verify places with `bep`'s manifest and `sm --stdout`.
 
-RBXM is columnar, so decoding it can materialize a Roblox class default for an instance that never stored that property. Requested `bb` properties also return class defaults. Use `rbx v <store>.renium --json` to distinguish stored overrides before comparing model formats.
+RBXM and requested `bb` properties may materialize class defaults. Use `rbx v <store>.renium --json` to identify stored overrides.
 
 Search saved script files without asking Studio to read them again:
 
 ```powershell
 rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
-rbx sr src/ServerScriptService/Main.server.luau --start-line 40 --end-line 80
 ```
 
-`ss` matches files containing every keyword, without case sensitivity, and reports file counts. `sg` matches literal source text, is case-sensitive unless `--case-insensitive` is used, and reports line counts. Limits cap returned results while totals still cover the full project.
+`ss` finds files containing every keyword, case-insensitively. `sg` finds literal lines and is case-sensitive unless changed. Limits cap results, not totals.
+
+Read known scripts as normal files. Use `sr` only for bounded reads when direct access is unavailable.

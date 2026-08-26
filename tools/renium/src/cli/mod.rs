@@ -27,16 +27,15 @@ pub(crate) fn command() -> clap::Command {
     examples::COMMAND_EXAMPLES
         .iter()
         .fold(Cli::command(), |command, (name, examples)| {
-            command.mut_subcommand(*name, |subcommand| subcommand.after_help(*examples))
+            command.mut_subcommand(*name, |subcommand| subcommand.override_help(*examples))
         })
+        .override_help(
+            "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
+        )
 }
 
 #[derive(Parser)]
-#[command(
-    author,
-    version,
-    after_help = "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png"
-)]
+#[command(author, version)]
 pub(super) struct Cli {
     #[arg(
         help = "Pin bridge commands to one Studio place by name, placeId, or gameId:placeId (env: RENIUM_PLACE)",
@@ -368,13 +367,15 @@ mod tests {
             .get_subcommands()
             .filter(|subcommand| !subcommand.is_hide_set())
         {
-            let examples = subcommand
-                .get_after_help()
-                .unwrap_or_else(|| panic!("{} has no examples", subcommand.get_name()))
-                .to_string();
+            let examples = subcommand.clone().render_help().to_string();
             assert!(
                 examples.contains(&format!("rbx {}", subcommand.get_name())),
                 "{} does not use its short name in examples",
+                subcommand.get_name()
+            );
+            assert!(
+                !examples.contains("Options:") && !examples.contains("Usage:"),
+                "{} exposes implementation details in help",
                 subcommand.get_name()
             );
         }
@@ -383,7 +384,7 @@ mod tests {
 
 #[derive(Clone, clap::Args)]
 pub(super) struct BridgeConnectionArgs {
-    #[arg(short, long, alias = "wait", default_value_t = 8.0)]
+    #[arg(short, long, default_value_t = 8.0)]
     pub(super) wait_seconds: f64,
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
     pub(super) host: String,
@@ -1131,8 +1132,20 @@ pub(super) struct StudioChangeStateArgs {
     pub(super) suppress_seconds: Option<f64>,
     #[arg(long = "event-wait-seconds", value_name = "SECONDS")]
     pub(super) event_wait_seconds: Option<f64>,
+    #[arg(
+        long = "wait",
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        default_missing_value = "10",
+        help = "Wait for watched file changes to finish syncing"
+    )]
+    pub(super) settle_wait_seconds: Option<f64>,
     #[arg(long)]
     pub(super) context_bound: bool,
+    #[arg(long)]
+    pub(super) details: bool,
+    #[arg(long, value_name = "studio|editor")]
+    pub(super) prefer: Option<String>,
 }
 
 #[derive(Parser)]
@@ -1297,8 +1310,16 @@ pub(super) struct ApplyEditorPropertyArgs {
     pub(super) scope: String,
     #[arg(short = 'n', long, alias = "prop")]
     pub(super) property: String,
-    #[arg(short = 'j', long, alias = "value")]
-    pub(super) value_json: String,
+    #[arg(
+        short = 'j',
+        long,
+        alias = "value",
+        required_unless_present = "source_file",
+        conflicts_with = "source_file"
+    )]
+    pub(super) value_json: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub(super) source_file: Option<PathBuf>,
     #[arg(long)]
     pub(super) no_review: bool,
     #[arg(long, alias = "apply")]

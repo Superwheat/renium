@@ -1,26 +1,19 @@
 # Renium (VS Code/Cursor)
 
-This extension gives Rojo/Argon-style control from VS Code/Cursor using native Rust executables:
+This extension controls Renium from VS Code and Cursor through the native CLI.
 
-- `renium.exe` for Studio export/import/serialization
-
-Renium checks its signed GitHub Release manifest when the editor opens. **Install Update**
-downloads and installs the matching editor extension and Studio plugin. Reload
-the editor and restart Studio when it finishes. Automatic checks can be turned
-off with `renium.automaticUpdateChecks`.
+Renium checks signed updates when the editor opens. **Install Update** installs
+matching extension and plugin versions. Reload the editor and restart Studio.
+Disable checks with `renium.automaticUpdateChecks`.
 
 ## What it does
 
-- Separate Pull Studio to Files and Push Files to Studio commands
-- Export-only command: Studio -> snapshots
-- Import-only command: snapshots -> the configured project source folder (Rust importer)
-- Two-way live sync between project files and Studio, including dirty Studio service imports
-- Git tab inside the main Renium panel with repository status plus pull/commit/push actions
-- Optional "Pull from Studio, Commit and Push" flow so Studio changes can be published in one workflow
-- Wally package sync that runs `wally install` and imports packages directly into the configured package target
-- Reusable link packages; treat third-party `.renium` packages as source code because they can contain Luau scripts, auto-running script classes, properties, and PackageLink instances
-- Optional debounced auto-sync on save
-- Status bar button + quick menu + output panel
+- Pull, Push, snapshots, and two-way Live Sync
+- Git status, pull, commit, and push
+- Pull from Studio, commit, and push in one flow
+- Wally and reusable link packages
+- Optional sync on save
+- Status bar menu and output panel
 
 ## Commands
 
@@ -37,11 +30,9 @@ off with `renium.automaticUpdateChecks`.
 
 ## Multi-place experiences
 
-Open `Renium: Manage Places`, then choose **Add Current Studio Place** for each
-published place in an experience.
-Renium verifies that its `GameId` matches the project before creating or
-changing files. Each place gets an independent project root. `src` is the
-default source folder; `sourceRoot` in `renium.project.jsonc` can change it:
+Use **Manage Places → Add Current Studio Place** for each published place.
+Renium checks the `GameId` before writing. Each place has its own project root;
+`sourceRoot` changes the default `src` folder:
 
 ```text
 renium.experience.json
@@ -56,30 +47,20 @@ places/
     sourcemap.json
 ```
 
-Each place file defaults to `{ "schemaVersion": 1 }`. Add `sourceRoot` or other
-project options only when that place differs from the defaults.
+Place files default to `{ "schemaVersion": 1 }`; add only non-default options.
 
-The first alias comes from the published place name. It is lowercased, spaces
-become underscores, and non-ASCII letters and punctuation are removed. Choose
-**Rename Active Place** to use a shorter alias such as `main` or `lobby`.
-Renaming the alias moves that place folder and does not rename the place on
-Roblox.
+Aliases come from published names: lowercase, spaces to underscores, ASCII
+letters and numbers only. **Rename Active Place** moves the folder without
+renaming the Roblox place.
 
-**Switch Active Place** changes the one place that Pull, Push, live sync,
-Explorer, generated files, and package commands use. **Reorder Places**
-controls how places are listed. Both are under **Manage Places**. The active
-selection is stored per workspace, while the display order is stored in
-`renium.experience.json`. Projects without that file keep the existing
-single-place layout and behavior.
+**Switch Active Place** selects the target for sync and project commands.
+**Reorder Places** changes display order. The workspace stores the active place;
+`renium.experience.json` stores order. Without it, the project stays single-place.
 
 ## .renium viewer
 
-Open the Renium panel and switch to the **Inspector** tab (next to Explorer /
-History / Git), then drag any `.renium` file onto it to see its instance tree:
-class icons, properties, attributes, script source, and settings id, with a
-filter box. You can also double-click a `.renium` in the file Explorer to open
-the same view full-width. Decoding is done by the `renium` CLI, so what you see
-matches exactly what syncs.
+Drag a `.renium` file onto **Inspector**, or double-click it, to view instances,
+properties, attributes, source, and IDs. The CLI uses the same decoder as sync.
 
 ## Requirements
 
@@ -88,15 +69,11 @@ matches exactly what syncs.
 - For Wally package sync: `wally` on PATH, or configure `renium.wallySync.wallyPath`
 - `git` available on PATH, or configure `renium.gitSync.gitPath`
 
-The released extension carries its matching Renium CLI and exposes `renium`
-and `rbx` to new integrated terminals. Projects do not need copies of
-`renium.exe`, `rbx.cmd`, or the extension itself. A CLI already on `PATH` and
-the older project-local locations remain supported.
+Releases include the matching CLI and expose `renium` and `rbx` to new terminals.
+Projects need no executable copies.
 
-On macOS, **Renium: Install Studio Plugin** also prepares
-`~/Applications/Renium Studio.app`. Open that app for exact protected-property
-sync without save or export dialogs. The original Roblox Studio app remains
-unchanged.
+On macOS, installation creates `~/Applications/Renium Studio.app` for
+protected-property sync. The original Studio app is unchanged.
 
 ## Wally package sync
 
@@ -112,23 +89,25 @@ realm = "shared"
 [dependencies]
 ```
 
-Then run `Renium: Sync Wally Packages` from the command palette or Renium menu. Renium runs `wally install`, imports the generated package tree directly, replaces the configured package target, and can apply the package tree to Studio. By default, that target is `<sourceRoot>/ReplicatedStorage/Packages`.
+Run **Sync Wally Packages** to install, import, and optionally apply packages to
+Studio. The default target is `<sourceRoot>/ReplicatedStorage/Packages`.
 
-If `wally.toml` is missing, the VS Code command can create a starter manifest. If you use Aftman shims or a custom tool location, set `renium.wallySync.wallyPath`.
+If `wally.toml` is missing, Renium can create it. Set
+`renium.wallySync.wallyPath` for custom locations.
 
 ## Git tab behavior
 
-The **Git** tab lives inside the main Renium panel alongside the existing Explorer and History tabs.
+The **Git** tab is beside Explorer and History.
 
-- Shows current branch, remote, ahead/behind counts, and changed project source files
-- Redacts credentials/tokens before remote URLs are shown in the UI or output
-- Uses the configured project source folder as the default Git sync scope for staging/status
-- Blocks pull when the worktree is dirty if `renium.gitSync.requireCleanWorktreeBeforePull` is enabled
-- Pauses file mirroring while pull or branch checkout rewrites the worktree, then resumes from the final files
-- Uses fast-forward-only pull to avoid creating merge commits silently
-- Blocks commit/push when files are already staged, to avoid publishing unintended index state
-- Excludes untracked files by default unless `renium.gitSync.includeUntracked` is enabled
-- Can optionally push pulled project-file changes back into Studio after a successful pull
+- Shows branch, remote, ahead/behind, and changed project files
+- Redacts credentials from remote URLs
+- Scopes Git operations to the configured source folder
+- Can require a clean worktree before pull
+- Pauses mirroring during pull and checkout
+- Uses fast-forward-only pull
+- Rejects unexpected pre-staged files
+- Excludes untracked files by default
+- Can apply pulled changes to Studio
 
 ## Development
 
@@ -138,20 +117,17 @@ npm.cmd ci
 npm.cmd run verify
 ```
 
-Ordinary compile, verify, package, and release commands use the checked-in API
-metadata and class icons. They do not start Roblox Studio or rewrite generated
-source files. Asset refreshes are explicit:
+Normal builds use checked-in API metadata and icons without starting Studio.
+Refresh assets explicitly:
 
 ```powershell
 npm.cmd run sync-assets             # local metadata/icons; no Studio process
 npm.cmd run refresh-studio-assets   # also runs Studio's headless -API export
 ```
 
-Review and commit the generated diff after either refresh. Release builds must
-not depend on whichever Studio version happens to be installed on the build
-machine.
+Review generated diffs. Release builds don't depend on the installed Studio.
 
-Build Rust backend (recommended):
+Build the Rust backend:
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\\.cargo\\bin;$env:PATH"
@@ -159,11 +135,11 @@ cd tools/renium
 cargo build --locked --release
 ```
 
-Press `F5` in VS Code from this extension folder to run an Extension Development Host.
+Press `F5` here to run an Extension Development Host.
 
 ## Packaging and release builds
 
-Build just the extension VSIX from its source directory:
+Build the VSIX:
 
 ```powershell
 cd tools/renium-vscode-extension
@@ -171,22 +147,18 @@ npm.cmd ci
 npm.cmd run package
 ```
 
-For the CLI, extension, and both Studio plugin formats together, run this from
-the repository root:
+Build all release artifacts from the repository root:
 
 ```powershell
 .\tools\build-release.ps1 -LocalBuild
 ```
 
-It writes a versioned directory under `dist/`, regenerates both plugin bundles
-from `Renium.project.json`, validates the VSIX metadata, and writes hashes plus
-a build manifest. `recompile.bat` is the same local-build shortcut.
+This writes versioned artifacts, hashes, and a manifest under `dist/`.
+`recompile.bat` is the shortcut.
 
-For a public release, omit `-LocalBuild`. The release command intentionally
-requires a clean checkout, a root product `LICENSE` file, and a registered VS
-Code publisher. The current `publisher: "local"` setting is suitable only for
-offline/private VSIX installation; replace it with your registered publisher
-before Marketplace publication.
+For a public release, omit `-LocalBuild`. It requires a clean checkout, license,
+and registered VS Code publisher. `publisher: "local"` supports only private
+VSIX installation.
 
 ## Key settings
 

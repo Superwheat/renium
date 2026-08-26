@@ -1122,53 +1122,78 @@ impl BridgeServer {
             .clear();
     }
 
+    pub(crate) fn pin_runtime(&self, target: BridgeTarget, runtime_id: &str) {
+        self.runtime_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                Self::runtime_pin_key(target, None),
+                RuntimePin {
+                    runtime_id: runtime_id.to_string(),
+                },
+            );
+    }
+
     pub(crate) fn choose_runtime_pin(
         &self,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> Result<RuntimePin> {
-        let mut candidates: HashMap<String, RuntimePinCandidate> = HashMap::new();
-        let mut matching_socket_count = 0usize;
+        let lock_deadline = Instant::now() + BRIDGE_CHANNEL_LOCK_TIMEOUT;
+        let matching_socket_count = loop {
+            let mut candidates: HashMap<String, RuntimePinCandidate> = HashMap::new();
+            let mut matching_socket_count = 0usize;
+            let mut busy = false;
 
-        for channel in &self.channels {
-            let mut guard = match channel.sockets.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => continue,
-            };
-            Self::ensure_place_unambiguous(&mut guard, target, player)?;
-            for (role_key, socket) in guard.iter() {
-                if !Self::socket_matches_selector(role_key, socket, target, player) {
-                    continue;
-                }
-                matching_socket_count += 1;
-                let runtime_id = socket.bridge_info.runtime_id.trim();
-                if runtime_id.is_empty() {
-                    continue;
-                }
-                let role_rank = Self::role_preference_rank(role_key, target);
-                let candidate = candidates.entry(runtime_id.to_string()).or_insert_with(|| {
-                    RuntimePinCandidate {
-                        ports: HashSet::new(),
-                        role_rank,
-                        last_focused_at: socket.last_focused_at,
+            for channel in &self.channels {
+                let mut guard = match channel.sockets.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => {
+                        busy = true;
+                        continue;
                     }
-                });
-                candidate.ports.insert(channel.port);
-                candidate.role_rank = candidate.role_rank.min(role_rank);
-                candidate.last_focused_at = candidate.last_focused_at.max(socket.last_focused_at);
+                };
+                Self::ensure_place_unambiguous(&mut guard, target, player)?;
+                for (role_key, socket) in guard.iter() {
+                    if !Self::socket_matches_selector(role_key, socket, target, player) {
+                        continue;
+                    }
+                    matching_socket_count += 1;
+                    let runtime_id = socket.bridge_info.runtime_id.trim();
+                    if runtime_id.is_empty() {
+                        continue;
+                    }
+                    let role_rank = Self::role_preference_rank(role_key, target);
+                    let candidate = candidates.entry(runtime_id.to_string()).or_insert_with(|| {
+                        RuntimePinCandidate {
+                            ports: HashSet::new(),
+                            role_rank,
+                            last_focused_at: socket.last_focused_at,
+                        }
+                    });
+                    candidate.ports.insert(channel.port);
+                    candidate.role_rank = candidate.role_rank.min(role_rank);
+                    candidate.last_focused_at =
+                        candidate.last_focused_at.max(socket.last_focused_at);
+                }
             }
-        }
 
-        if let Some((runtime_id, _)) = candidates.into_iter().max_by(|(_, left), (_, right)| {
-            right
-                .role_rank
-                .cmp(&left.role_rank)
-                .then_with(|| left.ports.len().cmp(&right.ports.len()))
-                .then_with(|| left.last_focused_at.cmp(&right.last_focused_at))
-        }) {
-            return Ok(RuntimePin { runtime_id });
-        }
+            let candidate = candidates.into_iter().max_by(|(_, left), (_, right)| {
+                right
+                    .role_rank
+                    .cmp(&left.role_rank)
+                    .then_with(|| left.ports.len().cmp(&right.ports.len()))
+                    .then_with(|| left.last_focused_at.cmp(&right.last_focused_at))
+            });
+            if let Some((runtime_id, _)) = candidate {
+                return Ok(RuntimePin { runtime_id });
+            }
+            if !busy || Instant::now() >= lock_deadline {
+                break matching_socket_count;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
 
         if target == BridgeTarget::Client
             && let Some(index) = player.and_then(|value| value.parse::<usize>().ok())
@@ -1226,14 +1251,6 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Result<RuntimePin> {
         let key = Self::runtime_pin_key(target, player);
-        if target == BridgeTarget::Main {
-            let pin = self.choose_runtime_pin(target, player)?;
-            self.runtime_pins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, pin.clone());
-            return Ok(pin);
-        }
         let existing = self
             .runtime_pins
             .lock()

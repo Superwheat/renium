@@ -1,4 +1,5 @@
 local BridgeStudioChanges = {}
+local BridgeScriptDocuments = require(script.Parent.BridgeScriptDocuments)
 local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
 local CHANGE_TRACKER_VERSION = 4
 local CollectionService = game:GetService("CollectionService")
@@ -1563,6 +1564,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				true,
 				instance.Parent
 		end
+		if lowered == "source" then
+			local okSource, source = BridgeScriptDocuments.readSource(instance)
+			if not okSource then
+				return nil, false, nil, false, nil
+			end
+			local directOk, directValue = encodeDirectValue(source)
+			return stableValueString(source), directOk, directValue, true, source
+		end
 
 		local readName = propertyReadNameForEvent(instance, propertyName)
 		local okValue, value = pcall(function()
@@ -1869,6 +1878,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end),
 			service.DescendantRemoving:Connect(function(instance: Instance)
 				state.exportInstancesByService[serviceName] = nil
+				local removingParent = instance.Parent
 				removeTrackedArchivable(instance, serviceName)
 				local expected = consumeExpectedInstanceEvent(
 					state.expectedStructuralByInstance,
@@ -1898,6 +1908,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					)
 				end
 				disconnectInstanceTree(instance)
+				task.defer(function()
+					invalidateSiblingOrdinals(removingParent)
+				end)
 				if state.onlyCodeMode and #ancestors > 0 then
 					task.defer(function()
 						for _, ancestor in ipairs(ancestors) do
@@ -2228,7 +2241,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function buildStateResponse(services: { string }): { [string]: any }
+	local function buildStateResponse(services: { string }, compact: boolean): { [string]: any }
 		local requested = {}
 		for _, serviceName in ipairs(services) do
 			requested[serviceName] = true
@@ -2244,37 +2257,52 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		local propertyChanges = {}
+		local propertyChangeCount = 0
 		for _, change in pairs(state.propertyChangesByKey) do
 			if
 				requested[change.service]
 				and state.dirtySeqByService[change.service] ~= nil
 				and state.fullSyncSeqByService[change.service] == nil
 			then
-				propertyChanges[#propertyChanges + 1] = change
+				propertyChangeCount += 1
+				if not compact then
+					propertyChanges[#propertyChanges + 1] = change
+				end
 			end
 		end
-		table.sort(propertyChanges, function(a, b)
-			return a.seq < b.seq
-		end)
+		if not compact then
+			table.sort(propertyChanges, function(a, b)
+				return a.seq < b.seq
+			end)
+		end
 		local changes = {}
+		local changeCount = 0
 		for _, change in pairs(state.changeLogByKey) do
 			if requested[change.service] and state.dirtySeqByService[change.service] ~= nil then
-				changes[#changes + 1] = change
+				changeCount += 1
+				if not compact then
+					changes[#changes + 1] = change
+				end
 			end
 		end
-		table.sort(changes, function(a, b)
-			return a.seq < b.seq
-		end)
-		if #changes == 0 and #dirtyServices > 0 then
+		if not compact then
+			table.sort(changes, function(a, b)
+				return a.seq < b.seq
+			end)
+		end
+		if changeCount == 0 and #dirtyServices > 0 then
+			changeCount = #dirtyServices
 			for _, serviceName in ipairs(dirtyServices) do
-				changes[#changes + 1] = {
-					service = serviceName,
-					action = "fullSync",
-					reason = "dirty service had no retained change log",
-					path = serviceName,
-					fullSync = true,
-					seq = state.dirtySeqByService[serviceName] or state.seq,
-				}
+				if not compact then
+					changes[#changes + 1] = {
+						service = serviceName,
+						action = "fullSync",
+						reason = "dirty service had no retained change log",
+						path = serviceName,
+						fullSync = true,
+						seq = state.dirtySeqByService[serviceName] or state.seq,
+					}
+				end
 			end
 		end
 		local trackedServiceCount = 0
@@ -2292,6 +2320,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			fullSyncServices = fullSyncServices,
 			propertyChanges = propertyChanges,
 			changes = changes,
+			propertyChangeCount = propertyChangeCount,
+			changeCount = changeCount,
 			itemChangedAvailable = state.itemChangedAvailable,
 			tagSignalsAvailable = state.tagSignalsAvailable,
 			propertyFilterClasses = state.propertyFilterClassCount,
@@ -2345,7 +2375,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			waitTimedOut = not changed and not waitCancelled
 		end
 
-		local response = buildStateResponse(services)
+		local response = buildStateResponse(services, params.compact == true)
 		if waitedForChange then
 			response.eventDriven = true
 			response.waitSeconds = math.min(waitSeconds or 0, 25)

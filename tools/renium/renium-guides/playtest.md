@@ -1,7 +1,5 @@
 # Playtests, Luau, and consoles
 
-Read `RENIUM.md` first.
-
 ```powershell
 rbx play -s                         # ordinary Play; default for one-client checks
 rbx play -s --players 1             # local server plus one separate client
@@ -14,14 +12,16 @@ rbx co --player 2 -n 20
 rbx play -x
 ```
 
-Use ordinary Play unless the test needs a separate server runtime or multiple clients. `--players 1` is still a local-server test, not ordinary one-player Play. Ordinary Play still reports its internal `play-server` and `play-client` bridges; `mode: "play"` confirms it isn't a local-server test.
+Use ordinary Play unless a separate server or several clients are needed. `--players 1` starts a local server and client. `mode: "play"` identifies ordinary Play.
 
-Outside Play, `rbx l` runs in the edit plugin context. It has the edit DataModel but no normal Play-client `LocalPlayer` or `PlayerGui`. Start Play before requiring runtime client code. During Play, `rbx l` targets the server and `rbx lc ... <name|index>` targets one client. Luau compile errors, runtime errors, and timeouts return nonzero.
+Outside Play, `rbx l` uses the edit DataModel without `LocalPlayer` or `PlayerGui`. During Play, `l` targets the server and `lc ... <name|index>` targets one client. Luau errors and timeouts exit nonzero.
 
-Return values from `l` and `lc`; don't print values just to read them. Renium returns captured `print` and `warn` output directly without adding it to Studio's Output. Use `co` only for messages produced by the game or Studio itself.
+Return values from `l` and `lc` instead of printing them. Captured `print` and `warn` output is returned without entering Studio Output. Use `co` for game or Studio messages.
 
-Don't keep an `l` or `lc` command waiting while issuing another command; daemon operations run in order. Register any observer, return, perform the action, then read the recorded state.
+Don't leave `l` or `lc` waiting while issuing another command; operations run in order. Register an observer, return, act, then read its state.
 
-An `l` or `lc` runner is removed when the command returns. Its callbacks and threads can't persist across later commands; add a temporary source script when a test fixture must persist.
+`l` and `lc` runners are removed on return. Use a temporary source script for persistent test fixtures.
 
-In PowerShell, wrap Luau containing double quotes in single quotes; `\"` doesn't escape quotes there.
+In PowerShell, wrap Luau containing double quotes in single quotes; `\"` isn't an escape.
+
+Pipe large programs to `rbx l -` or `rbx lc - PLAYER`.

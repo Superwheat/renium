@@ -278,6 +278,7 @@ type EditorDirectPushContext = {
 type ProgrammaticEditorWriteRequest = {
   paths?: string[] | string;
   fileWrites?: "pause" | "resume" | "queue";
+  acknowledgedSide?: "editor" | "studio";
 };
 
 type SourcemapNode = {
@@ -331,7 +332,7 @@ class RobloxSyncController {
   private studioActionPollTimer: NodeJS.Timeout | undefined;
   private studioActionPollInFlight = false;
   private changePreviewPanel: vscode.WebviewPanel | undefined;
-  private changePreviewResolve: ((decision: "apply" | "full" | "discard" | "pending") => void) | undefined;
+  private changePreviewResolve: ((decision: "apply" | "full" | "pending") => void) | undefined;
   private pendingStudioReviewKey: string | undefined;
   private forcedStudioReviewKey: string | undefined;
   private changePreviewIconNames: ReadonlySet<string> | undefined;
@@ -384,6 +385,7 @@ class RobloxSyncController {
   private daemonFileSyncStatusTimer: NodeJS.Timeout | undefined;
   private daemonFileSyncStatusInFlight = false;
   private daemonFileSyncError: string | undefined;
+  private reconcileResolutionPromise: Promise<StudioChangeState | undefined> | undefined;
   private disposed = false;
 
   public constructor(private readonly context: vscode.ExtensionContext) {
@@ -2636,7 +2638,7 @@ class RobloxSyncController {
   }
 
   public async startLiveSync(
-    options: { silent?: boolean; bestEffort?: boolean; graphRefresh?: boolean } = {},
+    options: { silent?: boolean; bestEffort?: boolean } = {},
   ): Promise<void> {
     if (this.liveSyncStartPromise) {
       await this.liveSyncStartPromise;
@@ -2655,7 +2657,7 @@ class RobloxSyncController {
   }
 
   private async startLiveSyncInternal(
-    options: { silent?: boolean; bestEffort?: boolean; graphRefresh?: boolean } = {},
+    options: { silent?: boolean; bestEffort?: boolean } = {},
   ): Promise<void> {
     this.stopStudioActionPolling();
     this.liveSyncStartupInProgress = true;
@@ -2680,14 +2682,21 @@ class RobloxSyncController {
             return;
           }
         }
-        if (
-          !this.daemonFileSyncEnabled
-          || this.daemonFileSyncGeneration !== this.automationClient.processGeneration()
-        ) {
-          initialState = await this.setDaemonFileSync(cfg, true);
+        initialState = await this.setDaemonFileSync(cfg, true);
+        const liveCfg = this.effectiveLiveSyncConfig(cfg);
+        initialState = await this.resolveReconciliation(liveCfg, initialState, false);
+        if (!initialState) {
+          await this.stopUnresolvedLiveSync();
+          return;
         }
         if (cfg.studioLiveSyncEnabled && !this.studioLiveSyncStarted) {
-          await this.startStudioLiveSyncRuntime(cfg, { ...options, initialState });
+          await this.startStudioLiveSyncRuntime(liveCfg, { ...options, initialState });
+        }
+        if (initialState.daemon?.mode === "verify") {
+          if (!options.silent) {
+            vscode.window.showInformationMessage("Studio and project files were checked. Live sync is off in Verify mode.");
+          }
+          return;
         }
         if (!options.silent) {
           vscode.window.showInformationMessage("Live sync is already running.");
@@ -2709,7 +2718,6 @@ class RobloxSyncController {
 
       this.liveSyncProjectRoot = cfg.projectRoot;
       invalidateProjectSourceGraph(cfg.projectRoot);
-      const srcRoot = this.sourceRoot(cfg);
       const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
       if (sourceGraph.locations.length === 0) {
         const message = `No project source directory exists for ${cfg.projectRoot}`;
@@ -2738,18 +2746,11 @@ class RobloxSyncController {
       let initialState = await this.setDaemonFileSync(liveCfg, true, true);
       startupFilePauseHeld = true;
       liveCfg = this.effectiveLiveSyncConfig(liveCfg);
-      if (liveCfg.initialSyncPriority === "editor" || options.graphRefresh === true) {
-        const outcome = await this.runInitialEditorLiveSyncPass(srcRoot, options);
-        if (outcome === "applied" && initialState) {
-          initialState = await this.getStudioChangeState(
-            liveCfg,
-            liveCfg.services,
-            studioChangeAckOptions(
-              studioChangeSeq(initialState),
-              initialState.runtimeId,
-            ),
-          );
-        }
+      initialState = await this.resolveReconciliation(liveCfg, initialState, true);
+      if (!initialState) {
+        await this.stopUnresolvedLiveSync();
+        startupFilePauseHeld = false;
+        return;
       }
       if (this.liveSyncStopRequested) {
         await this.disposeLiveSyncRuntime();
@@ -2758,9 +2759,17 @@ class RobloxSyncController {
       }
       await this.startStudioLiveSyncRuntime(liveCfg, {
         ...options,
-        initialSync: options.graphRefresh === true ? false : liveCfg.initialSyncPriority === "studio",
+        initialSync: false,
         initialState,
       });
+      if (initialState.daemon?.mode === "verify") {
+        await this.controlDaemonFileWrites(liveCfg, "resume", []);
+        startupFilePauseHeld = false;
+        if (!options.silent) {
+          vscode.window.showInformationMessage("Studio and project files were checked. Live sync is off in Verify mode.");
+        }
+        return;
+      }
       if (this.liveSyncStopRequested) {
         await this.disposeLiveSyncRuntime();
         await this.setEditorLiveSyncEnabled(false);
@@ -2864,54 +2873,6 @@ class RobloxSyncController {
     }
   }
 
-  private async runInitialEditorLiveSyncPass(
-    srcRoot: string,
-    options: { bestEffort?: boolean } = {},
-  ): Promise<EditorPushOutcome> {
-    const cfg = this.getConfig();
-    const initialPaths = Array.from(new Set([
-      ...await this.collectInitialEditorLiveSyncSettingsPaths(srcRoot),
-      ...loadProjectSourceLocations(cfg.projectRoot),
-    ]));
-    const initialTargets = await this.collectInitialEditorLiveSyncTargetIds(srcRoot, initialPaths);
-    if (initialTargets.paths.length === 0) {
-      return "applied";
-    }
-    try {
-      const applied = await this.pushEditorPathsNow(initialTargets.paths, {
-        force: true,
-        targetSettingsIds: initialTargets.targetSettingsIds,
-        taskName: "Editor -> Studio initial sync",
-      });
-      if (!applied) {
-        await this.controlDaemonFileWrites(cfg, "queue", initialTargets.paths);
-      }
-      return applied ? "applied" : "skipped";
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(`[renium] editor live sync initial pass failed: ${message}`);
-      await this.controlDaemonFileWrites(cfg, "queue", initialTargets.paths);
-      if (!options.bestEffort) {
-        throw err;
-      }
-      return "skipped";
-    }
-  }
-
-  public async retryEditorInitialSync(): Promise<void> {
-    const cfg = this.getConfig();
-    const srcRoot = this.sourceRoot(cfg);
-    if (!loadProjectSourceLocations(cfg.projectRoot).some((root) => fs.existsSync(root))) {
-      throw new Error(`No project source directory exists for ${cfg.projectRoot}`);
-    }
-    const outcome = await this.runInitialEditorLiveSyncPass(srcRoot);
-    vscode.window.showInformationMessage(
-      outcome === "applied"
-        ? "Editor -> Studio initial sync finished."
-        : "Editor -> Studio initial sync is still pending.",
-    );
-  }
-
   private async startStudioLiveSyncRuntime(
     cfg: SyncConfig,
     options: { bestEffort?: boolean; initialSync?: boolean; initialState?: StudioChangeState } = {},
@@ -2934,12 +2895,17 @@ class RobloxSyncController {
         return;
       }
       const runtimeCfg = this.effectiveLiveSyncConfig(cfg);
+      if (initialState.daemon?.mode === "verify") {
+        this.output.appendLine("[renium] Studio and project files are in verify-only mode; no live changes will be written.");
+        await this.stopStudioLiveSyncRuntime();
+        return;
+      }
       if (initialState.twoWaySyncEnabled === false) {
         this.output.appendLine("[renium] Studio -> editor live sync is disabled in the Renium Studio plugin settings.");
         await this.stopStudioLiveSyncRuntime();
         return;
       }
-      const shouldRunStudioInitialSync = options.initialSync ?? (runtimeCfg.initialSyncPriority === "studio");
+      const shouldRunStudioInitialSync = options.initialSync === true;
       if (shouldRunStudioInitialSync) {
         await this.enqueue("Studio -> Editor initial sync", async () => {
           if (generation !== this.studioLiveSyncGeneration) {
@@ -3124,6 +3090,10 @@ class RobloxSyncController {
         return;
       }
       const runtimeCfg = this.effectiveLiveSyncConfig(cfg);
+      if (state.daemon?.mode === "verify") {
+        await this.stopStudioLiveSyncRuntime();
+        return;
+      }
       if (state.twoWaySyncEnabled === false) {
         this.output.appendLine("[renium] Studio -> editor live sync was disabled in the Renium Studio plugin settings.");
         await this.stopStudioLiveSyncRuntime();
@@ -3334,6 +3304,7 @@ class RobloxSyncController {
     cfg: SyncConfig,
     running: boolean,
     filesPaused = false,
+    resolveConflictPreference?: "studio" | "editor",
   ): Promise<StudioChangeState | undefined> {
     if (!running) {
       this.daemonFileSyncEnabled = false;
@@ -3360,6 +3331,9 @@ class RobloxSyncController {
         filesPaused: running && filesPaused,
         resetFilesPaused: running && filesPaused,
         replaceServices: running,
+        initialSyncMode: cfg.initialSyncPriority,
+        initialConflictPreference: cfg.initialConflictPreference,
+        ...(resolveConflictPreference ? { resolveConflictPreference } : {}),
       },
       { quietWait: true },
     );
@@ -3379,6 +3353,55 @@ class RobloxSyncController {
     }
     this.updateStatusBar();
     return running ? this.consumeStudioChangeState(result, cfg, cfg.services) : undefined;
+  }
+
+  private async resolveReconciliation(
+    cfg: SyncConfig,
+    state: StudioChangeState | undefined,
+    filesPaused: boolean,
+  ): Promise<StudioChangeState | undefined> {
+    if (!state || state.daemon?.mode !== "verify" || cfg.initialSyncPriority !== "reconcile") {
+      return state;
+    }
+    const reason = state.daemon.error ?? "Studio and project files contain changes that cannot be merged automatically.";
+    if (state.daemon.resolutionRequired !== true || cfg.initialConflictPreference !== "none") {
+      this.output.appendLine(`[renium] ${reason}`);
+      if (this.canDisplayLiveSyncPrompt(cfg)) {
+        this.displayedLiveSyncPrompt = true;
+        void vscode.window.showErrorMessage(`${reason} Neither side was changed.`);
+      }
+      return undefined;
+    }
+    if (!this.canDisplayLiveSyncPrompt(cfg)) {
+      this.output.appendLine(`[renium] ${reason}`);
+      return undefined;
+    }
+    this.displayedLiveSyncPrompt = true;
+    const choice = await vscode.window.showWarningMessage(
+      "Studio and project files changed the same content. Choose which side wins for those conflicts. Independent changes will still be kept.",
+      "Keep Studio",
+      "Keep Project Files",
+    );
+    if (!choice) {
+      return undefined;
+    }
+    const preference = choice === "Keep Studio" ? "studio" : "editor";
+    const resolved = await this.setDaemonFileSync(cfg, true, filesPaused, preference);
+    if (resolved?.daemon?.mode !== "reconcile") {
+      const unresolved = resolved?.daemon?.error ?? "Renium could not safely reconcile the remaining differences.";
+      this.output.appendLine(`[renium] ${unresolved}`);
+      void vscode.window.showErrorMessage(`${unresolved} Neither side was changed.`);
+      return undefined;
+    }
+    return resolved;
+  }
+
+  private async stopUnresolvedLiveSync(): Promise<void> {
+    if (this.daemonFileSyncEnabled) {
+      await this.setDaemonFileSync(this.getConfig(), false);
+    }
+    await this.disposeLiveSyncRuntime();
+    await this.setEditorLiveSyncEnabled(false);
   }
 
   private scheduleDaemonFileSyncRestart(): void {
@@ -3492,6 +3515,7 @@ class RobloxSyncController {
     if (!status || !cfg) {
       return;
     }
+    const liveCfg = this.effectiveLiveSyncConfig(cfg);
     const pending = Array.isArray(status.pendingPaths)
       ? status.pendingPaths
         .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
@@ -3510,6 +3534,55 @@ class RobloxSyncController {
     if (this.daemonFileSyncEnabled && status.running !== true) {
       this.scheduleDaemonFileSyncRestart();
     }
+    if (status.mode === "verify" && this.studioLiveSyncStarted) {
+      void this.stopStudioLiveSyncRuntime();
+    } else if (
+      status.mode === "reconcile"
+      && !this.studioLiveSyncStarted
+      && !this.liveSyncStartupInProgress
+      && this.isEditorLiveSyncActive()
+      && liveCfg.studioLiveSyncEnabled
+    ) {
+      void this.startStudioLiveSyncRuntime(liveCfg, { bestEffort: true });
+    }
+    if (
+      status.mode === "verify"
+      && typeof status.error === "string"
+      && liveCfg.initialSyncPriority === "reconcile"
+      && this.isEditorLiveSyncActive()
+      && !this.liveSyncStartupInProgress
+      && !this.reconcileResolutionPromise
+    ) {
+      const resolution = this.resolveReconciliation(
+        liveCfg,
+        {
+          daemon: {
+            mode: "verify",
+            error: status.error,
+            paused: status.paused === true,
+            resolutionRequired: status.resolutionRequired === true,
+          },
+        },
+        status.paused === true,
+      );
+      this.reconcileResolutionPromise = resolution;
+      void resolution
+        .then(async (resolved) => {
+          if (!resolved) {
+            await this.stopUnresolvedLiveSync();
+          }
+        })
+        .catch((error) => {
+          this.output.appendLine(
+            `[renium] reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        })
+        .finally(() => {
+          if (this.reconcileResolutionPromise === resolution) {
+            this.reconcileResolutionPromise = undefined;
+          }
+        });
+    }
     this.updateStatusBar();
   }
 
@@ -3517,6 +3590,7 @@ class RobloxSyncController {
     cfg: SyncConfig,
     action: "pause" | "resume" | "settle" | "queue",
     paths: string[],
+    acknowledgedSide?: "editor" | "studio",
   ): Promise<void> {
     if (!this.isEditorLiveSyncActive()) {
       return;
@@ -3545,6 +3619,7 @@ class RobloxSyncController {
           ...(fileWrites === "pause" || fileWrites === "resume" ? { fileWrites } : {}),
           ...(action === "queue" ? { queuePaths: paths } : {}),
           ...(fileWrites === "resume" || action === "settle" ? { settlePaths: paths } : {}),
+          ...(acknowledgedSide && paths.length > 0 ? { acknowledgedSide } : {}),
         },
         { quietWait: true },
       );
@@ -3655,13 +3730,18 @@ class RobloxSyncController {
     if (!settings) {
       return cfg;
     }
-    const initialSyncPriority = settings.initialSyncPriority === "editor"
-      ? "editor"
-      : settings.initialSyncPriority === "none"
-        ? "none"
-        : settings.initialSyncPriority === "studio"
-          ? "studio"
-          : cfg.initialSyncPriority;
+    const initialSyncPriority = settings.initialSyncPriority === "verify"
+      ? "verify"
+      : settings.initialSyncPriority === "reconcile"
+        ? "reconcile"
+        : cfg.initialSyncPriority;
+    const initialConflictPreference = settings.initialConflictPreference === "studio"
+      ? "studio"
+      : settings.initialConflictPreference === "editor"
+        ? "editor"
+        : settings.initialConflictPreference === "none"
+          ? "none"
+          : cfg.initialConflictPreference;
     const displayPrompts = settings.displayPrompts === "initial"
       ? "initial"
       : settings.displayPrompts === "never"
@@ -3678,6 +3758,7 @@ class RobloxSyncController {
     return {
       ...cfg,
       initialSyncPriority,
+      initialConflictPreference,
       changesThreshold: boundedInteger(settings.changesThreshold, cfg.changesThreshold, 0, 100000),
       diffLinesLimit: boundedInteger(settings.diffLinesLimit, cfg.diffLinesLimit, 100, 1_000_000),
       displayPrompts,
@@ -3846,7 +3927,7 @@ class RobloxSyncController {
     mode: "property" | "structural",
     generation?: number,
     reviewKey?: string,
-  ): Promise<"apply" | "full" | "discard" | "pending"> {
+  ): Promise<"apply" | "full" | "pending"> {
     if (!this.isStudioLiveSyncCurrent(generation)) {
       return "pending";
     }
@@ -3968,7 +4049,7 @@ class RobloxSyncController {
     title: string,
     generation?: number,
     reviewKey?: string,
-  ): Promise<"apply" | "full" | "discard" | "pending"> {
+  ): Promise<"apply" | "full" | "pending"> {
     if (!this.isStudioLiveSyncCurrent(generation)) {
       return "pending";
     }
@@ -3997,9 +4078,9 @@ class RobloxSyncController {
       this.changePreviewIconNames ?? new Set<string>(),
     );
 
-    return new Promise<"apply" | "full" | "discard" | "pending">((resolve) => {
+    return new Promise<"apply" | "full" | "pending">((resolve) => {
       let settled = false;
-      const finish = (decision: "apply" | "full" | "discard" | "pending"): void => {
+      const finish = (decision: "apply" | "full" | "pending"): void => {
         if (settled) {
           return;
         }
@@ -4037,7 +4118,7 @@ class RobloxSyncController {
       this.changePreviewResolve = finish;
       panel.webview.onDidReceiveMessage((message: { action?: string }) => {
         const action = message?.action;
-        if (action === "apply" || action === "full" || action === "discard") {
+        if (action === "apply" || action === "full" || action === "pending") {
           finish(action);
         }
       });
@@ -4099,12 +4180,6 @@ class RobloxSyncController {
           return "pending";
         }
         this.displayedLiveSyncPrompt = true;
-        if (decision === "discard") {
-          this.output.appendLine(
-            `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
-          );
-          return "applied";
-        }
         this.output.appendLine(
           `[renium] Studio -> editor: ${changeCount} changes reviewed; running protected full import.`,
         );
@@ -4141,12 +4216,6 @@ class RobloxSyncController {
         );
         return "fallback";
       }
-      if (decision === "discard") {
-        this.output.appendLine(
-          `[renium] Studio -> editor: ${changeCount} changes skipped from review; editor files were not updated.`,
-        );
-        return "applied";
-      }
       this.output.appendLine(`[renium] Studio -> editor: applying ${changeCount} reviewed changes.`);
     }
 
@@ -4175,9 +4244,22 @@ class RobloxSyncController {
       property: string;
       value: unknown;
     }> = [];
-    const sourceValues = new Map<number, string>();
+    const sourceValues = new Map<number, { content: string; studio: string }>();
     const pathsToSuppress = new Set<string>();
-    for (const change of propertyChanges) {
+    const sourcePaths = new Map<number, string>();
+    for (let index = 0; index < propertyChanges.length; index += 1) {
+      const change = propertyChanges[index];
+      if (change.property !== "Source" || (change.scope ?? "property") !== "property") {
+        continue;
+      }
+      const sourcePath = this.resolveStudioSourcePathFromSourcemap(cfg, change);
+      if (sourcePath) {
+        sourcePaths.set(index, sourcePath);
+      }
+    }
+    const coordinatorBases = await this.readCoordinatorSourceBases(Array.from(sourcePaths.values()), cfg);
+    for (let changeIndex = 0; changeIndex < propertyChanges.length; changeIndex += 1) {
+      const change = propertyChanges[changeIndex];
       const service = String(change.service ?? "").trim();
       const property = String(change.property ?? "").trim();
       if (!dirtySet.has(service) || property.length === 0) {
@@ -4201,13 +4283,21 @@ class RobloxSyncController {
         if (typeof change.value !== "string") {
           return "fallback";
         }
-        const sourcePath = this.resolveStudioSourcePathFromSourcemap(cfg, change);
+        const sourcePath = sourcePaths.get(changeIndex);
         if (!sourcePath) {
           return "fallback";
         }
-        const finalSource = this.reconcileStudioSourceWithLocalEdits(cfg, sourcePath, change.value);
+        const finalSource = this.reconcileStudioSourceWithLocalEdits(
+          cfg,
+          sourcePath,
+          change.value,
+          coordinatorBases.get(filesystemPathKey(sourcePath)),
+        );
+        if (finalSource === undefined) {
+          return "pending";
+        }
         value = finalSource;
-        sourceValues.set(batchEntries.length, finalSource);
+        sourceValues.set(batchEntries.length, { content: finalSource, studio: change.value });
         pathsToSuppress.add(sourcePath);
       }
       pathsToSuppress.add(settingsFile);
@@ -4254,6 +4344,7 @@ class RobloxSyncController {
       throw error;
     }
     let importFailed = false;
+    let importAcknowledged = false;
     try {
       const result = await this.runCommand(
         cfg.cliPath,
@@ -4292,13 +4383,38 @@ class RobloxSyncController {
       const changedSettingsFiles = new Set(
         Array.from(changedFiles).filter((filePath) => isReniumSettingsFileName(path.basename(filePath))),
       );
+      const sourceBases = new Map<string, string>();
+      const mergedSourcePaths: string[] = [];
       for (const sourceResult of Array.isArray(batchResult.sourcePaths) ? batchResult.sourcePaths : []) {
         const entryIndex = Number(sourceResult.entryIndex);
         const sourcePath = path.resolve(String(sourceResult.path ?? ""));
-        const finalContent = sourceValues.get(entryIndex);
-        if (Number.isInteger(entryIndex) && sourcePath.length > 0 && finalContent !== undefined) {
-          this.writeSyncBase(cfg, sourcePath, finalContent);
+        const sourceValue = sourceValues.get(entryIndex);
+        if (Number.isInteger(entryIndex) && sourcePath.length > 0 && sourceValue !== undefined) {
+          sourceBases.set(sourcePath, sourceValue.content);
+          if (!sameSourceText(sourceValue.content, sourceValue.studio)) {
+            mergedSourcePaths.push(sourcePath);
+          }
         }
+      }
+
+      if (!stillCurrent) {
+        return "pending";
+      }
+      if (mergedSourcePaths.length > 0) {
+        try {
+          const outcome = await this.runEditorPush(mergedSourcePaths, cfg, { verifySources: true });
+          if (outcome !== "applied" || !this.isStudioLiveSyncCurrent(generation)) {
+            return "pending";
+          }
+        } catch (error) {
+          this.output.appendLine(
+            `[renium] merged Source is waiting to reach Studio: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return "pending";
+        }
+      }
+      for (const [sourcePath, content] of sourceBases) {
+        this.writeSyncBase(cfg, sourcePath, content);
       }
 
       if (stillCurrent && changedSettingsFiles.size > 0) {
@@ -4307,6 +4423,7 @@ class RobloxSyncController {
           Array.from(changedSettingsFiles),
         );
       }
+      importAcknowledged = stillCurrent;
       return stillCurrent ? "applied" : "pending";
     } catch (error) {
       importFailed = true;
@@ -4320,6 +4437,7 @@ class RobloxSyncController {
         await this.noteProgrammaticEditorWrite({
           paths: Array.from(resumePaths),
           fileWrites: "resume",
+          ...(importAcknowledged ? { acknowledgedSide: "studio" as const } : {}),
         });
       } catch (error) {
         if (!importFailed) {
@@ -4332,28 +4450,77 @@ class RobloxSyncController {
     }
   }
 
-  private reconcileStudioSourceWithLocalEdits(cfg: SyncConfig, sourcePath: string, theirs: string): string {
+  private reconcileStudioSourceWithLocalEdits(
+    cfg: SyncConfig,
+    sourcePath: string,
+    theirs: string,
+    coordinatorBase?: string,
+  ): string | undefined {
     let ours: string;
     try {
       ours = fs.readFileSync(sourcePath, "utf8");
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        this.output.appendLine(`[renium] conflict: failed to read ${sourcePath}: ${String(err)}`);
+      if (code === "ENOENT") {
+        return theirs;
       }
-      return theirs;
+      this.output.appendLine(`[renium] conflict: failed to read ${sourcePath}: ${String(err)}`);
+      return undefined;
     }
 
     if (sameSourceText(ours, theirs)) {
       return ours;
     }
 
-    const base = this.readSyncBase(cfg, sourcePath);
+    const base = coordinatorBase ?? this.readSyncBase(cfg, sourcePath);
     if (base !== undefined && sameSourceText(ours, base)) {
       return withLineEnding(theirs, ours.includes("\r\n") ? "\r\n" : "\n");
     }
 
-    return this.mergeSourceAgainstBase(cfg, sourcePath, ours, theirs, base);
+    if (base === undefined) {
+      this.output.appendLine(`[renium] ${sourcePath} changed on both sides without a common baseline; the batch remains pending.`);
+      return undefined;
+    }
+    const eol: "\n" | "\r\n" = ours.includes("\r\n") ? "\r\n" : "\n";
+    const merged = mergeAndResolve(base, ours, theirs, "prompt", eol);
+    if (merged.hadConflicts) {
+      this.output.appendLine(`[renium] ${sourcePath} has overlapping edits; the batch remains pending.`);
+      return undefined;
+    }
+    return merged.text;
+  }
+
+  private async readCoordinatorSourceBases(paths: string[], cfg: SyncConfig): Promise<Map<string, string>> {
+    if (paths.length === 0 || !this.isEditorLiveSyncActive()) {
+      return new Map();
+    }
+    const result = await this.runAutomationOperation(
+      cfg.cliPath,
+      cfg,
+      "live-sync-baselines",
+      AUTOMATION_OP.liveStatus,
+      {
+        contextBound: true,
+        manageFiles: true,
+        filesOnly: true,
+        baselinePaths: paths,
+      },
+      { quietWait: true },
+    );
+    if (result.code !== 0) {
+      return new Map();
+    }
+    const baselines = recordValue(recordValue(result.result)?.baselines);
+    if (!baselines) {
+      return new Map();
+    }
+    const resolved = new Map<string, string>();
+    for (const [filePath, content] of Object.entries(baselines)) {
+      if (typeof content === "string") {
+        resolved.set(filesystemPathKey(path.resolve(filePath)), content);
+      }
+    }
+    return resolved;
   }
 
   private mergeSourceAgainstBase(
@@ -4991,57 +5158,6 @@ class RobloxSyncController {
     ];
   }
 
-  private async collectInitialEditorLiveSyncSettingsPaths(srcRoot: string): Promise<string[]> {
-    return (await this.collectInitialEditorLiveSyncPathsAsync(srcRoot))
-      .filter((filePath) => isReniumSettingsFileName(path.basename(filePath)));
-  }
-
-  private async collectInitialEditorLiveSyncTargetIds(
-    srcRoot: string,
-    settingsPaths: string[],
-  ): Promise<{ paths: string[]; targetSettingsIds: string[] }> {
-    const cfg = this.getConfig();
-    const result = await this.runCommand(
-      cfg.cliPath,
-      [
-        "bt",
-        "-d",
-        srcRoot,
-        "-s",
-        cfg.services.join(","),
-      ],
-      cfg.projectRoot,
-      "editor-live-sync-target-scan",
-      cfg.progressHeartbeatSeconds,
-      { quietLog: true, timeoutMs: 10_000 },
-    );
-    if (result.code !== 0) {
-      const message = result.output.trim();
-      this.output.appendLine(`[renium] editor live sync initial target scan failed: ${message || `exit ${result.code}`}`);
-      return { paths: settingsPaths, targetSettingsIds: [] };
-    }
-    const parsed = parseCliJsonObject<{ paths?: unknown; targetSettingsIds?: unknown }>(result.output);
-    if (!parsed) {
-      this.output.appendLine("[renium] editor live sync initial target scan returned invalid JSON");
-      return { paths: settingsPaths, targetSettingsIds: [] };
-    }
-    const rawPaths = Array.isArray(parsed.paths)
-      ? parsed.paths
-      : [];
-    const rawIds = Array.isArray(parsed.targetSettingsIds)
-      ? parsed.targetSettingsIds
-      : [];
-    const validSettingsPaths = new Set(settingsPaths.map((settingsPath) => filesystemPathKey(settingsPath)));
-    const paths = rawPaths
-      .map((value) => String(value))
-      .filter((value) => validSettingsPaths.has(filesystemPathKey(value)));
-    paths.push(...settingsPaths.filter((value) => !isReniumSettingsFileName(path.basename(value))));
-    return {
-      paths: [...new Set(paths)],
-      targetSettingsIds: [...new Set(rawIds.map((value) => String(value)).filter((value) => value.startsWith("editor:")))],
-    };
-  }
-
   private async partitionUnresolvedConflictMarkerPaths(
     paths: string[],
   ): Promise<{ pushable: string[]; blocked: string[] }> {
@@ -5104,11 +5220,11 @@ class RobloxSyncController {
     if (request.fileWrites === "pause") {
       await this.controlDaemonFileWrites(cfg, "pause", paths);
     } else if (request.fileWrites === "resume") {
-      await this.controlDaemonFileWrites(cfg, "resume", paths);
+      await this.controlDaemonFileWrites(cfg, "resume", paths, request.acknowledgedSide);
     } else if (request.fileWrites === "queue") {
       await this.controlDaemonFileWrites(cfg, "queue", paths);
     } else {
-      await this.controlDaemonFileWrites(cfg, "settle", paths);
+      await this.controlDaemonFileWrites(cfg, "settle", paths, request.acknowledgedSide);
     }
   }
 
@@ -5309,7 +5425,7 @@ class RobloxSyncController {
       throw new Error(`Studio rejected or failed editor ${kind} apply.`);
     }
     if (changedPaths.length > 0) {
-      await this.controlDaemonFileWrites(cfg, "settle", changedPaths);
+      await this.controlDaemonFileWrites(cfg, "settle", changedPaths, "editor");
       await this.suppressStudioLiveSyncAfterEditorPush(changedPaths, cfg);
     }
     return "applied";
@@ -6649,7 +6765,6 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("renium.startLiveSync", () => controller.startLiveSync()),
     vscode.commands.registerCommand("renium.stopLiveSync", () => controller.stopLiveSync()),
-    vscode.commands.registerCommand("renium.retryEditorInitialSync", () => controller.retryEditorInitialSync()),
     vscode.commands.registerCommand("renium.retryPendingEditorChanges", () => controller.retryPendingEditorChanges()),
     vscode.commands.registerCommand("renium.discardPendingEditorChanges", () => controller.discardPendingEditorChanges()),
     vscode.commands.registerCommand("renium.serve", () => controller.serve()),

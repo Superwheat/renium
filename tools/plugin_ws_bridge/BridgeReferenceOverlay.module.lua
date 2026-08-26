@@ -3,6 +3,7 @@ local BridgeReferenceOverlay = {}
 function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	local BridgeIdentity = dependencies.BridgeIdentity
 	local BridgeReferenceRetarget = dependencies.BridgeReferenceRetarget
+	local CollectionService = dependencies.CollectionService
 	local RbxDomModule = dependencies.RbxDomModule
 	local captureExplorerSelection = dependencies.captureExplorerSelection
 	local containsPackageLink = dependencies.containsPackageLink
@@ -12,8 +13,11 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	local resolveOrdinalChild = dependencies.resolveOrdinalChild
 	local resolvePathSegments = dependencies.resolvePathSegments
 	local restoreExplorerSelection = dependencies.restoreExplorerSelection
+	local setAttributeForSync = dependencies.setAttributeForSync
 	local setCurrentCameraForSync = dependencies.setCurrentCameraForSync
 	local setParentForSync = dependencies.setParentForSync
+	local setTagForSync = dependencies.setTagForSync
+	local valuesEqual = dependencies.valuesEqual
 	local writePropertyForSync = dependencies.writePropertyForSync
 
 	local ReferenceOverlay = {}
@@ -212,10 +216,14 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				end
 				for _, group in ipairs(prepared) do
 					local root = original
-					while root.Parent ~= nil and root.Parent ~= group.target do
+					while
+						root.Parent ~= nil
+						and root.Parent ~= group.target
+						and not group.outgoingRootSet[root]
+					do
 						root = root.Parent
 					end
-					if root.Parent == group.target and group.outgoingRootSet[root] then
+					if group.outgoingRootSet[root] then
 						local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(original)
 						if pathSegments ~= nil then
 							local replacement = resolveStagedPath(pathSegments, pathOrdinals)
@@ -266,6 +274,193 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		return duplicateCount
 	end
 
+	local function childRows(parent: Instance): { [string]: any }
+		local rows = {}
+		local counts = {}
+		for _, child in ipairs(parent:GetChildren()) do
+			local ordinal = (counts[child.Name] or 0) + 1
+			counts[child.Name] = ordinal
+			rows[pathCacheKey({ child.Name }, { ordinal })] = {
+				instance = child,
+				ordinal = ordinal,
+			}
+		end
+		return rows
+	end
+
+	local function childPath(pathSegments, pathOrdinals, child: Instance, ordinal: number)
+		local segments = table.clone(pathSegments)
+		local ordinals = table.clone(pathOrdinals)
+		segments[#segments + 1] = child.Name
+		ordinals[#ordinals + 1] = ordinal
+		return segments, ordinals
+	end
+
+	function ReferenceOverlay.preparePackageMerge(
+		liveRoot: Instance,
+		duplicateRoot: Instance,
+		pathSegments: { string },
+		pathOrdinals: { number },
+		aliases: { [Instance]: Instance },
+		merges: { any },
+		statePairs: { any }
+	): number
+		if liveRoot.ClassName ~= duplicateRoot.ClassName or liveRoot.Name ~= duplicateRoot.Name then
+			error(`Package root {table.concat(pathSegments, ".")} changed during import`)
+		end
+		aliases[duplicateRoot] = liveRoot
+		statePairs[#statePairs + 1] = {
+			live = liveRoot,
+			duplicate = duplicateRoot,
+		}
+		local liveRows = childRows(liveRoot)
+		local matchedLive = {}
+		local incoming = {}
+		local preservedCount = 1
+		local duplicateCounts = {}
+		for _, duplicateChild in ipairs(duplicateRoot:GetChildren()) do
+			local ordinal = (duplicateCounts[duplicateChild.Name] or 0) + 1
+			duplicateCounts[duplicateChild.Name] = ordinal
+			local key = pathCacheKey({ duplicateChild.Name }, { ordinal })
+			local liveRow = liveRows[key]
+			local liveChild = if liveRow ~= nil then liveRow.instance else nil
+			local duplicateHasPackage = duplicateChild:IsA("PackageLink") or containsPackageLink(duplicateChild)
+			local liveHasPackage = liveChild ~= nil
+				and (liveChild:IsA("PackageLink") or containsPackageLink(liveChild))
+			if duplicateHasPackage or liveHasPackage then
+				if
+					liveChild == nil
+					or liveChild.ClassName ~= duplicateChild.ClassName
+					or liveChild:IsA("PackageLink") ~= duplicateChild:IsA("PackageLink")
+					or not liveChild:IsA("PackageLink") and not containsPackageLink(liveChild)
+				then
+					error(`Package root {table.concat(pathSegments, ".")} changed during import`)
+				end
+				matchedLive[liveChild] = true
+				local segments, ordinals = childPath(pathSegments, pathOrdinals, duplicateChild, ordinal)
+				if duplicateChild:IsA("PackageLink") then
+					preservedCount += ReferenceOverlay.retainedAliases(
+						liveChild,
+						duplicateChild,
+						segments,
+						ordinals,
+						aliases
+					)
+				else
+					preservedCount += ReferenceOverlay.preparePackageMerge(
+						liveChild,
+						duplicateChild,
+						segments,
+						ordinals,
+						aliases,
+						merges,
+						statePairs
+					)
+				end
+			else
+				incoming[#incoming + 1] = duplicateChild
+			end
+		end
+		local outgoing = {}
+		for _, liveChild in ipairs(liveRoot:GetChildren()) do
+			if not matchedLive[liveChild] then
+				if liveChild:IsA("PackageLink") then
+					preservedCount += 1 + #liveChild:GetDescendants()
+				else
+					outgoing[#outgoing + 1] = liveChild
+				end
+			end
+		end
+		merges[#merges + 1] = {
+			target = liveRoot,
+			incoming = incoming,
+			outgoing = outgoing,
+		}
+		return preservedCount
+	end
+
+	function ReferenceOverlay.copyPackageRootState(
+		pair: { [string]: Instance },
+		aliases: { [Instance]: Instance },
+		ctx: { [string]: any },
+		referencesOnly: boolean
+	)
+		local live = pair.live
+		local duplicate = pair.duplicate
+		local referenceNames = {}
+		for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(duplicate.ClassName)) do
+			referenceNames[propertyName] = true
+		end
+		for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(duplicate.ClassName)) do
+			referenceNames[propertyName] = true
+		end
+		for _, propertyName in ipairs(RbxDomModule.getWritablePropertyNames(duplicate.ClassName)) do
+			if
+				referenceNames[propertyName] == referencesOnly
+				and propertyName ~= "Attributes"
+				and propertyName ~= "Tags"
+				and propertyName ~= "WorldPivot"
+				and propertyName ~= "WorldPivotData"
+				and propertyName ~= "Origin"
+			then
+				local okRead, value = readProperty(duplicate, propertyName)
+				if okRead then
+					if typeof(value) == "Instance" then
+						value = aliases[value] or value
+					elseif
+						typeof(value) == "Content"
+						and value.SourceType == Enum.ContentSourceType.Object
+						and value.Object ~= nil
+						and aliases[value.Object] ~= nil
+					then
+						value = Content.fromObject(aliases[value.Object])
+					end
+					local okCurrent, current = readProperty(live, propertyName)
+					if not okCurrent or not valuesEqual(current, value) then
+						local okWrite, writeError = writePropertyForSync(live, propertyName, value, ctx)
+						if not okWrite then
+							error(`Could not preserve {live:GetFullName()}.{propertyName}: {writeError}`)
+						end
+					end
+				end
+			end
+		end
+		if referencesOnly then
+			return
+		end
+		local desiredAttributes = duplicate:GetAttributes()
+		for name in pairs(live:GetAttributes()) do
+			if desiredAttributes[name] == nil then
+				local okWrite, writeError = setAttributeForSync(live, name, nil, ctx)
+				if not okWrite then
+					error(`Could not delete {live:GetFullName()} attribute {name}: {writeError}`)
+				end
+			end
+		end
+		for name, value in pairs(desiredAttributes) do
+			if not valuesEqual(live:GetAttribute(name), value) then
+				local okWrite, writeError = setAttributeForSync(live, name, value, ctx)
+				if not okWrite then
+					error(`Could not write {live:GetFullName()} attribute {name}: {writeError}`)
+				end
+			end
+		end
+		local desiredTags = {}
+		for _, tag in ipairs(CollectionService:GetTags(duplicate)) do
+			desiredTags[tag] = true
+		end
+		for _, tag in ipairs(CollectionService:GetTags(live)) do
+			if not desiredTags[tag] then
+				setTagForSync(live, tag, false, ctx)
+			end
+		end
+		for tag in pairs(desiredTags) do
+			if not CollectionService:HasTag(live, tag) then
+				setTagForSync(live, tag, true, ctx)
+			end
+		end
+	end
+
 	function ReferenceOverlay.assertPackageRoots(group: { [string]: any })
 		local actual = {}
 		for _, root in ipairs(group.packageScanRoots) do
@@ -291,23 +486,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			error("Studio package roots changed during import")
 		end
 		return expected
-	end
-
-	function ReferenceOverlay.stripIncomingPackages(root: Instance): number
-		if root:IsA("PackageLink") then
-			error("A native import root cannot be a PackageLink")
-		end
-		local removed = 0
-		for _, child in ipairs(root:GetChildren()) do
-			if child:IsA("PackageLink") then
-				removed += 1 + #child:GetDescendants()
-				child:Destroy()
-			end
-		end
-		if removed == 0 then
-			error(`Package root {root.Name} no longer contains a PackageLink`)
-		end
-		return removed
 	end
 
 	function ReferenceOverlay.assertNativeImportState(undo: { [string]: any }, ctx: { [string]: any })
@@ -371,6 +549,8 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		local incomingAliases = {}
 		local retainedDuplicates = {}
 		local retainedDuplicateInstanceCount = 0
+		local packageMerges = {}
+		local packageStatePairs = {}
 		for _, group in ipairs(prepared) do
 			group.packageScanRoots = table.clone(group.outgoing)
 			group.incomingRootsByPath = {}
@@ -402,15 +582,30 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 					or duplicate.Name ~= live.Name
 					or (not live:IsA("PackageLink") and live:FindFirstChildWhichIsA("PackageLink", true) == nil)
 					or descriptor.payloadOmitted and #duplicate:GetChildren() ~= 0
-					or not descriptor.payloadOmitted
-						and (
-						not duplicate:IsA("PackageLink")
-						and duplicate:FindFirstChildWhichIsA("PackageLink", true) == nil
-					)
 				then
 					error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
 				end
-				if not descriptor.payloadOmitted then
+				local retainedInstanceCount
+				if descriptor.payloadOmitted or duplicate:IsA("PackageLink") then
+					retainedInstanceCount = descriptor.instanceCount
+				else
+					retainedInstanceCount = ReferenceOverlay.preparePackageMerge(
+						live,
+						duplicate,
+						descriptor.pathSegments,
+						descriptor.pathOrdinals,
+						incomingAliases,
+						packageMerges,
+						packageStatePairs
+					)
+				end
+				if descriptor.payloadOmitted then
+					if 1 + #live:GetDescendants() ~= descriptor.instanceCount then
+						error(`Retained package root {table.concat(descriptor.pathSegments, ".")} changed during import`)
+					end
+					incomingAliases[duplicate] = live
+					group.incomingRootsByPath[pathCacheKey(descriptor.pathSegments, descriptor.pathOrdinals)] = live
+				elseif duplicate:IsA("PackageLink") then
 					local duplicateInstanceCount = ReferenceOverlay.retainedAliases(
 						live,
 						duplicate,
@@ -426,7 +621,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				excludedOutgoing[live] = true
 				group.retainedLiveRoots[#group.retainedLiveRoots + 1] = live
 				retainedDuplicates[#retainedDuplicates + 1] = duplicate
-				retainedDuplicateInstanceCount += descriptor.instanceCount
+				retainedDuplicateInstanceCount += retainedInstanceCount
 			end
 		end
 		for duplicate, live in pairs(incomingAliases) do
@@ -452,6 +647,20 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				end
 			end
 			group.outgoing = outgoing
+		end
+		for _, merge in ipairs(packageMerges) do
+			for _, root in ipairs(merge.incoming) do
+				incomingScanRoots[#incomingScanRoots + 1] = root
+			end
+			for _, root in ipairs(merge.outgoing) do
+				outgoingScanRoots[#outgoingScanRoots + 1] = root
+				for _, group in ipairs(prepared) do
+					if root:IsDescendantOf(group.target) then
+						group.outgoingRootSet[root] = true
+						break
+					end
+				end
+			end
 		end
 		local aliasUpdated = 0
 		local aliasContentUpdated = 0
@@ -498,6 +707,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		for _, group in ipairs(prepared) do
 			removedRootCount += #group.outgoing
 		end
+		for _, merge in ipairs(packageMerges) do
+			removedRootCount += #merge.outgoing
+		end
 		return {
 			referenceOverlay = referenceOverlay,
 			replacements = replacements,
@@ -505,6 +717,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			resolveStagedPath = resolveStagedPath,
 			retainedDuplicates = retainedDuplicates,
 			retainedDuplicateInstanceCount = retainedDuplicateInstanceCount,
+			packageAliases = incomingAliases,
+			packageMerges = packageMerges,
+			packageStatePairs = packageStatePairs,
 			removedRootCount = removedRootCount,
 			referenceUpdates = #referenceOverlay + aliasUpdated + aliasContentUpdated,
 		}
@@ -534,6 +749,14 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				excludedRoots[instance] = true
 			end
 			for _, instance in ipairs(group.retainedLiveRoots) do
+				excludedRoots[instance] = true
+			end
+		end
+		for _, merge in ipairs(undo.packageMerges or {}) do
+			for _, instance in ipairs(merge.outgoing) do
+				excludedRoots[instance] = true
+			end
+			for _, instance in ipairs(merge.incoming) do
 				excludedRoots[instance] = true
 			end
 		end
@@ -570,12 +793,29 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				error(`Could not retarget {contentFailed} native import content references`)
 			end
 		end
+		for _, pair in ipairs(undo.packageStatePairs or {}) do
+			ReferenceOverlay.copyPackageRootState(pair, undo.packageAliases, ctx, false)
+		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.incoming) do
 				setParentForSync(instance, group.target, ctx)
 			end
 		end
+		for _, merge in ipairs(undo.packageMerges or {}) do
+			for _, instance in ipairs(merge.incoming) do
+				setParentForSync(instance, merge.target, ctx)
+			end
+		end
+		for _, pair in ipairs(undo.packageStatePairs or {}) do
+			ReferenceOverlay.copyPackageRootState(pair, undo.packageAliases, ctx, true)
+		end
 		local removedRootCount = 0
+		for _, merge in ipairs(undo.packageMerges or {}) do
+			for _, instance in ipairs(merge.outgoing) do
+				removeInstanceForUndo(instance, ctx)
+				removedRootCount += 1
+			end
+		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.outgoing) do
 				removeInstanceForUndo(instance, ctx)
@@ -609,6 +849,19 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				structuralErrors[#structuralErrors + 1] = tostring(result)
 			end
 		end
+		for _, merge in ipairs(undo.packageMerges or {}) do
+			for _, instance in ipairs(merge.incoming) do
+				incoming[#incoming + 1] = instance
+				if instance.Parent ~= nil then
+					restoreParent(instance, nil)
+				end
+			end
+			for _, instance in ipairs(merge.outgoing) do
+				if instance.Parent == nil then
+					restoreParent(instance, merge.target)
+				end
+			end
+		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.incoming) do
 				incoming[#incoming + 1] = instance
@@ -630,6 +883,18 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		end
 		if #structuralErrors > 0 then
 			error(`Could not roll back {#structuralErrors} native import roots: {structuralErrors[1]}`)
+		end
+		for _, merge in ipairs(undo.packageMerges or {}) do
+			for _, instance in ipairs(merge.outgoing) do
+				if instance.Parent ~= merge.target then
+					error(`Could not roll back package content {instance.Name}`)
+				end
+			end
+			for _, instance in ipairs(merge.incoming) do
+				if instance.Parent ~= nil then
+					error(`Incoming package content {instance.Name} remained live after rollback`)
+				end
+			end
 		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.outgoing) do

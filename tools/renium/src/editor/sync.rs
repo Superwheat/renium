@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::app::output::{global_json_output, global_pretty_output, global_yes, print_json_output};
@@ -74,6 +75,12 @@ struct EditorTransaction<'a> {
     package_mutation: bool,
 }
 
+#[derive(Default)]
+struct EditorCommitStatus {
+    package_mutation: bool,
+    package_dialog_accepted: bool,
+}
+
 impl<'a> EditorTransaction<'a> {
     fn parameters(
         changes: &EditorChangeSet,
@@ -136,6 +143,24 @@ impl<'a> EditorTransaction<'a> {
                     &instance.path_segments,
                     &instance.path_ordinals,
                 );
+            }
+        }
+        if let Some(binary_import) = binary_import {
+            for group in &binary_import.groups {
+                for package_root in &group.package_roots {
+                    let retained = group.retained_roots.iter().any(|root| {
+                        root.payload_omitted
+                            && root.path_segments == package_root.path_segments
+                            && root.path_ordinals == package_root.path_ordinals
+                    });
+                    if !retained {
+                        add_mutation_root(
+                            &group.service,
+                            &package_root.path_segments,
+                            &package_root.path_ordinals,
+                        );
+                    }
+                }
             }
         }
         let has_instance_changes = !changes.instance_changes.is_empty();
@@ -320,7 +345,7 @@ impl<'a> EditorTransaction<'a> {
         }))
     }
 
-    fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self) -> Result<EditorCommitStatus> {
         let result = self.bridge.call(
             "commitEditorTransaction",
             json!({
@@ -334,15 +359,24 @@ impl<'a> EditorTransaction<'a> {
             eprintln!("[renium] native editor commit profile: {profile}");
         }
         self.active = false;
-        if self.package_mutation {
+        let package_dialog_accepted = if self.package_mutation {
             let dialog_result = studio_pid_for_bridge(self.bridge).and_then(|pid| {
                 crate::studio::input::accept_package_changes_dialog_when_visible(pid)
             });
-            if let Err(error) = dialog_result {
-                eprintln!("[renium] package changes dialog remains open: {error:#}");
+            match dialog_result {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    eprintln!("[renium] package changes dialog remains open: {error:#}");
+                    false
+                }
             }
-        }
-        Ok(())
+        } else {
+            false
+        };
+        Ok(EditorCommitStatus {
+            package_mutation: self.package_mutation,
+            package_dialog_accepted,
+        })
     }
 
     fn rollback(&mut self) -> Result<()> {
@@ -397,6 +431,24 @@ fn skipped_editor_summary(changes: &EditorChangeSet) -> Map<String, Value> {
     summary
 }
 
+pub(crate) fn settings_file_hash(path: &Path) -> Result<Option<[u8; 32]>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(Sha256::digest(bytes).into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
+fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorCommitStatus) {
+    if status.package_mutation {
+        summary.insert("packageModified".to_string(), Value::Bool(true));
+        summary.insert(
+            "packageDialogAccepted".to_string(),
+            Value::Bool(status.package_dialog_accepted),
+        );
+    }
+}
+
 fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer> {
     let ports = parse_bridge_ports(&args.ports)?;
     let (bridge, metrics) = BridgeServer::listen(&args.host, &ports, args.wait_seconds)?;
@@ -429,6 +481,7 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
         "probeEvents": args.probe_events,
         "verifySources": args.verify_sources,
         "overridePackages": args.override_packages,
+        "allowProtectedWrites": !args.no_review,
         "linkCacheDir": args.link_cache_dir,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
@@ -1468,6 +1521,12 @@ fn push_editor_changes_with_collected(
     let apply_protected_offline = !args.no_review
         && !protected_writes.is_empty()
         && (args.yes || global_yes() || request_protected_write_review(bridge, &protected_writes)?);
+    if crate::app::output::global_log_enabled(5) && !protected_writes.is_empty() {
+        eprintln!(
+            "[renium] protected writes: {}",
+            serde_json::to_string(&protected_writes)?
+        );
+    }
     log_timing("native editor protected write preparation", phase_started);
     let phase_started = Instant::now();
     let settings_transaction = if review_skipped {
@@ -1480,6 +1539,7 @@ fn push_editor_changes_with_collected(
     }
     log_timing("native editor settings apply", phase_started);
     let phase_started = Instant::now();
+    let mut commit_status = None;
     if apply_protected_offline {
         let result = apply_protected_writes_offline(bridge, &args, &protected_writes)?;
         if let Some(transaction) = transaction.as_mut() {
@@ -1490,17 +1550,21 @@ fn push_editor_changes_with_collected(
             "protectedApplied".to_string(),
             Value::Number(serde_json::Number::from(protected_writes.len() as u64)),
         );
-    } else if let Some(transaction) = transaction.as_mut()
-        && let Err(commit_error) = transaction.commit()
-    {
-        if let Err(rollback_error) = transaction.rollback() {
-            return Err(
-                commit_error.context(format!("Studio rollback also failed: {rollback_error:#}"))
-            );
+    } else if let Some(transaction) = transaction.as_mut() {
+        match transaction.commit() {
+            Ok(status) => commit_status = Some(status),
+            Err(commit_error) => {
+                if let Err(rollback_error) = transaction.rollback() {
+                    return Err(commit_error
+                        .context(format!("Studio rollback also failed: {rollback_error:#}")));
+                }
+                return Err(commit_error
+                    .context("Studio rejected the commit; its changes were rolled back"));
+            }
         }
-        return Err(
-            commit_error.context("Studio rejected the commit; its changes were rolled back")
-        );
+    }
+    if let Some(status) = commit_status {
+        add_editor_commit_status(&mut summary, status);
     }
     log_timing("native editor transaction commit", phase_started);
     if let Some(settings_transaction) = settings_transaction {
@@ -1559,14 +1623,15 @@ fn apply_editor_change_with_warm_bridge(
     }
     let mut transaction = EditorTransaction::begin(bridge, &changes, None)?;
     let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
-    let summary =
+    let mut summary =
         send_editor_change_batches(bridge, &changes, false, false, false, None, transaction_id)?;
     let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
         bail!("Studio rejected or failed editor {label} apply");
     }
     if let Some(transaction) = transaction.as_mut() {
-        transaction.commit()?;
+        let status = transaction.commit()?;
+        add_editor_commit_status(&mut summary, status);
     }
     println!(
         "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
@@ -1588,6 +1653,7 @@ fn emit_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<
 }
 
 pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result<()> {
+    resolve_editor_property_source_file(&mut args)?;
     apply_configured_project_layout(
         &mut args.target.project.project_root,
         &mut args.target.project.src_root,
@@ -1598,7 +1664,12 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
     parameters.insert("property".to_string(), Value::String(args.property.clone()));
     parameters.insert(
         "value".to_string(),
-        serde_json::from_str(&args.value_json).context("Failed to parse --value-json")?,
+        serde_json::from_str(
+            args.value_json
+                .as_deref()
+                .context("Provide --value-json or --source-file")?,
+        )
+        .context("Failed to parse --value-json")?,
     );
     let approved = !args.no_review && (args.yes || global_yes());
     if let Some(result) = try_daemon_control_request(
@@ -1607,8 +1678,7 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         Value::Object(parameters),
         approved,
     )? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     let bridge = listen_editor_oneshot_bridge(
         "property",
@@ -1620,16 +1690,19 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
 }
 
 pub(crate) fn apply_editor_property_with_warm_bridge(
-    args: ApplyEditorPropertyArgs,
+    mut args: ApplyEditorPropertyArgs,
     bridge: &BridgeServer,
 ) -> Result<Map<String, Value>> {
+    resolve_editor_property_source_file(&mut args)?;
     let started = Instant::now();
     let changes = collect_direct_editor_property_change(&args)?;
+    let verify_sources = !changes.source_changes.is_empty();
     push_editor_changes_with_collected(
         PushEditorChangesArgs {
             no_review: args.no_review,
             yes: args.yes || global_yes(),
             override_packages: args.target.override_packages,
+            verify_sources,
             ..PushEditorChangesArgs::new(args.target.project, args.target.bridge)
         },
         bridge,
@@ -1638,6 +1711,19 @@ pub(crate) fn apply_editor_property_with_warm_bridge(
         None,
         None,
     )
+}
+
+fn resolve_editor_property_source_file(args: &mut ApplyEditorPropertyArgs) -> Result<()> {
+    let Some(path) = args.source_file.take() else {
+        return Ok(());
+    };
+    if !args.scope.eq_ignore_ascii_case("property") || args.property != "Source" {
+        bail!("--source-file requires --property Source");
+    }
+    let source = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read source file {}", path.display()))?;
+    args.value_json = Some(serde_json::to_string(&source)?);
+    Ok(())
 }
 
 fn collect_direct_editor_property_change(
@@ -1663,8 +1749,30 @@ fn collect_direct_editor_property_change(
             property
         )
     }
-    let value: Value =
-        serde_json::from_str(&args.value_json).context("Failed to parse --value-json")?;
+    let value: Value = serde_json::from_str(
+        args.value_json
+            .as_deref()
+            .context("Provide --value-json or --source-file")?,
+    )
+    .context("Failed to parse --value-json")?;
+
+    if args.scope.eq_ignore_ascii_case("property") && property == "Source" {
+        let source = value
+            .as_str()
+            .context("Source must be a string")?
+            .to_string();
+        let mut changes = EditorChangeSet::default();
+        changes.source_changes.push(EditorSourceChange {
+            service: target.service,
+            settings_id: target.settings_id,
+            path_segments: target.path_segments,
+            path_ordinals: target.path_ordinals,
+            class_name: target.class_name,
+            source: Some(source),
+            deleted: false,
+        });
+        return Ok(changes);
+    }
 
     let mut properties = Map::new();
     let mut attributes = Map::new();
@@ -1702,8 +1810,7 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
         Value::Object(parameters),
         false,
     )? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     let bridge = listen_editor_oneshot_bridge(
         "delete",
@@ -1961,7 +2068,7 @@ fn verify_editor_source_changes(
             let expected = change.source.as_deref().unwrap_or_default();
             let source_key = editor_source_key(change);
             let failure = match sources.get(index) {
-                Some(Ok(actual)) if actual == expected => None,
+                Some(Ok(actual)) if editor_sources_match(expected, actual) => None,
                 Some(Ok(actual)) => Some(format!(
                     "{} source mismatch: editor_len={} studio_len={} editor_hash={} studio_hash={} key={}",
                     change.path_segments.join("."),
@@ -2008,6 +2115,12 @@ fn verify_editor_source_changes(
     })
 }
 
+fn editor_sources_match(expected: &str, actual: &str) -> bool {
+    expected == actual
+        || expected.strip_suffix('\n') == Some(actual)
+        || expected.strip_suffix("\r\n") == Some(actual)
+}
+
 fn editor_source_key(change: &EditorSourceChange) -> String {
     editor_source_key_for_path(&change.path_segments, &change.path_ordinals)
 }
@@ -2049,7 +2162,23 @@ fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathB
             paths.push(PathBuf::from(trimmed));
         }
     }
-    Ok(paths)
+    let mut expanded = Vec::new();
+    for path in paths {
+        let absolute = absolutize_under(&args.project.project_root, &path);
+        if !absolute.is_dir() {
+            expanded.push(path);
+            continue;
+        }
+        for entry in WalkDir::new(&absolute) {
+            let entry = entry.with_context(|| format!("Failed to walk {}", absolute.display()))?;
+            if entry.file_type().is_file() {
+                expanded.push(entry.into_path());
+            }
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    Ok(expanded)
 }
 
 fn collect_editor_full_paths(src_root: &Path) -> Result<Vec<PathBuf>> {
@@ -2096,6 +2225,14 @@ impl EditorSettingsTransaction {
             lock_paths.sort_by(|left, right| left.0.cmp(&right.0));
             for (_, path) in lock_paths {
                 transaction._locks.push(acquire_settings_file_lock(path)?);
+            }
+            for write in &changes.settings_writes {
+                if settings_file_hash(&write.path)? != write.expected_hash {
+                    bail!(
+                        "{} changed while the Studio update was being prepared; retry the sync",
+                        write.path.display()
+                    );
+                }
             }
             for (index, write) in changes.settings_writes.iter().enumerate() {
                 let file_name = write
@@ -2302,8 +2439,10 @@ fn finish_editor_change_collection(
     validate_read_only_service_changes(link_enforcement, &services.settings, documents, src_root)?;
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
+            let path = service_settings_path(&src_root.join(&service));
             changes.settings_writes.push(EditorSettingsWrite {
-                path: service_settings_path(&src_root.join(&service)),
+                expected_hash: settings_file_hash(&path)?,
+                path,
                 document: document.clone(),
             });
         }

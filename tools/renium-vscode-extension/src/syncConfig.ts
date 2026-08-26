@@ -53,7 +53,8 @@ export type SyncConfig = {
   editorLiveSyncEnabled: boolean;
   studioLiveSyncEnabled: boolean;
   studioLiveSyncPollMs: number;
-  initialSyncPriority: "studio" | "editor" | "none";
+  initialSyncPriority: "reconcile" | "verify";
+  initialConflictPreference: "none" | "studio" | "editor";
   changesThreshold: number;
   diffLinesLimit: number;
   displayPrompts: "always" | "initial" | "never";
@@ -149,10 +150,16 @@ export class SyncConfigResolver {
     const performanceMode = performanceModeRaw === "smooth" || performanceModeRaw === "balanced"
       ? performanceModeRaw
       : "throughput";
-    const initialSyncPriorityRaw = read<string>("liveSync.initialSyncPriority", "studio");
-    const initialSyncPriority = initialSyncPriorityRaw === "editor" || initialSyncPriorityRaw === "none"
-      ? initialSyncPriorityRaw
-      : "studio";
+    const initialSyncPriorityRaw = read<string>("liveSync.initialSyncPriority", "reconcile");
+    const initialSyncPriority = initialSyncPriorityRaw === "none" || initialSyncPriorityRaw === "verify"
+      ? "verify"
+      : "reconcile";
+    const initialConflictPreferenceRaw = read<string>("liveSync.initialConflictPreference", "none");
+    const initialConflictPreference = initialConflictPreferenceRaw === "studio" || initialConflictPreferenceRaw === "editor"
+      ? initialConflictPreferenceRaw
+      : initialSyncPriorityRaw === "editor"
+        ? "editor"
+        : "none";
     const displayPromptsRaw = read<string>("liveSync.displayPrompts", "always");
     const displayPrompts = displayPromptsRaw === "initial" || displayPromptsRaw === "never"
       ? displayPromptsRaw
@@ -193,6 +200,7 @@ export class SyncConfigResolver {
         { min: MIN_STUDIO_LIVE_SYNC_POLL_MS, integer: true },
       ),
       initialSyncPriority,
+      initialConflictPreference,
       changesThreshold: number("liveSync.changesThreshold", 5, { min: 0, integer: true }),
       diffLinesLimit: number("liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
       displayPrompts,

@@ -4,6 +4,7 @@ local PropertyDescriptor = require(script.PropertyDescriptor)
 
 local referencePropertiesByClass = {}
 local objectContentPropertiesByClass = {}
+local writablePropertiesByClass = {}
 
 local function getPropertyNames(className, cache, dataType, skipParent)
 	local cached = cache[className]
@@ -45,6 +46,39 @@ end
 
 local function getObjectContentPropertyNames(className)
 	return getPropertyNames(className, objectContentPropertiesByClass, "Content", false)
+end
+
+local function getWritablePropertyNames(className)
+	local cached = writablePropertiesByClass[className]
+	if cached ~= nil then
+		return cached
+	end
+	local names = {}
+	local seen = {}
+	local currentClassName = className
+	repeat
+		local currentClass = database.Classes[currentClassName]
+		if currentClass == nil then
+			break
+		end
+		for propertyName, propertyData in pairs(currentClass.Properties) do
+			if seen[propertyName] == nil then
+				seen[propertyName] = true
+				local scriptability = propertyData.Scriptability
+				if
+					propertyData.Kind.Canonical ~= nil
+					and propertyName ~= "Parent"
+					and (scriptability == "ReadWrite" or scriptability == "Custom")
+				then
+					names[#names + 1] = propertyName
+				end
+			end
+		end
+		currentClassName = currentClass.Superclass
+	until currentClassName == nil
+	table.sort(names)
+	writablePropertiesByClass[className] = names
+	return names
 end
 
 local function findCanonicalPropertyDescriptor(className, propertyName)
@@ -112,6 +146,7 @@ return {
 	findCanonicalPropertyDescriptor = findCanonicalPropertyDescriptor,
 	getReferencePropertyNames = getReferencePropertyNames,
 	getObjectContentPropertyNames = getObjectContentPropertyNames,
+	getWritablePropertyNames = getWritablePropertyNames,
 	Error = Error,
 	EncodedValue = require(script.EncodedValue),
 }

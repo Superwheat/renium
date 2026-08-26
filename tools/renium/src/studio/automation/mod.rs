@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global};
+use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
@@ -44,6 +45,13 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     if args.code.is_none() {
         args.code = args.inline_code.take();
     }
+    if args.code.as_deref() == Some("-") || args.file.as_deref() == Some(std::path::Path::new("-"))
+    {
+        let mut code = String::new();
+        io::stdin().read_to_string(&mut code)?;
+        args.code = Some(code);
+        args.file = None;
+    }
     let parameters = json!({
         "code": args.code,
         "file": args.file,
@@ -54,8 +62,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "bridgePorts": args.bridge.ports,
     });
     if let Some(result) = try_daemon_control_request(op::LUAU, None, parameters, false)? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let target = BridgeTarget::main_or_client(args.client || args.player.is_some());
@@ -67,8 +74,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     )?;
     bridge.wait_for_target(args.bridge.wait_seconds, target)?;
     let result = execute_luau_result(args, &bridge)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
@@ -129,8 +135,7 @@ pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
         "bridgePorts": args.bridge.ports,
     });
     if let Some(result) = try_daemon_control_request(op::DEVICE, None, parameters, false)? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) = BridgeServer::listen_with_initial_wait(
@@ -141,8 +146,7 @@ pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
     )?;
     bridge.wait_for_target(args.bridge.wait_seconds, BridgeTarget::Edit)?;
     let result = studio_device_result(&args, &bridge)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn studio_device_resolution(raw: &str) -> Result<(u32, u32)> {
@@ -276,8 +280,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgePorts": args.bridge.ports,
     });
     if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     if args.stop {
         bail!("Stopping play mode requires an active Renium bridge daemon");
@@ -286,8 +289,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
     let result = start_stop_play_result(args, &bridge)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result<()> {
@@ -310,6 +312,7 @@ pub(crate) fn studio_change_state_operation_command(
     args.stop = operation == op::LIVE_STOP;
     args.no_start = operation == op::LIVE_STATUS;
     args.clear_pending = operation == op::DISCARD_PENDING;
+    let has_preference = args.prefer.is_some();
     let parameters = json!({
         "services": args.services,
         "reset": args.reset,
@@ -321,26 +324,58 @@ pub(crate) fn studio_change_state_operation_command(
         "runtimeId": args.runtime_id,
         "suppressSeconds": args.suppress_seconds,
         "eventWaitSeconds": args.event_wait_seconds,
+        "settleWaitSeconds": args.settle_wait_seconds,
         "contextBound": args.context_bound,
+        "resolveConflictPreference": args.prefer,
+        "compact": !args.details,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
     if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-        println!("{}", serde_json::to_string(&result)?);
-        return Ok(());
+        return finish_studio_change_state_command(operation, has_preference, result);
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
     let result = studio_change_state_result(args, &bridge)?;
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    finish_studio_change_state_command(operation, has_preference, result)
+}
+
+fn finish_studio_change_state_command(
+    operation: u16,
+    has_preference: bool,
+    result: Value,
+) -> Result<()> {
+    let failed = result.get("ok").and_then(Value::as_bool) == Some(false);
+    let resolution_required = result
+        .pointer("/daemon/resolutionRequired")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if failed && resolution_required {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Studio and project files changed the same content");
+        if operation == op::LIVE_START && has_preference {
+            bail!(error.to_string());
+        }
+        bail!("{error}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor");
+    }
+    if operation == op::LIVE_START && failed {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Live sync could not start");
+        bail!(error.to_string());
+    }
+    print_json_output(&result, false)
 }
 
 pub(crate) fn studio_change_state_result(
     args: StudioChangeStateArgs,
     bridge: &BridgeServer,
 ) -> Result<Value> {
+    let details = args.details;
     let services = parse_services(&args.services)?;
     let action_results: Value = serde_json::from_str(&args.ack_action_results)
         .context("--ack-action-results must be a JSON object")?;
@@ -364,10 +399,129 @@ pub(crate) fn studio_change_state_result(
             "suppressSeconds": args.suppress_seconds,
             "waitSeconds": args.event_wait_seconds,
             "contextBound": args.context_bound,
+            "compact": !details,
         }),
     )?;
     ensure_plugin_api_ok(&result)?;
-    Ok(result)
+    Ok(if details {
+        result
+    } else {
+        compact_live_status(result)
+    })
+}
+
+pub(crate) fn compact_live_status(value: Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return value;
+    };
+    let mut result = Map::new();
+    for key in [
+        "busy",
+        "role",
+        "runtimeId",
+        "twoWaySyncEnabled",
+        "tracking",
+        "trackedServices",
+        "connectedInstances",
+        "onlyCodeMode",
+        "seq",
+        "runtimeSettingsSeq",
+        "conflictResolution",
+        "dirtyServices",
+        "fullSyncServices",
+    ] {
+        if let Some(value) = source.get(key) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+
+    let mut pending_changes = 0usize;
+    for (source_key, count_key) in [
+        ("changes", "changeCount"),
+        ("propertyChanges", "propertyChangeCount"),
+        ("editorActions", "editorActionCount"),
+        ("runtimeSettingChanges", "runtimeSettingChangeCount"),
+    ] {
+        let count = source
+            .get(count_key)
+            .and_then(Value::as_u64)
+            .map(|count| count as usize)
+            .or_else(|| {
+                source
+                    .get(source_key)
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            })
+            .unwrap_or_default();
+        pending_changes += count;
+        if count > 0 {
+            result.insert(count_key.to_string(), json!(count));
+        }
+    }
+    result.insert("pendingChanges".to_string(), json!(pending_changes));
+
+    let daemon = source.get("daemon").map(compact_live_daemon_status);
+    let daemon_error = daemon
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|daemon| daemon.get("error"))
+        .and_then(Value::as_str)
+        .filter(|error| !error.is_empty());
+    let mut ok = source.get("ok").and_then(Value::as_bool).unwrap_or(true);
+    if let Some(error) = daemon_error {
+        ok = false;
+        result.insert("error".to_string(), Value::String(error.to_string()));
+    } else if let Some(error) = source.get("error") {
+        ok = false;
+        result.insert("error".to_string(), error.clone());
+    }
+    result.insert("ok".to_string(), Value::Bool(ok));
+    if let Some(daemon) = daemon {
+        result.insert("daemon".to_string(), daemon);
+    }
+    Value::Object(result)
+}
+
+fn compact_live_daemon_status(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return value.clone();
+    };
+    let mut result = Map::new();
+    for key in [
+        "running",
+        "mode",
+        "resolutionRequired",
+        "pullChanges",
+        "paused",
+        "syncing",
+        "settled",
+        "pushes",
+        "pulls",
+        "error",
+    ] {
+        if let Some(value) = source.get(key) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    let pending = source
+        .get("pendingCount")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .or_else(|| {
+            source
+                .get("pendingPaths")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or_default();
+    result.insert("pendingCount".to_string(), json!(pending));
+    if pending > 0
+        && pending <= 8
+        && let Some(paths) = source.get("pendingPaths")
+    {
+        result.insert("pendingPaths".to_string(), paths.clone());
+    }
+    Value::Object(result)
 }
 
 pub(crate) fn start_stop_play_result(
@@ -1685,8 +1839,7 @@ fn run_input_command(
     } else {
         result
     };
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn press_command(args: PressArgs) -> Result<()> {
@@ -1817,8 +1970,7 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
         false,
         None,
     )?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
@@ -1831,28 +1983,22 @@ pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
         false,
     )?
     .context("No Renium recording is active")?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     if let Some(result) = try_daemon_control_request(op::STUDIOS, None, json!({}), false)? {
-        println!(
-            "{}",
-            serde_json::to_string(&json!({
+        return print_json_output(
+            &json!({
                 "clients": result.get("clients").cloned().unwrap_or(Value::Array(Vec::new()))
-            }))?
+            }),
+            false,
         );
-        return Ok(());
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
         BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({ "clients": bridge.list_bridge_clients() }))?
-    );
-    Ok(())
+    print_json_output(&json!({ "clients": bridge.list_bridge_clients() }), false)
 }
 
 pub(crate) fn editor_review_decision_result(
@@ -1886,8 +2032,7 @@ pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> 
     });
     let result = try_daemon_control_request(op::REVIEW_APPLY, None, parameters, false)?
         .context("No Renium review is active")?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 fn connected_launch_nonce(bridge: &BridgeServer, edit_runtime_id: &str) -> Result<Option<String>> {
@@ -2076,7 +2221,7 @@ pub(crate) fn test_command(args: TestArgs) -> Result<()> {
         "player": args.player,
     });
     let result = daemon_result(op::PLAY_START, None, parameters, false, None)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    print_json_output(&result, false)?;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let count = result
             .get("errors")

@@ -642,6 +642,11 @@ pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
     )
 }
 
+pub(crate) fn import_snapshots_quiet(args: ImportSnapshotsArgs) -> Result<Vec<PathBuf>> {
+    set_quiet_timings(true);
+    import_snapshots_inner(args, true)
+}
+
 fn import_snapshots_inner(
     mut args: ImportSnapshotsArgs,
     allow_project_stage: bool,

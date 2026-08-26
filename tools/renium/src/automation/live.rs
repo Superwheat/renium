@@ -8,13 +8,14 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use super::BoundContext;
 use super::context as bound_context;
+use super::reconcile::{BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup};
 use super::runtime::{
     acknowledge_pulled_changes, automation_failure_ref, automation_pull_args, automation_push_args,
 };
@@ -49,11 +50,14 @@ struct FileStamp {
 #[serde(rename_all = "camelCase")]
 struct Status {
     running: bool,
+    mode: String,
     pull_changes: bool,
     paused: bool,
+    syncing: bool,
     pending_paths: Vec<String>,
     pushes: u64,
     pulls: u64,
+    resolution_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -64,8 +68,11 @@ struct Control {
     retry_pull: AtomicBool,
     reset: AtomicBool,
     pull_changes: AtomicBool,
+    writes_enabled: AtomicBool,
     file_pause_count: AtomicU64,
     generation: AtomicU64,
+    scan_requested: AtomicU64,
+    scan_completed: AtomicU64,
     file_changes: Mutex<FileChanges>,
     sync_active: Mutex<bool>,
     sync_idle: Condvar,
@@ -89,12 +96,17 @@ struct ResetState {
     requested: u64,
     completed: u64,
     error: Option<String>,
-    rebase: Option<Rebase>,
+    rebase: Option<RebaseRequest>,
 }
 
 enum Rebase {
     Captured(CapturedState),
     Published(PublishedProjectChanges),
+}
+
+struct RebaseRequest {
+    value: Rebase,
+    resume: bool,
 }
 
 pub(crate) struct CapturedState {
@@ -104,15 +116,24 @@ pub(crate) struct CapturedState {
 }
 
 impl Control {
-    fn new(root: PathBuf, pull_changes: bool, files_paused: bool) -> Self {
+    fn new(
+        root: PathBuf,
+        pull_changes: bool,
+        files_paused: bool,
+        mode: PairMode,
+        resolution_required: bool,
+    ) -> Self {
         Self {
             stop: AtomicBool::new(false),
             retry: AtomicBool::new(false),
             retry_pull: AtomicBool::new(false),
             reset: AtomicBool::new(false),
             pull_changes: AtomicBool::new(pull_changes),
+            writes_enabled: AtomicBool::new(mode.writes()),
             file_pause_count: AtomicU64::new(u64::from(files_paused)),
             generation: AtomicU64::new(0),
+            scan_requested: AtomicU64::new(0),
+            scan_completed: AtomicU64::new(0),
             file_changes: Mutex::new(FileChanges::default()),
             sync_active: Mutex::new(false),
             sync_idle: Condvar::new(),
@@ -122,8 +143,10 @@ impl Control {
             root,
             status: Mutex::new(Status {
                 running: true,
+                mode: mode.name().to_string(),
                 pull_changes,
                 paused: files_paused,
+                resolution_required,
                 ..Status::default()
             }),
             finished: Mutex::new(false),
@@ -178,6 +201,14 @@ impl Control {
     }
 
     fn rebase_then_resume(&self, rebase: Rebase) -> Result<()> {
+        self.rebase(rebase, true)
+    }
+
+    fn rebase_without_resume(&self, rebase: Rebase) -> Result<()> {
+        self.rebase(rebase, false)
+    }
+
+    fn rebase(&self, rebase: Rebase, resume: bool) -> Result<()> {
         let _serial = self
             .reset_serial
             .lock()
@@ -193,7 +224,10 @@ impl Control {
                 .unwrap_or_else(PoisonError::into_inner);
             state.requested = state.requested.saturating_add(1);
             state.error = None;
-            state.rebase = Some(rebase);
+            state.rebase = Some(RebaseRequest {
+                value: rebase,
+                resume,
+            });
             state.requested
         };
         self.reset.store(true, Ordering::Release);
@@ -218,7 +252,7 @@ impl Control {
         Ok(())
     }
 
-    fn take_rebase(&self) -> Option<(u64, Rebase)> {
+    fn take_rebase(&self) -> Option<(u64, RebaseRequest)> {
         let mut state = self
             .reset_state
             .lock()
@@ -255,6 +289,21 @@ impl Control {
         if changed && pull_changes {
             self.retry_pull.store(true, Ordering::Release);
         }
+    }
+
+    fn set_mode(&self, mode: PairMode) {
+        self.writes_enabled.store(mode.writes(), Ordering::Release);
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mode = mode.name().to_string();
+    }
+
+    fn set_resolution_required(&self, required: bool) {
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resolution_required = required;
     }
 
     fn pause(&self) {
@@ -317,6 +366,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .paused = previous > 1;
+        self.sync_idle.notify_all();
     }
 
     fn begin_sync(&self, generation: u64) -> Option<SyncActivity<'_>> {
@@ -333,7 +383,43 @@ impl Control {
             return None;
         }
         *active = true;
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .syncing = true;
         Some(SyncActivity { control: self })
+    }
+
+    fn wait_settled(&self, timeout: Duration) -> bool {
+        let scan = self.scan_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        let deadline = Instant::now() + timeout;
+        let mut active = self
+            .sync_active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            let settled = self.scan_completed.load(Ordering::Acquire) >= scan
+                && !*active
+                && !status.paused
+                && status.pending_paths.is_empty();
+            drop(status);
+            if settled {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self
+                .sync_idle
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            active = next;
+            if result.timed_out() {
+                return false;
+            }
+        }
     }
 
     fn snapshot(&self) -> Value {
@@ -358,6 +444,7 @@ impl Control {
                     .into_owned()
             })
             .collect();
+        self.sync_idle.notify_all();
     }
 
     fn fail(&self, error: String) {
@@ -406,22 +493,53 @@ impl Drop for SyncActivity<'_> {
             .sync_active
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = false;
+        self.control
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .syncing = false;
         self.control.sync_idle.notify_all();
     }
 }
 
 #[derive(Default)]
 pub(crate) struct Manager {
-    sessions: Mutex<HashMap<u64, Arc<Control>>>,
+    sessions: Mutex<HashMap<String, Session>>,
+    aliases: Mutex<HashMap<u64, String>>,
+    starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    coordinator: Arc<Coordinator>,
+}
+
+struct Session {
+    control: Arc<Control>,
+    runtime_id: Option<String>,
 }
 
 impl Manager {
-    fn control(&self, context_id: u64) -> Option<Arc<Control>> {
-        self.sessions
+    fn start_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut starts = self.starts.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            starts
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    fn session_key(&self, context_id: u64) -> Option<String> {
+        self.aliases
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&context_id)
             .cloned()
+    }
+
+    fn control(&self, context_id: u64) -> Option<Arc<Control>> {
+        let key = self.session_key(context_id)?;
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .map(|session| Arc::clone(&session.control))
     }
 
     pub(crate) fn start(
@@ -431,15 +549,51 @@ impl Manager {
         pull_changes: Option<bool>,
         files_paused: bool,
         reset_files_paused: bool,
+        configuration: PairConfiguration,
     ) -> Result<Value> {
+        let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
+        self.start_prepared(
+            context,
+            bridge,
+            pull_changes,
+            files_paused,
+            reset_files_paused,
+            setup,
+        )
+    }
+
+    fn start_prepared(
+        &self,
+        context: BoundContext,
+        bridge: Arc<BridgeServer>,
+        pull_changes: Option<bool>,
+        files_paused: bool,
+        reset_files_paused: bool,
+        mut setup: PairSetup,
+    ) -> Result<Value> {
+        self.aliases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(context.id, setup.key.clone());
+        let start_lock = self.start_lock(&setup.key);
+        let _start = start_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        while let Some(control) = sessions.get(&context.id).cloned() {
+        while let Some((control, runtime_id)) = sessions
+            .get(&setup.key)
+            .map(|session| (Arc::clone(&session.control), session.runtime_id.clone()))
+        {
             let running = control
                 .status
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .running;
-            if running && !control.stop.load(Ordering::Acquire) {
+            if running
+                && !control.stop.load(Ordering::Acquire)
+                && runtime_id == context.runtime_id
+                && !setup.requires_reconcile
+            {
+                control.set_mode(setup.mode);
+                control.set_resolution_required(setup.resolution_required);
                 if let Some(pull_changes) = pull_changes {
                     control.set_pull_changes(pull_changes);
                 }
@@ -450,16 +604,19 @@ impl Manager {
                 }
                 return Ok(control.snapshot());
             }
+            control.stop.store(true, Ordering::Release);
             drop(sessions);
             control.wait_finished();
             sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions
-                .get(&context.id)
-                .is_some_and(|current| Arc::ptr_eq(current, &control))
+                .get(&setup.key)
+                .is_some_and(|current| Arc::ptr_eq(&current.control, &control))
             {
-                sessions.remove(&context.id);
+                sessions.remove(&setup.key);
             }
         }
+        drop(sessions);
+        self.coordinator.reconcile(&context, &bridge, &mut setup)?;
         let project = open_watch_project(&context)?;
         let current = scan(&project)?;
         let (mut baseline, state_error, state_missing) = match load_state(&project) {
@@ -474,9 +631,14 @@ impl Manager {
             PathBuf::from(&context.root),
             pull_changes.unwrap_or(true),
             files_paused,
+            setup.mode,
+            setup.resolution_required,
         ));
         if let Some(error) = state_error {
             control.fail(format!("Live sync ignored invalid saved state: {error:#}"));
+        }
+        if let Some(error) = setup.error {
+            control.fail(error);
         }
         if (state_missing || state_pruned)
             && let Err(error) = save_state(&project, &baseline)
@@ -486,12 +648,24 @@ impl Manager {
             ));
         }
         let context_id = context.id;
+        let runtime_id = context.runtime_id.clone();
+        let pair_key = setup.key.clone();
         let worker_control = Arc::clone(&control);
+        let coordinator = Arc::clone(&self.coordinator);
         thread::Builder::new()
             .name(format!("renium-live-{context_id}"))
             .spawn(move || {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(context, bridge, project, baseline, current, &worker_control)
+                    run(Worker {
+                        context,
+                        bridge,
+                        project,
+                        baseline,
+                        current,
+                        control: worker_control.clone(),
+                        coordinator,
+                        pair_key,
+                    })
                 })) {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => worker_control.fail(format!("{error:#}")),
@@ -507,14 +681,68 @@ impl Manager {
                 worker_control.finish();
             })
             .context("Failed to start live sync watcher")?;
-        sessions.insert(context_id, Arc::clone(&control));
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                setup.key,
+                Session {
+                    control: Arc::clone(&control),
+                    runtime_id,
+                },
+            );
         Ok(control.snapshot())
+    }
+
+    pub(crate) fn update_runtime_settings(
+        &self,
+        context: BoundContext,
+        bridge: Arc<BridgeServer>,
+        configuration: PairConfiguration,
+    ) -> Result<Option<Value>> {
+        let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
+        if !setup.requires_reconcile {
+            return Ok(None);
+        }
+        let Some(control) = self.control(context.id) else {
+            return Ok(None);
+        };
+        let pull_changes = control.pull_changes.load(Ordering::Acquire);
+        let files_paused = control.file_pause_count.load(Ordering::Acquire) > 0;
+        self.start_prepared(
+            context,
+            bridge,
+            Some(pull_changes),
+            files_paused,
+            true,
+            setup,
+        )
+        .map(Some)
     }
 
     pub(crate) fn status(&self, context_id: u64) -> Value {
         self.control(context_id)
             .as_deref()
             .map_or_else(|| json!({ "running": false }), |control| control.snapshot())
+    }
+
+    pub(crate) fn baseline_files(
+        &self,
+        context: &BoundContext,
+        paths: &[PathBuf],
+    ) -> Result<Value> {
+        let key = self
+            .session_key(context.id)
+            .context("Live sync has no reconciliation context")?;
+        Ok(json!(
+            self.coordinator.baseline_files(context, &key, paths)?
+        ))
+    }
+
+    pub(crate) fn wait_settled(&self, context_id: u64, timeout: Duration) -> bool {
+        self.control(context_id)
+            .as_deref()
+            .is_none_or(|control| control.wait_settled(timeout))
     }
 
     pub(crate) fn is_enabled(&self, context: &BoundContext) -> bool {
@@ -621,15 +849,81 @@ impl Manager {
         Ok(self.status(context_id))
     }
 
+    pub(crate) fn acknowledge_then_resume(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        captured: CapturedState,
+        side: BaselineSide,
+    ) -> Result<Value> {
+        let full = captured.full;
+        let paths = captured.scopes.iter().cloned().collect::<Vec<_>>();
+        if let Some(control) = self.control(context.id) {
+            if let Err(error) = control.rebase_without_resume(Rebase::Captured(captured)) {
+                control.set_mode(PairMode::Verify);
+                control.fail(format!(
+                    "Live sync could not rebase its file watcher: {error:#}"
+                ));
+                control.release_pause();
+                return Err(error);
+            }
+            let result = (|| {
+                if full {
+                    let setup = self.coordinator.reconcile_current(context, bridge)?;
+                    control.set_mode(setup.mode);
+                    control.set_resolution_required(setup.resolution_required);
+                    if let Some(error) = setup.error {
+                        bail!(error);
+                    }
+                } else if let Some(key) = self.session_key(context.id) {
+                    self.coordinator
+                        .advance_baseline(context, &key, &paths, side)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = &result {
+                control.set_mode(PairMode::Verify);
+                control.fail(format!(
+                    "Live sync could not record the shared state: {error:#}"
+                ));
+            }
+            control.release_pause();
+            result?;
+        }
+        Ok(self.status(context.id))
+    }
+
     pub(crate) fn reconcile_then_resume(
         &self,
-        context_id: u64,
+        context: &BoundContext,
         published: PublishedProjectChanges,
     ) -> Result<Value> {
-        if let Some(control) = self.control(context_id) {
-            control.rebase_then_resume(Rebase::Published(published))?;
+        let paths = published.changed_roots.clone();
+        if let Some(control) = self.control(context.id) {
+            if let Err(error) = control.rebase_without_resume(Rebase::Published(published)) {
+                control.set_mode(PairMode::Verify);
+                control.fail(format!(
+                    "Live sync could not rebase its file watcher: {error:#}"
+                ));
+                control.release_pause();
+                return Err(error);
+            }
+            let result = if let Some(key) = self.session_key(context.id) {
+                self.coordinator
+                    .advance_baseline(context, &key, &paths, BaselineSide::Studio)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = &result {
+                control.set_mode(PairMode::Verify);
+                control.fail(format!(
+                    "Live sync could not record the shared state: {error:#}"
+                ));
+            }
+            control.release_pause();
+            result?;
         }
-        Ok(self.status(context_id))
+        Ok(self.status(context.id))
     }
 
     pub(crate) fn pause(&self, context_id: u64) -> Value {
@@ -651,16 +945,25 @@ impl Manager {
     }
 
     pub(crate) fn stop(&self, context_id: u64) -> Value {
+        let key = self.session_key(context_id);
         let control = self.control(context_id);
         if let Some(control) = control {
             control.stop.store(true, Ordering::Release);
             control.wait_finished();
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            if sessions
-                .get(&context_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &control))
-            {
-                sessions.remove(&context_id);
+            if key.as_ref().is_some_and(|key| {
+                sessions
+                    .get(key)
+                    .is_some_and(|current| Arc::ptr_eq(&current.control, &control))
+            }) {
+                sessions.remove(key.as_ref().unwrap());
+            }
+            drop(sessions);
+            if let Some(key) = key {
+                self.aliases
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|_, value| value != &key);
             }
             control.snapshot()
         } else {
@@ -1063,17 +1366,31 @@ fn push(context: &BoundContext, bridge: &BridgeServer, paths: Option<&[PathBuf]>
     }
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
-    push_editor_changes_with_warm_bridge(
+    if let Some(runtime_id) = context.runtime_id.as_deref() {
+        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+        bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+    }
+    let summary = push_editor_changes_with_warm_bridge(
         automation_push_args(context, &parameters, false)?,
         bridge,
     )?;
+    if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
+        bail!("Studio changes are waiting for review");
+    }
     Ok(())
+}
+
+struct PulledStudioChanges {
+    published: PublishedProjectChanges,
+    services: Vec<String>,
+    seq: u64,
+    runtime_id: String,
 }
 
 fn pull_studio_changes(
     context: &BoundContext,
     bridge: &BridgeServer,
-) -> Result<Option<PublishedProjectChanges>> {
+) -> Result<Option<PulledStudioChanges>> {
     let runtime_id = context
         .runtime_id
         .as_deref()
@@ -1081,10 +1398,12 @@ fn pull_studio_changes(
     let _gate = bridge.acquire_request_gate();
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
+    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+    bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({ "start": true }),
-        BridgeTarget::Main,
+        BridgeTarget::Edit,
         runtime_id,
         Some(Duration::from_secs(1)),
     )?;
@@ -1121,8 +1440,35 @@ fn pull_studio_changes(
         0.0,
         false,
     )?;
-    acknowledge_pulled_changes(bridge, &services, seq, &state_runtime_id)?;
-    Ok(Some(published))
+    Ok(Some(PulledStudioChanges {
+        published,
+        services,
+        seq,
+        runtime_id: state_runtime_id,
+    }))
+}
+
+fn studio_has_pending_changes(context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
+    let runtime_id = context
+        .runtime_id
+        .as_deref()
+        .context("Live sync context has no Studio runtime")?;
+    let _gate = bridge.acquire_request_gate();
+    let _selection = bound_context::select(context);
+    bridge.clear_runtime_pins();
+    bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "start": true, "eventWaitSeconds": 0 }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(1)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    Ok(state["dirtyServices"]
+        .as_array()
+        .is_some_and(|services| !services.is_empty()))
 }
 
 fn published_state_matches(
@@ -1180,14 +1526,28 @@ fn reconcile_published_changes(
     }
 }
 
-fn run(
+struct Worker {
     context: BoundContext,
     bridge: Arc<BridgeServer>,
-    mut project: WatchProject,
-    mut baseline: BTreeMap<PathBuf, FileStamp>,
+    project: WatchProject,
+    baseline: BTreeMap<PathBuf, FileStamp>,
     current: BTreeMap<PathBuf, FileStamp>,
-    control: &Control,
-) -> Result<()> {
+    control: Arc<Control>,
+    coordinator: Arc<Coordinator>,
+    pair_key: String,
+}
+
+fn run(worker: Worker) -> Result<()> {
+    let Worker {
+        context,
+        bridge,
+        mut project,
+        mut baseline,
+        current,
+        control,
+        coordinator,
+        pair_key,
+    } = worker;
     let mut pending = BTreeSet::new();
     let mut blocked = BTreeMap::new();
     let mut push_ready = queue_scan_changes(&baseline, &current, &mut pending, &mut blocked);
@@ -1215,21 +1575,31 @@ fn run(
         };
         match project.watcher.receiver().recv_timeout(receive_timeout) {
             Ok(Ok(event)) => {
-                match queue_changed(&project, &baseline, &mut pending, &mut blocked, event.paths) {
-                    Ok(changed) => {
-                        if changed {
-                            unblock_full_push(&project, &mut blocked);
-                            last_event = Instant::now();
-                            push_retry_delay = Duration::ZERO;
-                            push_ready = true;
-                            control.update_pending(&pending);
+                if control.file_pause_count.load(Ordering::Acquire) > 0 {
+                    rescan_pending = true;
+                } else {
+                    match queue_changed(
+                        &project,
+                        &baseline,
+                        &mut pending,
+                        &mut blocked,
+                        event.paths,
+                    ) {
+                        Ok(changed) => {
+                            if changed {
+                                unblock_full_push(&project, &mut blocked);
+                                last_event = Instant::now();
+                                push_retry_delay = Duration::ZERO;
+                                push_ready = true;
+                                control.update_pending(&pending);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        control.fail(format!(
-                            "Project watcher could not read a changed file: {error:#}"
-                        ));
-                        rescan_pending = true;
+                        Err(error) => {
+                            control.fail(format!(
+                                "Project watcher could not read a changed file: {error:#}"
+                            ));
+                            rescan_pending = true;
+                        }
                     }
                 }
             }
@@ -1246,7 +1616,15 @@ fn run(
         if project.watcher.take_overflowed() {
             rescan_pending = true;
         }
-        if rescan_pending && last_rescan.elapsed() >= RESCAN_RETRY {
+        let requested_scan = control.scan_requested.load(Ordering::Acquire);
+        let explicit_scan = requested_scan > control.scan_completed.load(Ordering::Acquire);
+        if explicit_scan {
+            rescan_pending = true;
+        }
+        if rescan_pending
+            && control.file_pause_count.load(Ordering::Acquire) == 0
+            && (explicit_scan || last_rescan.elapsed() >= RESCAN_RETRY)
+        {
             last_rescan = Instant::now();
             match scan(&project) {
                 Ok(current) => {
@@ -1266,17 +1644,24 @@ fn run(
                     control.fail(format!("Project watcher rescan failed: {error:#}"));
                 }
             }
+            if explicit_scan {
+                control
+                    .scan_completed
+                    .store(requested_scan, Ordering::Release);
+                control.sync_idle.notify_all();
+            }
         }
         if control.reset.swap(false, Ordering::AcqRel) {
             let (reset_sequence, rebase) = control
                 .take_rebase()
                 .context("Live sync rebase request was missing")?;
+            let RebaseRequest { value, resume } = rebase;
             match open_watch_project(&context)
                 .and_then(|current| scan(&current).map(|snapshot| (current, snapshot)))
             {
                 Ok((current, snapshot)) => {
                     project = current;
-                    match rebase {
+                    match value {
                         Rebase::Captured(captured) => {
                             if captured.full {
                                 baseline = captured
@@ -1335,13 +1720,17 @@ fn run(
                     } else {
                         control.clear_error();
                     }
-                    control.release_pause();
+                    if resume {
+                        control.release_pause();
+                    }
                     control.complete_reset(reset_sequence, reset_error);
                 }
                 Err(error) => {
                     let message = format!("Live sync could not refresh the project: {error:#}");
                     control.fail(message.clone());
-                    control.release_pause();
+                    if resume {
+                        control.release_pause();
+                    }
                     control.complete_reset(reset_sequence, Some(message));
                     return Err(error);
                 }
@@ -1434,12 +1823,60 @@ fn run(
         }
 
         if push_ready
+            && control.writes_enabled.load(Ordering::Acquire)
             && !rescan_pending
             && control.file_pause_count.load(Ordering::Acquire) == 0
             && !pending.is_empty()
             && pending.iter().any(|path| !blocked.contains_key(path))
             && last_event.elapsed() >= EVENT_DEBOUNCE.max(push_retry_delay)
         {
+            match studio_has_pending_changes(&context, &bridge) {
+                Ok(true) => {
+                    let generation = control.generation.load(Ordering::Acquire);
+                    let Some(_activity) = control.begin_sync(generation) else {
+                        continue;
+                    };
+                    match coordinator.reconcile_current(&context, &bridge) {
+                        Ok(setup) => {
+                            control.set_mode(setup.mode);
+                            control.set_resolution_required(setup.resolution_required);
+                            if let Some(error) = setup.error {
+                                control.fail(error);
+                            } else {
+                                control.clear_error();
+                            }
+                            let current = scan(&project)?;
+                            baseline.clone_from(&current);
+                            pending.clear();
+                            blocked.clear();
+                            control.update_pending(&pending);
+                            save_state(&project, &baseline)?;
+                            push_ready = false;
+                            pull_ready = true;
+                            last_event = Instant::now();
+                            continue;
+                        }
+                        Err(error) => {
+                            control.set_mode(PairMode::Verify);
+                            control.fail(format!(
+                                "Live sync could not reconcile concurrent changes: {error:#}"
+                            ));
+                            push_ready = false;
+                            rescan_pending = true;
+                            continue;
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    control.fail(format!(
+                        "Live sync could not inspect Studio changes: {error:#}"
+                    ));
+                    push_ready = false;
+                    rescan_pending = true;
+                    continue;
+                }
+            }
             let paths = pending
                 .iter()
                 .filter(|path| !blocked.contains_key(*path))
@@ -1478,7 +1915,7 @@ fn run(
             let Some(_activity) = control.begin_sync(generation) else {
                 continue;
             };
-            let _gate = bridge.acquire_request_gate();
+            let gate = bridge.acquire_request_gate();
             if control.generation.load(Ordering::Acquire) != generation
                 || control.file_pause_count.load(Ordering::Acquire) > 0
             {
@@ -1497,8 +1934,38 @@ fn run(
                     }
                 }
             };
+            drop(gate);
             match result {
                 Ok(()) => {
+                    let baseline_result = if refresh_project {
+                        coordinator
+                            .reconcile_current(&context, &bridge)
+                            .map(|setup| {
+                                control.set_mode(setup.mode);
+                                control.set_resolution_required(setup.resolution_required);
+                                setup.error
+                            })
+                    } else {
+                        coordinator
+                            .advance_baseline(&context, &pair_key, &paths, BaselineSide::Editor)
+                            .map(|()| None)
+                    };
+                    match baseline_result {
+                        Ok(None) => {}
+                        Ok(Some(error)) => {
+                            control.fail(error);
+                            push_ready = false;
+                            continue;
+                        }
+                        Err(error) => {
+                            control.set_mode(PairMode::Verify);
+                            control.fail(format!(
+                                "Live sync applied files in Studio but could not record the shared state: {error:#}"
+                            ));
+                            push_ready = false;
+                            continue;
+                        }
+                    }
                     let mut persisted = Vec::new();
                     if refresh_project {
                         let current = scan(&project)?;
@@ -1583,11 +2050,21 @@ fn run(
         }
 
         if pull_ready
+            && control.writes_enabled.load(Ordering::Acquire)
             && control.pull_changes.load(Ordering::Acquire)
             && control.file_pause_count.load(Ordering::Acquire) == 0
             && pending.is_empty()
             && last_studio_poll.elapsed() >= STUDIO_POLL_INTERVAL.max(pull_retry_delay)
         {
+            let current = scan(&project)?;
+            if queue_scan_changes(&baseline, &current, &mut pending, &mut blocked)
+                && !pending.is_empty()
+            {
+                control.update_pending(&pending);
+                push_ready = true;
+                last_event = Instant::now();
+                continue;
+            }
             last_studio_poll = Instant::now();
             let generation = control.generation.load(Ordering::Acquire);
             let Some(_activity) = control.begin_sync(generation) else {
@@ -1605,14 +2082,15 @@ fn run(
                 result => result,
             };
             match result {
-                Ok(Some(published)) => {
+                Ok(Some(pulled)) => {
+                    let baseline_paths = pulled.published.changed_roots.clone();
                     let current = scan(&project)?;
                     reconcile_published_changes(
                         &project,
                         &mut baseline,
                         &current,
                         &mut pending,
-                        &published,
+                        &pulled.published,
                     );
                     let mut status = control
                         .status
@@ -1626,6 +2104,25 @@ fn run(
                     pull_retry_delay = Duration::ZERO;
                     if let Err(error) = save_state(&project, &baseline) {
                         control.fail(format!("Live sync could not save its state: {error:#}"));
+                    } else if let Err(error) = coordinator.advance_baseline(
+                        &context,
+                        &pair_key,
+                        &baseline_paths,
+                        BaselineSide::Studio,
+                    ) {
+                        control.set_mode(PairMode::Verify);
+                        control.fail(format!(
+                            "Live sync saved Studio changes but could not record the shared state: {error:#}"
+                        ));
+                    } else if let Err(error) = acknowledge_pulled_changes(
+                        &bridge,
+                        &pulled.services,
+                        pulled.seq,
+                        &pulled.runtime_id,
+                    ) {
+                        control.fail(format!(
+                            "Live sync saved Studio changes but could not acknowledge them: {error:#}"
+                        ));
                     }
                 }
                 Ok(None) => {

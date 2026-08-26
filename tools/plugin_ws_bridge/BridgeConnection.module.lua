@@ -117,15 +117,17 @@ function BridgeConnection.create(context)
 		return table.clone(runtimeSettings)
 	end
 
-	function Config.getPendingBridgeSettingChanges(): ({ [string]: any }?, number?)
+	function Config.getPendingBridgeSettingChanges(): ({ [string]: any }?, number?, number)
 		local changes = nil
 		local maxSeq = nil
+		local count = 0
 		for key, entry in pairs(pendingRuntimeSettingChanges) do
 			changes = changes or {}
 			changes[key] = entry.value
 			maxSeq = math.max(maxSeq or 0, entry.seq)
+			count += 1
 		end
-		return changes, maxSeq
+		return changes, maxSeq, count
 	end
 
 	function Config.hasPendingBridgeSettingChanges(): boolean

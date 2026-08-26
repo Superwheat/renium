@@ -15,7 +15,7 @@ pub(crate) mod query;
 
 use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
-use crate::bytecode::edit::bytecode_service_name;
+use crate::bytecode::edit::{bytecode_service_name, reject_package_link_instance_mutation};
 use crate::bytecode::explorer::{
     BytecodeNodeProjection, explorer_search_groups, explorer_search_instance_matches,
     insert_top_field, parse_requested_fields,
@@ -1234,6 +1234,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         args.value_null,
     )?;
     let index = resolved.index;
+    reject_package_link_instance_mutation(&document, index, "edited")?;
     validate_auto_property_name(&document, index, &args.property, scope)?;
     let canonical_property =
         canonical_stored_property_name(&document, index, &args.property, scope)?;
@@ -1475,6 +1476,7 @@ fn resolve_property_batch_entries(
             )?
         };
         let instance = &state.document.instances[instance_index];
+        reject_package_link_instance_mutation(&state.document, instance_index, "edited")?;
         if !entry.class_name.trim().is_empty() && instance.class_name != entry.class_name {
             bail!(
                 "Class mismatch for {}: expected {}, found {}",

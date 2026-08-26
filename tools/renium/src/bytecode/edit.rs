@@ -53,6 +53,9 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         args.parent.parent_class_name.as_deref(),
     )?;
     let class_name = args.class_name.clone();
+    if class_name == "PackageLink" {
+        bail!("PackageLink instances can only be created by Roblox package workflows");
+    }
     let mut properties = parse_property_assignments(&args.properties)?;
     let source = if is_lua_source_class(&class_name) {
         match properties.get("Source") {
@@ -174,6 +177,7 @@ pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
     let children_before = settings_children_by_parent(&document);
     let mut source_subtree = Vec::new();
     collect_settings_subtree_preorder(&children_before, source_index, &mut source_subtree);
+    reject_package_link_subtree_mutation(&document, &source_subtree, "copied")?;
     let source_set = source_subtree.iter().copied().collect::<HashSet<_>>();
     if source_set.contains(&target_parent_index) {
         bail!("Cannot copy an instance into itself or one of its descendants");
@@ -372,6 +376,37 @@ pub(crate) fn bytecode_service_name(
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn reject_package_link_instance_mutation(
+    document: &SettingsBytecode,
+    index: usize,
+    action: &str,
+) -> Result<()> {
+    let instance = document
+        .instances
+        .get(index)
+        .with_context(|| format!("Invalid instance index {index}"))?;
+    if instance.class_name == "PackageLink" {
+        bail!("PackageLink instances cannot be {action}; desync the package to remove its link");
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_package_link_subtree_mutation(
+    document: &SettingsBytecode,
+    indices: &[usize],
+    action: &str,
+) -> Result<()> {
+    if indices.iter().any(|index| {
+        document
+            .instances
+            .get(*index)
+            .is_some_and(|instance| instance.class_name == "PackageLink")
+    }) {
+        bail!("Package-bearing instances cannot be {action}; desync the package first");
+    }
+    Ok(())
 }
 
 pub(crate) fn unique_editor_child_name(
@@ -826,6 +861,10 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     let index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
             .index;
+    let children_by_parent = settings_children_by_parent(&document);
+    let mut subtree = Vec::new();
+    collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
+    reject_package_link_subtree_mutation(&document, &subtree, "removed")?;
     if is_protected_starter_player_container(&document, index) {
         bail!("{} cannot be removed", document.instances[index].name);
     }

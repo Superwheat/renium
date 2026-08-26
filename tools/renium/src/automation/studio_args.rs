@@ -117,7 +117,10 @@ pub(super) fn live(operation: u16, parameters: &Value) -> Result<StudioChangeSta
         runtime_id: string(object, "runtimeId"),
         suppress_seconds: optional_number(object, "suppressSeconds")?,
         event_wait_seconds: optional_number(object, "eventWaitSeconds")?,
+        settle_wait_seconds: optional_number(object, "settleWaitSeconds")?,
         context_bound: boolean(object, "contextBound")?,
+        details: object.get("compact").and_then(Value::as_bool) != Some(true),
+        prefer: string(object, "resolveConflictPreference"),
     })
 }
 

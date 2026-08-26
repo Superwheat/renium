@@ -11,6 +11,7 @@ use crate::app::output::ensure_plugin_api_ok;
 use crate::automation::context as bound_context;
 use crate::automation::local;
 use crate::automation::places;
+use crate::automation::reconcile::BaselineSide;
 use crate::automation::studio_args;
 use crate::automation::{self, op};
 use crate::bytecode::explorer::bytecode_explorer_batch_result;
@@ -32,10 +33,11 @@ use crate::project::workflows;
 use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
-    click_result, editor_review_decision_result, execute_luau_result, get_console_output_result,
-    goto_result, input_result, key_result, press_result, record_end_result, record_start_result,
-    shot_result, start_stop_play_result, studio_change_state_result, studio_device_result,
-    timed_test_result, type_result, ui_result, wait_until_result,
+    click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
+    get_console_output_result, goto_result, input_result, key_result, press_result,
+    record_end_result, record_start_result, shot_result, start_stop_play_result,
+    studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
+    wait_until_result,
 };
 use crate::studio::bridge::{BridgeServer, BridgeTarget, DEFAULT_EXPORT_CHUNK_SIZE};
 #[cfg(any(windows, target_os = "macos"))]
@@ -267,7 +269,7 @@ pub(super) fn automation_push_args(
     args.link_cache_dir = automation_string(object, "linkCacheDir")
         .map(PathBuf::from)
         .map(|path| bound_context::path(context, path));
-    args.no_review = !reviewed;
+    args.no_review = !reviewed || !automation_bool(object, "allowProtectedWrites", true)?;
     args.yes = true;
     Ok(args)
 }
@@ -286,7 +288,10 @@ fn automation_editor_property_args(
         scope: automation_string(object, "scope").unwrap_or_else(|| "property".to_string()),
         property: automation_string(object, "property")
             .context("set-property requires p.property")?,
-        value_json: serde_json::to_string(object.get("value").unwrap_or(&Value::Null))?,
+        value_json: Some(serde_json::to_string(
+            object.get("value").unwrap_or(&Value::Null),
+        )?),
+        source_file: None,
         no_review: !reviewed,
         yes: reviewed,
     })
@@ -459,11 +464,17 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "sourceVerifyErrors",
         "protectedWrites",
         "protectedApplied",
+        "packageModified",
     ] {
         let value = parameters.get(key).or_else(|| summary.get(key));
         if let Some(value) = value.filter(|value| automation_value_is_non_empty(value)) {
             result.insert(key.to_string(), value.clone());
         }
+    }
+    if result.get("packageModified").and_then(Value::as_bool) == Some(true)
+        && let Some(value) = summary.get("packageDialogAccepted")
+    {
+        result.insert("packageDialogAccepted".to_string(), value.clone());
     }
     result
 }
@@ -821,6 +832,10 @@ fn automation_dispatch_operation(
     }
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
+    if let Some(runtime_id) = context.runtime_id.as_deref() {
+        bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+    }
     match operation {
         op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
             .map(|(result, _)| result),
@@ -1263,7 +1278,7 @@ fn automation_dispatch_managed(
                     .map_err(automation_failure)?;
                 state
                     .live_sync()
-                    .reconcile_then_resume(context.id, published)
+                    .reconcile_then_resume(context, published)
                     .map_err(automation_failure)?;
             } else if operation == op::IMPORT_SNAPSHOTS {
                 match state.live_sync().capture(context, Some(&paths)) {
@@ -1288,7 +1303,7 @@ fn automation_dispatch_managed(
             if let Some(captured) = push_capture {
                 state
                     .live_sync()
-                    .rebase_then_resume(context.id, captured)
+                    .acknowledge_then_resume(context, bridge, captured, BaselineSide::Editor)
                     .map_err(automation_failure)?;
             } else {
                 state.live_sync().resume(context.id, std::iter::empty());
@@ -1313,11 +1328,22 @@ fn automation_live_operation(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let object = automation_object(parameters)?;
+    let compact = automation_bool(object, "compact", false).map_err(automation_failure)?;
     let manage_files = automation_bool(object, "manageFiles", true).map_err(automation_failure)?;
     let files_only = automation_bool(object, "filesOnly", false).map_err(automation_failure)?;
     let files_paused = automation_bool(object, "filesPaused", false).map_err(automation_failure)?;
     let reset_files_paused =
         automation_bool(object, "resetFilesPaused", false).map_err(automation_failure)?;
+    let settle_wait_seconds =
+        automation_number(object, "settleWaitSeconds", 0.0_f64).map_err(automation_failure)?;
+    if !settle_wait_seconds.is_finite() || !(0.0..=120.0).contains(&settle_wait_seconds) {
+        return Err(automation::Failure::new(
+            "bad_req",
+            "p.settleWaitSeconds must be between 0 and 120",
+            false,
+            "live-status",
+        ));
+    }
     let pull_changes = object
         .get("pullChanges")
         .map(|_| automation_bool(object, "pullChanges", true).map_err(automation_failure))
@@ -1330,6 +1356,23 @@ fn automation_live_operation(
         .into_iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    let baseline_paths = automation_strings(object, "baselinePaths")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let acknowledged_side = match object.get("acknowledgedSide").and_then(Value::as_str) {
+        None => None,
+        Some("editor") => Some(BaselineSide::Editor),
+        Some("studio") => Some(BaselineSide::Studio),
+        Some(_) => {
+            return Err(automation::Failure::new(
+                "bad_req",
+                "p.acknowledgedSide must be editor or studio",
+                false,
+                "live-status",
+            ));
+        }
+    };
     if manage_files
         && operation == op::LIVE_STATUS
         && let Some(file_writes) = object.get("fileWrites").and_then(Value::as_str)
@@ -1352,10 +1395,17 @@ fn automation_live_operation(
                         return Err(automation_failure(error));
                     }
                 };
-                state
-                    .live_sync()
-                    .rebase_then_resume(context.id, captured)
-                    .map_err(automation_failure)?
+                if let Some(side) = acknowledged_side {
+                    state
+                        .live_sync()
+                        .acknowledge_then_resume(context, bridge, captured, side)
+                        .map_err(automation_failure)?
+                } else {
+                    state
+                        .live_sync()
+                        .rebase_then_resume(context.id, captured)
+                        .map_err(automation_failure)?
+                }
             }
             _ => {
                 return Err(automation::Failure::new(
@@ -1369,12 +1419,45 @@ fn automation_live_operation(
         return Ok(json!({ "daemon": daemon }));
     }
     if manage_files && operation == op::LIVE_STATUS && !settle_paths.is_empty() {
-        state.live_sync().settle(context.id, settle_paths);
+        if let Some(side) = acknowledged_side {
+            state.live_sync().pause(context.id);
+            let captured = match state.live_sync().capture(context, Some(&settle_paths)) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    state
+                        .live_sync()
+                        .resume(context.id, std::iter::empty::<PathBuf>());
+                    return Err(automation_failure(error));
+                }
+            };
+            if let Some(captured) = captured {
+                state
+                    .live_sync()
+                    .acknowledge_then_resume(context, bridge, captured, side)
+                    .map_err(automation_failure)?;
+            } else {
+                state
+                    .live_sync()
+                    .resume(context.id, std::iter::empty::<PathBuf>());
+            }
+        } else {
+            state.live_sync().settle(context.id, settle_paths);
+        }
         return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
     }
     if manage_files && operation == op::LIVE_STATUS && !queue_paths.is_empty() {
         return Ok(json!({
             "daemon": state.live_sync().queue(context.id, queue_paths)
+        }));
+    }
+    if manage_files && operation == op::LIVE_STATUS && !baseline_paths.is_empty() {
+        let baselines = state
+            .live_sync()
+            .baseline_files(context, &baseline_paths)
+            .map_err(automation_failure)?;
+        return Ok(json!({
+            "daemon": state.live_sync().status(context.id),
+            "baselines": baselines,
         }));
     }
 
@@ -1398,7 +1481,7 @@ fn automation_live_operation(
                 .discard(context)
                 .map_err(automation_failure)?
         };
-        return Ok(merge_live_status(plugin, daemon));
+        return Ok(merge_live_status(plugin, daemon, compact));
     }
 
     if manage_files && files_only && operation == op::LIVE_STATUS {
@@ -1422,9 +1505,11 @@ fn automation_live_operation(
             )
         };
         let daemon = state.live_sync().stop(context.id);
-        return plugin.map(|plugin| merge_live_status(plugin, daemon));
+        return plugin.map(|plugin| merge_live_status(plugin, daemon, compact));
     }
 
+    let settle_requested =
+        manage_files && operation == op::LIVE_STATUS && settle_wait_seconds > 0.0;
     let daemon = match operation {
         op::LIVE_START if manage_files => {
             state
@@ -1442,12 +1527,14 @@ fn automation_live_operation(
                     false,
                 )?
             };
+            let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
             let daemon = match state.live_sync().start(
                 context.clone(),
                 Arc::clone(bridge),
                 pull_changes,
                 files_paused,
                 reset_files_paused,
+                configuration,
             ) {
                 Ok(daemon) => daemon,
                 Err(error) => {
@@ -1473,7 +1560,7 @@ fn automation_live_operation(
                     return Err(failure);
                 }
             };
-            return Ok(merge_live_status(plugin, daemon));
+            return Ok(merge_live_status(plugin, daemon, compact));
         }
         _ => state.live_sync().status(context.id),
     };
@@ -1481,6 +1568,18 @@ fn automation_live_operation(
         .get("eventWaitSeconds")
         .and_then(Value::as_f64)
         .filter(|seconds| *seconds > 0.0);
+    if operation == op::LIVE_STATUS
+        && compact
+        && !settle_requested
+        && event_wait_seconds.is_none()
+        && (daemon["paused"].as_bool() == Some(true) || daemon["syncing"].as_bool() == Some(true))
+    {
+        return Ok(compact_live_status(json!({
+            "ok": true,
+            "busy": true,
+            "daemon": daemon,
+        })));
+    }
     let waits_for_change = matches!(operation, op::LIVE_START | op::LIVE_STATUS)
         && event_wait_seconds.is_some()
         && bridge.channel_count_for_target(BridgeTarget::Main) > 1;
@@ -1510,10 +1609,28 @@ fn automation_live_operation(
             false,
         )?
     };
-    let daemon = if manage_files
+    let settings_update = if manage_files
+        && operation == op::LIVE_STATUS
+        && plugin
+            .get("runtimeSettingChanges")
+            .and_then(Value::as_object)
+            .is_some_and(|changes| !changes.is_empty())
+    {
+        let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
+        state
+            .live_sync()
+            .update_runtime_settings(context.clone(), Arc::clone(bridge), configuration)
+            .map_err(automation_failure)?
+    } else {
+        None
+    };
+    let mut daemon = if let Some(daemon) = settings_update {
+        daemon
+    } else if manage_files
         && operation == op::LIVE_STATUS
         && should_restore_file_watcher(&plugin, &daemon, state.live_sync().is_enabled(context))
     {
+        let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
         state
             .live_sync()
             .set_enabled(context, true)
@@ -1526,21 +1643,72 @@ fn automation_live_operation(
                 pull_changes,
                 files_paused,
                 reset_files_paused,
+                configuration,
             )
             .map_err(automation_failure)?
     } else {
         daemon
     };
-    Ok(merge_live_status(plugin, daemon))
+    if settle_requested {
+        let settled = state
+            .live_sync()
+            .wait_settled(context.id, Duration::from_secs_f64(settle_wait_seconds));
+        if let Some(daemon) = daemon.as_object_mut() {
+            daemon.insert("settled".to_string(), Value::Bool(settled));
+        }
+    }
+    Ok(merge_live_status(plugin, daemon, compact))
 }
 
-fn merge_live_status(plugin: Value, daemon: Value) -> Value {
+fn merge_live_status(plugin: Value, daemon: Value, compact: bool) -> Value {
     let mut result = plugin
         .as_object()
         .cloned()
         .unwrap_or_else(|| Map::from_iter([("plugin".to_string(), plugin)]));
     result.insert("daemon".to_string(), daemon);
-    Value::Object(result)
+    let result = Value::Object(result);
+    if compact {
+        compact_live_status(result)
+    } else {
+        result
+    }
+}
+
+fn pair_configuration(
+    plugin: &Value,
+    request: &Map<String, Value>,
+) -> Result<automation::reconcile::PairConfiguration> {
+    let runtime_settings = plugin
+        .get("runtimeSettingChanges")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let raw_mode = runtime_settings
+        .get("initialSyncPriority")
+        .and_then(Value::as_str)
+        .or_else(|| request.get("initialSyncMode").and_then(Value::as_str));
+    let resolution = request
+        .get("resolveConflictPreference")
+        .and_then(Value::as_str);
+    if resolution.is_some_and(|value| !matches!(value, "studio" | "editor")) {
+        bail!("p.resolveConflictPreference must be studio or editor");
+    }
+    let raw_preference = runtime_settings
+        .get("initialConflictPreference")
+        .and_then(Value::as_str)
+        .or_else(|| (raw_mode == Some("editor")).then_some("editor"))
+        .or_else(|| {
+            request
+                .get("initialConflictPreference")
+                .and_then(Value::as_str)
+        });
+    Ok(automation::reconcile::PairConfiguration {
+        mode: automation::reconcile::PairMode::parse(raw_mode),
+        conflict_preference: automation::reconcile::ConflictPreference::parse(raw_preference),
+        resolution_preference: resolution
+            .map(|value| automation::reconcile::ConflictPreference::parse(Some(value))),
+        runtime_settings,
+    })
 }
 
 fn should_restore_file_watcher(plugin: &Value, daemon: &Value, enabled: bool) -> bool {
@@ -1963,5 +2131,71 @@ mod tests {
             &json!({ "running": false }),
             false
         ));
+    }
+
+    #[test]
+    fn explicit_reconcile_choice_only_overrides_the_current_conflict() {
+        let plugin = json!({
+            "runtimeSettingChanges": {
+                "initialSyncPriority": "reconcile",
+                "initialConflictPreference": "none"
+            }
+        });
+        let request = json!({ "resolveConflictPreference": "studio" });
+        let configuration = pair_configuration(&plugin, request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            configuration.mode,
+            automation::reconcile::PairMode::Reconcile
+        );
+        assert_eq!(
+            configuration.conflict_preference,
+            automation::reconcile::ConflictPreference::None
+        );
+        assert_eq!(
+            configuration.resolution_preference,
+            Some(automation::reconcile::ConflictPreference::Studio)
+        );
+        assert_eq!(
+            configuration
+                .runtime_settings
+                .get("initialConflictPreference"),
+            Some(&Value::String("none".to_string()))
+        );
+    }
+
+    #[test]
+    fn compact_live_status_summarizes_pending_state_and_daemon_errors() {
+        assert_eq!(
+            compact_live_status(json!({
+                "ok": true,
+                "role": "edit",
+                "runtimeId": "runtime",
+                "twoWaySyncEnabled": true,
+                "changes": [{"large": "payload"}],
+                "propertyChanges": [{}, {}],
+                "editorActions": [],
+                "daemon": {
+                    "running": true,
+                    "pendingPaths": ["a", "b"],
+                    "error": "timed out"
+                }
+            })),
+            json!({
+                "ok": false,
+                "error": "timed out",
+                "role": "edit",
+                "runtimeId": "runtime",
+                "twoWaySyncEnabled": true,
+                "changeCount": 1,
+                "propertyChangeCount": 2,
+                "pendingChanges": 3,
+                "daemon": {
+                    "running": true,
+                    "pendingCount": 2,
+                    "pendingPaths": ["a", "b"],
+                    "error": "timed out"
+                }
+            })
+        );
     }
 }

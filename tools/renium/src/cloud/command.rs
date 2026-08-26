@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
 
+use super::parameters::{absolutize_files, assignments};
 use super::{CloudIdentity, execute_one, execute_with_identity};
 use crate::app;
 use crate::automation::Failure;
@@ -292,7 +293,7 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
             .map_err(cloud_error)?
         }
     };
-    app::output::print_json_output(&result, true)
+    app::output::print_json_output(&result, false)
 }
 
 fn run_route(
@@ -355,10 +356,7 @@ fn request_command(
         None => None,
     };
     let mut files = assignments(&args.file)?;
-    for value in files.values_mut() {
-        let path = value.as_str().context("--file values must be paths")?;
-        *value = Value::String(absolute_path(Path::new(path)).display().to_string());
-    }
+    absolutize_files(&mut files)?;
     let raw_file = args
         .body_file
         .map(|path| absolute_path(&path).display().to_string());
@@ -424,23 +422,6 @@ fn read_json(source: &str) -> Result<Value> {
         fs::read_to_string(source).with_context(|| format!("Failed to read {source}"))?
     };
     serde_json::from_str(&text).with_context(|| format!("Invalid JSON in {source}"))
-}
-
-fn assignments(values: &[String]) -> Result<Map<String, Value>> {
-    values
-        .iter()
-        .map(|assignment| {
-            let (name, value) = assignment
-                .split_once('=')
-                .with_context(|| format!("Expected NAME=VALUE, got '{assignment}'"))?;
-            if name.is_empty() {
-                bail!("Assignment names cannot be empty");
-            }
-            let value =
-                serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
-            Ok((name.to_string(), value))
-        })
-        .collect()
 }
 
 fn json_assignments(values: &[String]) -> Result<Map<String, Value>> {
