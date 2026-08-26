@@ -45,7 +45,7 @@ const PARAM_ROOTS: usize = 144;
 const PARAM_OUTPUT_PATH: usize = 4240;
 const PARAM_ERROR: usize = 5280;
 const MAX_ROOTS: usize = 256;
-const DATA_MODEL_INSTANCE_OFFSET: usize = 0x1c8;
+const DATA_MODEL_INSTANCE_SCAN: std::ops::RangeInclusive<usize> = 0x100..=0x400;
 const INSTANCE_CLASS_DESCRIPTOR_OFFSET: usize = 0x18;
 const INSTANCE_CHILDREN_OFFSET: usize = 0x70;
 const INSTANCE_NAME_OFFSET: usize = 0x98;
@@ -71,6 +71,7 @@ struct CachedDataModel {
     title: String,
     outer: usize,
     owner: usize,
+    instance_offset: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +92,7 @@ struct SharedEntry {
 struct ActiveDataModel {
     outer: usize,
     owner: usize,
+    instance_offset: usize,
     roots: Vec<SharedEntry>,
 }
 
@@ -851,16 +853,22 @@ fn find_active_data_model(
         {
             continue;
         }
-        let instance = outer + DATA_MODEL_INSTANCE_OFFSET;
-        if memory
-            .read_u64(instance + 8)
-            .ok()
-            .map(|value| value as usize)
-            != Some(instance)
-            || read_instance_class(memory, instance).as_deref() != Some("DataModel")
-        {
+        let Some((instance_offset, instance)) = DATA_MODEL_INSTANCE_SCAN
+            .clone()
+            .step_by(8)
+            .find_map(|instance_offset| {
+                let instance = outer.checked_add(instance_offset)?;
+                (memory
+                    .read_u64(instance + 8)
+                    .ok()
+                    .map(|value| value as usize)
+                    == Some(instance)
+                    && read_instance_class(memory, instance).as_deref() == Some("DataModel"))
+                .then_some((instance_offset, instance))
+            })
+        else {
             continue;
-        }
+        };
         let Some(name) = read_instance_name(memory, instance) else {
             continue;
         };
@@ -906,6 +914,7 @@ fn find_active_data_model(
             ActiveDataModel {
                 outer,
                 owner,
+                instance_offset,
                 roots,
             },
         ));
@@ -939,7 +948,7 @@ fn refresh_active_data_model(
     {
         return None;
     }
-    let instance = cached.outer.checked_add(DATA_MODEL_INSTANCE_OFFSET)?;
+    let instance = cached.outer.checked_add(cached.instance_offset)?;
     if memory
         .read_u64(instance + 8)
         .ok()
@@ -965,6 +974,7 @@ fn refresh_active_data_model(
     Some(ActiveDataModel {
         outer: cached.outer,
         owner: cached.owner,
+        instance_offset: cached.instance_offset,
         roots,
     })
 }
@@ -998,6 +1008,7 @@ fn active_data_model(
                 title: title.to_string(),
                 outer: data_model.outer,
                 owner: data_model.owner,
+                instance_offset: data_model.instance_offset,
             },
         );
     Ok(data_model)

@@ -130,6 +130,8 @@ pub(crate) struct GenerateSourcemapArgs {
     pub(crate) output: Option<PathBuf>,
     #[arg(long)]
     pub(crate) stdout: bool,
+    #[arg(long, requires = "stdout")]
+    pub(crate) cached: bool,
     #[arg(long)]
     pub(crate) watch: bool,
     #[arg(long, default_value_t = 250)]

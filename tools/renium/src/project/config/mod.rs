@@ -561,6 +561,15 @@ pub enum ConfigScope {
     Merged,
 }
 
+struct ConfigSettingSpec {
+    key: &'static str,
+    kind: &'static str,
+    default_json: Option<&'static str>,
+    values: &'static [&'static str],
+}
+
+include!(concat!(env!("OUT_DIR"), "/config_settings.rs"));
+
 #[derive(Args)]
 pub struct AdaptersArgs {
     #[command(subcommand)]
@@ -1880,17 +1889,101 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
     print_json(&result, args.pretty)
 }
 
+fn config_value_text(value: &Value) -> Result<String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Null => Ok("unset".to_string()),
+        _ => Ok(serde_json::to_string(value)?),
+    }
+}
+
+fn load_config_scope_with_defaults(scope: ConfigScope, root: &Path) -> Result<Value> {
+    let configured = load_config_scope(scope, root)?;
+    if scope != ConfigScope::Merged {
+        return Ok(configured);
+    }
+    let mut values = json!({});
+    for setting in CONFIG_SETTING_SPECS {
+        if let Some(default) = setting.default_json {
+            set_dotted(&mut values, setting.key, serde_json::from_str(default)?)?;
+        }
+    }
+    merge_json(&mut values, configured);
+    Ok(values)
+}
+
+fn list_config_settings(args: ConfigListArgs) -> Result<()> {
+    let scope = if args.origins {
+        ConfigScope::Merged
+    } else {
+        args.scope
+    };
+    let values = load_config_scope_with_defaults(scope, &args.root)?;
+    let origins = if args.origins {
+        config_with_origins(&args.root)?
+            .get("origins")
+            .and_then(Value::as_object)
+            .cloned()
+    } else {
+        None
+    };
+    let mut rows = Vec::with_capacity(CONFIG_SETTING_SPECS.len());
+    let mut lines = Vec::with_capacity(CONFIG_SETTING_SPECS.len());
+    for setting in CONFIG_SETTING_SPECS {
+        let value = get_dotted(&values, setting.key)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let choices = if setting.kind == "boolean" {
+            "true|false".to_string()
+        } else if setting.values.is_empty() {
+            setting.kind.to_string()
+        } else {
+            setting.values.join("|")
+        };
+        let origin = origins
+            .as_ref()
+            .and_then(|origins| origins.get(setting.key))
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let mut row = json!({ "name": setting.key, "value": value });
+        if setting.kind == "boolean" {
+            row["values"] = json!([true, false]);
+        } else if setting.values.is_empty() {
+            row["type"] = Value::String(setting.kind.to_string());
+        } else {
+            row["values"] = json!(setting.values);
+        }
+        if args.origins {
+            row["origin"] = Value::String(origin.to_string());
+        }
+        let origin_text = if args.origins {
+            format!(" @{origin}")
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "{}={} [{}]{}",
+            setting.key,
+            config_value_text(&value)?,
+            choices,
+            origin_text
+        ));
+        rows.push(row);
+    }
+    crate::app::output::emit_global_output(&json!({ "settings": rows }), &lines.join("\n"))
+}
+
 pub fn run_config(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Get(args) => {
-            let value = load_config_scope(args.scope, &args.root)?;
+            let value = load_config_scope_with_defaults(args.scope, &args.root)?;
             let selected = match args.key.as_deref() {
                 Some(key) => get_dotted(&value, key)
                     .cloned()
-                    .with_context(|| format!("Configuration key '{key}' is not set"))?,
+                    .with_context(|| format!("Unknown setting '{key}'"))?,
                 None => value,
             };
-            print_json(&selected, true)
+            crate::app::output::emit_global_output(&selected, &config_value_text(&selected)?)
         }
         ConfigCommand::Set(args) => {
             ensure_writable_scope(args.scope)?;
@@ -1901,12 +1994,12 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             } else {
                 serde_json::from_str(&args.value).unwrap_or(Value::String(args.value))
             };
-            set_dotted(&mut value, &args.key, parsed)?;
+            set_dotted(&mut value, &args.key, parsed.clone())?;
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_json(&path, &value)?;
             crate::app::output::emit_global_output(
-                &json!({ "ok": true, "action": "set", "key": args.key, "path": path }),
-                &format!("Set {} in {}", args.key, path.display()),
+                &json!({ "ok": true, "key": args.key, "value": parsed }),
+                &format!("{}={}", args.key, config_value_text(&parsed)?),
             )
         }
         ConfigCommand::Unset(args) => {
@@ -1937,14 +2030,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
                 &format!("Reset {}", path.display()),
             )
         }
-        ConfigCommand::List(args) => {
-            if args.origins {
-                let result = config_with_origins(&args.root)?;
-                print_json(&result, true)
-            } else {
-                print_json(&load_config_scope(args.scope, &args.root)?, true)
-            }
-        }
+        ConfigCommand::List(args) => list_config_settings(args),
         ConfigCommand::Edit(args) => {
             ensure_writable_scope(args.scope)?;
             let path = config_scope_path(args.scope, &args.root)?;
@@ -2475,8 +2561,16 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 )?,
                 "liveSync.initialSyncPriority" => require_kind(
                     &path,
-                    "studio, editor, or none",
-                    matches!(value.as_str(), Some("studio" | "editor" | "none")),
+                    "reconcile or verify",
+                    matches!(
+                        value.as_str(),
+                        Some("reconcile" | "verify" | "studio" | "editor" | "none")
+                    ),
+                )?,
+                "liveSync.initialConflictPreference" => require_kind(
+                    &path,
+                    "none, studio, or editor",
+                    matches!(value.as_str(), Some("none" | "studio" | "editor")),
                 )?,
                 "liveSync.displayPrompts" => require_kind(
                     &path,
@@ -3435,5 +3529,23 @@ mod tests {
             },
         ];
         assert!(filter_allows(&rules, FilterDirection::StudioToFiles, &candidate).unwrap());
+    }
+
+    #[test]
+    fn generated_setting_defaults_are_valid() {
+        let mut values = json!({ "schemaVersion": 1 });
+        let mut keys = BTreeSet::new();
+        for setting in CONFIG_SETTING_SPECS {
+            assert!(keys.insert(setting.key));
+            if let Some(default) = setting.default_json {
+                set_dotted(
+                    &mut values,
+                    setting.key,
+                    serde_json::from_str(default).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        validate_merged_config(&values).unwrap();
     }
 }

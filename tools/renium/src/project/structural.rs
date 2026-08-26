@@ -9,6 +9,7 @@ use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
     collect_settings_subtree_preorder, instance_path_parts_key, next_editor_settings_id_fast,
     path_ordinals_from_value, path_segments_from_value, prune_removed_source_dirs,
+    reject_package_link_subtree_mutation,
 };
 use crate::bytecode::{
     apply_file_mutations, collect_source_path_updates, file_mutation_paths,
@@ -197,6 +198,7 @@ pub(crate) fn move_instance_between_service_stores(
     let children = settings_children_by_parent(&source);
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children, source_index, &mut subtree);
+    reject_package_link_subtree_mutation(&source, &subtree, "moved between services")?;
     let source_paths_before = build_editor_source_paths_by_index(
         &source_before,
         source_service,

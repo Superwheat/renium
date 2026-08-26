@@ -632,6 +632,9 @@ pub(crate) fn generate_sourcemap_command(
     args: GenerateSourcemapArgs,
     global_project: Option<&Path>,
 ) -> Result<()> {
+    if args.cached && args.watch {
+        bail!("--cached cannot be combined with --watch");
+    }
     let explicit_project = args
         .project
         .as_deref()
@@ -658,7 +661,16 @@ pub(crate) fn generate_sourcemap_command(
             config::try_load_project(None, Some(&project_root))?
                 .filter(|loaded| loaded.root == project_root)
         };
-        let mut root = build_project_sourcemap_with_loaded(&project_root, loaded.as_ref())?;
+        let mut root = if args.cached {
+            load_existing_sourcemap_root(&project_root)?.with_context(|| {
+                format!(
+                    "No cached sourcemap exists at {}",
+                    project_root.join("sourcemap.json").display()
+                )
+            })?
+        } else {
+            build_project_sourcemap_with_loaded(&project_root, loaded.as_ref())?
+        };
         if !matchers.is_empty() {
             filter_sourcemap_nodes(&mut root, &matchers);
         }

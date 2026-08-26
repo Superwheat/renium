@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -215,11 +215,6 @@
       {
         "command": "renium.stopLiveSync",
         "title": "Stop Live Sync",
-        "category": "Renium"
-      },
-      {
-        "command": "renium.retryEditorInitialSync",
-        "title": "Retry Initial Editor Sync",
         "category": "Renium"
       },
       {
@@ -572,14 +567,24 @@
         },
         "renium.liveSync.initialSyncPriority": {
           "type": "string",
-          "enum": ["studio", "editor", "none"],
+          "enum": ["reconcile", "verify"],
           "enumDescriptions": [
-            "Start from Studio and import its state into src before watching for later edits.",
-            "Start from src and push it to Studio before watching for later edits.",
-            "Start watching without an initial import or push."
+            "Merge independent changes from Studio and project files before live sync starts.",
+            "Compare both sides without writing either one."
           ],
-          "default": "studio",
-          "description": "Which side initializes a newly started live-sync session."
+          "default": "reconcile",
+          "description": "How Renium handles differences that already exist when live sync starts."
+        },
+        "renium.liveSync.initialConflictPreference": {
+          "type": "string",
+          "enum": ["none", "studio", "editor"],
+          "enumDescriptions": [
+            "Leave conflicts pending for review.",
+            "Prefer Studio for ordinary conflicts that are safe to resolve automatically.",
+            "Prefer project files for ordinary conflicts that are safe to resolve automatically."
+          ],
+          "default": "none",
+          "description": "Preferred side for ordinary initial-sync conflicts."
         },
         "renium.liveSync.changesThreshold": {
           "type": "number",

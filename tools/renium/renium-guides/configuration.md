@@ -1,6 +1,14 @@
 # Project configuration and adapters
 
-Read `RENIUM.md` first.
+## Settings
+
+```powershell
+rbx cfg list
+rbx cfg get liveSync.initialSyncPriority
+rbx cfg set liveSync.initialSyncPriority reconcile
+```
+
+`list` shows every setting, its current value, and valid values. `set` writes the active place; add `--scope user`, `workspace`, or `experience` only when that wider scope is intended.
 
 ```powershell
 rbx fmt --check
@@ -18,15 +26,15 @@ rbx ip .\Shared.server.luau --path-json '["ServerScriptService","Shared"]'
 rbx ip .\SharedFolder --destination src\ReplicatedStorage\Shared --dry-run
 ```
 
-`build` maps configured source files into project instances. `syncback` writes supported two-way instance edits back to their adapter sources. Use `--check` or `--preview` before a write when only validation or a plan is needed; don't use `watch` for one-off agent work.
+`build` maps source files to instances. `syncback` writes supported instance edits to adapter sources. Use `--check` or `--preview` for validation; don't use `watch` for one-off work.
 
-`pv` checks the complete project offline. `ir` converts one Rojo project file or a folder containing exactly one into a formatted `renium.project.jsonc`; preview before applying.
+`pv` validates the project offline. `ir` converts one Rojo project into `renium.project.jsonc`; preview first.
 
-`ip` copies one file by Roblox path or a directory by project-relative destination. Preview first; existing files are reported as `unchanged` or `overwrite`, and omitting `--dry-run` applies the listed actions.
+`ip` copies a file by Roblox path or a directory by project path. Preview first; omitting `--dry-run` applies the listed actions.
 
-Mounts use `{"source":"shared","target":"ReplicatedStorage.Shared","ownership":"read-only","optional":true}` in the project's `mounts` array. Ownership defaults to `exclusive`; optional missing sources project nothing. Normal reads include mounted instances, `bss` writes writable mounted scripts, and `xp` follows nested-project descendants.
+Mounts use `{"source":"shared","target":"ReplicatedStorage.Shared","ownership":"read-only","optional":true}`. Ownership defaults to `exclusive`; optional missing sources project nothing. Reads include mounts, `bss` edits writable mounted scripts, and `xp` follows nested projects.
 
-`syncRules` map extra file types into instances. Rules are ordered and the last match wins; `suffix` strips a file suffix, `exclude` disqualifies that rule, and `use: "ignore"` suppresses the file. `globIgnorePaths` ignores matching project paths before projection.
+`syncRules` map extra file types. Last match wins; `suffix` strips a suffix, `exclude` rejects a rule, and `use: "ignore"` suppresses a file. `globIgnorePaths` blocks paths before projection.
 
 ```jsonc
 {
@@ -43,4 +51,4 @@ Mounts use `{"source":"shared","target":"ReplicatedStorage.Shared","ownership":"
 }
 ```
 
-Filter actions are `include` or `ignore`; directions are `files-to-studio`, `studio-to-files`, or `both`. Selectors are `glob`, `name`, `class`, `tag`, `attribute`, `property`, and `id`. Filters are ordered and last-match wins; `property` and `attribute` rules affect only that field. In `xp`, `owned` means a mapping claims the path, `ignored` means `globIgnorePaths` blocks it, and `selectedSyncRule` identifies the winning rule even when another setting suppresses its output.
+Filters use `include` or `ignore` in `files-to-studio`, `studio-to-files`, or `both`. Selectors: `glob`, `name`, `class`, `tag`, `attribute`, `property`, `id`. Last match wins; field selectors affect only that field. In `xp`, `owned` means mapped, `ignored` means blocked, and `selectedSyncRule` is the winning rule.

@@ -1,22 +1,22 @@
 # Roblox Cloud and creator assets
 
-Read `RENIUM.md` first. Cloud commands run without Studio or a daemon. Put the key in `ROBLOX_API_KEY`; for OAuth, put the token in another environment variable and add `--oauth-env ENV`. Never put credentials in commands or project files.
+Cloud commands don't use Studio or a daemon. Store API keys in `ROBLOX_API_KEY`; store OAuth tokens in another environment variable and use `--oauth-env ENV`. Never put credentials in commands or project files.
 
-Roblox keys may belong to a user, a dedicated account used for a group, or be limited to selected resources. Renium uses the same commands for all three. Roblox enforces the key owner's permissions, its scopes, and its allowed universe, data-store, or creator targets. Check the active API key without exposing it:
+The same commands support user, group-automation, and resource-limited keys. Roblox enforces owner permissions, scopes, and allowed targets. Inspect the active key without exposing it:
 
 ```powershell
 rbx oc key
 ```
 
-Use `--key-env ENV` when a task needs a different key. A dedicated group key is normally stored in its own environment variable. Renium doesn't widen a key's access or retry with another credential.
+Use `--key-env ENV` for another key. Renium never widens access or switches credentials.
 
-Public reads can skip credentials with `--anonymous`, for example `rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Model`. Renium never falls back from authenticated to anonymous access.
+Public reads may use `--anonymous`, for example `rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Model`. Authenticated requests never fall back to anonymous access.
 
-The universe and place come from the current Renium project. Outside one, add `--universe ID` and, when needed, `--place-id ID` before the resource name.
+The current project supplies universe and place IDs. Otherwise add `--universe ID` and, if needed, `--place-id ID` before the resource.
 
 ## Native Open Cloud operations
 
-Use the resource command instead of entering an HTTP method, route, or JSON body. Values that look like JSON numbers, booleans, arrays, or objects keep that type; other values are strings.
+Prefer resource commands over raw HTTP routes. JSON-like values keep their type; other values are strings.
 
 ```powershell
 rbx oc data stores --limit 25
@@ -36,9 +36,9 @@ rbx oc localization product-name PRODUCT fr "Nom français"
 rbx oc ai speech "Welcome back" --field speechStyle.voiceId=VOICE
 ```
 
-Data and ordered-store commands use the `global` scope by default; add `--scope NAME` for another scope. `update` requires an existing entry, while `upsert` may create one. `--field a.b=value` sets nested request fields without a JSON file. `--query name=value`, `--filter`, `--cursor`, `--if-match`, `--form`, and `--file` cover less common endpoint options.
+Data and ordered stores default to `global`; change it with `--scope`. `update` requires an entry; `upsert` may create one. `--field a.b=value` sets nested fields. Less common options use `--query`, `--filter`, `--cursor`, `--if-match`, `--form`, or `--file`.
 
-List exact native operations and positional values only when needed:
+List routes only when needed:
 
 ```powershell
 rbx oc routes
@@ -46,13 +46,33 @@ rbx oc routes data
 rbx oc routes matchmaking
 ```
 
-Native categories include `data`, `ordered`, `memory`, `universe`, `place`, `restriction`, `secret`, `notification`, `user`, `group`, `interaction`, `team`, `asset`, `creator-store`, `pass`, `localization`, `config`, `luau`, `server`, `advertising`, `analytics`, `avatar`, `badge`, `experiment`, `event`, `ai`, `matchmaking`, and `thumbnail`.
+Categories include `data`, `ordered`, `memory`, `universe`, `place`, `restriction`, `secret`, `notification`, `user`, `group`, `interaction`, `team`, `asset`, `creator-store`, `pass`, `localization`, `config`, `luau`, `server`, `advertising`, `analytics`, `avatar`, `badge`, `experiment`, `event`, `ai`, `matchmaking`, and `thumbnail`.
 
-Use `rbx oc request` only when Roblox has added an endpoint that `rbx oc routes` doesn't list. Pipe a complex body to stdin instead of creating a payload file.
+Use `rbx oc request` only for an unlisted endpoint. Pipe complex bodies through stdin.
+
+## Analytics, events, experiments, and thumbnails
+
+These commands use the current universe from the project unless `--universe ID` is set:
+
+```powershell
+rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z
+rbx oc analytics metrics-operation OPERATION
+rbx oc event list --limit 10 -q fields=id,title,startTime,visibility
+rbx oc event get EVENT -q fields=id,title,userRsvpStatus
+rbx oc experiment list --limit 25 -q searchKey=BossHealth
+rbx oc experiment stats EXPERIMENT
+rbx oc experiment start EXPERIMENT
+rbx oc thumbnail personalization --limit 10
+rbx oc thumbnail personalization-create --field homepageThumbnailIds='["THUMBNAIL_1","THUMBNAIL_2"]'
+rbx oc thumbnail upload first.png --file files=second.png
+rbx oc thumbnail upload-status -q operationIds=OPERATION_1 -q operationIds=OPERATION_2
+```
+
+JSON writes use `--field`. Repeating the same `-q`, `--form`, or `--file` name keeps every value.
 
 ## Products, passes, and assets
 
-Developer products have concise typed fields:
+Developer products:
 
 ```powershell
 rbx oc product list
@@ -61,7 +81,7 @@ rbx oc product create "Refresh Daily Rewards" --price 27 --for-sale --regional-p
 rbx oc product update PRODUCT_ID --price 29 --regional-pricing=false
 ```
 
-Game-pass multipart fields use `--form`; images use `--file imageFile=PATH`. Native asset creation takes its main metadata and file as positional values; use `--field` for the user or group creator. Image asset upload requires an explicit owner:
+Game passes use `--form`; images use `--file imageFile=PATH`. Asset creation takes metadata and file positionally; set the creator with `--field`. Image uploads require an owner:
 
 ```powershell
 rbx oc pass create "VIP" --form price=99 --form isForSale=true --file imageFile=vip.png
@@ -70,7 +90,7 @@ rbx oc asset create Model "Street Lamp" "A lamp model" lamp.fbx --field creation
 rbx iu reference.png --user USER_ID --name Reference
 ```
 
-Creator Store search and Studio insertion are separate direct commands:
+Creator Store and Studio commands:
 
 ```powershell
 rbx as "wooden crate" --limit 5
@@ -79,4 +99,4 @@ rbx gm "small wooden crate" --parent Workspace --name GeneratedCrate
 rbx js JOB_ID --wait-seconds 30
 ```
 
-Uploads, writes, restrictions, notifications, server control, and other mutations must be explicitly requested. Use the normal web tool for current Roblox documentation.
+Run mutations only when requested. Use normal web tools for Roblox documentation.

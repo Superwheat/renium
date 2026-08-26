@@ -125,6 +125,50 @@ fn collect_and_apply_editor_changes(
     changes
 }
 
+#[test]
+fn changed_directory_collects_every_external_script() {
+    let project_root = temp_dir("changed-directory");
+    let service_dir = project_root.join("src/ReplicatedStorage");
+    fs::create_dir_all(&service_dir).unwrap();
+    let document = settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("public", "Public", "Folder", Some(0)),
+        settings_instance("one", "One", "ModuleScript", Some(1)),
+        settings_instance("two", "Two", "ModuleScript", Some(1)),
+    ]);
+    document
+        .write_file(&service_settings_path(&service_dir))
+        .unwrap();
+    let source_paths =
+        build_editor_source_paths_by_index(&document, "ReplicatedStorage", &service_dir);
+    for index in [2, 3] {
+        let path = source_paths[index].as_ref().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("return {index}\n")).unwrap();
+    }
+
+    let public_dir = source_paths[2].as_ref().unwrap().parent().unwrap();
+    let changes = collect_editor_changes(&PushEditorChangesArgs {
+        changed_paths: vec![public_dir.to_path_buf()],
+        ..PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: project_root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.0),
+        )
+    })
+    .unwrap();
+    let names = changes
+        .source_changes
+        .iter()
+        .filter_map(|change| change.path_segments.last().cloned())
+        .collect::<HashSet<_>>();
+    assert_eq!(names, HashSet::from(["One".to_string(), "Two".to_string()]));
+
+    let _ = fs::remove_dir_all(project_root);
+}
+
 fn get_source_property_args(settings_file: &Path) -> BytecodeGetPropertyArgs {
     BytecodeGetPropertyArgs::try_parse_from([
         "bytecode-get-property",
@@ -913,6 +957,56 @@ fn bytecode_desync_package_link_removes_direct_package_link_child() {
         .find(|instance| instance.settings_id == "door")
         .expect("ordinary children should remain");
     assert_eq!(door.parent_index, Some(1));
+
+    let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
+fn ordinary_remove_rejects_package_bearing_instances_and_links() {
+    let project_root = temp_dir("remove-package-link");
+    let service_dir = project_root.join("src").join("Workspace");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_path = service_settings_path(&service_dir);
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        settings_instance("garage", "Garage", "Model", Some(0)),
+        settings_instance("package-link", "PackageLink", "PackageLink", Some(1)),
+        settings_instance("door", "Door", "Part", Some(1)),
+    ])
+    .write_file(&settings_path)
+    .unwrap();
+
+    let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("garage".into())),
+        no_recursive: false,
+        pretty: false,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("Package-bearing"), "{error}");
+
+    let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
+        no_recursive: false,
+        pretty: false,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("Package-bearing"), "{error}");
+
+    let decoded = SettingsBytecode::read_file(&settings_path).unwrap();
+    assert!(
+        decoded
+            .instances
+            .iter()
+            .any(|instance| instance.class_name == "PackageLink")
+    );
+    assert!(
+        decoded
+            .instances
+            .iter()
+            .any(|instance| instance.settings_id == "door")
+    );
 
     let _ = fs::remove_dir_all(project_root);
 }

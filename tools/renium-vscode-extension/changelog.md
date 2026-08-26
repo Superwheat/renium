@@ -1,6 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-26
+
+### Agent commands
+
+- Commands return compact one-line results by default. Use `--output-mode pretty` only when expanded JSON is useful.
+- Command help shows short runnable examples without daemon, bridge, or protocol options.
+- Saved-data edits rely on Live Sync when it's active instead of repeating the same edit with a manual push.
+- Update notices use the short `rbx upd` command.
+- Luau can be piped through standard input, and sourcemap reads can use the existing cached map without rebuilding it.
+- Explorer searches stay inside the selected service or subtree instead of returning unrelated project instances.
+
+### Live Sync
+
+- Reconcile starts without a direction choice when edits are independent. If both sides changed the same content, choose the version to keep once and Live Sync finishes starting automatically.
+- A conflict choice applies only to that overlap; the saved reconciliation policy remains unchanged.
+- CLI conflicts return both resolution commands directly; checking Studio's UI isn't required.
+- Verify mode compares Studio and project files without changing either side or starting live writes.
+- Existing `studio`, `editor`, and `none` startup settings migrate to the matching reconcile or verify behavior.
+- Independent script edits from Studio and project files merge against their last common version. Overlapping edits stay pending, and CRLF/LF differences don't create conflicts.
+- Studio source, hierarchy, duplicate-name, and sibling-order changes wake Live Sync without waiting for a full rescan.
+- Settings changed in the Studio plugin while disconnected are delivered after reconnect; untouched plugin settings don't replace editor settings.
+
+### Explorer
+
+- Large searches show results quickly and keep loading ahead of fast scrolling instead of leaving blank gaps.
+- Expanding and collapsing large trees responds faster without reloading work that's already available.
+- Clearing a search no longer expands unrelated instances or moves the scroll position backward.
+- Search help opens only when starting a search, and search navigation icons display consistently.
+
+### Packages and sync safety
+
+- Package contents can sync without replacing the existing `PackageLink` or losing the package relationship.
+- `PackageLink` instances are read-only during normal add, copy, move, rename, property, import, and delete operations. Package desync remains an explicit command.
+- Package changes are confirmed after a successful push on Windows and macOS without taking over keyboard or mouse input.
+- A failed native import restores the original Studio tree; failed rollback data remains available instead of being discarded.
+- Settings files changed during a prepared Studio update are detected before the update can overwrite newer edits.
+- The Studio plugin no longer shows the extra editor-sync undo notification.
+
+### Configuration
+
+- Renium settings can be listed, read, and changed through the short `rbx cfg` command.
+- The settings list includes current and valid values.
+
+### Open Cloud
+
+- Open Cloud can query analytics, manage game events and experiments, and configure personalized thumbnails.
+- Multi-image thumbnail uploads and repeated array parameters are sent intact, and experiments can be started without request-body failures.
 
 ## 0.2.9 - 2026-08-22
 

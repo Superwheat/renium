@@ -781,57 +781,69 @@ local function buildSettingsWidget(plugin)
 	local sync = makeSection(scroll, "Sync", 2, refs, dropdownCtx.closeAll)
 	addDropdownRow(
 		sync,
-		"Initial sync priority",
-		"Which side wins when live sync starts.",
+		"Initial sync",
+		"Reconcile both sides safely, or only verify that they match.",
 		1,
 		true,
 		"initialSyncPriority",
 		{
+			{ value = "reconcile", label = "Reconcile" },
+			{ value = "verify", label = "Verify only" },
+		}
+	)
+	addDropdownRow(
+		sync,
+		"Conflict preference",
+		"Preferred side for ordinary conflicts that are safe to resolve automatically.",
+		2,
+		false,
+		"initialConflictPreference",
+		{
+			{ value = "none", label = "Ask" },
 			{ value = "studio", label = "Studio" },
 			{ value = "editor", label = "Editor" },
-			{ value = "none", label = "None" },
 		}
 	)
 	addToggleRow(
 		sync,
 		"Two-way sync",
 		"Import Studio changes back into the editor while live sync is active.",
-		2,
+		3,
 		"twoWaySync"
 	)
 	addToggleRow(
 		sync,
 		"Syncback properties",
 		"Include non-script property and attribute edits from Studio.",
-		3,
+		4,
 		"syncbackProperties"
 	)
 	addToggleRow(
 		sync,
 		"Only code mode",
 		"Track scripts and containers that contain scripts, skipping unrelated property-only changes.",
-		4,
+		5,
 		"onlyCodeMode"
 	)
 	addToggleRow(
 		sync,
 		"Live hydrate",
 		"Create a missing Studio instance when an editor push targets it.",
-		5,
+		6,
 		"liveHydrate"
 	)
 	addToggleRow(
 		sync,
 		"Keep unknowns",
 		"Do not delete Studio instances that are absent from the editor tree during a full reconcile.",
-		6,
+		7,
 		"keepUnknowns"
 	)
 	addToggleRow(
 		sync,
 		"Override packages",
 		"Allow editor pushes to change read-only linked package mirrors.",
-		7,
+		8,
 		"overridePackages"
 	)
 
@@ -2079,7 +2091,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 		}, {
 			changesThreshold = 0,
 			displayPrompts = "always",
-			initialSyncPriority = "studio",
+			initialSyncPriority = "reconcile",
 		}, helpers)
 		if result.required then
 			local panel = ensureReviewUi()

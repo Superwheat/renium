@@ -4,6 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value, json};
 
+use super::parameters::{
+    absolutize_files, assignment, assignments, merge_assignments, parse_value,
+};
 use super::{CloudIdentity, execute_one};
 use crate::automation::Failure;
 use crate::system::files::absolutize_for_daemon as absolute_path;
@@ -63,6 +66,7 @@ enum Target {
 
 #[derive(Clone, Copy)]
 enum BodyMode {
+    None,
     Json(Option<&'static str>),
     Multipart(Option<&'static str>),
     Raw(&'static str),
@@ -254,6 +258,12 @@ macro_rules! route {
     };
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], json $content_type:literal) => {
         route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Json(Some($content_type)))
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, no_body) => {
+        route!(@make $category, $action, $method, $path, [], [], None, None, BodyMode::None)
+    };
+    ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], no_body) => {
+        route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::None)
     };
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], raw $content_type:literal) => {
         route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Raw($content_type))
@@ -897,7 +907,8 @@ static ROUTES: &[Route] = &[
         "start",
         "POST",
         "/creator-configs-public-api/v1/experimentation/universes/{universe}/experiments/{experimentId}:start",
-        [path("EXPERIMENT", "experimentId")]
+        [path("EXPERIMENT", "experimentId")],
+        no_body
     ),
     route!(
         "experiment",
@@ -2230,15 +2241,8 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
             Value::String(filter),
         );
     }
-    parts.files.extend(assignments(&args.file)?);
-    for value in parts.files.values_mut() {
-        let path = value.as_str().context("--file values must be paths")?;
-        let path = absolute_path(Path::new(path));
-        if !path.is_file() {
-            bail!("File does not exist: {}", path.display());
-        }
-        *value = Value::String(path.display().to_string());
-    }
+    merge_assignments(&mut parts.files, &args.file)?;
+    absolutize_files(&mut parts.files)?;
     let raw_file = parts
         .raw_file
         .map(|value| checked_file(&value, "raw file"))
@@ -2248,6 +2252,17 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
         && parts.files.is_empty()
         && raw_file.is_none();
     let (body, json_parts, content_type) = match route.body_mode {
+        BodyMode::None => {
+            if parts.root_body.is_some()
+                || !parts.body.is_empty()
+                || !parts.form.is_empty()
+                || !parts.files.is_empty()
+                || raw_file.is_some()
+            {
+                bail!("This operation doesn't accept a body");
+            }
+            (None, Map::new(), None)
+        }
         BodyMode::Json(content_type) => {
             if !parts.body.is_empty() && (!parts.form.is_empty() || !parts.files.is_empty()) {
                 bail!("Use either --field or multipart --form/--file values, not both");
@@ -2430,30 +2445,6 @@ fn checked_file(value: &Value, label: &str) -> Result<String> {
         bail!("File does not exist: {}", path.display());
     }
     Ok(path.display().to_string())
-}
-
-fn assignments(values: &[String]) -> Result<Map<String, Value>> {
-    values
-        .iter()
-        .map(|value| {
-            let (name, value) = assignment(value)?;
-            Ok((name.to_string(), value))
-        })
-        .collect()
-}
-
-fn assignment(value: &str) -> Result<(&str, Value)> {
-    let (name, value) = value
-        .split_once('=')
-        .with_context(|| format!("Expected NAME=VALUE, got '{value}'"))?;
-    if name.is_empty() {
-        bail!("Assignment names cannot be empty");
-    }
-    Ok((name, parse_value(value)))
-}
-
-fn parse_value(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
 fn scalar_string(value: Value) -> Value {
@@ -2754,5 +2745,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request["body"], true);
+    }
+
+    #[test]
+    fn creator_operations_match_the_announced_open_cloud_contracts() {
+        let identity = CloudIdentity {
+            game_id: Some(123),
+            place_id: Some(456),
+        };
+
+        let mut metrics = args("metrics", &[]);
+        metrics.field = vec![
+            "metric=DailyActiveUsers".to_string(),
+            "granularity=OneDay".to_string(),
+            "startTime=2026-01-01T00:00:00Z".to_string(),
+            "endTime=2026-02-01T00:00:00Z".to_string(),
+        ];
+        let request = build_request("analytics", identity, metrics).unwrap();
+        assert_eq!(request["method"], "POST");
+        assert_eq!(
+            request["path"],
+            "/analytics-query-api/v1/universes/{universe}/metrics"
+        );
+        assert_eq!(request["body"]["metric"], "DailyActiveUsers");
+
+        let request = build_request("experiment", identity, args("start", &["exp-1"])).unwrap();
+        assert_eq!(request["method"], "POST");
+        assert_eq!(request["body"], Value::Null);
+
+        let mut events = args("list", &[]);
+        events.limit = Some(10);
+        events.cursor = Some("next".to_string());
+        events.query = vec!["fields=id,title,startTime,visibility".to_string()];
+        let request = build_request("event", identity, events).unwrap();
+        assert_eq!(
+            request["query"],
+            json!({
+                "fields":"id,title,startTime,visibility",
+                "pageSize":10,
+                "pageToken":"next"
+            })
+        );
+
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut upload = args("upload", &[&file.display().to_string()]);
+        upload.file = vec![format!("files={}", file.display())];
+        let request = build_request("thumbnail", identity, upload).unwrap();
+        assert_eq!(
+            request["files"]["files"],
+            json!([file.display().to_string(), file.display().to_string()])
+        );
+
+        let mut status = args("upload-status", &[]);
+        status.query = vec![
+            "operationIds=first".to_string(),
+            "operationIds=second".to_string(),
+        ];
+        let request = build_request("thumbnail", identity, status).unwrap();
+        assert_eq!(request["query"]["operationIds"], json!(["first", "second"]));
     }
 }

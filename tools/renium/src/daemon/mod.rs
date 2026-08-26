@@ -157,7 +157,7 @@ fn check_for_available_update(state: Arc<automation::State>) {
     thread::spawn(move || match update::available_release_version() {
         Ok(version) => {
             if let Some(version) = version.as_deref() {
-                eprintln!("[renium] update available: {version}; run `rbx update` to install it");
+                eprintln!("[renium] update available: {version}; run `rbx upd`");
             }
             state.set_available_update(version);
         }

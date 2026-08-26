@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use crate::app::build::{
     GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
 };
+use crate::app::output::print_json_output;
 use crate::app::timing::{
     elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
@@ -609,6 +610,10 @@ impl ExportProjectStage {
         Ok(())
     }
 
+    pub(crate) fn publish_paths(&self) -> &[PathBuf] {
+        &self.publish_paths
+    }
+
     pub(crate) fn preview_operations(&self, project_root: &Path) -> Result<Vec<Value>> {
         let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
         let current = collect_publish_hashes(project_root, &self.publish_paths)?;
@@ -1137,8 +1142,7 @@ pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
     if let Some(result) =
         try_daemon_control_request(operation, Some(&args.project_root), parameters, false)?
     {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
 
     let prelude = export_snapshots_prelude(&args)?;

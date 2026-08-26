@@ -798,7 +798,7 @@ pub(crate) fn check_agent_update() {
 
 pub(crate) fn report_update_notice(version: &str) {
     if !UPDATE_NOTICE_PRINTED.swap(true, Ordering::Relaxed) {
-        eprintln!("[renium] update available: {version}; run `rbx update`");
+        eprintln!("[renium] update available: {version}; run `rbx upd`");
     }
 }
 
@@ -2708,7 +2708,7 @@ fn cli_is_extension_owned(path: &Path) -> bool {
     })
 }
 
-fn user_data_dir() -> Result<PathBuf> {
+pub(crate) fn user_data_dir() -> Result<PathBuf> {
     if cfg!(windows) {
         return Ok(
             PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)

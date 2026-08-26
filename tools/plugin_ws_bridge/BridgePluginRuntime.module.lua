@@ -56,7 +56,6 @@ function BridgePluginRuntime.start(context)
 	local HttpService = game:GetService("HttpService")
 	local RunService = game:GetService("RunService")
 	local ScriptEditorService = game:GetService("ScriptEditorService")
-	local ChangeHistoryService = game:GetService("ChangeHistoryService")
 	local Selection = game:GetService("Selection")
 
 	if not plugin then
@@ -165,9 +164,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.2.9"
+	local BRIDGE_VERSION = "0.3.0"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1783875358
+	local BRIDGE_BUILD_UNIX = 1787645055
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -580,11 +579,6 @@ function BridgePluginRuntime.start(context)
 		lastAtUnix = 0,
 		lastOk = true,
 	}
-	local historyVersion = 0
-	lifetimeConnections[#lifetimeConnections + 1] = ChangeHistoryService.OnRecordingFinished:Connect(function()
-		historyVersion += 1
-	end)
-
 	local getClassPropertySchema
 	local encodeSchemaComparableValue
 	local propertyKey
@@ -611,6 +605,9 @@ function BridgePluginRuntime.start(context)
 	end
 
 	local function includeExportInstance(serviceName: string, instance: Instance): boolean
+		if instance:IsA("TouchTransmitter") then
+			return false
+		end
 		if serviceName == "ServerStorage" then
 			return not sessionLock.isLockInstance(instance)
 		end
@@ -642,43 +639,6 @@ function BridgePluginRuntime.start(context)
 		editorSyncStats.lastAtUnix = os.time()
 		editorSyncStats.lastOk = true
 		Config.updateStatusText()
-	end
-
-	function Config.showUndoNotification()
-		local runtimeSettings = Config.getBridgeSettings()
-		if runtimeSettings.notifications == false then
-			return
-		end
-		local notificationHistoryVersion = historyVersion
-		local canUndo, undoName = ChangeHistoryService:GetCanUndo()
-		ui.notify(
-			"undo",
-			"Editor changes were applied",
-			"Studio recorded the sync as one undo step.",
-			"Undo",
-			function()
-				local stillCanUndo, currentUndoName = ChangeHistoryService:GetCanUndo()
-				if
-					canUndo
-					and stillCanUndo
-					and historyVersion == notificationHistoryVersion
-					and currentUndoName == undoName
-					and string.find(tostring(currentUndoName), "Renium", 1, true) ~= nil
-				then
-					ChangeHistoryService:Undo()
-				else
-					ui.notify(
-						"undo-unavailable",
-						"Undo is no longer available",
-						"Studio has newer edits. Use the History panel to choose what to undo.",
-						nil,
-						nil,
-						false
-					)
-				end
-			end,
-			false
-		)
 	end
 
 	editorSync = EditorSyncModule.create({
@@ -3438,26 +3398,26 @@ function BridgePluginRuntime.start(context)
 		local descendants = snapshotInstances or service:GetDescendants()
 		if not snapshotInstances then
 			local excludedRoots = excludedExportRoots(serviceName, service)
-			if #excludedRoots > 0 then
-				local descendantCount = #descendants
-				local includedCount = 0
-				for index = 1, descendantCount do
-					local instance = descendants[index]
-					local included = true
+			local descendantCount = #descendants
+			local includedCount = 0
+			for index = 1, descendantCount do
+				local instance = descendants[index]
+				local included = includeExportInstance(serviceName, instance)
+				if included then
 					for _, root in ipairs(excludedRoots) do
 						if instance == root or instance:IsDescendantOf(root) then
 							included = false
 							break
 						end
 					end
-					if included then
-						includedCount += 1
-						descendants[includedCount] = instance
-					end
 				end
-				for index = includedCount + 1, descendantCount do
-					descendants[index] = nil
+				if included then
+					includedCount += 1
+					descendants[includedCount] = instance
 				end
+			end
+			for index = includedCount + 1, descendantCount do
+				descendants[index] = nil
 			end
 		end
 		local expectedCount = if snapshotInstances then #snapshotInstances else #descendants + 1
@@ -4745,9 +4705,6 @@ function BridgePluginRuntime.start(context)
 			error(result, 0)
 		end
 		transactionExpectations[transactionId] = nil
-		if result.undoRecorded == true then
-			Config.showUndoNotification()
-		end
 		return result
 	end
 	Config.bridgeMethodHandlers.rollbackEditorTransaction = function(p)
@@ -4779,9 +4736,6 @@ function BridgePluginRuntime.start(context)
 		if not ok then
 			error(result, 0)
 		end
-		if result.ok == true and result.undoRecorded == true and tostring(p.transactionId or "") == "" then
-			Config.showUndoNotification()
-		end
 		return result
 	end
 
@@ -4790,7 +4744,10 @@ function BridgePluginRuntime.start(context)
 		if tostring(p.runtimeId or "") == Config.bridgeRuntimeId then
 			Config.ackPendingBridgeSettingChanges(p.ackRuntimeSettingsSeq)
 		end
-		local runtimeSettingChanges, runtimeSettingsSeq = Config.getPendingBridgeSettingChanges()
+		local runtimeSettingChanges, runtimeSettingsSeq, runtimeSettingChangeCount =
+			Config.getPendingBridgeSettingChanges()
+		local editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
+		local compact = p.compact == true
 		if runtimeSettings.twoWaySync == false then
 			return {
 				ok = true,
@@ -4800,18 +4757,24 @@ function BridgePluginRuntime.start(context)
 				fullSyncServices = {},
 				propertyChanges = {},
 				changes = {},
+				propertyChangeCount = 0,
+				changeCount = 0,
 				twoWaySyncEnabled = false,
 				runtimeSettingChanges = runtimeSettingChanges,
+				runtimeSettingChangeCount = runtimeSettingChangeCount,
 				runtimeSettingsSeq = runtimeSettingsSeq,
 				runtimeId = Config.bridgeRuntimeId,
-				editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId),
+				editorActions = if compact then {} else editorActions,
+				editorActionCount = #editorActions,
 			}
 		end
 		local changeState = Config.studioChanges.getState(p)
 		changeState.twoWaySyncEnabled = true
 		changeState.runtimeSettingChanges = runtimeSettingChanges
+		changeState.runtimeSettingChangeCount = runtimeSettingChangeCount
 		changeState.runtimeSettingsSeq = runtimeSettingsSeq
-		changeState.editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
+		changeState.editorActions = if compact then {} else editorActions
+		changeState.editorActionCount = #editorActions
 		return changeState
 	end
 

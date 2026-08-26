@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::{console_entry_level, wait_for_player_bridge};
-use crate::app::output::ensure_plugin_api_ok;
+use crate::app::output::{ensure_plugin_api_ok, print_json_output};
 use crate::automation::op;
 use crate::cli::PluginConsoleOutputArgs;
 use crate::daemon::try_daemon_control_request;
@@ -24,8 +24,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         console_daemon_parameters(&args, args.since_seq, args.clear, args.from_oldest),
         false,
     )? {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+        return print_json_output(&result, false);
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
@@ -34,8 +33,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         return follow_console_with_bridge(&args, &bridge);
     }
     let result = get_console_output_result(&args, &bridge)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 fn console_daemon_parameters(

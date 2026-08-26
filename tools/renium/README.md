@@ -1,27 +1,21 @@
 # Renium
 
-Renium is a two-way sync tool for Roblox Studio. It mirrors a place into a plain
-file tree — scripts as `.luau` files, everything else in one compact binary
-store per service — and keeps Studio and your editor in sync in both
-directions, with high property fidelity subject to the documented limitations
-below.
+Renium syncs Roblox Studio with a file tree in both directions. Scripts use
+`.luau`; other instances and properties use one compact store per service.
 
-Licensed under [AGPL-3.0 with the Commons Clause](../../LICENSE): free for
-everyone, including commercial game development — the license covers the tool
-itself, not what you make with it. Forks are welcome and must stay open
-source; selling the software (or paid hosting/support built on it) is not
-permitted.
+Licensed under [AGPL-3.0 with the Commons Clause](../../LICENSE). Commercial
+game development is allowed; selling Renium or paid hosting/support is not.
+Forks must remain open source.
 
 It has three parts:
 
-- **`renium.exe`** — the CLI that does all the work (this document).
-- **VS Code/Cursor extension** — panels, live sync, git tab, `.renium` viewer.
+- **`renium.exe`** — CLI and daemon.
+- **VS Code/Cursor extension** — sync controls, Git, and `.renium` viewer.
   See `tools/renium-vscode-extension/readme.md`.
-- **Studio plugin** — the in-Studio bridge the CLI talks to over WebSocket.
+- **Studio plugin** — Studio bridge.
   See `tools/plugin_ws_bridge/README.md`.
 
-AI agents: read `AGENTS.md` at the repository root instead — it is the compact
-command guide written for that use.
+Agents should read the repository's `AGENTS.md` instead.
 
 ## How a synced project looks
 
@@ -36,53 +30,41 @@ sourcemap.json
 renium.project.jsonc
 ```
 
-Script sources live as normal `.luau` files you edit directly. The `.renium`
-store holds the instance tree and every other property. Together they contain
-the saved project state. Studio is updated from them, and Studio edits are
-written back.
+Edit `.luau` files directly. `.renium` stores hold the remaining project state.
 
 ## Installation
 
-Put these two files anywhere together, or put the CLI on `PATH`:
+Keep the launcher and CLI together, or put the CLI on `PATH`:
 
 ```text
 rbx.cmd   renium.exe        (Windows; or bin\renium.exe)
 rbx       renium            (macOS and Linux; chmod +x both)
 ```
 
-`rbx` is the launcher used in every example below. It finds the CLI in
-this order: `RENIUM_CLI` env var → next to the launcher → `bin\` next to the
-launcher → the installed Renium directory → `PATH`. macOS support is implemented but
-not yet live-verified. Input and capture use Quartz and need Accessibility and
-Screen Recording permissions.
+Examples use `rbx`. It checks `RENIUM_CLI`, its own directory, `bin/`, the
+installed Renium directory, then `PATH`. macOS input and capture need
+Accessibility and Screen Recording permissions and aren't yet live-verified.
 
 ## Quick start
 
-1. Install the Studio plugin and open your place. The plugin connects to a
-   local bridge daemon on ports 8781–8782.
+1. Install the Studio plugin and open your place.
 
    ```powershell
    rbx setup-renium
    ```
 
-   `setup-renium` installs `Renium.rbxm` into your Roblox Plugins folder — from
-   a copy next to the exe if present, otherwise downloading the latest GitHub
-   release (`--file <path>` and `--dir <plugins dir>` override both). On macOS,
-   it also prepares `~/Applications/Renium Studio.app`. Open that app instead
-   of the original Studio app so Renium can serialize protected properties
-   directly to a local file without showing a file picker. The original Studio
-   app is not changed. The VS Code extension provides the same setup through
-   **Renium: Install Studio Plugin** in the command palette and status-bar menu.
+   This uses a nearby plugin or downloads the latest release. Override it with
+   `--file` or `--dir`. On macOS, use the generated
+   `~/Applications/Renium Studio.app` for protected-property support. The
+   extension also provides **Renium: Install Studio Plugin**.
 2. Pull the place into files:
 
    ```powershell
    rbx pull
    ```
 
-   Renium starts or reuses the shared daemon, writes its internal snapshots
-   under `.renium`, and imports the place into `src/`. From the extension, use
-   **Renium: Pull Studio to Files**. Use **Renium: Push Files to Studio** for
-   the opposite direction.
+   This writes snapshots under `.renium` and imports the place into `src/`.
+   The extension has matching Pull and Push commands.
 
 3. Check the connection any time:
 
@@ -90,18 +72,15 @@ Screen Recording permissions.
    rbx studio-status
    ```
 
-The daemon is found automatically by later commands (env vars
+Commands find the daemon through env vars
 `RENIUM_DAEMON`, `RENIUM_DAEMON_HOST`/`RENIUM_DAEMON_CONTROL_PORT`,
 `RENIUM_DAEMON_FILE`, then `%LOCALAPPDATA%\Renium\daemon.json`, then the
-default local endpoint).
+default local endpoint.
 
-`rbx bridge-daemon` is an optional standalone long-running process. Direct commands start
-or reuse the shared daemon automatically. `--editor-stdio` is reserved for the
-VS Code extension's owned child process: it reads daemon requests from stdin
-and exits when its owner closes stdin.
+`rbx bridge-daemon` runs a standalone daemon. Other commands start or reuse one.
+`--editor-stdio` is reserved for the extension and exits when its stdin closes.
 
-Agent instructions use compact command names. The descriptive aliases below are
-equivalent and are intended for people reading this reference:
+Agents use short names; descriptive aliases call the same commands:
 
 | Short | Descriptive alias |
 |---|---|
@@ -114,15 +93,13 @@ equivalent and are intended for people reading this reference:
 | `dev` / `cs` | `device` / `clients` |
 | `oc` | `cloud` |
 
-Running `rbx` without a command lists only the compact names. Both forms call
-the same implementation; there is no separate automation command layer.
+`rbx` lists short names. There is no separate automation layer.
 
 ## Projects, adapters, and builds
 
-Each place root has a small `renium.project.jsonc` marker. The default file only
-contains `schemaVersion`; add fields when the place needs a different source
-directory, projected tree, mounts, adapters, filters, or script naming. It does
-not replace the full-fidelity `.renium` stores.
+Each place has `renium.project.jsonc`. Add fields only for custom source roots,
+trees, mounts, adapters, filters, or script naming. Project data remains in
+`.renium` stores.
 
 ```jsonc
 {
@@ -131,10 +108,9 @@ not replace the full-fidelity `.renium` stores.
 }
 ```
 
-Service folders directly under `sourceRoot` are mapped automatically. Use `tree`
-only for sources that need a different target. The extension Pull and Push
-commands honor `sourceRoot`; it does not have to be `src`.
-Renium discovers the nearest project file, or you can pin one globally:
+Service folders under `sourceRoot` map automatically. Use `tree` for exceptions.
+The extension honors `sourceRoot`. Renium finds the nearest project or accepts
+`--project`:
 
 ```powershell
 rbx --project .\renium.project.jsonc build -o .\build\place.rbxl
@@ -150,21 +126,14 @@ rbx init .\my-place --with git,wally,selene,docs
 rbx init .\empty-project --preview
 ```
 
-Without `--with`, initialization creates a minimal `renium.project.jsonc`, an
-empty `src` directory, a compact `RENIUM.md` topic router with its `RENIUM/`
-guides, and one marked instruction in `AGENTS.md` and `CLAUDE.md`. Existing
-guidance in those two files is preserved, and repeated initialization doesn't
-duplicate or rewrite unchanged instructions. Preview lists each file action
-and directory without writing anything. A required path with the wrong file
-type stops the whole initialization before any project file is changed.
+Without `--with`, initialization creates the project marker, `src`, Renium
+guides, and marked pointers in `AGENTS.md` and `CLAUDE.md`. Existing guidance is
+preserved. Preview writes nothing. Invalid required paths stop initialization.
 
-Adapters explicitly map non-Luau files into Roblox instances. TXT maps to
-`StringValue`, CSV maps to `LocalizationTable`, model JSON maps to an instance
-subtree, and JSON/JSONC/TOML/YAML/MessagePack/Markdown generate deterministic
-ModuleScripts. Markdown is converted to escaped Roblox RichText before it is
-returned. Roblox models and nested Renium or Rojo projects can be mounted.
-Generated or one-way formats must be marked as such in the project file. Mounts
-can be `exclusive`, `overlay`, or `read-only`, and can be `optional`.
+Adapters map non-Luau files to instances: TXT → `StringValue`, CSV →
+`LocalizationTable`, model JSON → subtree, and structured text/MessagePack/
+Markdown → deterministic ModuleScripts. Models and nested Renium/Rojo projects
+can be mounted as `exclusive`, `overlay`, `read-only`, or `optional`.
 
 ```jsonc
 {
@@ -179,10 +148,9 @@ can be `exclusive`, `overlay`, or `read-only`, and can be `optional`.
 }
 ```
 
-`exclusive` is the default ownership. An optional missing source projects
-nothing and doesn't block validation or builds. Project reads include mounted
-instances, writable mount scripts can be edited through `bss`, and
-`explain-path` follows descendants inside nested projects.
+`exclusive` is the default. Missing optional sources project nothing. Reads
+include mounts; `bss` edits writable mounted scripts; `explain-path` follows
+nested projects.
 
 ```powershell
 rbx project-validate
@@ -196,16 +164,12 @@ rbx import-rojo --project .\default.project.json --preview
 rbx import-rojo --project .\default.project.json --apply
 ```
 
-`project-validate` checks the complete project without Studio. It exits nonzero
-for invalid configuration, ownership, mounts, adapters, filters, or source
-paths.
+`project-validate` checks the project offline and exits nonzero on errors.
 
-Two-way TXT, CSV, and model-JSON adapters update their canonical instances
-during `adapters build` or `adapters watch`. Studio imports update their source
-files after pulling from Studio.
+Two-way TXT, CSV, and model-JSON adapters update instances during build/watch
+and source files after a pull.
 
-For a controlled Studio-to-files import, preview the included and ignored
-instances plus every planned file write, deletion, and adapter update first:
+Preview controlled Studio → files imports first:
 
 ```powershell
 rbx syncback --input .\snapshots --list
@@ -216,26 +180,19 @@ rbx import-path .\Shared.luau --path-json '["ReplicatedStorage","Shared"]'
 rbx import-path .\SharedFolder --destination src\ReplicatedStorage\Shared --dry-run
 ```
 
-`--path-json` maps one file to a Roblox path and preserves its script suffix, so
-`.server.luau` becomes a `Script` and `.client.luau` becomes a `LocalScript`.
-`--destination` copies a file or directory to a portable project-relative path.
-Each result labels every file `create`, `overwrite`, or `unchanged`. Preview
-first; omitting `--dry-run` applies the listed actions. Add `--push` only when
-the imported files should immediately update Studio; pushed destinations must
-belong to the active project.
+`--path-json` maps one file to a Roblox path and keeps script suffix semantics.
+`--destination` uses a project-relative path. Results show `create`,
+`overwrite`, or `unchanged`; omit `--dry-run` to apply. `--push` also updates
+Studio and requires destinations in the active project.
 
-Filters are ordered and last-match wins. They can match path glob, name, class,
-tag, attribute, or property and can apply to either sync direction. Ignored
-Studio instances and ignored script sources remain unchanged, including during
-a structural reconcile.
+Filters match glob, name, class, tag, attribute, property, or ID. Last match
+wins. Ignored instances and fields remain unchanged in either direction.
 
-`syncRules` map files not covered by normal script naming. Each rule has a
-`pattern`, `use`, and optional `suffix` and `exclude`. The last matching rule
-wins. `suffix` is removed from the instance name, `exclude` disqualifies that
-rule for matching paths, and `use: "ignore"` suppresses the file. Supported
-script middleware names are `moduleScript`, `serverScript`, `clientScript`, and
-`pluginScript`; adapter format names are also accepted. `globIgnorePaths`
-ignores matching project-relative paths before projection.
+`syncRules` map other files. Last match wins; `suffix` is removed from the
+instance name, `exclude` rejects a match, and `use: "ignore"` suppresses a file.
+Script uses are `moduleScript`, `serverScript`, `clientScript`, and
+`pluginScript`; adapter formats also work. `globIgnorePaths` blocks paths before
+projection.
 
 ```jsonc
 {
@@ -272,34 +229,30 @@ ignores matching project-relative paths before projection.
 }
 ```
 
-Filter actions are `include` or `ignore`; directions are `files-to-studio`,
-`studio-to-files`, or `both`. A filter can select by `glob`, `name`, `class`,
-`tag`, `attribute`, `property`, or `id`. Property and attribute selectors affect
-only the matching field. In `rbx explain-path PATH`, `owned` means a configured
-mapping claims the path, `ignored` means `globIgnorePaths` blocks it, and
-`selectedSyncRule` identifies the winning rule even when another setting
-suppresses its output. The command also reports excluded rules, matching filter
-selectors, instance decisions for both directions, and field decisions.
+Actions are `include` or `ignore`; directions are `files-to-studio`,
+`studio-to-files`, or `both`. Field selectors affect only that field.
+`explain-path` reports ownership, ignored paths, winning rules, filters, and
+both-direction decisions.
 
 ### Layered configuration
 
-Shared settings merge in this order: user, workspace, experience, place, then
-the project file's `settings` object. Explicit editor settings and CLI flags
-override the merged value.
+Settings merge in this order: user, workspace, experience, place, project.
+Editor settings and CLI flags override them.
 
-`get` and `list` read the merged configuration by default; only `list` accepts
-`--origins`. `set`, `unset`, `reset`, `edit`, and `path` accept a writable
-`--scope`. `export` always writes the merged configuration and has no scope.
+`list` shows every setting, its current value, and valid values. `get` reads one
+value; `list --origins` also shows its source. Writes use `--scope`. `export`
+writes the merged configuration.
 
 ```powershell
-rbx config list --origins
-rbx config get liveSync.changesThreshold
-rbx config set liveSync.changesThreshold 10 --scope place
-rbx config unset liveSync.changesThreshold --scope place
-rbx config reset --scope place
-rbx config path --scope workspace
-rbx config edit --scope user
-rbx config export -o effective-renium-config.json
+rbx cfg list
+rbx cfg get liveSync.changesThreshold
+rbx cfg set liveSync.changesThreshold 10
+rbx cfg unset liveSync.changesThreshold
+rbx cfg list --origins
+rbx cfg reset --scope place
+rbx cfg path --scope workspace
+rbx cfg edit --scope user
+rbx cfg export -o effective-renium-config.json
 ```
 
 ## Everyday commands
@@ -336,22 +289,17 @@ rbx screenshot --studio -o iphone-16-pro.png
 rbx device stop
 ```
 
-`device set` returns the resulting state. Use `device status` when reading the current state separately. Add `--details` to listing or status commands for native preset dimensions and density.
+`device set` returns the new state. Add `--details` for native dimensions and
+density.
 
-The command accepts catalog names or stable ids and requires no keyboard,
-mouse, focus, coordinates, or ribbon interaction. Notched devices reproduce
-Studio's actual safe-area behavior for `DeviceSafeInsets`,
-`ClipToDeviceSafeArea`, and `SafeAreaCompatibility`. While
-emulation is active, `rbx screenshot` automatically targets the simulated Studio
-viewport. Use `--studio` to force it or `--client` to force the latest Play
-client.
+Devices accept names or stable IDs. Notched presets reproduce Studio safe-area
+behavior. With emulation active, screenshots target the simulated viewport;
+`--studio` or `--client` overrides the target.
 
-In multiplayer tests every instance runs its own bridge; `--player <name|N>`
-on `lx`/`co` targets one client (`Player2` and `2` both work). Without a
-selector, client commands go to the most recently focused client.
+In multiplayer, `--player <name|N>` targets one client. Without it, client
+commands use the latest focused client.
 
-Simulate real input on a client (the window can stay in the background —
-no focus is taken):
+Send input without focusing the client:
 
 ```powershell
 rbx ui -p 2                                 # list visible buttons/textboxes with paths + ids
@@ -370,38 +318,23 @@ rbx goto "Workspace.Shop.Door" -p 2   # pathfind-walk there; --tp teleports; --p
 rbx press "Workspace.Button" --world  # click a part or model's on-screen position
 ```
 
-Multiple games open at once: every bridge reports its place (`rbx clients` shows
-`placeName`, `placeId`, and `gameId`), and when connected bridges span more than one place,
-commands refuse with the list instead of guessing. Pin commands to one game with
-the `RENIUM_PLACE` env var or the global `--place <name|id|gameId:placeId>`
-flag. The pair form is exact; names can be exact or substring matches. With a
-single game open no filter is needed.
+With several games open, ambiguous commands list candidates. Pin one with
+`RENIUM_PLACE` or `--place <name|id|gameId:placeId>`. Names allow substrings;
+the ID pair is exact.
 
-Multiple Studio windows can also have the same place open. `rbx clients` exposes
-their distinct `runtimeId` values. Renium chooses the most recently focused
-matching runtime once per command and pins every bridge channel to it, so a
-chunked or parallel operation cannot combine two windows.
+For duplicate Studio windows, `rbx clients` shows each `runtimeId`. Renium pins
+one runtime per command.
 
-For an optional allowlist, put `allowedPlaceIds` and/or `allowedGameIds` arrays
-in `renium.config.json` in the command's working directory. Set
-`RENIUM_CONFIG=<path>` to use an explicit file. The daemon reloads this file for
-new bridge handshakes and rejects malformed JSON instead of silently disabling
-the guard. `RENIUM_ALLOW_ANY_PLACE=1` is the explicit bypass.
+Optional allowlists use `allowedPlaceIds` or `allowedGameIds` in
+`renium.config.json`; select another file with `RENIUM_CONFIG`. Invalid JSON is
+rejected. `RENIUM_ALLOW_ANY_PLACE=1` bypasses the list.
 
-Duplicate GUI names resolve with `[n]` ordinals (`"Shop[2].BuyButton"`) or by
-element id (`press -i <id>`); ambiguous presses fail with a candidate list, and
-if exactly one match is visible it is picked automatically. `press` auto-scrolls
-ScrollingFrame containers to bring the target into view; elements scrolled out
-of view are excluded from `ui` until then. Legacy ClickDetectors
-don't respond to injected clicks (engine limitation: hover events react, but
-MouseClick validation follows the real hardware cursor) — ProximityPrompts
-(`goto` + `key E`) and UserInputService-driven interaction work. `press`/`click`
-take `--hold <ms>` (default 30) for the down→up gap. Short aliases:
-`pr`, `clk`, `ky`, `ty`, `sc`, `wait`, `go`. Windows uses targeted window
-messages, macOS uses Quartz events and needs Accessibility permission, and
-Linux uses the connected Play client's virtual-input API. Input commands show
-an orange Renium shield over the target viewport while they run. The shield is
-a transparent native overlay; it never adds Roblox UI or project instances.
+Resolve duplicate UI names with `[n]` or `-i <id>`. Ambiguity returns
+candidates; one visible match is selected. `press` scrolls targets into view.
+Injected clicks can't fire `ClickDetector`; use ProximityPrompts or game input.
+`press`/`click --hold <ms>` controls the down/up delay. Windows and macOS target
+the selected window; Linux uses the Play client's virtual-input API. The orange
+shield blocks interfering physical input.
 
 Read Studio console output:
 
@@ -420,16 +353,12 @@ rbx push -r . -d src -p src\Workspace\__roblox_sync_settings.renium --upsert
 rbx push -r . -d src -p src\ServerScriptService\Main.server.luau --verify
 ```
 
-If Studio rejects a read-only property, Renium shows the rejected items before
-using its offline fallback. **Apply anyway** serializes the complete live place,
-patches only those rejected values, closes that exact Studio process, and
-reopens the same local file. The original file and Studio process are left
-untouched if serialization or validation fails. This path does not send
-keyboard or mouse input.
+For rejected read-only properties, **Apply anyway** serializes the place,
+patches only rejected values, then reopens the same Studio target. Failure
+leaves the original file and process untouched.
 
-The protected-property prompt applies automatically after its countdown unless
-**Not now** is chosen. Automation can resolve the active prompt through the
-daemon without interacting with Studio:
+The protected-property prompt applies after its countdown unless skipped.
+Automation may resolve it directly:
 
 ```powershell
 rbx review apply
@@ -488,25 +417,15 @@ rbx doctor --json
 rbx doctor --bundle .\.renium\diagnostics\release-check
 ```
 
-`doctor` checks the project, merged configuration, optional tools, Studio
-plugin, and daemon discoveries. `--root` selects its working directory; a
-global `--project` pins the project check. Warnings and missing optional tools
-keep exit code 0, while errors return 1. `--json` returns the check list and
-build identity. `--bundle` writes `doctor.json`, `environment.json`, and an
-exact copy of the selected project file when one loaded successfully. Repeating
-the same bundle replaces only those diagnostic files.
+`doctor` checks the project, configuration, optional tools, plugin, and daemon.
+Warnings exit 0; errors exit 1. `--json` returns checks and build identity.
+`--bundle` writes diagnostics and the loaded project file.
 
-The editor extension checks for a signed GitHub release when it opens. The Rust
-updater shares that verified result with the daemon for five minutes. After the
-cache expires, it sends the saved ETag so GitHub returns no manifest body when
-the release is unchanged. The update prompt installs the matching extension and
-Studio plugin together. The Studio plugin shows the same update in its
-notification card and sends the install request to the connected editor. Reload
-the editor after installation. When the Studio plugin changes, Renium asks how
-to handle connected local place files: leave them open, save and close them, or
-terminate them without saving. The choice can be remembered. Closed local files
-and published places reopen at the same target after the update; Renium never
-opens Studio's save dialog.
+The extension checks signed releases on startup and caches results for five
+minutes. Updating installs matching extension and plugin versions. If the
+plugin changes, choose whether local places stay open, save and close, or close
+without saving; this choice can be remembered. Closed targets reopen after the
+update without Studio's save dialog.
 
 Named daemons are selected with the global `--daemon` flag:
 
@@ -518,30 +437,29 @@ rbx daemon stop playtest
 rbx daemon clean
 ```
 
-Resolve or launch the exact Studio file without choosing an ambiguous project:
+Open an exact Studio target:
 
 ```powershell
 rbx studio .\place.rbxl --check
 rbx --project .\renium.project.jsonc studio
 ```
 
-Publish a place through Open Cloud. Renium validates the universe and place
-against `renium.experience.json` when that file exists:
+Publish through Open Cloud. `renium.experience.json` validates the IDs when
+present:
 
 ```powershell
 $env:ROBLOX_API_KEY = "..."
 rbx --project .\renium.project.jsonc upload-place --universe-id 123 --place-id 456
 ```
 
-OAuth access tokens can be read from a named environment variable instead:
+OAuth tokens may come from a named environment variable:
 
 ```powershell
 rbx upload-place --oauth-env ROBLOX_OAUTH_TOKEN
 ```
 
-Open Cloud commands run in the current `rbx` process. They don't start a daemon
-or wait for Studio. `{universe}` and
-`{place}` come from the current Renium project when available:
+Open Cloud runs without Studio or a daemon. The project supplies universe and
+place IDs when available:
 
 ```powershell
 rbx cloud key
@@ -551,31 +469,22 @@ rbx cloud universe message updates refresh
 rbx cloud user inventory 42 --limit 25
 rbx cloud product create "Refresh Daily Rewards" --price 27 --for-sale --regional-pricing
 rbx cloud place publish place.rbxl
+rbx cloud analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z
+rbx cloud event list --limit 10
+rbx cloud experiment list --limit 25
+rbx cloud thumbnail upload first.png --file files=second.png
 ```
 
-Set `ROBLOX_API_KEY` in the environment. On Windows, Renium also checks the
-current user's saved environment when the parent application has stale values.
-Use `--oauth-env ENV` to send a bearer token stored in another environment
-variable. Credentials aren't accepted in payloads or command arguments.
-`rbx cloud key` reports the active API key's scopes and allowed resource targets
-without printing the credential. User-owned keys, keys stored for dedicated
-group automation accounts, and resource-restricted keys use the same commands;
-Roblox enforces their owner permissions, scopes, and target restrictions. Use
-`--key-env ENV` to select another stored API key. Public reads can use
-`--anonymous`; Renium doesn't fall back to anonymous access after an authenticated
-request is denied.
-Native resource commands cover data and memory stores, universes and places,
-messages and servers, restrictions, secrets, notifications, users and
-inventories, groups, social interactions, Team Create, assets, passes, Creator
-Store, localization, configs, Luau tasks, analytics, advertising, experiments,
-events, matchmaking, avatar and asset thumbnails, speech generation, and
-thumbnail personalization. `rbx cloud routes [CATEGORY]` lists their short
-operations. The generic request and batch commands remain available for Roblox
-endpoints introduced after the installed Renium version.
+Set `ROBLOX_API_KEY`, or use `--oauth-env`/`--key-env`. Credentials aren't
+accepted in arguments or payloads. `cloud key` reports scopes and targets
+without the secret. `--anonymous` is explicit and never used as a fallback.
+Native commands cover Roblox data, memory, universes, places, users, groups,
+assets, commerce, localization, servers, analytics, events, AI, and related
+APIs. `cloud routes [CATEGORY]` lists operations; generic requests cover new
+endpoints.
 
-Renium also covers the plugin-accessible Creator features used by
-Roblox's Studio MCP: Creator Store and user-inventory search, asset insertion,
-AI model generation jobs, local image validation, and Open Cloud image upload.
+Creator features include search, asset insertion, model generation, image
+validation, and Open Cloud image upload.
 
 Common reads and Studio creator jobs have direct commands:
 
@@ -588,39 +497,23 @@ rbx image-store assets/reference.png
 rbx image-upload assets/reference.png --user USER_ID --name Reference --open-cloud
 ```
 
-Asset insertion returns the inserted path, name, class, and asset ID. Insertion
-and generation change the live Edit runtime; pull or save to persist them.
-Generation returns a `jobId`; `job-status` can wait up to 120 seconds and returns
-`running`, `succeeded`, or `failed`. An expired wait returns `running` with exit 0.
-`image-store` only validates a local PNG, JPEG, BMP, or TGA up to 5 MiB; it does
-not upload anything. Use normal web tooling for Roblox documentation instead of
-routing documentation requests through Renium.
+Insertion and generation edit the live runtime; pull or save to persist them.
+Generation returns a job ID and status. `image-store` validates PNG, JPEG, BMP,
+or TGA files up to 5 MiB without uploading. Use normal web tools for Roblox
+documentation.
 
-Image upload requires an explicit user or group owner and creates assets in that
-Roblox account. Run it only as an explicit write. For unpublished projects, pass
-`--universe`, `--place-id`, or custom `--param name=value` values as needed.
+Image upload requires an explicit user or group owner. Unpublished projects may
+need `--universe`, `--place-id`, or `--param`.
 
-`generate-model` uses the public `GenerationService:GenerateModelAsync` plugin
-API. Material generation and Roblox's internal primitive `ProceduralModel`
-generator require `RobloxScriptSecurity`, so third-party plugins cannot expose
-them reliably. Group and universe Creator Inventory searches are also absent
-from public plugin and Open Cloud APIs; Renium reports them as unsupported.
-HTTP image uploads use the locally installed plugin's prompt-free
-`AssetService:CreateAssetAsync` API. Local files and explicit user/group
-ownership use Open Cloud instead.
+Material generation, internal procedural models, and group/universe Creator
+Inventory search aren't available to third-party plugins or Open Cloud and are
+reported as unsupported.
 
-Ordered mouse and keyboard sequences use the direct `input` command, for example
-`rbx input --player 1 click "Shop.BuyButton" wait 100 key E`. Actions and their
-targets are read from left to right; no payload file is needed.
-Windows posts events to the exact target window handle and macOS posts Quartz
-events to the exact target process. Neither implementation moves the system
-cursor, sends global input, or activates another application. Linux sends the
-same ordered actions inside the selected Play client without desktop focus.
-The native shield follows the target app window while leaving its background
-transparent.
+`input` reads action/value pairs left to right, for example
+`rbx input --player 1 click "Shop.BuyButton" wait 100 key E`. Input targets one
+window without moving the cursor or taking focus. The shield follows it.
 
-Agents can record the edit viewport or one play client without activating its
-window or capturing the rest of the desktop:
+Record one Studio or client viewport:
 
 ```powershell
 rbx record-start -p 2 -o test.mp4
@@ -628,19 +521,15 @@ rbx key W --hold-ms 700 -p 2
 rbx record-end
 ```
 
-`record-start` accepts `--player`, `--studio`, `--client`, an `--output` path ending in
-`.mp4`, `--fps` from 1 through 30, `--max-seconds` from 1 through 300, and `--quality`
-from 0 through 100. `record-end` stops the sole active recording; pass its optional
-recording ID to verify which recording is being stopped. The result
-is an H.264 MP4 with no audio and can be attached directly as a clip.
+`record-start` accepts a target, `.mp4` path, 1–30 FPS, 1–300 seconds, and
+quality 0–100. `record-end` stops the active recording; an optional ID verifies
+it. Output is silent H.264 MP4.
 
-`rbx docs [topic]` prints the bundled reference. `rbx docs --serve` exposes the
-same text on a read-only loopback page.
+`rbx docs [topic]` prints bundled docs; `--serve` opens a read-only local page.
 
 ## Exploring and editing the store
 
-Three high-level read commands work directly on `src/<Service>/…renium` files —
-no Studio connection needed:
+Read stores without Studio:
 
 ```powershell
 rbx find Workspace VipMan              # locate instances by name
@@ -649,11 +538,9 @@ rbx tree Workspace VipMan --depth 2 --limit 100    # browse children
 rbx inspect Workspace VipMan           # one instance in detail
 ```
 
-Output is compact JSON built for scripting and agents. When a bare name is
-ambiguous, the command returns the candidates (with `id`, `path`, `ords`)
-instead of guessing; retry with `--id`, a fuller `--path`, or `--ords`.
+Ambiguity returns candidates with IDs, paths, and ordinals; refine the selector.
 
-Edit the store directly with the `b*` (bytecode) commands, then `rbx push`:
+Edit stores, then push:
 
 ```powershell
 rbx set-property Workspace -i editor:id -p DisplayName --str "VIP Man"
@@ -664,31 +551,26 @@ rbx bytecode-remove-instance Workspace -i editor:id
 rbx get-property Workspace -i editor:script-id -p Source
 ```
 
-Selector rules that prevent surprises:
+Selector rules:
 
 - Select with `-i` (settings id), `-x` (index), `-n` (name), `-c` (class), or
   `--path` + optional `--ords`. Use exactly one selector and don't combine
   `--path` with another selector.
 - A bare service name resolves `src\<Service>\__roblox_sync_settings.renium`;
   pass an explicit file with `-f` instead — never both.
-- Duplicate names or paths are rejected rather than silently picking the first
-  match; disambiguate with `--ords`, `--id`, or `--index`.
+- Duplicate names or paths return candidates; use `--ords`, `--id`, or `--index`.
 - `--scope auto|metadata|property|attribute` controls what a property write
   targets. `auto` rejects names missing from the selected class. Use `property`
   only for a real newer or hidden Roblox property absent from the bundled
   schema, and `attribute` to create an attribute, for example
   `rbx bs Workspace -i editor:id -p Reviewed --scope attribute --bool true`.
 
-Set an instance reference with
-`-j '{"_type":"Ref","settingsId":"editor:target"}'`; `--null` clears it.
-Mutation results include only actual file changes in `changedPaths`, so an
-empty list is a successful no-op and needs no push.
+Set references with `-j '{"_type":"Ref","settingsId":"editor:target"}'`;
+clear with `--null`. Empty `changedPaths` means no push is needed.
 
-Batched low-level reads go through `rbx bb` (one call, many queries). The op
-types are `counts`, `service`, `search`, `children`, `instance`, and `find`;
-see `RENIUM/data.md` for recipes and field presets.
+`rbx bb` batches low-level reads. See `RENIUM/data.md` for operations and fields.
 
-Search and read saved scripts directly without a daemon or Studio:
+Search saved scripts without Studio:
 
 ```powershell
 rbx script-search DataStoreService UpdateAsync --limit 20
@@ -696,18 +578,12 @@ rbx script-grep RemoteEvent --limit 100
 rbx script-read src/ServerScriptService/Main.server.luau --start-line 40 --end-line 80
 ```
 
-`script-search` finds files containing every keyword without case sensitivity
-and reports `returnedFiles`, `totalFiles`, and truncation. `script-grep` matches
-literal source text, is case-sensitive unless `--case-insensitive` is used,
-and reports returned and total line counts. Limits cap returned results while
-totals still cover the full project. Script reads use inclusive one-based line
-numbers and reject invalid ranges.
+`script-search` matches all keywords case-insensitively. `script-grep` matches
+literal lines and is case-sensitive by default. Limits cap results, not totals.
+Line ranges are inclusive and one-based.
 
-RBXM stores properties in class-wide columns, so reading it can materialize a
-Roblox class default for an instance that did not store that property. Requested
-`bb` properties also return class defaults. Inspect the source `.renium` store
-with `rbx view <store>.renium --json` before treating a decoded default as an
-explicit override.
+RBXM and requested `bb` properties may materialize class defaults. Check the
+source `.renium` store before treating one as an override.
 
 Export/import whole models and places:
 
@@ -720,19 +596,13 @@ rbx sourcemap --stdout                          # print the complete sourcemap
 rbx bytecode-repack                             # repack outdated stores and packages
 ```
 
-`sm` without `--stdout` writes `sourcemap.json`. Repacking leaves files that
-already use the current format untouched and reports its changed paths. `view`
-accepts stores and model files, not places; use `bep`'s manifest plus
-`sm --stdout` to verify project contents before comparing place-file hashes.
+`sm` writes `sourcemap.json` unless `--stdout` is used. Repacking changes only
+old stores. `view` accepts stores and models, not places.
 
 ## Links (shared code across places)
 
-A renium-link mirrors one source into one or more targets. Sources can be a
-local file/folder, a git repo (branch/tag/commit + subpath, private repos use
-your git credentials), or an installed Wally package. Mirrors are read-only by
-default: editing a mirror reverts on the next apply, editing the source fans
-out to every mirror. `--writable` links instead keep local edits and report
-them as `preservedEdits`.
+A renium-link mirrors a local, Git, or Wally source to several targets. Links
+are read-only by default; `--writable` preserves local edits.
 
 ```powershell
 # Control links/Logger.luau from two places in the tree.
@@ -752,31 +622,21 @@ rbx lkb --service ServerScriptService --path '["ServerScriptService","Logger"]'
 rbx lkb --link logger
 ```
 
-The manifest is `renium-link.json` at the project root. Git/Wally clones are
-cached in `.renium/link-cache` (auto-ignored); the lockfile
-`.renium/link.lock.json` commits so pinned sources reproduce. Override the
-cache location with `--cache-dir`, the manifest `cacheDir` field, or the
-`renium.link.cacheDir` VS Code setting.
+Links use `renium-link.json`, `.renium/link-cache`, and the committed
+`.renium/link.lock.json`. Override the cache with `--cache-dir`, `cacheDir`, or
+the editor setting.
 
-Treat third-party `.renium` packages like source-code dependencies, not inert
-data: they can contain scripts that run, arbitrary properties, and
-`PackageLink` instances. `rbx lkp` packs an existing subtree into a reusable
-package. `rbx link-delete-package --action delete-unused` removes an unused
-package, `delete-uses` also removes its active trees, and `unlink-uses` keeps
-those trees as ordinary editable instances. Bare `rbx bpack` repacks service
-stores and local project packages; pass explicit paths to limit it.
+Third-party `.renium` packages may contain scripts, properties, and
+`PackageLink`s. `lkp` packs a subtree. Package deletion can reject active uses,
+delete them, or keep editable copies. `bpack` repacks stores and local packages.
 
-Linked model instances may be renamed, moved, and rotated independently. An
-updated source keeps that local root name and world transform while refreshing
-the model's contents.
+Linked models keep local names and transforms when refreshed.
 
-In VS Code/Cursor, linked files show an `L` badge and open read-only;
-right-click for **Break Link** / **Reveal Link Source**.
+Linked editor files show an `L` badge and open read-only.
 
 ## Version control
 
-A synced project is a normal git repo — scripts are plain text and each
-service has one binary store. Run once per repo:
+A synced project is a normal Git repository. Run once:
 
 ```powershell
 rbx vc-init                                            # in the project root
@@ -784,21 +644,11 @@ rbx vc-init --remote https://github.com/you/your-game  # also set origin
 rbx vc-init --skip-git                                 # only write policy files
 ```
 
-It is idempotent and sets up: `.gitattributes` (LF policy, marks `*.renium`
-binary with a diff/merge driver), `.gitignore` (build artifacts, snapshots,
-locks), `.renium/.gitignore` (cache local, lockfile committed), and the git
-config for the textconv + merge driver.
+This safely sets ignore rules, LF policy, and `.renium` diff/merge drivers.
 
-After that:
-
-- `git diff` on a `.renium` store renders as text: one line per instance plus
-  sorted property lines. Script bodies show as line-count + fingerprint since
-  they already diff as `.luau` files.
-- `git merge` of divergent stores merges at the instance/property level.
-  Parallel edits to different properties merge cleanly; same-property edits
-  conflict with an exact report (path + property + both values). Resolve with
-  `git checkout --ours/--theirs -- <file>` or standalone:
-  `rbx vc-merge <base> <ours> <theirs> --prefer theirs -o <file>`.
+`git diff` renders stores as text. Merges operate per instance/property;
+same-property conflicts report both values. Resolve through Git or
+`rbx vc-merge <base> <ours> <theirs> --prefer theirs -o <file>`.
 
 Typical flow:
 
@@ -807,8 +657,7 @@ edit in Studio / editor  ->  renium syncs src/         ->  git commit + push
 git pull                 ->  rbx lk (--strict in CI)   ->  rbx push to Studio
 ```
 
-Studio and the daemon never see git; version control is purely over the file
-tree, like Rojo — but with full property fidelity and mergeable stores.
+Git operates only on project files.
 
 ## Inspecting a .renium file
 
@@ -817,14 +666,11 @@ rbx view src\SoundService\__roblox_sync_settings.renium   # text tree
 rbx view links\ui-kit.renium --json                       # structured JSON
 ```
 
-Same decoder as the sync itself, so what you see is what syncs. In VS Code,
-double-click any `.renium` for the same view.
+The extension opens `.renium` files with the same decoder.
 
 ## Wally packages
 
-`rbx wally` runs `wally install` and imports the package tree straight into
-the stores — Rojo is not needed. It is `wally.lock`-aware (unchanged installs
-are a no-op) and maps realms:
+`rbx wally` installs and imports Wally packages. Unchanged lockfiles are no-ops.
 
 ```text
 shared -> Packages       -> ReplicatedStorage/Packages
@@ -841,9 +687,7 @@ rbx wally --skip-install
 
 ## PowerShell 5.1 quoting
 
-Inline-JSON examples here are written for PowerShell 7+. Windows
-PowerShell 5.1 strips embedded double quotes when calling native executables,
-so `-j '[{"type":"counts"}]'` arrives mangled. On 5.1 either escape:
+PowerShell 5.1 mangles inline JSON. Pipe it instead:
 
 ```powershell
 '{"ops":[{"type":"counts"}]}' | rbx batch Workspace -J -
@@ -908,68 +752,52 @@ so `-j '[{"type":"counts"}]'` arrives mangled. On 5.1 either escape:
 | `pa` | `place-add` | `pn` | `place-rename` |
 | `po` | `place-reorder` |  |  |
 
-`rbx.cmd` and `rbx` only locate Renium and forward arguments. Command parsing
-lives in the Rust CLI on every platform.
+Launchers only locate Renium and forward arguments.
 
 ## Building from source
 
-Released binaries don't require a build. From the source repo:
+Build from source:
 
 ```powershell
 cargo build --locked --release --manifest-path tools\renium\Cargo.toml
 ```
 
-If the exe is locked by a running daemon, stop it first:
+If the executable is locked, stop the daemon:
 
 ```powershell
 Get-Process renium -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
-Full release builds (CLI + extension VSIX + both plugin bundle formats, with
-version cross-checks, hashes, and a manifest under `dist/`):
+Build all release artifacts into `dist/`:
 
 ```powershell
 .\tools\build-release.ps1 -LocalBuild
 ```
 
-Omit `-LocalBuild` only for a public release; that mode intentionally requires
-a clean checkout, a root `LICENSE` file, and a registered VS Code publisher.
+Public builds omit `-LocalBuild` and require a clean checkout, license, and VS
+Code publisher.
 
 ## Good to know
 
-- Prefer settings ids over names in scripts and automation — names can repeat.
+- Prefer settings IDs; names can repeat.
 - For model pivots the property is `WorldPivot`.
-- `rbx bd` stays alive while Studio is closed or reconnecting. It exits only
-  when stopped. `--editor-stdio` is for the VS Code extension's owned child
-  process and exits when the editor closes its stdin stream.
-- Live sync = editor changes push to Studio, and dirty Studio services import
-  back after serve/plugin connection. Dirty detection uses per-instance
-  property/attribute listeners, service-root descendant add/remove listeners,
-  and CollectionService tag membership signals. Newly created tag names are
-  discovered during the session. Those listeners stay active once live sync
-  has started, which is what catches edits made while the editor was
-  disconnected.
-- Studio imports use stable `GetDebugId` ids, so reparenting an instance in
-  Studio updates its parent in the store instead of duplicating it.
-- Filesystem-to-Studio mutations create a Studio undo recording and preserve
-  Explorer selection across class/full-import replacements. A failed batch
-  stops at its first error so the recorded partial work can be undone as one
-  Renium action.
-- Snapshot imports move stale generated paths to
-  `.renium/import-backups/<timestamp>/` instead of permanently deleting them.
-  The manual VS Code import command asks for confirmation; automated live sync
-  remains non-interactive.
-- Script comparison ignores CRLF/LF-only differences while retaining the
-  existing filesystem line-ending convention.
+- `rbx bd` stays alive until stopped. `--editor-stdio` exits when its editor
+  closes stdin.
+- Live Sync sends file edits to Studio and Studio edits to files. Event
+  listeners remain active through editor disconnects.
+- Live Sync starts by reconciling both sides against their last common state.
+  Conflicts remain pending unless a Studio or editor preference is configured.
+- Package descendants sync normally. Renium preserves the PackageLink object
+  itself and never treats deleting it as package desynchronization.
+- Stable IDs preserve reparenting without duplication.
+- Files → Studio batches create one undo step and stop on the first error.
+- Snapshot imports move stale generated paths to `.renium/import-backups/`.
+- Script comparison ignores CRLF/LF-only differences.
 
 ## Known limitations
 
-- Two writable properties can't be carried: `TextChatMessage.Timestamp`
-  (`DateTime` isn't serializable by rbx-dom, so place files never contain it)
-  and the Studio-only `QDir`/`QFont` settings fields. `Axes`, `Faces`, and
-  `Ray` properties sync fully.
-- Modern `Content` properties preserve URI and `None` sources. `Object` and
-  `Opaque` sources can't be represented by the current file store, so export
-  stops with an error instead of replacing them with empty content.
-- Infinity, negative Infinity, and NaN use Renium's tagged float transport and
-  round-trip without being converted to finite JSON numbers.
+- Unsupported: `TextChatMessage.Timestamp` and Studio-only `QDir`/`QFont`
+  settings fields. `Axes`, `Faces`, and `Ray` sync.
+- `Content` preserves URI and `None`; unsupported `Object` and `Opaque` sources
+  stop export.
+- Infinity, negative infinity, and NaN round-trip through tagged floats.

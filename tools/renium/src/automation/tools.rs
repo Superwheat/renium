@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
+use crate::app::output::print_json_output;
 use crate::automation::{BoundContext, Failure, op};
 use crate::cli::{
     AssetInsertArgs, AssetSearchArgs, BridgeConnectionArgs, GenerateModelArgs, ImageStoreArgs,
@@ -81,8 +82,7 @@ pub(crate) fn asset_search_command(args: AssetSearchArgs) -> anyhow::Result<()> 
             .collect::<Vec<_>>();
         result["results"] = json!(compact);
     }
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 fn creator_command(
@@ -184,8 +184,7 @@ pub(crate) fn image_store_command(
     let (root, _) = script_roots(project)?;
     let result = crate::cloud::assets::store_image_at(&root, &json!({ "path": args.path }))
         .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    print_json_output(&result, false)
 }
 
 fn script_roots(project: Option<&Path>) -> anyhow::Result<(PathBuf, PathBuf)> {
@@ -196,8 +195,7 @@ fn script_roots(project: Option<&Path>) -> anyhow::Result<(PathBuf, PathBuf)> {
 
 fn print_script_result(result: Result<Value, Failure>) -> anyhow::Result<()> {
     let value = result.map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    println!("{}", serde_json::to_string(&value)?);
-    Ok(())
+    print_json_output(&value, false)
 }
 
 pub(crate) fn script_search_command(

@@ -41,6 +41,7 @@ body{position:relative;display:flex;flex-direction:column}
 .searchSummary{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .searchActions{display:flex;align-items:center;gap:2px}
 .iconBtn{width:22px;height:20px;border:0;background:transparent;color:var(--vscode-icon-foreground);padding:0;cursor:pointer;font:inherit}
+.iconBtn svg{display:block;width:16px;height:16px;margin:auto;fill:currentColor}
 .iconBtn:hover{background:var(--vscode-toolbar-hoverBackground,var(--vscode-list-hoverBackground))}
 #suggestions{display:none;position:absolute;z-index:5357;top:30px;left:0;right:0;max-height:min(320px,calc(100% - 30px));overflow:auto;border:1px solid var(--vscode-sideBarSectionHeader-border,transparent);border-top:0;background:var(--vscode-sideBar-background);padding:7px 12px 8px 12px;color:var(--vscode-foreground);box-shadow:0 8px 18px rgba(0,0,0,.22)}
 #suggestions.active{display:block}
@@ -207,7 +208,7 @@ body{position:relative;display:flex;flex-direction:column}
     <div class="suggestItem" data-insert="textureid="><span class="suggestIcon">T</span><span>textureid=</span></div>
     <div class="suggestItem" data-insert="tag:"><span class="suggestIcon">&#9671;</span><span>tag:</span></div>
   </div>
-  <div id="searchMeta"><span class="searchSummary">0 matches</span><span class="searchActions"><button class="iconBtn" id="prevMatch" title="Select previous match">&uarr;</button><button class="iconBtn" id="nextMatch" title="Select next match">&darr;</button><button class="iconBtn" id="selectMatches" title="Select all matches">&#9633;</button><button class="iconBtn" id="refreshResults" title="Refresh results">&#8635;</button></span></div>
+  <div id="searchMeta"><span class="searchSummary">0 matches</span><span class="searchActions"><button class="iconBtn" id="prevMatch" title="Select previous match" aria-label="Select previous match"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.7 10.2 3.3-3.3 3.3 3.3 1-1L8 4.9 3.7 9.2z"/></svg></button><button class="iconBtn" id="nextMatch" title="Select next match" aria-label="Select next match"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.7 5.8 3.3 3.3 3.3-3.3 1 1L8 11.1 3.7 6.8z"/></svg></button><button class="iconBtn" id="selectMatches" title="Select all matches" aria-label="Select all matches"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h1v-1h-1zm2 0h2v-1h-2zm3 0h2v-1h-2zm3 0h2v-1h-2zm2 1v2h1v-2zm0 3v2h1v-2zm0 3v2h1v-2zm-2 2h-2v1h2zm-3 0h-2v1h2zm-3 0h-2v1h2zm-2-2v2h1v-2zm0-3v2h1v-2zm0-3v2h1v-2zM5.3 8l1-1 1.2 1.2 2.4-2.4 1 1-3.4 3.4z"/></svg></button><button class="iconBtn" id="refreshResults" title="Refresh results" aria-label="Refresh results"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.4 4.6A5.5 5.5 0 1 0 13.5 8h-1.4a4.1 4.1 0 1 1-1-2.7L9.5 7H14V2.5z"/></svg></button></span></div>
   <div id="tree" tabindex="0">${initialRows || '<div id="treeEmpty">Loading services...</div>'}</div>
 </div>
 <div id="historyPane" class="hidden">
@@ -229,8 +230,16 @@ body{position:relative;display:flex;flex-direction:column}
 var vscode=acquireVsCodeApi(),ASSET=${JSON.stringify(assetBase)},CLASS_NAMES=${classNamesJson},AVAILABLE_ICONS=new Set(${assetIconNamesJson});
 var nodes={},rootIds=[],expanded=new Set(),selectedId=null,lastHostSelectionId=null,referencePreviewId=null,filter='',menuNode=null,menuX=0,menuY=0;
 var linkKeys={},externalPackageDrag=null,packageDragCursorSawDown=false;
+var ROW_SERVICE=1<<0,ROW_HAS_CHILDREN=1<<1,ROW_HAS_PACKAGE_LINK=1<<2,ROW_EXPANDED=1<<3,ROW_MATCHED=1<<4,ROW_DISABLED=1<<5,ROW_CAN_RENAME=1<<6,ROW_CAN_MOVE=1<<7,ROW_CAN_DELETE=1<<8;
+function decodeRow(row){
+  if(!Array.isArray(row))return row;
+  var flags=Number(row[7])||0,className=String(row[3]||'');
+  return{id:String(row[0]||''),service:String(row[1]||''),name:String(row[2]||''),className:className,parentId:typeof row[4]==='string'?row[4]:null,depth:Number(row[5])||0,index:typeof row[6]==='number'?row[6]:undefined,kind:(flags&ROW_SERVICE)?'service':'instance',hasChildren:!!(flags&ROW_HAS_CHILDREN),hasPackageLink:!!(flags&ROW_HAS_PACKAGE_LINK),expanded:!!(flags&ROW_EXPANDED),matched:!!(flags&ROW_MATCHED),disabled:!!(flags&ROW_DISABLED),locked:!!(flags&ROW_SERVICE),canRename:!!(flags&ROW_CAN_RENAME),canMove:!!(flags&ROW_CAN_MOVE),canDelete:!!(flags&ROW_CAN_DELETE),isScript:className==='Script'||className==='LocalScript'||className==='ModuleScript',linkPathKey:typeof row[8]==='string'?row[8]:undefined};
+}
 function nodeLinkState(n){
-  if(!n||!n.pathSegments||n.pathSegments.length<2)return null;
+  if(!n)return null;
+  if(n.linkPathKey)return linkKeys[n.linkPathKey]||null;
+  if(!n.pathSegments||n.pathSegments.length<2)return null;
   return linkKeys[n.pathSegments[0]+String.fromCharCode(1)+n.pathSegments.slice(1).join('/')]||null;
 }
 function directReniumState(n){
@@ -248,10 +257,9 @@ function reniumBadgeHtml(state){
   return '<span class="linkBadge '+esc(state.kind)+'" title="'+esc(title)+'">'+esc(label)+'</span>';
 }
 function canDesyncPackage(n){return !!n&&n.kind!=='service'&&(n.className==='PackageLink'||n.hasPackageLink===true)}
-var renameId=null,renameOriginal='',suppressRenameFocusoutRender=false,renamePointerStartedInside=false,renameSuppressFocusoutUntil=0,draggedId=null,dropId=null,lastPointerRowId=null,screenOffsetX=null,screenOffsetY=null,addParentId=null,classActive=0,loadingIds={},loadDelayUntil={},autoLoadIds=[],matchIds=[],matchIndex=-1,searchLoading=false,searchRequested=false,searchLoaded=0,searchTotal=0,searchMatchCount=0,allMatchesSelected=false;
-var searchPlanFilter=null,searchPlanGroups=[],selfMatchCache={},subtreeMatchCache={},searchExpanded=new Set(),renderFrame=0,pendingRenderAnchor=null;
-var searchIndexDirty=true,searchEntries={},searchEntryIds=[],searchResultsFilter=null,searchVisibleSet=new Set(),searchResultIds=[];
-var ROW_HEIGHT=22,VIRTUAL_OVERSCAN=40,flatRows=[],visibleRenderFrame=0,currentEmptyHtml='',totalRows=0,rowWindowStart=0,lastRequestedStart=-1,lastRequestedCount=0,lastRequestMode='normal',searchDebounce=null,rowRequestPending=false,searchPointerOpenUntil=0,searchRetainFocusUntil=0,searchRestoringFocus=false,searchSuggestionsShownThisFocus=false,rowCache={},rowCacheMode='normal',backendErrorRetryCount=0,searchRevision=0,searchInitialLoading=false,prefetchPending=false,prefetchTimer=null,lastScrollTop=0,lastScrollTime=0,scrollVelocityRows=0,scrollDirection=1;
+var renameId=null,renameOriginal='',suppressRenameFocusoutRender=false,renamePointerStartedInside=false,renameSuppressFocusoutUntil=0,draggedId=null,dropId=null,lastPointerRowId=null,screenOffsetX=null,screenOffsetY=null,addParentId=null,classActive=0,loadingIds={},loadDelayUntil={},autoLoadIds=[],searchLoading=false,searchRequested=false,searchLoaded=0,searchTotal=0,searchMatchCount=0,searchRevealId=null,allMatchesSelected=false;
+var renderFrame=0,pendingRenderAnchor=null;
+var ROW_HEIGHT=22,VIRTUAL_OVERSCAN=40,flatRows=[],visibleRenderFrame=0,currentEmptyHtml='',totalRows=0,rowWindowStart=0,lastRequestedStart=-1,lastRequestedCount=0,lastRequestMode='normal',searchDebounce=null,rowRequestPending=false,searchPointerOpenUntil=0,searchRetainFocusUntil=0,searchRestoringFocus=false,searchSuggestionsShownThisFocus=false,rowCache={},rowCacheCount=0,rowCacheMode='normal',rowCacheSnapshotVersion=null,rowCacheViewVersion=null,backendErrorRetryCount=0,searchRevision=0,searchInitialLoading=false,prefetchPending=false,prefetchTimer=null,lastScrollTop=0,lastScrollTime=0,scrollVelocityRows=0,scrollDirection=1;
 var dragAutoScrollFrame=0,dragAutoScrollDirection=0,dragAutoScrollPointerY=0;
 var tree=document.getElementById('tree'),search=document.getElementById('search'),searchMeta=document.getElementById('searchMeta'),suggestions=document.getElementById('suggestions'),menu=document.getElementById('menu');
 var searchSummary=searchMeta.querySelector('.searchSummary'),prevMatch=document.getElementById('prevMatch'),nextMatch=document.getElementById('nextMatch'),selectMatches=document.getElementById('selectMatches'),refreshResults=document.getElementById('refreshResults');
@@ -317,14 +325,6 @@ function syncSelectionToHost(){
     vscode.postMessage({type:'selectNode',nodeId:selectedId});
   }
 }
-function expandAncestors(id){
-  var n=nodes[id],changed=false;
-  while(n&&n.parentId){
-    if(!expanded.has(n.parentId)){expanded.add(n.parentId);changed=true}
-    n=nodes[n.parentId];
-  }
-  if(changed)save();
-}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function canShowSearchSuggestions(){
   return activeTab==='explorer'&&!search.value.trim();
@@ -373,13 +373,11 @@ function prepareReferencePreview(){
     if(prefetchTimer){clearTimeout(prefetchTimer);prefetchTimer=null}
     prefetchPending=false;
     searchInitialLoading=false;
-    searchExpanded.clear();
     searchRequested=false;
     searchLoading=false;
     searchLoaded=0;
     searchTotal=0;
     searchMatchCount=0;
-    matchIds=[];
     allMatchesSelected=false;
     rowWindowStart=0;
     totalRows=0;
@@ -663,11 +661,18 @@ function visibleCount(){
 }
 function resetRowCache(mode){
   rowCache={};
+  rowCacheCount=0;
   rowCacheMode=mode||((filter?'search':'normal'));
+  rowCacheSnapshotVersion=null;
+  rowCacheViewVersion=null;
+  lastScrollTop=tree.scrollTop||0;
+  lastScrollTime=0;
+  scrollVelocityRows=0;
 }
 function rememberRows(rows){
   for(var i=0;i<rows.length;i++){
-    var row=rows[i];
+    var row=decodeRow(rows[i]);
+    rows[i]=row;
     if(row&&row.id){
       nodes[row.id]=row;
       delete loadingIds[row.id];
@@ -676,13 +681,15 @@ function rememberRows(rows){
 }
 function pruneRowCache(start,count){
   var span=rowCacheMode==='search'?30000:10000;
+  if(rowCacheCount<=span*2)return;
   var keepBefore=Math.max(0,start-span),keepAfter=start+count+span;
   Object.keys(rowCache).forEach(function(key){
     var index=Number(key);
     if(index<keepBefore||index>keepAfter){
       var row=rowCache[key];
-      if(row&&row.id&&row.id!==selectedId)delete nodes[row.id];
+      if(row&&row.id&&row.id!==selectedId&&!row.hasChildren)delete nodes[row.id];
       delete rowCache[key];
+      rowCacheCount--;
     }
   });
 }
@@ -712,7 +719,7 @@ function optimisticDelete(id){
     flatRows.splice(idx,removeCount);
     totalRows=Math.max(0,totalRows-removeCount);
   }
-  rowCache={};
+  rowCache={};rowCacheCount=0;
   save();render(anchor);syncSelectionToHost();
 }
 function firstMissingRow(start,end){
@@ -780,9 +787,14 @@ function requestRows(force){
     renderFlatRows();
   }
   var speedRows=Math.abs(scrollVelocityRows);
-  var maxRequest=mode==='search'?2600:1400;
-  var requestCount=Math.max(count,Math.min(maxRequest,count+Math.ceil(speedRows*1.2)+(mode==='search'?900:400)));
-  vscode.postMessage({type:'getRows',start:start,count:requestCount,mode:mode,revision:searchRevision});
+  var baseAhead=mode==='search'?900:400;
+  var maxAhead=mode==='search'?2100:1000;
+  var ahead=Math.max(baseAhead,Math.min(maxAhead,Math.ceil(speedRows*1.2)));
+  var trail=Math.max(100,Math.min(mode==='search'?300:180,Math.ceil(ahead*0.18)));
+  var requestStart=scrollDirection<0?Math.max(0,start-ahead):Math.max(0,start-trail);
+  var requestEnd=scrollDirection<0?start+count+trail:start+count+ahead;
+  if(totalRows>0)requestEnd=Math.min(totalRows,requestEnd);
+  vscode.postMessage({type:'getRows',start:requestStart,count:Math.max(count,requestEnd-requestStart),mode:mode,revision:searchRevision});
 }
 function canDrag(n){return !!n&&n.kind!=='service'&&n.canMove!==false}
 function isDescendant(id,ancestorId){
@@ -995,258 +1007,8 @@ function requestLoad(id,force){
     return;
   }
   loadingIds[id]=true;
-  vscode.postMessage({type:'expandNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount()});
+  vscode.postMessage({type:'expandNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount(),revision:searchRevision});
   render(anchor);
-}
-function compactText(value){return String(value===undefined||value===null?'':value).toLowerCase().replace(/\\s+/g,'')}
-function displayText(value){
-  if(value===undefined||value===null)return '';
-  if(typeof value==='string'||typeof value==='number'||typeof value==='boolean')return String(value);
-  if(value&&typeof value==='object'&&!Array.isArray(value)&&value._type==='EnumItem')return String(value.name||'');
-  try{return JSON.stringify(value)}catch(_){return String(value)}
-}
-function tokenize(query){
-  var out=[],re=/"([^"]*)"|'([^']*)'|(\\S+)/g,m;
-  while((m=re.exec(query))!==null)out.push(m[1]!==undefined?m[1]:m[2]!==undefined?m[2]:m[3]);
-  return out;
-}
-function splitOr(tokens){
-  var groups=[[]];
-  tokens.forEach(function(token){
-    if(token.toLowerCase()==='or')groups.push([]);
-    else if(token.toLowerCase()!=='and')groups[groups.length-1].push(token.replace(/^\\(+|\\)+$/g,''));
-  });
-  return groups.filter(function(group){return group.length>0});
-}
-function resetSearchResults(){searchResultsFilter=null;searchVisibleSet=new Set();searchResultIds=[];subtreeMatchCache={}}
-function invalidateSearchCache(){searchPlanFilter=null;searchPlanGroups=[];selfMatchCache={};resetSearchResults()}
-function invalidateSearchIndex(){searchIndexDirty=true;searchEntries={};searchEntryIds=[];invalidateSearchCache()}
-function searchGroups(){
-  if(searchPlanFilter!==filter){
-    searchPlanFilter=filter;
-    searchPlanGroups=filter?splitOr(tokenize(filter)):[];
-    selfMatchCache={};
-    resetSearchResults();
-  }
-  return searchPlanGroups;
-}
-function searchableRecord(n){
-  var s=n.search||{},props={};
-  function copyRecord(record){
-    if(Array.isArray(record)){
-      for(var i=0;i<record.length;i++){
-        var pair=record[i];
-        if(pair&&pair.length>=2&&props[pair[0]]===undefined)props[pair[0]]=pair[1];
-      }
-      return;
-    }
-    Object.keys(record||{}).forEach(function(key){if(props[key]===undefined)props[key]=record[key]});
-  }
-  copyRecord(s.properties||{});
-  copyRecord(s.attributes||{});
-  props.Name=s.name||n.name;props.ClassName=s.className||n.className;props.Parent=(s.path||'').split('.').slice(-2,-1)[0]||'';
-  return props;
-}
-function buildSearchEntry(n){
-  var s=n.search||{},props={};
-  function addRecord(record){
-    if(Array.isArray(record)){
-      for(var i=0;i<record.length;i++){
-        var pair=record[i];
-        if(pair&&pair.length>=2)props[compactText(pair[0])]=pair[1];
-      }
-      return;
-    }
-    Object.keys(record||{}).forEach(function(key){
-      var value=record[key],compactKey=compactText(key);
-      props[compactKey]=value;
-    });
-  }
-  addRecord(s.properties||{});
-  addRecord(s.attributes||{});
-  props.name=s.name||n.name;
-  props.classname=s.className||n.className;
-  props.parent=(s.path||'').split('.').slice(-2,-1)[0]||'';
-  var pathParts=String(s.path||'').split('.').filter(Boolean).map(compactText);
-  var classChain=(Array.isArray(s.classChain)&&s.classChain.length?s.classChain:[n.className]).map(compactText);
-  var tags=(Array.isArray(s.tags)?s.tags:[]).map(compactText);
-  return {
-    id:n.id||n.treeId||n.name,
-    name:compactText(s.name||n.name),
-    className:compactText(s.className||n.className),
-    classChain:classChain,
-    pathParts:pathParts,
-    tags:tags,
-    props:props
-  };
-}
-function ensureSearchIndex(){
-  if(!searchIndexDirty)return;
-  searchEntries={};
-  searchEntryIds=[];
-  var ids=Object.keys(nodes);
-  for(var i=0;i<ids.length;i++){
-    var id=ids[i],n=nodes[id];
-    if(n){searchEntries[id]=buildSearchEntry(n);searchEntryIds.push(id)}
-  }
-  searchIndexDirty=false;
-  resetSearchResults();
-}
-function searchEntryFor(n){
-  ensureSearchIndex();
-  return n?searchEntries[n.id||n.treeId||n.name]:undefined;
-}
-function findProperty(n,name){
-  var wanted=compactText(name),entry=searchEntryFor(n);
-  if(entry&&Object.prototype.hasOwnProperty.call(entry.props,wanted))return entry.props[wanted];
-  var record=searchableRecord(n),keys=Object.keys(record);
-  for(var i=0;i<keys.length;i++)if(compactText(keys[i])===wanted)return record[keys[i]];
-  return undefined;
-}
-function propertyCompare(n,prop,op,expected){
-  var actual=findProperty(n,prop);
-  if(actual===undefined)return false;
-  var aNum=Number(displayText(actual)),eNum=Number(expected);
-  if((op==='<'||op==='>'||op==='<='||op==='>=')&&isFinite(aNum)&&isFinite(eNum)){
-    if(op==='<')return aNum<eNum;
-    if(op==='>')return aNum>eNum;
-    if(op==='<=')return aNum<=eNum;
-    return aNum>=eNum;
-  }
-  var actualText=compactText(displayText(actual)),expectedText=compactText(expected);
-  if(op==='!='||op==='~=')return actualText.indexOf(expectedText)<0;
-  return actualText.indexOf(expectedText)>=0;
-}
-function tagMatch(n,term){
-  var entry=searchEntryFor(n),tags=entry?entry.tags:((n.search&&n.search.tags)||[]).map(compactText);
-  term=compactText(term);
-  for(var i=0;i<tags.length;i++)if(tags[i].indexOf(term)>=0)return true;
-  return false;
-}
-function classMatch(n,term){
-  var entry=searchEntryFor(n),chain=entry?entry.classChain:((n.search&&n.search.classChain)||[n.className]).map(compactText);
-  term=compactText(term);
-  for(var i=0;i<chain.length;i++)if(chain[i]===term)return true;
-  return false;
-}
-function ancestryMatch(n,pattern){
-  var entry=searchEntryFor(n),path=entry?entry.pathParts:((n.search&&n.search.path)||'').split('.').filter(Boolean).map(compactText);
-  var parts=pattern.split('.').filter(Boolean).map(compactText);
-  if(parts.length===0||path.length===0)return false;
-  function at(pi,si){
-    if(pi===parts.length)return si===path.length;
-    if(parts[pi]==='**')return true;
-    if(si>=path.length)return false;
-    if(parts[pi]==='*'||parts[pi]===path[si])return at(pi+1,si+1);
-    return false;
-  }
-  for(var start=0;start<path.length;start++)if(at(0,start))return true;
-  return false;
-}
-function nameMatch(n,term){
-  var entry=searchEntryFor(n);
-  return (entry?entry.name:compactText((n.search&&n.search.name)||n.name)).indexOf(compactText(term))>=0;
-}
-function tokenMatch(n,tokens,index){
-  var token=tokens[index]||'',next=tokens[index+1],next2=tokens[index+2];
-  if(!token)return {ok:true,next:index+1};
-  var colon=token.indexOf(':');
-  if(colon>0){
-    var prefix=token.slice(0,colon).toLowerCase(),value=token.slice(colon+1);
-    if(prefix==='is')return {ok:classMatch(n,value),next:index+1};
-    if(prefix==='tag')return {ok:tagMatch(n,value),next:index+1};
-  }
-  if(next&&(next==='='||next==='=='||next==='!='||next==='~='||next==='<'||next==='>'||next==='<='||next==='>=')){
-    return {ok:propertyCompare(n,token,next,next2||''),next:index+3};
-  }
-  var inline=token.match(/^([^=!<>~]+)(==|=|!=|~=|<=|>=|<|>)(.+)$/);
-  if(inline)return {ok:propertyCompare(n,inline[1],inline[2],inline[3]),next:index+1};
-  if(token.indexOf('.')>=0||token==='*'||token==='**')return {ok:ancestryMatch(n,token),next:index+1};
-  return {ok:nameMatch(n,token),next:index+1};
-}
-function matchesGroup(n,tokens){
-  for(var i=0;i<tokens.length;){
-    var result=tokenMatch(n,tokens,i);
-    if(!result.ok)return false;
-    i=Math.max(result.next,i+1);
-  }
-  return true;
-}
-function matchesSelf(n){
-  if(!filter)return true;
-  if(n.search&&n.search.hostMatch===true)return true;
-  var id=n.id||n.treeId||n.name;
-  if(Object.prototype.hasOwnProperty.call(selfMatchCache,id))return selfMatchCache[id];
-  var groups=searchGroups(),ok=false;
-  for(var i=0;i<groups.length;i++)if(matchesGroup(n,groups[i])){ok=true;break}
-  selfMatchCache[id]=ok;
-  return ok;
-}
-function fastNameGroups(){
-  var groups=searchGroups();
-  if(!groups.length)return null;
-  var out=[];
-  for(var i=0;i<groups.length;i++){
-    var group=groups[i],terms=[];
-    for(var j=0;j<group.length;j++){
-      var token=group[j];
-      if(!token||token.indexOf(':')>=0||/[=!<>~]/.test(token)||token.indexOf('.')>=0||token==='*'||token==='**')return null;
-      terms.push(compactText(token));
-    }
-    if(!terms.length)return null;
-    out.push(terms);
-  }
-  return out;
-}
-function fastNameMatch(entry,groups){
-  for(var i=0;i<groups.length;i++){
-    var terms=groups[i],ok=true;
-    for(var j=0;j<terms.length;j++){
-      if(entry.name.indexOf(terms[j])<0){ok=false;break}
-    }
-    if(ok)return true;
-  }
-  return false;
-}
-function markSearchVisible(n){
-  while(n){
-    searchVisibleSet.add(n.id);
-    if(!n.parentId)break;
-    n=nodes[n.parentId];
-  }
-}
-function ensureSearchResults(){
-  if(!filter){
-    if(searchResultsFilter!==filter)resetSearchResults();
-    searchResultsFilter=filter;
-    return;
-  }
-  if(searchResultsFilter===filter&&!searchIndexDirty)return;
-  ensureSearchIndex();
-  var fastGroups=fastNameGroups();
-  searchVisibleSet=new Set();
-  searchResultIds=[];
-  for(var i=0;i<searchEntryIds.length;i++){
-    var id=searchEntryIds[i],n=nodes[id];
-    if(!n)continue;
-    var ok=fastGroups?fastNameMatch(searchEntries[id],fastGroups):matchesSelf(n);
-    if(fastGroups)selfMatchCache[id]=ok;
-    if(ok){
-      searchResultIds.push(id);
-      markSearchVisible(n);
-    }
-  }
-  searchResultsFilter=filter;
-}
-function matches(id){
-  var n=nodes[id]; if(!n)return false;
-  if(!filter)return true;
-  ensureSearchResults();
-  return searchVisibleSet.has(id);
-}
-function isSearchOpen(id){
-  if(!filter)return expanded.has(id);
-  return !searchExpanded.has(id);
 }
 function updateSearchMeta(){
   if(!filter){
@@ -1259,18 +1021,6 @@ function updateSearchMeta(){
     searchSummary.textContent=searchMatchCount?searchMatchCount+' '+(searchMatchCount===1?'match':'matches'):progress;
   }else{
     searchSummary.textContent=searchMatchCount+' '+(searchMatchCount===1?'match':'matches');
-  }
-}
-function collectRow(id,depth,out){
-  var n=nodes[id]; if(!n||!matches(id))return;
-  var kids=n.children||[],has=n.hasChildren||kids.length>0,open=isSearchOpen(id);
-  out.push({type:'node',id:id,depth:depth});
-  if(open){
-    if(has&&kids.length===0){
-      if(!loadingIds[id])autoLoadIds.push(id);
-      out.push({type:'placeholder',loadId:id,depth:depth+1});
-    }
-    for(var i=0;i<kids.length;i++)collectRow(kids[i],depth+1,out);
   }
 }
 function rowHtml(item){
@@ -1365,13 +1115,12 @@ function updateDragAutoScroll(clientY){
   if(dragAutoScrollDirection)startDragAutoScroll();
   else stopDragAutoScroll();
 }
-function render(anchor){
-  var scrollAnchor=anchor||captureScrollAnchor();
+function render(anchor,preserveScroll){
+  var scrollAnchor=preserveScroll===false?null:(anchor||captureScrollAnchor());
   currentEmptyHtml=filter?'<div id="treeEmpty">No matches found.</div>':'<div id="treeEmpty">No services found in src.</div>';
   renderFlatRows();
   updateSearchMeta();
-  restoreScrollAnchor(scrollAnchor);
-  renderFlatRows();
+  if(scrollAnchor)restoreScrollAnchor(scrollAnchor);
   if(renameId){setTimeout(function(){var el=rowEl(renameId);var input=el&&el.querySelector('.rename');if(input){input.focus();input.select()}},0)}
 }
 function scheduleRender(anchor){
@@ -1429,6 +1178,7 @@ function scrollToId(id){
   }
 }
 function selectNode(id){
+  if(filter)searchRevealId=id;
   tree.focus();applySelection(id,true);
 }
 function startRename(id){
@@ -1556,7 +1306,7 @@ window.addEventListener('message',function(e){
   if(m.type==='clearSelection'){clearSelection();return}
   if(m.type==='setTab'){setActiveTab(m.tab,true);return}
   if(m.type==='gitState'){gitState=m.state||null;gitLoading=!!m.loading;gitProjectRoot=String(m.projectRoot||'');gitGeneration=Number(m.generation||0);if(activeTab==='git')renderGit();return}
-  if(m.type==='updateTree'){var anchor=captureScrollAnchor();nodes=m.nodes||{};rootIds=m.rootIds||[];if(m.selectedId)lastHostSelectionId=m.selectedId;selectedId=m.selectedId||selectedId;invalidateSearchIndex();Object.keys(loadingIds).forEach(function(id){var n=nodes[id];if(!n||n.loaded||(n.children&&n.children.length>0))delete loadingIds[id]});save();scheduleRender(anchor);syncSelectionToHost()}
+  if(m.type==='updateTree'){var anchor=captureScrollAnchor();nodes=m.nodes||{};rootIds=m.rootIds||[];if(m.selectedId)lastHostSelectionId=m.selectedId;selectedId=m.selectedId||selectedId;Object.keys(loadingIds).forEach(function(id){var n=nodes[id];if(!n||n.loaded||(n.children&&n.children.length>0))delete loadingIds[id]});save();scheduleRender(anchor);syncSelectionToHost()}
   else if(m.type==='rowsWindow'){
     if(m.scrollToReferencePreview)prepareReferencePreview();
     var expectedMode=filter?'search':'normal';
@@ -1564,29 +1314,34 @@ window.addEventListener('message',function(e){
     if(filter&&typeof m.revision==='number'&&m.revision!==searchRevision)return;
     backendErrorRetryCount=0;
     if(rowCacheMode!==expectedMode)resetRowCache(expectedMode);
-    var anchor=captureScrollAnchor();
+    var incomingSnapshot=typeof m.snapshotVersion==='number'?m.snapshotVersion:null,incomingView=typeof m.viewVersion==='number'?m.viewVersion:null;
+    if((rowCacheSnapshotVersion!==null&&incomingSnapshot!==rowCacheSnapshotVersion)||(rowCacheViewVersion!==null&&incomingView!==rowCacheViewVersion))resetRowCache(expectedMode);
+    rowCacheSnapshotVersion=incomingSnapshot;
+    rowCacheViewVersion=incomingView;
+    var anchor=m.preserveAnchor?captureScrollAnchor():null;
     rowRequestPending=false;
-    rowWindowStart=typeof m.start==='number'?m.start:0;
+    var receivedStart=typeof m.start==='number'?m.start:0;
     totalRows=typeof m.totalRows==='number'?m.totalRows:0;
     var receivedRows=Array.isArray(m.rows)?m.rows:[];
-    for(var rowIndex=0;rowIndex<receivedRows.length;rowIndex++){
-      rowCache[rowWindowStart+rowIndex]=receivedRows[rowIndex];
-    }
     rememberRows(receivedRows);
+    for(var rowIndex=0;rowIndex<receivedRows.length;rowIndex++){
+      if(!rowCache[receivedStart+rowIndex])rowCacheCount++;
+      rowCache[receivedStart+rowIndex]=receivedRows[rowIndex];
+    }
+    rowWindowStart=visibleStart();
     pruneRowCache(rowWindowStart,Math.max(lastRequestedCount,receivedRows.length));
     flatRows=cachedWindow(rowWindowStart,visibleCount());
     if(m.selectedId)selectedId=m.selectedId;
     referencePreviewId=typeof m.referencePreviewId==='string'?m.referencePreviewId:null;
-    if(Array.isArray(m.matchIds))matchIds=m.matchIds;
     if(typeof m.matchCount==='number')searchMatchCount=m.matchCount;
     if(filter){searchLoading=false;searchInitialLoading=false}
     searchLoaded=typeof m.loaded==='number'?m.loaded:searchLoaded;
     searchTotal=typeof m.total==='number'?m.total:searchTotal;
     currentEmptyHtml=filter?'<div id="treeEmpty">No matches found.</div>':'<div id="treeEmpty">No services found in src.</div>';
-    save();render(anchor);syncSelectionToHost();
+    save();render(anchor,m.preserveAnchor===true);syncSelectionToHost();
     if(m.scrollToReferencePreview&&referencePreviewId){setTimeout(function(){scrollToId(referencePreviewId)},0)}
     if(m.scrollToSelected&&selectedId){setTimeout(function(){scrollToId(selectedId);if(document.activeElement===search||Date.now()<searchRetainFocusUntil){if(document.activeElement!==search)searchRestoringFocus=true;search.focus();return}tree.focus()},0)}
-    schedulePrefetch();
+    if(firstMissingRow(rowWindowStart,rowWindowStart+visibleCount())>=0)requestRows(true);else schedulePrefetch();
   }
   else if(m.type==='rowsPrefetch'){
     var expectedPrefetchMode=filter?'search':'normal';
@@ -1594,13 +1349,14 @@ window.addEventListener('message',function(e){
     if(m.mode&&m.mode!==expectedPrefetchMode)return;
     if(filter&&typeof m.revision==='number'&&m.revision!==searchRevision)return;
     if(rowCacheMode!==expectedPrefetchMode)return;
+    if(typeof m.snapshotVersion!=='number'||typeof m.viewVersion!=='number'||m.snapshotVersion!==rowCacheSnapshotVersion||m.viewVersion!==rowCacheViewVersion){schedulePrefetch();return}
     var prefetchStart=typeof m.start==='number'?m.start:0;
     var prefetchRows=Array.isArray(m.rows)?m.rows:[];
+    rememberRows(prefetchRows);
     if(typeof m.totalRows==='number')totalRows=m.totalRows;
     var currentCount=lastRequestedCount||visibleCount();
     var affectsVisible=prefetchStart<rowWindowStart+currentCount&&prefetchStart+prefetchRows.length>rowWindowStart;
-    for(var pi=0;pi<prefetchRows.length;pi++)rowCache[prefetchStart+pi]=prefetchRows[pi];
-    rememberRows(prefetchRows);
+    for(var pi=0;pi<prefetchRows.length;pi++){if(!rowCache[prefetchStart+pi])rowCacheCount++;rowCache[prefetchStart+pi]=prefetchRows[pi]}
     pruneRowCache(rowWindowStart,Math.max(currentCount,prefetchRows.length));
     if(affectsVisible){
       flatRows=cachedWindow(rowWindowStart,currentCount);
@@ -1609,6 +1365,16 @@ window.addEventListener('message',function(e){
     schedulePrefetch();
   }
 	  else if(m.type==='rowsPrefetchDone'){prefetchPending=false;schedulePrefetch()}
+	  else if(m.type==='searchMatch'){
+    if(typeof m.revision==='number'&&m.revision!==searchRevision)return;
+    if(typeof m.nodeId!=='string'||typeof m.rowIndex!=='number')return;
+    selectedId=m.nodeId;
+    lastHostSelectionId=m.nodeId;
+    tree.scrollTop=Math.max(0,m.rowIndex*ROW_HEIGHT-Math.floor((tree.clientHeight||300)/2));
+    lastRequestedStart=-1;
+    requestRows(true);
+    vscode.postMessage({type:'selectNode',nodeId:m.nodeId});
+  }
 	  else if(m.type==='invalidateRows'){lastRequestedStart=-1;requestRows(true)}
 	  else if(m.type==='loadComplete'){var completeAnchor=captureScrollAnchor(m.nodeId);delete loadingIds[m.nodeId];if(m.ok===false)loadDelayUntil[m.nodeId]=Date.now()+1200;else delete loadDelayUntil[m.nodeId];render(completeAnchor)}
 	  else if(m.type==='searchStatus'){searchLoading=!!m.loading;if(!searchLoading)searchInitialLoading=false;searchLoaded=typeof m.loaded==='number'?m.loaded:searchLoaded;searchTotal=typeof m.total==='number'?m.total:searchTotal;if(typeof m.matchCount==='number')searchMatchCount=m.matchCount;updateSearchMeta()}
@@ -1646,11 +1412,10 @@ function startSearchLoad(force){
 }
 search.addEventListener('input',function(){
   var nextFilter=search.value.trim().toLowerCase();
-  var wasFiltering=!!filter;
-  if(nextFilter!==filter){searchRevision++;prefetchPending=false;if(prefetchTimer){clearTimeout(prefetchTimer);prefetchTimer=null}searchInitialLoading=false;searchExpanded.clear();searchRequested=false;matchIds=[];resetRowCache(nextFilter?'search':'normal');rowWindowStart=0;totalRows=0;flatRows=[];lastRequestedStart=-1;lastRequestMode=nextFilter?'search':'normal'}
-  filter=nextFilter;allMatchesSelected=false;invalidateSearchCache();
+  if(nextFilter!==filter){searchRevision++;if(nextFilter)searchRevealId=null;prefetchPending=false;if(prefetchTimer){clearTimeout(prefetchTimer);prefetchTimer=null}searchInitialLoading=false;searchRequested=false;resetRowCache(nextFilter?'search':'normal');rowWindowStart=0;totalRows=0;flatRows=[];lastRequestedStart=-1;lastRequestMode=nextFilter?'search':'normal'}
+  filter=nextFilter;allMatchesSelected=false;
   hideSearchSuggestions();
-  if(filter)startSearchLoad(false);else{if(searchDebounce)clearTimeout(searchDebounce);var hadFocus=document.activeElement===search;if(hadFocus)searchRetainFocusUntil=Date.now()+1500;searchLoading=false;searchInitialLoading=false;searchRequested=false;searchLoaded=0;searchTotal=0;searchMatchCount=0;rowWindowStart=0;totalRows=0;flatRows=[];tree.scrollTop=0;lastRequestedStart=-1;lastRequestMode='normal';resetRowCache('normal');currentEmptyHtml='<div id="treeEmpty">Loading...</div>';renderFlatRows();vscode.postMessage({type:'clearSearch',start:0,count:visibleCount(),mode:'normal'});if(wasFiltering&&selectedId)expandAncestors(selectedId);if(hadFocus)showSearchSuggestionsOnce();if(hadFocus)setTimeout(function(){if(document.activeElement!==search)searchRestoringFocus=true;search.focus()},0)}
+  if(filter)startSearchLoad(false);else{if(searchDebounce)clearTimeout(searchDebounce);var hadFocus=document.activeElement===search;if(hadFocus)searchRetainFocusUntil=Date.now()+1500;searchLoading=false;searchInitialLoading=false;searchRequested=false;searchLoaded=0;searchTotal=0;searchMatchCount=0;rowWindowStart=0;totalRows=0;flatRows=[];tree.scrollTop=0;lastRequestedStart=-1;lastRequestMode='normal';resetRowCache('normal');currentEmptyHtml='<div id="treeEmpty">Loading...</div>';renderFlatRows();vscode.postMessage({type:'clearSearch',start:0,count:visibleCount(),mode:'normal',revealId:searchRevealId});searchRevealId=null;if(hadFocus)setTimeout(function(){if(document.activeElement!==search)searchRestoringFocus=true;search.focus()},0)}
   updateSearchMeta();
 });
 tree.addEventListener('scroll',scheduleVisibleRows);
@@ -1675,16 +1440,11 @@ search.addEventListener('blur',function(){
 suggestions.addEventListener('mousedown',function(e){searchPointerOpenUntil=Date.now()+600;e.preventDefault()});
 suggestions.addEventListener('click',function(e){
   var item=e.target.closest('.suggestItem');if(!item)return;
-  search.value=item.dataset.insert||'';searchRevision++;filter=search.value.trim().toLowerCase();searchRequested=false;searchInitialLoading=false;prefetchPending=false;matchIds=[];resetRowCache(filter?'search':'normal');rowWindowStart=0;totalRows=0;flatRows=[];lastRequestedStart=-1;invalidateSearchCache();hideSearchSuggestions();search.focus();startSearchLoad(false);render();
+  search.value=item.dataset.insert||'';searchRevision++;searchRevealId=null;filter=search.value.trim().toLowerCase();searchRequested=false;searchInitialLoading=false;prefetchPending=false;resetRowCache(filter?'search':'normal');rowWindowStart=0;totalRows=0;flatRows=[];lastRequestedStart=-1;hideSearchSuggestions();search.focus();startSearchLoad(false);render();
 });
 function jumpMatch(delta){
-  if(matchIds.length===0)return;
-  var current=selectedId?matchIds.indexOf(selectedId):-1;
-  if(current<0)current=delta>0?-1:0;
-  var next=(current+delta+matchIds.length)%matchIds.length;
-  selectNode(matchIds[next]);
-  scrollToId(matchIds[next]);
-  var row=rowEl(matchIds[next]);if(row)row.scrollIntoView({block:'nearest'});
+  if(!filter||searchMatchCount===0)return;
+  vscode.postMessage({type:'jumpMatch',delta:delta,revision:searchRevision});
 }
 prevMatch.addEventListener('click',function(){jumpMatch(-1)});
 nextMatch.addEventListener('click',function(){jumpMatch(1)});
@@ -1836,10 +1596,10 @@ tree.addEventListener('click',function(e){
     loadingIds[id]=true;
     if(n.expanded){
       n.expanded=false;
-      vscode.postMessage({type:'collapseNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount()});
+      vscode.postMessage({type:'collapseNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount(),revision:searchRevision});
     }else{
       n.expanded=true;
-      vscode.postMessage({type:'expandNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount()});
+      vscode.postMessage({type:'expandNode',nodeId:id,mode:filter?'search':'normal',start:visibleStart(),count:visibleCount(),revision:searchRevision});
     }
     suppressRenameFocusoutRender=false;
     render(anchor); return;

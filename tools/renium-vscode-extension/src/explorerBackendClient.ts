@@ -41,9 +41,58 @@ export type ExplorerRowSummary = {
   sourcePath?: string;
   pathSegments?: string[];
   pathOrdinals?: number[];
+  linkPathKey?: string;
   properties?: Record<string, unknown>;
   attributes?: Record<string, unknown>;
 };
+
+export type ExplorerRowWire = [
+  id: string,
+  service: string,
+  name: string,
+  className: string,
+  parentId: string | null,
+  depth: number,
+  index: number | null,
+  flags: number,
+  linkPathKey?: string | null,
+];
+
+const ROW_SERVICE = 1 << 0;
+const ROW_HAS_CHILDREN = 1 << 1;
+const ROW_HAS_PACKAGE_LINK = 1 << 2;
+const ROW_EXPANDED = 1 << 3;
+const ROW_MATCHED = 1 << 4;
+const ROW_DISABLED = 1 << 5;
+const ROW_CAN_RENAME = 1 << 6;
+const ROW_CAN_MOVE = 1 << 7;
+const ROW_CAN_DELETE = 1 << 8;
+
+export function decodeExplorerRow(row: ExplorerRowWire): ExplorerRowSummary {
+  const flags = row[7];
+  const className = row[3];
+  return {
+    id: row[0],
+    service: row[1],
+    name: row[2],
+    className,
+    parentId: row[4],
+    depth: row[5],
+    index: row[6] ?? undefined,
+    kind: flags & ROW_SERVICE ? "service" : "instance",
+    hasChildren: !!(flags & ROW_HAS_CHILDREN),
+    hasPackageLink: !!(flags & ROW_HAS_PACKAGE_LINK),
+    expanded: !!(flags & ROW_EXPANDED),
+    matched: !!(flags & ROW_MATCHED),
+    disabled: !!(flags & ROW_DISABLED),
+    locked: !!(flags & ROW_SERVICE),
+    canRename: !!(flags & ROW_CAN_RENAME),
+    canMove: !!(flags & ROW_CAN_MOVE),
+    canDelete: !!(flags & ROW_CAN_DELETE),
+    isScript: className === "Script" || className === "LocalScript" || className === "ModuleScript",
+    linkPathKey: typeof row[8] === "string" ? row[8] : undefined,
+  };
+}
 
 export type ExplorerBackendResponse = {
   type?: string;
@@ -53,8 +102,7 @@ export type ExplorerBackendResponse = {
   mode?: ExplorerViewMode;
   start?: number;
   totalRows?: number;
-  rows?: ExplorerRowSummary[];
-  matchIds?: string[];
+  rows?: ExplorerRowWire[];
   details?: {
     id?: string;
     treeId?: string;
@@ -87,6 +135,7 @@ export type ExplorerBackendResponse = {
   total?: number;
   matchCount?: number;
   rowIndex?: number;
+  nodeId?: string;
   scrollToSelected?: boolean;
   code?: string;
   message?: string;
@@ -98,7 +147,6 @@ export type ExplorerRowRequest = {
   count: number;
   mode: ExplorerViewMode;
   scrollToSelected: boolean;
-  includeMatchIds: boolean;
   revision?: number;
   generation: number;
 };
@@ -168,22 +216,30 @@ export class ExplorerBackendClient implements vscode.Disposable {
     start: number,
     count: number,
     mode: ExplorerViewMode,
-    includeMatchIds = false,
   ): Promise<ExplorerBackendResponse> {
     return this.request(mode === "search" ? "searchRows" : "getRows", {
       start,
       count,
       mode,
-      includeMatchIds,
     });
   }
 
-  public expand(nodeId: string, mode: ExplorerViewMode): Promise<ExplorerBackendResponse> {
-    return this.request("expand", { nodeId, mode });
+  public expand(
+    nodeId: string,
+    mode: ExplorerViewMode,
+    start: number,
+    count: number,
+  ): Promise<ExplorerBackendResponse> {
+    return this.request("expand", { nodeId, mode, start, count });
   }
 
-  public collapse(nodeId: string, mode: ExplorerViewMode): Promise<ExplorerBackendResponse> {
-    return this.request("collapse", { nodeId, mode });
+  public collapse(
+    nodeId: string,
+    mode: ExplorerViewMode,
+    start: number,
+    count: number,
+  ): Promise<ExplorerBackendResponse> {
+    return this.request("collapse", { nodeId, mode, start, count });
   }
 
   public selectDetails(nodeId: string): Promise<ExplorerBackendResponse> {
@@ -196,6 +252,10 @@ export class ExplorerBackendClient implements vscode.Disposable {
 
   public clearSearch(): Promise<ExplorerBackendResponse> {
     return this.request("clearSearch", {});
+  }
+
+  public searchMatch(nodeId: string | undefined, delta: number): Promise<ExplorerBackendResponse> {
+    return this.request("searchMatch", { nodeId, delta });
   }
 
   public reloadServices(services: string[]): Promise<ExplorerBackendResponse> {
@@ -277,6 +337,7 @@ export class ExplorerBackendClient implements vscode.Disposable {
       searchStart: "ss",
       searchRows: "sr",
       clearSearch: "cs",
+      searchMatch: "sm",
       reloadServices: "rl",
       revealNode: "rv",
     };
@@ -285,9 +346,9 @@ export class ExplorerBackendClient implements vscode.Disposable {
       mode: "m",
       start: "a",
       count: "c",
-      includeMatchIds: "ids",
       query: "q",
       searchId: "sid",
+      delta: "d",
       services: "s",
     };
     const message: Record<string, unknown> = { t: typeMap[type] ?? type, id: requestId };

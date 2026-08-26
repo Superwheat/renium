@@ -1,6 +1,6 @@
 # Capture and device simulation
 
-Read `RENIUM.md` first. Read `RENIUM/playtest.md` too when capturing or configuring a running test.
+Also read `RENIUM/playtest.md` during Play.
 
 ```powershell
 rbx sc --studio -o studio.png
@@ -10,13 +10,13 @@ rbx dev set "iPhone 16 Pro" --orientation portrait --scaling fit
 rbx dev stop
 ```
 
-Screenshots and H.264 MP4 recordings capture only the selected Studio or client window.
+Screenshots and H.264 MP4 recordings capture only the selected window.
 
-Use device simulation only for mobile, resolution, or safe-area checks. Configure or stop it in Edit mode, never during Play, and never use it to repair a hidden normal viewport.
+Use device simulation only for mobile, resolution, or safe-area checks. Configure it in Edit mode, never during Play.
 
-`dev set` returns the resulting state, so don't call `dev status` immediately afterward. Use `dev status` to read existing state later. `dev list` returns selection fields; use `dev list --details` or `dev status --details` only when native dimensions or density are needed.
+`dev set` returns the new state. Use `dev status` later, and `--details` only for native dimensions or density.
 
-Start, act, and end in one shell call so planning time isn't recorded:
+Start, act, and end without pauses:
 
 ```powershell
 rbx rs -p 2 -o test.mp4
@@ -24,4 +24,4 @@ rbx ky W --hold-ms 700 -p 2
 rbx re
 ```
 
-`re` stops the sole active recording; an optional recording ID checks that it is the expected one. End before screenshots, console reads, or other verification.
+`re` stops the active recording; an optional ID verifies it. Stop before other checks.

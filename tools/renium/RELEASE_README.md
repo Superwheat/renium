@@ -2,26 +2,22 @@
 
 ## Windows
 
-Double-click **Install Renium.cmd**. It works from inside the ZIP and after
-extraction.
+Double-click **Install Renium.cmd**. It works inside or outside the ZIP.
 
 ## macOS
 
-Double-click **Install Renium.command**. If macOS blocks it, Control-click the
-file, choose **Open**, then confirm.
+Double-click **Install Renium.command**. If blocked, Control-click it and choose
+**Open**.
 
 ## Linux
 
-Double-click **install.sh** and choose **Run** if your file manager supports it.
-Otherwise, open a terminal in the extracted folder and run:
+Double-click **install.sh**, or run this from the extracted folder:
 
 ```sh
 ./install.sh
 ```
 
-The installer asks which detected editor should receive the Renium extension,
-installs the Studio plugin on Windows and macOS, and puts `renium` on your PATH.
-It uses the files from an extracted ZIP when available and verifies anything it
-downloads. Restart the selected editor and Roblox Studio afterward.
+Choose an editor when asked. The installer adds Renium to `PATH` and installs
+the Studio plugin on Windows and macOS. Restart the editor and Studio.
 
 Full documentation: https://github.com/Superwheat/renium/tree/v{{VERSION}}/tools/renium

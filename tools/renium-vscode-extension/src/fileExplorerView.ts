@@ -4,6 +4,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import {
+  decodeExplorerRow,
   ExplorerBackendClient,
   type ExplorerBackendResponse,
   type ExplorerRowRequest,
@@ -67,7 +68,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private webviewReady = false;
   private lastErrorMessage: string | undefined;
   private readonly backend = new ExplorerBackendClient(getExplorerConfig, (response) => this.onBackendEvent(response));
-  private readonly searchBackend = new ExplorerBackendClient(getExplorerConfig, (response) => this.onBackendEvent(response));
   private clipboardNodeId: string | undefined;
   private currentMode: ExplorerViewMode = "normal";
   private rowWindow = { start: 0, count: 80 };
@@ -348,7 +348,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   public dispose(): void {
     this.stopPackageCursorPolling();
     this.backend.dispose();
-    this.searchBackend.dispose();
   }
 
   public clearSelection(): void {
@@ -472,7 +471,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     this.propertyOnlyStaleServices.clear();
     this.propertiesProvider.resetProjectState();
     this.backend.restart();
-    this.searchBackend.restart();
     this.selectedId = undefined;
     this.currentMode = "normal";
     this.referencePreviewId = undefined;
@@ -598,12 +596,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       if (generation !== this.projectGeneration) {
         return;
       }
-      if (this.searchBackend.hasInitialized()) {
-        await this.searchBackend.reloadServices(canonicalServices).catch(() => undefined);
-        if (generation !== this.projectGeneration) {
-          return;
-        }
-      }
       for (const service of canonicalServices) {
         this.propertyOnlyStaleServices.delete(service);
       }
@@ -661,7 +653,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     await this.propertiesProvider.refreshCurrentForSettingsFiles(settingsFiles);
   }
 
-  private async requestRows(start = this.rowWindow.start, count = this.rowWindow.count, mode = this.currentMode, scrollToSelected = false, includeMatchIds = false, revision?: number): Promise<void> {
+  private async requestRows(start = this.rowWindow.start, count = this.rowWindow.count, mode = this.currentMode, scrollToSelected = false, revision?: number): Promise<void> {
     if (!this.webviewView || !pickWorkspaceRoot()) {
       return;
     }
@@ -674,7 +666,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       count: Math.max(1, Math.min(maxCount, count)),
       mode,
       scrollToSelected,
-      includeMatchIds,
       revision,
       generation: this.projectGeneration,
     };
@@ -692,20 +683,19 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         this.rowWindow = { start: request.start, count: request.count };
         const serial = ++this.rowRequestSerial;
         try {
-          const backend = request.mode === "search" ? this.searchBackend : this.backend;
-          if (request.mode === "search") {
-            await backend.ensureInitialized();
-          }
-          const response = await backend.getRows(request.start, request.count, request.mode, request.includeMatchIds);
+          const response = await this.backend.getRows(
+            request.start,
+            request.count,
+            request.mode,
+          );
           if (
             request.generation !== this.projectGeneration
-            || this.queuedRowRequest
-            || serial !== this.rowRequestSerial
             || request.mode !== this.currentMode
           ) {
-            if (request.mode === this.currentMode) {
-              this.postRowsPrefetch(response, request.revision);
-            }
+            continue;
+          }
+          if (this.queuedRowRequest || serial !== this.rowRequestSerial) {
+            this.postRowsPrefetch(response, request.revision);
             continue;
           }
           this.postRowsWindow(response, request.scrollToSelected, request.revision);
@@ -732,7 +722,12 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private postRowsWindow(response: ExplorerBackendResponse, scrollToSelected = false, revision?: number): void {
+  private postRowsWindow(
+    response: ExplorerBackendResponse,
+    scrollToSelected = false,
+    revision?: number,
+    preserveAnchor = false,
+  ): void {
     if (!this.webviewView || !this.webviewReady || response.type !== "rowsWindow") {
       return;
     }
@@ -745,6 +740,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       scrollToReferencePreview: this.referencePreviewScrollPending,
       hasClipboardInstance: this.hasClipboardInstance(),
       scrollToSelected,
+      preserveAnchor,
       revision,
     });
     this.referencePreviewScrollPending = false;
@@ -758,7 +754,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     this.webviewView.webview.postMessage({
       ...response,
       type: "rowsPrefetch",
-      hasClipboardInstance: this.hasClipboardInstance(),
       revision,
     });
   }
@@ -768,8 +763,9 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   private rememberRows(response: ExplorerBackendResponse): void {
+    const config = getExplorerConfig();
     for (const row of response.rows ?? []) {
-      this.model.rememberNode(this.nodeFromBackend(row));
+      this.model.rememberNode(this.nodeFromBackend(decodeExplorerRow(row), config));
     }
   }
 
@@ -796,11 +792,11 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
     const generation = this.projectGeneration;
     try {
-      const backend = mode === "search" ? this.searchBackend : this.backend;
-      if (mode === "search") {
-        await backend.ensureInitialized();
-      }
-      const response = await backend.getRows(Math.max(0, start), Math.max(1, Math.min(2400, count)), mode);
+      const response = await this.backend.getRows(
+        Math.max(0, start),
+        Math.max(1, Math.min(2400, count)),
+        mode,
+      );
       if (
         generation !== this.projectGeneration
         || !this.webviewView
@@ -810,12 +806,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       ) {
         return;
       }
-      this.rememberRows(response);
-      this.webviewView.webview.postMessage({
-        ...response,
-        type: "rowsPrefetch",
-        revision,
-      });
+      this.postRowsPrefetch(response, revision);
     } catch {
       if (generation === this.projectGeneration) {
         this.webviewView?.webview.postMessage({ type: "rowsPrefetchDone", mode, revision });
@@ -823,12 +814,14 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private nodeFromBackend(row: ExplorerRowSummary | ExplorerBackendResponse["details"]): FileExplorerNode {
+  private nodeFromBackend(
+    row: ExplorerRowSummary | ExplorerBackendResponse["details"],
+    config = getExplorerConfig(),
+  ): FileExplorerNode {
     const id = String(row?.id ?? "");
     const service = String(row?.service ?? this.serviceFromNodeId(id) ?? "");
     const kind = (row?.kind === "service" ? "service" : "instance") as FileExplorerNodeKind;
     const settingsId = typeof row?.settingsId === "string" ? row.settingsId : this.settingsIdFromNodeId(id);
-    const config = getExplorerConfig();
     const hasBackendSettingsFile = !!row && Object.prototype.hasOwnProperty.call(row, "settingsFile");
     return {
       id,
@@ -850,8 +843,12 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         ? typeof row?.settingsFile === "string" ? path.normalize(row.settingsFile) : ""
         : settingsFileForService(config, service),
       sourcePath: typeof row?.sourcePath === "string" ? row.sourcePath : undefined,
-      pathSegments: Array.isArray(row?.pathSegments) ? row.pathSegments : [service],
-      pathOrdinals: Array.isArray(row?.pathOrdinals) ? row.pathOrdinals : [1],
+      pathSegments: Array.isArray(row?.pathSegments)
+        ? row.pathSegments
+        : kind === "service" ? [service] : [],
+      pathOrdinals: Array.isArray(row?.pathOrdinals)
+        ? row.pathOrdinals
+        : kind === "service" ? [1] : [],
       properties: safeObject(row?.properties),
       attributes: safeObject(row?.attributes),
       searchMatched: row?.matched === true,
@@ -971,23 +968,17 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     mode?: ExplorerViewMode,
     start?: number,
     count?: number,
+    revision?: number,
   ): Promise<void> {
     this.currentMode = mode ?? this.currentMode;
+    const windowStart = start ?? this.rowWindow.start;
+    const windowCount = count ?? this.rowWindow.count;
     try {
-      const backend = this.currentMode === "search" ? this.searchBackend : this.backend;
-      if (this.currentMode === "search") {
-        await backend.ensureInitialized();
-      }
-      if (expanded) {
-        await backend.expand(nodeId, this.currentMode);
-      } else {
-        await backend.collapse(nodeId, this.currentMode);
-      }
-      await this.requestRows(
-        start ?? this.rowWindow.start,
-        count ?? this.rowWindow.count,
-        this.currentMode,
-      );
+      const response = expanded
+        ? await this.backend.expand(nodeId, this.currentMode, windowStart, windowCount)
+        : await this.backend.collapse(nodeId, this.currentMode, windowStart, windowCount);
+      this.rowWindow = { start: windowStart, count: windowCount };
+      this.postRowsWindow(response, false, revision, true);
     } catch (error) {
       if (expanded) {
         this.webviewView?.webview.postMessage({ type: "loadComplete", nodeId, ok: false });
@@ -1002,6 +993,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   private async onMessage(message: {
     type?: string;
     nodeId?: string;
+    revealId?: string;
     targetId?: string;
     linkId?: string;
     className?: string;
@@ -1012,6 +1004,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     count?: number;
     mode?: ExplorerViewMode;
     revision?: number;
+    delta?: number;
     expanded?: boolean;
     command?: string;
     historyId?: string;
@@ -1061,7 +1054,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       case "getRows":
         this.currentMode = message.mode ?? this.currentMode;
-        await this.requestRows(message.start ?? 0, message.count ?? 120, this.currentMode, false, false, message.revision);
+        await this.requestRows(message.start ?? 0, message.count ?? 120, this.currentMode, false, message.revision);
         return;
       case "prefetchRows":
         void this.prefetchRows(message.start ?? 0, message.count ?? 700, message.mode ?? this.currentMode, message.revision);
@@ -1159,27 +1152,34 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         this.searchGeneration += 1;
         this.currentMode = "normal";
         await this.backend.clearSearch();
-        if (this.searchBackend.hasInitialized()) {
-          await this.searchBackend.clearSearch().catch(() => undefined);
-        }
         const count = message.count ?? 120;
         let start = 0;
-        if (this.selectedId) {
-          const reveal = await this.backend.revealNode(this.selectedId);
+        if (message.revealId) {
+          const reveal = await this.backend.revealNode(message.revealId);
           if (typeof reveal.rowIndex === "number") {
             start = Math.max(0, reveal.rowIndex - Math.floor(count / 2));
           }
         }
-        await this.requestRows(start, count, "normal", !!this.selectedId);
+        await this.requestRows(start, count, "normal", !!message.revealId);
         return;
+      case "jumpMatch": {
+        const result = await this.backend.searchMatch(this.selectedId, message.delta ?? 1);
+        this.webviewView?.webview.postMessage({
+          type: "searchMatch",
+          nodeId: result.nodeId,
+          rowIndex: result.rowIndex,
+          revision: message.revision,
+        });
+        return;
+      }
       case "expandNode":
         if (message.nodeId) {
-          await this.setNodeExpanded(message.nodeId, true, message.mode, message.start, message.count);
+          await this.setNodeExpanded(message.nodeId, true, message.mode, message.start, message.count, message.revision);
         }
         return;
       case "collapseNode":
         if (message.nodeId) {
-          await this.setNodeExpanded(message.nodeId, false, message.mode, message.start, message.count);
+          await this.setNodeExpanded(message.nodeId, false, message.mode, message.start, message.count, message.revision);
         }
         return;
       case "selectNode":
@@ -1244,7 +1244,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
             if (!current || current.kind === "service") {
               return;
             }
-            await this.actions.deleteInstance(current);
+            await this.actions.deleteInstance(await this.model.ensureLoaded(current));
             this.postOptimisticDelete(current.treeId);
             void this.refreshServices([current.service]);
           });
@@ -1342,17 +1342,14 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       this.webviewView?.webview.postMessage({ type: "searchStatus", loading: true, loaded: 0, total: 0, matchCount: 0 });
-      if (this.searchBackend.hasPendingRequests()) {
-        this.searchBackend.restart();
-      }
       let lastError: unknown;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-          await this.searchBackend.ensureInitialized();
-          const searchStatus = await this.searchBackend.searchStart(trimmedQuery, searchId);
+          await this.backend.ensureInitialized();
+          const searchStatus = await this.backend.searchStart(trimmedQuery, searchId);
           if (projectGeneration === this.projectGeneration && generation === this.searchGeneration) {
-            const firstCount = Math.max(700, Math.min(1800, count ?? this.rowWindow.count));
-            const searchRows = await this.searchBackend.getRows(0, firstCount, "search");
+            const firstCount = Math.max(220, Math.min(500, count ?? this.rowWindow.count));
+            const searchRows = await this.backend.getRows(0, firstCount, "search");
             if (
               projectGeneration === this.projectGeneration
               && generation === this.searchGeneration
@@ -1376,7 +1373,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           }
           const message = error instanceof Error ? error.message : String(error);
           if (attempt === 0 && /Explorer backend exited|timed out|not running|restarted/i.test(message)) {
-            this.searchBackend.restart();
+            this.backend.restart();
             continue;
           }
           throw error;
@@ -1393,7 +1390,8 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
 
   private async createInstance(parent: FileExplorerNode, className: string, name: string): Promise<void> {
     try {
-      const created = await this.model.addInstance(parent, className, name);
+      const loadedParent = await this.model.ensureLoaded(parent);
+      const created = await this.model.addInstance(loadedParent, className, name);
       await this.refreshAfterMutation(created, [parent.service]);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to add instance. ${error instanceof Error ? error.message : String(error)}`);
@@ -1920,9 +1918,6 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
       const services = Array.from(changedServices);
       if (services.length > 0) {
         await this.backend.reloadServices(services);
-        if (this.searchBackend.hasInitialized()) {
-          await this.searchBackend.reloadServices(services).catch(() => undefined);
-        }
         await this.propertiesProvider.refreshCurrentForServices(services);
         await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
       }

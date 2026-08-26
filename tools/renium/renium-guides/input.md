@@ -1,6 +1,6 @@
 # UI, input, and world interaction
 
-Read `RENIUM.md` first. Read `RENIUM/playtest.md` too when the task needs Play.
+Also read `RENIUM/playtest.md` for Play tasks.
 
 ```powershell
 rbx ui -p 2
@@ -14,10 +14,10 @@ rbx go --pos "745,40,510" -p 2
 rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20
 ```
 
-Run `ui` first and reuse its `p` path exactly; paths are relative to `PlayerGui`, though a leading `PlayerGui.` is also accepted. Duplicate names use `Name[n]`; ambiguity returns candidates. `pr --world` needs an on-screen target, so use `go` first. Injected clicks can't fire `ClickDetector`; use a `ProximityPrompt` or game input path.
+Run `ui` first and reuse its `p` path. Paths are relative to `PlayerGui`; a leading `PlayerGui.` also works. Use `Name[n]` for duplicates. `pr --world` requires an on-screen target, so use `go` first. Injected clicks can't fire `ClickDetector`; use a `ProximityPrompt` or game input.
 
-`go` finishes within eight studs of its target so nearby interaction is possible; its result includes the final distance.
+`go` stops within eight studs and returns the final distance.
 
-Input targets one Play window without moving the system cursor or taking focus. The orange native shield stops physical input from interrupting an active sequence. Roblox reserves Escape for CoreGui, so use the game's on-screen control or an alternate key.
+Input targets one Play window without moving the cursor or taking focus. The orange shield blocks interfering physical input. Roblox reserves Escape for CoreGui; use an on-screen control or another key.
 
-Use `inp` when order matters: `rbx inp -p 1 click "Shop.BuyButton" wait 100 key E`. Each action is followed by its target or value; no payload file is needed.
+For ordered input: `rbx inp -p 1 click "Shop.BuyButton" wait 100 key E`. Each action is followed by its value.

@@ -1,7 +1,7 @@
-# About the project
+# Renium
 
-Renium is a Roblox daemon sync tool, written mostly in rust. It was built to solve multiple issues, long sync times in other similar tools like Argon/Rojo and the inefficiencies of Roblox MCP, such as its token hungry nature and slow commands.
-It is still in active development and any suggestions/bug reports are greatly appreciated.
+Renium is a fast, two-way Roblox Studio sync and automation tool written mostly
+in Rust. Bug reports and suggestions are welcome.
 
 ## Components
 
@@ -11,19 +11,18 @@ It is still in active development and any suggestions/bug reports are greatly ap
 
 ## Getting started
 
-1. On Windows, download **Install-Renium.cmd** from [GitHub Releases](https://github.com/Superwheat/renium/releases/latest) and double-click it. The installer selects x64 or ARM64 and asks which detected editor to use. On macOS or Linux, download the matching platform ZIP and run its installer.
+1. Download **Install-Renium.cmd** on Windows, or the matching platform ZIP on
+   macOS/Linux, from [GitHub Releases](https://github.com/Superwheat/renium/releases/latest).
 2. Restart the selected editor and Roblox Studio.
 3. See [tools/renium/README.md](tools/renium/README.md) for the command reference, and [AGENTS.md](AGENTS.md) if you are pointing an AI agent at it.
 
-Renium's Rust updater checks the signed GitHub Release manifest when the editor
-opens. The daemon also checks when a Studio process first connects and suppresses
-its reconnects for five minutes. The update notification installs the matching
-extension and Studio plugin together.
+Signed updates install matching CLI, extension, and Studio plugin versions.
 
 To build from source, run `cargo build --release --manifest-path tools/renium/Cargo.toml`.
-Generated binaries, VSIX packages, and plugin models are release artifacts and
-are not stored in the source repository.
+Built executables, VSIX files, and plugin models aren't stored in Git.
 
 ## License
 
-Licensed under [AGPL-3.0 with the Commons Clause](LICENSE): free for everyone, including commercial game development. Forks are welcome and must stay open source; selling the software (or paid hosting/support built on it) is not permitted.
+Licensed under [AGPL-3.0 with the Commons Clause](LICENSE). Commercial game
+development is allowed. Forks must stay open source; selling Renium or paid
+hosting/support isn't permitted.

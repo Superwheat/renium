@@ -226,7 +226,7 @@ export function buildChangePreviewHtml(
       <span id="count-label">Protected full import in <b id="secs">90</b>s &mdash; hover the list to pause</span>
       <div class="countdown-bar"><div class="countdown-fill" id="fill"></div></div>
     </div>
-    <button class="skip" id="skip" title="Acknowledge without touching editor files">Skip batch</button>
+    <button class="skip" id="skip" title="Keep this batch pending">Review later</button>
     ${mode === "structural"
       ? '<button class="apply" id="full" title="Re-export and import everything that differs">Import</button>'
       : '<button class="full" id="full" title="Safest: re-export and import everything that differs">Full import</button>\n    <button class="apply" id="apply" title="Write exactly these changes to the editor files">Apply changes</button>'}
@@ -481,7 +481,7 @@ export function buildChangePreviewHtml(
   const applyButton = document.getElementById("apply");
   if (applyButton) applyButton.addEventListener("click", () => vscode.postMessage({ action: "apply" }));
   document.getElementById("full").addEventListener("click", () => vscode.postMessage({ action: "full" }));
-  document.getElementById("skip").addEventListener("click", () => vscode.postMessage({ action: "discard" }));
+  document.getElementById("skip").addEventListener("click", () => vscode.postMessage({ action: "pending" }));
 </script>
 </body>
 </html>`;

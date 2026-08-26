@@ -147,8 +147,7 @@ pub(super) fn run_daemon(
     bridge: Option<&BridgeConnectionArgs>,
 ) -> Result<()> {
     let result = daemon_result(operation, project, parameters, reviewed, bridge)?;
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    app::output::print_json_output(&result, false)
 }
 
 pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> Result<()> {
@@ -347,7 +346,7 @@ pub(crate) fn image_upload(args: ImageUploadArgs, project: Option<&Path>) -> Res
             .map_or_else(std::env::current_dir, |loaded| Ok(loaded.root))?;
         let result =
             cloud::assets::upload(&root, &parameters, None).map_err(cloud::command::cloud_error)?;
-        return app::output::print_json_output(&result, true);
+        return app::output::print_json_output(&result, false);
     }
     run_daemon(
         op::IMAGE_UPLOAD,

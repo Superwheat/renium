@@ -355,6 +355,9 @@ pub(crate) fn append_editor_property_changes(
     let paths_by_index = build_editor_instance_paths(document, service);
     let settings_ids_by_index = editor_settings_ids(document);
     for (index, instance) in document.instances.iter().enumerate() {
+        if instance.class_name == "PackageLink" {
+            continue;
+        }
         if !filter.includes_instance(&instance.settings_id) {
             continue;
         }
@@ -429,6 +432,9 @@ pub(crate) fn append_native_editor_full_property_changes(
     let root_index = editor_service_root_index(document, service);
     let settings_ids_by_index = editor_settings_ids(document);
     for (index, instance) in document.instances.iter().enumerate() {
+        if instance.class_name == "PackageLink" {
+            continue;
+        }
         let direct_service_child = instance.parent_index == root_index;
         if service == "Workspace"
             && direct_service_child

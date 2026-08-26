@@ -663,7 +663,11 @@ fn bytecode_explorer_batch_op_json(
 
     match kind {
         "counts" => {
-            let root_index = editor_service_root_index(ctx.document, ctx.service);
+            let root_index = bytecode_batch_instance_index(ctx.document, ctx.service, op, true)?;
+            if root_index.is_none() {
+                insert_top_field(&mut response, mode, "found", Value::Bool(false));
+                return Ok(Value::Object(response));
+            }
             let (root_id, root_children, descendants) = if let Some(index) = root_index {
                 let root_children = ctx
                     .children_by_parent
@@ -745,12 +749,24 @@ fn bytecode_explorer_batch_op_json(
         "search" => {
             let query = op.query.as_deref().unwrap_or_default();
             let limit = op.limit.unwrap_or(20);
-            let root_index = editor_service_root_index(ctx.document, ctx.service);
+            let root_index = bytecode_batch_instance_index(ctx.document, ctx.service, op, true)?;
+            let Some(root_index) = root_index else {
+                insert_top_field(&mut response, mode, "found", Value::Bool(false));
+                return Ok(Value::Object(response));
+            };
             let groups = explorer_search_groups(query);
             let mut match_indices = Vec::new();
             let mut visible_indices = HashSet::new();
             if !groups.is_empty() {
-                for index in 0..ctx.document.instances.len() {
+                let mut candidates = vec![root_index];
+                let mut cursor = 0usize;
+                while cursor < candidates.len() {
+                    if let Some(children) = ctx.children_by_parent.get(candidates[cursor]) {
+                        candidates.extend(children.iter().copied());
+                    }
+                    cursor += 1;
+                }
+                for index in candidates {
                     if explorer_search_instance_matches(
                         ctx.document,
                         ctx.service_path_segments_by_index,
@@ -763,7 +779,9 @@ fn bytecode_explorer_batch_op_json(
                         match_indices.push(index);
                         let mut current = Some(index);
                         while let Some(ancestor_index) = current {
-                            if !visible_indices.insert(ancestor_index) {
+                            if !visible_indices.insert(ancestor_index)
+                                || ancestor_index == root_index
+                            {
                                 break;
                             }
                             current = ctx.document.instances[ancestor_index].parent_index;
@@ -771,9 +789,7 @@ fn bytecode_explorer_batch_op_json(
                     }
                 }
             }
-            if let Some(index) = root_index {
-                visible_indices.insert(index);
-            }
+            visible_indices.insert(root_index);
             let projection = ctx.service_projection(mode, fields.as_ref());
             let nodes = (0..ctx.document.instances.len())
                 .filter(|index| visible_indices.contains(index))
@@ -785,8 +801,10 @@ fn bytecode_explorer_batch_op_json(
                     node
                 })
                 .collect::<Vec<_>>();
-            let root_ids = root_index
-                .and_then(|index| ctx.document.instances.get(index))
+            let root_ids = ctx
+                .document
+                .instances
+                .get(root_index)
                 .map(|instance| vec![Value::String(instance.settings_id.clone())])
                 .unwrap_or_default();
             let match_ids = match_indices
@@ -1383,30 +1401,6 @@ enum ExplorerViewMode {
     Search,
 }
 
-struct ExplorerRowWindow {
-    mode: ExplorerViewMode,
-    start: usize,
-    end: usize,
-    rows: Vec<Value>,
-    index: usize,
-}
-
-impl ExplorerRowWindow {
-    fn new(mode: ExplorerViewMode, start: usize, count: usize) -> Self {
-        Self {
-            mode,
-            start,
-            end: start.saturating_add(count),
-            rows: Vec::with_capacity(count.min(512)),
-            index: 0,
-        }
-    }
-
-    fn includes_current(&self) -> bool {
-        self.index >= self.start && self.index < self.end
-    }
-}
-
 impl ExplorerViewMode {
     fn parse(value: Option<&str>) -> Self {
         match value {
@@ -1422,12 +1416,33 @@ impl ExplorerViewMode {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct ExplorerFlatRow {
+    service_index: usize,
+    instance_index: Option<usize>,
+    depth: usize,
+}
+
+const EXPLORER_ROW_SERVICE: u16 = 1 << 0;
+const EXPLORER_ROW_HAS_CHILDREN: u16 = 1 << 1;
+const EXPLORER_ROW_HAS_PACKAGE_LINK: u16 = 1 << 2;
+const EXPLORER_ROW_EXPANDED: u16 = 1 << 3;
+const EXPLORER_ROW_MATCHED: u16 = 1 << 4;
+const EXPLORER_ROW_DISABLED: u16 = 1 << 5;
+const EXPLORER_ROW_CAN_RENAME: u16 = 1 << 6;
+const EXPLORER_ROW_CAN_MOVE: u16 = 1 << 7;
+const EXPLORER_ROW_CAN_DELETE: u16 = 1 << 8;
+
+struct ExplorerSearchService {
+    visible: Vec<bool>,
+    matches: Vec<bool>,
+}
+
 struct ExplorerSearchView {
     search_id: u64,
     query: String,
-    visible_by_service: HashMap<String, HashSet<usize>>,
-    matches_by_service: HashMap<String, HashSet<usize>>,
-    match_ids: Vec<String>,
+    services: HashMap<String, ExplorerSearchService>,
     match_count: usize,
 }
 
@@ -1455,6 +1470,8 @@ struct ExplorerDaemonState {
     expanded: HashSet<String>,
     search_collapsed: HashSet<String>,
     search: Option<ExplorerSearchView>,
+    normal_rows: Vec<ExplorerFlatRow>,
+    search_rows: Vec<ExplorerFlatRow>,
     snapshot_version: u64,
     view_version: u64,
 }
@@ -1600,6 +1617,12 @@ impl ExplorerDaemonState {
         if let Some(search) = self.search.take() {
             self.search = Some(self.build_search_view(search.search_id, &search.query));
         }
+        self.rebuild_rows(ExplorerViewMode::Normal);
+        if self.search.is_some() {
+            self.rebuild_rows(ExplorerViewMode::Search);
+        } else {
+            self.search_rows.clear();
+        }
         Ok(())
     }
 
@@ -1612,7 +1635,7 @@ impl ExplorerDaemonState {
     }
 
     fn total_rows(&self, mode: ExplorerViewMode) -> usize {
-        self.collect_rows_window(mode, 0, 0).1
+        self.rows(mode).len()
     }
 
     fn rows_window(
@@ -1621,18 +1644,24 @@ impl ExplorerDaemonState {
         mode: ExplorerViewMode,
         start: usize,
         count: usize,
-        include_match_ids: bool,
     ) -> Value {
         let started = Instant::now();
-        let (window, total_rows) = self.collect_rows_window(mode, start, count);
+        let flat_rows = self.rows(mode);
+        let total_rows = flat_rows.len();
         let safe_start = start.min(total_rows);
-        let match_ids = if mode == ExplorerViewMode::Search && include_match_ids {
-            self.search
-                .as_ref()
-                .map_or(Value::Null, |search| json!(&search.match_ids))
-        } else {
-            Value::Null
-        };
+        let safe_end = safe_start.saturating_add(count).min(total_rows);
+        let mut window = Vec::with_capacity(safe_end - safe_start);
+        for row in &flat_rows[safe_start..safe_end] {
+            let Some(service) = self.services.get(row.service_index) else {
+                continue;
+            };
+            let state = self.service_states.get(service);
+            if let (Some(state), Some(instance_index)) = (state, row.instance_index) {
+                self.push_instance_row(&mut window, state, instance_index, row.depth, mode);
+            } else {
+                self.push_service_row(&mut window, service, state, row.depth, mode);
+            }
+        }
         let match_count = if mode == ExplorerViewMode::Search {
             self.search
                 .as_ref()
@@ -1650,7 +1679,6 @@ impl ExplorerDaemonState {
             "start": safe_start,
             "totalRows": total_rows,
             "rows": window,
-            "matchIds": match_ids,
             "matchCount": match_count,
             "metrics": {
                 "backendMs": elapsed_ms(started),
@@ -1668,6 +1696,7 @@ impl ExplorerDaemonState {
                 self.expanded.insert(node_id.to_string());
             }
         }
+        self.rebuild_rows(mode);
         self.view_version += 1;
     }
 
@@ -1680,25 +1709,14 @@ impl ExplorerDaemonState {
                 self.expanded.remove(node_id);
             }
         }
+        self.rebuild_rows(mode);
         self.view_version += 1;
-    }
-
-    fn invalidate_rows(&self, request_id: u64, mode: ExplorerViewMode) -> Value {
-        let total_rows = self.total_rows(mode);
-        json!({
-            "type": "invalidateRows",
-            "requestId": request_id,
-            "snapshotVersion": self.snapshot_version,
-            "viewVersion": self.view_version,
-            "start": 0,
-            "end": total_rows,
-            "totalRows": total_rows,
-        })
     }
 
     fn clear_search(&mut self) {
         self.search = None;
         self.search_collapsed.clear();
+        self.search_rows.clear();
         self.view_version += 1;
     }
 
@@ -1706,6 +1724,7 @@ impl ExplorerDaemonState {
         let started = Instant::now();
         self.search = Some(self.build_search_view(search_id, query));
         self.search_collapsed.clear();
+        self.rebuild_rows(ExplorerViewMode::Search);
         self.view_version += 1;
         let match_count = self.search.as_ref().map_or(0, |search| search.match_count);
         json!({
@@ -1725,9 +1744,8 @@ impl ExplorerDaemonState {
     fn build_search_view(&self, search_id: u64, query: &str) -> ExplorerSearchView {
         let groups = explorer_search_groups(query);
         let fast_name_groups = explorer_search_fast_name_groups(&groups);
-        let mut visible_by_service: HashMap<String, HashSet<usize>> = HashMap::new();
-        let mut matches_by_service: HashMap<String, HashSet<usize>> = HashMap::new();
-        let mut match_ids = Vec::new();
+        let mut services = HashMap::new();
+        let mut match_count = 0;
         if !groups.is_empty() {
             for service in &self.services {
                 let Some(state) = self.service_states.get(service) else {
@@ -1736,7 +1754,9 @@ impl ExplorerDaemonState {
                 let Some(document) = state.document.as_ref() else {
                     continue;
                 };
-                for index in 0..document.instances.len() {
+                let mut visible = vec![false; document.instances.len()];
+                let mut matches_by_index = vec![false; document.instances.len()];
+                for (index, match_entry) in matches_by_index.iter_mut().enumerate() {
                     let matches = if let Some(fast_groups) = fast_name_groups.as_ref() {
                         explorer_search_fast_name_matches(
                             state.name_search_text.get(index).map_or("", String::as_str),
@@ -1753,31 +1773,32 @@ impl ExplorerDaemonState {
                     if !matches {
                         continue;
                     }
-                    matches_by_service
-                        .entry(service.clone())
-                        .or_default()
-                        .insert(index);
-                    if let Some(instance) = document.instances.get(index) {
-                        match_ids.push(explorer_instance_tree_id(service, &instance.settings_id));
-                    }
+                    *match_entry = true;
+                    match_count += 1;
                     let mut current = Some(index);
                     while let Some(ancestor_index) = current {
-                        visible_by_service
-                            .entry(service.clone())
-                            .or_default()
-                            .insert(ancestor_index);
+                        if visible[ancestor_index] {
+                            break;
+                        }
+                        visible[ancestor_index] = true;
                         current = document.instances[ancestor_index].parent_index;
                     }
                 }
+                if matches_by_index.iter().any(|matches| *matches) {
+                    services.insert(
+                        service.clone(),
+                        ExplorerSearchService {
+                            visible,
+                            matches: matches_by_index,
+                        },
+                    );
+                }
             }
         }
-        let match_count = match_ids.len();
         ExplorerSearchView {
             search_id,
             query: query.to_string(),
-            visible_by_service,
-            matches_by_service,
-            match_ids,
+            services,
             match_count,
         }
     }
@@ -1885,27 +1906,38 @@ impl ExplorerDaemonState {
             .map(|index| (service.to_string(), index))
     }
 
-    fn collect_rows_window(
-        &self,
-        mode: ExplorerViewMode,
-        start: usize,
-        count: usize,
-    ) -> (Vec<Value>, usize) {
-        let mut window = ExplorerRowWindow::new(mode, start, count);
-        for service in &self.services {
+    fn rows(&self, mode: ExplorerViewMode) -> &[ExplorerFlatRow] {
+        match mode {
+            ExplorerViewMode::Normal => &self.normal_rows,
+            ExplorerViewMode::Search => &self.search_rows,
+        }
+    }
+
+    fn rebuild_rows(&mut self, mode: ExplorerViewMode) {
+        let rows = self.build_rows(mode);
+        match mode {
+            ExplorerViewMode::Normal => self.normal_rows = rows,
+            ExplorerViewMode::Search => self.search_rows = rows,
+        }
+    }
+
+    fn build_rows(&self, mode: ExplorerViewMode) -> Vec<ExplorerFlatRow> {
+        let mut rows = Vec::new();
+        for (service_index, service) in self.services.iter().enumerate() {
             let state = self.service_states.get(service);
             if mode == ExplorerViewMode::Search
                 && !self
                     .search
                     .as_ref()
-                    .is_some_and(|search| search.visible_by_service.contains_key(service))
+                    .is_some_and(|search| search.services.contains_key(service))
             {
                 continue;
             }
-            if window.includes_current() {
-                self.push_service_row(&mut window.rows, service, state, 0, mode);
-            }
-            window.index += 1;
+            rows.push(ExplorerFlatRow {
+                service_index,
+                instance_index: None,
+                depth: 0,
+            });
             let service_id = explorer_service_tree_id(service);
             let expanded = match mode {
                 ExplorerViewMode::Search => !self.search_collapsed.contains(&service_id),
@@ -1915,39 +1947,42 @@ impl ExplorerDaemonState {
                 && let Some(state) = state
                 && let Some(root_index) = state.root_index
             {
-                self.collect_instance_rows_window(state, root_index, 1, &mut window);
+                self.collect_instance_rows(state, service_index, root_index, 1, mode, &mut rows);
             }
         }
-        (window.rows, window.index)
+        rows
     }
 
-    fn collect_instance_rows_window(
+    fn collect_instance_rows(
         &self,
         state: &ExplorerServiceState,
+        service_index: usize,
         parent_index: usize,
         depth: usize,
-        window: &mut ExplorerRowWindow,
+        mode: ExplorerViewMode,
+        rows: &mut Vec<ExplorerFlatRow>,
     ) {
         let children = state
             .children_by_parent
             .get(parent_index)
             .map_or(&[][..], Vec::as_slice);
         for child_index in children {
-            if window.mode == ExplorerViewMode::Search
+            if mode == ExplorerViewMode::Search
                 && !self.search_contains(&state.service, *child_index)
             {
                 continue;
             }
-            if window.includes_current() {
-                self.push_instance_row(&mut window.rows, state, *child_index, depth, window.mode);
-            }
-            window.index += 1;
+            rows.push(ExplorerFlatRow {
+                service_index,
+                instance_index: Some(*child_index),
+                depth,
+            });
             let node_id = state
                 .document
                 .as_ref()
                 .and_then(|document| document.instances.get(*child_index))
                 .map(|instance| explorer_instance_tree_id(&state.service, &instance.settings_id));
-            let is_open = match (window.mode, node_id.as_deref()) {
+            let is_open = match (mode, node_id.as_deref()) {
                 (ExplorerViewMode::Search, Some(node_id)) => {
                     !self.search_collapsed.contains(node_id)
                 }
@@ -1955,9 +1990,117 @@ impl ExplorerDaemonState {
                 _ => false,
             };
             if is_open {
-                self.collect_instance_rows_window(state, *child_index, depth + 1, window);
+                self.collect_instance_rows(
+                    state,
+                    service_index,
+                    *child_index,
+                    depth + 1,
+                    mode,
+                    rows,
+                );
             }
         }
+    }
+
+    fn search_match(&self, request_id: u64, current_id: Option<&str>, delta: i64) -> Value {
+        let current_index =
+            current_id.and_then(|node_id| self.row_index(ExplorerViewMode::Search, node_id));
+        let target = if delta < 0 {
+            self.search_rows
+                .iter()
+                .enumerate()
+                .take(current_index.unwrap_or(self.search_rows.len()))
+                .rev()
+                .find(|(_, row)| self.flat_row_matches(row))
+                .or_else(|| {
+                    self.search_rows
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, row)| self.flat_row_matches(row))
+                })
+        } else {
+            self.search_rows
+                .iter()
+                .enumerate()
+                .skip(current_index.map_or(0, |index| index + 1))
+                .find(|(_, row)| self.flat_row_matches(row))
+                .or_else(|| {
+                    self.search_rows
+                        .iter()
+                        .enumerate()
+                        .find(|(_, row)| self.flat_row_matches(row))
+                })
+        };
+        let (row_index, node_id) = target
+            .and_then(|(index, row)| self.flat_row_id(row).map(|node_id| (index, node_id)))
+            .map_or((Value::Null, Value::Null), |(index, node_id)| {
+                (json!(index), json!(node_id))
+            });
+        json!({
+            "type": "searchMatch",
+            "requestId": request_id,
+            "rowIndex": row_index,
+            "nodeId": node_id,
+        })
+    }
+
+    fn flat_row_matches(&self, row: &ExplorerFlatRow) -> bool {
+        let Some(service) = self.services.get(row.service_index) else {
+            return false;
+        };
+        let Some(search_service) = self
+            .search
+            .as_ref()
+            .and_then(|search| search.services.get(service))
+        else {
+            return false;
+        };
+        let index = row.instance_index.or_else(|| {
+            self.service_states
+                .get(service)
+                .and_then(|state| state.root_index)
+        });
+        index
+            .and_then(|index| search_service.matches.get(index))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn flat_row_id(&self, row: &ExplorerFlatRow) -> Option<String> {
+        let service = self.services.get(row.service_index)?;
+        let Some(index) = row.instance_index else {
+            return Some(explorer_service_tree_id(service));
+        };
+        self.service_states
+            .get(service)?
+            .document
+            .as_ref()?
+            .instances
+            .get(index)
+            .map(|instance| explorer_instance_tree_id(service, &instance.settings_id))
+    }
+
+    fn row_index(&self, mode: ExplorerViewMode, node_id: &str) -> Option<usize> {
+        let (service, instance_index) = if let Some(service) = node_id.strip_prefix("service:") {
+            (service, None)
+        } else {
+            let (service, index) = self.resolve_node_index(node_id)?;
+            return self.rows(mode).iter().position(|row| {
+                row.instance_index == Some(index)
+                    && self
+                        .services
+                        .get(row.service_index)
+                        .is_some_and(|name| name == &service)
+            });
+        };
+        self.rows(mode).iter().position(|row| {
+            row.instance_index == instance_index
+                && self
+                    .services
+                    .get(row.service_index)
+                    .is_some_and(|name| name == service)
+        })
     }
 
     fn push_service_row(
@@ -1969,63 +2112,52 @@ impl ExplorerDaemonState {
         mode: ExplorerViewMode,
     ) {
         let id = explorer_service_tree_id(service);
-        let (settings_id, settings_file, index, child_count, matched) = if let Some(state) = state {
+        let (index, child_count, matched) = if let Some(state) = state {
             let root_index = state.root_index;
-            let settings_id = root_index.and_then(|root_index| {
-                state
-                    .canonical_settings_ids_by_index
-                    .get(root_index)
-                    .and_then(std::clone::Clone::clone)
-            });
-            let settings_file = root_index.and_then(|root_index| {
-                state
-                    .settings_files_by_index
-                    .get(root_index)
-                    .and_then(|path| path.as_ref())
-                    .map(|path| path.to_string_lossy().into_owned())
-            });
             let child_count = root_index.map_or(0, |root_index| {
                 self.visible_child_count(state, root_index, mode)
             });
             let matched = self
                 .search
                 .as_ref()
-                .and_then(|search| search.matches_by_service.get(service))
+                .and_then(|search| search.services.get(service))
                 .zip(root_index)
-                .is_some_and(|(matches, root_index)| matches.contains(&root_index));
-            (settings_id, settings_file, root_index, child_count, matched)
+                .is_some_and(|(search_service, root_index)| {
+                    search_service
+                        .matches
+                        .get(root_index)
+                        .copied()
+                        .unwrap_or(false)
+                });
+            (root_index, child_count, matched)
         } else {
-            (None, None, None, 0, false)
+            (None, 0, false)
         };
         let expanded = match mode {
             ExplorerViewMode::Search => child_count > 0 && !self.search_collapsed.contains(&id),
             ExplorerViewMode::Normal => child_count > 0 && self.expanded.contains(&id),
         };
-        rows.push(json!({
-            "id": id,
-            "settingsId": settings_id,
-            "settingsFile": settings_file,
-            "index": index,
-            "kind": "service",
-            "service": service,
-            "name": service,
-            "className": service,
-            "parentId": Value::Null,
-            "pathSegments": [service],
-            "pathOrdinals": [1],
-            "depth": depth,
-            "hasChildren": child_count > 0,
-            "childCount": child_count,
-            "expanded": expanded,
-            "matched": matched,
-            "iconName": icon_asset_name_for_class_rs(service),
-            "isScript": false,
-            "disabled": false,
-            "locked": true,
-            "canRename": true,
-            "canMove": false,
-            "canDelete": false,
-        }));
+        let mut flags = EXPLORER_ROW_SERVICE | EXPLORER_ROW_CAN_RENAME;
+        if child_count > 0 {
+            flags |= EXPLORER_ROW_HAS_CHILDREN;
+        }
+        if expanded {
+            flags |= EXPLORER_ROW_EXPANDED;
+        }
+        if matched {
+            flags |= EXPLORER_ROW_MATCHED;
+        }
+        rows.push(json!([
+            id,
+            service,
+            service,
+            service,
+            Value::Null,
+            depth,
+            index,
+            flags,
+            Value::Null,
+        ]));
     }
 
     fn push_instance_row(
@@ -2051,8 +2183,10 @@ impl ExplorerDaemonState {
         let matched = self
             .search
             .as_ref()
-            .and_then(|search| search.matches_by_service.get(&state.service))
-            .is_some_and(|matches| matches.contains(&index));
+            .and_then(|search| search.services.get(&state.service))
+            .and_then(|search_service| search_service.matches.get(index))
+            .copied()
+            .unwrap_or(false);
         let disabled = matches!(instance.class_name.as_str(), "Script" | "LocalScript")
             && instance
                 .properties
@@ -2060,61 +2194,58 @@ impl ExplorerDaemonState {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         let parent_id = explorer_parent_tree_id(&state.service, document, state.root_index, index);
-        let path_segments = state
-            .path_segments_by_index
-            .get(index)
-            .and_then(std::clone::Clone::clone)
-            .unwrap_or_else(|| vec![state.service.clone(), instance.name.clone()]);
-        let path_ordinals = state
-            .path_ordinals_by_index
-            .get(index)
-            .and_then(std::clone::Clone::clone)
-            .unwrap_or_default();
         let has_package_link =
             has_direct_package_link_child(document, &state.children_by_parent, index);
-        let settings_id = state
-            .canonical_settings_ids_by_index
-            .get(index)
-            .and_then(|settings_id| settings_id.as_deref())
-            .unwrap_or(&instance.settings_id);
-        let settings_file = state
-            .settings_files_by_index
+        let is_package_link = instance.class_name == "PackageLink";
+        let protected = is_protected_starter_player_container(document, index);
+        let link_path_key = state
+            .path_segments_by_index
             .get(index)
             .and_then(|path| path.as_ref())
-            .map(|path| path.to_string_lossy().into_owned());
-        rows.push(json!({
-            "id": id,
-            "settingsId": settings_id,
-            "settingsFile": settings_file,
-            "index": index,
-            "kind": "instance",
-            "service": state.service,
-            "name": instance.name,
-            "className": instance.class_name,
-            "parentId": parent_id,
-            "pathSegments": path_segments,
-            "pathOrdinals": path_ordinals,
-            "depth": depth,
-            "hasChildren": child_count > 0,
-            "childCount": child_count,
-            "hasPackageLink": has_package_link,
-            "expanded": expanded,
-            "matched": matched,
-            "iconName": icon_asset_name_for_class_rs(&instance.class_name),
-            "isScript": matches!(instance.class_name.as_str(), "Script" | "LocalScript" | "ModuleScript"),
-            "disabled": disabled,
-            "locked": false,
-            "canRename": true,
-            "canMove": !is_protected_starter_player_container(document, index),
-            "canDelete": !is_protected_starter_player_container(document, index),
-        }));
+            .filter(|path| path.len() > 1)
+            .map(|path| format!("{}\u{1}{}", path[0], path[1..].join("/")));
+        let mut flags = 0;
+        if child_count > 0 {
+            flags |= EXPLORER_ROW_HAS_CHILDREN;
+        }
+        if has_package_link {
+            flags |= EXPLORER_ROW_HAS_PACKAGE_LINK;
+        }
+        if expanded {
+            flags |= EXPLORER_ROW_EXPANDED;
+        }
+        if matched {
+            flags |= EXPLORER_ROW_MATCHED;
+        }
+        if disabled {
+            flags |= EXPLORER_ROW_DISABLED;
+        }
+        if !is_package_link {
+            flags |= EXPLORER_ROW_CAN_RENAME;
+            if !protected {
+                flags |= EXPLORER_ROW_CAN_MOVE | EXPLORER_ROW_CAN_DELETE;
+            }
+        }
+        rows.push(json!([
+            id,
+            state.service,
+            instance.name,
+            instance.class_name,
+            parent_id,
+            depth,
+            index,
+            flags,
+            link_path_key,
+        ]));
     }
 
     fn search_contains(&self, service: &str, index: usize) -> bool {
         self.search
             .as_ref()
-            .and_then(|search| search.visible_by_service.get(service))
-            .is_some_and(|visible| visible.contains(&index))
+            .and_then(|search| search.services.get(service))
+            .and_then(|search_service| search_service.visible.get(index))
+            .copied()
+            .unwrap_or(false)
     }
 
     fn visible_child_count(
@@ -2338,21 +2469,6 @@ fn explorer_parent_tree_id(
     )
 }
 
-fn icon_asset_name_for_class_rs(class_name: &str) -> &str {
-    match class_name {
-        "BinaryStringValue"
-        | "Color3Value"
-        | "DoubleConstrainedValue"
-        | "IntConstrainedValue"
-        | "IntValue"
-        | "NumberValue"
-        | "ObjectValue"
-        | "StringValue"
-        | "Vector3Value" => "Value",
-        _ => class_name,
-    }
-}
-
 fn explorer_search_fast_name_groups(groups: &[Vec<String>]) -> Option<Vec<Vec<String>>> {
     if groups.is_empty() {
         return None;
@@ -2412,6 +2528,7 @@ fn normalize_explorer_request_type(raw: &str) -> &str {
         "det" => "selectDetails",
         "ss" => "searchStart",
         "sr" => "searchRows",
+        "sm" => "searchMatch",
         "cs" => "clearSearch",
         "rl" | "reload" => "reloadServices",
         "rv" | "reveal" => "revealNode",
@@ -2441,9 +2558,9 @@ fn explorer_u64(request: &Value, keys: &[&str]) -> Option<u64> {
         .find_map(|key| request.get(*key).and_then(Value::as_u64))
 }
 
-fn explorer_bool(request: &Value, keys: &[&str]) -> Option<bool> {
+fn explorer_i64(request: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter()
-        .find_map(|key| request.get(*key).and_then(Value::as_bool))
+        .find_map(|key| request.get(*key).and_then(Value::as_i64))
 }
 
 fn explorer_array<'a>(request: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value>> {
@@ -2540,17 +2657,21 @@ pub(crate) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                 let count = explorer_u64(&request, &["count", "c"])
                     .unwrap_or(80)
                     .min(2500) as usize;
-                state.rows_window(request_id, mode, start, count, false)
+                state.rows_window(request_id, mode, start, count)
             }
             "expand" | "collapse" => {
                 let mode = ExplorerViewMode::parse(explorer_str(&request, &["mode", "m"]));
+                let start = explorer_u64(&request, &["start", "a"]).unwrap_or(0) as usize;
+                let count = explorer_u64(&request, &["count", "c"])
+                    .unwrap_or(80)
+                    .min(2500) as usize;
                 if let Some(node_id) = explorer_str(&request, &["nodeId", "n"]) {
                     if request_type == "expand" {
                         state.expand(node_id, mode);
                     } else {
                         state.collapse(node_id, mode);
                     }
-                    state.invalidate_rows(request_id, mode)
+                    state.rows_window(request_id, mode, start, count)
                 } else {
                     explorer_error(
                         request_id,
@@ -2573,15 +2694,12 @@ pub(crate) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                 let count = explorer_u64(&request, &["count", "c"])
                     .unwrap_or(80)
                     .min(25000) as usize;
-                let include_match_ids =
-                    explorer_bool(&request, &["includeMatchIds", "ids"]).unwrap_or(false);
-                state.rows_window(
-                    request_id,
-                    ExplorerViewMode::Search,
-                    start,
-                    count,
-                    include_match_ids,
-                )
+                state.rows_window(request_id, ExplorerViewMode::Search, start, count)
+            }
+            "searchMatch" => {
+                let node_id = explorer_str(&request, &["nodeId", "n"]);
+                let delta = explorer_i64(&request, &["delta", "d"]).unwrap_or(1);
+                state.search_match(request_id, node_id, delta)
             }
             "clearSearch" => {
                 state.clear_search();
@@ -2635,20 +2753,16 @@ pub(crate) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
                         current = instance.parent_index;
                     }
                     state.expanded.insert(explorer_service_tree_id(&service));
+                    state.rebuild_rows(ExplorerViewMode::Normal);
                     state.view_version += 1;
                     Some(node_id.to_string())
                 } else {
                     None
                 };
-                let (rows, total_rows) =
-                    state.collect_rows_window(ExplorerViewMode::Normal, 0, usize::MAX);
-                let row_index = revealed_node_id.as_deref().and_then(|node_id| {
-                    rows.iter().position(|row| {
-                        row.get("id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| id == node_id)
-                    })
-                });
+                let total_rows = state.total_rows(ExplorerViewMode::Normal);
+                let row_index = revealed_node_id
+                    .as_deref()
+                    .and_then(|node_id| state.row_index(ExplorerViewMode::Normal, node_id));
                 json!({
                     "type": "invalidateRows",
                     "requestId": request_id,

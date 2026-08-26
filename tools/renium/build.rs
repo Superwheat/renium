@@ -205,6 +205,101 @@ fn generate_operations(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
+fn generate_config_settings(out_dir: &Path) {
+    let path = Path::new("..")
+        .join("renium-vscode-extension")
+        .join("package.json");
+    let package: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("failed to read extension package"),
+    )
+    .expect("failed to parse extension package");
+    let properties = package["contributes"]["configuration"]["properties"]
+        .as_object()
+        .expect("extension settings must be an object");
+    let mut settings = properties
+        .iter()
+        .filter_map(|(name, property)| {
+            let name = name.strip_prefix("renium.")?;
+            if matches!(name, "automaticUpdateChecks" | "localPlaceUpdateBehavior") {
+                return None;
+            }
+            let kind = property["type"].as_str().unwrap_or("value");
+            let default = property
+                .get("default")
+                .map(serde_json::to_string)
+                .transpose()
+                .expect("extension setting default must be JSON");
+            let values = property
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("extension setting enum values must be strings")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            Some((name.to_string(), kind.to_string(), default, values))
+        })
+        .collect::<Vec<_>>();
+    settings.extend([
+        (
+            "backtrace".to_string(),
+            "boolean".to_string(),
+            Some("false".to_string()),
+            vec![],
+        ),
+        (
+            "color".to_string(),
+            "string".to_string(),
+            Some("\"auto\"".to_string()),
+            vec![
+                "auto".to_string(),
+                "always".to_string(),
+                "never".to_string(),
+            ],
+        ),
+        ("daemon".to_string(), "string".to_string(), None, vec![]),
+        (
+            "outputMode".to_string(),
+            "string".to_string(),
+            Some("\"text\"".to_string()),
+            vec!["text".to_string(), "json".to_string(), "pretty".to_string()],
+        ),
+        ("place".to_string(), "string".to_string(), None, vec![]),
+        (
+            "yes".to_string(),
+            "boolean".to_string(),
+            Some("false".to_string()),
+            vec![],
+        ),
+    ]);
+    settings.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut source = String::from("static CONFIG_SETTING_SPECS: &[ConfigSettingSpec] = &[\n");
+    for (name, kind, default, values) in settings {
+        let default = default
+            .as_deref()
+            .map_or_else(|| "None".to_string(), |value| format!("Some({value:?})"));
+        let values = values
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            source,
+            "    ConfigSettingSpec {{ key: {name:?}, kind: {kind:?}, default_json: {default}, values: &[{values}] }},"
+        )
+        .expect("failed to generate setting metadata");
+    }
+    source.push_str("];\n");
+    std::fs::write(out_dir.join("config_settings.rs"), source)
+        .expect("failed to write generated setting metadata");
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
 fn embed_windows_manifest(out_dir: &Path) {
     let manifest_path = out_dir.join("renium.exe.manifest");
     let manifest = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -233,6 +328,7 @@ fn main() {
     let host = env::var("HOST").expect("HOST is missing");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
     generate_operations(&out_dir);
+    generate_config_settings(&out_dir);
     match target_os.as_str() {
         "windows" => {
             build_windows(&out_dir);
