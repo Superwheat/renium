@@ -791,9 +791,37 @@ pub(crate) fn available_release_version() -> Result<Option<String>> {
 }
 
 pub(crate) fn check_agent_update() {
-    if let Ok(Some(version)) = available_release_version() {
-        report_update_notice(&version);
+    let (manifest, fresh) = check::cached_manifest_status();
+    if let Some(manifest) = manifest
+        && let (Ok(current), Ok(latest)) = (
+            Version::parse(crate::app::build::VERSION),
+            Version::parse(&manifest.payload.version),
+        )
+        && latest > current
+    {
+        report_update_notice(&manifest.payload.version);
     }
+    if !fresh {
+        spawn_agent_update_check();
+    }
+}
+
+fn spawn_agent_update_check() {
+    let Ok(executable) = env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(executable);
+    command
+        .args(["upd", "check"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let _ = command.spawn();
 }
 
 pub(crate) fn report_update_notice(version: &str) {
@@ -2058,17 +2086,17 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
         .context("USERPROFILE is unavailable")?;
     let stable_root = home.join(".renium").join("bin");
     fs::create_dir_all(&stable_root)?;
-    let alias = target_root.join("rbx.exe");
-    if alias.is_file() {
-        fs::remove_file(&alias)?;
-    }
-    if fs::hard_link(&cli, &alias).is_err() {
-        fs::copy(&cli, &alias)?;
+    for alias in [target_root.join("rbx.exe"), stable_root.join("rbx.exe")] {
+        if alias.is_file() {
+            fs::remove_file(&alias)?;
+        }
+        if fs::hard_link(&cli, &alias).is_err() {
+            fs::copy(&cli, &alias)?;
+        }
     }
     for stale in [
         target_root.join("rbx-run.ps1"),
         stable_root.join("rbx-run.ps1"),
-        stable_root.join("rbx.exe"),
         stable_root.join("renium.exe"),
     ] {
         if stale.is_file() {
@@ -2078,6 +2106,23 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
     let launcher = target_root.join("rbx.cmd");
     if launcher.is_file() {
         fs::copy(launcher, stable_root.join("rbx.cmd"))?;
+    }
+    let agent_instructions = target_root.join(AGENT_INSTRUCTIONS_FILE);
+    if agent_instructions.is_file() {
+        fs::copy(
+            agent_instructions,
+            stable_root.join(AGENT_INSTRUCTIONS_FILE),
+        )?;
+    }
+    let agent_guides = target_root.join(AGENT_GUIDES_DIRECTORY);
+    if agent_guides.is_dir() {
+        let destination = stable_root.join(AGENT_GUIDES_DIRECTORY);
+        if destination.is_dir() {
+            fs::remove_dir_all(&destination)?;
+        } else if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        copy_directory(&agent_guides, &destination)?;
     }
     Ok(())
 }

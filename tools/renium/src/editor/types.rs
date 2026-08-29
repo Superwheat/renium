@@ -44,6 +44,8 @@ pub(crate) struct EditorPropertyChange {
     pub(crate) class_name: String,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub(crate) properties: Map<String, Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reset_properties: Vec<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub(crate) attributes: Map<String, Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -57,7 +59,13 @@ pub(crate) struct EditorInstanceDescriptor {
     pub(crate) path_segments: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) path_ordinals: Vec<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) previous_path_segments: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) previous_path_ordinals: Vec<usize>,
     pub(crate) class_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_class_name: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) ambiguous_siblings: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -245,6 +253,7 @@ pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) ->
     }
     changes.property_changes.retain(|change| {
         !change.properties.is_empty()
+            || !change.reset_properties.is_empty()
             || !change.attributes.is_empty()
             || !change.deleted_attributes.is_empty()
     });
@@ -259,8 +268,18 @@ pub(crate) struct EditorBinaryExportGroup {
     pub(crate) count: usize,
     pub(crate) instance_count: usize,
     #[serde(default)]
+    pub(crate) identity_carrier_class: String,
+    #[serde(default)]
+    pub(crate) identity_carrier_prefix: String,
+    #[serde(default)]
+    pub(crate) identity_carrier_slots: Vec<String>,
+    #[serde(default)]
+    pub(crate) identity_carrier_count: usize,
+    #[serde(default)]
     pub(crate) script_count: usize,
     pub(crate) class_names: Vec<String>,
+    #[serde(default)]
+    pub(crate) non_archivable_indices: Vec<usize>,
     #[serde(default, deserialize_with = "deserialize_json_object_or_empty_array")]
     pub(crate) root_properties: Map<String, Value>,
 }

@@ -37,7 +37,8 @@ function Install-ReniumCommandAliases {
     if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) {
         return
     }
-    foreach ($alias in @((Join-Path $installRoot "rbx.exe"))) {
+    New-Item -ItemType Directory -Path $stableLauncherRoot -Force | Out-Null
+    foreach ($alias in @((Join-Path $installRoot "rbx.exe"), $stableExecutable)) {
         if (Test-Path -LiteralPath $alias -PathType Leaf) {
             Remove-Item -LiteralPath $alias -Force
         }
@@ -48,10 +49,23 @@ function Install-ReniumCommandAliases {
             Copy-Item -LiteralPath $cli -Destination $alias
         }
     }
-    foreach ($staleExecutable in @($stableExecutable, $stableReniumExecutable)) {
+    foreach ($staleExecutable in @($stableReniumExecutable)) {
         if (Test-Path -LiteralPath $staleExecutable -PathType Leaf) {
             Remove-Item -LiteralPath $staleExecutable -Force
         }
+    }
+    $agentInstructions = Join-Path $installRoot "renium-agents.md"
+    if (Test-Path -LiteralPath $agentInstructions -PathType Leaf) {
+        Copy-Item -LiteralPath $agentInstructions `
+            -Destination (Join-Path $stableLauncherRoot "renium-agents.md") -Force
+    }
+    $agentGuides = Join-Path $installRoot "renium-guides"
+    $stableAgentGuides = Join-Path $stableLauncherRoot "renium-guides"
+    if (Test-Path -LiteralPath $agentGuides -PathType Container) {
+        if (Test-Path -LiteralPath $stableAgentGuides) {
+            Remove-Item -LiteralPath $stableAgentGuides -Recurse -Force
+        }
+        Copy-Item -LiteralPath $agentGuides -Destination $stableAgentGuides -Recurse
     }
 }
 
@@ -784,6 +798,14 @@ try {
         }
         if (Test-Path -LiteralPath $stableReniumExecutable -PathType Leaf) {
             Remove-Item -LiteralPath $stableReniumExecutable -Force
+        }
+        $stableAgentInstructions = Join-Path $stableLauncherRoot "renium-agents.md"
+        if (Test-Path -LiteralPath $stableAgentInstructions -PathType Leaf) {
+            Remove-Item -LiteralPath $stableAgentInstructions -Force
+        }
+        $stableAgentGuides = Join-Path $stableLauncherRoot "renium-guides"
+        if (Test-Path -LiteralPath $stableAgentGuides) {
+            Remove-Item -LiteralPath $stableAgentGuides -Recurse -Force
         }
         if ((Test-Path -LiteralPath $stableLauncherRoot -PathType Container) -and
             @(Get-ChildItem -LiteralPath $stableLauncherRoot -Force).Count -eq 0) {

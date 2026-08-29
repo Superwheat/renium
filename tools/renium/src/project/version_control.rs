@@ -15,6 +15,7 @@ use crate::editor::paths::{build_editor_instance_path_parts, build_editor_source
 use crate::editor::sync::is_lua_source_class;
 use crate::project::package_links::RENIUM_DIR_GITIGNORE;
 use crate::rbx::model::read_settings_model_document;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
 };
@@ -572,11 +573,19 @@ fn vc_render_short(value: Option<&Value>) -> String {
 struct VcMergeContext<'a> {
     value_prefer: Option<bool>,
     structural_prefer: Option<bool>,
-    path: &'a str,
+    document: &'a SettingsBytecode,
+    index: usize,
     conflicts: &'a mut Vec<VcMergeConflict>,
 }
 
 impl VcMergeContext<'_> {
+    fn push_conflict(&mut self, detail: String) {
+        self.conflicts.push(VcMergeConflict {
+            path: settings_instance_path(self.document, self.index),
+            detail,
+        });
+    }
+
     fn merge_scalar<T: Clone + PartialEq>(
         &mut self,
         base: Option<&T>,
@@ -597,10 +606,7 @@ impl VcMergeContext<'_> {
             Some(true) => ours.clone(),
             Some(false) => theirs.clone(),
             None => {
-                self.conflicts.push(VcMergeConflict {
-                    path: self.path.to_string(),
-                    detail: detail(),
-                });
+                self.push_conflict(detail());
                 ours.clone()
             }
         }
@@ -636,15 +642,12 @@ impl VcMergeContext<'_> {
                     Some(true) => o.cloned(),
                     Some(false) => t.cloned(),
                     None => {
-                        self.conflicts.push(VcMergeConflict {
-                            path: self.path.to_string(),
-                            detail: format!(
-                                "{label} {key}: ours={} theirs={} (base={})",
-                                vc_render_short(o),
-                                vc_render_short(t),
-                                vc_render_short(b)
-                            ),
-                        });
+                        self.push_conflict(format!(
+                            "{label} {key}: ours={} theirs={} (base={})",
+                            vc_render_short(o),
+                            vc_render_short(t),
+                            vc_render_short(b)
+                        ));
                         o.cloned()
                     }
                 }
@@ -672,6 +675,16 @@ fn prepare_settings_merge(
     let mut base = base.clone();
     let mut ours = ours.clone();
     let mut theirs = theirs.clone();
+    for document in [&mut base, &mut ours, &mut theirs] {
+        for instance in &mut document.instances {
+            if is_lua_source_class(&instance.class_name) {
+                instance
+                    .properties
+                    .entry("Source".to_string())
+                    .or_insert_with(|| Value::String(EXTERNAL_SOURCE_MARKER.to_string()));
+            }
+        }
+    }
     stabilize_settings_document_references(&mut base);
     stabilize_settings_document_references(&mut ours);
     stabilize_settings_document_references(&mut theirs);
@@ -718,6 +731,101 @@ fn merged_instance_from(document: &SettingsBytecode, index: usize) -> VcMergedIn
         parent_id: settings_parent_id(document, index),
         properties: document.instances[index].properties.clone(),
         attributes: document.instances[index].attributes.clone(),
+    }
+}
+
+fn parent_cycles(instances: &[VcMergedInstance]) -> Vec<Vec<usize>> {
+    let index_by_id = instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut state = vec![0u8; instances.len()];
+    let mut path_positions = vec![usize::MAX; instances.len()];
+    let mut path = Vec::new();
+    let mut cycles = Vec::new();
+    for start in 0..instances.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut current = Some(start);
+        while let Some(index) = current {
+            match state[index] {
+                0 => {
+                    state[index] = 1;
+                    path_positions[index] = path.len();
+                    path.push(index);
+                    current = instances[index]
+                        .parent_id
+                        .as_deref()
+                        .and_then(|parent| index_by_id.get(parent))
+                        .copied();
+                }
+                1 => {
+                    cycles.push(path[path_positions[index]..].to_vec());
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for index in path.drain(..) {
+            state[index] = 2;
+            path_positions[index] = usize::MAX;
+        }
+    }
+    cycles
+}
+
+fn resolve_parent_cycles(
+    merged: &mut [VcMergedInstance],
+    preferred: Option<&SettingsBytecode>,
+    conflicts: &mut Vec<VcMergeConflict>,
+) {
+    let mut cycles = parent_cycles(merged);
+    if cycles.is_empty() {
+        return;
+    }
+    if let Some(preferred) = preferred {
+        let preferred_parents = preferred
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| {
+                (
+                    instance.settings_id.clone(),
+                    settings_parent_id(preferred, index),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for cycle in &cycles {
+            for index in cycle {
+                if let Some(parent) = preferred_parents.get(&merged[*index].settings_id) {
+                    merged[*index].parent_id.clone_from(parent);
+                }
+            }
+        }
+        cycles = parent_cycles(merged);
+        if cycles.is_empty() {
+            return;
+        }
+    }
+    let root_id = merged
+        .iter()
+        .find(|instance| instance.parent_id.is_none())
+        .map(|instance| instance.settings_id.clone());
+    for cycle in cycles {
+        let names = cycle
+            .iter()
+            .map(|index| merged[*index].name.as_str())
+            .collect::<Vec<_>>();
+        conflicts.push(VcMergeConflict {
+            path: names.first().copied().unwrap_or_default().to_string(),
+            detail: format!(
+                "Parent: combined moves create a cycle among {}",
+                names.join(", ")
+            ),
+        });
+        merged[cycle[0]].parent_id.clone_from(&root_id);
     }
 }
 
@@ -809,6 +917,26 @@ pub(crate) fn merge_settings_documents_with_policy(
     value_prefer: Option<bool>,
     structural_prefer: Option<bool>,
 ) -> (SettingsBytecode, Vec<VcMergeConflict>) {
+    merge_settings_documents_with_policy_and_source_changes(
+        base,
+        ours,
+        theirs,
+        value_prefer,
+        structural_prefer,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+}
+
+pub(crate) fn merge_settings_documents_with_policy_and_source_changes(
+    base: &SettingsBytecode,
+    ours: &SettingsBytecode,
+    theirs: &SettingsBytecode,
+    value_prefer: Option<bool>,
+    structural_prefer: Option<bool>,
+    ours_source_changes: &HashSet<String>,
+    theirs_source_changes: &HashSet<String>,
+) -> (SettingsBytecode, Vec<VcMergeConflict>) {
     let PreparedSettingsMerge {
         base,
         ours,
@@ -832,7 +960,6 @@ pub(crate) fn merge_settings_documents_with_policy(
         if merged_ids.contains(id) {
             continue;
         }
-        let inst_path = settings_instance_path(ours, ours_index);
         match (base_ids.get(id).copied(), theirs_ids.get(id).copied()) {
             (Some(base_index), Some(theirs_index)) => {
                 let base_inst = &base.instances[base_index];
@@ -840,7 +967,8 @@ pub(crate) fn merge_settings_documents_with_policy(
                 let mut merge_context = VcMergeContext {
                     value_prefer,
                     structural_prefer,
-                    path: &inst_path,
+                    document: ours,
+                    index: ours_index,
                     conflicts: &mut conflicts,
                 };
                 let name = merge_context.merge_scalar(
@@ -892,7 +1020,9 @@ pub(crate) fn merge_settings_documents_with_policy(
                 merged_ids.insert(id.clone());
             }
             (Some(base_index), None) => {
-                if vc_instance_equal(base, base_index, ours, ours_index) {
+                if vc_instance_equal(base, base_index, ours, ours_index)
+                    && !ours_source_changes.contains(id)
+                {
                     continue;
                 }
                 match structural_prefer {
@@ -903,7 +1033,7 @@ pub(crate) fn merge_settings_documents_with_policy(
                     }
                     None => {
                         conflicts.push(VcMergeConflict {
-                            path: inst_path.clone(),
+                            path: settings_instance_path(ours, ours_index),
                             detail: "modified here but deleted on the other side".to_string(),
                         });
                         merged.push(merged_instance_from(ours, ours_index));
@@ -920,7 +1050,6 @@ pub(crate) fn merge_settings_documents_with_policy(
 
     for (theirs_index, instance) in theirs.instances.iter().enumerate() {
         let id = &instance.settings_id;
-        let inst_path = settings_instance_path(theirs, theirs_index);
         let remapped_parent = settings_parent_id(theirs, theirs_index)
             .map(|pid| theirs_id_remap.get(&pid).cloned().unwrap_or(pid));
         if ours_ids.contains_key(id) {
@@ -942,7 +1071,9 @@ pub(crate) fn merge_settings_documents_with_policy(
             continue;
         }
         if let Some(base_index) = base_ids.get(id).copied() {
-            if vc_instance_equal(base, base_index, theirs, theirs_index) {
+            if vc_instance_equal(base, base_index, theirs, theirs_index)
+                && !theirs_source_changes.contains(id)
+            {
                 continue;
             }
             match structural_prefer {
@@ -964,7 +1095,7 @@ pub(crate) fn merge_settings_documents_with_policy(
                 }
                 None => {
                     conflicts.push(VcMergeConflict {
-                        path: inst_path,
+                        path: settings_instance_path(theirs, theirs_index),
                         detail: "deleted here but modified on the other side".to_string(),
                     });
                 }
@@ -993,6 +1124,9 @@ pub(crate) fn merge_settings_documents_with_policy(
                 .unwrap_or_else(|| id.clone()),
         );
     }
+
+    let preferred = structural_prefer.map(|prefer_ours| if prefer_ours { ours } else { theirs });
+    resolve_parent_cycles(&mut merged, preferred, &mut conflicts);
 
     finish_settings_merge(merged, structural_prefer, version, conflicts)
 }

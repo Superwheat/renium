@@ -34,6 +34,8 @@ pub(crate) struct SnapshotInstance {
     pub(crate) attributes: Map<String, Value>,
     pub(crate) debug_id: Option<String>,
     pub(crate) parent_debug_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) transported_settings_id: Option<String>,
     pub(crate) instance_id: Option<String>,
     pub(crate) parent_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +141,7 @@ pub(crate) struct NativeOverlayFetch {
     pub(crate) compact_expand_ms: f64,
     pub(crate) request_ms: f64,
     pub(crate) debug_ids: Vec<Option<String>>,
+    pub(crate) settings_ids: Vec<(usize, String)>,
     pub(crate) items: Vec<NativeOverlayItem>,
 }
 
@@ -168,6 +171,7 @@ pub(crate) struct NativeServiceFinishDependencies<'a, 'db> {
 pub(crate) struct NativeServiceFinishInput {
     pub(crate) native: NativeServiceDom,
     pub(crate) debug_ids: Vec<Option<String>>,
+    pub(crate) settings_ids: Vec<(usize, String)>,
     pub(crate) overlay: NativeOverlayFetch,
     pub(crate) reference_prefetch: Option<NativeConditionalOverlayReceiver>,
     pub(crate) reference_request: Option<NativeConditionalOverlayRequest>,
@@ -192,6 +196,8 @@ pub(crate) struct CompactBatchPayload {
     pub(crate) shapes: Vec<Value>,
     #[serde(default)]
     pub(crate) debug_ids: Vec<Value>,
+    #[serde(default)]
+    pub(crate) settings_ids: Vec<Value>,
     pub(crate) items: Vec<Value>,
 }
 
@@ -208,5 +214,7 @@ pub(crate) struct NativeOverlayPayload {
     pub(crate) debug_id_encoding: String,
     #[serde(default)]
     pub(crate) debug_id_buffer_bytes: usize,
+    #[serde(default)]
+    pub(crate) settings_ids: Vec<Value>,
     pub(crate) items: Vec<Value>,
 }

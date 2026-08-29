@@ -30,7 +30,13 @@ use crate::rbx::model::{
 };
 use crate::roblox::schema::{PropertySchemaMap, load_rbx_dom_property_schema};
 use crate::roblox::services::explorer_service_order;
-use crate::settings::bytecode::SettingsBytecode;
+use crate::settings::bytecode::{
+    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+};
+use crate::settings::equivalence::{
+    align_settings_ids_to_reference, settings_documents_equivalent,
+    stabilize_settings_reference_ids,
+};
 use crate::studio::bridge::BridgeServer;
 use crate::studio::native::editor::{
     EditorBinaryExportFinishGuard, begin_editor_binary_export, rbx_variant_referent,
@@ -191,6 +197,16 @@ struct CanonicalRbxSubtreePair {
     entries: Vec<(RbxRef, RbxRef)>,
 }
 
+fn canonical_rbx_import_refs(dom: &RbxWeakDom) -> BytecodeModelImportRefs {
+    let mut refs = rbx_dom_path_import_refs(dom, true);
+    refs.settings_id_by_ref = refs
+        .new_index_by_ref
+        .iter()
+        .map(|(referent, index)| (*referent, format!("debug:native:{index}")))
+        .collect();
+    refs
+}
+
 fn canonical_rbx_subtree_pair(
     desired: &CanonicalRbxSubtree<'_>,
     live: &CanonicalRbxSubtree<'_>,
@@ -285,6 +301,13 @@ fn canonical_rbx_instance_record(
         .dom
         .get_by_ref(referent)
         .context("Package preflight subtree contains a missing instance")?;
+    if instance.class.as_str() == "PackageLink" {
+        return Ok(CanonicalRbxInstanceRecord {
+            properties: Map::new(),
+            attributes: Map::new(),
+            source: None,
+        });
+    }
     let property_filter = property_filters
         .get(instance.class.as_str())
         .context("Package preflight property filter is missing")?;
@@ -354,62 +377,253 @@ fn canonical_rbx_instance_record(
 fn canonical_rbx_subtrees_equal(
     left: CanonicalRbxSubtree<'_>,
     right: CanonicalRbxSubtree<'_>,
-    entries: &[(RbxRef, RbxRef)],
+    _entries: &[(RbxRef, RbxRef)],
     database: &ReflectionDatabase<'_>,
     property_filters: &HashMap<String, NativePropertyFilter>,
 ) -> Result<bool> {
-    entries
-        .par_iter()
-        .map(|(left_referent, right_referent)| -> Result<bool> {
-            let left_record =
-                canonical_rbx_instance_record(&left, *left_referent, database, property_filters)?;
-            let mut right_record =
-                canonical_rbx_instance_record(&right, *right_referent, database, property_filters)?;
-            right_record
-                .properties
-                .retain(|name, _| left_record.properties.contains_key(name));
-            if left_record.properties.len() != right_record.properties.len()
-                || left_record.properties.iter().any(|(name, left_value)| {
-                    right_record.properties.get(name).is_none_or(|right_value| {
-                        !canonical_rbx_property_values_equal(left_value, right_value)
-                    })
-                })
-                || left_record.attributes != right_record.attributes
-                || left_record.source != right_record.source
-            {
-                return Ok(false);
-            }
-            Ok(true)
-        })
-        .try_reduce(|| true, |left, right| Ok(left && right))
+    let left = canonical_rbx_subtree_document(left, database, property_filters, "desired")?;
+    let mut right = canonical_rbx_subtree_document(right, database, property_filters, "live")?;
+    stabilize_settings_reference_ids(&mut right);
+    align_settings_ids_to_reference(&left, &mut right);
+    Ok(settings_documents_equivalent(&left, &right))
 }
 
-fn canonical_rbx_property_values_equal(left: &Value, right: &Value) -> bool {
-    if left == right {
-        return true;
+fn canonical_rbx_subtree_document(
+    subtree: CanonicalRbxSubtree<'_>,
+    database: &ReflectionDatabase<'_>,
+    property_filters: &HashMap<String, NativePropertyFilter>,
+    id_prefix: &str,
+) -> Result<SettingsBytecode> {
+    let mut pending = vec![(subtree.root, None)];
+    let mut instances = Vec::new();
+    while let Some((referent, parent_index)) = pending.pop() {
+        let instance = subtree
+            .dom
+            .get_by_ref(referent)
+            .context("Package preflight subtree contains a missing instance")?;
+        let mut record =
+            canonical_rbx_instance_record(&subtree, referent, database, property_filters)?;
+        if let Some(source) = record.source {
+            record
+                .properties
+                .insert("Source".to_string(), Value::String(source));
+        }
+        let index = instances.len();
+        instances.push(SettingsBytecodeInstance {
+            settings_id: subtree
+                .refs
+                .settings_id_by_ref
+                .get(&referent)
+                .cloned()
+                .unwrap_or_else(|| format!("debug:{id_prefix}:{index}")),
+            name: instance.name.clone(),
+            class_name: instance.class.to_string(),
+            parent_index,
+            properties: record.properties,
+            attributes: record.attributes,
+        });
+        pending.extend(
+            instance
+                .children()
+                .iter()
+                .rev()
+                .copied()
+                .map(|child| (child, Some(index))),
+        );
     }
-    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
-        return false;
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
     };
-    if left.get("_type").and_then(Value::as_str) != Some("EnumItem")
-        || right.get("_type").and_then(Value::as_str) != Some("EnumItem")
-    {
-        return false;
+    stabilize_settings_reference_ids(&mut document);
+    Ok(document)
+}
+
+// These canonicalization tests stay beside the comparison helpers they characterize.
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn package_link_runtime_state_does_not_change_package_content_equality() {
+        let mut desired = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let desired_root = desired.insert(
+            desired.root_ref(),
+            RbxInstanceBuilder::new("PackageLink")
+                .with_property("ModifiedState", RbxVariant::Int32(-1)),
+        );
+        let mut live = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let live_root = live.insert(
+            live.root_ref(),
+            RbxInstanceBuilder::new("PackageLink")
+                .with_property("ModifiedState", RbxVariant::Int32(1)),
+        );
+        let desired_refs = rbx_dom_path_import_refs(&desired, false);
+        let live_refs = rbx_dom_path_import_refs(&live, false);
+        let desired_subtree = CanonicalRbxSubtree {
+            dom: &desired,
+            root: desired_root,
+            refs: &desired_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let live_subtree = CanonicalRbxSubtree {
+            dom: &live,
+            root: live_root,
+            refs: &live_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let pair = canonical_rbx_subtree_pair(&desired_subtree, &live_subtree)
+            .unwrap()
+            .unwrap();
+        assert!(
+            canonical_rbx_subtrees_equal(
+                desired_subtree,
+                live_subtree,
+                &pair.entries,
+                rbx_reflection_database::get().unwrap(),
+                &HashMap::new(),
+            )
+            .unwrap()
+        );
     }
-    let left_type = left.get("enumType").and_then(Value::as_str);
-    let right_type = right.get("enumType").and_then(Value::as_str);
-    if left_type.is_some() && right_type.is_some() && left_type != right_type {
-        return false;
+
+    #[test]
+    fn package_comparison_matches_reordered_duplicate_siblings_by_content() {
+        let mut desired = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let desired_root = desired.insert(
+            desired.root_ref(),
+            RbxInstanceBuilder::new("Model").with_name("Package"),
+        );
+        for value in ["first", "second"] {
+            desired.insert(
+                desired_root,
+                RbxInstanceBuilder::new("StringValue")
+                    .with_name("Node")
+                    .with_property("Value", RbxVariant::String(value.to_string())),
+            );
+        }
+        let mut live = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let live_root = live.insert(
+            live.root_ref(),
+            RbxInstanceBuilder::new("Model").with_name("Package"),
+        );
+        for value in ["second", "first"] {
+            live.insert(
+                live_root,
+                RbxInstanceBuilder::new("StringValue")
+                    .with_name("Node")
+                    .with_property("Value", RbxVariant::String(value.to_string())),
+            );
+        }
+        let desired_refs = canonical_rbx_import_refs(&desired);
+        let live_refs = canonical_rbx_import_refs(&live);
+        let desired_subtree = CanonicalRbxSubtree {
+            dom: &desired,
+            root: desired_root,
+            refs: &desired_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let live_subtree = CanonicalRbxSubtree {
+            dom: &live,
+            root: live_root,
+            refs: &live_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let pair = canonical_rbx_subtree_pair(&desired_subtree, &live_subtree)
+            .unwrap()
+            .unwrap();
+        let database = rbx_reflection_database::get().unwrap();
+        let property_filters = ["Model", "StringValue"]
+            .into_iter()
+            .map(|class_name| {
+                (
+                    class_name.to_string(),
+                    native_property_filter(database, class_name),
+                )
+            })
+            .collect();
+        assert!(
+            canonical_rbx_subtrees_equal(
+                desired_subtree,
+                live_subtree,
+                &pair.entries,
+                database,
+                &property_filters,
+            )
+            .unwrap()
+        );
     }
-    match (
-        left.get("name").and_then(Value::as_str),
-        right.get("name").and_then(Value::as_str),
-    ) {
-        (Some(left), Some(right)) => left == right,
-        _ => left
-            .get("value")
-            .zip(right.get("value"))
-            .is_some_and(|(left, right)| left == right),
+
+    #[test]
+    fn package_comparison_remaps_internal_references_from_global_dom_ids() {
+        let build = |leading_folders: usize| {
+            let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+            for index in 0..leading_folders {
+                let root = dom.root_ref();
+                dom.insert(
+                    root,
+                    RbxInstanceBuilder::new("Folder").with_name(format!("Before{index}")),
+                );
+            }
+            let root = dom.root_ref();
+            let package = dom.insert(root, RbxInstanceBuilder::new("Model").with_name("Package"));
+            let card = dom.insert(
+                package,
+                RbxInstanceBuilder::new("Model").with_name("CardRig"),
+            );
+            let primary = dom.insert(card, RbxInstanceBuilder::new("Part").with_name("RootPart"));
+            dom.get_by_ref_mut(card)
+                .unwrap()
+                .properties
+                .insert("PrimaryPart".into(), RbxVariant::Ref(primary));
+            (dom, package)
+        };
+        let (desired, desired_root) = build(2);
+        let (live, live_root) = build(5);
+        let desired_refs = canonical_rbx_import_refs(&desired);
+        let live_refs = canonical_rbx_import_refs(&live);
+        let desired_subtree = CanonicalRbxSubtree {
+            dom: &desired,
+            root: desired_root,
+            refs: &desired_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let live_subtree = CanonicalRbxSubtree {
+            dom: &live,
+            root: live_root,
+            refs: &live_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let pair = canonical_rbx_subtree_pair(&desired_subtree, &live_subtree)
+            .unwrap()
+            .unwrap();
+        let database = rbx_reflection_database::get().unwrap();
+        let property_filters = ["Model", "Part"]
+            .into_iter()
+            .map(|class_name| {
+                (
+                    class_name.to_string(),
+                    native_property_filter(database, class_name),
+                )
+            })
+            .collect();
+        assert!(
+            canonical_rbx_subtrees_equal(
+                desired_subtree,
+                live_subtree,
+                &pair.entries,
+                database,
+                &property_filters,
+            )
+            .unwrap()
+        );
     }
 }
 
@@ -846,6 +1060,15 @@ fn editor_service_change_generations(
     })
 }
 
+pub(crate) fn editor_services_have_package_links(
+    bridge: &BridgeServer,
+    services: &[String],
+) -> Result<bool> {
+    Ok(editor_service_change_generations(bridge, services)?
+        .has_package_links
+        .is_none_or(|services| services.into_values().any(|present| present)))
+}
+
 struct EditorPackagePreflightLive<'a> {
     dom: Option<RbxWeakDom>,
     generations: HashMap<String, u64>,
@@ -1090,7 +1313,7 @@ fn plan_editor_package_root_retention(
         let started = Instant::now();
         let desired_refs =
             prepared_desired_refs.unwrap_or_else(|| rbx_dom_path_import_refs(desired_dom, false));
-        let live_refs = rbx_dom_path_import_refs(&live_dom, false);
+        let live_refs = canonical_rbx_import_refs(&live_dom);
         log_timing("package preflight canonical paths", started);
         (Some(desired_refs), Some(live_refs))
     };
@@ -1513,7 +1736,7 @@ fn build_editor_binary_import_for_services(
                 let desired_package_roots = package_roots_for_groups(&build.dom, &pending_groups);
                 let desired_refs = if build.has_package_links {
                     let started = Instant::now();
-                    let refs = rbx_dom_path_import_refs(&build.dom, false);
+                    let refs = canonical_rbx_import_refs(&build.dom);
                     log_timing("package preflight desired canonical paths", started);
                     Some(refs)
                 } else {
@@ -1595,15 +1818,17 @@ fn build_editor_binary_import_for_services(
                     .then(|| name.as_str().to_string())
             })
             .collect::<Vec<_>>();
-        if external_names.is_empty() {
+        let unresolved_names = build.unresolved_reference_properties_by_ref.get(&referent);
+        if external_names.is_empty() && unresolved_names.is_none() {
             continue;
         }
         let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
         let path_key = instance_path_parts_key(&segments, &ordinals);
-        post_apply_properties_by_path
-            .entry(path_key)
-            .or_default()
-            .extend(external_names.iter().cloned());
+        let post_apply_names = post_apply_properties_by_path.entry(path_key).or_default();
+        post_apply_names.extend(external_names.iter().cloned());
+        if let Some(names) = unresolved_names {
+            post_apply_names.extend(names.iter().map(|name| name.as_str().to_string()));
+        }
         external_reference_properties
             .extend(external_names.into_iter().map(|name| (referent, name)));
     }
@@ -1799,14 +2024,7 @@ pub(crate) fn prepare_native_editor_full_push(
 ) -> Result<(EditorChangeSet, EditorBinaryImport)> {
     let started = Instant::now();
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.project.src_root);
-    let services = explorer_daemon_services(&src_root, "")?
-        .into_iter()
-        .filter(|service| {
-            let service_dir = src_root.join(service);
-            service_dir.is_dir() || service_settings_path(&service_dir).is_file()
-        })
-        .collect::<HashSet<_>>();
+    let services = native_editor_full_push_services(args)?;
     let PreparedEditorBinaryImport {
         binary_import,
         documents_by_service,
@@ -1867,4 +2085,18 @@ pub(crate) fn prepare_native_editor_full_push(
     }
     log_timing("native editor full push preparation", started);
     Ok((changes, binary_import))
+}
+
+pub(crate) fn native_editor_full_push_services(
+    args: &PushEditorChangesArgs,
+) -> Result<HashSet<String>> {
+    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
+    let src_root = absolutize_under(&project_root, &args.project.src_root);
+    Ok(explorer_daemon_services(&src_root, "")?
+        .into_iter()
+        .filter(|service| {
+            let service_dir = src_root.join(service);
+            service_dir.is_dir() || service_settings_path(&service_dir).is_file()
+        })
+        .collect())
 }

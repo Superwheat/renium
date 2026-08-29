@@ -37,17 +37,19 @@ fs.mkdirSync(path.join(root, "src"));
 fs.mkdirSync(path.join(root, "src", "Workspace"));
 fs.writeFileSync(project, JSON.stringify({ schemaVersion: 1, sourceRoot: "src", tree: {} }));
 
+const daemonEnvironment = {
+  ...process.env,
+  RENIUM_DAEMON_CONTROL_PORT: String(controlPort),
+  RENIUM_DAEMON_FILE: path.join(root, "daemon.json"),
+};
 const daemon = childProcess.spawn(executable, ["bd", "--editor-stdio", "--control-port", String(controlPort), "-w", "0.1", "-P", `${firstPort},${secondPort}`], {
   cwd: root,
-  env: {
-    ...process.env,
-    RENIUM_DAEMON_CONTROL_PORT: String(controlPort),
-    RENIUM_DAEMON_FILE: path.join(root, "daemon.json"),
-  },
+  env: daemonEnvironment,
   stdio: ["pipe", "pipe", "pipe"],
 });
 const stdoutLines = [];
 const pendingLines = [];
+const availableLines = [];
 let stderr = "";
 daemon.stderr.setEncoding("utf8");
 daemon.stderr.on("data", (chunk) => {
@@ -58,19 +60,26 @@ readline.createInterface({ input: daemon.stdout }).on("line", (line) => {
     return;
   }
   stdoutLines.push(line);
-  pendingLines.shift()?.(line);
+  const pending = pendingLines.shift();
+  if (pending) {
+    pending(line);
+  } else {
+    availableLines.push(line);
+  }
 });
 
-const nextLine = async () => await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error(`Daemon response timed out. stderr: ${stderr}`)), 3000);
+const nextLine = async (request) => availableLines.shift() ?? await new Promise((resolve, reject) => {
+  const timeoutMs = request.id === 1 ? 7000 : 3000;
+  const timer = setTimeout(() => reject(new Error(`Daemon response ${request.id}/${request.op} timed out. stderr: ${stderr}`)), timeoutMs);
   pendingLines.push((line) => {
     clearTimeout(timer);
     resolve(line);
   });
 });
 const send = async (request) => {
+  const response = nextLine(request);
   daemon.stdin.write(`${JSON.stringify(request)}\n`);
-  return JSON.parse(await nextLine());
+  return JSON.parse(await response);
 };
 const expect = (condition, message) => {
   if (!condition) {
@@ -182,6 +191,16 @@ try {
       resolve();
     });
   });
+  if (fs.existsSync(daemonEnvironment.RENIUM_DAEMON_FILE)) {
+    const stopped = childProcess.spawnSync(executable, ["dm", "stop", "default", "--force"], {
+      cwd: repository,
+      env: daemonEnvironment,
+      encoding: "utf8",
+    });
+    if (stopped.status !== 0) {
+      throw new Error(`Could not stop replay daemon: ${stopped.stderr || stopped.stdout}`);
+    }
+  }
   fs.rmSync(root, { recursive: true, force: true });
 }
 

@@ -119,7 +119,8 @@ function BridgeScriptDocuments.setSource(
 	end
 
 	local updateOk = pcall(function()
-		(ScriptEditorService :: any):UpdateSourceAsync(instance, function()
+		local scriptEditorService = ScriptEditorService :: any
+		scriptEditorService:UpdateSourceAsync(instance, function()
 			return source
 		end)
 	end)
@@ -127,7 +128,8 @@ function BridgeScriptDocuments.setSource(
 		return true, nil, "UpdateSourceAsync"
 	end
 	local ok, err = pcall(function()
-		(instance :: any).Source = source
+		local writableInstance = instance :: any
+		writableInstance.Source = source
 	end)
 	if ok then
 		return true, nil, "Source"
@@ -180,6 +182,66 @@ function BridgeScriptDocuments.capture(serviceNames: { string }, includedKeys: {
 	return entries
 end
 
+local function resolveEntryTarget(entry, replacements, resolveStagedPath)
+	local target = entry.instance
+	local seen = {}
+	while replacements ~= nil and replacements[target] ~= nil and not seen[target] do
+		seen[target] = true
+		target = replacements[target]
+	end
+	if BridgeIdentity.liveInstance(target) == nil then
+		target = nil
+	end
+	if target == nil and resolveStagedPath ~= nil then
+		target = resolveStagedPath(entry.pathSegments, entry.pathOrdinals)
+	end
+	if target == nil and entry.debugId ~= nil then
+		local pathTarget = BridgeIdentity.resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+		if pathTarget ~= nil and readInstanceDebugId(pathTarget) == entry.debugId then
+			target = pathTarget
+		end
+	end
+	return target
+end
+
+local function sourceState(entry, target, changedSourceInstances, changedSourceKeys, allSourcesChanged)
+	local changed = allSourcesChanged or (changedSourceKeys ~= nil and changedSourceKeys[entry.key])
+	if changedSourceInstances ~= nil then
+		changed = changed or changedSourceInstances[entry.instance] or changedSourceInstances[target]
+	end
+	if changed then
+		return true, entry.source, entry.selection
+	end
+	local okCurrentSource, currentSource = pcall(entry.document.GetText, entry.document)
+	if okCurrentSource then
+		return false, currentSource, getDocumentSelection(entry.document)
+	end
+	return false, entry.source, entry.selection
+end
+
+local function openScriptDocument(target)
+	local document = findScriptDocument(target)
+	if document ~= nil then
+		return document
+	end
+	local okOpen, opened, openError = pcall(ScriptEditorService.OpenScriptDocumentAsync, ScriptEditorService, target)
+	if not okOpen or opened == false then
+		error(`Could not open replacement script document {target:GetFullName()}: {openError or opened}`)
+	end
+	document = findScriptDocument(target)
+	if document == nil then
+		error("Replacement script document did not open for " .. target:GetFullName())
+	end
+	return document
+end
+
+local function closeDocument(document, errorLabel)
+	local closed, closeError = closeScriptDocument(document)
+	if not closed then
+		error(`{errorLabel}: {closeError}`)
+	end
+end
+
 function BridgeScriptDocuments.apply(
 	entries: { any },
 	changedSourceInstances: { [Instance]: boolean }?,
@@ -189,59 +251,17 @@ function BridgeScriptDocuments.apply(
 	allSourcesChanged: boolean?
 )
 	for _, entry in ipairs(entries) do
-		local target = entry.instance
-		local seen = {}
-		while replacements ~= nil and replacements[target] ~= nil and not seen[target] do
-			seen[target] = true
-			target = replacements[target]
-		end
-		if BridgeIdentity.liveInstance(target) == nil then
-			target = nil
-		end
-		if target == nil and resolveStagedPath ~= nil then
-			target = resolveStagedPath(entry.pathSegments, entry.pathOrdinals)
-		end
-		if target == nil and entry.debugId ~= nil then
-			local pathTarget = BridgeIdentity.resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
-			if pathTarget ~= nil and readInstanceDebugId(pathTarget) == entry.debugId then
-				target = pathTarget
-			end
-		end
+		local target = resolveEntryTarget(entry, replacements, resolveStagedPath)
 		if (target == nil or not target:IsA("LuaSourceContainer")) and allSourcesChanged then
-			local closed, closeError = closeScriptDocument(entry.document)
-			if not closed then
-				error(`Could not close removed script document: {closeError}`)
-			end
+			closeDocument(entry.document, "Could not close removed script document")
 			continue
 		end
 		if target == nil or not target:IsA("LuaSourceContainer") then
 			error("Could not restore open script document " .. table.concat(entry.pathSegments, "."))
 		end
-		local sourceChanged = allSourcesChanged or (changedSourceKeys ~= nil and changedSourceKeys[entry.key])
-		if changedSourceInstances ~= nil then
-			sourceChanged = sourceChanged or changedSourceInstances[entry.instance] or changedSourceInstances[target]
-		end
-		local source = entry.source
-		local selection = entry.selection
-		if not sourceChanged then
-			local okCurrentSource, currentSource = pcall(entry.document.GetText, entry.document)
-			if okCurrentSource then
-				source = currentSource
-				selection = getDocumentSelection(entry.document)
-			end
-		end
-		local targetDocument = findScriptDocument(target)
-		if targetDocument == nil then
-			local okOpen, opened, openError =
-				pcall(ScriptEditorService.OpenScriptDocumentAsync, ScriptEditorService, target)
-			if not okOpen or opened == false then
-				error(`Could not open replacement script document {target:GetFullName()}: {openError or opened}`)
-			end
-			targetDocument = findScriptDocument(target)
-			if targetDocument == nil then
-				error("Replacement script document did not open for " .. target:GetFullName())
-			end
-		end
+		local sourceChanged, source, selection =
+			sourceState(entry, target, changedSourceInstances, changedSourceKeys, allSourcesChanged)
+		local targetDocument = openScriptDocument(target)
 		if not sourceChanged and targetDocument ~= entry.document then
 			local okWrite, writeError = setOpenDocumentSource(targetDocument, source)
 			if not okWrite then
@@ -250,10 +270,7 @@ function BridgeScriptDocuments.apply(
 		end
 		restoreDocumentSelection(targetDocument, selection)
 		if entry.document ~= targetDocument then
-			local closed, closeError = closeScriptDocument(entry.document)
-			if not closed then
-				error(`Could not close replaced script document: {closeError}`)
-			end
+			closeDocument(entry.document, "Could not close replaced script document")
 		end
 	end
 end

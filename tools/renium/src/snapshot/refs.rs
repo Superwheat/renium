@@ -6,9 +6,9 @@ use serde_json::{Map, Value};
 
 use crate::editor::sync::is_lua_source_class;
 use crate::project::config;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, reindex_reference_indices, stabilize_reference_objects,
-    visit_reference_objects_mut,
+    SettingsBytecode, reindex_reference_indices, visit_reference_objects_mut,
 };
 use crate::snapshot::types::SnapshotInstance;
 
@@ -60,7 +60,7 @@ pub(crate) fn settings_document_as_snapshot_instances(
             if is_lua_source_class(&current.class_name) {
                 properties.insert(
                     "Source".to_string(),
-                    Value::String("__SOURCE_EXTERNAL__".to_string()),
+                    Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
                 );
             }
             SnapshotInstance {
@@ -100,23 +100,57 @@ pub(crate) fn reindex_snapshot_references(
 }
 
 pub(crate) fn stabilize_record_references(record: &mut Map<String, Value>, ids: &[String]) {
-    stabilize_reference_objects(record, |object, index| {
-        if let Some(id) = ids.get(index) {
-            object.insert("settingsId".to_string(), Value::String(id.clone()));
-        }
-    });
+    rewrite_record_reference_ids(record, Some(ids), None, false);
 }
 
 pub(crate) fn remap_record_reference_ids(
     record: &mut Map<String, Value>,
     ids: &HashMap<String, String>,
 ) {
+    rewrite_record_reference_ids(record, None, Some(ids), false);
+}
+
+pub(crate) fn remap_and_stabilize_record_references(
+    record: &mut Map<String, Value>,
+    ids: &[String],
+    remap: &HashMap<String, String>,
+    keep_instance_indices: bool,
+) {
+    rewrite_record_reference_ids(record, Some(ids), Some(remap), keep_instance_indices);
+}
+
+fn rewrite_record_reference_ids(
+    record: &mut Map<String, Value>,
+    indices: Option<&[String]>,
+    remap: Option<&HashMap<String, String>>,
+    keep_instance_indices: bool,
+) {
     visit_reference_objects_mut(record, |object| {
-        for key in ["settingsId", "instanceId"] {
-            if let Some(current) = object.get(key).and_then(Value::as_str)
-                && let Some(next) = ids.get(current)
+        let has_text_id = ["settingsId", "instanceId"]
+            .into_iter()
+            .any(|key| object.get(key).and_then(Value::as_str).is_some());
+        if let Some(remap) = remap {
+            for key in ["settingsId", "instanceId"] {
+                if let Some(current) = object.get(key).and_then(Value::as_str)
+                    && let Some(next) = remap.get(current)
+                {
+                    object.insert(key.to_string(), Value::String(next.clone()));
+                }
+            }
+        }
+        if let Some(ids) = indices {
+            if !has_text_id
+                && let Some(id) = object
+                    .get("instanceIndex")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| ids.get(index))
             {
-                object.insert(key.to_string(), Value::String(next.clone()));
+                object.insert("settingsId".to_string(), Value::String(id.clone()));
+            }
+            if !keep_instance_indices {
+                object.remove("instanceIndex");
             }
         }
     });

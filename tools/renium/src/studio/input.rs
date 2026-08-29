@@ -1,4 +1,11 @@
+#[cfg(any(windows, target_os = "macos"))]
+use anyhow::Context;
 use anyhow::{Result, bail};
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(any(windows, target_os = "macos"))]
 const PACKAGE_CHANGES_MESSAGE: &str =
@@ -107,13 +114,77 @@ pub fn close_device_emulator_toolbar_when_visible(pid: u32) -> Result<bool> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
-    platform::accept_package_changes_dialog_when_visible(pid)
+pub struct PackageChangesDialogWatcher {
+    finished: Arc<AtomicBool>,
+    result: std::sync::mpsc::Receiver<Result<bool>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl PackageChangesDialogWatcher {
+    pub fn finish(mut self) -> Result<bool> {
+        self.finished.store(true, Ordering::Release);
+        let result = self
+            .result
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .context("Package dialog watcher did not stop")?;
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Package dialog watcher stopped unexpectedly"))?;
+        }
+        result
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl Drop for PackageChangesDialogWatcher {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        self.worker.take();
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn watch_package_changes_dialog(pid: u32) -> Result<PackageChangesDialogWatcher> {
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = Arc::clone(&finished);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = platform::watch_package_changes_dialog(pid, worker_finished, ready_tx);
+        let _ = result_tx.send(result);
+    });
+    match ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .context("Package dialog watcher did not become ready")?
+    {
+        Ok(()) => Ok(PackageChangesDialogWatcher {
+            finished,
+            result: result_rx,
+            worker: Some(worker),
+        }),
+        Err(error) => {
+            finished.store(true, Ordering::Release);
+            drop(worker);
+            bail!(error)
+        }
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn accept_package_changes_dialog_when_visible(_pid: u32) -> Result<bool> {
-    Ok(false)
+pub struct PackageChangesDialogWatcher;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl PackageChangesDialogWatcher {
+    pub fn finish(self) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn watch_package_changes_dialog(_pid: u32) -> Result<PackageChangesDialogWatcher> {
+    Ok(PackageChangesDialogWatcher)
 }
 
 #[cfg(windows)]
@@ -138,6 +209,11 @@ pub fn terminate_studio_process(pid: u32) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn frontmost_studio_pid() -> Option<u32> {
     platform::frontmost_studio_pid()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn studio_process_ids() -> Vec<u32> {
+    platform::studio_process_ids()
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -366,12 +442,12 @@ mod platform {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CHILDID_SELF, EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, GA_ROOT, GW_OWNER,
-        GetAncestor, GetClassNameW, GetClientRect, GetMessageW, GetWindow, GetWindowTextW,
-        GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible, MSG, OBJID_WINDOW,
-        SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SendMessageTimeoutW, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT,
-        WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-        WM_RBUTTONDOWN, WM_RBUTTONUP,
+        GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetMessageW, GetWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
+        MSG, OBJID_WINDOW, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow,
+        WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     #[link(name = "user32")]
@@ -471,6 +547,32 @@ mod platform {
             .then_some(pid)
     }
 
+    struct EnumStudioState {
+        pids: Vec<u32>,
+    }
+
+    unsafe extern "system" fn enum_studio_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut EnumStudioState) };
+        if unsafe { IsWindowVisible(hwnd) } != 0
+            && let Some(pid) = studio_window_pid(hwnd)
+            && !state.pids.contains(&pid)
+        {
+            state.pids.push(pid);
+        }
+        1
+    }
+
+    pub fn studio_process_ids() -> Vec<u32> {
+        let mut state = EnumStudioState { pids: Vec::new() };
+        unsafe {
+            EnumWindows(
+                Some(enum_studio_proc),
+                &mut state as *mut EnumStudioState as LPARAM,
+            );
+        }
+        state.pids
+    }
+
     fn auto_recovery_pid(hwnd: HWND) -> Option<u32> {
         if unsafe { IsWindowVisible(hwnd) } == 0 {
             return None;
@@ -487,13 +589,7 @@ mod platform {
         if auto_recovery_pid(hwnd).is_none() {
             return false;
         }
-        let mut result = 0;
-        if unsafe { SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 500, &mut result) }
-            == 0
-        {
-            return false;
-        }
-        auto_recovery_pid(hwnd).is_none()
+        invoke_auto_recovery_ignore(hwnd).unwrap_or(false)
     }
 
     fn dismiss_auto_recovery_until_closed(hwnd: HWND) {
@@ -591,18 +687,7 @@ mod platform {
         }
         let dialogs = modal_dialogs(top as isize);
         if let Some((dialog, _)) = dialogs.iter().find(|(_, title)| title == "Auto-Recovery") {
-            let mut result = 0;
-            unsafe {
-                SendMessageTimeoutW(
-                    *dialog as HWND,
-                    WM_CLOSE,
-                    0,
-                    0,
-                    SMTO_ABORTIFHUNG,
-                    500,
-                    &mut result,
-                );
-            }
+            dismiss_auto_recovery_until_closed(*dialog as HWND);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while unsafe { IsWindowEnabled(top) } == 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1025,6 +1110,34 @@ mod platform {
         }
     }
 
+    fn invoke_auto_recovery_ignore(hwnd: HWND) -> Result<bool> {
+        let _com = ComGuard::initialize()?;
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .context("Could not start Windows UI Automation")?;
+        let root = unsafe { automation.ElementFromHandle(AutomationHwnd(hwnd)) }
+            .context("Could not inspect the Auto-Recovery dialog")?;
+        let condition = unsafe {
+            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from("Ignore"))
+        }
+        .context("Could not create the Auto-Recovery button query")?;
+        let Ok(button) = (unsafe { root.FindFirst(TreeScope_Descendants, &condition) }) else {
+            return Ok(false);
+        };
+        let invoke: IUIAutomationInvokePattern =
+            unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
+                .context("The Auto-Recovery Ignore button is not invokable")?;
+        unsafe { invoke.Invoke() }.context("Could not ignore the Auto-Recovery file")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            if auto_recovery_pid(hwnd).is_none() {
+                return Ok(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(false)
+    }
+
     fn device_emulator_close_button(
         automation: &IUIAutomation,
         top: isize,
@@ -1145,34 +1258,87 @@ mod platform {
         Ok(false)
     }
 
-    pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
-        let (top, _, _) = main_studio_window(pid)?;
-        let _com = ComGuard::initialize()?;
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .context("Could not start Windows UI Automation")?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
+    fn window_process_id(hwnd: HWND) -> u32 {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        pid
+    }
+
+    fn return_studio_to_background(top: isize, pid: u32, foreground: HWND) {
+        if foreground.is_null()
+            || unsafe { IsWindow(foreground) } == 0
+            || window_process_id(foreground) == pid
+        {
+            return;
+        }
+        let _ = send_window_to_bottom(top);
+        unsafe { SetForegroundWindow(foreground) };
+    }
+
+    pub fn watch_package_changes_dialog(
+        pid: u32,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ready: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    ) -> Result<bool> {
+        let setup = (|| -> Result<_> {
+            let (top, _, _) = main_studio_window(pid)?;
+            let com = ComGuard::initialize()?;
+            let automation: IUIAutomation =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                    .context("Could not start Windows UI Automation")?;
+            Ok((top, com, automation))
+        })();
+        let (top, _com, automation) = match setup {
+            Ok(setup) => {
+                let _ = ready.send(Ok(()));
+                setup
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let _ = ready.send(Err(message));
+                return Err(error);
+            }
+        };
+        let mut last_non_studio_foreground = unsafe { GetForegroundWindow() };
+        if window_process_id(last_non_studio_foreground) == pid {
+            last_non_studio_foreground = std::ptr::null_mut();
+        }
+        let mut finish_deadline = None;
+        loop {
+            let foreground = unsafe { GetForegroundWindow() };
+            if !foreground.is_null() && window_process_id(foreground) != pid {
+                last_non_studio_foreground = foreground;
+            }
             if let Some(button) = package_changes_ok_button(&automation, top)? {
+                return_studio_to_background(top, pid, last_non_studio_foreground);
                 let invoke: IUIAutomationInvokePattern =
                     unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
                         .context("The package changes OK button is not invokable")?;
                 unsafe { invoke.Invoke() }.context("Could not accept package changes")?;
+                return_studio_to_background(top, pid, last_non_studio_foreground);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     if package_changes_ok_button(&automation, top)?.is_none() {
+                        return_studio_to_background(top, pid, last_non_studio_foreground);
                         return Ok(true);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 bail!("Studio did not close the package changes dialog")
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if finished.load(std::sync::atomic::Ordering::Acquire) {
+                let deadline = finish_deadline.get_or_insert_with(|| {
+                    std::time::Instant::now() + std::time::Duration::from_secs(1)
+                });
+                if std::time::Instant::now() >= *deadline {
+                    return Ok(false);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        Ok(false)
     }
 
-    fn restore_window_at_bottom(hwnd: isize) -> Result<()> {
-        unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+    fn send_window_to_bottom(hwnd: isize) -> Result<()> {
         let bottom = 1usize as HWND;
         if unsafe {
             SetWindowPos(
@@ -1182,13 +1348,20 @@ mod platform {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
         } == 0
         {
             bail!("Could not restore the Studio window behind other applications");
         }
         Ok(())
+    }
+
+    fn restore_window_at_bottom(hwnd: isize) -> Result<()> {
+        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+            unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
+        }
+        send_window_to_bottom(hwnd)
     }
 
     pub fn recover_stalled_window_for_pid(pid: u32) -> Result<()> {
@@ -1982,10 +2155,24 @@ mod platform {
         Ok(button)
     }
 
-    pub fn accept_package_changes_dialog_when_visible(pid: u32) -> Result<bool> {
+    pub fn watch_package_changes_dialog(
+        pid: u32,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ready: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    ) -> Result<bool> {
         let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
+        let application = match ax_application(pid) {
+            Ok(application) => application,
+            Err(error) => {
+                let _ = ready.send(Err(format!("{error:#}")));
+                return Err(error);
+            }
+        };
+        // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+        unsafe { CFRelease(application) };
+        let _ = ready.send(Ok(()));
+        let mut finish_deadline = None;
+        loop {
             if let Some(button) = package_changes_ok_button(pid)? {
                 let action = cf_string("AXPress");
                 // SAFETY: button and action are valid retained accessibility objects.
@@ -1998,6 +2185,7 @@ mod platform {
                 if result != 0 {
                     bail!("Could not accept package changes (AXError {result})");
                 }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     let Some(button) = package_changes_ok_button(pid)? else {
                         return Ok(true);
@@ -2008,9 +2196,16 @@ mod platform {
                 }
                 bail!("Studio did not close the package changes dialog")
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            if finished.load(std::sync::atomic::Ordering::Acquire) {
+                let deadline = finish_deadline.get_or_insert_with(|| {
+                    std::time::Instant::now() + std::time::Duration::from_secs(1)
+                });
+                if std::time::Instant::now() >= *deadline {
+                    return Ok(false);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(false)
     }
 
     fn cf_rect(value: CFTypeRef) -> Option<CGRect> {
@@ -2102,6 +2297,18 @@ mod platform {
                     None
                 }
             })
+    }
+
+    pub fn studio_process_ids() -> Vec<u32> {
+        let mut pids = studio_window_records(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.pid > 0 && is_studio_owner(&record.owner))
+            .filter_map(|record| u32::try_from(record.pid).ok())
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
     }
 
     unsafe fn mark_renium_event(event: CGEventRef) {

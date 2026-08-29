@@ -15,7 +15,9 @@ pub(crate) mod query;
 
 use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
-use crate::bytecode::edit::{bytecode_service_name, reject_package_link_instance_mutation};
+use crate::bytecode::edit::{
+    bytecode_service_name, collect_settings_subtree_preorder, reject_package_link_instance_mutation,
+};
 use crate::bytecode::explorer::{
     BytecodeNodeProjection, explorer_search_groups, explorer_search_instance_matches,
     insert_top_field, parse_requested_fields,
@@ -43,12 +45,11 @@ use crate::project::layout::configured_project_layout;
 use crate::project::package_links::{LinkEnforcement, build_loaded_project_link_enforcement};
 use crate::rbx::decode::rbx_variant_to_settings_json;
 use crate::rbx::encode::{
-    rbx_model_property_descriptor, rbx_property_descriptor,
-    rbx_serialized_property_name_for_logical,
+    rbx_logical_property_name, rbx_model_property_descriptor, rbx_property_descriptor,
 };
 use crate::rbx::model::{
-    BytecodeModelImportRefs, canonicalize_settings_reference_documents,
-    source_structure_settings_document,
+    BytecodeModelImportRefs, canonicalize_settings_references_for_move,
+    canonicalize_settings_references_for_moves, source_structure_settings_document,
 };
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
@@ -208,9 +209,26 @@ fn canonical_stored_property_name(
     {
         return Ok(None);
     }
+    if let Some(existing) = instance
+        .properties
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case(property))
+        .or_else(|| {
+            (scope == PropertyScope::Auto)
+                .then(|| {
+                    instance
+                        .attributes
+                        .keys()
+                        .find(|name| name.eq_ignore_ascii_case(property))
+                })
+                .flatten()
+        })
+    {
+        return Ok(Some(existing.clone()));
+    }
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     Ok(
-        rbx_serialized_property_name_for_logical(database, &instance.class_name, property)
+        rbx_logical_property_name(database, &instance.class_name, property)
             .map(str::to_string)
             .filter(|name| name != property),
     )
@@ -1238,7 +1256,40 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     validate_auto_property_name(&document, index, &args.property, scope)?;
     let canonical_property =
         canonical_stored_property_name(&document, index, &args.property, scope)?;
-    let property = canonical_property.as_deref().unwrap_or(&args.property);
+    let logical_property = if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
+        && !args.property.eq_ignore_ascii_case("source")
+        && !(scope == PropertyScope::Auto
+            && document.instances[index]
+                .attributes
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(&args.property)))
+    {
+        let database =
+            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+        rbx_logical_property_name(
+            database,
+            &document.instances[index].class_name,
+            &args.property,
+        )
+        .map(str::to_string)
+    } else {
+        None
+    };
+    let property = logical_property
+        .as_deref()
+        .or(canonical_property.as_deref())
+        .unwrap_or(&args.property);
+    if let Some(logical_property) = logical_property.as_deref() {
+        document.instances[index].properties.retain(|name, _| {
+            name == logical_property || !name.eq_ignore_ascii_case(logical_property)
+        });
+    }
+    let moved_indices = structural_reference_update.then(|| {
+        let children = settings_children_by_parent(&document);
+        let mut subtree = Vec::new();
+        collect_settings_subtree_preorder(&children, index, &mut subtree);
+        subtree.into_iter().collect::<HashSet<_>>()
+    });
     if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
         && matches!(args.property.as_str(), "ClassName" | "Parent")
         && is_protected_starter_player_container(&document, index)
@@ -1289,7 +1340,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         )?;
     }
     writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
-    if structural_reference_update {
+    if let Some(moved_indices) = moved_indices.as_ref() {
         let mut reference_documents = BTreeMap::new();
         let mut reference_files = BTreeMap::new();
         for path in &settings_files_to_lock {
@@ -1306,7 +1357,11 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             reference_files.insert(service_name.clone(), path.clone());
             reference_documents.insert(service_name, value);
         }
-        let changed_services = canonicalize_settings_reference_documents(&mut reference_documents);
+        let changed_services = canonicalize_settings_references_for_move(
+            &mut reference_documents,
+            &service,
+            moved_indices,
+        );
         for changed_service in changed_services {
             let path = &reference_files[&changed_service];
             writes.insert(
@@ -1407,7 +1462,7 @@ pub(super) fn bytecode_apply_property_batch(args: BytecodeApplyPropertyBatchArgs
             .filter_map(|operation| operation.get("path").and_then(Value::as_str))
             .map(|path| loaded.root.join(path))
             .collect();
-        stage.publish(&loaded.root)?;
+        stage.publish(&loaded.root, false)?;
         result
     } else {
         let projection = config::stage_project(&loaded)?;
@@ -1796,20 +1851,43 @@ fn canonicalize_property_batch_references(
     documents: &mut BTreeMap<String, BytecodePropertyBatchDocument>,
     entries: &[ResolvedBytecodePropertyBatchEntry],
 ) -> Result<()> {
-    let refresh_references = entries.iter().any(|entry| {
-        matches!(
+    let mut roots_by_service = HashMap::<String, HashSet<usize>>::new();
+    for entry in entries {
+        if matches!(
             entry.property.to_ascii_lowercase().as_str(),
             "name" | "parent"
         ) && matches!(entry.scope, PropertyScope::Auto | PropertyScope::Metadata)
-    });
-    if !refresh_references {
+        {
+            roots_by_service
+                .entry(entry.service.clone())
+                .or_default()
+                .insert(entry.instance_index);
+        }
+    }
+    if roots_by_service.is_empty() {
         return Ok(());
+    }
+    let mut moved_indices = HashMap::<String, HashSet<usize>>::new();
+    for (service, roots) in roots_by_service {
+        let document = &documents
+            .get(&service)
+            .context("Property batch service disappeared")?
+            .document;
+        let children = settings_children_by_parent(document);
+        let indices = moved_indices.entry(service).or_default();
+        for root in roots {
+            let mut subtree = Vec::new();
+            collect_settings_subtree_preorder(&children, root, &mut subtree);
+            indices.extend(subtree);
+        }
     }
     let mut reference_documents = documents
         .iter()
         .map(|(service, state)| (service.clone(), state.document.clone()))
         .collect::<BTreeMap<_, _>>();
-    for service in canonicalize_settings_reference_documents(&mut reference_documents) {
+    for service in
+        canonicalize_settings_references_for_moves(&mut reference_documents, &moved_indices)
+    {
         let state = documents
             .get_mut(&service)
             .context("Reference owner service disappeared")?;

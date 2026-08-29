@@ -104,7 +104,7 @@ local function replaceText(source: string, old: string, new: string, replaceAll:
 	return table.concat(output)
 end
 
-function BridgeCreatorApi.create()
+function BridgeCreatorApi.create(runtimeContext)
 	local api = {}
 	local history = game:GetService("ChangeHistoryService")
 	local HttpService = game:GetService("HttpService")
@@ -112,7 +112,17 @@ function BridgeCreatorApi.create()
 	local jobOrder = {}
 	local cameraStates = {}
 
-	local function startJob(callback): string?
+	local function assertRequestLeaseActive()
+		runtimeContext.assertRequestLeaseActive()
+	end
+
+	local function restoreCameraState(state)
+		state.camera.CameraType = state.cameraType
+		state.camera.CFrame = state.cframe
+		state.camera.Focus = state.focus
+	end
+
+	local function startJob(callback, leaseId): string?
 		if #jobOrder >= 32 then
 			for index, existingId in ipairs(jobOrder) do
 				if jobs[existingId].status ~= "running" then
@@ -126,7 +136,7 @@ function BridgeCreatorApi.create()
 			end
 		end
 		local id = HttpService:GenerateGUID(false)
-		jobs[id] = { status = "running", startedAt = os.clock() }
+		jobs[id] = { status = "running", startedAt = os.clock(), leaseId = leaseId }
 		jobOrder[#jobOrder + 1] = id
 		jobs[id].thread = task.spawn(function()
 			local ok, result = pcall(callback)
@@ -169,7 +179,7 @@ function BridgeCreatorApi.create()
 		}
 	end
 
-	function api.cameraCapture(params)
+	function api.cameraCapture(params, _sessionGeneration, leaseId)
 		local action = tostring(params.action or "")
 		if action == "restore" then
 			local token = tostring(params.token or "")
@@ -177,10 +187,11 @@ function BridgeCreatorApi.create()
 			if state == nil then
 				return { ok = false, error = "Camera capture token is stale" }
 			end
+			if state.leaseId ~= nil and state.leaseId ~= leaseId then
+				return { ok = false, error = "Camera capture token belongs to another request" }
+			end
+			restoreCameraState(state)
 			cameraStates[token] = nil
-			state.camera.CameraType = state.cameraType
-			state.camera.CFrame = state.cframe
-			state.camera.Focus = state.focus
 			return { ok = true }
 		end
 		if action ~= "prepare" then
@@ -191,25 +202,41 @@ function BridgeCreatorApi.create()
 		if type(position) ~= "table" or #position ~= 3 or type(lookAt) ~= "table" or #lookAt ~= 3 then
 			return { ok = false, error = "Camera position and lookAt must have three numbers" }
 		end
+		for _, value in ipairs({ position[1], position[2], position[3], lookAt[1], lookAt[2], lookAt[3] }) do
+			if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+				return { ok = false, error = "Camera position and lookAt must contain finite numbers" }
+			end
+		end
 		local camera = game:GetService("Workspace").CurrentCamera
 		if camera == nil then
 			return { ok = false, error = "No CurrentCamera is available" }
 		end
+		local activeCaptures = 0
+		for _ in pairs(cameraStates) do
+			activeCaptures += 1
+		end
+		if activeCaptures >= 8 then
+			return { ok = false, error = "Too many camera captures are active" }
+		end
+		local cameraPosition = Vector3.new(position[1], position[2], position[3])
+		local target = Vector3.new(lookAt[1], lookAt[2], lookAt[3])
+		local targetCFrame = CFrame.lookAt(cameraPosition, target)
 		local token = HttpService:GenerateGUID(false)
 		cameraStates[token] = {
 			camera = camera,
 			cameraType = camera.CameraType,
 			cframe = camera.CFrame,
 			focus = camera.Focus,
+			leaseId = leaseId,
 		}
-		local target = Vector3.new(lookAt[1], lookAt[2], lookAt[3])
 		camera.CameraType = Enum.CameraType.Scriptable
-		camera.CFrame = CFrame.lookAt(Vector3.new(position[1], position[2], position[3]), target)
+		camera.CFrame = targetCFrame
 		camera.Focus = CFrame.new(target)
 		return { ok = true, token = token }
 	end
 
 	function api.insertAsset(params)
+		assertRequestLeaseActive()
 		local assetId = tonumber(params.assetId)
 		if assetId == nil or assetId % 1 ~= 0 or assetId <= 0 then
 			return { ok = false, error = "assetId must be a positive integer" }
@@ -217,10 +244,12 @@ function BridgeCreatorApi.create()
 		local parent = resolvePath(params.parentPath)
 		local assetType = tostring(params.assetType or "")
 		local name = tostring(params.assetName or params.name or ("Asset" .. assetId))
-		local recording = history:TryBeginRecording("ReniumInsertAsset", "Insert asset")
+		local recording = nil
+		local loadedInstance = nil
 		local ok, result = pcall(function()
 			if assetType == "" then
 				local info = game:GetService("MarketplaceService"):GetProductInfoAsync(assetId, Enum.InfoType.Asset)
+				assertRequestLeaseActive()
 				local typeId = tonumber(info.AssetTypeId)
 				for _, item in ipairs(Enum.AssetType:GetEnumItems()) do
 					if item.Value == typeId then
@@ -244,6 +273,7 @@ function BridgeCreatorApi.create()
 				instance.AnimationId = "rbxassetid://" .. assetId
 			else
 				local objects = game:GetObjects("rbxassetid://" .. assetId)
+				assertRequestLeaseActive()
 				if #objects == 0 then
 					error("Roblox returned no instances for the asset")
 				elseif #objects == 1 then
@@ -255,12 +285,18 @@ function BridgeCreatorApi.create()
 					end
 				end
 			end
+			loadedInstance = instance
+			assertRequestLeaseActive()
+			recording = history:TryBeginRecording("ReniumInsertAsset", "Insert asset")
 			instance.Name = name
 			instance.Parent = parent
 			return instanceResult(instance)
 		end)
 		finishRecording(history, recording, ok)
 		if not ok then
+			if loadedInstance ~= nil then
+				loadedInstance:Destroy()
+			end
 			return { ok = false, error = tostring(result) }
 		end
 		result.ok = true
@@ -269,6 +305,7 @@ function BridgeCreatorApi.create()
 	end
 
 	function api.multiEdit(params)
+		assertRequestLeaseActive()
 		local path = tostring(params.filePath or params.path or "")
 		local edits = params.edits
 		if path == "" or type(edits) ~= "table" or #edits == 0 then
@@ -277,6 +314,7 @@ function BridgeCreatorApi.create()
 		local recording = history:TryBeginRecording("ReniumMultiEdit", "Edit script")
 		local found, script = pcall(resolvePath, path)
 		local created = false
+		local createdParent = nil
 		if not found then
 			local className = tostring(params.className or "")
 			if className ~= "Script" and className ~= "LocalScript" and className ~= "ModuleScript" then
@@ -297,41 +335,69 @@ function BridgeCreatorApi.create()
 			end
 			script = Instance.new(className)
 			script.Name = name
-			script.Parent = parent
+			createdParent = parent
 			created = true
 		end
 		if not script:IsA("LuaSourceContainer") then
 			finishRecording(history, recording, false)
 			return { ok = false, error = path .. " is not a script" }
 		end
-		local ok, result = pcall(function()
-			game:GetService("ScriptEditorService"):UpdateSourceAsync(script, function(source)
-				local output = source
-				for index, edit in ipairs(edits) do
-					if type(edit) ~= "table" then
-						error(("edits[%d] must be an object"):format(index))
-					end
-					local old = edit.oldString or edit.old_string
-					local new = edit.newString or edit.new_string
-					if type(old) ~= "string" or type(new) ~= "string" or old == new then
-						error(("edits[%d] needs different oldString and newString values"):format(index))
-					end
-					if old == "" then
-						if not created or index ~= 1 or output ~= "" then
-							error("An empty oldString is only valid for the first edit of a new empty script")
-						end
-						output = new
-					else
-						output = replaceText(output, old, new, edit.replaceAll == true or edit.replace_all == true)
-					end
+		local originalSource = nil
+		local updateApplied = false
+		local function applyEdits(source)
+			local output = source
+			for index, edit in ipairs(edits) do
+				if type(edit) ~= "table" then
+					error(("edits[%d] must be an object"):format(index))
 				end
-				return output
-			end)
+				local old = edit.oldString or edit.old_string
+				local new = edit.newString or edit.new_string
+				if type(old) ~= "string" or type(new) ~= "string" or old == new then
+					error(("edits[%d] needs different oldString and newString values"):format(index))
+				end
+				if old == "" then
+					if not created or index ~= 1 or output ~= "" then
+						error("An empty oldString is only valid for the first edit of a new empty script")
+					end
+					output = new
+				else
+					output = replaceText(output, old, new, edit.replaceAll == true or edit.replace_all == true)
+				end
+			end
+			return output
+		end
+		local ok, result = pcall(function()
+			if created then
+				assertRequestLeaseActive()
+				local writableScript = script :: any
+				writableScript.Source = applyEdits("")
+				assertRequestLeaseActive()
+				script.Parent = createdParent
+			else
+				game:GetService("ScriptEditorService"):UpdateSourceAsync(script, function(source)
+					assertRequestLeaseActive()
+					originalSource = source
+					local output = applyEdits(source)
+					assertRequestLeaseActive()
+					return output
+				end)
+				updateApplied = true
+			end
+			assertRequestLeaseActive()
 			return instanceResult(script)
 		end)
 		if not ok then
 			if created then
 				script:Destroy()
+			elseif updateApplied and originalSource ~= nil then
+				local okRestore, restoreError = pcall(function()
+					game:GetService("ScriptEditorService"):UpdateSourceAsync(script, function()
+						return originalSource
+					end)
+				end)
+				if not okRestore then
+					result = tostring(result) .. "; script rollback failed: " .. tostring(restoreError)
+				end
 			end
 			finishRecording(history, recording, false)
 			return { ok = false, error = tostring(result) }
@@ -342,7 +408,7 @@ function BridgeCreatorApi.create()
 		return result
 	end
 
-	function api.generateModel(params)
+	function api.generateModel(params, _sessionGeneration, leaseId)
 		local prompt = tostring(params.prompt or params.textPrompt or "")
 		local imageReference = params.imageAssetId or params.imageId or params.imageUri
 		if prompt == "" and imageReference == nil then
@@ -432,14 +498,14 @@ function BridgeCreatorApi.create()
 				result.generationId = metadata.UUID or metadata.Uuid or metadata.uuid or metadata.GenerationId
 			end
 			return result
-		end)
+		end, leaseId)
 		if jobId == nil then
 			return { ok = false, error = "Too many generation jobs are still running" }
 		end
 		return { ok = true, jobId = jobId, status = "running" }
 	end
 
-	function api.uploadImages(params)
+	function api.uploadImages(params, _sessionGeneration, leaseId)
 		local images = params.images or params.imagePaths
 		if type(images) ~= "table" or #images == 0 or #images > 20 then
 			return { ok = false, error = "uploadImages requires 1 through 20 image URIs" }
@@ -474,7 +540,7 @@ function BridgeCreatorApi.create()
 				}
 			end
 			return { images = output }
-		end)
+		end, leaseId)
 		if jobId == nil then
 			return { ok = false, error = "Too many creator jobs are still running" }
 		end
@@ -497,6 +563,32 @@ function BridgeCreatorApi.create()
 		}
 	end
 
+	function api.cancelRequestLease(leaseId)
+		local cancelledJobs = 0
+		for _, job in pairs(jobs) do
+			if job.leaseId == leaseId and job.status == "running" then
+				if coroutine.status(job.thread) ~= "dead" then
+					pcall(task.cancel, job.thread)
+				end
+				job.status = "cancelled"
+				job.error = "Renium request lease was cancelled"
+				job.finishedAt = os.clock()
+				cancelledJobs += 1
+			end
+		end
+		local restoredCameras = 0
+		for token, state in pairs(cameraStates) do
+			if state.leaseId == leaseId then
+				local okRestore = pcall(restoreCameraState, state)
+				if okRestore then
+					cameraStates[token] = nil
+					restoredCameras += 1
+				end
+			end
+		end
+		return { jobs = cancelledJobs, cameras = restoredCameras }
+	end
+
 	function api.cleanup()
 		for _, job in pairs(jobs) do
 			if job.status == "running" and coroutine.status(job.thread) ~= "dead" then
@@ -506,10 +598,10 @@ function BridgeCreatorApi.create()
 		table.clear(jobs)
 		table.clear(jobOrder)
 		for token, state in pairs(cameraStates) do
-			cameraStates[token] = nil
-			state.camera.CameraType = state.cameraType
-			state.camera.CFrame = state.cframe
-			state.camera.Focus = state.focus
+			local okRestore = pcall(restoreCameraState, state)
+			if okRestore then
+				cameraStates[token] = nil
+			end
 		end
 	end
 

@@ -1,12 +1,14 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
+use memchr::memmem;
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
@@ -76,31 +78,20 @@ impl SettingsBytecodeInstance {
 
 impl SettingsBytecode {
     pub(crate) fn read_file(path: &Path) -> Result<Self> {
-        for attempt in 0..6 {
-            let file_len = fs::metadata(path)
-                .with_context(|| format!("Failed to stat {}", path.display()))?
-                .len();
-            if file_len > MAX_SETTINGS_BYTECODE_BYTES as u64 {
-                bail!(
-                    "Settings bytecode file exceeds safe size limit of {} bytes: {}",
-                    MAX_SETTINGS_BYTECODE_BYTES,
-                    path.display()
-                );
-            }
-            let bytes =
-                fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-            match decode_settings_bytecode(&bytes) {
-                Ok(document) => return Ok(document),
-                Err(_) if attempt < 5 => {
-                    thread::sleep(Duration::from_millis(15 * (attempt + 1) as u64));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to decode {}", path.display()));
-                }
-            }
-        }
-        unreachable!("settings bytecode retry loop always returns")
+        read_settings_file(path, decode_settings_bytecode)
+    }
+
+    pub(crate) fn read_structure_file(path: &Path) -> Result<Self> {
+        read_settings_file(path, decode_settings_bytecode_structure)
+    }
+
+    pub(crate) fn read_file_if_contains_any_string_set(
+        path: &Path,
+        required: &[Vec<String>],
+    ) -> Result<Option<Self>> {
+        read_settings_file(path, |bytes| {
+            decode_settings_bytecode_if_contains_any_string_set(bytes, required)
+        })
     }
 
     pub(crate) fn write_file(&self, path: &Path) -> Result<()> {
@@ -111,6 +102,32 @@ impl SettingsBytecode {
         let bytes = encode_settings_bytecode(self)?;
         write_bytes_if_changed(path, &bytes)
     }
+}
+
+fn read_settings_file<T>(path: &Path, mut decode: impl FnMut(&[u8]) -> Result<T>) -> Result<T> {
+    for attempt in 0..6 {
+        let file_len = fs::metadata(path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?
+            .len();
+        if file_len > MAX_SETTINGS_BYTECODE_BYTES as u64 {
+            bail!(
+                "Settings bytecode file exceeds safe size limit of {} bytes: {}",
+                MAX_SETTINGS_BYTECODE_BYTES,
+                path.display()
+            );
+        }
+        let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        match decode(&bytes) {
+            Ok(document) => return Ok(document),
+            Err(_) if attempt < 5 => {
+                thread::sleep(Duration::from_millis(15 * (attempt + 1) as u64));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to decode {}", path.display()));
+            }
+        }
+    }
+    unreachable!("settings bytecode retry loop always returns")
 }
 
 pub(crate) fn settings_reference_index(value: &Value) -> Option<usize> {
@@ -182,6 +199,13 @@ pub(crate) fn strict_reference_path(object: &Map<String, Value>) -> Result<Optio
 pub(crate) fn instance_settings_id(index: usize, instance: &SnapshotInstance) -> String {
     if instance.instance_index == Some(1) && instance.parent_index.is_none() {
         return "1".to_string();
+    }
+    if let Some(settings_id) = instance
+        .transported_settings_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return settings_id.to_string();
     }
     if let Some(debug_id) = instance
         .debug_id
@@ -257,6 +281,28 @@ pub(crate) fn is_default_property_value(
 }
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
+    let (version, decoded) = decode_settings_bytecode_container(bytes)?;
+    decode_settings_bytecode_document(version, &decoded)
+}
+
+fn decode_settings_bytecode_if_contains_any_string_set(
+    bytes: &[u8],
+    required: &[Vec<String>],
+) -> Result<Option<SettingsBytecode>> {
+    let (version, decoded) = decode_settings_bytecode_container(bytes)?;
+    if !required.is_empty()
+        && !required.iter().any(|needles| {
+            needles
+                .iter()
+                .all(|needle| memmem::find(&decoded, needle.as_bytes()).is_some())
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(decode_settings_bytecode_document(version, &decoded)?))
+}
+
+fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     if bytes.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!("Settings bytecode exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes");
     }
@@ -283,17 +329,42 @@ pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode>
     }
     let encoded = reader.read_bytes(encoded_len)?;
     reader.finish()?;
+    let decompress_started = Instant::now();
     let decoded = zstd::bulk::decompress(encoded, decoded_len)?;
-    let mut payload_reader = BytecodeReader::new(&decoded);
+    log_timing("settings binary decompress", decompress_started);
+    Ok((version, decoded))
+}
+
+fn decode_settings_bytecode_document(version: u8, decoded: &[u8]) -> Result<SettingsBytecode> {
+    let decode_started = Instant::now();
+    let mut payload_reader = BytecodeReader::new(decoded);
     let document = decode_settings_bytecode_payload(version, &mut payload_reader)?;
     payload_reader.finish()?;
+    log_timing("settings binary payload decode", decode_started);
     Ok(document)
 }
 
-fn decode_settings_bytecode_payload(
-    version: u8,
+fn decode_settings_bytecode_structure(bytes: &[u8]) -> Result<SettingsBytecode> {
+    let (version, decoded) = decode_settings_bytecode_container(bytes)?;
+    let mut reader = BytecodeReader::new(&decoded);
+    let header = decode_settings_payload_header(&mut reader)?;
+    Ok(SettingsBytecode {
+        version,
+        instances: header.instances,
+    })
+}
+
+struct SettingsPayloadHeader {
+    strings: Vec<String>,
+    properties: Vec<String>,
+    instances: Vec<SettingsBytecodeInstance>,
+    instance_count: usize,
+}
+
+fn decode_settings_payload_header(
     reader: &mut BytecodeReader<'_>,
-) -> Result<SettingsBytecode> {
+) -> Result<SettingsPayloadHeader> {
+    let tables_started = Instant::now();
     let string_count = reader.read_collection_len("string count")?;
     let mut strings = Vec::with_capacity(string_count);
     for _ in 0..string_count {
@@ -320,12 +391,87 @@ fn decode_settings_bytecode_payload(
                 .to_string(),
         );
     }
+    log_timing("settings binary tables decode", tables_started);
 
+    let instances_started = Instant::now();
     let instance_count = reader.read_collection_len("instance count")?;
-    let mut instances = Vec::with_capacity(instance_count);
-    for instance_index in 0..instance_count {
-        let settings_id = read_compact_settings_id(reader, &strings)?;
-        let name = reader.read_string(&strings, "instance name")?.to_string();
+    let instances = decode_settings_instances(reader, &strings, &classes, instance_count)?;
+    validate_settings_hierarchy(&instances)?;
+    log_timing("settings binary instances decode", instances_started);
+
+    Ok(SettingsPayloadHeader {
+        strings,
+        properties,
+        instances,
+        instance_count,
+    })
+}
+
+fn decode_settings_bytecode_payload(
+    version: u8,
+    reader: &mut BytecodeReader<'_>,
+) -> Result<SettingsBytecode> {
+    let SettingsPayloadHeader {
+        strings,
+        properties,
+        mut instances,
+        instance_count,
+    } = decode_settings_payload_header(reader)?;
+
+    let group_specs_started = Instant::now();
+    let group_count = reader.read_collection_len("property group count")?;
+    let mut specs = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let property_id = reader.read_len("property id")?;
+        let property_name = properties
+            .get(property_id)
+            .with_context(|| format!("Invalid property id {property_id}"))?;
+        let kind = reader.read_u8().context("Missing property kind")?;
+        let value_count = reader.read_collection_len("property value count")?;
+        let body_len = reader.read_len("property group byte length")?;
+        let body = reader.read_bytes(body_len)?;
+        specs.push((property_name, kind, value_count, body));
+    }
+    log_timing(
+        "settings binary property group headers",
+        group_specs_started,
+    );
+    let groups_started = Instant::now();
+    let decoded_groups = specs
+        .par_iter()
+        .map(|(property_name, kind, value_count, body)| {
+            decode_property_group_body(
+                body,
+                property_name.as_str(),
+                *kind,
+                *value_count,
+                &strings,
+                instance_count,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log_timing("settings binary property group decode", groups_started);
+    let apply_started = Instant::now();
+    apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
+    log_timing("settings binary property group apply", apply_started);
+
+    Ok(SettingsBytecode { version, instances })
+}
+
+fn decode_settings_instance_range(
+    bytes: &[u8],
+    strings: &[String],
+    classes: &[String],
+    first_index: usize,
+    instance_count: usize,
+    count: usize,
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    let mut reader = BytecodeReader::new(bytes);
+    let mut instances = Vec::with_capacity(count);
+    for offset in 0..count {
+        let instance_index = first_index + offset;
+        let settings_id = read_compact_settings_id(&mut reader, strings)?;
+        let name = reader.read_string(strings, "instance name")?.to_string();
         let class_id = reader.read_len("instance class id")?;
         let class_name = classes
             .get(class_id)
@@ -340,55 +486,148 @@ fn decode_settings_bytecode_payload(
             parent_index,
         ));
     }
-    validate_settings_hierarchy(&instances)?;
+    reader.finish()?;
+    Ok(instances)
+}
 
-    let group_count = reader.read_collection_len("property group count")?;
-    let mut specs = Vec::with_capacity(group_count);
-    for _ in 0..group_count {
-        let property_id = reader.read_len("property id")?;
-        let property_name = properties
-            .get(property_id)
-            .with_context(|| format!("Invalid property id {property_id}"))?;
-        let kind = reader.read_u8().context("Missing property kind")?;
-        let value_count = reader.read_collection_len("property value count")?;
-        let body_len = reader.read_len("property group byte length")?;
-        let body = reader.read_bytes(body_len)?;
-        specs.push((property_name, kind, value_count, body));
+fn decode_settings_instances(
+    reader: &mut BytecodeReader<'_>,
+    strings: &[String],
+    classes: &[String],
+    instance_count: usize,
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    if instance_count < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
+    {
+        let start = reader.position();
+        for _ in 0..instance_count {
+            reader.read_var_u64()?;
+            reader.read_var_u64()?;
+            reader.read_var_u64()?;
+            reader.read_var_u64()?;
+        }
+        let bytes = &reader.bytes()[start..reader.position()];
+        return decode_settings_instance_range(
+            bytes,
+            strings,
+            classes,
+            0,
+            instance_count,
+            instance_count,
+        );
     }
-    let decoded_groups = specs
-        .par_iter()
-        .map(|(property_name, kind, value_count, body)| {
-            decode_property_group_body(
-                body,
-                property_name.as_str(),
-                *kind,
-                *value_count,
-                &strings,
+
+    let start = reader.position();
+    let chunk_count = instance_count.div_ceil(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
+    let mut offsets = Vec::with_capacity(chunk_count + 1);
+    offsets.push(start);
+    for index in 0..instance_count {
+        reader.read_var_u64()?;
+        reader.read_var_u64()?;
+        reader.read_var_u64()?;
+        reader.read_var_u64()?;
+        if (index + 1) % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE == 0 {
+            offsets.push(reader.position());
+        }
+    }
+    if offsets.last().copied() != Some(reader.position()) {
+        offsets.push(reader.position());
+    }
+    let bytes = reader.bytes();
+    let chunks = offsets
+        .par_windows(2)
+        .enumerate()
+        .map(|(chunk_index, offsets)| {
+            let first_index = chunk_index * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+            let count = (instance_count - first_index).min(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
+            decode_settings_instance_range(
+                &bytes[offsets[0]..offsets[1]],
+                strings,
+                classes,
+                first_index,
                 instance_count,
+                count,
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    for ((property_name, ..), entries) in specs.iter().zip(decoded_groups) {
-        for entry in entries {
-            match entry {
-                DecodedGroupEntry::Property(instance_index, value) => {
-                    instances[instance_index]
-                        .properties
-                        .insert((*property_name).clone(), value);
-                }
-                DecodedGroupEntry::Attributes(instance_index, attributes) => {
-                    instances[instance_index].attributes = attributes;
-                }
-            }
-        }
-    }
-
-    Ok(SettingsBytecode { version, instances })
+    Ok(chunks.into_iter().flatten().collect())
 }
 
 enum DecodedGroupEntry {
     Property(usize, Value),
     Attributes(usize, Map<String, Value>),
+}
+
+enum DecodedChunkEntry {
+    Property(usize, usize, Value),
+    Attributes(usize, Map<String, Value>),
+}
+
+fn apply_decoded_property_groups(
+    instances: &mut [SettingsBytecodeInstance],
+    specs: &[(&String, u8, usize, &[u8])],
+    decoded_groups: Vec<Vec<DecodedGroupEntry>>,
+) {
+    if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
+    {
+        for ((property_name, ..), entries) in specs.iter().zip(decoded_groups) {
+            for entry in entries {
+                match entry {
+                    DecodedGroupEntry::Property(instance_index, value) => {
+                        instances[instance_index]
+                            .properties
+                            .insert((*property_name).clone(), value);
+                    }
+                    DecodedGroupEntry::Attributes(instance_index, attributes) => {
+                        instances[instance_index].attributes = attributes;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let chunk_count = instances
+        .len()
+        .div_ceil(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
+    let mut by_chunk = (0..chunk_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (property_index, entries) in decoded_groups.into_iter().enumerate() {
+        for entry in entries {
+            match entry {
+                DecodedGroupEntry::Property(instance_index, value) => {
+                    let chunk_index = instance_index / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    let local_index = instance_index % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    by_chunk[chunk_index].push(DecodedChunkEntry::Property(
+                        local_index,
+                        property_index,
+                        value,
+                    ));
+                }
+                DecodedGroupEntry::Attributes(instance_index, attributes) => {
+                    let chunk_index = instance_index / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    let local_index = instance_index % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    by_chunk[chunk_index]
+                        .push(DecodedChunkEntry::Attributes(local_index, attributes));
+                }
+            }
+        }
+    }
+    instances
+        .par_chunks_mut(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .zip(by_chunk.into_par_iter())
+        .for_each(|(instances, entries)| {
+            for entry in entries {
+                match entry {
+                    DecodedChunkEntry::Property(instance_index, property_index, value) => {
+                        instances[instance_index]
+                            .properties
+                            .insert(specs[property_index].0.clone(), value);
+                    }
+                    DecodedChunkEntry::Attributes(instance_index, attributes) => {
+                        instances[instance_index].attributes = attributes;
+                    }
+                }
+            }
+        });
 }
 
 fn decode_property_group_body(
@@ -443,13 +682,36 @@ fn decode_property_group_body(
 }
 
 pub(crate) fn encode_settings_bytecode(document: &SettingsBytecode) -> Result<Vec<u8>> {
+    encode_settings_bytecode_with_reference_lookup(document, true)
+}
+
+pub(crate) fn encode_settings_bytecode_with_dense_references(
+    document: &SettingsBytecode,
+) -> Result<Vec<u8>> {
+    encode_settings_bytecode_with_reference_lookup(document, false)
+}
+
+fn encode_settings_bytecode_with_reference_lookup(
+    document: &SettingsBytecode,
+    build_reference_lookup: bool,
+) -> Result<Vec<u8>> {
+    let validate_started = Instant::now();
     validate_settings_hierarchy(&document.instances)?;
-    let payload = encode_settings_bytecode_payload(document)?;
-    wrap_settings_bytecode_payload(&payload)
+    log_timing("settings binary hierarchy validation", validate_started);
+
+    let payload_started = Instant::now();
+    let payload =
+        encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
+    log_timing("settings binary payload encode", payload_started);
+
+    let compress_started = Instant::now();
+    let encoded = wrap_settings_bytecode_payload(&payload)?;
+    log_timing("settings binary payload compression", compress_started);
+    Ok(encoded)
 }
 
 fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result<()> {
-    let mut settings_ids = HashSet::with_capacity(instances.len());
+    let mut settings_ids = AHashSet::with_capacity(instances.len());
     for (index, instance) in instances.iter().enumerate() {
         if instance.settings_id.is_empty() {
             bail!("Settings bytecode instance {index} has an empty settings id");
@@ -510,58 +772,110 @@ fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result
     Ok(())
 }
 
-fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
-    let lookup = build_bytecode_instance_lookup(document);
-    let mut collected = SettingsBinaryCollection::default();
+fn collect_settings_bytecode_chunk<'a>(
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    instances: &'a [SettingsBytecodeInstance],
+    base_index: usize,
+) -> Result<SettingsBinaryCollection<'a>> {
+    let mut out = SettingsBinaryCollection::default();
 
-    for (instance_index, instance) in document.instances.iter().enumerate() {
+    for (offset, instance) in instances.iter().enumerate() {
+        let instance_index = base_index + offset;
         if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
-            add_count(
-                &mut collected.string_counts,
-                instance.settings_id.as_str(),
-                1,
-            );
+            add_count(&mut out.string_counts, instance.settings_id.as_str(), 1);
         }
-        add_count(&mut collected.string_counts, instance.name.as_str(), 1);
-        add_count(
-            &mut collected.string_counts,
-            instance.class_name.as_str(),
-            1,
-        );
-        add_count(&mut collected.class_counts, instance.class_name.as_str(), 1);
+        add_count(&mut out.string_counts, instance.name.as_str(), 1);
+        add_count(&mut out.string_counts, instance.class_name.as_str(), 1);
+        add_count(&mut out.class_counts, instance.class_name.as_str(), 1);
 
         for (property_name, raw_value) in &instance.properties {
-            let kind = binary_raw_value_kind(raw_value, &lookup)?;
+            let kind = binary_raw_value_kind(raw_value, lookup)?;
             if kind == 0 {
                 continue;
             }
             let property_name = property_name.as_str();
-            let source = SettingsBinaryValueSource::Property(raw_value);
             push_settings_binary_value(
-                &mut collected,
-                &lookup,
+                &mut out,
+                lookup,
                 instance_index,
                 property_name,
                 kind,
-                source,
+                SettingsBinaryValueSource::Property(raw_value),
             )?;
         }
 
         if !instance.attributes.is_empty() {
-            let property_name = "Attributes";
             let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
-            let kind = binary_source_value_kind(&source, &lookup)?;
+            let kind = binary_source_value_kind(&source, lookup)?;
             push_settings_binary_value(
-                &mut collected,
-                &lookup,
+                &mut out,
+                lookup,
                 instance_index,
-                property_name,
+                "Attributes",
                 kind,
                 source,
             )?;
         }
     }
 
+    Ok(out)
+}
+
+fn collect_settings_bytecode_data<'a>(
+    document: &'a SettingsBytecode,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Result<SettingsBinaryCollection<'a>> {
+    if document.instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
+        || rayon::current_num_threads() <= 1
+    {
+        return collect_settings_bytecode_chunk(lookup, &document.instances, 0);
+    }
+
+    let partials = document
+        .instances
+        .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk_index, instances)| {
+            collect_settings_bytecode_chunk(
+                lookup,
+                instances,
+                chunk_index * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut out = SettingsBinaryCollection::default();
+    for partial in partials {
+        merge_settings_binary_collection(&mut out, partial);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
+    encode_settings_bytecode_payload_with_reference_lookup(document, true)
+}
+
+fn encode_settings_bytecode_payload_with_reference_lookup(
+    document: &SettingsBytecode,
+    build_reference_lookup: bool,
+) -> Result<Vec<u8>> {
+    let lookup_started = Instant::now();
+    let lookup = if build_reference_lookup {
+        build_bytecode_instance_lookup(document)
+    } else {
+        SettingsBinaryInstanceLookup {
+            dense_instance_count: document.instances.len(),
+            dense_instances: Some(&document.instances),
+            ..Default::default()
+        }
+    };
+    log_timing("settings binary encode lookup", lookup_started);
+    let collect_started = Instant::now();
+    let collected = collect_settings_bytecode_data(document, &lookup)?;
+    log_timing("settings binary encode collect", collect_started);
+
+    let tables_started = Instant::now();
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -570,6 +884,7 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
     let property_ids = build_id_map(&properties);
     let property_group_entries =
         sorted_settings_property_groups(collected.property_groups, &property_ids);
+    log_timing("settings binary encode tables", tables_started);
 
     let estimated_capacity = document
         .instances
@@ -585,20 +900,54 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
         &properties,
         document.instances.len(),
     )?;
-    for (instance_index, instance) in document.instances.iter().enumerate() {
-        write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
-        write_binary_string_id(&mut writer, &string_ids, instance.name.as_str())?;
-        write_lookup_id(
-            &mut writer,
-            &class_ids,
-            instance.class_name.as_str(),
-            "class",
-        )?;
-        write_var_u64(
-            &mut writer,
-            encode_parent_index(instance.parent_index, instance_index)?,
-        )?;
+    let instances_started = Instant::now();
+    if document.instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
+        && rayon::current_num_threads() > 1
+    {
+        let bodies = document
+            .instances
+            .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+            .enumerate()
+            .map(|(chunk_index, instances)| {
+                let base_index = chunk_index * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                let mut body = Vec::with_capacity(instances.len().saturating_mul(12));
+                for (offset, instance) in instances.iter().enumerate() {
+                    write_compact_settings_id(
+                        &mut body,
+                        &string_ids,
+                        instance.settings_id.as_str(),
+                    )?;
+                    write_binary_string_id(&mut body, &string_ids, instance.name.as_str())?;
+                    write_lookup_id(&mut body, &class_ids, instance.class_name.as_str(), "class")?;
+                    write_var_u64(
+                        &mut body,
+                        encode_parent_index(instance.parent_index, base_index + offset)?,
+                    )?;
+                }
+                Ok(body)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for body in bodies {
+            writer.extend_from_slice(&body);
+        }
+    } else {
+        for (instance_index, instance) in document.instances.iter().enumerate() {
+            write_compact_settings_id(&mut writer, &string_ids, instance.settings_id.as_str())?;
+            write_binary_string_id(&mut writer, &string_ids, instance.name.as_str())?;
+            write_lookup_id(
+                &mut writer,
+                &class_ids,
+                instance.class_name.as_str(),
+                "class",
+            )?;
+            write_var_u64(
+                &mut writer,
+                encode_parent_index(instance.parent_index, instance_index)?,
+            )?;
+        }
     }
+    log_timing("settings binary encode instances", instances_started);
+    let properties_started = Instant::now();
     write_settings_binary_property_groups(
         &mut writer,
         &property_group_entries,
@@ -606,6 +955,7 @@ fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u
         &string_ids,
         &lookup,
     )?;
+    log_timing("settings binary encode properties", properties_started);
 
     Ok(writer)
 }
@@ -647,16 +997,44 @@ fn var_u64_len(mut value: u64) -> usize {
     len
 }
 
-fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup {
-    let mut lookup = SettingsBinaryInstanceLookup::default();
-    let paths = settings_document_path_parts(document);
+fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup<'_> {
+    let selectors = settings_document_reference_selectors(document);
+    let mut lookup = SettingsBinaryInstanceLookup {
+        dense_instance_count: document.instances.len(),
+        dense_instances: Some(&document.instances),
+        by_settings_id: if selectors.settings_id {
+            AHashMap::with_capacity(document.instances.len())
+        } else {
+            AHashMap::new()
+        },
+        by_path: if selectors.path {
+            AHashMap::with_capacity(document.instances.len())
+        } else {
+            AHashMap::new()
+        },
+        by_path_segments: if selectors.path {
+            AHashMap::with_capacity(document.instances.len())
+        } else {
+            AHashMap::new()
+        },
+        by_path_parts: if selectors.path {
+            AHashMap::with_capacity(document.instances.len())
+        } else {
+            AHashMap::new()
+        },
+        ..Default::default()
+    };
+    let paths = selectors
+        .path
+        .then(|| settings_document_path_parts(document));
     for (index, instance) in document.instances.iter().enumerate() {
-        lookup.by_instance_index.entry(index + 1).or_insert(index);
-        lookup
-            .by_settings_id
-            .entry(instance.settings_id.clone())
-            .or_insert(index);
-        if let Some((segments, ordinals)) = paths.get(index) {
+        if selectors.settings_id {
+            lookup
+                .by_settings_id
+                .entry(Cow::Borrowed(instance.settings_id.as_str()))
+                .or_insert(index);
+        }
+        if let Some((segments, ordinals)) = paths.as_ref().and_then(|paths| paths.get(index)) {
             insert_unique_path(
                 &mut lookup.by_path_segments,
                 path_segments_key(segments),
@@ -671,6 +1049,57 @@ fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinary
         }
     }
     lookup
+}
+
+#[derive(Default)]
+struct SettingsReferenceSelectors {
+    settings_id: bool,
+    path: bool,
+}
+
+fn settings_document_reference_selectors(
+    document: &SettingsBytecode,
+) -> SettingsReferenceSelectors {
+    let mut selectors = SettingsReferenceSelectors::default();
+    for instance in &document.instances {
+        for value in instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+        {
+            collect_settings_reference_selectors(value, &mut selectors);
+            if selectors.settings_id && selectors.path {
+                return selectors;
+            }
+        }
+    }
+    selectors
+}
+
+fn collect_settings_reference_selectors(value: &Value, selectors: &mut SettingsReferenceSelectors) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_settings_reference_selectors(value, selectors);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(reference) = ref_payload_object(value) {
+                selectors.settings_id |= reference.get("instanceIndex").is_none()
+                    && ["settingsId", "referent", "ref"]
+                        .iter()
+                        .any(|key| reference.contains_key(*key));
+                selectors.path |= ["path", "pathSegments", "pathOrdinals"]
+                    .iter()
+                    .any(|key| reference.contains_key(*key));
+            } else {
+                for value in object.values() {
+                    collect_settings_reference_selectors(value, selectors);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 struct BytecodeReader<'a> {
@@ -693,6 +1122,14 @@ impl<'a> BytecodeReader<'a> {
             bail!("Invalid settings bytecode magic");
         }
         Ok(())
+    }
+
+    fn bytes(&self) -> &'a [u8] {
+        self.cursor.get_ref()
+    }
+
+    fn position(&self) -> usize {
+        self.cursor.position() as usize
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -1172,10 +1609,10 @@ fn decode_parent_index(
 }
 
 type SettingsString<'a> = Cow<'a, str>;
-type SettingsStringCounts<'a> = HashMap<SettingsString<'a>, u64>;
-type SettingsPropertyGroups<'a> = HashMap<(&'a str, u8), Vec<SettingsBinaryValue<'a>>>;
-type SettingsStringIdMap<'a> = HashMap<&'a str, u64>;
-type SettingsIndexMap<K> = HashMap<K, usize>;
+type SettingsStringCounts<'a> = AHashMap<SettingsString<'a>, u64>;
+type SettingsPropertyGroups<'a> = AHashMap<(&'a str, u8), Vec<SettingsBinaryValue<'a>>>;
+type SettingsStringIdMap<'a> = AHashMap<&'a str, u64>;
+type SettingsIndexMap<K> = AHashMap<K, usize>;
 
 struct SettingsBinaryInstance<'a> {
     source_index: usize,
@@ -1220,15 +1657,16 @@ enum SettingsBinaryValueSource<'a> {
 }
 
 #[derive(Default)]
-struct SettingsBinaryInstanceLookup {
+struct SettingsBinaryInstanceLookup<'a> {
     dense_instance_count: usize,
+    dense_instances: Option<&'a [SettingsBytecodeInstance]>,
     by_instance_index: SettingsIndexMap<usize>,
-    by_settings_id: SettingsIndexMap<String>,
+    by_settings_id: SettingsIndexMap<Cow<'a, str>>,
     by_instance_id: SettingsIndexMap<String>,
     by_debug_id: SettingsIndexMap<String>,
-    by_path: HashMap<String, Option<usize>>,
-    by_path_segments: HashMap<String, Option<usize>>,
-    by_path_parts: HashMap<String, Option<usize>>,
+    by_path: AHashMap<String, Option<usize>>,
+    by_path_segments: AHashMap<String, Option<usize>>,
+    by_path_parts: AHashMap<String, Option<usize>>,
 }
 
 const SETTINGS_BINARY_PARALLEL_MIN_INSTANCES: usize = 2_048;
@@ -1247,7 +1685,7 @@ enum FixedNumericKind {
 
 fn push_settings_binary_value<'a>(
     out: &mut SettingsBinaryCollection<'a>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     instance_index: usize,
     property_name: &'a str,
     kind: u8,
@@ -1268,7 +1706,7 @@ fn push_settings_binary_value<'a>(
 
 fn collect_settings_binary_chunk<'a>(
     state: &'a ServiceState,
-    lookup: &'a SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBinaryInstance<'a>],
     base_index: usize,
 ) -> Result<SettingsBinaryCollection<'a>> {
@@ -1370,7 +1808,7 @@ fn merge_settings_binary_collection<'a>(
 
 fn collect_settings_binary_data<'a>(
     state: &'a ServiceState,
-    lookup: &'a SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBinaryInstance<'a>],
 ) -> Result<SettingsBinaryCollection<'a>> {
     if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
@@ -1398,6 +1836,7 @@ fn collect_settings_binary_data<'a>(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceState) -> Result<()> {
     write_service_settings_binary_file_inner(path, state, false)
 }
@@ -1419,6 +1858,27 @@ fn write_service_settings_binary_file_inner(
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
+    let writer = encode_service_settings_binary(path, state)?;
+    let write_started = Instant::now();
+    if fresh {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(&writer)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    } else {
+        write_bytes_if_changed(path, &writer)?;
+    }
+    log_timing(
+        &format!("settings binary write {}", path.display()),
+        write_started,
+    );
+    Ok(())
+}
+
+pub(crate) fn encode_service_settings_binary(path: &Path, state: &ServiceState) -> Result<Vec<u8>> {
     let collect_started = Instant::now();
     let instances = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &instances);
@@ -1428,7 +1888,7 @@ fn write_service_settings_binary_file_inner(
         collect_started,
     );
 
-    let write_started = Instant::now();
+    let encode_started = Instant::now();
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -1493,22 +1953,11 @@ fn write_service_settings_binary_file_inner(
     )?;
 
     let writer = wrap_settings_bytecode_payload(&payload)?;
-    if fresh {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| format!("Failed to create {}", path.display()))?;
-        file.write_all(&writer)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-    } else {
-        write_bytes_if_changed(path, &writer)?;
-    }
     log_timing(
-        &format!("settings binary write {}", path.display()),
-        write_started,
+        &format!("settings binary encode {}", path.display()),
+        encode_started,
     );
-    Ok(())
+    Ok(writer)
 }
 
 fn collect_service_settings_binary_instances(
@@ -1576,6 +2025,13 @@ fn settings_binary_id(source_index: usize, instance: &SnapshotInstance) -> Setti
     if instance.instance_index == Some(1) && instance.parent_index.is_none() {
         return SettingsBinaryId::Text(Cow::Borrowed("1"));
     }
+    if let Some(settings_id) = instance
+        .transported_settings_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return SettingsBinaryId::Text(Cow::Borrowed(settings_id));
+    }
     if let Some(debug_id) = instance
         .debug_id
         .as_deref()
@@ -1587,53 +2043,56 @@ fn settings_binary_id(source_index: usize, instance: &SnapshotInstance) -> Setti
     SettingsBinaryId::Text(Cow::Owned(instance_settings_id(source_index, instance)))
 }
 
-fn build_settings_binary_instance_lookup(
-    state: &ServiceState,
-    instances: &[SettingsBinaryInstance<'_>],
-) -> SettingsBinaryInstanceLookup {
+fn build_settings_binary_instance_lookup<'a>(
+    state: &'a ServiceState,
+    instances: &[SettingsBinaryInstance<'a>],
+) -> SettingsBinaryInstanceLookup<'a> {
     if state.dense_index_topology {
         return SettingsBinaryInstanceLookup {
             dense_instance_count: instances.len(),
             ..Default::default()
         };
     }
-    let mut by_instance_index = HashMap::with_capacity(instances.len());
+    let mut by_instance_index = AHashMap::with_capacity(instances.len());
     let mut by_settings_id = if state.properties_default_elided {
-        HashMap::new()
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len())
+        AHashMap::with_capacity(instances.len())
     };
     let mut by_instance_id = if state.properties_default_elided {
-        HashMap::new()
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len())
+        AHashMap::with_capacity(instances.len())
     };
     let mut by_debug_id = if state.properties_default_elided {
-        HashMap::new()
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len() / 4)
+        AHashMap::with_capacity(instances.len() / 4)
     };
-    let mut by_path: HashMap<String, Option<usize>> = if state.properties_default_elided {
-        HashMap::new()
+    let mut by_path: AHashMap<String, Option<usize>> = if state.properties_default_elided {
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len())
+        AHashMap::with_capacity(instances.len())
     };
-    let mut by_path_segments: HashMap<String, Option<usize>> = if state.properties_default_elided {
-        HashMap::new()
+    let mut by_path_segments: AHashMap<String, Option<usize>> = if state.properties_default_elided {
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len())
+        AHashMap::with_capacity(instances.len())
     };
-    let mut by_path_parts: HashMap<String, Option<usize>> = if state.properties_default_elided {
-        HashMap::new()
+    let mut by_path_parts: AHashMap<String, Option<usize>> = if state.properties_default_elided {
+        AHashMap::new()
     } else {
-        HashMap::with_capacity(instances.len())
+        AHashMap::with_capacity(instances.len())
     };
     let path_parts = settings_binary_path_parts(instances);
 
     for (binary_index, record) in instances.iter().enumerate() {
         let instance = &state.instances[record.source_index];
         by_settings_id
-            .entry(instance_settings_id(record.source_index, instance))
+            .entry(Cow::Owned(instance_settings_id(
+                record.source_index,
+                instance,
+            )))
             .or_insert(binary_index);
         if let Some(instance_index) = instance.instance_index.filter(|value| *value > 0) {
             by_instance_index
@@ -1675,6 +2134,7 @@ fn build_settings_binary_instance_lookup(
 
     SettingsBinaryInstanceLookup {
         dense_instance_count: 0,
+        dense_instances: None,
         by_instance_index,
         by_settings_id,
         by_instance_id,
@@ -1706,7 +2166,7 @@ fn path_parts_key(segments: &[String], ordinals: &[usize]) -> String {
     key
 }
 
-fn insert_unique_path(map: &mut HashMap<String, Option<usize>>, key: String, index: usize) {
+fn insert_unique_path(map: &mut AHashMap<String, Option<usize>>, key: String, index: usize) {
     match map.entry(key) {
         std::collections::hash_map::Entry::Vacant(entry) => {
             entry.insert(Some(index));
@@ -1803,7 +2263,7 @@ fn sorted_counted_strings<'a>(counts: SettingsStringCounts<'a>) -> Vec<SettingsS
 }
 
 fn build_id_map<'a>(items: &'a [SettingsString<'_>]) -> SettingsStringIdMap<'a> {
-    let mut out = HashMap::with_capacity(items.len());
+    let mut out = AHashMap::with_capacity(items.len());
     for (index, text) in items.iter().enumerate() {
         out.insert(text.as_ref(), index as u64);
     }
@@ -1853,7 +2313,7 @@ fn write_settings_binary_property_groups<W: Write + ?Sized>(
     groups: &[((&str, u8), Vec<SettingsBinaryValue<'_>>)],
     property_ids: &SettingsStringIdMap<'_>,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<()> {
     write_var_u64(writer, groups.len() as u64)?;
     let bodies = groups
@@ -1876,7 +2336,7 @@ fn write_settings_binary_property_groups<W: Write + ?Sized>(
 
 fn binary_source_value_kind(
     source: &SettingsBinaryValueSource<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<u8> {
     Ok(match source {
         SettingsBinaryValueSource::Property(value) => binary_raw_value_kind(value, lookup)?,
@@ -1887,7 +2347,7 @@ fn binary_source_value_kind(
 
 fn collect_binary_source_strings<'a>(
     source: &SettingsBinaryValueSource<'a>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     out: &mut SettingsStringCounts<'a>,
 ) -> Result<()> {
     match source {
@@ -1911,7 +2371,7 @@ fn write_binary_source_payload<W: Write + ?Sized>(
     source: &SettingsBinaryValueSource<'_>,
     kind: u8,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     match source {
@@ -2007,7 +2467,7 @@ fn write_property_group_values<W: Write + ?Sized>(
     values: &[SettingsBinaryValue<'_>],
     kind: u8,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     let mut previous_instance_index = 0_usize;
@@ -2067,7 +2527,7 @@ fn write_property_group_values<W: Write + ?Sized>(
 
 fn write_resolved_ref_group_payload<W: Write + ?Sized>(
     source: &SettingsBinaryValueSource<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     previous_target_index: &mut usize,
     writer: &mut W,
 ) -> Result<()> {
@@ -2183,7 +2643,7 @@ fn write_f32_bits<W: Write + ?Sized>(bits: u32, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn binary_raw_value_kind(value: &Value, lookup: &SettingsBinaryInstanceLookup) -> Result<u8> {
+fn binary_raw_value_kind(value: &Value, lookup: &SettingsBinaryInstanceLookup<'_>) -> Result<u8> {
     Ok(match value {
         Value::Null => 0,
         Value::Bool(false) => 1,
@@ -2418,10 +2878,11 @@ fn ref_payload_object(value: &Value) -> Option<&Map<String, Value>> {
 
 fn resolve_ref_index(
     ref_value: &Map<String, Value>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<Option<usize>> {
     let mut resolved = None;
     let mut unresolved = false;
+    let mut explicit_instance_index = None;
     let mut accept = |label: &str, candidate: usize| -> Result<()> {
         if let Some(existing) = resolved
             && existing != candidate
@@ -2445,10 +2906,9 @@ fn resolve_ref_index(
             }
             index_candidate = Some(*index);
         }
-        accept(
-            "instanceIndex",
-            index_candidate.context("Ref instanceIndex does not exist")?,
-        )?;
+        let index_candidate = index_candidate.context("Ref instanceIndex does not exist")?;
+        explicit_instance_index = Some(index_candidate);
+        accept("instanceIndex", index_candidate)?;
     }
     let mut accept_stable = |label: &str, candidate: Option<usize>| -> Result<()> {
         if let Some(candidate) = candidate {
@@ -2462,10 +2922,15 @@ fn resolve_ref_index(
         let settings_id = raw_settings_id
             .as_str()
             .context("Ref settingsId must be a string")?;
-        accept_stable(
-            "settingsId",
-            lookup.by_settings_id.get(settings_id).copied(),
-        )?;
+        let candidate = lookup.by_settings_id.get(settings_id).copied().or_else(|| {
+            let index = explicit_instance_index?;
+            lookup
+                .dense_instances?
+                .get(index)
+                .filter(|instance| instance.settings_id == settings_id)
+                .map(|_| index)
+        });
+        accept_stable("settingsId", candidate)?;
     }
     if let Some(raw_instance_id) = ref_value.get("instanceId") {
         let instance_id = raw_instance_id
@@ -2481,7 +2946,15 @@ fn resolve_ref_index(
             let id = raw_id
                 .as_str()
                 .with_context(|| format!("Ref {alias} must be a string"))?;
-            accept_stable(alias, lookup.by_settings_id.get(id).copied())?;
+            let candidate = lookup.by_settings_id.get(id).copied().or_else(|| {
+                let index = explicit_instance_index?;
+                lookup
+                    .dense_instances?
+                    .get(index)
+                    .filter(|instance| instance.settings_id == id)
+                    .map(|_| index)
+            });
+            accept_stable(alias, candidate)?;
         }
     }
     if let Some(raw_debug_id) = ref_value.get("debugId") {
@@ -2520,7 +2993,7 @@ fn resolve_ref_index(
 
 fn collect_raw_value_strings<'a>(
     value: &'a Value,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     out: &mut SettingsStringCounts<'a>,
 ) -> Result<()> {
     match binary_raw_value_kind(value, lookup)? {
@@ -2551,7 +3024,7 @@ fn collect_raw_value_strings<'a>(
 
 fn collect_raw_object_strings<'a>(
     value: &'a Value,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     out: &mut SettingsStringCounts<'a>,
 ) -> Result<()> {
     let obj = value
@@ -2674,7 +3147,7 @@ fn split_enum_tail(text: &str) -> &str {
 fn write_raw_value<W: Write + ?Sized>(
     value: &Value,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     let kind = binary_raw_value_kind(value, lookup)?;
@@ -2686,7 +3159,7 @@ fn write_raw_value_payload<W: Write + ?Sized>(
     value: &Value,
     kind: u8,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     match kind {
@@ -2802,7 +3275,7 @@ fn write_number_payload<W: Write + ?Sized>(
 fn write_raw_object_payload<W: Write + ?Sized>(
     value: &Value,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     let obj = value
@@ -2834,7 +3307,7 @@ fn write_raw_object_payload<W: Write + ?Sized>(
 fn write_brick_color_payload<W: Write + ?Sized>(
     obj: &Map<String, Value>,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     write_var_u64(writer, 1)?;
@@ -2870,7 +3343,7 @@ fn write_sequence_payload_header<'a, W: Write + ?Sized>(
 fn write_color_sequence_payload<W: Write + ?Sized>(
     obj: &Map<String, Value>,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     for keypoint_obj in write_sequence_payload_header(obj, "ColorSequence", string_ids, writer)?
@@ -2899,7 +3372,7 @@ fn write_color_sequence_payload<W: Write + ?Sized>(
 fn write_number_sequence_payload<W: Write + ?Sized>(
     obj: &Map<String, Value>,
     string_ids: &SettingsStringIdMap<'_>,
-    lookup: &SettingsBinaryInstanceLookup,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
     for keypoint_obj in write_sequence_payload_header(obj, "NumberSequence", string_ids, writer)?
@@ -3371,6 +3844,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transported_settings_id_precedes_live_debug_id() {
+        let instance = SnapshotInstance {
+            transported_settings_id: Some("editor:stable".to_string()),
+            debug_id: Some("0_123".to_string()),
+            instance_index: Some(2),
+            parent_index: Some(1),
+            ..Default::default()
+        };
+
+        assert_eq!(instance_settings_id(1, &instance), "editor:stable");
+        match settings_binary_id(1, &instance) {
+            SettingsBinaryId::Text(settings_id) => assert_eq!(settings_id, "editor:stable"),
+            SettingsBinaryId::NumericDebug(_) => panic!("transported id was bypassed"),
+        }
+    }
+
+    #[test]
+    fn indexed_stable_reference_avoids_global_id_lookup() {
+        let reference = json!({
+            "_type": "Ref",
+            "instanceIndex": 2,
+            "settingsId": "child",
+        });
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance {
+                    settings_id: "root".to_string(),
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    parent_index: None,
+                    properties: Map::from_iter([("PrimaryPart".to_string(), reference.clone())]),
+                    attributes: Map::new(),
+                },
+                SettingsBytecodeInstance::new(
+                    "child".to_string(),
+                    "Target".to_string(),
+                    "Part".to_string(),
+                    Some(0),
+                ),
+            ],
+        };
+
+        let lookup = build_bytecode_instance_lookup(&document);
+        assert!(lookup.by_settings_id.is_empty());
+        assert_eq!(
+            resolve_ref_index(ref_payload_object(&reference).unwrap(), &lookup).unwrap(),
+            Some(1)
+        );
+
+        let decoded = decode_settings_bytecode(
+            &encode_settings_bytecode_with_dense_references(&document).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.instances[0].properties["PrimaryPart"],
+            json!({ "_type": "Ref", "instanceIndex": 2 })
+        );
+    }
+
+    #[test]
+    fn indexed_stable_reference_rejects_contradictory_id() {
+        let reference = json!({
+            "_type": "Ref",
+            "instanceIndex": 2,
+            "settingsId": "root",
+        });
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance {
+                    settings_id: "root".to_string(),
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    parent_index: None,
+                    properties: Map::from_iter([("PrimaryPart".to_string(), reference.clone())]),
+                    attributes: Map::new(),
+                },
+                SettingsBytecodeInstance::new(
+                    "child".to_string(),
+                    "Target".to_string(),
+                    "Part".to_string(),
+                    Some(0),
+                ),
+            ],
+        };
+        let lookup = build_bytecode_instance_lookup(&document);
+
+        assert!(resolve_ref_index(ref_payload_object(&reference).unwrap(), &lookup).is_err());
+        assert!(encode_settings_bytecode_with_dense_references(&document).is_err());
+    }
+
+    #[test]
     fn fixed_numeric_component_preserves_special_values_and_clamps_overflow() {
         assert_eq!(fixed_numeric_component_f32(1.5), 1.5_f32);
         assert_eq!(fixed_numeric_component_f32(1e39), f32::MAX);
@@ -3445,8 +4011,16 @@ mod tests {
 
         let bytes = encode_settings_bytecode(&document).unwrap();
         let decoded = decode_settings_bytecode(&bytes).unwrap();
+        let structure = decode_settings_bytecode_structure(&bytes).unwrap();
 
         assert_eq!(decoded.instances.len(), 3);
+        assert_eq!(structure.instances.len(), 3);
+        assert_eq!(structure.instances[1].settings_id, "child");
+        assert_eq!(structure.instances[1].name, "Target");
+        assert_eq!(structure.instances[1].class_name, "Part");
+        assert_eq!(structure.instances[1].parent_index, Some(0));
+        assert!(structure.instances[1].properties.is_empty());
+        assert!(structure.instances[1].attributes.is_empty());
         assert_eq!(decoded.instances[1].parent_index, Some(0));
         assert_eq!(
             decoded.instances[1].properties.get("Tags"),
@@ -3484,6 +4058,45 @@ mod tests {
                 "enumType": "Enum.KeyCode",
                 "name": "ButtonL2",
             }))
+        );
+    }
+
+    #[test]
+    fn settings_bytecode_string_set_filter_skips_unrelated_documents() {
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "Workspace".to_string(),
+                    "Workspace".to_string(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "child".to_string(),
+                    "Target".to_string(),
+                    "Part".to_string(),
+                    Some(0),
+                ),
+            ],
+        };
+        let bytes = encode_settings_bytecode(&document).unwrap();
+
+        assert!(
+            decode_settings_bytecode_if_contains_any_string_set(
+                &bytes,
+                &[vec!["Workspace".to_string(), "Target".to_string()]],
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            decode_settings_bytecode_if_contains_any_string_set(
+                &bytes,
+                &[vec!["Workspace".to_string(), "Missing".to_string()]],
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

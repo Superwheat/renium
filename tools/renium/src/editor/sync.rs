@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,8 +29,8 @@ use crate::editor::document::{
 };
 use crate::editor::history::save_editor_history_entries;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_source_path_map, editor_run_context_value,
-    infer_editor_source_path_spec, service_from_changed_path,
+    build_editor_instance_paths, build_editor_source_path_map, editor_directory_target,
+    editor_run_context_value, infer_editor_source_path_spec, service_from_changed_path,
 };
 use crate::editor::review::{
     apply_protected_writes_offline, is_externally_managed_editor_property,
@@ -62,7 +62,9 @@ use crate::studio::bridge::{
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
 };
-use crate::studio::native::import::{build_editor_binary_import, prepare_native_editor_full_push};
+use crate::studio::native::import::{
+    build_editor_binary_import, editor_services_have_package_links, prepare_native_editor_full_push,
+};
 use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix,
@@ -73,12 +75,34 @@ struct EditorTransaction<'a> {
     id: String,
     active: bool,
     package_mutation: bool,
+    package_dialog: Option<crate::studio::input::PackageChangesDialogWatcher>,
 }
+
+#[derive(Clone)]
+pub(crate) struct StudioChangeGuard {
+    pub(crate) runtime_id: String,
+    pub(crate) service_generations: BTreeMap<String, u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StudioChangedBeforePush;
+
+impl std::fmt::Display for StudioChangedBeforePush {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Studio changed while its filesystem update was being prepared")
+    }
+}
+
+impl std::error::Error for StudioChangedBeforePush {}
 
 #[derive(Default)]
 struct EditorCommitStatus {
     package_mutation: bool,
     package_dialog_accepted: bool,
+}
+
+fn editor_transaction_state(result: &Value) -> Option<&str> {
+    result.get("state").and_then(Value::as_str)
 }
 
 impl<'a> EditorTransaction<'a> {
@@ -87,6 +111,7 @@ impl<'a> EditorTransaction<'a> {
         binary_import: Option<&EditorBinaryImport>,
         id: &str,
         services: Vec<String>,
+        guard: Option<&StudioChangeGuard>,
     ) -> Value {
         let native_import = binary_import.is_some();
         let native_import_services = binary_import
@@ -109,6 +134,9 @@ impl<'a> EditorTransaction<'a> {
             .collect::<Vec<_>>();
         let mut mutation_root_keys = BTreeSet::new();
         let mut mutation_roots = Vec::new();
+        let retained_by_native_import = |service: &str, path: &[String], ordinals: &[usize]| {
+            binary_import.is_some_and(|import| import.retains_path(service, path, ordinals))
+        };
         let mut add_mutation_root = |service: &str, path: &[String], ordinals: &[usize]| {
             if path.len() < 2 {
                 return;
@@ -123,6 +151,13 @@ impl<'a> EditorTransaction<'a> {
             }
         };
         for change in &changes.source_changes {
+            if retained_by_native_import(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            ) {
+                continue;
+            }
             add_mutation_root(
                 &change.service,
                 &change.path_segments,
@@ -130,6 +165,13 @@ impl<'a> EditorTransaction<'a> {
             );
         }
         for change in &changes.property_changes {
+            if retained_by_native_import(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            ) {
+                continue;
+            }
             add_mutation_root(
                 &change.service,
                 &change.path_segments,
@@ -138,6 +180,15 @@ impl<'a> EditorTransaction<'a> {
         }
         for change in &changes.instance_changes {
             for instance in &change.instances {
+                if instance.anchor_only
+                    || retained_by_native_import(
+                        &change.service,
+                        &instance.path_segments,
+                        &instance.path_ordinals,
+                    )
+                {
+                    continue;
+                }
                 add_mutation_root(
                     &change.service,
                     &instance.path_segments,
@@ -181,6 +232,7 @@ impl<'a> EditorTransaction<'a> {
                     .map(|value| {
                         let mut change = change.clone();
                         change.properties.clear();
+                        change.reset_properties.clear();
                         change
                             .properties
                             .insert("WorldPivot".to_string(), value.clone());
@@ -190,8 +242,7 @@ impl<'a> EditorTransaction<'a> {
                     })
             })
             .collect::<Vec<_>>();
-        post_commit_property_changes
-            .sort_by_key(|change| std::cmp::Reverse(change.path_segments.len()));
+        sort_post_commit_model_pivots(&mut post_commit_property_changes);
         let property_changes = changes
             .property_changes
             .iter()
@@ -211,6 +262,8 @@ impl<'a> EditorTransaction<'a> {
             "postCommitPropertyChanges": post_commit_property_changes,
             "nativeImport": native_import,
             "nativeImportServices": native_import_services,
+            "expectedRuntimeId": guard.map(|guard| &guard.runtime_id),
+            "expectedStudioGenerations": guard.map(|guard| &guard.service_generations),
         })
     }
 
@@ -234,6 +287,10 @@ impl<'a> EditorTransaction<'a> {
         let mutation_roots = object
             .remove("mutationRoots")
             .unwrap_or_else(|| Value::Array(Vec::new()));
+        let expected_runtime_id = object.remove("expectedRuntimeId").unwrap_or(Value::Null);
+        let expected_studio_generations = object
+            .remove("expectedStudioGenerations")
+            .unwrap_or(Value::Null);
         let mut rows = Vec::new();
         for (field, kind) in [
             ("sourceChanges", "source"),
@@ -278,6 +335,8 @@ impl<'a> EditorTransaction<'a> {
                 "nativeImport": native_import,
                 "nativeImportServices": native_import_services,
                 "mutationRoots": mutation_roots,
+                "expectedRuntimeId": expected_runtime_id,
+                "expectedStudioGenerations": expected_studio_generations,
                 "totalChunks": chunks.len(),
                 "rowCount": chunks.iter().map(Vec::len).sum::<usize>(),
             }),
@@ -311,6 +370,7 @@ impl<'a> EditorTransaction<'a> {
         bridge: &'a BridgeServer,
         changes: &EditorChangeSet,
         binary_import: Option<&EditorBinaryImport>,
+        guard: Option<&StudioChangeGuard>,
     ) -> Result<Option<Self>> {
         let mut services = changes.services().map(str::to_string).collect::<Vec<_>>();
         services.sort();
@@ -323,56 +383,127 @@ impl<'a> EditorTransaction<'a> {
             current_millis(),
             fnv1a_hex(services.join("\0").as_bytes())
         );
+        let watches_package_dialog = editor_services_have_package_links(bridge, &services)?;
         let upload_services = services.clone();
-        let parameters = Self::parameters(changes, binary_import, &id, services);
+        let parameters = Self::parameters(changes, binary_import, &id, services, guard);
         let result = match bridge.call("beginEditorTransaction", parameters) {
             Ok(result) => result,
             Err(error) if error.is::<BridgeRequestTooLarge>() => Self::upload(
                 bridge,
                 &id,
-                Self::parameters(changes, binary_import, &id, upload_services),
+                Self::parameters(changes, binary_import, &id, upload_services, guard),
             )?,
             Err(error) => return Err(error),
         };
-        Ok(Some(Self {
+        let package_mutation = result
+            .get("packageMutation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut transaction = Self {
             bridge,
             id,
             active: true,
-            package_mutation: result
-                .get("packageMutation")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }))
+            package_mutation,
+            package_dialog: None,
+        };
+        if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
+            return Err(StudioChangedBeforePush.into());
+        }
+        if package_mutation && watches_package_dialog {
+            transaction.package_dialog = Some(
+                studio_pid_for_bridge(bridge)
+                    .and_then(crate::studio::input::watch_package_changes_dialog)
+                    .context("Package changes cannot be applied without a dialog watcher")?,
+            );
+        }
+        Ok(Some(transaction))
     }
 
     fn commit(&mut self) -> Result<EditorCommitStatus> {
-        let result = self.bridge.call(
+        let commit_result = self.bridge.call(
             "commitEditorTransaction",
             json!({
                 "transactionId": &self.id,
                 "profile": verbose_timing_logs(),
             }),
-        )?;
+        );
+        let result = match commit_result {
+            Ok(result) => result,
+            Err(commit_error) => {
+                let state_result = self.bridge.call(
+                    "getEditorTransactionState",
+                    json!({ "transactionId": &self.id }),
+                );
+                match state_result {
+                    Ok(result) => match editor_transaction_state(&result) {
+                        Some("committed") => result,
+                        Some("rolledBack") => {
+                            self.active = false;
+                            self.package_dialog.take();
+                            return Err(commit_error.context(
+                                "Studio rolled the transaction back before its commit response was received",
+                            ));
+                        }
+                        Some("open" | "prepared") => {
+                            return Err(commit_error.context(
+                                "Studio did not commit the transaction; rollback is still available",
+                            ));
+                        }
+                        Some("rollbackFailed") => {
+                            return Err(commit_error.context(
+                                "Studio could not roll the transaction back; its recovery state was retained",
+                            ));
+                        }
+                        Some("notFound") | None => {
+                            self.active = false;
+                            self.package_dialog.take();
+                            return Err(commit_error.context(
+                                "Studio did not retain this transaction outcome; whether it committed is unknown",
+                            ));
+                        }
+                        Some(state) => {
+                            return Err(commit_error.context(format!(
+                                "Studio returned an invalid transaction state: {state}"
+                            )));
+                        }
+                    },
+                    Err(state_error) => {
+                        return Err(commit_error.context(format!(
+                            "Studio commit outcome could not be queried: {state_error:#}"
+                        )));
+                    }
+                }
+            }
+        };
+        match editor_transaction_state(&result) {
+            Some("rolledBack") => {
+                self.active = false;
+                self.package_dialog.take();
+                bail!("Studio rolled the transaction back instead of committing it");
+            }
+            Some("open" | "prepared" | "notFound") => {
+                bail!("Studio did not confirm the editor transaction commit");
+            }
+            Some("rollbackFailed") => {
+                bail!("Studio retained the transaction because its rollback failed")
+            }
+            Some("committed") | None => {}
+            Some(state) => bail!("Studio returned an invalid transaction state: {state}"),
+        }
+        self.active = false;
+        let package_dialog_accepted = self
+            .package_dialog
+            .take()
+            .map(|watcher| watcher.finish())
+            .transpose();
+        let package_dialog_accepted = package_dialog_accepted
+            .context("Studio did not finish accepting package changes")?
+            .unwrap_or(false);
         if verbose_timing_logs()
             && let Some(profile) = result.get("profile")
         {
             eprintln!("[renium] native editor commit profile: {profile}");
         }
-        self.active = false;
-        let package_dialog_accepted = if self.package_mutation {
-            let dialog_result = studio_pid_for_bridge(self.bridge).and_then(|pid| {
-                crate::studio::input::accept_package_changes_dialog_when_visible(pid)
-            });
-            match dialog_result {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    eprintln!("[renium] package changes dialog remains open: {error:#}");
-                    false
-                }
-            }
-        } else {
-            false
-        };
         Ok(EditorCommitStatus {
             package_mutation: self.package_mutation,
             package_dialog_accepted,
@@ -380,19 +511,60 @@ impl<'a> EditorTransaction<'a> {
     }
 
     fn rollback(&mut self) -> Result<()> {
-        let result = self.bridge.call(
+        if !self.active {
+            return Ok(());
+        }
+        self.package_dialog.take();
+        let rollback_result = self.bridge.call(
             "rollbackEditorTransaction",
             json!({ "transactionId": &self.id }),
         );
-        if result.is_ok() {
-            self.active = false;
+        let result = match rollback_result {
+            Ok(result) => result,
+            Err(rollback_error) => {
+                let state_result = self.bridge.call(
+                    "getEditorTransactionState",
+                    json!({ "transactionId": &self.id }),
+                );
+                match state_result {
+                    Ok(result) => result,
+                    Err(state_error) => {
+                        return Err(rollback_error.context(format!(
+                            "Studio rollback outcome could not be queried: {state_error:#}"
+                        )));
+                    }
+                }
+            }
+        };
+        match editor_transaction_state(&result) {
+            Some("rolledBack") | None => {
+                self.active = false;
+                Ok(())
+            }
+            Some("committed") => {
+                self.active = false;
+                bail!("Studio had already committed the transaction; rollback was not performed")
+            }
+            Some("notFound") => {
+                self.active = false;
+                bail!("Studio did not retain this transaction outcome; rollback is unconfirmed")
+            }
+            Some("open" | "prepared") => bail!("Studio did not roll the transaction back"),
+            Some("rollbackFailed") => {
+                bail!("Studio retained the transaction because its rollback failed")
+            }
+            Some(state) => bail!("Studio returned an invalid transaction state: {state}"),
         }
-        result.map(|_| ())
     }
 
     fn disarm(&mut self) {
         self.active = false;
+        self.package_dialog.take();
     }
+}
+
+fn sort_post_commit_model_pivots(changes: &mut [EditorPropertyChange]) {
+    changes.sort_by_key(|change| change.path_segments.len());
 }
 
 impl Drop for EditorTransaction<'_> {
@@ -496,6 +668,9 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
     )? {
         return print_json_output(&result, global_pretty_output(false));
     }
+    if !incremental {
+        bail!("A full push requires Renium's semantic sync daemon; Studio was not changed");
+    }
     let started = Instant::now();
     if native_editor_full_push_eligible(&args)? {
         let bridge = listen_editor_push_bridge(&args.bridge)?;
@@ -504,39 +679,102 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
             args,
             &bridge,
             changes,
-            started,
-            None,
-            Some(binary_import),
+            CollectedPushOptions {
+                started,
+                projection: None,
+                prepared_binary_import: Some(binary_import),
+                guard: None,
+                validate_project: None,
+            },
         )
         .map(|_| ());
     }
     let (changes, projection) = collect_project_editor_changes(&args)?;
     let bridge = listen_editor_push_bridge(&args.bridge)?;
-    push_editor_changes_with_collected(args, &bridge, changes, started, projection.as_ref(), None)
-        .map(|_| ())
+    push_editor_changes_with_collected(
+        args,
+        &bridge,
+        changes,
+        CollectedPushOptions {
+            started,
+            projection: projection.as_ref(),
+            prepared_binary_import: None,
+            guard: None,
+            validate_project: None,
+        },
+    )
+    .map(|_| ())
 }
 
 pub(crate) fn push_editor_changes_with_warm_bridge(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
 ) -> Result<serde_json::Map<String, Value>> {
-    let started = Instant::now();
-    if native_editor_full_push_eligible(&args)? {
-        let (changes, binary_import) = prepare_native_editor_full_push(&args, bridge)?;
-        return push_editor_changes_with_collected(
-            args,
-            bridge,
-            changes,
-            started,
-            None,
-            Some(binary_import),
-        );
-    }
-    let (changes, projection) = collect_project_editor_changes(&args)?;
-    push_editor_changes_with_collected(args, bridge, changes, started, projection.as_ref(), None)
+    push_editor_changes_with_warm_bridge_guarded(args, bridge, None)
 }
 
-fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool> {
+pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
+    args: PushEditorChangesArgs,
+    bridge: &BridgeServer,
+    guard: Option<&StudioChangeGuard>,
+) -> Result<serde_json::Map<String, Value>> {
+    let started = Instant::now();
+    if native_editor_full_push_eligible(&args)? {
+        bail!("A full push must use the semantic delta path; Studio was not changed");
+    }
+    let (changes, projection) = collect_project_editor_changes(&args)?;
+    push_editor_changes_with_collected(
+        args,
+        bridge,
+        changes,
+        CollectedPushOptions {
+            started,
+            projection: projection.as_ref(),
+            prepared_binary_import: None,
+            guard,
+            validate_project: None,
+        },
+    )
+}
+
+pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G>(
+    args: PushEditorChangesArgs,
+    bridge: &BridgeServer,
+    guard: Option<&StudioChangeGuard>,
+    amend: F,
+    validate_project: G,
+) -> Result<serde_json::Map<String, Value>>
+where
+    F: FnOnce(&mut EditorChangeSet) -> Result<()>,
+    G: Fn() -> Result<()>,
+{
+    let started = Instant::now();
+    let no_selection = args.changed_paths.is_empty()
+        && args.changed_paths_files.is_empty()
+        && args.target_settings_ids.is_empty()
+        && args.target_settings_id_files.is_empty()
+        && args.target_properties.is_empty();
+    let (mut changes, projection) = if no_selection {
+        (EditorChangeSet::default(), None)
+    } else {
+        collect_project_editor_changes(&args)?
+    };
+    amend(&mut changes)?;
+    push_editor_changes_with_collected(
+        args,
+        bridge,
+        changes,
+        CollectedPushOptions {
+            started,
+            projection: projection.as_ref(),
+            prepared_binary_import: None,
+            guard,
+            validate_project: Some(&validate_project),
+        },
+    )
+}
+
+pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool> {
     if !args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()
         || !args.target_settings_ids.is_empty()
@@ -1264,6 +1502,18 @@ fn apply_files_to_studio_filters(
             }
         }
         change.properties = kept_properties;
+        let mut kept_reset_properties = Vec::new();
+        for name in change.reset_properties {
+            if candidate.allows_property(&rules, &name)?
+                && current
+                    .map(|candidate| candidate.allows_property(&rules, &name))
+                    .transpose()?
+                    .unwrap_or(true)
+            {
+                kept_reset_properties.push(name);
+            }
+        }
+        change.reset_properties = kept_reset_properties;
         let mut kept_attributes = Map::new();
         for (name, value) in change.attributes {
             if candidate.allows_attribute(&rules, &name)?
@@ -1289,6 +1539,7 @@ fn apply_files_to_studio_filters(
         }
         change.deleted_attributes = kept_deleted_attributes;
         if !change.properties.is_empty()
+            || !change.reset_properties.is_empty()
             || !change.attributes.is_empty()
             || !change.deleted_attributes.is_empty()
         {
@@ -1328,14 +1579,166 @@ fn apply_files_to_studio_filters(
     Ok(())
 }
 
+fn verify_pushed_sources(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    transaction_id: Option<&str>,
+    summary: &mut Map<String, Value>,
+) -> Result<()> {
+    let mut verification = verify_editor_source_changes(bridge, changes)?;
+    if !verification.failed_indexes.is_empty() {
+        let retry_changes = EditorChangeSet {
+            source_changes: verification
+                .failed_indexes
+                .iter()
+                .map(|index| changes.source_changes[*index].clone())
+                .collect(),
+            ..EditorChangeSet::default()
+        };
+        send_editor_change_batches(
+            bridge,
+            &retry_changes,
+            false,
+            false,
+            false,
+            None,
+            transaction_id,
+        )?;
+        verification = verify_editor_source_changes(bridge, changes)?;
+    }
+    summary.insert(
+        "sourceVerified".to_string(),
+        Value::Number(Number::from(verification.verified as u64)),
+    );
+    summary.insert(
+        "sourceVerifyFailed".to_string(),
+        Value::Number(Number::from(verification.failed.len() as u64)),
+    );
+    if verification.failed.is_empty() {
+        return Ok(());
+    }
+    summary.insert("ok".to_string(), Value::Bool(false));
+    summary.insert(
+        "sourceVerifyErrors".to_string(),
+        Value::Array(
+            verification
+                .failed
+                .iter()
+                .map(|error| Value::String(error.clone()))
+                .collect(),
+        ),
+    );
+    emit_editor_push_summary(summary)?;
+    Err(EditorSourceVerificationError {
+        details: verification.failed,
+    }
+    .into())
+}
+
+struct ProtectedWritePlan {
+    writes: Vec<Value>,
+    apply_offline: bool,
+}
+
+fn prepare_protected_writes(
+    args: &PushEditorChangesArgs,
+    bridge: &BridgeServer,
+    summary: &mut Map<String, Value>,
+    pre_routed: Vec<Value>,
+) -> Result<ProtectedWritePlan> {
+    let mut reported = summary
+        .get("protectedWrites")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pre_routed_count = pre_routed.len();
+    reported.extend(
+        protected_root_write_rows_with_live_values(bridge, pre_routed).unwrap_or_else(|rows| rows),
+    );
+    if pre_routed_count > 0 {
+        summary.insert(
+            "protectedPreRouted".to_string(),
+            Value::Number(Number::from(pre_routed_count as u64)),
+        );
+    }
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let applicable = reported
+        .iter()
+        .filter(|row| {
+            !is_externally_managed_protected_write(row)
+                && is_user_facing_protected_write(row, database)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let unavailable_count = reported.len() - applicable.len();
+    let enriched = if args.no_review {
+        applicable
+    } else {
+        local_place_path_for_bridge(bridge)
+            .and_then(|path| protected_write_rows_with_previous_values(&path, &applicable).ok())
+            .unwrap_or(applicable)
+    };
+    let writes = enriched
+        .iter()
+        .filter(|row| !protected_write_matches_previous(row))
+        .cloned()
+        .collect::<Vec<_>>();
+    if args.no_review && !writes.is_empty() {
+        bail!(
+            "Studio could not apply {} protected write(s); all changes were rolled back and remain pending",
+            writes.len()
+        );
+    }
+    summary.insert("protectedWrites".to_string(), Value::Array(writes.clone()));
+    if unavailable_count > 0 {
+        summary.insert(
+            "unavailableProtectedSkipped".to_string(),
+            Value::Number(Number::from(unavailable_count as u64)),
+        );
+    }
+    let already_current = enriched.len() - writes.len();
+    if already_current > 0 {
+        summary.insert(
+            "protectedAlreadyCurrent".to_string(),
+            Value::Number(Number::from(already_current as u64)),
+        );
+    }
+    let apply_offline = !args.no_review
+        && !writes.is_empty()
+        && (args.yes || global_yes() || request_protected_write_review(bridge, &writes)?);
+    if crate::app::output::global_log_enabled(5) && !writes.is_empty() {
+        eprintln!(
+            "[renium] protected writes: {}",
+            serde_json::to_string(&writes)?
+        );
+    }
+    Ok(ProtectedWritePlan {
+        writes,
+        apply_offline,
+    })
+}
+
+struct CollectedPushOptions<'a> {
+    started: Instant,
+    projection: Option<&'a config::ProjectionStage>,
+    prepared_binary_import: Option<EditorBinaryImport>,
+    guard: Option<&'a StudioChangeGuard>,
+    validate_project: Option<&'a dyn Fn() -> Result<()>>,
+}
+
 fn push_editor_changes_with_collected(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
     mut changes: EditorChangeSet,
-    started: Instant,
-    projection: Option<&config::ProjectionStage>,
-    prepared_binary_import: Option<EditorBinaryImport>,
+    options: CollectedPushOptions<'_>,
 ) -> Result<serde_json::Map<String, Value>> {
+    let CollectedPushOptions {
+        started,
+        projection,
+        prepared_binary_import,
+        guard,
+        validate_project,
+    } = options;
     let phase_started = Instant::now();
     apply_files_to_studio_filters(&args, bridge, &mut changes, projection)?;
     log_timing("native editor push filters", phase_started);
@@ -1369,10 +1772,13 @@ fn push_editor_changes_with_collected(
         save_editor_history_entries(bridge, &args.project.project_root, &changes)?
     };
     let phase_started = Instant::now();
+    if !review_skipped && let Some(validate_project) = validate_project {
+        validate_project()?;
+    }
     let mut transaction = if review_skipped {
         None
     } else {
-        EditorTransaction::begin(bridge, &changes, binary_import.as_ref())?
+        EditorTransaction::begin(bridge, &changes, binary_import.as_ref(), guard)?
     };
     log_timing("native editor transaction begin", phase_started);
     let mut summary = if review_skipped {
@@ -1411,124 +1817,21 @@ fn push_editor_changes_with_collected(
         }
     }
     if args.verify_sources && !review_skipped {
-        let mut verification = verify_editor_source_changes(bridge, &changes)?;
-        if !verification.failed_indexes.is_empty() {
-            let retry_changes = EditorChangeSet {
-                source_changes: verification
-                    .failed_indexes
-                    .iter()
-                    .map(|index| changes.source_changes[*index].clone())
-                    .collect(),
-                ..EditorChangeSet::default()
-            };
-            send_editor_change_batches(
-                bridge,
-                &retry_changes,
-                false,
-                false,
-                false,
-                None,
-                transaction.as_ref().map(|value| value.id.as_str()),
-            )?;
-            verification = verify_editor_source_changes(bridge, &changes)?;
-        }
-        summary.insert(
-            "sourceVerified".to_string(),
-            Value::Number(serde_json::Number::from(verification.verified as u64)),
-        );
-        summary.insert(
-            "sourceVerifyFailed".to_string(),
-            Value::Number(serde_json::Number::from(verification.failed.len() as u64)),
-        );
-        if !verification.failed.is_empty() {
-            summary.insert("ok".to_string(), Value::Bool(false));
-            summary.insert(
-                "sourceVerifyErrors".to_string(),
-                Value::Array(
-                    verification
-                        .failed
-                        .iter()
-                        .map(|error| Value::String(error.clone()))
-                        .collect(),
-                ),
-            );
-            emit_editor_push_summary(&summary)?;
-            return Err(EditorSourceVerificationError {
-                details: verification.failed,
-            }
-            .into());
-        }
+        verify_pushed_sources(
+            bridge,
+            &changes,
+            transaction.as_ref().map(|value| value.id.as_str()),
+            &mut summary,
+        )?;
     }
     let phase_started = Instant::now();
-    let mut reported_protected_writes = summary
-        .get("protectedWrites")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let pre_routed_protected_count = pre_routed_protected_writes.len();
-    let pre_routed_protected_writes =
-        protected_root_write_rows_with_live_values(bridge, pre_routed_protected_writes)
-            .unwrap_or_else(|rows| rows);
-    reported_protected_writes.extend(pre_routed_protected_writes);
-    if pre_routed_protected_count > 0 {
-        summary.insert(
-            "protectedPreRouted".to_string(),
-            Value::Number(Number::from(pre_routed_protected_count as u64)),
-        );
-    }
-    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let applicable_protected_writes = reported_protected_writes
-        .iter()
-        .filter(|row| {
-            !is_externally_managed_protected_write(row)
-                && is_user_facing_protected_write(row, database)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let unavailable_protected_skipped =
-        reported_protected_writes.len() - applicable_protected_writes.len();
-    let enriched_protected_writes = if args.no_review {
-        applicable_protected_writes
-    } else {
-        local_place_path_for_bridge(bridge)
-            .and_then(|path| {
-                protected_write_rows_with_previous_values(&path, &applicable_protected_writes).ok()
-            })
-            .unwrap_or(applicable_protected_writes)
-    };
-    let protected_writes = enriched_protected_writes
-        .iter()
-        .filter(|row| !protected_write_matches_previous(row))
-        .cloned()
-        .collect::<Vec<_>>();
-    let already_current = enriched_protected_writes.len() - protected_writes.len();
-    summary.insert(
-        "protectedWrites".to_string(),
-        Value::Array(protected_writes.clone()),
-    );
-    if unavailable_protected_skipped > 0 {
-        summary.insert(
-            "unavailableProtectedSkipped".to_string(),
-            Value::Number(Number::from(unavailable_protected_skipped as u64)),
-        );
-    }
-    if already_current > 0 {
-        summary.insert(
-            "protectedAlreadyCurrent".to_string(),
-            Value::Number(Number::from(already_current as u64)),
-        );
-    }
-    let apply_protected_offline = !args.no_review
-        && !protected_writes.is_empty()
-        && (args.yes || global_yes() || request_protected_write_review(bridge, &protected_writes)?);
-    if crate::app::output::global_log_enabled(5) && !protected_writes.is_empty() {
-        eprintln!(
-            "[renium] protected writes: {}",
-            serde_json::to_string(&protected_writes)?
-        );
-    }
+    let protected =
+        prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
     log_timing("native editor protected write preparation", phase_started);
     let phase_started = Instant::now();
+    if !review_skipped && let Some(validate_project) = validate_project {
+        validate_project()?;
+    }
     let settings_transaction = if review_skipped {
         None
     } else {
@@ -1540,20 +1843,23 @@ fn push_editor_changes_with_collected(
     log_timing("native editor settings apply", phase_started);
     let phase_started = Instant::now();
     let mut commit_status = None;
-    if apply_protected_offline {
-        let result = apply_protected_writes_offline(bridge, &args, &protected_writes)?;
+    if protected.apply_offline {
+        let result = apply_protected_writes_offline(bridge, &args, &protected.writes)?;
         if let Some(transaction) = transaction.as_mut() {
             transaction.disarm();
         }
         summary.insert("protectedOfflineApply".to_string(), result);
         summary.insert(
             "protectedApplied".to_string(),
-            Value::Number(serde_json::Number::from(protected_writes.len() as u64)),
+            Value::Number(serde_json::Number::from(protected.writes.len() as u64)),
         );
     } else if let Some(transaction) = transaction.as_mut() {
         match transaction.commit() {
             Ok(status) => commit_status = Some(status),
             Err(commit_error) => {
+                if !transaction.active {
+                    return Err(commit_error);
+                }
                 if let Err(rollback_error) = transaction.rollback() {
                     return Err(commit_error
                         .context(format!("Studio rollback also failed: {rollback_error:#}")));
@@ -1621,7 +1927,7 @@ fn apply_editor_change_with_warm_bridge(
         emit_editor_push_summary(&summary)?;
         return Ok(summary);
     }
-    let mut transaction = EditorTransaction::begin(bridge, &changes, None)?;
+    let mut transaction = EditorTransaction::begin(bridge, &changes, None, None)?;
     let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
     let mut summary =
         send_editor_change_batches(bridge, &changes, false, false, false, None, transaction_id)?;
@@ -1707,9 +2013,13 @@ pub(crate) fn apply_editor_property_with_warm_bridge(
         },
         bridge,
         changes,
-        started,
-        None,
-        None,
+        CollectedPushOptions {
+            started,
+            projection: None,
+            prepared_binary_import: None,
+            guard: None,
+            validate_project: None,
+        },
     )
 }
 
@@ -1795,6 +2105,7 @@ fn collect_direct_editor_property_change(
         path_ordinals: target.path_ordinals,
         class_name: target.class_name,
         properties,
+        reset_properties: Vec::new(),
         attributes,
         deleted_attributes,
     });
@@ -2148,7 +2459,7 @@ pub(crate) fn is_lua_source_class(class_name: &str) -> bool {
     matches!(class_name, "Script" | "LocalScript" | "ModuleScript")
 }
 
-fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathBuf>> {
+pub(crate) fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathBuf>> {
     let mut paths = args.changed_paths.clone();
     for list_path in &args.changed_paths_files {
         let raw = fs::read_to_string(list_path).with_context(|| {
@@ -2169,6 +2480,7 @@ fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Result<Vec<PathB
             expanded.push(path);
             continue;
         }
+        expanded.push(path);
         for entry in WalkDir::new(&absolute) {
             let entry = entry.with_context(|| format!("Failed to walk {}", absolute.display()))?;
             if entry.file_type().is_file() {
@@ -2494,13 +2806,40 @@ fn finish_editor_change_collection(
     Ok(changes)
 }
 
+fn collect_settings_file_change(
+    args: &PushEditorChangesArgs,
+    path: &Path,
+    service: &str,
+    property_filter: &EditorPropertyFilter,
+    changed_services: &mut EditorChangedServices,
+) -> bool {
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_service_settings_file_name)
+    {
+        return false;
+    }
+    if args.upsert_instances_only {
+        changed_services.target_upsert.insert(service.to_string());
+    } else {
+        changed_services.settings.insert(service.to_string());
+        if !property_filter.is_active() {
+            changed_services.reconcile.insert(service.to_string());
+        } else if !property_filter.settings_ids.is_empty() {
+            changed_services.target_upsert.insert(service.to_string());
+        }
+    }
+    true
+}
+
 fn collect_editor_changes_with_link_enforcement(
     args: &PushEditorChangesArgs,
     project_root: &Path,
     src_root: &Path,
     link_enforcement: &LinkEnforcement,
 ) -> Result<EditorChangeSet> {
-    let property_filter = EditorPropertyFilter::from_args(args)?;
+    let mut property_filter = EditorPropertyFilter::from_args(args)?;
     let mut changes = EditorChangeSet::default();
     let mut documents: HashMap<String, Option<SettingsBytecode>> = HashMap::new();
     let mut source_maps: HashMap<String, HashMap<String, EditorSourceTarget>> = HashMap::new();
@@ -2531,21 +2870,37 @@ fn collect_editor_changes_with_link_enforcement(
             );
         }
 
-        if absolute_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_service_settings_file_name)
+        if collect_settings_file_change(
+            args,
+            &absolute_path,
+            &service,
+            &property_filter,
+            &mut changed_services,
+        ) {
+            continue;
+        }
+
+        if absolute_path.is_dir()
+            && let Some(document) = documents.get(&service).and_then(Option::as_ref)
+            && let Some(target) = editor_directory_target(
+                document,
+                &service,
+                &src_root.join(&service),
+                &absolute_path,
+            )
         {
-            if args.upsert_instances_only {
-                changed_services.target_upsert.insert(service.clone());
-            } else {
-                changed_services.settings.insert(service.clone());
-                if !property_filter.is_active() {
-                    changed_services.reconcile.insert(service.clone());
-                } else if !property_filter.settings_ids.is_empty() {
-                    changed_services.target_upsert.insert(service.clone());
-                }
+            if reject_read_only_changed_path(
+                link_enforcement,
+                &service,
+                Some((&target.path_segments, &target.path_ordinals)),
+                &absolute_path,
+                full_reconcile,
+            )? {
+                continue;
             }
+            property_filter.settings_ids.extend(target.settings_ids);
+            changed_services.settings.insert(service.clone());
+            changed_services.target_upsert.insert(service);
             continue;
         }
 
@@ -2626,6 +2981,7 @@ fn collect_editor_changes_with_link_enforcement(
                             path_ordinals: target.path_ordinals.clone(),
                             class_name: target.class_name.clone(),
                             properties,
+                            reset_properties: Vec::new(),
                             attributes: Map::new(),
                             deleted_attributes: Vec::new(),
                         });
@@ -2775,4 +3131,34 @@ fn collect_editor_changes_with_link_enforcement(
         src_root,
         link_enforcement,
     )
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    fn model_pivot(path: &[&str]) -> EditorPropertyChange {
+        EditorPropertyChange {
+            service: "Workspace".to_string(),
+            settings_id: None,
+            path_segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+            path_ordinals: vec![1; path.len()],
+            class_name: "Model".to_string(),
+            properties: Map::new(),
+            reset_properties: Vec::new(),
+            attributes: Map::new(),
+            deleted_attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nested_model_pivots_apply_parent_before_child() {
+        let mut changes = vec![
+            model_pivot(&["Workspace", "Parent", "Child"]),
+            model_pivot(&["Workspace", "Parent"]),
+        ];
+        sort_post_commit_model_pivots(&mut changes);
+        assert_eq!(changes[0].path_segments, ["Workspace", "Parent"]);
+        assert_eq!(changes[1].path_segments, ["Workspace", "Parent", "Child"]);
+    }
 }

@@ -19,22 +19,31 @@ use crate::editor::document::is_protected_starter_player_container;
 use crate::editor::paths::{
     build_editor_instance_paths, build_editor_source_paths_by_index, script_file_names,
 };
-use crate::rbx::model::canonicalize_settings_reference_documents;
+use crate::rbx::model::canonicalize_settings_references_for_move;
 use crate::settings::bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, encode_settings_bytecode,
-    stabilize_reference_objects, visit_reference_objects_mut,
+    visit_reference_objects_mut,
 };
 use crate::settings::instance;
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::system::files::{exact_path_key, service_settings_path};
 
-struct MovedReference {
-    settings_id: String,
-    path_segments: Vec<String>,
-    path_ordinals: Vec<usize>,
+pub(crate) struct MovedReference {
+    pub(crate) settings_id: String,
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
 }
 
-fn service_store_paths(src_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+#[derive(PartialEq)]
+struct PackageLinkState {
+    settings_id: String,
+    name: String,
+    parent_settings_id: Option<String>,
+    properties: Map<String, Value>,
+    attributes: Map<String, Value>,
+}
+
+pub(crate) fn service_store_paths(src_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
     let mut files = BTreeMap::new();
     for entry in
         fs::read_dir(src_root).with_context(|| format!("Failed to read {}", src_root.display()))?
@@ -54,27 +63,31 @@ fn service_store_paths(src_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
     Ok(files)
 }
 
-fn stabilize_document_references(document: &mut SettingsBytecode) {
-    let ids = document
+fn package_link_states(document: &SettingsBytecode) -> Vec<PackageLinkState> {
+    let mut states = document
         .instances
         .iter()
-        .map(|instance| instance.settings_id.clone())
+        .filter(|instance| instance.class_name == "PackageLink")
+        .map(|instance| PackageLinkState {
+            settings_id: instance.settings_id.clone(),
+            name: instance.name.clone(),
+            parent_settings_id: instance
+                .parent_index
+                .and_then(|index| document.instances.get(index))
+                .map(|parent| parent.settings_id.clone()),
+            properties: instance.properties.clone(),
+            attributes: instance.attributes.clone(),
+        })
         .collect::<Vec<_>>();
-    for instance in &mut document.instances {
-        for record in [&mut instance.properties, &mut instance.attributes] {
-            stabilize_reference_objects(record, |object, index| {
-                if let Some(settings_id) = ids.get(index) {
-                    object.insert("settingsId".to_string(), Value::String(settings_id.clone()));
-                }
-            });
-        }
-    }
+    states.sort_by(|left, right| left.settings_id.cmp(&right.settings_id));
+    states
 }
 
-fn rewrite_moved_references(
+pub(crate) fn rewrite_moved_references(
     record: &mut Map<String, Value>,
     moved: &HashMap<String, MovedReference>,
-) {
+) -> bool {
+    let mut changed = false;
     visit_reference_objects_mut(record, |object| {
         let Some(path_segments) = object
             .get("pathSegments")
@@ -92,6 +105,7 @@ fn rewrite_moved_references(
         else {
             return;
         };
+        changed = true;
         for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
             object.remove(selector);
         }
@@ -121,6 +135,75 @@ fn rewrite_moved_references(
             ),
         );
     });
+    changed
+}
+
+struct ReferenceLocation {
+    path_key: String,
+    class_name: String,
+    target: MovedReference,
+}
+
+fn reference_locations_by_id(
+    documents: &BTreeMap<String, SettingsBytecode>,
+) -> HashMap<String, Vec<ReferenceLocation>> {
+    let mut locations = HashMap::<String, Vec<ReferenceLocation>>::new();
+    for (service, document) in documents {
+        let paths = build_editor_instance_paths(document, service);
+        for (instance, path) in document.instances.iter().zip(paths) {
+            let Some(path) = path else {
+                continue;
+            };
+            locations
+                .entry(instance.settings_id.clone())
+                .or_default()
+                .push(ReferenceLocation {
+                    path_key: instance_path_parts_key(&path.path_segments, &path.path_ordinals),
+                    class_name: instance.class_name.clone(),
+                    target: MovedReference {
+                        settings_id: instance.settings_id.clone(),
+                        path_segments: path.path_segments,
+                        path_ordinals: path.path_ordinals,
+                    },
+                });
+        }
+    }
+    locations
+}
+
+pub(crate) fn moved_references_between_documents(
+    before: &BTreeMap<String, SettingsBytecode>,
+    after: &BTreeMap<String, SettingsBytecode>,
+) -> HashMap<String, MovedReference> {
+    let before = reference_locations_by_id(before);
+    let after = reference_locations_by_id(after);
+    let mut moved = HashMap::new();
+    for (settings_id, old_locations) in before {
+        let Some(new_locations) = after.get(&settings_id) else {
+            continue;
+        };
+        let removed = old_locations
+            .iter()
+            .filter(|old| !new_locations.iter().any(|new| new.path_key == old.path_key))
+            .collect::<Vec<_>>();
+        let added = new_locations
+            .iter()
+            .filter(|new| !old_locations.iter().any(|old| old.path_key == new.path_key))
+            .collect::<Vec<_>>();
+        if let ([old], [new]) = (removed.as_slice(), added.as_slice())
+            && old.class_name == new.class_name
+        {
+            moved.insert(
+                old.path_key.clone(),
+                MovedReference {
+                    settings_id: new.target.settings_id.clone(),
+                    path_segments: new.target.path_segments.clone(),
+                    path_ordinals: new.target.path_ordinals.clone(),
+                },
+            );
+        }
+    }
+    moved
 }
 
 fn source_root_for_stores(source_file: &Path, target_file: &Path) -> Result<PathBuf> {
@@ -159,33 +242,30 @@ pub(crate) fn move_instance_between_service_stores(
             SettingsBytecode::read_file(path).map(|document| (service.clone(), document))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-
-    canonicalize_settings_reference_documents(&mut documents);
-    for document in documents.values_mut() {
-        stabilize_document_references(document);
-    }
-
-    let mut source = documents
-        .remove(source_service)
+    let source_before = documents
+        .get(source_service)
+        .cloned()
         .with_context(|| format!("Source service '{source_service}' has no Renium store"))?;
-    let mut target = documents
-        .remove(target_service)
+    let target_before = documents
+        .get(target_service)
         .with_context(|| format!("Target service '{target_service}' has no Renium store"))?;
-    let source_before = source.clone();
-    let source_index = source
+    let source_index = source_before
         .instances
         .iter()
         .position(|instance| instance.settings_id == source_settings_id)
         .with_context(|| {
             format!("Source service '{source_service}' has no instance id '{source_settings_id}'")
         })?;
-    if source.instances[source_index].parent_index.is_none() {
+    if source_before.instances[source_index].parent_index.is_none() {
         bail!("Service roots cannot be moved");
     }
-    if is_protected_starter_player_container(&source, source_index) {
-        bail!("{} cannot be moved", source.instances[source_index].name);
+    if is_protected_starter_player_container(&source_before, source_index) {
+        bail!(
+            "{} cannot be moved",
+            source_before.instances[source_index].name
+        );
     }
-    let target_parent_index = target
+    let target_parent_index = target_before
         .instances
         .iter()
         .position(|instance| instance.settings_id == target_parent_settings_id)
@@ -195,10 +275,25 @@ pub(crate) fn move_instance_between_service_stores(
             )
         })?;
 
-    let children = settings_children_by_parent(&source);
+    let children = settings_children_by_parent(&source_before);
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children, source_index, &mut subtree);
-    reject_package_link_subtree_mutation(&source, &subtree, "moved between services")?;
+    reject_package_link_subtree_mutation(&source_before, &subtree, "moved between services")?;
+    let moved_indices = subtree.iter().copied().collect::<HashSet<_>>();
+    let original_package_links = documents
+        .iter()
+        .map(|(service, document)| (service.clone(), package_link_states(document)))
+        .collect::<BTreeMap<_, _>>();
+    let mut changed_services =
+        canonicalize_settings_references_for_move(&mut documents, source_service, &moved_indices);
+    changed_services.extend([source_service.to_string(), target_service.to_string()]);
+
+    let mut source = documents
+        .remove(source_service)
+        .with_context(|| format!("Source service '{source_service}' has no Renium store"))?;
+    let mut target = documents
+        .remove(target_service)
+        .with_context(|| format!("Target service '{target_service}' has no Renium store"))?;
     let source_paths_before = build_editor_source_paths_by_index(
         &source_before,
         source_service,
@@ -206,7 +301,7 @@ pub(crate) fn move_instance_between_service_stores(
             .parent()
             .context("Source settings file has no parent")?,
     );
-    let old_paths = build_editor_instance_paths(&source, source_service);
+    let old_paths = build_editor_instance_paths(&source_before, source_service);
     let mut target_ids = target
         .instances
         .iter()
@@ -257,13 +352,25 @@ pub(crate) fn move_instance_between_service_stores(
             ))
         })
         .collect::<HashMap<_, _>>();
-    for document in documents.values_mut() {
+    for (service, document) in &mut documents {
         for instance in &mut document.instances {
-            rewrite_moved_references(&mut instance.properties, &moved_references);
-            rewrite_moved_references(&mut instance.attributes, &moved_references);
+            let changed = rewrite_moved_references(&mut instance.properties, &moved_references)
+                | rewrite_moved_references(&mut instance.attributes, &moved_references);
+            if changed {
+                if instance.class_name == "PackageLink" {
+                    bail!(
+                        "A PackageLink refers to the moved instance and cannot be edited directly"
+                    );
+                }
+                changed_services.insert(service.clone());
+            }
         }
     }
-    canonicalize_settings_reference_documents(&mut documents);
+    for (service, document) in &documents {
+        if original_package_links.get(service) != Some(&package_link_states(document)) {
+            bail!("Cross-service move would edit a PackageLink");
+        }
+    }
 
     let source_after = &documents[source_service];
     let target_after = &documents[target_service];
@@ -311,7 +418,8 @@ pub(crate) fn move_instance_between_service_stores(
     let source_store_removed = source_after.instances.is_empty()
         || (source_after.instances.len() == 1
             && editor_service_root_index(source_after, source_service).is_some());
-    for (service, document) in &documents {
+    for service in &changed_services {
+        let document = &documents[service];
         let path = &files[service];
         if service == source_service && source_store_removed {
             removals.push(path.clone());

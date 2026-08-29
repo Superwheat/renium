@@ -25,6 +25,38 @@ const WORKSPACE_SERVER_AUTHORITY_PROPERTIES = new Set([
   "SignalBehavior",
   "UseFixedSimulation",
 ]);
+const LIGHTING_APPEARANCE_PROPERTY_TERMS = [
+  "ambient",
+  "brightness",
+  "color",
+  "diffuse",
+  "specular",
+  "exposure",
+  "fog",
+  "shadow",
+  "time",
+  "technology",
+  "lightingstyle",
+];
+const PROPERTY_CATEGORY_NAME_RULES: ReadonlyArray<{
+  category: string;
+  terms: readonly string[];
+  exact?: readonly string[];
+}> = [
+  {
+    category: "Behavior",
+    terms: ["enabled", "disabled", "autoload", "can", "locked", "visible", "active", "selectable", "shadows", "quality", "respawn"],
+    exact: ["runcontext"],
+  },
+  {
+    category: "Transform",
+    terms: ["position", "size", "cframe", "orientation", "rotation", "pivot", "origin", "scale", "offset"],
+  },
+  { category: "Text", terms: ["text", "font", "lineheight"] },
+  { category: "Image", terms: ["image", "slice", "tile"] },
+  { category: "Layout", terms: ["layout", "padding", "alignment", "sortorder"] },
+  { category: "Localization", terms: ["localization", "localize"] },
+];
 type RbxDomProperty = {
   Name?: string;
   MemberType?: string;
@@ -136,9 +168,15 @@ export type VerdePropertiesData = {
   tags: string[];
   attributes: VerdeAttributeInfo[];
 };
-let rbxDomDatabaseCache: RbxDomDatabase | undefined;
-let generatedRobloxPropertiesCache: GeneratedRobloxProperties | undefined;
+type MetadataCacheEntry<T> = {
+  sourceKey: string;
+  value: T;
+};
+
+const rbxDomDatabaseCache = new Map<string, MetadataCacheEntry<RbxDomDatabase>>();
+const generatedRobloxPropertiesCache = new Map<string, MetadataCacheEntry<GeneratedRobloxProperties>>();
 const propertyTemplateCache = new Map<string, PropertyTemplate[]>();
+let activePropertyProjectKey: string | undefined;
 const scriptDisabledClasses = new Set(["Script", "LocalScript"]);
 const valueInstanceFallbackTypes: Record<string, string> = {
   BinaryStringValue: "BinaryString",
@@ -150,46 +188,80 @@ export function isProtectedStarterPlayerContainer(node: FileExplorerNode): boole
     PROTECTED_STARTER_PLAYER_CONTAINERS.has(node.name);
 }
 
-function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined {
-  if (rbxDomDatabaseCache !== undefined) {
-    return rbxDomDatabaseCache;
+function propertyProjectKey(projectRoot: string): string {
+  const resolved = path.resolve(projectRoot);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function activatePropertyProject(projectKey: string): void {
+  if (activePropertyProjectKey !== projectKey) {
+    activePropertyProjectKey = projectKey;
+    propertyTemplateCache.clear();
   }
+}
+
+function metadataSourceKey(filePath: string | undefined): string {
+  if (!filePath) {
+    return "missing";
+  }
+  try {
+    const stats = fs.statSync(filePath);
+    return `${path.resolve(filePath)}\0${stats.size}\0${stats.mtimeMs}`;
+  } catch {
+    return `${path.resolve(filePath)}\0unreadable`;
+  }
+}
+
+function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined {
+  const projectKey = propertyProjectKey(config.projectRoot);
+  activatePropertyProject(projectKey);
   const databasePath = [
     path.join(config.projectRoot, "API-Dump.json"),
     path.join(config.projectRoot, "Full-API-Dump.json"),
     path.join(config.projectRoot, "tools", "plugin_ws_bridge", "rbx_dom_lua", "database.json"),
   ].find((candidate) => fs.existsSync(candidate));
-  if (!databasePath) {
-    rbxDomDatabaseCache = {};
-    return rbxDomDatabaseCache;
+  const sourceKey = metadataSourceKey(databasePath);
+  const cached = rbxDomDatabaseCache.get(projectKey);
+  if (cached?.sourceKey === sourceKey) {
+    return cached.value;
   }
+  let value: RbxDomDatabase = {};
   try {
-    rbxDomDatabaseCache = normalizeRbxDomDatabase(JSON.parse(fs.readFileSync(databasePath, "utf8")));
+    if (databasePath) {
+      value = normalizeRbxDomDatabase(JSON.parse(fs.readFileSync(databasePath, "utf8")));
+    }
   } catch {
-    rbxDomDatabaseCache = {};
+    value = {};
   }
-  return rbxDomDatabaseCache;
+  rbxDomDatabaseCache.set(projectKey, { sourceKey, value });
+  propertyTemplateCache.clear();
+  return value;
 }
 
 function loadGeneratedRobloxProperties(config: ExplorerConfig): GeneratedRobloxProperties | undefined {
-  if (generatedRobloxPropertiesCache !== undefined) {
-    return generatedRobloxPropertiesCache;
-  }
+  const projectKey = propertyProjectKey(config.projectRoot);
+  activatePropertyProject(projectKey);
   const extensionRoot = path.resolve(__dirname, "..");
   const metadataPath = [
     path.join(extensionRoot, "resources", "roblox-properties.generated.json"),
     path.join(config.projectRoot, "tools", "renium-vscode-extension", "resources", "roblox-properties.generated.json"),
   ].find((candidate) => fs.existsSync(candidate));
-  if (!metadataPath) {
-    generatedRobloxPropertiesCache = {};
-    return generatedRobloxPropertiesCache;
+  const sourceKey = metadataSourceKey(metadataPath);
+  const cached = generatedRobloxPropertiesCache.get(projectKey);
+  if (cached?.sourceKey === sourceKey) {
+    return cached.value;
   }
+  let value: GeneratedRobloxProperties = {};
   try {
-    generatedRobloxPropertiesCache = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as GeneratedRobloxProperties;
+    if (metadataPath) {
+      value = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as GeneratedRobloxProperties;
+    }
   } catch {
-    generatedRobloxPropertiesCache = {};
+    value = {};
   }
-  return generatedRobloxPropertiesCache;
+  generatedRobloxPropertiesCache.set(projectKey, { sourceKey, value });
+  propertyTemplateCache.clear();
+  return value;
 }
 
 function generatedPropertyInfo(
@@ -585,6 +657,19 @@ function propertyDisplayName(metadata: GeneratedRobloxProperties | undefined, cl
   return generated?.displayName && generated.displayName !== name ? generated.displayName : undefined;
 }
 
+function includesAny(value: string, terms: readonly string[]): boolean {
+  return terms.some((term) => value.includes(term));
+}
+
+function inferredPropertyCategory(lowerName: string): string {
+  for (const rule of PROPERTY_CATEGORY_NAME_RULES) {
+    if (rule.exact?.includes(lowerName) || includesAny(lowerName, rule.terms)) {
+      return rule.category;
+    }
+  }
+  return "Data";
+}
+
 function propertyCategory(
   className: string,
   name: string,
@@ -609,66 +694,10 @@ function propertyCategory(
   }
   const dataType = propertyDataType(property) ?? "";
   const lower = name.toLowerCase();
-  if (className === "Lighting") {
-    if (
-      dataType === "Color3" ||
-      lower.includes("ambient") ||
-      lower.includes("brightness") ||
-      lower.includes("color") ||
-      lower.includes("diffuse") ||
-      lower.includes("specular") ||
-      lower.includes("exposure") ||
-      lower.includes("fog") ||
-      lower.includes("shadow") ||
-      lower.includes("time") ||
-      lower.includes("technology") ||
-      lower.includes("lightingstyle")
-    ) {
-      return "Appearance";
-    }
+  if (className === "Lighting" && (dataType === "Color3" || includesAny(lower, LIGHTING_APPEARANCE_PROPERTY_TERMS))) {
+    return "Appearance";
   }
-  if (
-    lower.includes("enabled") ||
-    lower.includes("disabled") ||
-    lower === "runcontext" ||
-    lower.includes("autoload") ||
-    lower.includes("can") ||
-    lower.includes("locked") ||
-    lower.includes("visible") ||
-    lower.includes("active") ||
-    lower.includes("selectable") ||
-    lower.includes("shadows") ||
-    lower.includes("quality") ||
-    lower.includes("respawn")
-  ) {
-    return "Behavior";
-  }
-  if (
-    lower.includes("position") ||
-    lower.includes("size") ||
-    lower.includes("cframe") ||
-    lower.includes("orientation") ||
-    lower.includes("rotation") ||
-    lower.includes("pivot") ||
-    lower.includes("origin") ||
-    lower.includes("scale") ||
-    lower.includes("offset")
-  ) {
-    return "Transform";
-  }
-  if (lower.includes("text") || lower.includes("font") || lower.includes("lineheight")) {
-    return "Text";
-  }
-  if (lower.includes("image") || lower.includes("slice") || lower.includes("tile")) {
-    return "Image";
-  }
-  if (lower.includes("layout") || lower.includes("padding") || lower.includes("alignment") || lower.includes("sortorder")) {
-    return "Layout";
-  }
-  if (lower.includes("localization") || lower.includes("localize")) {
-    return "Localization";
-  }
-  return "Data";
+  return inferredPropertyCategory(lower);
 }
 
 function propertyOrder(
@@ -785,6 +814,105 @@ function defaultValueForDataType(dataType: string | undefined, database: RbxDomD
   }
 }
 
+type DefaultPropertyValueUnwrapper = (
+  value: unknown,
+  property: RbxDomProperty | undefined,
+  database: RbxDomDatabase,
+) => unknown;
+
+function taggedArrayDefaultValue(
+  value: unknown,
+  type: string,
+  members: ReadonlyArray<readonly [name: string, index: number, fallback: unknown]>,
+  divisor = 1,
+): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  const result: Record<string, unknown> = { _type: type };
+  for (const [name, index, fallback] of members) {
+    const memberValue = value[index] ?? fallback;
+    result[name] = divisor === 1 ? memberValue : Number(memberValue) / divisor;
+  }
+  return result;
+}
+
+function unwrapEnumDefaultValue(value: unknown, property: RbxDomProperty | undefined, database: RbxDomDatabase): unknown {
+  const enumType = property?.DataType?.Enum;
+  if (!enumType || typeof value !== "number") {
+    return value;
+  }
+  const enumItems = database.Enums?.[enumType]?.items ?? {};
+  const itemName = Object.entries(enumItems).find(([, enumValue]) => enumValue === value)?.[0];
+  return {
+    _type: "EnumItem",
+    enumType: `Enum.${enumType}`,
+    name: itemName ?? String(value),
+  };
+}
+
+function unwrapUdim2DefaultValue(value: unknown): unknown {
+  if (!Array.isArray(value) || !Array.isArray(value[0]) || !Array.isArray(value[1])) {
+    return value;
+  }
+  return {
+    _type: "UDim2",
+    xScale: value[0][0] ?? 0,
+    xOffset: value[0][1] ?? 0,
+    yScale: value[1][0] ?? 0,
+    yOffset: value[1][1] ?? 0,
+  };
+}
+
+function unwrapCframeDefaultValue(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const obj = value as { position?: unknown; orientation?: unknown };
+  const position = Array.isArray(obj.position) ? obj.position : [0, 0, 0];
+  const orientation = Array.isArray(obj.orientation) ? obj.orientation : [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const row0 = Array.isArray(orientation[0]) ? orientation[0] : [1, 0, 0];
+  const row1 = Array.isArray(orientation[1]) ? orientation[1] : [0, 1, 0];
+  const row2 = Array.isArray(orientation[2]) ? orientation[2] : [0, 0, 1];
+  return {
+    _type: "CFrame",
+    components: [
+      position[0] ?? 0,
+      position[1] ?? 0,
+      position[2] ?? 0,
+      row0[0] ?? 1,
+      row0[1] ?? 0,
+      row0[2] ?? 0,
+      row1[0] ?? 0,
+      row1[1] ?? 1,
+      row1[2] ?? 0,
+      row2[0] ?? 0,
+      row2[1] ?? 0,
+      row2[2] ?? 1,
+    ],
+  };
+}
+
+const DEFAULT_PROPERTY_VALUE_UNWRAPPERS = new Map<string, DefaultPropertyValueUnwrapper>([
+  ["Bool", (value) => value],
+  ["Int32", (value) => value],
+  ["Int64", (value) => value],
+  ["Float32", (value) => value],
+  ["Float64", (value) => value],
+  ["OptionalCFrame", (value) => value],
+  ["String", (value) => value],
+  ["ContentId", (value) => value],
+  ["Enum", unwrapEnumDefaultValue],
+  ["BrickColor", (value) => ({ _type: "BrickColor", number: value })],
+  ["Color3", (value) => taggedArrayDefaultValue(value, "Color3", [["r", 0, 0], ["g", 1, 0], ["b", 2, 0]])],
+  ["Color3uint8", (value) => taggedArrayDefaultValue(value, "Color3", [["r", 0, 0], ["g", 1, 0], ["b", 2, 0]], 255)],
+  ["Vector2", (value) => taggedArrayDefaultValue(value, "Vector2", [["x", 0, 0], ["y", 1, 0]])],
+  ["Vector3", (value) => taggedArrayDefaultValue(value, "Vector3", [["x", 0, 0], ["y", 1, 0], ["z", 2, 0]])],
+  ["UDim", (value) => taggedArrayDefaultValue(value, "UDim", [["scale", 0, 0], ["offset", 1, 0]])],
+  ["UDim2", unwrapUdim2DefaultValue],
+  ["CFrame", unwrapCframeDefaultValue],
+]);
+
 function unwrapDefaultPropertyValue(raw: unknown, property: RbxDomProperty | undefined, database: RbxDomDatabase): unknown {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return raw;
@@ -794,101 +922,109 @@ function unwrapDefaultPropertyValue(raw: unknown, property: RbxDomProperty | und
     return raw;
   }
   const [kind, value] = entries[0];
-  switch (kind) {
-    case "Bool":
-    case "Int32":
-    case "Int64":
-    case "Float32":
-    case "Float64":
-    case "OptionalCFrame":
-    case "String":
-    case "ContentId":
-      return value;
-    case "Enum": {
-      const enumType = property?.DataType?.Enum;
-      if (enumType && typeof value === "number") {
-        const enumItems = database.Enums?.[enumType]?.items ?? {};
-        const itemName = Object.entries(enumItems).find(([, enumValue]) => enumValue === value)?.[0];
-        return {
-          _type: "EnumItem",
-          enumType: `Enum.${enumType}`,
-          name: itemName ?? String(value),
-        };
-      }
-      return value;
+  const unwrap = DEFAULT_PROPERTY_VALUE_UNWRAPPERS.get(kind);
+  return unwrap ? unwrap(value, property, database) : raw;
+}
+
+type PropertyTemplateBuilder = {
+  className: string;
+  database: RbxDomDatabase;
+  classes: Record<string, RbxDomClass>;
+  generatedMetadata?: GeneratedRobloxProperties;
+  rows: Map<string, PropertyTemplate>;
+  pseudoNode: FileExplorerNode;
+  nextOrder: number;
+};
+
+function isGeneratedTemplateVisible(builder: PropertyTemplateBuilder, name: string): boolean {
+  return !hasGeneratedPropertyList(builder.generatedMetadata, builder.className) ||
+    isGeneratedPropertyVisible(builder.generatedMetadata, builder.className, name);
+}
+
+function setPropertyTemplate(
+  builder: PropertyTemplateBuilder,
+  name: string,
+  property: RbxDomProperty | undefined,
+  defaultValue: unknown,
+  declaringClassName?: string,
+): void {
+  const existing = builder.rows.get(name);
+  const generated = generatedPropertyInfo(builder.generatedMetadata, builder.className, name);
+  const fallbackOrder = existing?.order ?? builder.nextOrder++;
+  builder.rows.set(name, {
+    name,
+    displayName: existing?.displayName ?? propertyDisplayName(builder.generatedMetadata, builder.className, name),
+    defaultValue,
+    readonly: isReadonlyStudioPropertyForNode(builder.pseudoNode, name, property, builder.classes, declaringClassName),
+    category: existing?.category ?? propertyCategory(builder.className, name, property, builder.generatedMetadata),
+    order: propertyOrder(builder.generatedMetadata, builder.className, name, fallbackOrder),
+    dataType: propertyDataType(property),
+    enumItems: enumItemsForProperty(property, builder.database),
+    uiMinimum: existing?.uiMinimum ?? generated?.uiMinimum,
+    uiMaximum: existing?.uiMaximum ?? generated?.uiMaximum,
+    uiNumTicks: existing?.uiNumTicks ?? generated?.uiNumTicks,
+    sliderScaling: existing?.sliderScaling ?? generated?.sliderScaling,
+  });
+}
+
+function addRbxDomPropertyTemplates(builder: PropertyTemplateBuilder, declaringClassName: string): void {
+  const classInfo = builder.classes[declaringClassName];
+  for (const [name, property] of Object.entries(classInfo?.Properties ?? {})) {
+    if (!isGeneratedTemplateVisible(builder, name) ||
+      !isVisibleStudioPropertyForNode(builder.pseudoNode, name, property, builder.classes, declaringClassName)) {
+      continue;
     }
-    case "BrickColor":
-      return { _type: "BrickColor", number: value };
-    case "Color3":
-      if (Array.isArray(value)) {
-        return { _type: "Color3", r: value[0] ?? 0, g: value[1] ?? 0, b: value[2] ?? 0 };
-      }
-      return value;
-    case "Color3uint8":
-      if (Array.isArray(value)) {
-        return {
-          _type: "Color3",
-          r: Number(value[0] ?? 0) / 255,
-          g: Number(value[1] ?? 0) / 255,
-          b: Number(value[2] ?? 0) / 255,
-        };
-      }
-      return value;
-    case "Vector2":
-      if (Array.isArray(value)) {
-        return { _type: "Vector2", x: value[0] ?? 0, y: value[1] ?? 0 };
-      }
-      return value;
-    case "Vector3":
-      if (Array.isArray(value)) {
-        return { _type: "Vector3", x: value[0] ?? 0, y: value[1] ?? 0, z: value[2] ?? 0 };
-      }
-      return value;
-    case "UDim":
-      if (Array.isArray(value)) {
-        return { _type: "UDim", scale: value[0] ?? 0, offset: value[1] ?? 0 };
-      }
-      return value;
-    case "UDim2":
-      if (Array.isArray(value) && Array.isArray(value[0]) && Array.isArray(value[1])) {
-        return {
-          _type: "UDim2",
-          xScale: value[0][0] ?? 0,
-          xOffset: value[0][1] ?? 0,
-          yScale: value[1][0] ?? 0,
-          yOffset: value[1][1] ?? 0,
-        };
-      }
-      return value;
-    case "CFrame":
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        const obj = value as { position?: unknown; orientation?: unknown };
-        const position = Array.isArray(obj.position) ? obj.position : [0, 0, 0];
-        const orientation = Array.isArray(obj.orientation) ? obj.orientation : [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-        const row0 = Array.isArray(orientation[0]) ? orientation[0] : [1, 0, 0];
-        const row1 = Array.isArray(orientation[1]) ? orientation[1] : [0, 1, 0];
-        const row2 = Array.isArray(orientation[2]) ? orientation[2] : [0, 0, 1];
-        return {
-          _type: "CFrame",
-          components: [
-            position[0] ?? 0,
-            position[1] ?? 0,
-            position[2] ?? 0,
-            row0[0] ?? 1,
-            row0[1] ?? 0,
-            row0[2] ?? 0,
-            row1[0] ?? 0,
-            row1[1] ?? 1,
-            row1[2] ?? 0,
-            row2[0] ?? 0,
-            row2[1] ?? 0,
-            row2[2] ?? 1,
-          ],
-        };
-      }
-      return value;
-    default:
-      return raw;
+    const defaultRaw = classInfo?.DefaultProperties?.[name];
+    const defaultValue = defaultRaw === undefined
+      ? ""
+      : unwrapDefaultPropertyValue(defaultRaw, property, builder.database);
+    setPropertyTemplate(builder, name, property, defaultValue, declaringClassName);
+  }
+}
+
+function addRbxDomDefaultPropertyTemplates(builder: PropertyTemplateBuilder, declaringClassName: string): void {
+  const classInfo = builder.classes[declaringClassName];
+  for (const [name, defaultRaw] of Object.entries(classInfo?.DefaultProperties ?? {})) {
+    if (!isGeneratedTemplateVisible(builder, name)) {
+      continue;
+    }
+    const property = findRbxDomProperty(builder.classes, builder.className, name);
+    if (!isVisibleStudioPropertyForNode(builder.pseudoNode, name, property, builder.classes, declaringClassName)) {
+      continue;
+    }
+    setPropertyTemplate(
+      builder,
+      name,
+      property,
+      unwrapDefaultPropertyValue(defaultRaw, property, builder.database),
+      declaringClassName,
+    );
+  }
+}
+
+function addGeneratedPropertyTemplates(builder: PropertyTemplateBuilder): void {
+  const generatedProperties = builder.generatedMetadata?.classes?.[builder.className] ?? {};
+  for (const [name, info] of Object.entries(generatedProperties)) {
+    if (builder.rows.has(name) || info.visible === false) {
+      continue;
+    }
+    const dataType = info.type;
+    const property = propertyFromGeneratedInfo(info);
+    const enumItems = enumItemsForGeneratedInfo(info, property, builder.database);
+    builder.rows.set(name, {
+      name,
+      displayName: info.displayName && info.displayName !== name ? info.displayName : undefined,
+      defaultValue: defaultValueForDataType(dataType, builder.database, enumItems),
+      readonly: info.writable === false,
+      category: info.category ?? propertyCategory(builder.className, name, property, builder.generatedMetadata),
+      order: propertyOrder(builder.generatedMetadata, builder.className, name, builder.nextOrder++),
+      dataType,
+      enumItems,
+      uiMinimum: info.uiMinimum,
+      uiMaximum: info.uiMaximum,
+      uiNumTicks: info.uiNumTicks,
+      sliderScaling: info.sliderScaling,
+    });
   }
 }
 
@@ -902,89 +1038,99 @@ function propertyTemplatesForClass(
   if (cached) {
     return cached;
   }
-  const rows = new Map<string, PropertyTemplate>();
-  let nextOrder = 0;
-  const pseudoNode = { className } as FileExplorerNode;
-  const setTemplate = (name: string, property: RbxDomProperty | undefined, defaultValue: unknown, declaringClassName?: string): void => {
-    if (hasGeneratedPropertyList(generatedMetadata, className) && !isGeneratedPropertyVisible(generatedMetadata, className, name)) {
-      return;
-    }
-    const existing = rows.get(name);
-    const generated = generatedPropertyInfo(generatedMetadata, className, name);
-    const fallbackOrder = existing?.order ?? nextOrder++;
-    rows.set(name, {
-      name,
-      displayName: existing?.displayName ?? propertyDisplayName(generatedMetadata, className, name),
-      defaultValue,
-      readonly: isReadonlyStudioPropertyForNode(pseudoNode, name, property, classes, declaringClassName),
-      category: existing?.category ?? propertyCategory(className, name, property, generatedMetadata),
-      order: propertyOrder(generatedMetadata, className, name, fallbackOrder),
-      dataType: propertyDataType(property),
-      enumItems: enumItemsForProperty(property, database),
-      uiMinimum: existing?.uiMinimum ?? generated?.uiMinimum,
-      uiMaximum: existing?.uiMaximum ?? generated?.uiMaximum,
-      uiNumTicks: existing?.uiNumTicks ?? generated?.uiNumTicks,
-      sliderScaling: existing?.sliderScaling ?? generated?.sliderScaling,
-    });
+  const builder: PropertyTemplateBuilder = {
+    className,
+    database,
+    classes,
+    generatedMetadata,
+    rows: new Map<string, PropertyTemplate>(),
+    pseudoNode: { className } as FileExplorerNode,
+    nextOrder: 0,
   };
-  const chain = collectRbxDomClassChain(classes, className);
-  for (const chainClassName of chain) {
-    const classInfo = classes[chainClassName];
-    for (const [name, property] of Object.entries(classInfo?.Properties ?? {})) {
-      if (hasGeneratedPropertyList(generatedMetadata, className) && !isGeneratedPropertyVisible(generatedMetadata, className, name)) {
-        continue;
-      }
-      if (!isVisibleStudioPropertyForNode(pseudoNode, name, property, classes, chainClassName)) {
-        continue;
-      }
-      const defaultRaw = classInfo?.DefaultProperties?.[name];
-      setTemplate(name, property, defaultRaw === undefined ? "" : unwrapDefaultPropertyValue(defaultRaw, property, database), chainClassName);
-    }
-    for (const [name, defaultRaw] of Object.entries(classInfo?.DefaultProperties ?? {})) {
-      if (hasGeneratedPropertyList(generatedMetadata, className) && !isGeneratedPropertyVisible(generatedMetadata, className, name)) {
-        continue;
-      }
-      const property = findRbxDomProperty(classes, className, name);
-      if (!isVisibleStudioPropertyForNode(pseudoNode, name, property, classes, chainClassName)) {
-        continue;
-      }
-      setTemplate(name, property, unwrapDefaultPropertyValue(defaultRaw, property, database), chainClassName);
-    }
+  for (const chainClassName of collectRbxDomClassChain(classes, className)) {
+    addRbxDomPropertyTemplates(builder, chainClassName);
+    addRbxDomDefaultPropertyTemplates(builder, chainClassName);
   }
   const fallbackValueProperty = fallbackValueInstanceProperty(className, "Value");
-  if (fallbackValueProperty && !rows.has("Value")) {
-    setTemplate(
+  if (fallbackValueProperty && !builder.rows.has("Value") && isGeneratedTemplateVisible(builder, "Value")) {
+    setPropertyTemplate(
+      builder,
       "Value",
       fallbackValueProperty,
       defaultValueForDataType(propertyDataType(fallbackValueProperty), database),
       className,
     );
   }
-  for (const [name, info] of Object.entries(generatedMetadata?.classes?.[className] ?? {})) {
-    if (rows.has(name) || info.visible === false) {
-      continue;
-    }
-    const dataType = info.type;
-    const property = propertyFromGeneratedInfo(info);
-    const enumItems = enumItemsForGeneratedInfo(info, property, database);
-    rows.set(name, {
-      name,
-      displayName: info.displayName && info.displayName !== name ? info.displayName : undefined,
-      defaultValue: defaultValueForDataType(dataType, database, enumItems),
-      readonly: info.writable === false,
-      category: info.category ?? propertyCategory(className, name, property, generatedMetadata),
-      order: propertyOrder(generatedMetadata, className, name, nextOrder++),
-      dataType,
-      enumItems,
-      uiMinimum: info.uiMinimum,
-      uiMaximum: info.uiMaximum,
-      uiNumTicks: info.uiNumTicks,
-      sliderScaling: info.sliderScaling,
-    });
-  }
-  const templates = sortPropertyRows(Array.from(rows.values()));
+  addGeneratedPropertyTemplates(builder);
+  const templates = sortPropertyRows(Array.from(builder.rows.values()));
   propertyTemplateCache.set(className, templates);
   return templates;
+}
+
+type PropertyRowWithoutName = Omit<PropertyRow, "name">;
+
+function booleanPropertyValue(value: unknown): boolean {
+  return value === true || String(value).toLowerCase() === "true";
+}
+
+function setEnabledPropertyRow(rows: Map<string, PropertyRow>, row: PropertyRowWithoutName, value: boolean): void {
+  rows.set("Enabled", {
+    name: "Enabled",
+    displayName: "Enabled",
+    value,
+    readonly: row.readonly,
+    defaulted: row.defaulted,
+    category: row.category,
+    order: rows.get("Enabled")?.order ?? row.order,
+    dataType: "Bool",
+    enumItems: row.enumItems,
+  });
+}
+
+function setPropertyRow(
+  node: FileExplorerNode,
+  rows: Map<string, PropertyRow>,
+  name: string,
+  row: PropertyRowWithoutName,
+): void {
+  if (!usesDisabledProperty(node.className)) {
+    rows.set(name, { name, ...row });
+    return;
+  }
+  if (name === "Disabled") {
+    setEnabledPropertyRow(rows, row, !booleanPropertyValue(row.value));
+    return;
+  }
+  if (name === "Enabled") {
+    const existingEnabled = rows.get("Enabled");
+    if (existingEnabled && (!existingEnabled.defaulted || row.defaulted)) {
+      return;
+    }
+    setEnabledPropertyRow(rows, row, booleanPropertyValue(row.value));
+    return;
+  }
+  rows.set(name, { name, ...row });
+}
+
+function applyMigratedPropertyValue(
+  className: string,
+  propertyName: string,
+  property: RbxDomProperty | undefined,
+  properties: Record<string, unknown>,
+  rows: Map<string, PropertyRow>,
+  classes: Record<string, RbxDomClass>,
+): boolean {
+  if (!property || !isSupersededMigratedProperty(className, property, classes)) {
+    return false;
+  }
+  const targetName = propertyMigrationTarget(property);
+  if (targetName && !Object.prototype.hasOwnProperty.call(properties, targetName)) {
+    const targetRow = rows.get(targetName);
+    if (targetRow?.defaulted) {
+      rows.set(targetName, { ...targetRow, value: properties[propertyName], defaulted: false });
+    }
+  }
+  return true;
 }
 
 export function propertyRowsForNode(node: FileExplorerNode, config: ExplorerConfig): PropertyRow[] {
@@ -993,42 +1139,9 @@ export function propertyRowsForNode(node: FileExplorerNode, config: ExplorerConf
   const classes = database.Classes ?? {};
   const rows = new Map<string, PropertyRow>();
   let nextOrder = 0;
-  const setEnabledRow = (row: Omit<PropertyRow, "name">, value: boolean): void => {
-    rows.set("Enabled", {
-      name: "Enabled",
-      displayName: "Enabled",
-      value,
-      readonly: row.readonly,
-      defaulted: row.defaulted,
-      category: row.category,
-      order: rows.get("Enabled")?.order ?? row.order,
-      dataType: "Bool",
-      enumItems: row.enumItems,
-    });
-  };
-  const setRow = (name: string, row: Omit<PropertyRow, "name">): void => {
-    if (usesDisabledProperty(node.className) && name === "Disabled") {
-      const disabledValue = row.value === true || String(row.value).toLowerCase() === "true";
-      setEnabledRow(row, !disabledValue);
-      return;
-    }
-    if (usesDisabledProperty(node.className) && name === "Enabled") {
-      const existingEnabled = rows.get("Enabled");
-      if (existingEnabled && !existingEnabled.defaulted) {
-        return;
-      }
-      if (existingEnabled && row.defaulted) {
-        return;
-      }
-      setEnabledRow(row, row.value === true || String(row.value).toLowerCase() === "true");
-      return;
-    }
-    rows.set(name, { name, ...row });
-  };
-  const finalizeRows = (): PropertyRow[] => withStudioDuplicatePropertyRows(sortPropertyRows(Array.from(rows.values())), node);
   const templates = propertyTemplatesForClass(node.className, database, classes, generatedMetadata);
   for (const template of templates) {
-    setRow(template.name, {
+    setPropertyRow(node, rows, template.name, {
       displayName: template.displayName,
       value: template.defaultValue,
       readonly: template.readonly,
@@ -1049,14 +1162,7 @@ export function propertyRowsForNode(node: FileExplorerNode, config: ExplorerConf
       continue;
     }
     const property = findRbxDomProperty(classes, node.className, propertyName);
-    if (property && isSupersededMigratedProperty(node.className, property, classes)) {
-      const targetName = propertyMigrationTarget(property);
-      if (targetName && !Object.prototype.hasOwnProperty.call(node.properties, targetName)) {
-        const targetRow = rows.get(targetName);
-        if (targetRow && targetRow.defaulted) {
-          rows.set(targetName, { ...targetRow, value: node.properties[propertyName], defaulted: false });
-        }
-      }
+    if (applyMigratedPropertyValue(node.className, propertyName, property, node.properties, rows, classes)) {
       continue;
     }
     const generated = generatedPropertyInfo(generatedMetadata, node.className, propertyName);
@@ -1068,7 +1174,7 @@ export function propertyRowsForNode(node: FileExplorerNode, config: ExplorerConf
     if (property && !isVisibleStudioPropertyForNode(node, propertyName, property, classes) && !existing) {
       continue;
     }
-    setRow(propertyName, {
+    setPropertyRow(node, rows, propertyName, {
       displayName: existing?.displayName ?? propertyDisplayName(generatedMetadata, node.className, propertyName),
       value: node.properties[propertyName],
       readonly: existing?.readonly ?? isReadonlyStudioPropertyForNode(node, propertyName, property, classes),
@@ -1084,7 +1190,7 @@ export function propertyRowsForNode(node: FileExplorerNode, config: ExplorerConf
     });
   }
   ensureModelPivotRows(node, rows, classes, nextOrder);
-  return finalizeRows();
+  return withStudioDuplicatePropertyRows(sortPropertyRows(Array.from(rows.values())), node);
 }
 
 function withStudioDuplicatePropertyRows(rows: PropertyRow[], node: FileExplorerNode): PropertyRow[] {
@@ -1420,37 +1526,61 @@ function udim2ToVerde(value: unknown): { X: { Scale: number; Offset: number }; Y
   };
 }
 
+const DEFAULT_CFRAME_COMPONENTS = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1] as const;
+
+function arrayMember(record: Record<string, unknown> | undefined, name: string, alternateName: string): unknown[] | undefined {
+  const value = record?.[name];
+  if (Array.isArray(value)) {
+    return value;
+  }
+  const alternateValue = record?.[alternateName];
+  return Array.isArray(alternateValue) ? alternateValue : undefined;
+}
+
+function structuredCframeComponents(record: Record<string, unknown>): number[] | undefined {
+  const position = arrayMember(record, "position", "Position");
+  const orientation = arrayMember(record, "orientation", "Orientation");
+  if (!position && !orientation) {
+    return undefined;
+  }
+  const row0 = Array.isArray(orientation?.[0]) ? orientation[0] : undefined;
+  const row1 = Array.isArray(orientation?.[1]) ? orientation[1] : undefined;
+  const row2 = Array.isArray(orientation?.[2]) ? orientation[2] : undefined;
+  const values = [
+    position?.[0],
+    position?.[1],
+    position?.[2],
+    row0?.[0],
+    row0?.[1],
+    row0?.[2],
+    row1?.[0],
+    row1?.[1],
+    row1?.[2],
+    row2?.[0],
+    row2?.[1],
+    row2?.[2],
+  ];
+  return values.map((item, index) => typeof item === "number" ? item : DEFAULT_CFRAME_COMPONENTS[index]);
+}
+
+function normalizedCframeComponents(components: unknown[]): number[] {
+  const out = components.map((item) => typeof item === "number" && Number.isFinite(item) ? item : 0);
+  while (out.length < DEFAULT_CFRAME_COMPONENTS.length) {
+    out.push(DEFAULT_CFRAME_COMPONENTS[out.length]);
+  }
+  return out.slice(0, DEFAULT_CFRAME_COMPONENTS.length);
+}
+
 function cframeComponents(value: unknown): number[] {
   const record = recordValue(value);
-  const components = Array.isArray(record?.components) ? record.components : Array.isArray(record?.Components) ? record.Components : [];
+  const components = arrayMember(record, "components", "Components") ?? [];
   if (components.length === 0 && record) {
-    const position = Array.isArray(record.position) ? record.position : Array.isArray(record.Position) ? record.Position : undefined;
-    const orientation = Array.isArray(record.orientation) ? record.orientation : Array.isArray(record.Orientation) ? record.Orientation : undefined;
-    if (position || orientation) {
-      const row0 = Array.isArray(orientation?.[0]) ? orientation[0] : [1, 0, 0];
-      const row1 = Array.isArray(orientation?.[1]) ? orientation[1] : [0, 1, 0];
-      const row2 = Array.isArray(orientation?.[2]) ? orientation[2] : [0, 0, 1];
-      return [
-        typeof position?.[0] === "number" ? position[0] : 0,
-        typeof position?.[1] === "number" ? position[1] : 0,
-        typeof position?.[2] === "number" ? position[2] : 0,
-        typeof row0[0] === "number" ? row0[0] : 1,
-        typeof row0[1] === "number" ? row0[1] : 0,
-        typeof row0[2] === "number" ? row0[2] : 0,
-        typeof row1[0] === "number" ? row1[0] : 0,
-        typeof row1[1] === "number" ? row1[1] : 1,
-        typeof row1[2] === "number" ? row1[2] : 0,
-        typeof row2[0] === "number" ? row2[0] : 0,
-        typeof row2[1] === "number" ? row2[1] : 0,
-        typeof row2[2] === "number" ? row2[2] : 1,
-      ];
+    const structured = structuredCframeComponents(record);
+    if (structured) {
+      return structured;
     }
   }
-  const out = components.map((item) => typeof item === "number" && Number.isFinite(item) ? item : 0);
-  while (out.length < 12) {
-    out.push(out.length === 3 || out.length === 7 || out.length === 11 ? 1 : 0);
-  }
-  return out.slice(0, 12);
+  return normalizedCframeComponents(components);
 }
 
 function cframeToVerde(value: unknown): { Position: { X: number; Y: number; Z: number }; Rotation: { X: number; Y: number; Z: number } } {

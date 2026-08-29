@@ -1627,6 +1627,142 @@ pub fn run_fmt_project(args: FmtProjectArgs, global_project: Option<&Path>) -> R
     )
 }
 
+fn explain_filter_candidate(
+    loaded: &LoadedProject,
+    candidate: &FilterCandidate<'_>,
+    candidate_path: &str,
+) -> Result<(Value, Vec<Value>)> {
+    let mut candidate_rules = Vec::new();
+    let mut property_filters = BTreeSet::new();
+    let mut attribute_filters = BTreeSet::new();
+    for (rule_index, rule) in loaded.project.filters.iter().enumerate() {
+        if !filter_matches(rule, candidate, FilterScope::Any)? {
+            continue;
+        }
+        let mut entry = Map::new();
+        entry.insert("index".to_string(), json!(rule_index));
+        entry.insert("action".to_string(), json!(rule.action));
+        entry.insert("direction".to_string(), json!(rule.direction));
+        entry.insert("candidatePath".to_string(), json!(candidate_path));
+        for (key, value) in [
+            ("glob", rule.glob.as_ref()),
+            ("name", rule.name.as_ref()),
+            ("class", rule.class.as_ref()),
+            ("tag", rule.tag.as_ref()),
+            ("attribute", rule.attribute.as_ref()),
+            ("property", rule.property.as_ref()),
+            ("id", rule.id.as_ref()),
+        ] {
+            if let Some(value) = value {
+                entry.insert(key.to_string(), json!(value));
+            }
+        }
+        candidate_rules.push(Value::Object(entry));
+        property_filters.extend(rule.property.iter().cloned());
+        attribute_filters.extend(rule.attribute.iter().cloned());
+    }
+    let mut field_filters = Map::new();
+    for property in property_filters {
+        field_filters.insert(
+            format!("property:{property}"),
+            filter_scope_decisions(
+                &loaded.project.filters,
+                candidate,
+                FilterScope::Property(&property),
+            )?,
+        );
+    }
+    for attribute in attribute_filters {
+        field_filters.insert(
+            format!("attribute:{attribute}"),
+            filter_scope_decisions(
+                &loaded.project.filters,
+                candidate,
+                FilterScope::Attribute(&attribute),
+            )?,
+        );
+    }
+    let mut result = json!({
+        "path": candidate_path,
+        "id": candidate.id,
+        "filesToStudio": if filter_allows_instance(
+            &loaded.project.filters,
+            FilterDirection::FilesToStudio,
+            candidate,
+        )? { "include" } else { "ignore" },
+        "studioToFiles": if filter_allows_instance(
+            &loaded.project.filters,
+            FilterDirection::StudioToFiles,
+            candidate,
+        )? { "include" } else { "ignore" },
+        "matchingFilters": candidate_rules,
+    });
+    if !field_filters.is_empty() {
+        result["fieldFilters"] = Value::Object(field_filters);
+    }
+    let matching = result["matchingFilters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok((result, matching))
+}
+
+fn explain_staged_filter_candidates(
+    loaded: &LoadedProject,
+    projection: &ProjectionStage,
+    staged_absolute: &HashSet<PathBuf>,
+    sidecar_target: Option<&[String]>,
+    requested_absolute: &Path,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut candidates = Vec::new();
+    let mut matching_filters = Vec::new();
+    for service in fs::read_dir(projection.root())? {
+        let service = service?;
+        if !service.file_type()?.is_dir() {
+            continue;
+        }
+        let service_name = service.file_name().to_string_lossy().into_owned();
+        let settings = service_settings_path(&service.path());
+        if !settings.is_file() {
+            continue;
+        }
+        let document = SettingsBytecode::read_file(&settings)?;
+        let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
+            &document,
+            &service_name,
+            &service.path(),
+        );
+        let paths = projection_instance_paths(&document);
+        for (index, source_path) in source_paths.into_iter().enumerate() {
+            let source_matches = source_path
+                .as_deref()
+                .is_some_and(|source_path| staged_absolute.contains(&absolute_path(source_path)));
+            let transformed_matches = projection
+                .transformed_source_for_target(&paths[index])
+                .is_some_and(|source| absolute_path(source) == requested_absolute);
+            if !source_matches
+                && !transformed_matches
+                && sidecar_target != Some(paths[index].as_slice())
+            {
+                continue;
+            }
+            let instance = &document.instances[index];
+            let fields = filter_candidate_fields(&instance.properties, &instance.attributes);
+            let candidate_path = filter_path_segments(&paths[index]);
+            let candidate = fields.candidate(
+                &instance.settings_id,
+                &candidate_path,
+                &instance.name,
+                &instance.class_name,
+            );
+            let (result, matching) = explain_filter_candidate(loaded, &candidate, &candidate_path)?;
+            candidates.push(result);
+            matching_filters.extend(matching);
+        }
+    }
+    Ok((candidates, matching_filters))
+}
+
 pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) -> Result<()> {
     let loaded = load_project(args.project.as_deref().or(global_project), None)?;
     validate_project(&loaded)?;
@@ -1760,120 +1896,14 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
     } else {
         None
     };
-    let mut filter_candidates = Vec::new();
-    let mut matching_filters = Vec::new();
     let requested_absolute = absolute_path(&absolute);
-    for service in fs::read_dir(projection.root())? {
-        let service = service?;
-        if !service.file_type()?.is_dir() {
-            continue;
-        }
-        let service_name = service.file_name().to_string_lossy().into_owned();
-        let settings = service_settings_path(&service.path());
-        if !settings.is_file() {
-            continue;
-        }
-        let document = SettingsBytecode::read_file(&settings)?;
-        let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
-            &document,
-            &service_name,
-            &service.path(),
-        );
-        let paths = projection_instance_paths(&document);
-        for (index, source_path) in source_paths.into_iter().enumerate() {
-            let source_matches = source_path
-                .as_deref()
-                .is_some_and(|source_path| staged_absolute.contains(&absolute_path(source_path)));
-            let transformed_matches = projection
-                .transformed_source_for_target(&paths[index])
-                .is_some_and(|source| absolute_path(source) == requested_absolute);
-            if !source_matches
-                && !transformed_matches
-                && sidecar_target.as_ref() != Some(&paths[index])
-            {
-                continue;
-            }
-            let instance = &document.instances[index];
-            let fields = filter_candidate_fields(&instance.properties, &instance.attributes);
-            let candidate_path = filter_path_segments(&paths[index]);
-            let candidate = fields.candidate(
-                &instance.settings_id,
-                &candidate_path,
-                &instance.name,
-                &instance.class_name,
-            );
-            let mut candidate_rules = Vec::new();
-            let mut property_filters = BTreeSet::new();
-            let mut attribute_filters = BTreeSet::new();
-            for (rule_index, rule) in loaded.project.filters.iter().enumerate() {
-                if filter_matches(rule, &candidate, FilterScope::Any)? {
-                    let mut entry = Map::new();
-                    entry.insert("index".to_string(), json!(rule_index));
-                    entry.insert("action".to_string(), json!(rule.action));
-                    entry.insert("direction".to_string(), json!(rule.direction));
-                    entry.insert("candidatePath".to_string(), json!(candidate_path));
-                    for (key, value) in [
-                        ("glob", rule.glob.as_ref()),
-                        ("name", rule.name.as_ref()),
-                        ("class", rule.class.as_ref()),
-                        ("tag", rule.tag.as_ref()),
-                        ("attribute", rule.attribute.as_ref()),
-                        ("property", rule.property.as_ref()),
-                        ("id", rule.id.as_ref()),
-                    ] {
-                        if let Some(value) = value {
-                            entry.insert(key.to_string(), json!(value));
-                        }
-                    }
-                    let entry = Value::Object(entry);
-                    candidate_rules.push(entry.clone());
-                    matching_filters.push(entry);
-                    property_filters.extend(rule.property.iter().cloned());
-                    attribute_filters.extend(rule.attribute.iter().cloned());
-                }
-            }
-            let mut field_filters = Map::new();
-            for property in property_filters {
-                field_filters.insert(
-                    format!("property:{property}"),
-                    filter_scope_decisions(
-                        &loaded.project.filters,
-                        &candidate,
-                        FilterScope::Property(&property),
-                    )?,
-                );
-            }
-            for attribute in attribute_filters {
-                field_filters.insert(
-                    format!("attribute:{attribute}"),
-                    filter_scope_decisions(
-                        &loaded.project.filters,
-                        &candidate,
-                        FilterScope::Attribute(&attribute),
-                    )?,
-                );
-            }
-            let mut candidate_result = json!({
-                "path": candidate_path,
-                "id": instance.settings_id,
-                "filesToStudio": if filter_allows_instance(
-                    &loaded.project.filters,
-                    FilterDirection::FilesToStudio,
-                    &candidate,
-                )? { "include" } else { "ignore" },
-                "studioToFiles": if filter_allows_instance(
-                    &loaded.project.filters,
-                    FilterDirection::StudioToFiles,
-                    &candidate,
-                )? { "include" } else { "ignore" },
-                "matchingFilters": candidate_rules,
-            });
-            if !field_filters.is_empty() {
-                candidate_result["fieldFilters"] = Value::Object(field_filters);
-            }
-            filter_candidates.push(candidate_result);
-        }
-    }
+    let (filter_candidates, matching_filters) = explain_staged_filter_candidates(
+        &loaded,
+        &projection,
+        &staged_absolute,
+        sidecar_target.as_deref(),
+        &requested_absolute,
+    )?;
     let result = json!({
         "ok": true,
         "project": loaded.path,

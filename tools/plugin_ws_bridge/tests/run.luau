@@ -1,15 +1,23 @@
+local fs = require("@lune/fs")
+local luau = require("@lune/luau")
 local roblox = require("@lune/roblox")
 
 game = roblox.Instance.new("DataModel")
+task = {
+	delay = function() end,
+}
 
 local CandidateMatch = require("../BridgeCandidateMatch.module")
 local Chunking = require("../BridgeChunking.module")
+local Connection = require("../BridgeConnection.module")
 local Content = require("../BridgeContent.module")
+require("../BridgeCreatorApi.module")
 local Identity = require("../BridgeIdentity.module")
 local InstanceSwap = require("../BridgeInstanceSwap.module")
 local ReferenceOverlay = require("../BridgeReferenceOverlay.module")
 local ReferenceRetarget = require("../BridgeReferenceRetarget.module")
 local Settings = require("../BridgeSettings.module")
+local TransactionUpload = require("../BridgeTransactionUpload.module")
 local Update = require("../BridgeUpdate.module")
 local ValueEquality = require("../BridgeValueEquality.module")
 
@@ -21,6 +29,97 @@ end
 
 local Runtime = require("../BridgePluginRuntime.module")
 equal(type(Runtime.start), "function", "runtime module compilation")
+local editorSyncSource = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local editorSyncTopLevelLocals = 0
+for line in string.gmatch(editorSyncSource, "[^\r\n]+") do
+	if string.match(line, "^local function ") or string.match(line, "^local [%a_]") then
+		editorSyncTopLevelLocals += 1
+	end
+end
+if editorSyncTopLevelLocals > 190 then
+	error(`editor sync module has {editorSyncTopLevelLocals} top-level local declarations; maximum is 190`)
+end
+local editorSyncCompiled, editorSyncCompileError = pcall(luau.compile, editorSyncSource)
+if not editorSyncCompiled then
+	error("editor sync module compilation failed: " .. tostring(editorSyncCompileError))
+end
+
+local uploadedTransactions = {}
+local uploads = TransactionUpload.create(function(transaction)
+	uploadedTransactions[#uploadedTransactions + 1] = transaction
+	return { ok = true }
+end, function() end, ValueEquality.exactValuesEqual)
+uploads.begin({ transactionId = "lease-upload", totalChunks = 1, rowCount = 1 }, "lease-a")
+local wrongLeaseOk = pcall(uploads.append, {
+	transactionId = "lease-upload",
+	index = 1,
+	rows = { { kind = "source", change = {} } },
+}, "lease-b")
+equal(wrongLeaseOk, false, "transaction upload rejects another lease")
+uploads.append({
+	transactionId = "lease-upload",
+	index = 1,
+	rows = { { kind = "source", change = {} } },
+}, "lease-a")
+equal(uploads.cancelLease("lease-b"), 0, "unrelated lease leaves upload")
+equal(uploads.cancelLease("lease-a"), 1, "owning lease cancels upload")
+local cancelledFinishOk = pcall(uploads.finish, { transactionId = "lease-upload" }, "lease-a")
+equal(cancelledFinishOk, false, "cancelled transaction upload cannot finish")
+
+uploads.begin({ transactionId = "integrity-upload", totalChunks = 1, rowCount = 1 }, "lease-a")
+uploads.append({
+	transactionId = "integrity-upload",
+	index = 1,
+	rows = { { kind = "source", change = { source = "original" } } },
+}, "lease-a")
+uploads.append({
+	transactionId = "integrity-upload",
+	index = 1,
+	rows = { { kind = "source", change = { source = "original" } } },
+}, "lease-a")
+local conflictingRetryOk = pcall(uploads.append, {
+	transactionId = "integrity-upload",
+	index = 1,
+	rows = { { kind = "source", change = { source = "different" } } },
+}, "lease-a")
+equal(conflictingRetryOk, false, "transaction upload rejects conflicting chunk retries")
+uploads.finish({ transactionId = "integrity-upload" }, "lease-a")
+equal(#uploadedTransactions, 1, "matching transaction chunk retry stays idempotent")
+equal(uploadedTransactions[1].sourceChanges[1].source, "original", "conflicting retry keeps original chunk")
+
+local queuedRequests = {
+	{ id = 1, leaseId = "lease-a" },
+	{ id = 2, leaseId = "lease-b" },
+	{ id = 3, leaseId = "lease-a" },
+}
+local removedRequests = Connection.removeQueuedRequestsByLease(queuedRequests, "lease-a")
+equal(#removedRequests, 2, "lease queue cancellation count")
+equal(removedRequests[1].id, 1, "lease queue first cancelled request")
+equal(removedRequests[2].id, 3, "lease queue second cancelled request")
+equal(#queuedRequests, 1, "lease queue retained count")
+equal(queuedRequests[1].id, 2, "lease queue retained order")
+
+local outcomeNow = 10
+local outcomeStore = Connection.createTransactionOutcomeStore(5, 2, function()
+	return outcomeNow
+end)
+local committedOutcome = outcomeStore.record("tx-1", "committed", { undoRecorded = true })
+equal(committedOutcome.state, "committed", "committed transaction state")
+equal(committedOutcome.committed, true, "committed transaction outcome")
+equal(committedOutcome.rolledBack, false, "committed transaction rollback flag")
+local repeatedCommit = outcomeStore.get("tx-1")
+equal(repeatedCommit.state, "committed", "lost commit response recovery")
+repeatedCommit.state = "changed"
+equal(outcomeStore.get("tx-1").state, "committed", "transaction outcome response isolation")
+outcomeNow = 11
+local rolledBackOutcome = outcomeStore.record("tx-2", "rolledBack", { replacements = 4 })
+equal(rolledBackOutcome.rolledBack, true, "rolled back transaction outcome")
+outcomeNow = 12
+outcomeStore.record("tx-3", "committed", {})
+equal(outcomeStore.get("tx-1"), nil, "transaction outcome capacity pruning")
+outcomeNow = 18
+equal(outcomeStore.get("tx-2"), nil, "transaction outcome expiry")
+equal(outcomeStore.get("tx-3"), nil, "latest transaction outcome expiry")
 
 local chunk = Chunking.chunkEncodedString("abcdefgh", 3, 3, -2)
 equal(chunk.start, 3, "chunk start")
@@ -150,7 +249,7 @@ local tiedCandidate = CandidateMatch.choose(
 		return candidate[name] == value
 	end
 )
-equal(tiedCandidate, matchCandidates[1], "candidate reference tie")
+equal(tiedCandidate, nil, "candidate reference tie")
 
 local oversizedCandidates = {}
 for index = 1, 33 do
@@ -161,7 +260,7 @@ local cappedCandidate = CandidateMatch.choose(oversizedCandidates, { Value = 33 
 end, function(candidate, name, value)
 	return candidate[name] == value
 end)
-equal(cappedCandidate, oversizedCandidates[1], "candidate scoring cap")
+equal(cappedCandidate, nil, "candidate scoring cap")
 
 local FakeInstance = {}
 local FakeInstanceMetatable = {}
@@ -177,6 +276,7 @@ function FakeInstanceMetatable.__newindex(instance, key, value)
 		return
 	end
 	local parent = rawget(instance, "_parent")
+	rawset(instance, "_parentWrites", rawget(instance, "_parentWrites") + 1)
 	if parent ~= nil then
 		table.remove(parent._children, table.find(parent._children, instance))
 	end
@@ -191,10 +291,28 @@ function FakeInstance.new(className)
 		Name = className,
 		_attributes = {},
 		_children = {},
+		_parentWrites = 0,
 	}, FakeInstanceMetatable)
 end
 function FakeInstance:GetChildren()
 	return table.clone(self._children)
+end
+function FakeInstance:IsA(className)
+	return self.ClassName == className
+end
+function FakeInstance:FindFirstChildWhichIsA(className, recursive)
+	for _, childInstance in ipairs(self:GetChildren()) do
+		if childInstance:IsA(className) then
+			return childInstance
+		end
+		if recursive then
+			local found = childInstance:FindFirstChildWhichIsA(className, true)
+			if found ~= nil then
+				return found
+			end
+		end
+	end
+	return nil
 end
 function FakeInstance:GetDescendants()
 	local descendants = {}
@@ -231,7 +349,19 @@ end
 function tagService:AddTag(instance, tag)
 	local tags = tagsByInstance[instance] or {}
 	tagsByInstance[instance] = tags
-	tags[#tags + 1] = tag
+	if not table.find(tags, tag) then
+		tags[#tags + 1] = tag
+	end
+end
+function tagService:RemoveTag(instance, tag)
+	local tags = tagsByInstance[instance] or {}
+	local index = table.find(tags, tag)
+	if index then
+		table.remove(tags, index)
+	end
+end
+function tagService:HasTag(instance, tag)
+	return table.find(tagsByInstance[instance] or {}, tag) ~= nil
 end
 
 local swapParent = FakeInstance.new("Folder")
@@ -252,14 +382,17 @@ nestedTail.Parent = replaced
 local after = FakeInstance.new("Folder")
 after.Name = "Value"
 after.Parent = swapParent
+local beforeParentWrites = before._parentWrites
+local afterParentWrites = after._parentWrites
 
 local replacement = InstanceSwap.replace(replaced, "StringValue", tagService, function(instance)
 	instance.Parent = nil
 end, FakeInstance.new)
-local swappedChildren = swapParent:GetChildren()
-equal(swappedChildren[1], before, "replacement first sibling")
-equal(swappedChildren[2], replacement, "replacement original position")
-equal(swappedChildren[3], after, "replacement trailing sibling")
+equal(before.Parent, swapParent, "replacement first sibling parent")
+equal(after.Parent, swapParent, "replacement trailing sibling parent")
+equal(before._parentWrites, beforeParentWrites, "replacement first sibling untouched")
+equal(after._parentWrites, afterParentWrites, "replacement trailing sibling untouched")
+equal(replacement.Parent, swapParent, "replacement parent")
 equal(nested.Parent, replacement, "replacement child parent")
 equal(nestedTail.Parent, replacement, "replacement trailing child parent")
 equal(replacement:GetAttribute("Marker"), "middle", "replacement attribute")
@@ -268,9 +401,8 @@ equal(tagsByInstance[replacement][1], "Synced", "replacement tag")
 local nestedReplacement = InstanceSwap.replace(nested, "StringValue", tagService, function(instance)
 	instance.Parent = nil
 end, FakeInstance.new)
-local nestedChildren = replacement:GetChildren()
-equal(nestedChildren[1], nestedReplacement, "nested replacement position")
-equal(nestedChildren[2], nestedTail, "nested replacement trailing sibling")
+equal(nestedReplacement.Parent, replacement, "nested replacement parent")
+equal(nestedTail.Parent, replacement, "nested replacement trailing sibling parent")
 
 local referenceHolder = FakeInstance.new("ObjectValue")
 referenceHolder.Reference = replaced
@@ -299,13 +431,39 @@ lockedTarget.Parent = lockedParent
 local lockedSibling = FakeInstance.new("Terrain")
 lockedSibling.RobloxLocked = true
 lockedSibling.Parent = lockedParent
-local lockedReplacementOk = pcall(InstanceSwap.replace, lockedTarget, "StringValue", tagService, function(instance)
+local lockedSiblingParentWrites = lockedSibling._parentWrites
+local lockedReplacementOk, lockedReplacement = pcall(InstanceSwap.replace, lockedTarget, "StringValue", tagService, function(instance)
 	instance.Parent = nil
 end, FakeInstance.new)
-local lockedChildren = lockedParent:GetChildren()
-equal(lockedReplacementOk, false, "locked sibling replacement rejected")
-equal(lockedChildren[1], lockedTarget, "locked sibling target retained")
-equal(lockedChildren[2], lockedSibling, "locked sibling retained")
+equal(lockedReplacementOk, true, "locked sibling replacement allowed")
+equal(lockedTarget.Parent, nil, "locked sibling target removed")
+equal(lockedReplacement.Parent, lockedParent, "locked sibling replacement parent")
+equal(lockedSibling.Parent, lockedParent, "locked sibling retained")
+equal(lockedSibling._parentWrites, lockedSiblingParentWrites, "locked sibling untouched")
+
+local failedSwapParent = FakeInstance.new("Folder")
+local failedSwapTarget = FakeInstance.new("Folder")
+failedSwapTarget.Parent = failedSwapParent
+local failedSwapChild = FakeInstance.new("Folder")
+failedSwapChild.Parent = failedSwapTarget
+local failedSwapOk, failedSwapError = pcall(
+	InstanceSwap.replace,
+	failedSwapTarget,
+	"StringValue",
+	tagService,
+	function()
+		error("remove failed")
+	end,
+	FakeInstance.new,
+	function(instance, parent)
+		if instance == failedSwapChild and parent == failedSwapTarget then
+			error("restore failed")
+		end
+		instance.Parent = parent
+	end
+)
+equal(failedSwapOk, false, "class swap rollback failure surfaced")
+equal(string.find(failedSwapError, "rollback also failed", 1, true) ~= nil, true, "class swap rollback detail")
 
 local rollbackParent = FakeInstance.new("Folder")
 local rollbackOld = FakeInstance.new("Folder")
@@ -400,6 +558,64 @@ nativeOverlay.preparePackageMerge(packageRoot, duplicateRoot, { "Package" }, { 1
 equal(#packageMerges, 1, "package merge prepared")
 equal(#packageMerges[1].outgoing, 0, "package link excluded from outgoing content")
 equal(packageLink.Parent, packageRoot, "missing package link preserved")
+
+local packageStateOverlay = ReferenceOverlay.create({
+	BridgeIdentity = {},
+	BridgeReferenceRetarget = ReferenceRetarget,
+	CollectionService = tagService,
+	RbxDomModule = {
+		getObjectContentPropertyNames = function()
+			return {}
+		end,
+		getReferencePropertyNames = function()
+			return {}
+		end,
+		getWritablePropertyNames = function()
+			return { "Label" }
+		end,
+	},
+	readProperty = function(instance, propertyName)
+		return true, instance[propertyName]
+	end,
+	setAttributeForSync = function(instance, name, value)
+		instance:SetAttribute(name, value)
+		return true
+	end,
+	setTagForSync = function(instance, tag, added)
+		if added then
+			tagService:AddTag(instance, tag)
+		else
+			tagService:RemoveTag(instance, tag)
+		end
+	end,
+	valuesEqual = function(left, right)
+		return left == right
+	end,
+	writePropertyForSync = function(instance, propertyName, value)
+		instance[propertyName] = value
+		return true
+	end,
+})
+local livePackageState = FakeInstance.new("Folder")
+livePackageState.Label = "before"
+livePackageState:SetAttribute("Changed", "before")
+tagsByInstance[livePackageState] = { "Before" }
+local desiredPackageState = FakeInstance.new("Folder")
+desiredPackageState.Label = "after"
+desiredPackageState:SetAttribute("Changed", "after")
+desiredPackageState:SetAttribute("Added", true)
+tagsByInstance[desiredPackageState] = { "After" }
+local statePair = { live = livePackageState, duplicate = desiredPackageState }
+packageStateOverlay.copyPackageRootState(statePair, {}, {}, false)
+equal(livePackageState.Label, "after", "package state applied")
+equal(livePackageState:GetAttribute("Added"), true, "package attribute applied")
+equal(tagService:HasTag(livePackageState, "After"), true, "package tag applied")
+packageStateOverlay.restorePackageRootState(statePair, {})
+equal(livePackageState.Label, "before", "package state rolled back")
+equal(livePackageState:GetAttribute("Changed"), "before", "package attribute rolled back")
+equal(livePackageState:GetAttribute("Added"), nil, "package added attribute rolled back")
+equal(tagService:HasTag(livePackageState, "Before"), true, "package original tag rolled back")
+equal(tagService:HasTag(livePackageState, "After"), false, "package added tag rolled back")
 
 equal(Content.serializeSource("None", nil), "", "empty content")
 equal(Content.serializeSource("Uri", "rbxassetid://123"), "rbxassetid://123", "URI content")

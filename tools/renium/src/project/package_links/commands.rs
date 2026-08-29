@@ -26,6 +26,7 @@ use crate::editor::paths::{
 use crate::editor::sync::is_lua_source_class;
 use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::encode::bytecode_export_script_source;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
     SettingsBytecodeInstance, encode_settings_bytecode,
@@ -2146,7 +2147,7 @@ fn plan_externalize_editor_source_files_for_indexes(
         writes.insert(source_path.clone(), source.into_bytes());
         instance.properties.insert(
             "Source".to_string(),
-            Value::String("__SOURCE_EXTERNAL__".to_string()),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
         );
         written_paths.push(source_path.to_string_lossy().into_owned());
     }

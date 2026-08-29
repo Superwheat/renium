@@ -3,7 +3,6 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import { resolveReniumCliPath } from "./cliResolution";
-import { normalizeConflictPolicy, type ConflictPolicy } from "./conflictMerge";
 import {
   activeExperienceAlias,
   resolveActiveExperiencePlace,
@@ -24,9 +23,6 @@ import { pickWorkspaceRoot, resolveConfigPath } from "./utils";
 const DEFAULT_BRIDGE_PORTS = [8781, 8782];
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
 const MAX_BRIDGE_CHUNK_SIZE = 8 * 1024 * 1024;
-
-export const DEFAULT_STUDIO_LIVE_SYNC_POLL_MS = 250;
-export const MIN_STUDIO_LIVE_SYNC_POLL_MS = 10;
 
 export type ReniumLogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
 
@@ -52,16 +48,11 @@ export type SyncConfig = {
   autoSyncDebounceMs: number;
   editorLiveSyncEnabled: boolean;
   studioLiveSyncEnabled: boolean;
-  studioLiveSyncPollMs: number;
   initialSyncPriority: "reconcile" | "verify";
   initialConflictPreference: "none" | "studio" | "editor";
-  changesThreshold: number;
-  diffLinesLimit: number;
   displayPrompts: "always" | "initial" | "never";
   logLevel: ReniumLogLevel;
   overridePackages: boolean;
-  conflictResolution: ConflictPolicy;
-  importMode: "direct" | "snapshot";
   performanceMode: "throughput" | "balanced" | "smooth";
   modifiedDefaultBypass: boolean;
   progressHeartbeatSeconds: number;
@@ -145,7 +136,6 @@ export class SyncConfigResolver {
     const gitStagePaths = (Array.isArray(gitStagePathsRaw) ? gitStagePathsRaw : [])
       .map((value) => String(value).trim())
       .filter(Boolean);
-    const importMode = read<string>("importMode", "direct") === "snapshot" ? "snapshot" : "direct";
     const performanceModeRaw = read<string>("performanceMode", "throughput");
     const performanceMode = performanceModeRaw === "smooth" || performanceModeRaw === "balanced"
       ? performanceModeRaw
@@ -194,20 +184,11 @@ export class SyncConfigResolver {
       autoSyncDebounceMs: number("autoSyncDebounceMs", 800, { min: 100, integer: true }),
       editorLiveSyncEnabled: boolean("editorLiveSyncEnabled", false),
       studioLiveSyncEnabled: boolean("studioLiveSyncEnabled", true),
-      studioLiveSyncPollMs: number(
-        "studioLiveSyncPollMs",
-        DEFAULT_STUDIO_LIVE_SYNC_POLL_MS,
-        { min: MIN_STUDIO_LIVE_SYNC_POLL_MS, integer: true },
-      ),
       initialSyncPriority,
       initialConflictPreference,
-      changesThreshold: number("liveSync.changesThreshold", 5, { min: 0, integer: true }),
-      diffLinesLimit: number("liveSync.diffLinesLimit", 3000, { min: 100, integer: true }),
       displayPrompts,
       logLevel: this.configuredLogLevel(studioRuntimeSettings),
       overridePackages: boolean("liveSync.overridePackages", false),
-      conflictResolution: normalizeConflictPolicy(read("liveSync.conflictResolution", "prompt")),
-      importMode,
       performanceMode,
       modifiedDefaultBypass: boolean("modifiedDefaultBypass", false),
       progressHeartbeatSeconds: number("progressHeartbeatSeconds", 2, { min: 2 }),
@@ -313,7 +294,6 @@ export class SyncConfigResolver {
       ["sourceWorkers", config.sourceWorkers],
       ["instanceWorkers", config.instanceWorkers],
       ["importWorkers", config.importWorkers],
-      ["importMode", config.importMode],
       ["performanceMode", config.performanceMode],
       ["modifiedDefaultBypass", config.modifiedDefaultBypass],
     ];

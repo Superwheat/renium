@@ -37,7 +37,7 @@ Edit `.luau` files directly. `.renium` stores hold the remaining project state.
 Keep the launcher and CLI together, or put the CLI on `PATH`:
 
 ```text
-rbx.cmd   renium.exe        (Windows; or bin\renium.exe)
+rbx.exe   renium.exe        (Windows; `rbx.cmd` remains a fallback)
 rbx       renium            (macOS and Linux; chmod +x both)
 ```
 

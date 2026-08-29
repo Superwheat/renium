@@ -73,11 +73,20 @@ export function normalizePlaceAlias(name: string, placeId: number): string {
   return normalizeAlias(name, placeId, true);
 }
 
-export function readExperienceManifest(projectRoot: string): ExperienceManifest | undefined {
-  const manifestPath = path.join(projectRoot, EXPERIENCE_FILE_NAME);
-  if (!fs.existsSync(manifestPath)) {
-    return undefined;
-  }
+type ExperienceManifestHeader = {
+  version: 1 | 2;
+  gameId: number;
+  startPlace: unknown;
+  places: Record<string, unknown>;
+  placeOrder?: unknown;
+};
+
+type ValidatedExperienceManifest = Omit<ExperienceManifest, "version" | "placeOrder"> & {
+  version: 1 | 2;
+  placeOrder?: unknown;
+};
+
+function parseExperienceManifest(manifestPath: string): Record<string, unknown> {
   let raw: unknown;
   try {
     raw = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
@@ -87,19 +96,51 @@ export function readExperienceManifest(projectRoot: string): ExperienceManifest 
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`${EXPERIENCE_FILE_NAME} must contain a JSON object.`);
   }
-  const manifest = raw as Partial<Omit<ExperienceManifest, "version" | "placeOrder">> & {
-    version?: unknown;
-    placeOrder?: unknown;
-  };
-  if (manifest.version !== 1 && manifest.version !== 2) {
+  return raw as Record<string, unknown>;
+}
+
+function validateExperienceManifestHeader(raw: Record<string, unknown>): ExperienceManifestHeader {
+  if (raw.version !== 1 && raw.version !== 2) {
     throw new Error(`${EXPERIENCE_FILE_NAME} uses an unsupported version.`);
   }
-  if (!validInteger(manifest.gameId)) {
+  if (!validInteger(raw.gameId)) {
     throw new Error(`${EXPERIENCE_FILE_NAME} gameId must be a non-negative integer.`);
   }
-  if (!manifest.places || typeof manifest.places !== "object" || Array.isArray(manifest.places)) {
+  if (!raw.places || typeof raw.places !== "object" || Array.isArray(raw.places)) {
     throw new Error(`${EXPERIENCE_FILE_NAME} places must be an object.`);
   }
+  return raw as ExperienceManifestHeader;
+}
+
+function validateExperiencePlace(
+  projectRoot: string,
+  alias: string,
+  place: unknown,
+  publishedIds: Set<number>,
+): void {
+  if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(alias)) {
+    throw new Error(`Invalid place alias '${alias}' in ${EXPERIENCE_FILE_NAME}.`);
+  }
+  if (!place || typeof place !== "object" || Array.isArray(place)) {
+    throw new Error(`Place '${alias}' must contain an object.`);
+  }
+  const candidate = place as Partial<ExperiencePlace>;
+  if (!validInteger(candidate.placeId)) {
+    throw new Error(`Place '${alias}' has an invalid placeId.`);
+  }
+  if (candidate.placeId > 0 && !publishedIds.add(candidate.placeId)) {
+    throw new Error(`Published placeId ${candidate.placeId} appears more than once.`);
+  }
+  if (typeof candidate.name !== "string" || !candidate.name.trim()) {
+    throw new Error(`Place '${alias}' must have a name.`);
+  }
+  if (typeof candidate.root !== "string") {
+    throw new Error(`Place '${alias}' must have a root.`);
+  }
+  resolveExperiencePlaceRoot(projectRoot, candidate.root);
+}
+
+function validateExperiencePlaces(projectRoot: string, manifest: ExperienceManifestHeader): string[] {
   const aliases = Object.keys(manifest.places);
   if (aliases.length === 0) {
     throw new Error(`${EXPERIENCE_FILE_NAME} must contain at least one place.`);
@@ -109,73 +150,88 @@ export function readExperienceManifest(projectRoot: string): ExperienceManifest 
   }
   const publishedIds = new Set<number>();
   for (const alias of aliases) {
-    if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(alias)) {
-      throw new Error(`Invalid place alias '${alias}' in ${EXPERIENCE_FILE_NAME}.`);
-    }
-    const place = manifest.places[alias];
-    if (!place || typeof place !== "object" || Array.isArray(place)) {
-      throw new Error(`Place '${alias}' must contain an object.`);
-    }
-    if (!validInteger(place.placeId)) {
-      throw new Error(`Place '${alias}' has an invalid placeId.`);
-    }
-    if (place.placeId > 0 && !publishedIds.add(place.placeId)) {
-      throw new Error(`Published placeId ${place.placeId} appears more than once.`);
-    }
-    if (typeof place.name !== "string" || !place.name.trim()) {
-      throw new Error(`Place '${alias}' must have a name.`);
-    }
-    if (typeof place.root !== "string") {
-      throw new Error(`Place '${alias}' must have a root.`);
-    }
-    resolveExperiencePlaceRoot(projectRoot, place.root);
+    validateExperiencePlace(projectRoot, alias, manifest.places[alias], publishedIds);
   }
+  return aliases;
+}
+
+function appendPlaceId(placeId: number, placeOrder: number[], orderedIds: Set<number>): void {
+  if (placeId > 0 && !orderedIds.has(placeId)) {
+    orderedIds.add(placeId);
+    placeOrder.push(placeId);
+  }
+}
+
+function appendLegacyPlaceOrder(
+  manifest: ValidatedExperienceManifest,
+  configuredOrder: unknown[],
+  placeOrder: number[],
+  orderedIds: Set<number>,
+): void {
+  for (const value of configuredOrder) {
+    if (typeof value !== "string" || !manifest.places[value]) {
+      throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder contains an unknown place alias.`);
+    }
+    appendPlaceId(manifest.places[value].placeId, placeOrder, orderedIds);
+  }
+}
+
+function appendCurrentPlaceOrder(
+  manifest: ValidatedExperienceManifest,
+  aliases: string[],
+  configuredOrder: unknown[],
+  placeOrder: number[],
+  orderedIds: Set<number>,
+): void {
+  const configuredIds = new Set(
+    aliases
+      .map((alias) => manifest.places[alias].placeId)
+      .filter((placeId) => placeId > 0),
+  );
+  for (const value of configuredOrder) {
+    if (!validInteger(value) || value === 0) {
+      throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder must contain positive place IDs.`);
+    }
+    if (!configuredIds.has(value)) {
+      throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder contains unknown placeId ${value}.`);
+    }
+    appendPlaceId(value, placeOrder, orderedIds);
+  }
+}
+
+function normalizeExperiencePlaceOrder(
+  manifest: ValidatedExperienceManifest,
+  aliases: string[],
+): number[] {
   if (manifest.placeOrder !== undefined && !Array.isArray(manifest.placeOrder)) {
     throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder must be an array.`);
   }
+  const configuredOrder = manifest.placeOrder ?? [];
   const placeOrder: number[] = [];
   const orderedIds = new Set<number>();
   if (manifest.version === 1) {
-    for (const value of manifest.placeOrder ?? []) {
-      if (typeof value !== "string" || !manifest.places[value]) {
-        throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder contains an unknown place alias.`);
-      }
-      const placeId = manifest.places[value].placeId;
-      if (placeId > 0 && !orderedIds.has(placeId)) {
-        orderedIds.add(placeId);
-        placeOrder.push(placeId);
-      }
-    }
+    appendLegacyPlaceOrder(manifest, configuredOrder, placeOrder, orderedIds);
   } else {
-    const configuredIds = new Set(
-      aliases
-        .map((alias) => manifest.places![alias].placeId)
-        .filter((placeId) => placeId > 0),
-    );
-    for (const value of manifest.placeOrder ?? []) {
-      if (!validInteger(value) || value === 0) {
-        throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder must contain positive place IDs.`);
-      }
-      if (!configuredIds.has(value)) {
-        throw new Error(`${EXPERIENCE_FILE_NAME} placeOrder contains unknown placeId ${value}.`);
-      }
-      if (!orderedIds.has(value)) {
-        orderedIds.add(value);
-        placeOrder.push(value);
-      }
-    }
+    appendCurrentPlaceOrder(manifest, aliases, configuredOrder, placeOrder, orderedIds);
   }
   for (const alias of aliases) {
-    const placeId = manifest.places[alias].placeId;
-    if (placeId > 0 && !orderedIds.has(placeId)) {
-      orderedIds.add(placeId);
-      placeOrder.push(placeId);
-    }
+    appendPlaceId(manifest.places[alias].placeId, placeOrder, orderedIds);
   }
+  return placeOrder;
+}
+
+export function readExperienceManifest(projectRoot: string): ExperienceManifest | undefined {
+  const manifestPath = path.join(projectRoot, EXPERIENCE_FILE_NAME);
+  if (!fs.existsSync(manifestPath)) {
+    return undefined;
+  }
+  const header = validateExperienceManifestHeader(parseExperienceManifest(manifestPath));
+  const aliases = validateExperiencePlaces(projectRoot, header);
+  const manifest = header as ValidatedExperienceManifest;
   return {
     ...(manifest as Omit<ExperienceManifest, "version" | "placeOrder">),
     version: 2,
-    placeOrder,
+    placeOrder: normalizeExperiencePlaceOrder(manifest, aliases),
   };
 }
 

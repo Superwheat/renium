@@ -1,45 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use super::BoundContext;
 use super::context as bound_context;
-use super::reconcile::{BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup};
+use super::reconcile::{
+    BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup, push_project_delta,
+    studio_change_guard_from_state,
+};
 use super::runtime::{
     acknowledge_pulled_changes, automation_failure_ref, automation_pull_args, automation_push_args,
 };
-use crate::app::output::ensure_plugin_api_ok;
-use crate::editor::sync::push_editor_changes_with_warm_bridge;
+use crate::app::output::{ensure_plugin_api_ok, log_global};
+use crate::app::timing::elapsed_ms;
+use crate::editor::sync::{StudioChangeGuard, StudioChangedBeforePush};
 use crate::project::config;
 use crate::snapshot::export::{
     PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
 };
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
-use crate::system::files::{atomic_write_file, fnv1a};
+use crate::system::files::{OnDrop, atomic_write_file, fnv1a};
 use crate::system::watch::FileWatcher;
 
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(10);
+const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
-const STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const STATE_VERSION: u8 = 1;
-const STATE_FILE: &str = "live-watch-state.rmp.zst";
-const STATE_JOURNAL_FILE: &str = "live-watch-state.journal";
 const ENABLED_FILE: &str = "live-watch-state.enabled";
-const STATE_JOURNAL_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+fn log_live_timing(label: &str, started: Instant) {
+    log_global(
+        4,
+        format_args!("[renium] live {label}: {:.1}ms", elapsed_ms(started)),
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     directory: bool,
     length: u64,
@@ -71,8 +77,7 @@ struct Control {
     writes_enabled: AtomicBool,
     file_pause_count: AtomicU64,
     generation: AtomicU64,
-    scan_requested: AtomicU64,
-    scan_completed: AtomicU64,
+    settle_activity: AtomicU64,
     file_changes: Mutex<FileChanges>,
     sync_active: Mutex<bool>,
     sync_idle: Condvar,
@@ -81,6 +86,8 @@ struct Control {
     reset_event: Condvar,
     root: PathBuf,
     status: Mutex<Status>,
+    plugin_state: Mutex<Value>,
+    studio_wait_error: Mutex<Option<String>>,
     finished: Mutex<bool>,
     finished_event: Condvar,
 }
@@ -132,8 +139,7 @@ impl Control {
             writes_enabled: AtomicBool::new(mode.writes()),
             file_pause_count: AtomicU64::new(u64::from(files_paused)),
             generation: AtomicU64::new(0),
-            scan_requested: AtomicU64::new(0),
-            scan_completed: AtomicU64::new(0),
+            settle_activity: AtomicU64::new(0),
             file_changes: Mutex::new(FileChanges::default()),
             sync_active: Mutex::new(false),
             sync_idle: Condvar::new(),
@@ -149,6 +155,8 @@ impl Control {
                 resolution_required,
                 ..Status::default()
             }),
+            plugin_state: Mutex::new(json!({})),
+            studio_wait_error: Mutex::new(None),
             finished: Mutex::new(false),
             finished_event: Condvar::new(),
         }
@@ -198,6 +206,8 @@ impl Control {
                 .into_owned()
         }));
         status.pending_paths = pending.into_iter().collect();
+        drop(status);
+        self.notify_sync_state();
     }
 
     fn rebase_then_resume(&self, rebase: Rebase) -> Result<()> {
@@ -278,6 +288,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .error = None;
+        self.notify_sync_state();
     }
 
     fn set_pull_changes(&self, pull_changes: bool) {
@@ -288,6 +299,9 @@ impl Control {
             .pull_changes = pull_changes;
         if changed && pull_changes {
             self.retry_pull.store(true, Ordering::Release);
+        }
+        if changed {
+            self.notify_sync_state();
         }
     }
 
@@ -300,10 +314,12 @@ impl Control {
     }
 
     fn set_resolution_required(&self, required: bool) {
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .resolution_required = required;
+        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        if status.resolution_required != required {
+            status.resolution_required = required;
+            drop(status);
+            self.notify_sync_state();
+        }
     }
 
     fn pause(&self) {
@@ -313,6 +329,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .paused = true;
+        self.notify_sync_state();
         let mut active = self
             .sync_active
             .lock()
@@ -332,6 +349,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .paused = true;
+        self.notify_sync_state();
         let mut active = self
             .sync_active
             .lock()
@@ -348,6 +366,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .paused = paused;
+        self.notify_sync_state();
     }
 
     fn resume(&self, paths: impl IntoIterator<Item = PathBuf>) {
@@ -366,7 +385,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .paused = previous > 1;
-        self.sync_idle.notify_all();
+        self.notify_sync_state();
     }
 
     fn begin_sync(&self, generation: u64) -> Option<SyncActivity<'_>> {
@@ -391,35 +410,69 @@ impl Control {
     }
 
     fn wait_settled(&self, timeout: Duration) -> bool {
-        let scan = self.scan_requested.fetch_add(1, Ordering::AcqRel) + 1;
         let deadline = Instant::now() + timeout;
+        let mut activity = self.settle_activity.load(Ordering::Acquire);
+        let mut quiet_since = Instant::now();
         let mut active = self
             .sync_active
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         loop {
             let status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
-            let settled = self.scan_completed.load(Ordering::Acquire) >= scan
-                && !*active
-                && !status.paused
-                && status.pending_paths.is_empty();
+            let plugin = self
+                .plugin_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let plugin_pending = plugin["pendingChanges"].as_u64().unwrap_or(0) > 0
+                || plugin["dirtyServices"]
+                    .as_array()
+                    .is_some_and(|services| !services.is_empty());
+            let settled =
+                !*active && !status.paused && status.pending_paths.is_empty() && !plugin_pending;
+            let cannot_progress = !status.running
+                || status.paused
+                || status.error.is_some()
+                || status.resolution_required
+                || (plugin_pending && !self.pull_changes.load(Ordering::Acquire));
+            drop(plugin);
             drop(status);
             if settled {
-                return true;
+                let current_activity = self.settle_activity.load(Ordering::Acquire);
+                if current_activity != activity {
+                    activity = current_activity;
+                    quiet_since = Instant::now();
+                } else if quiet_since.elapsed() >= SETTLE_QUIET_PERIOD {
+                    return true;
+                }
+            }
+            if cannot_progress {
+                return false;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;
             }
-            let (next, result) = self
+            let wait_for = if settled {
+                remaining.min(SETTLE_QUIET_PERIOD.saturating_sub(quiet_since.elapsed()))
+            } else {
+                remaining.min(SETTLE_QUIET_PERIOD)
+            };
+            let (next, _) = self
                 .sync_idle
-                .wait_timeout(active, remaining)
+                .wait_timeout(active, wait_for)
                 .unwrap_or_else(PoisonError::into_inner);
             active = next;
-            if result.timed_out() {
-                return false;
+            let current_activity = self.settle_activity.load(Ordering::Acquire);
+            if current_activity != activity {
+                activity = current_activity;
+                quiet_since = Instant::now();
             }
         }
+    }
+
+    fn notify_sync_state(&self) {
+        self.settle_activity.fetch_add(1, Ordering::Release);
+        self.sync_idle.notify_all();
     }
 
     fn snapshot(&self) -> Value {
@@ -429,6 +482,21 @@ impl Control {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         )
+    }
+
+    fn set_plugin_state(&self, state: Value) {
+        *self
+            .plugin_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = state;
+        self.notify_sync_state();
+    }
+
+    fn plugin_snapshot(&self) -> Value {
+        self.plugin_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn update_pending(&self, pending: &BTreeSet<PathBuf>) {
@@ -444,7 +512,7 @@ impl Control {
                     .into_owned()
             })
             .collect();
-        self.sync_idle.notify_all();
+        self.notify_sync_state();
     }
 
     fn fail(&self, error: String) {
@@ -452,6 +520,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .error = Some(error);
+        self.notify_sync_state();
     }
 
     fn clear_error(&self) {
@@ -459,6 +528,30 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .error = None;
+        self.notify_sync_state();
+    }
+
+    fn fail_studio_wait(&self, message: String) {
+        *self
+            .studio_wait_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message.clone());
+        self.fail(message);
+    }
+
+    fn clear_studio_wait_error(&self) {
+        let expected = self
+            .studio_wait_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        if expected
+            .as_ref()
+            .is_some_and(|error| status.error.as_ref() == Some(error))
+        {
+            status.error = None;
+        }
     }
 
     fn finish(&self) {
@@ -466,6 +559,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .running = false;
+        self.notify_sync_state();
         *self.finished.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.finished_event.notify_all();
         self.reset_event.notify_all();
@@ -498,24 +592,42 @@ impl Drop for SyncActivity<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .syncing = false;
-        self.control.sync_idle.notify_all();
+        self.control.notify_sync_state();
     }
 }
 
 #[derive(Default)]
 pub(crate) struct Manager {
     sessions: Mutex<HashMap<String, Session>>,
-    aliases: Mutex<HashMap<u64, String>>,
+    aliases: Mutex<HashMap<u64, SessionAlias>>,
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    next_session: AtomicU64,
     coordinator: Arc<Coordinator>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SessionAlias {
+    key: String,
+    session_id: u64,
+}
+
 struct Session {
+    id: u64,
     control: Arc<Control>,
+    bridge: Arc<BridgeServer>,
     runtime_id: Option<String>,
 }
 
+pub(crate) struct StartResult {
+    pub(crate) status: Value,
+    created: Option<SessionAlias>,
+}
+
 impl Manager {
+    pub(crate) fn saved_local_file(&self, context: &BoundContext) -> Result<Option<PathBuf>> {
+        self.coordinator.saved_local_file(context)
+    }
+
     fn start_lock(&self, key: &str) -> Arc<Mutex<()>> {
         let mut starts = self.starts.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(
@@ -525,7 +637,7 @@ impl Manager {
         )
     }
 
-    fn session_key(&self, context_id: u64) -> Option<String> {
+    fn session_alias(&self, context_id: u64) -> Option<SessionAlias> {
         self.aliases
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -533,13 +645,56 @@ impl Manager {
             .cloned()
     }
 
-    fn control(&self, context_id: u64) -> Option<Arc<Control>> {
-        let key = self.session_key(context_id)?;
+    fn session_key(&self, context_id: u64) -> Option<String> {
+        let alias = self.session_alias(context_id)?;
         self.sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
+            .get(&alias.key)
+            .filter(|session| session.id == alias.session_id)
+            .map(|_| alias.key)
+    }
+
+    fn control(&self, context_id: u64) -> Option<Arc<Control>> {
+        let alias = self.session_alias(context_id)?;
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&alias.key)
+            .filter(|session| session.id == alias.session_id)
             .map(|session| Arc::clone(&session.control))
+    }
+
+    pub(crate) fn attach(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
+        let key = self.coordinator.pair_key(context, bridge)?;
+        let alias = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .and_then(|session| {
+                let running = session
+                    .control
+                    .status
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .running;
+                (running
+                    && !session.control.stop.load(Ordering::Acquire)
+                    && session.runtime_id == context.runtime_id)
+                    .then(|| SessionAlias {
+                        key: key.clone(),
+                        session_id: session.id,
+                    })
+            });
+        if let Some(alias) = alias {
+            self.aliases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(context.id, alias);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) fn start(
@@ -550,16 +705,22 @@ impl Manager {
         files_paused: bool,
         reset_files_paused: bool,
         configuration: PairConfiguration,
-    ) -> Result<Value> {
+    ) -> Result<StartResult> {
         let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
-        self.start_prepared(
+        let pair_key = setup.key.clone();
+        let mut release_owner = OnDrop::new(|| self.coordinator.release_target(&pair_key));
+        let result = self.start_prepared(
             context,
             bridge,
             pull_changes,
             files_paused,
             reset_files_paused,
             setup,
-        )
+        );
+        if result.is_ok() {
+            release_owner.disarm();
+        }
+        result
     }
 
     fn start_prepared(
@@ -570,17 +731,26 @@ impl Manager {
         files_paused: bool,
         reset_files_paused: bool,
         mut setup: PairSetup,
-    ) -> Result<Value> {
-        self.aliases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(context.id, setup.key.clone());
+    ) -> Result<StartResult> {
+        let total_started = Instant::now();
+        log_global(
+            5,
+            format_args!(
+                "[renium] live start prepared: cx={} pair={} reconcile={}",
+                context.id, setup.key, setup.requires_reconcile
+            ),
+        );
         let start_lock = self.start_lock(&setup.key);
         let _start = start_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        while let Some((control, runtime_id)) = sessions
-            .get(&setup.key)
-            .map(|session| (Arc::clone(&session.control), session.runtime_id.clone()))
+        while let Some((session_id, control, runtime_id)) =
+            sessions.get(&setup.key).map(|session| {
+                (
+                    session.id,
+                    Arc::clone(&session.control),
+                    session.runtime_id.clone(),
+                )
+            })
         {
             let running = control
                 .status
@@ -602,31 +772,51 @@ impl Manager {
                 } else if files_paused && control.file_pause_count.load(Ordering::Acquire) == 0 {
                     control.pause();
                 }
-                return Ok(control.snapshot());
+                drop(sessions);
+                self.aliases
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(
+                        context.id,
+                        SessionAlias {
+                            key: setup.key,
+                            session_id,
+                        },
+                    );
+                return Ok(StartResult {
+                    status: control.snapshot(),
+                    created: None,
+                });
             }
             control.stop.store(true, Ordering::Release);
             drop(sessions);
             control.wait_finished();
             sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            if sessions
-                .get(&setup.key)
-                .is_some_and(|current| Arc::ptr_eq(&current.control, &control))
-            {
+            if sessions.get(&setup.key).is_some_and(|current| {
+                current.id == session_id && Arc::ptr_eq(&current.control, &control)
+            }) {
                 sessions.remove(&setup.key);
             }
+            drop(sessions);
+            self.aliases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|_, alias| alias.key != setup.key || alias.session_id != session_id);
+            sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         }
         drop(sessions);
+        let phase = Instant::now();
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
+        log_live_timing("startup reconcile", phase);
+        let phase = Instant::now();
         let project = open_watch_project(&context)?;
+        log_live_timing("startup watcher open", phase);
+        let phase = Instant::now();
         let current = scan(&project)?;
-        let (mut baseline, state_error, state_missing) = match load_state(&project) {
-            Ok(Some(baseline)) => (baseline, None, false),
-            Ok(None) => (current.clone(), None, true),
-            Err(error) => (current.clone(), Some(error), true),
-        };
-        let saved_entries = baseline.len();
-        baseline.retain(|path, _| relevant(&project, path));
-        let state_pruned = baseline.len() != saved_entries;
+        log_live_timing("startup filesystem scan", phase);
+        let phase = Instant::now();
+        let baseline = current.clone();
+        log_live_timing("startup baseline clone", phase);
         let control = Arc::new(Control::new(
             PathBuf::from(&context.root),
             pull_changes.unwrap_or(true),
@@ -634,27 +824,27 @@ impl Manager {
             setup.mode,
             setup.resolution_required,
         ));
-        if let Some(error) = state_error {
-            control.fail(format!("Live sync ignored invalid saved state: {error:#}"));
-        }
         if let Some(error) = setup.error {
             control.fail(error);
         }
-        if (state_missing || state_pruned)
-            && let Err(error) = save_state(&project, &baseline)
-        {
-            control.fail(format!(
-                "Live sync could not save its initial state: {error:#}"
-            ));
-        }
+        let session_id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let context_id = context.id;
         let runtime_id = context.runtime_id.clone();
+        let session_bridge = Arc::clone(&bridge);
         let pair_key = setup.key.clone();
         let worker_control = Arc::clone(&control);
         let coordinator = Arc::clone(&self.coordinator);
+        let owner_coordinator = Arc::clone(&coordinator);
+        let owner_key = pair_key.clone();
+        let (start_sender, start_receiver) = mpsc::sync_channel(0);
         thread::Builder::new()
             .name(format!("renium-live-{context_id}"))
             .spawn(move || {
+                if start_receiver.recv().is_err() {
+                    owner_coordinator.release_target(&owner_key);
+                    worker_control.finish();
+                    return;
+                }
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run(Worker {
                         context,
@@ -668,7 +858,10 @@ impl Manager {
                     })
                 })) {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => worker_control.fail(format!("{error:#}")),
+                    Ok(Err(error)) => {
+                        log_global(5, format_args!("[renium] live worker failed: {error:#}"));
+                        worker_control.fail(format!("{error:#}"));
+                    }
                     Err(panic) => {
                         let message = panic
                             .downcast_ref::<&str>()
@@ -678,20 +871,40 @@ impl Manager {
                         worker_control.fail(format!("Live sync watcher panicked: {message}"));
                     }
                 }
+                owner_coordinator.release_target(&owner_key);
                 worker_control.finish();
             })
             .context("Failed to start live sync watcher")?;
+        let session_key = setup.key;
+        let session_alias = SessionAlias {
+            key: session_key.clone(),
+            session_id,
+        };
         self.sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
-                setup.key,
+                session_key.clone(),
                 Session {
+                    id: session_id,
                     control: Arc::clone(&control),
+                    bridge: session_bridge,
                     runtime_id,
                 },
             );
-        Ok(control.snapshot())
+        self.aliases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(context_id, session_alias.clone());
+        if start_sender.send(()).is_err() {
+            self.stop_session(&session_alias);
+            bail!("Live sync watcher stopped before startup");
+        }
+        log_live_timing("startup total", total_started);
+        Ok(StartResult {
+            status: control.snapshot(),
+            created: Some(session_alias),
+        })
     }
 
     pub(crate) fn update_runtime_settings(
@@ -700,13 +913,20 @@ impl Manager {
         bridge: Arc<BridgeServer>,
         configuration: PairConfiguration,
     ) -> Result<Option<Value>> {
-        let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
-        if !setup.requires_reconcile {
-            return Ok(None);
-        }
         let Some(control) = self.control(context.id) else {
             return Ok(None);
         };
+        let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] live runtime settings: cx={} reconcile={}",
+                context.id, setup.requires_reconcile
+            ),
+        );
+        if !setup.requires_reconcile {
+            return Ok(None);
+        }
         let pull_changes = control.pull_changes.load(Ordering::Acquire);
         let files_paused = control.file_pause_count.load(Ordering::Acquire) > 0;
         self.start_prepared(
@@ -717,13 +937,31 @@ impl Manager {
             true,
             setup,
         )
-        .map(Some)
+        .map(|started| Some(started.status))
+    }
+
+    pub(crate) fn rollback_start(&self, started: &StartResult) {
+        if let Some(alias) = &started.created {
+            self.stop_session(alias);
+        }
     }
 
     pub(crate) fn status(&self, context_id: u64) -> Value {
         self.control(context_id)
             .as_deref()
             .map_or_else(|| json!({ "running": false }), |control| control.snapshot())
+    }
+
+    pub(crate) fn plugin_status(&self, context_id: u64) -> Value {
+        self.control(context_id)
+            .as_deref()
+            .map_or_else(|| json!({}), Control::plugin_snapshot)
+    }
+
+    pub(crate) fn set_plugin_status(&self, context_id: u64, state: Value) {
+        if let Some(control) = self.control(context_id) {
+            control.set_plugin_state(state);
+        }
     }
 
     pub(crate) fn baseline_files(
@@ -742,11 +980,7 @@ impl Manager {
     pub(crate) fn wait_settled(&self, context_id: u64, timeout: Duration) -> bool {
         self.control(context_id)
             .as_deref()
-            .is_none_or(|control| control.wait_settled(timeout))
-    }
-
-    pub(crate) fn is_enabled(&self, context: &BoundContext) -> bool {
-        enabled_path(context).is_file()
+            .is_some_and(|control| control.wait_settled(timeout))
     }
 
     pub(crate) fn set_enabled(&self, context: &BoundContext, enabled: bool) -> Result<()> {
@@ -762,6 +996,10 @@ impl Manager {
                 }
             }
         }
+    }
+
+    pub(crate) fn enabled(&self, context: &BoundContext) -> bool {
+        enabled_path(context).is_file()
     }
 
     pub(crate) fn retry(&self, context_id: u64) -> Value {
@@ -869,6 +1107,10 @@ impl Manager {
             }
             let result = (|| {
                 if full {
+                    log_global(
+                        5,
+                        format_args!("[renium] reconcile reason: full acknowledgment"),
+                    );
                     let setup = self.coordinator.reconcile_current(context, bridge)?;
                     control.set_mode(setup.mode);
                     control.set_resolution_required(setup.resolution_required);
@@ -945,34 +1187,70 @@ impl Manager {
     }
 
     pub(crate) fn stop(&self, context_id: u64) -> Value {
-        let key = self.session_key(context_id);
-        let control = self.control(context_id);
-        if let Some(control) = control {
+        let Some(alias) = self.session_alias(context_id) else {
+            return json!({ "running": false });
+        };
+        self.stop_session(&alias)
+    }
+
+    fn stop_session(&self, alias: &SessionAlias) -> Value {
+        let session = {
+            self.sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&alias.key)
+                .filter(|session| session.id == alias.session_id)
+                .map(|session| {
+                    (
+                        Arc::clone(&session.control),
+                        Arc::clone(&session.bridge),
+                        session.runtime_id.clone(),
+                    )
+                })
+        };
+        if let Some((control, bridge, runtime_id)) = session {
             control.stop.store(true, Ordering::Release);
+            if let Some(runtime_id) = runtime_id {
+                let _ = bridge.call_for_runtime_with_timeout(
+                    "cancelStudioChangeWait",
+                    json!({}),
+                    BridgeTarget::Edit,
+                    &runtime_id,
+                    Some(Duration::from_secs(1)),
+                );
+            }
             control.wait_finished();
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            if key.as_ref().is_some_and(|key| {
-                sessions
-                    .get(key)
-                    .is_some_and(|current| Arc::ptr_eq(&current.control, &control))
+            if sessions.get(&alias.key).is_some_and(|current| {
+                current.id == alias.session_id && Arc::ptr_eq(&current.control, &control)
             }) {
-                sessions.remove(key.as_ref().unwrap());
+                sessions.remove(&alias.key);
             }
             drop(sessions);
-            if let Some(key) = key {
-                self.aliases
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retain(|_, value| value != &key);
-            }
+            self.aliases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|_, current| current != alias);
             control.snapshot()
         } else {
+            self.aliases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|_, current| current != alias);
             json!({ "running": false })
         }
     }
 
     pub(crate) fn cancel(&self, context_id: u64) {
-        self.stop(context_id);
+        let mut aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(alias) = aliases.remove(&context_id) else {
+            return;
+        };
+        let still_shared = aliases.values().any(|current| current == &alias);
+        drop(aliases);
+        if !still_shared {
+            self.stop_session(&alias);
+        }
     }
 }
 
@@ -986,7 +1264,6 @@ struct WatchProject {
     roots: BTreeSet<PathBuf>,
     files: BTreeSet<PathBuf>,
     full_push: BTreeSet<PathBuf>,
-    project_path: PathBuf,
 }
 
 fn open_watch_project(context: &BoundContext) -> Result<WatchProject> {
@@ -1016,158 +1293,7 @@ fn open_watch_project(context: &BoundContext) -> Result<WatchProject> {
         roots,
         files,
         full_push,
-        project_path: loaded.path,
     })
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedState {
-    version: u8,
-    project: String,
-    files: BTreeMap<String, FileStamp>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedChange {
-    path: String,
-    stamp: Option<FileStamp>,
-}
-
-fn state_path(project: &WatchProject) -> PathBuf {
-    project.root.join(".renium").join(STATE_FILE)
-}
-
-fn state_journal_path(project: &WatchProject) -> PathBuf {
-    project.root.join(".renium").join(STATE_JOURNAL_FILE)
-}
-
-fn save_state(project: &WatchProject, baseline: &BTreeMap<PathBuf, FileStamp>) -> Result<()> {
-    let state = PersistedState {
-        version: STATE_VERSION,
-        project: project.project_path.to_string_lossy().into_owned(),
-        files: baseline
-            .iter()
-            .map(|(path, stamp)| (path.to_string_lossy().into_owned(), *stamp))
-            .collect(),
-    };
-    let encoded = rmp_serde::to_vec(&state).context("Failed to encode live sync state")?;
-    let compressed = zstd::stream::encode_all(encoded.as_slice(), 1)
-        .context("Failed to compress live sync state")?;
-    atomic_write_file(&state_path(project), &compressed)?;
-    match fs::remove_file(state_journal_path(project)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("Failed to reset live sync state journal"),
-    }
-    Ok(())
-}
-
-fn append_state_changes(
-    project: &WatchProject,
-    baseline: &BTreeMap<PathBuf, FileStamp>,
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<()> {
-    let paths = paths.into_iter().collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let journal_path = state_journal_path(project);
-    if let Some(parent) = journal_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    let mut journal = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&journal_path)
-        .with_context(|| format!("Failed to open {}", journal_path.display()))?;
-    for path in paths {
-        let encoded = rmp_serde::to_vec(&PersistedChange {
-            path: path.to_string_lossy().into_owned(),
-            stamp: baseline.get(&path).copied(),
-        })
-        .context("Failed to encode live sync state change")?;
-        let length = u32::try_from(encoded.len()).context("Live sync state change is too large")?;
-        journal
-            .write_all(&length.to_le_bytes())
-            .and_then(|()| journal.write_all(&encoded))
-            .with_context(|| format!("Failed to write {}", journal_path.display()))?;
-    }
-    journal
-        .flush()
-        .with_context(|| format!("Failed to flush {}", journal_path.display()))?;
-    if journal.metadata()?.len() >= STATE_JOURNAL_COMPACT_BYTES {
-        drop(journal);
-        save_state(project, baseline)?;
-    }
-    Ok(())
-}
-
-fn load_state(project: &WatchProject) -> Result<Option<BTreeMap<PathBuf, FileStamp>>> {
-    let path = state_path(project);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
-        }
-    };
-    let decoded = zstd::stream::decode_all(bytes.as_slice())
-        .with_context(|| format!("Failed to decompress {}", path.display()))?;
-    let state: PersistedState = rmp_serde::from_slice(&decoded)
-        .with_context(|| format!("Failed to decode {}", path.display()))?;
-    if state.version != STATE_VERSION || state.project != project.project_path.to_string_lossy() {
-        return Ok(None);
-    }
-    let mut baseline = state
-        .files
-        .into_iter()
-        .map(|(path, stamp)| (PathBuf::from(path), stamp))
-        .collect::<BTreeMap<_, _>>();
-    let journal_path = state_journal_path(project);
-    let journal = match fs::read(&journal_path) {
-        Ok(journal) => journal,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(baseline)),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to read {}", journal_path.display()));
-        }
-    };
-    let mut offset = 0;
-    while offset + 4 <= journal.len() {
-        let record_start = offset;
-        let length = u32::from_le_bytes([
-            journal[offset],
-            journal[offset + 1],
-            journal[offset + 2],
-            journal[offset + 3],
-        ]) as usize;
-        offset += 4;
-        let Some(end) = offset
-            .checked_add(length)
-            .filter(|end| *end <= journal.len())
-        else {
-            offset = record_start;
-            break;
-        };
-        let change: PersistedChange = rmp_serde::from_slice(&journal[offset..end])
-            .with_context(|| format!("Failed to decode {}", journal_path.display()))?;
-        let path = PathBuf::from(change.path);
-        if let Some(stamp) = change.stamp {
-            baseline.insert(path, stamp);
-        } else {
-            baseline.remove(&path);
-        }
-        offset = end;
-    }
-    if offset < journal.len() {
-        OpenOptions::new()
-            .write(true)
-            .open(&journal_path)
-            .and_then(|file| file.set_len(offset as u64))
-            .with_context(|| format!("Failed to repair {}", journal_path.display()))?;
-    }
-    Ok(Some(baseline))
 }
 
 fn absolute(path: PathBuf, root: &Path) -> PathBuf {
@@ -1180,12 +1306,20 @@ fn absolute(path: PathBuf, root: &Path) -> PathBuf {
 
 fn ignored_under(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|relative| {
-        relative.components().any(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .is_some_and(|name| matches!(name, ".git" | ".renium"))
-        })
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.ends_with(".renium.lock")
+                    || name.ends_with(".rbxl.lock")
+                    || name.ends_with(".rbxlx.lock")
+            })
+            || relative.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| matches!(name, ".git" | ".renium"))
+            })
     })
 }
 
@@ -1359,20 +1493,25 @@ fn unblock_full_push(project: &WatchProject, blocked: &mut BTreeMap<PathBuf, Opt
     blocked.retain(|path, _| !project.full_push.contains(path));
 }
 
-fn push(context: &BoundContext, bridge: &BridgeServer, paths: Option<&[PathBuf]>) -> Result<()> {
-    let mut parameters = json!({ "verifySources": true });
-    if let Some(paths) = paths {
-        parameters["changedPaths"] = json!(paths);
-    }
+fn push_full(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    guard: Option<&StudioChangeGuard>,
+) -> Result<()> {
+    let parameters = json!({ "verifySources": true });
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
     if let Some(runtime_id) = context.runtime_id.as_deref() {
         bridge.pin_runtime(BridgeTarget::Main, runtime_id);
         bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     }
-    let summary = push_editor_changes_with_warm_bridge(
-        automation_push_args(context, &parameters, false)?,
+    let services = super::reconcile::sync_services();
+    let summary = push_project_delta(
+        context,
         bridge,
+        &services,
+        automation_push_args(context, &parameters, false)?,
+        guard,
     )?;
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
         bail!("Studio changes are waiting for review");
@@ -1390,23 +1529,23 @@ struct PulledStudioChanges {
 fn pull_studio_changes(
     context: &BoundContext,
     bridge: &BridgeServer,
+    pending_state: Option<Value>,
 ) -> Result<Option<PulledStudioChanges>> {
     let runtime_id = context
         .runtime_id
         .as_deref()
         .context("Live sync context has no Studio runtime")?;
-    let _gate = bridge.acquire_request_gate();
-    let _selection = bound_context::select(context);
-    bridge.clear_runtime_pins();
-    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
-    bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-    let state = bridge.call_for_runtime_with_timeout(
-        "getStudioChangeState",
-        json!({ "start": true }),
-        BridgeTarget::Edit,
-        runtime_id,
-        Some(Duration::from_secs(1)),
-    )?;
+    let state = if let Some(state) = pending_state {
+        state
+    } else {
+        bridge.call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({ "start": true }),
+            BridgeTarget::Edit,
+            runtime_id,
+            Some(Duration::from_secs(1)),
+        )?
+    };
     ensure_plugin_api_ok(&state)?;
     if state["twoWaySyncEnabled"].as_bool() == Some(false) {
         return Ok(None);
@@ -1432,6 +1571,11 @@ fn pull_studio_changes(
         "services": &services,
         "importMode": "staged",
     });
+    let _gate = bridge.acquire_request_gate();
+    let _selection = bound_context::select(context);
+    bridge.clear_runtime_pins();
+    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+    bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
     let published = export_snapshots_with_warm_bridge(
         automation_pull_args(context, &parameters, true)?,
@@ -1439,6 +1583,7 @@ fn pull_studio_changes(
         &info,
         0.0,
         false,
+        state["referencePathsMayChange"].as_bool().unwrap_or(false),
     )?;
     Ok(Some(PulledStudioChanges {
         published,
@@ -1448,27 +1593,164 @@ fn pull_studio_changes(
     }))
 }
 
-fn studio_has_pending_changes(context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
+struct StudioPushState {
+    pending: bool,
+    guard: StudioChangeGuard,
+}
+
+fn studio_push_state(context: &BoundContext, bridge: &BridgeServer) -> Result<StudioPushState> {
     let runtime_id = context
         .runtime_id
         .as_deref()
         .context("Live sync context has no Studio runtime")?;
-    let _gate = bridge.acquire_request_gate();
-    let _selection = bound_context::select(context);
-    bridge.clear_runtime_pins();
-    bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({ "start": true, "eventWaitSeconds": 0 }),
+        json!({ "start": true, "includeGenerations": true }),
         BridgeTarget::Edit,
         runtime_id,
-        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(10)),
     )?;
     ensure_plugin_api_ok(&state)?;
-    Ok(state["dirtyServices"]
-        .as_array()
-        .is_some_and(|services| !services.is_empty()))
+    let guard = studio_change_guard_from_state(context, &state)?;
+    Ok(StudioPushState {
+        pending: state["dirtyServices"]
+            .as_array()
+            .is_some_and(|services| !services.is_empty()),
+        guard,
+    })
+}
+
+enum StudioEvent {
+    State(Value),
+    Error(anyhow::Error),
+}
+
+fn wait_for_studio_event(context: &BoundContext, bridge: &BridgeServer) -> Result<Value> {
+    let runtime_id = context
+        .runtime_id
+        .as_deref()
+        .context("Live sync context has no Studio runtime")?;
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({
+            "start": true,
+            "waitSeconds": 25,
+            "compact": true,
+        }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(27)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    Ok(state)
+}
+
+fn start_studio_event_waiter(
+    context: BoundContext,
+    bridge: Arc<BridgeServer>,
+    control: Arc<Control>,
+) -> Result<(Receiver<StudioEvent>, SyncSender<()>)> {
+    let (event_sender, events) = mpsc::channel();
+    let (resume, resume_receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name(format!("renium-studio-events-{}", context.id))
+        .spawn(move || {
+            while !control.stop.load(Ordering::Acquire) && bridge.alive.load(Ordering::Acquire) {
+                let event = match wait_for_studio_event(&context, &bridge) {
+                    Ok(state) => StudioEvent::State(state),
+                    Err(error) => StudioEvent::Error(error),
+                };
+                if event_sender.send(event).is_err() {
+                    break;
+                }
+                loop {
+                    if control.stop.load(Ordering::Acquire) || !bridge.alive.load(Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    match resume_receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            }
+        })
+        .context("Failed to start Studio event waiter")?;
+    Ok((events, resume))
+}
+
+#[derive(Default)]
+struct StudioEventState {
+    wait_paused: bool,
+    resume_at: Option<Instant>,
+    pull_ready: bool,
+    retry_delay: Duration,
+    pending_payload: Option<Value>,
+}
+
+fn poll_studio_event(
+    control: &Control,
+    events: &Receiver<StudioEvent>,
+    resume: &SyncSender<()>,
+    state: &mut StudioEventState,
+) -> Result<()> {
+    if state
+        .resume_at
+        .is_some_and(|resume_at| Instant::now() >= resume_at)
+    {
+        let _ = resume.try_send(());
+        state.wait_paused = false;
+        state.resume_at = None;
+    }
+    if state.wait_paused {
+        return Ok(());
+    }
+    match events.try_recv() {
+        Ok(StudioEvent::State(payload)) => {
+            control.set_plugin_state(payload.clone());
+            control.clear_studio_wait_error();
+            let has_changes = payload["dirtyServices"]
+                .as_array()
+                .is_some_and(|services| !services.is_empty());
+            let enabled = payload["twoWaySyncEnabled"].as_bool() != Some(false);
+            if has_changes && enabled {
+                state.pending_payload = Some(payload);
+                state.wait_paused = true;
+                state.pull_ready = true;
+                state.retry_delay = Duration::ZERO;
+                return Ok(());
+            }
+            state.pending_payload = None;
+            if enabled {
+                let _ = resume.try_send(());
+            } else {
+                state.wait_paused = true;
+                state.resume_at = Some(Instant::now() + RESCAN_RETRY);
+            }
+        }
+        Ok(StudioEvent::Error(error)) => {
+            let failure = automation_failure_ref(&error);
+            if failure.0.c == "no_studio" {
+                return Err(error);
+            }
+            control.fail_studio_wait(format!("Studio live sync failed: {}", failure.0.m));
+            state.wait_paused = true;
+            state.retry_delay = next_retry_delay(state.retry_delay);
+            state.resume_at = Some(Instant::now() + state.retry_delay);
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => bail!("Studio change waiter stopped"),
+    }
+    Ok(())
+}
+
+fn next_retry_delay(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_millis(250)
+    } else {
+        (current * 2).min(MAX_PUSH_RETRY_DELAY)
+    }
 }
 
 fn published_state_matches(
@@ -1487,6 +1769,25 @@ fn published_state_matches(
             fs::read_link(root.join(relative)).is_ok_and(|actual| actual == *target)
         }
         _ => false,
+    }
+}
+
+fn published_state_label(state: Option<&PublishEntryState>) -> String {
+    match state {
+        None => "missing".to_string(),
+        Some(PublishEntryState::Directory) => "directory".to_string(),
+        Some(PublishEntryState::File { length, hash, .. }) => {
+            format!("file({length},{hash:016x})")
+        }
+        Some(PublishEntryState::Symlink(target)) => format!("symlink({})", target.display()),
+    }
+}
+
+fn file_stamp_label(state: Option<&FileStamp>) -> String {
+    match state {
+        None => "missing".to_string(),
+        Some(state) if state.directory => "directory".to_string(),
+        Some(state) => format!("file({},{:016x})", state.length, state.hash),
     }
 }
 
@@ -1519,6 +1820,17 @@ fn reconcile_published_changes(
             }
             pending.remove(&path);
         } else if baseline.get(&path) != current.get(&path) {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] live publish mismatch: {} expected={} current={}",
+                    relative.display(),
+                    published_state_label(
+                        published.expected.get(relative).and_then(Option::as_ref)
+                    ),
+                    file_stamp_label(current.get(&path))
+                ),
+            );
             pending.insert(path);
         } else {
             pending.remove(&path);
@@ -1537,618 +1849,993 @@ struct Worker {
     pair_key: String,
 }
 
-fn run(worker: Worker) -> Result<()> {
-    let Worker {
-        context,
-        bridge,
-        mut project,
-        mut baseline,
-        current,
-        control,
-        coordinator,
-        pair_key,
-    } = worker;
-    let mut pending = BTreeSet::new();
-    let mut blocked = BTreeMap::new();
-    let mut push_ready = queue_scan_changes(&baseline, &current, &mut pending, &mut blocked);
-    let mut last_event = if push_ready {
-        Instant::now() - EVENT_DEBOUNCE
-    } else {
-        Instant::now()
-    };
-    let mut last_studio_poll = Instant::now();
-    let mut last_rescan = Instant::now() - RESCAN_RETRY;
-    let mut push_retry_delay = Duration::ZERO;
-    let mut pull_retry_delay = Duration::ZERO;
-    let mut pull_ready = true;
-    let mut rescan_pending = false;
-    control.update_pending(&pending);
+#[derive(Default)]
+struct ProjectEventOutcome {
+    changed: bool,
+    rescan: bool,
+}
 
-    while !control.stop.load(Ordering::Acquire) && bridge.alive.load(Ordering::Acquire) {
-        let receive_timeout = if push_ready {
-            EVENT_DEBOUNCE
-                .max(push_retry_delay)
-                .saturating_sub(last_event.elapsed())
-                .min(Duration::from_millis(50))
-        } else {
-            Duration::from_millis(50)
-        };
-        match project.watcher.receiver().recv_timeout(receive_timeout) {
-            Ok(Ok(event)) => {
-                if control.file_pause_count.load(Ordering::Acquire) > 0 {
-                    rescan_pending = true;
-                } else {
-                    match queue_changed(
-                        &project,
-                        &baseline,
-                        &mut pending,
-                        &mut blocked,
-                        event.paths,
-                    ) {
-                        Ok(changed) => {
-                            if changed {
-                                unblock_full_push(&project, &mut blocked);
-                                last_event = Instant::now();
-                                push_retry_delay = Duration::ZERO;
-                                push_ready = true;
-                                control.update_pending(&pending);
-                            }
-                        }
-                        Err(error) => {
-                            control.fail(format!(
-                                "Project watcher could not read a changed file: {error:#}"
-                            ));
-                            rescan_pending = true;
-                        }
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                control.fail(format!("Project watcher failed: {error}"));
-                rescan_pending = true;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("Project watcher stopped")
-            }
+fn receive_project_event(
+    project: &WatchProject,
+    baseline: &BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    control: &Control,
+    timeout: Duration,
+) -> Result<ProjectEventOutcome> {
+    let mut outcome = ProjectEventOutcome::default();
+    match project.watcher.receiver().recv_timeout(timeout) {
+        Ok(Ok(_)) if control.file_pause_count.load(Ordering::Acquire) > 0 => {
+            outcome.rescan = true;
         }
-
-        if project.watcher.take_overflowed() {
-            rescan_pending = true;
-        }
-        let requested_scan = control.scan_requested.load(Ordering::Acquire);
-        let explicit_scan = requested_scan > control.scan_completed.load(Ordering::Acquire);
-        if explicit_scan {
-            rescan_pending = true;
-        }
-        if rescan_pending
-            && control.file_pause_count.load(Ordering::Acquire) == 0
-            && (explicit_scan || last_rescan.elapsed() >= RESCAN_RETRY)
-        {
-            last_rescan = Instant::now();
-            match scan(&project) {
-                Ok(current) => {
-                    if queue_scan_changes(&baseline, &current, &mut pending, &mut blocked) {
-                        unblock_full_push(&project, &mut blocked);
-                        push_ready = true;
-                        last_event = Instant::now();
-                        push_retry_delay = Duration::ZERO;
-                        control.update_pending(&pending);
-                    }
-                    if blocked.is_empty() {
-                        control.clear_error();
-                    }
-                    rescan_pending = false;
-                }
-                Err(error) => {
-                    control.fail(format!("Project watcher rescan failed: {error:#}"));
-                }
-            }
-            if explicit_scan {
-                control
-                    .scan_completed
-                    .store(requested_scan, Ordering::Release);
-                control.sync_idle.notify_all();
-            }
-        }
-        if control.reset.swap(false, Ordering::AcqRel) {
-            let (reset_sequence, rebase) = control
-                .take_rebase()
-                .context("Live sync rebase request was missing")?;
-            let RebaseRequest { value, resume } = rebase;
-            match open_watch_project(&context)
-                .and_then(|current| scan(&current).map(|snapshot| (current, snapshot)))
-            {
-                Ok((current, snapshot)) => {
-                    project = current;
-                    match value {
-                        Rebase::Captured(captured) => {
-                            if captured.full {
-                                baseline = captured
-                                    .entries
-                                    .into_iter()
-                                    .filter(|(path, _)| relevant(&project, path))
-                                    .filter_map(|(path, stamp)| stamp.map(|stamp| (path, stamp)))
-                                    .collect();
-                            } else {
-                                let candidates = baseline
-                                    .keys()
-                                    .chain(snapshot.keys())
-                                    .filter(|path| {
-                                        captured.scopes.iter().any(|scope| path.starts_with(scope))
-                                    })
-                                    .cloned()
-                                    .collect::<BTreeSet<_>>();
-                                for path in candidates {
-                                    let expected =
-                                        captured.entries.get(&path).copied().unwrap_or(None);
-                                    if !relevant(&project, &path)
-                                        || snapshot.get(&path).copied() != expected
-                                    {
-                                        continue;
-                                    }
-                                    if let Some(stamp) = expected {
-                                        baseline.insert(path, stamp);
-                                    } else {
-                                        baseline.remove(&path);
-                                    }
-                                }
-                            }
-                            blocked.clear();
-                            pending.clear();
-                            queue_scan_changes(&baseline, &snapshot, &mut pending, &mut blocked);
-                        }
-                        Rebase::Published(published) => {
-                            blocked.clear();
-                            reconcile_published_changes(
-                                &project,
-                                &mut baseline,
-                                &snapshot,
-                                &mut pending,
-                                &published,
-                            );
-                        }
-                    }
-                    push_ready = !pending.is_empty();
-                    push_retry_delay = Duration::ZERO;
-                    control.update_pending(&pending);
-                    let reset_error = save_state(&project, &baseline)
-                        .err()
-                        .map(|error| format!("Live sync could not save its state: {error:#}"));
-                    if let Some(error) = &reset_error {
-                        control.fail(error.clone());
-                    } else {
-                        control.clear_error();
-                    }
-                    if resume {
-                        control.release_pause();
-                    }
-                    control.complete_reset(reset_sequence, reset_error);
-                }
-                Err(error) => {
-                    let message = format!("Live sync could not refresh the project: {error:#}");
-                    control.fail(message.clone());
-                    if resume {
-                        control.release_pause();
-                    }
-                    control.complete_reset(reset_sequence, Some(message));
-                    return Err(error);
-                }
-            }
-        }
-        let (queued, settled) = {
-            let mut changes = control
-                .file_changes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            (
-                std::mem::take(&mut changes.queued),
-                std::mem::take(&mut changes.settled),
-            )
-        };
-        if !queued.is_empty() {
-            let mut accepted = false;
-            for path in queued {
-                if relevant(&project, &path) {
-                    blocked.remove(&path);
-                    pending.insert(path);
-                    accepted = true;
-                }
-            }
-            if accepted {
-                unblock_full_push(&project, &mut blocked);
-                push_ready = true;
-                last_event = Instant::now() - EVENT_DEBOUNCE;
-                push_retry_delay = Duration::ZERO;
-            }
-            control.update_pending(&pending);
-        }
-        if !settled.is_empty() {
-            let mut settle_failed = false;
-            let mut persisted = Vec::new();
-            for path in settled {
-                if !relevant(&project, &path) {
-                    continue;
-                }
-                match stamp(&path) {
-                    Ok(Some(current)) => {
-                        baseline.insert(path.clone(), current);
-                        pending.remove(&path);
-                        blocked.remove(&path);
-                        persisted.push(path);
-                    }
-                    Ok(None) => {
-                        baseline.remove(&path);
-                        pending.remove(&path);
-                        blocked.remove(&path);
-                        persisted.push(path);
-                    }
-                    Err(error) => {
-                        control
-                            .file_changes
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .settled
-                            .insert(path);
-                        control.fail(format!(
-                            "Live sync could not settle a written file: {error:#}"
-                        ));
-                        settle_failed = true;
+        Ok(Ok(event)) => {
+            let had_blocked_changes = !blocked.is_empty();
+            match queue_changed(project, baseline, pending, blocked, event.paths) {
+                Ok(changed) => {
+                    outcome.changed = changed;
+                    if changed {
+                        unblock_full_push(project, blocked);
+                        control.update_pending(pending);
                     }
                 }
-            }
-            push_ready = pending.iter().any(|path| !blocked.contains_key(path));
-            control.update_pending(&pending);
-            if settle_failed {
-                thread::sleep(RESCAN_RETRY);
-                continue;
-            }
-            match append_state_changes(&project, &baseline, persisted) {
-                Ok(()) if blocked.is_empty() => control.clear_error(),
-                Ok(()) => {}
-                Err(error) => {
-                    control.fail(format!("Live sync could not save its state: {error:#}"));
-                }
-            }
-        }
-        if control.retry.swap(false, Ordering::AcqRel) {
-            blocked.clear();
-            push_retry_delay = Duration::ZERO;
-            pull_retry_delay = Duration::ZERO;
-            push_ready = true;
-            pull_ready = true;
-        }
-        if control.retry_pull.swap(false, Ordering::AcqRel) {
-            pull_ready = true;
-        }
-
-        if push_ready
-            && control.writes_enabled.load(Ordering::Acquire)
-            && !rescan_pending
-            && control.file_pause_count.load(Ordering::Acquire) == 0
-            && !pending.is_empty()
-            && pending.iter().any(|path| !blocked.contains_key(path))
-            && last_event.elapsed() >= EVENT_DEBOUNCE.max(push_retry_delay)
-        {
-            match studio_has_pending_changes(&context, &bridge) {
-                Ok(true) => {
-                    let generation = control.generation.load(Ordering::Acquire);
-                    let Some(_activity) = control.begin_sync(generation) else {
-                        continue;
-                    };
-                    match coordinator.reconcile_current(&context, &bridge) {
-                        Ok(setup) => {
-                            control.set_mode(setup.mode);
-                            control.set_resolution_required(setup.resolution_required);
-                            if let Some(error) = setup.error {
-                                control.fail(error);
-                            } else {
-                                control.clear_error();
-                            }
-                            let current = scan(&project)?;
-                            baseline.clone_from(&current);
-                            pending.clear();
-                            blocked.clear();
-                            control.update_pending(&pending);
-                            save_state(&project, &baseline)?;
-                            push_ready = false;
-                            pull_ready = true;
-                            last_event = Instant::now();
-                            continue;
-                        }
-                        Err(error) => {
-                            control.set_mode(PairMode::Verify);
-                            control.fail(format!(
-                                "Live sync could not reconcile concurrent changes: {error:#}"
-                            ));
-                            push_ready = false;
-                            rescan_pending = true;
-                            continue;
-                        }
-                    }
-                }
-                Ok(false) => {}
                 Err(error) => {
                     control.fail(format!(
-                        "Live sync could not inspect Studio changes: {error:#}"
+                        "Project watcher could not read a changed file: {error:#}"
                     ));
-                    push_ready = false;
-                    rescan_pending = true;
-                    continue;
+                    outcome.rescan = true;
                 }
             }
-            let paths = pending
-                .iter()
-                .filter(|path| !blocked.contains_key(*path))
-                .cloned()
-                .collect::<Vec<_>>();
-            let refresh_project = paths.iter().any(|path| project.full_push.contains(path));
-            let mut refreshed_project = None;
-            let captured = match if refresh_project {
-                open_watch_project(&context).and_then(|current| {
-                    scan(&current).map(|captured| {
-                        refreshed_project = Some(current);
-                        captured
-                            .into_iter()
-                            .map(|(path, stamp)| (path, Some(stamp)))
-                            .collect()
-                    })
-                })
-            } else {
-                capture_pending(&project, &baseline, &paths)
-            } {
-                Ok(captured) => captured,
-                Err(error) => {
-                    control.fail(format!("Live sync could not read pending files: {error:#}"));
-                    for path in &paths {
-                        blocked.insert(path.clone(), stamp(path).unwrap_or(None));
-                    }
-                    push_ready = false;
-                    rescan_pending = true;
-                    continue;
-                }
-            };
-            if let Some(current) = refreshed_project.take() {
-                project = current;
-            }
-            let generation = control.generation.load(Ordering::Acquire);
-            let Some(_activity) = control.begin_sync(generation) else {
-                continue;
-            };
-            let gate = bridge.acquire_request_gate();
-            if control.generation.load(Ordering::Acquire) != generation
-                || control.file_pause_count.load(Ordering::Acquire) > 0
-            {
-                continue;
-            }
-            let selected_paths = (!refresh_project).then_some(paths.as_slice());
-            let result = match push(&context, &bridge, selected_paths) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let failure = automation_failure_ref(&error);
-                    if failure.0.rt == 1 {
-                        thread::sleep(Duration::from_millis(100));
-                        push(&context, &bridge, selected_paths)
-                    } else {
-                        Err(error)
-                    }
-                }
-            };
-            drop(gate);
-            match result {
-                Ok(()) => {
-                    let baseline_result = if refresh_project {
-                        coordinator
-                            .reconcile_current(&context, &bridge)
-                            .map(|setup| {
-                                control.set_mode(setup.mode);
-                                control.set_resolution_required(setup.resolution_required);
-                                setup.error
-                            })
-                    } else {
-                        coordinator
-                            .advance_baseline(&context, &pair_key, &paths, BaselineSide::Editor)
-                            .map(|()| None)
-                    };
-                    match baseline_result {
-                        Ok(None) => {}
-                        Ok(Some(error)) => {
-                            control.fail(error);
-                            push_ready = false;
-                            continue;
-                        }
-                        Err(error) => {
-                            control.set_mode(PairMode::Verify);
-                            control.fail(format!(
-                                "Live sync applied files in Studio but could not record the shared state: {error:#}"
-                            ));
-                            push_ready = false;
-                            continue;
-                        }
-                    }
-                    let mut persisted = Vec::new();
-                    if refresh_project {
-                        let current = scan(&project)?;
-                        baseline = captured
-                            .into_iter()
-                            .filter_map(|(path, stamp)| stamp.map(|stamp| (path, stamp)))
-                            .collect();
-                        blocked.clear();
-                        pending.clear();
-                        queue_scan_changes(&baseline, &current, &mut pending, &mut blocked);
-                    } else {
-                        for (path, captured_stamp) in &captured {
-                            match stamp(path) {
-                                Ok(current) if *captured_stamp == current => {
-                                    if let Some(current) = current {
-                                        baseline.insert(path.clone(), current);
-                                    } else {
-                                        baseline.remove(path);
-                                    }
-                                    pending.remove(path);
-                                    blocked.remove(path);
-                                    persisted.push(path.clone());
-                                }
-                                Ok(_) => {
-                                    pending.insert(path.clone());
-                                    blocked.remove(path);
-                                }
-                                Err(error) => {
-                                    control.fail(format!(
-                                        "Live sync could not verify a pushed file: {error:#}"
-                                    ));
-                                    rescan_pending = true;
-                                }
-                            }
-                        }
-                    }
-                    let mut status = control
-                        .status
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    status.pushes = status.pushes.saturating_add(1);
-                    if blocked.is_empty() {
-                        status.error = None;
-                    }
-                    drop(status);
-                    if refresh_project {
-                        if let Err(error) = save_state(&project, &baseline) {
-                            control.fail(format!("Live sync could not save its state: {error:#}"));
-                        }
-                    } else if let Err(error) = append_state_changes(&project, &baseline, persisted)
-                    {
-                        control.fail(format!("Live sync could not save its state: {error:#}"));
-                    }
-                    control.update_pending(&pending);
-                    push_ready = pending.iter().any(|path| !blocked.contains_key(path));
-                    push_retry_delay = Duration::ZERO;
-                    last_event = Instant::now();
-                }
-                Err(error) => {
-                    let failure = automation_failure_ref(&error);
-                    if failure.0.c == "no_studio" {
-                        return Err(error);
-                    }
-                    let retry = failure.0.rt == 1;
-                    control.fail(failure.0.m);
-                    push_ready = retry;
-                    if push_ready {
-                        push_retry_delay = if push_retry_delay.is_zero() {
-                            Duration::from_millis(250)
-                        } else {
-                            (push_retry_delay * 2).min(MAX_PUSH_RETRY_DELAY)
-                        };
-                        last_event = Instant::now();
-                    } else {
-                        for path in &paths {
-                            blocked
-                                .insert(path.clone(), captured.get(path).copied().unwrap_or(None));
-                        }
-                    }
-                }
+            if had_blocked_changes && blocked.is_empty() {
+                control.clear_error();
             }
         }
+        Ok(Err(error)) => {
+            control.fail(format!("Project watcher failed: {error}"));
+            outcome.rescan = true;
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("Project watcher stopped")
+        }
+    }
+    Ok(outcome)
+}
 
-        if pull_ready
-            && control.writes_enabled.load(Ordering::Acquire)
-            && control.pull_changes.load(Ordering::Acquire)
-            && control.file_pause_count.load(Ordering::Acquire) == 0
-            && pending.is_empty()
-            && last_studio_poll.elapsed() >= STUDIO_POLL_INTERVAL.max(pull_retry_delay)
-        {
-            let current = scan(&project)?;
-            if queue_scan_changes(&baseline, &current, &mut pending, &mut blocked)
-                && !pending.is_empty()
-            {
-                control.update_pending(&pending);
-                push_ready = true;
-                last_event = Instant::now();
+fn rescan_project_if_due(
+    project: &WatchProject,
+    baseline: &BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    control: &Control,
+    last_rescan: &mut Instant,
+    rescan_pending: &mut bool,
+) -> bool {
+    if !*rescan_pending
+        || control.file_pause_count.load(Ordering::Acquire) > 0
+        || last_rescan.elapsed() < RESCAN_RETRY
+    {
+        return false;
+    }
+    *last_rescan = Instant::now();
+    match scan(project) {
+        Ok(current) => {
+            let had_blocked_changes = !blocked.is_empty();
+            let changed = queue_scan_changes(baseline, &current, pending, blocked);
+            if changed {
+                unblock_full_push(project, blocked);
+                control.update_pending(pending);
+            }
+            if had_blocked_changes && blocked.is_empty() {
+                control.clear_error();
+            }
+            *rescan_pending = false;
+            changed
+        }
+        Err(error) => {
+            control.fail(format!("Project watcher rescan failed: {error:#}"));
+            false
+        }
+    }
+}
+
+fn apply_captured_rebase(
+    project: &WatchProject,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    snapshot: &BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    captured: CapturedState,
+) {
+    if captured.full {
+        *baseline = captured
+            .entries
+            .into_iter()
+            .filter(|(path, _)| relevant(project, path))
+            .filter_map(|(path, stamp)| stamp.map(|stamp| (path, stamp)))
+            .collect();
+    } else {
+        let candidates = baseline
+            .keys()
+            .chain(snapshot.keys())
+            .filter(|path| captured.scopes.iter().any(|scope| path.starts_with(scope)))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for path in candidates {
+            let expected = captured.entries.get(&path).copied().unwrap_or(None);
+            if !relevant(project, &path) || snapshot.get(&path).copied() != expected {
                 continue;
             }
-            last_studio_poll = Instant::now();
-            let generation = control.generation.load(Ordering::Acquire);
-            let Some(_activity) = control.begin_sync(generation) else {
-                continue;
-            };
-            let result = match pull_studio_changes(&context, &bridge) {
-                Err(error) => {
-                    if automation_failure_ref(&error).0.rt == 1 {
-                        thread::sleep(Duration::from_millis(100));
-                        pull_studio_changes(&context, &bridge)
-                    } else {
-                        Err(error)
-                    }
-                }
-                result => result,
-            };
-            match result {
-                Ok(Some(pulled)) => {
-                    let baseline_paths = pulled.published.changed_roots.clone();
-                    let current = scan(&project)?;
-                    reconcile_published_changes(
-                        &project,
-                        &mut baseline,
-                        &current,
-                        &mut pending,
-                        &pulled.published,
-                    );
-                    let mut status = control
-                        .status
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    status.pulls = status.pulls.saturating_add(1);
-                    status.error = None;
-                    drop(status);
-                    control.update_pending(&pending);
-                    push_ready = !pending.is_empty();
-                    pull_retry_delay = Duration::ZERO;
-                    if let Err(error) = save_state(&project, &baseline) {
-                        control.fail(format!("Live sync could not save its state: {error:#}"));
-                    } else if let Err(error) = coordinator.advance_baseline(
-                        &context,
-                        &pair_key,
-                        &baseline_paths,
-                        BaselineSide::Studio,
-                    ) {
-                        control.set_mode(PairMode::Verify);
-                        control.fail(format!(
-                            "Live sync saved Studio changes but could not record the shared state: {error:#}"
-                        ));
-                    } else if let Err(error) = acknowledge_pulled_changes(
-                        &bridge,
-                        &pulled.services,
-                        pulled.seq,
-                        &pulled.runtime_id,
-                    ) {
-                        control.fail(format!(
-                            "Live sync saved Studio changes but could not acknowledge them: {error:#}"
-                        ));
-                    }
-                }
-                Ok(None) => {
-                    if !pull_retry_delay.is_zero() && blocked.is_empty() {
-                        control.clear_error();
-                    }
-                    pull_retry_delay = Duration::ZERO;
-                }
-                Err(error) => {
-                    let failure = automation_failure_ref(&error);
-                    if failure.0.c == "no_studio" {
-                        return Err(error);
-                    }
-                    let retry = failure.0.rt == 1;
-                    control.fail(format!("Studio live sync failed: {}", failure.0.m));
-                    pull_ready = retry;
-                    if retry {
-                        pull_retry_delay = if pull_retry_delay.is_zero() {
-                            Duration::from_millis(250)
-                        } else {
-                            (pull_retry_delay * 2).min(MAX_PUSH_RETRY_DELAY)
-                        };
-                    }
-                }
+            if let Some(stamp) = expected {
+                baseline.insert(path, stamp);
+            } else {
+                baseline.remove(&path);
             }
         }
     }
+    blocked.clear();
+    pending.clear();
+    queue_scan_changes(baseline, snapshot, pending, blocked);
+}
+
+fn apply_rebase_request(
+    context: &BoundContext,
+    project: &mut WatchProject,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    control: &Control,
+) -> Result<Option<bool>> {
+    if !control.reset.swap(false, Ordering::AcqRel) {
+        return Ok(None);
+    }
+    let (reset_sequence, rebase) = control
+        .take_rebase()
+        .context("Live sync rebase request was missing")?;
+    let RebaseRequest { value, resume } = rebase;
+    let refreshed = open_watch_project(context)
+        .and_then(|current| scan(&current).map(|snapshot| (current, snapshot)));
+    match refreshed {
+        Ok((current, snapshot)) => {
+            *project = current;
+            match value {
+                Rebase::Captured(captured) => {
+                    apply_captured_rebase(project, baseline, &snapshot, pending, blocked, captured);
+                }
+                Rebase::Published(published) => {
+                    blocked.clear();
+                    reconcile_published_changes(project, baseline, &snapshot, pending, &published);
+                }
+            }
+            control.update_pending(pending);
+            control.clear_error();
+            if resume {
+                control.release_pause();
+            }
+            control.complete_reset(reset_sequence, None);
+            Ok(Some(!pending.is_empty()))
+        }
+        Err(error) => {
+            let message = format!("Live sync could not refresh the project: {error:#}");
+            control.fail(message.clone());
+            if resume {
+                control.release_pause();
+            }
+            control.complete_reset(reset_sequence, Some(message));
+            Err(error)
+        }
+    }
+}
+
+#[derive(Default)]
+struct FileControlOutcome {
+    push_ready: Option<bool>,
+    push_immediately: bool,
+    retry_later: bool,
+}
+
+fn record_current_stamp(
+    path: &Path,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+) -> Result<()> {
+    record_stamp(path, stamp(path)?, baseline, pending, blocked);
     Ok(())
+}
+
+fn record_stamp(
+    path: &Path,
+    current: Option<FileStamp>,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+) {
+    if let Some(current) = current {
+        baseline.insert(path.to_path_buf(), current);
+    } else {
+        baseline.remove(path);
+    }
+    pending.remove(path);
+    blocked.remove(path);
+}
+
+fn apply_file_control_changes(
+    project: &WatchProject,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    control: &Control,
+) -> FileControlOutcome {
+    let (queued, settled) = {
+        let mut changes = control
+            .file_changes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (
+            std::mem::take(&mut changes.queued),
+            std::mem::take(&mut changes.settled),
+        )
+    };
+    let mut outcome = FileControlOutcome::default();
+    if !queued.is_empty() {
+        let mut accepted = false;
+        for path in queued {
+            if relevant(project, &path) {
+                blocked.remove(&path);
+                pending.insert(path);
+                accepted = true;
+            }
+        }
+        if accepted {
+            unblock_full_push(project, blocked);
+            outcome.push_ready = Some(true);
+            outcome.push_immediately = true;
+        }
+        control.update_pending(pending);
+    }
+    if settled.is_empty() {
+        return outcome;
+    }
+    for path in settled {
+        if !relevant(project, &path) {
+            continue;
+        }
+        if let Err(error) = record_current_stamp(&path, baseline, pending, blocked) {
+            control
+                .file_changes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .settled
+                .insert(path);
+            control.fail(format!(
+                "Live sync could not settle a written file: {error:#}"
+            ));
+            outcome.retry_later = true;
+        }
+    }
+    outcome.push_ready = Some(pending.iter().any(|path| !blocked.contains_key(path)));
+    control.update_pending(pending);
+    outcome
+}
+
+struct PreparedPush {
+    paths: Vec<PathBuf>,
+    refresh_project: bool,
+    captured: BTreeMap<PathBuf, Option<FileStamp>>,
+    guard: StudioChangeGuard,
+}
+
+struct LiveLoop {
+    context: BoundContext,
+    bridge: Arc<BridgeServer>,
+    project: WatchProject,
+    baseline: BTreeMap<PathBuf, FileStamp>,
+    control: Arc<Control>,
+    coordinator: Arc<Coordinator>,
+    pair_key: String,
+    pending: BTreeSet<PathBuf>,
+    blocked: BTreeMap<PathBuf, Option<FileStamp>>,
+    push_ready: bool,
+    last_event: Instant,
+    studio_events: Receiver<StudioEvent>,
+    studio_resume: SyncSender<()>,
+    studio: StudioEventState,
+    last_pull_attempt: Instant,
+    last_rescan: Instant,
+    push_retry_delay: Duration,
+    rescan_pending: bool,
+}
+
+impl LiveLoop {
+    fn new(worker: Worker) -> Result<Self> {
+        let Worker {
+            context,
+            bridge,
+            project,
+            baseline,
+            current,
+            control,
+            coordinator,
+            pair_key,
+        } = worker;
+        let mut pending = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
+        let push_ready = queue_scan_changes(&baseline, &current, &mut pending, &mut blocked);
+        let last_event = if push_ready {
+            Instant::now() - EVENT_DEBOUNCE
+        } else {
+            Instant::now()
+        };
+        let (studio_events, studio_resume) =
+            start_studio_event_waiter(context.clone(), Arc::clone(&bridge), Arc::clone(&control))?;
+        control.update_pending(&pending);
+        Ok(Self {
+            context,
+            bridge,
+            project,
+            baseline,
+            control,
+            coordinator,
+            pair_key,
+            pending,
+            blocked,
+            push_ready,
+            last_event,
+            studio_events,
+            studio_resume,
+            studio: StudioEventState::default(),
+            last_pull_attempt: Instant::now(),
+            last_rescan: Instant::now() - RESCAN_RETRY,
+            push_retry_delay: Duration::ZERO,
+            rescan_pending: false,
+        })
+    }
+
+    fn running(&self) -> bool {
+        !self.control.stop.load(Ordering::Acquire) && self.bridge.alive.load(Ordering::Acquire)
+    }
+
+    fn receive_timeout(&self) -> Duration {
+        if !self.push_ready {
+            return Duration::from_millis(50);
+        }
+        EVENT_DEBOUNCE
+            .max(self.push_retry_delay)
+            .saturating_sub(self.last_event.elapsed())
+            .min(Duration::from_millis(50))
+    }
+
+    fn process_events(&mut self) -> Result<bool> {
+        poll_studio_event(
+            &self.control,
+            &self.studio_events,
+            &self.studio_resume,
+            &mut self.studio,
+        )?;
+        let receive_timeout = self.receive_timeout();
+        let project_event = receive_project_event(
+            &self.project,
+            &self.baseline,
+            &mut self.pending,
+            &mut self.blocked,
+            &self.control,
+            receive_timeout,
+        )?;
+        if project_event.changed {
+            self.last_event = Instant::now();
+            self.push_retry_delay = Duration::ZERO;
+            self.push_ready = true;
+        }
+        self.rescan_pending |= project_event.rescan || self.project.watcher.take_overflowed();
+        if rescan_project_if_due(
+            &self.project,
+            &self.baseline,
+            &mut self.pending,
+            &mut self.blocked,
+            &self.control,
+            &mut self.last_rescan,
+            &mut self.rescan_pending,
+        ) {
+            self.push_ready = true;
+            self.last_event = Instant::now();
+            self.push_retry_delay = Duration::ZERO;
+        }
+        if let Some(ready) = apply_rebase_request(
+            &self.context,
+            &mut self.project,
+            &mut self.baseline,
+            &mut self.pending,
+            &mut self.blocked,
+            &self.control,
+        )? {
+            self.push_ready = ready;
+            self.push_retry_delay = Duration::ZERO;
+        }
+        let file_control = apply_file_control_changes(
+            &self.project,
+            &mut self.baseline,
+            &mut self.pending,
+            &mut self.blocked,
+            &self.control,
+        );
+        if let Some(ready) = file_control.push_ready {
+            self.push_ready = ready;
+        }
+        if file_control.push_immediately {
+            self.last_event = Instant::now() - EVENT_DEBOUNCE;
+            self.push_retry_delay = Duration::ZERO;
+        }
+        self.apply_retry_requests();
+        Ok(file_control.retry_later)
+    }
+
+    fn apply_retry_requests(&mut self) {
+        if self.control.retry.swap(false, Ordering::AcqRel) {
+            self.blocked.clear();
+            self.push_retry_delay = Duration::ZERO;
+            self.studio.retry_delay = Duration::ZERO;
+            self.push_ready = true;
+            self.studio.pull_ready = true;
+            if self.studio.wait_paused {
+                self.studio.resume_at = None;
+            }
+        }
+        if self.control.retry_pull.swap(false, Ordering::AcqRel) {
+            self.studio.pull_ready = true;
+        }
+    }
+
+    fn push_due(&self) -> bool {
+        self.push_ready
+            && self.control.writes_enabled.load(Ordering::Acquire)
+            && !self.rescan_pending
+            && self.control.file_pause_count.load(Ordering::Acquire) == 0
+            && !self.pending.is_empty()
+            && self
+                .pending
+                .iter()
+                .any(|path| !self.blocked.contains_key(path))
+            && self.last_event.elapsed() >= EVENT_DEBOUNCE.max(self.push_retry_delay)
+    }
+
+    fn push_guard(&mut self) -> Result<Option<StudioChangeGuard>> {
+        match studio_push_state(&self.context, &self.bridge) {
+            Ok(state) if state.pending => self.reconcile_concurrent_changes(),
+            Ok(state) => Ok(Some(state.guard)),
+            Err(error) if automation_failure_ref(&error).0.c == "no_studio" => Err(error),
+            Err(error) => {
+                self.control.fail(format!(
+                    "Live sync could not inspect Studio changes: {error:#}"
+                ));
+                self.push_ready = false;
+                self.rescan_pending = true;
+                Ok(None)
+            }
+        }
+    }
+
+    fn reconcile_concurrent_changes(&mut self) -> Result<Option<StudioChangeGuard>> {
+        log_global(
+            5,
+            format_args!("[renium] reconcile reason: concurrent editor and Studio changes"),
+        );
+        let generation = self.control.generation.load(Ordering::Acquire);
+        let Some(_activity) = self.control.begin_sync(generation) else {
+            return Ok(None);
+        };
+        match self
+            .coordinator
+            .reconcile_current(&self.context, &self.bridge)
+        {
+            Ok(setup) => {
+                self.control.set_mode(setup.mode);
+                self.control
+                    .set_resolution_required(setup.resolution_required);
+                if let Some(error) = setup.error {
+                    self.control.fail(error);
+                } else {
+                    self.control.clear_error();
+                }
+                self.baseline = scan(&self.project)?;
+                self.pending.clear();
+                self.blocked.clear();
+                self.control.update_pending(&self.pending);
+                self.push_ready = false;
+                self.studio.pending_payload = None;
+                self.studio.pull_ready = true;
+                self.last_event = Instant::now();
+            }
+            Err(error) if automation_failure_ref(&error).0.c == "no_studio" => return Err(error),
+            Err(error) => {
+                self.control.set_mode(PairMode::Verify);
+                self.control.fail(format!(
+                    "Live sync could not reconcile concurrent changes: {error:#}"
+                ));
+                self.push_ready = false;
+                self.rescan_pending = true;
+            }
+        }
+        Ok(None)
+    }
+
+    fn pending_push_paths(&self) -> Vec<PathBuf> {
+        self.pending
+            .iter()
+            .filter(|path| !self.blocked.contains_key(*path))
+            .cloned()
+            .collect()
+    }
+
+    fn prepare_push(&mut self, guard: StudioChangeGuard) -> Result<PreparedPush> {
+        let paths = self.pending_push_paths();
+        let refresh_project = paths
+            .iter()
+            .any(|path| self.project.full_push.contains(path));
+        let captured = if refresh_project {
+            let project = open_watch_project(&self.context)?;
+            let captured = scan(&project)?
+                .into_iter()
+                .map(|(path, stamp)| (path, Some(stamp)))
+                .collect();
+            self.project = project;
+            captured
+        } else {
+            capture_pending(&self.project, &self.baseline, &paths)?
+        };
+        Ok(PreparedPush {
+            paths,
+            refresh_project,
+            captured,
+            guard,
+        })
+    }
+
+    fn block_unreadable_push(&mut self, paths: &[PathBuf], error: &anyhow::Error) {
+        self.control
+            .fail(format!("Live sync could not read pending files: {error:#}"));
+        for path in paths {
+            self.blocked
+                .insert(path.clone(), stamp(path).unwrap_or(None));
+        }
+        self.push_ready = false;
+        self.rescan_pending = true;
+    }
+
+    fn execute_push(&self, push: &PreparedPush) -> Option<Result<Vec<PathBuf>>> {
+        let generation = self.control.generation.load(Ordering::Acquire);
+        let _activity = self.control.begin_sync(generation)?;
+        let gate = self.bridge.acquire_request_gate();
+        if self.control.generation.load(Ordering::Acquire) != generation
+            || self.control.file_pause_count.load(Ordering::Acquire) > 0
+        {
+            return None;
+        }
+        let push_changes = || {
+            if push.refresh_project {
+                let validation_paths = push.captured.keys().cloned().collect::<Vec<_>>();
+                self.coordinator
+                    .validate_editor_changes(&self.context, &self.pair_key, &validation_paths)
+                    .and_then(|()| {
+                        push_full(&self.context, &self.bridge, Some(&push.guard))
+                            .map(|()| Vec::new())
+                    })
+            } else {
+                self.coordinator.push_editor_changes(
+                    &self.context,
+                    &self.pair_key,
+                    &self.bridge,
+                    &push.paths,
+                    Some(&push.guard),
+                )
+            }
+        };
+        let result = match push_changes() {
+            Err(error) if automation_failure_ref(&error).0.rt == 1 => {
+                thread::sleep(Duration::from_millis(100));
+                push_changes()
+            }
+            result => result,
+        };
+        drop(gate);
+        Some(result)
+    }
+
+    fn record_full_push(&mut self, push: &PreparedPush) -> Result<bool> {
+        log_global(
+            5,
+            format_args!("[renium] reconcile reason: full project push"),
+        );
+        match self
+            .coordinator
+            .reconcile_current(&self.context, &self.bridge)
+        {
+            Ok(setup) => {
+                self.control.set_mode(setup.mode);
+                self.control
+                    .set_resolution_required(setup.resolution_required);
+                if let Some(error) = setup.error {
+                    self.control.fail(error);
+                    self.push_ready = false;
+                    return Ok(false);
+                }
+            }
+            Err(error) if automation_failure_ref(&error).0.c == "no_studio" => return Err(error),
+            Err(error) => {
+                self.control.set_mode(PairMode::Verify);
+                self.control.fail(format!(
+                    "Live sync applied files in Studio but could not record the shared state: {error:#}"
+                ));
+                self.push_ready = false;
+                return Ok(false);
+            }
+        }
+        let current = scan(&self.project)?;
+        self.baseline = push
+            .captured
+            .iter()
+            .filter_map(|(path, stamp)| stamp.map(|stamp| (path.clone(), stamp)))
+            .collect();
+        self.blocked.clear();
+        self.pending.clear();
+        queue_scan_changes(
+            &self.baseline,
+            &current,
+            &mut self.pending,
+            &mut self.blocked,
+        );
+        Ok(true)
+    }
+
+    fn record_incremental_push(&mut self, push: &PreparedPush, generated_paths: Vec<PathBuf>) {
+        for (path, captured_stamp) in &push.captured {
+            match stamp(path) {
+                Ok(current) if *captured_stamp == current => {
+                    record_stamp(
+                        path,
+                        current,
+                        &mut self.baseline,
+                        &mut self.pending,
+                        &mut self.blocked,
+                    );
+                }
+                Ok(_) => {
+                    self.pending.insert(path.clone());
+                    self.blocked.remove(path);
+                }
+                Err(error) => {
+                    self.control.fail(format!(
+                        "Live sync could not verify a pushed file: {error:#}"
+                    ));
+                    self.rescan_pending = true;
+                }
+            }
+        }
+        for path in generated_paths {
+            if let Err(error) = record_current_stamp(
+                &path,
+                &mut self.baseline,
+                &mut self.pending,
+                &mut self.blocked,
+            ) {
+                self.control.fail(format!(
+                    "Live sync could not record a generated file: {error:#}"
+                ));
+                self.rescan_pending = true;
+            }
+        }
+    }
+
+    fn record_push_success(
+        &mut self,
+        push: &PreparedPush,
+        generated_paths: Vec<PathBuf>,
+    ) -> Result<bool> {
+        if push.refresh_project {
+            if !self.record_full_push(push)? {
+                return Ok(true);
+            }
+        } else {
+            self.record_incremental_push(push, generated_paths);
+        }
+        let mut status = self
+            .control
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        status.pushes = status.pushes.saturating_add(1);
+        if self.blocked.is_empty() {
+            status.error = None;
+        }
+        drop(status);
+        self.control.update_pending(&self.pending);
+        self.push_ready = self
+            .pending
+            .iter()
+            .any(|path| !self.blocked.contains_key(path));
+        self.push_retry_delay = Duration::ZERO;
+        self.last_event = Instant::now();
+        Ok(false)
+    }
+
+    fn record_push_failure(&mut self, push: &PreparedPush, error: anyhow::Error) -> Result<bool> {
+        if error.is::<StudioChangedBeforePush>() {
+            self.push_ready = true;
+            self.push_retry_delay = Duration::ZERO;
+            self.last_event = Instant::now() - EVENT_DEBOUNCE;
+            return Ok(true);
+        }
+        let failure = automation_failure_ref(&error);
+        if failure.0.c == "no_studio" {
+            return Err(error);
+        }
+        let retry = failure.0.rt == 1;
+        self.control.fail(failure.0.m);
+        self.push_ready = retry;
+        if retry {
+            self.push_retry_delay = next_retry_delay(self.push_retry_delay);
+            self.last_event = Instant::now();
+        } else {
+            for path in &push.paths {
+                self.blocked.insert(
+                    path.clone(),
+                    push.captured.get(path).copied().unwrap_or(None),
+                );
+            }
+        }
+        Ok(false)
+    }
+
+    fn maybe_push(&mut self) -> Result<bool> {
+        if !self.push_due() {
+            return Ok(false);
+        }
+        let Some(guard) = self.push_guard()? else {
+            return Ok(true);
+        };
+        let paths = self.pending_push_paths();
+        let push = match self.prepare_push(guard) {
+            Ok(push) => push,
+            Err(error) => {
+                self.block_unreadable_push(&paths, &error);
+                return Ok(true);
+            }
+        };
+        let Some(result) = self.execute_push(&push) else {
+            return Ok(true);
+        };
+        match result {
+            Ok(generated_paths) => self.record_push_success(&push, generated_paths),
+            Err(error) => self.record_push_failure(&push, error),
+        }
+    }
+
+    fn pull_due(&self) -> bool {
+        self.studio.pull_ready
+            && self.control.writes_enabled.load(Ordering::Acquire)
+            && self.control.pull_changes.load(Ordering::Acquire)
+            && self.control.file_pause_count.load(Ordering::Acquire) == 0
+            && self.pending.is_empty()
+            && self.last_pull_attempt.elapsed() >= self.studio.retry_delay
+    }
+
+    fn pull_studio(&mut self) -> Result<Option<PulledStudioChanges>> {
+        let payload = self.studio.pending_payload.take();
+        match pull_studio_changes(&self.context, &self.bridge, payload) {
+            Err(error) if automation_failure_ref(&error).0.rt == 1 => {
+                thread::sleep(Duration::from_millis(100));
+                pull_studio_changes(&self.context, &self.bridge, None)
+            }
+            result => result,
+        }
+    }
+
+    fn finish_studio_wait(&mut self) {
+        self.studio.pull_ready = false;
+        self.studio.wait_paused = false;
+        let _ = self.studio_resume.try_send(());
+    }
+
+    fn acknowledge_pull(&self, pulled: &PulledStudioChanges) -> Result<()> {
+        if let Err(error) = self.coordinator.advance_baseline(
+            &self.context,
+            &self.pair_key,
+            &pulled.published.changed_roots,
+            BaselineSide::Studio,
+        ) {
+            self.control.set_mode(PairMode::Verify);
+            self.control.fail(format!(
+                "Live sync saved Studio changes but could not record the shared state: {error:#}"
+            ));
+            return Ok(());
+        }
+        match acknowledge_pulled_changes(
+            &self.bridge,
+            &pulled.services,
+            pulled.seq,
+            &pulled.runtime_id,
+        ) {
+            Ok(state) => {
+                self.control.set_plugin_state(state);
+                log_global(
+                    5,
+                    format_args!("[renium] live pull acknowledged seq {}", pulled.seq),
+                );
+                Ok(())
+            }
+            Err(error) if automation_failure_ref(&error).0.c == "no_studio" => Err(error),
+            Err(error) => {
+                self.control.fail(format!(
+                    "Live sync saved Studio changes but could not acknowledge them: {error:#}"
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn record_pull(&mut self, pulled: PulledStudioChanges) -> Result<()> {
+        let current = scan(&self.project)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] live pull publish: roots={} expected={}",
+                pulled.published.changed_roots.len(),
+                pulled.published.expected.len()
+            ),
+        );
+        reconcile_published_changes(
+            &self.project,
+            &mut self.baseline,
+            &current,
+            &mut self.pending,
+            &pulled.published,
+        );
+        log_global(
+            5,
+            format_args!(
+                "[renium] live pull pending after publish: {}",
+                self.pending.len()
+            ),
+        );
+        let mut status = self
+            .control
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        status.pulls = status.pulls.saturating_add(1);
+        status.error = None;
+        drop(status);
+        self.control.update_pending(&self.pending);
+        self.push_ready = !self.pending.is_empty();
+        self.studio.retry_delay = Duration::ZERO;
+        self.acknowledge_pull(&pulled)?;
+        self.finish_studio_wait();
+        Ok(())
+    }
+
+    fn record_empty_pull(&mut self) {
+        if !self.studio.retry_delay.is_zero() && self.blocked.is_empty() {
+            self.control.clear_error();
+        }
+        self.studio.retry_delay = Duration::ZERO;
+        self.finish_studio_wait();
+    }
+
+    fn record_pull_failure(&mut self, error: anyhow::Error) -> Result<()> {
+        log_global(5, format_args!("[renium] live pull failed: {error:#}"));
+        let failure = automation_failure_ref(&error);
+        if failure.0.c == "no_studio" {
+            return Err(error);
+        }
+        let retry = failure.0.rt == 1;
+        self.control
+            .fail(format!("Studio live sync failed: {}", failure.0.m));
+        self.studio.pull_ready = retry;
+        if retry {
+            self.studio.retry_delay = next_retry_delay(self.studio.retry_delay);
+        }
+        Ok(())
+    }
+
+    fn maybe_pull(&mut self) -> Result<bool> {
+        if !self.pull_due() {
+            return Ok(false);
+        }
+        let current = scan(&self.project)?;
+        if queue_scan_changes(
+            &self.baseline,
+            &current,
+            &mut self.pending,
+            &mut self.blocked,
+        ) && !self.pending.is_empty()
+        {
+            self.control.update_pending(&self.pending);
+            self.push_ready = true;
+            self.last_event = Instant::now();
+            return Ok(true);
+        }
+        self.last_pull_attempt = Instant::now();
+        let generation = self.control.generation.load(Ordering::Acquire);
+        let control = Arc::clone(&self.control);
+        let Some(_activity) = control.begin_sync(generation) else {
+            return Ok(true);
+        };
+        match self.pull_studio() {
+            Ok(Some(pulled)) => self.record_pull(pulled)?,
+            Ok(None) => self.record_empty_pull(),
+            Err(error) => self.record_pull_failure(error)?,
+        }
+        Ok(false)
+    }
+
+    fn run(mut self) -> Result<()> {
+        while self.running() {
+            if self.process_events()? {
+                thread::sleep(RESCAN_RETRY);
+                continue;
+            }
+            if self.maybe_push()? {
+                continue;
+            }
+            self.maybe_pull()?;
+        }
+        Ok(())
+    }
+}
+
+fn run(worker: Worker) -> Result<()> {
+    LiveLoop::new(worker)?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_control() -> Arc<Control> {
+        Arc::new(Control::new(
+            PathBuf::from("test-project"),
+            true,
+            false,
+            PairMode::Reconcile,
+            false,
+        ))
+    }
+
+    #[test]
+    fn settled_wait_observes_an_event_quiet_period() {
+        let control = test_control();
+        let notifier = Arc::clone(&control);
+        let event = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            notifier.set_plugin_state(json!({}));
+        });
+
+        let started = Instant::now();
+        assert!(control.wait_settled(Duration::from_secs(1)));
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        event.join().expect("event thread should finish");
+    }
+
+    #[test]
+    fn settled_wait_tracks_pending_work_without_a_project_scan() {
+        let control = test_control();
+        control.queue([PathBuf::from("test-project/src/changed.luau")]);
+        let finisher = Arc::clone(&control);
+        let event = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            finisher.update_pending(&BTreeSet::new());
+        });
+
+        assert!(control.wait_settled(Duration::from_secs(1)));
+        event.join().expect("event thread should finish");
+    }
+
+    #[test]
+    fn settled_wait_returns_immediately_when_progress_is_blocked() {
+        let control = test_control();
+        control.fail("blocked".to_string());
+
+        let started = Instant::now();
+        assert!(!control.wait_settled(Duration::from_secs(1)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 }

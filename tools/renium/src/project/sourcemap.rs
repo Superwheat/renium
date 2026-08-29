@@ -27,7 +27,7 @@ use crate::system::files::{
 };
 use crate::system::watch::FileWatcher;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourcemapNode {
     pub(crate) name: String,
@@ -75,6 +75,16 @@ fn make_sourcemap_root(project_root: &Path) -> SourcemapNode {
         file_paths: Vec::new(),
         children: Vec::new(),
     }
+}
+
+pub(crate) fn sourcemap_root_is_current(project_root: &Path, root: &SourcemapNode) -> bool {
+    let expected = make_sourcemap_root(project_root);
+    let mut canonical = root.clone();
+    sort_sourcemap_root_children(&mut canonical);
+    root.name == expected.name
+        && root.class_name == expected.class_name
+        && root.file_paths == expected.file_paths
+        && root.children == canonical.children
 }
 
 fn sort_sourcemap_root_children(root: &mut SourcemapNode) {

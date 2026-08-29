@@ -4,8 +4,8 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use crate::automation::client::{
     run_stdio_proxy, send_request, shared_daemon_available, try_send_request,
 };
 use crate::automation::runtime::{
-    automation_parse_response, oversized_automation_request_response, run_automation_stdio,
+    automation_parse_response_with_lease, oversized_automation_request_response,
 };
 use crate::bytecode::explorer::watch_parent_and_exit;
 use crate::cli::args::CursorPollArgs;
@@ -33,9 +33,14 @@ use crate::daemon::transport::{
     normalize_loopback_host, read_bounded_line,
 };
 use crate::snapshot::export::{fetch_text_chunks, parse_bridge_ports};
-use crate::studio::bridge::{BridgeServer, clamp_bridge_chunk_size};
+use crate::studio::bridge::{BridgeRequestLease, BridgeServer, clamp_bridge_chunk_size};
 use crate::studio::target::place_filter;
 use crate::system::files::{absolutize_for_daemon, fnv1a_hex, sanitize_ascii_identifier};
+
+const SHARED_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_CONTROL_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+static CONTROL_LEASE_BOOT_ID: LazyLock<String> =
+    LazyLock::new(|| format!("{:x}-{:x}", current_millis(), std::process::id()));
 
 #[cfg(windows)]
 pub(super) fn cursor_poll(args: CursorPollArgs) -> Result<()> {
@@ -96,22 +101,34 @@ pub(super) fn cursor_poll(_args: CursorPollArgs) -> Result<()> {
 pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     let editor_stdio = args.editor_stdio;
     crate::app::context::set_automation_stdio(editor_stdio);
+    if editor_stdio {
+        if !shared_daemon_available()
+            && !start_shared_daemon_on(
+                &args.bridge.ports,
+                args.bridge.wait_seconds,
+                args.control_port,
+            )
+        {
+            bail!("Renium could not start the shared daemon");
+        }
+        if let Some(parent_pid) = args.parent_pid {
+            watch_parent_and_exit(parent_pid);
+        }
+        return run_stdio_proxy(args.bridge.ports, args.bridge.wait_seconds);
+    }
     let name = args
         .name
         .or_else(|| std::env::var("RENIUM_DAEMON_NAME").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "default".to_string());
+    let lifecycle_lock = update::acquire_lifecycle_lock()?;
+    if shared_daemon_available() {
+        drop(lifecycle_lock);
+        return Ok(());
+    }
     if let Some(parent_pid) = args.parent_pid {
         watch_parent_and_exit(parent_pid);
-    }
-    if editor_stdio && shared_daemon_available() {
-        return run_stdio_proxy();
-    }
-    let lifecycle_lock = update::acquire_lifecycle_lock()?;
-    if editor_stdio && shared_daemon_available() {
-        drop(lifecycle_lock);
-        return run_stdio_proxy();
     }
     #[cfg(windows)]
     crate::studio::input::watch_auto_recovery_dialogs();
@@ -140,11 +157,6 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         listen_metrics.bind_ms,
         listen_metrics.wait_for_channels_ms
     );
-    if editor_stdio {
-        run_automation_stdio(&bridge, &automation_state, args.bridge.wait_seconds)?;
-        bridge.alive.store(false, Ordering::Relaxed);
-        return Ok(());
-    }
     while bridge.alive.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(250));
     }
@@ -258,9 +270,66 @@ fn handle_daemon_control_connection(
         if trimmed.is_empty() {
             continue;
         }
-        let response = automation_parse_response(trimmed, state, bridge, bridge_wait_seconds);
-        writeln!(writer, "{}", serde_json::to_string(&response)?)?;
-        writer.flush()?;
+        let lease_id = format!(
+            "{}-{:x}",
+            *CONTROL_LEASE_BOOT_ID,
+            NEXT_CONTROL_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let request_lease = Arc::new(BridgeRequestLease::new(lease_id));
+        let monitor_stream = writer
+            .get_ref()
+            .try_clone()
+            .context("Failed to clone control stream for cancellation")?;
+        let monitor_lease = Arc::clone(&request_lease);
+        let monitor_bridge = Arc::clone(bridge);
+        monitor_stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .context("Failed to configure control cancellation monitor")?;
+        let disconnect_monitor = thread::spawn(move || {
+            let mut probe = [0u8; 1];
+            while !monitor_lease.is_finished() {
+                match monitor_stream.peek(&mut probe) {
+                    Ok(0) => {
+                        if monitor_lease.cancel() {
+                            let _ = monitor_bridge.cancel_request_lease(monitor_lease.id());
+                        }
+                        break;
+                    }
+                    Ok(_) => thread::sleep(Duration::from_millis(2)),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        if monitor_lease.cancel() {
+                            let _ = monitor_bridge.cancel_request_lease(monitor_lease.id());
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        let response = automation_parse_response_with_lease(
+            trimmed,
+            state,
+            bridge,
+            bridge_wait_seconds,
+            Some(Arc::clone(&request_lease)),
+        );
+        let response = serde_json::to_string(&response)?;
+        let write_result = (|| -> io::Result<()> {
+            writeln!(writer, "{response}")?;
+            writer.flush()
+        })();
+        request_lease.finish();
+        let _ = disconnect_monitor.join();
+        let _ = writer
+            .get_ref()
+            .set_read_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
+        write_result?;
     }
     Ok(())
 }
@@ -596,7 +665,12 @@ fn detach_daemon(command: &mut Command) {
 }
 
 #[cfg(unix)]
-fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io::Result<()> {
+fn spawn_shared_daemon(
+    executable: &Path,
+    ports: &str,
+    wait_seconds: f64,
+    control_port: u16,
+) -> io::Result<()> {
     let mut command = Command::new(executable);
     command
         .arg("bd")
@@ -604,6 +678,8 @@ fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io:
         .arg(ports)
         .arg("--wait-seconds")
         .arg(wait_seconds.to_string())
+        .arg("--control-port")
+        .arg(control_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -612,7 +688,12 @@ fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io:
 }
 
 #[cfg(windows)]
-fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io::Result<()> {
+fn spawn_shared_daemon(
+    executable: &Path,
+    ports: &str,
+    wait_seconds: f64,
+    control_port: u16,
+) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -624,11 +705,12 @@ fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io:
             "-WindowStyle",
             "Hidden",
             "-Command",
-            "Start-Process -FilePath $env:RENIUM_DAEMON_EXECUTABLE -ArgumentList @('bd','--ports',$env:RENIUM_DAEMON_PORTS,'--wait-seconds',$env:RENIUM_DAEMON_WAIT) -WindowStyle Hidden",
+            "Start-Process -FilePath $env:RENIUM_DAEMON_EXECUTABLE -ArgumentList @('bd','--ports',$env:RENIUM_DAEMON_PORTS,'--wait-seconds',$env:RENIUM_DAEMON_WAIT,'--control-port',$env:RENIUM_DAEMON_CONTROL_PORT) -WindowStyle Hidden",
         ])
         .env("RENIUM_DAEMON_EXECUTABLE", executable)
         .env("RENIUM_DAEMON_PORTS", ports)
         .env("RENIUM_DAEMON_WAIT", wait_seconds.to_string())
+        .env("RENIUM_DAEMON_CONTROL_PORT", control_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -642,13 +724,22 @@ fn spawn_shared_daemon(executable: &Path, ports: &str, wait_seconds: f64) -> io:
 }
 
 pub(crate) fn start_shared_daemon(ports: &str, wait_seconds: f64) -> bool {
+    let control_port = std::env::var("RENIUM_DAEMON_CONTROL_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_DAEMON_CONTROL_PORT);
+    start_shared_daemon_on(ports, wait_seconds, control_port)
+}
+
+fn start_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) -> bool {
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
-    if spawn_shared_daemon(&executable, ports, wait_seconds).is_err() {
+    if spawn_shared_daemon(&executable, ports, wait_seconds, control_port).is_err() {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + SHARED_DAEMON_START_TIMEOUT;
     while Instant::now() < deadline {
         if shared_daemon_available() {
             return true;
@@ -725,11 +816,17 @@ pub(super) fn try_daemon_control_request(
             !needs_runtime || context.get("runtimeId").and_then(Value::as_str).is_some()
         })
     };
-    if needs_runtime && context.is_none() {
-        start_shared_daemon(&bridge_ports, bridge_wait_seconds);
-    }
+    let daemon_started = needs_runtime
+        && context.is_none()
+        && start_shared_daemon(&bridge_ports, bridge_wait_seconds);
     if needs_runtime && !ready(&context) && shared_daemon_available() {
-        let deadline = Instant::now() + Duration::from_secs_f64(bridge_wait_seconds);
+        let reconnect_grace = if daemon_started {
+            Duration::from_secs(2)
+        } else {
+            Duration::ZERO
+        };
+        let wait = Duration::from_secs_f64(bridge_wait_seconds) + reconnect_grace;
+        let deadline = Instant::now() + wait;
         let mut bind_error = None;
         while !ready(&context) && Instant::now() < deadline {
             match try_bind_daemon_context(project_root) {
@@ -744,7 +841,10 @@ pub(super) fn try_daemon_control_request(
             if let Some(error) = bind_error {
                 return Err(error);
             }
-            bail!("No Studio runtime connected to this project within {bridge_wait_seconds:.1}s");
+            bail!(
+                "No Studio runtime connected to this project within {:.1}s",
+                wait.as_secs_f64()
+            );
         }
     }
     let Some(context) = context else {

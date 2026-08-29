@@ -3,7 +3,7 @@
   "sources": {
     "propertySource": "tools/API-Dump.json",
     "propertySourceKind": "api-dump",
-    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-b2d03e4efaa04174/ReflectionMetadata.xml",
+    "reflectionMetadata": "%LOCALAPPDATA%/Roblox/Versions/version-268c7d941ba34c1a/ReflectionMetadata.xml",
     "propertySorter": "tools/renium-vscode-extension/resources/robloxPropertySorters.js"
   },
   "classes": {
@@ -2408,6 +2408,31 @@
         "visible": true,
         "declaringClass": "Instance"
       },
+      "DistanceAttenuationBounds": {
+        "type": "NumberRange",
+        "category": "Emission",
+        "displayName": "DistanceAttenuationBounds",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioEmitter"
+      },
+      "DistanceAttenuationMode": {
+        "type": "Enum.DistanceAttenuationMode",
+        "category": "Emission",
+        "displayName": "DistanceAttenuationMode",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioEmitter",
+        "enumItems": [
+          "Custom",
+          "InverseTapered",
+          "Linear",
+          "LinearSquared",
+          "Inverse"
+        ]
+      },
       "PositionInstance": {
         "type": "Ref",
         "category": "Emission",
@@ -3579,6 +3604,75 @@
         "writable": true,
         "visible": true,
         "declaringClass": "AudioTremolo"
+      }
+    },
+    "AudioWindSynthesizer": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      },
+      "PositionInstance": {
+        "type": "Ref",
+        "category": "Emission",
+        "displayName": "PositionInstance",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioWindSynthesizer"
+      },
+      "PositionType": {
+        "type": "Enum.AudioPositionType",
+        "category": "Emission",
+        "displayName": "PositionType",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioWindSynthesizer",
+        "enumItems": [
+          "Parent",
+          "Instance"
+        ]
+      },
+      "Enabled": {
+        "type": "Bool",
+        "category": "State",
+        "displayName": "Enabled",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioWindSynthesizer"
+      },
+      "Profile": {
+        "type": "Enum.WindSoundProfile",
+        "category": "State",
+        "displayName": "Profile",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioWindSynthesizer",
+        "enumItems": [
+          "Turbulence",
+          "Whistle",
+          "Foliage"
+        ]
+      },
+      "Volume": {
+        "type": "Float32",
+        "category": "State",
+        "displayName": "Volume",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "AudioWindSynthesizer",
+        "uiMinimum": 0,
+        "uiMaximum": 3,
+        "uiNumTicks": 100,
+        "sliderScaling": "Square"
       }
     },
     "AuroraScriptObject": {
@@ -5910,6 +6004,17 @@
         "declaringClass": "Instance"
       }
     },
+    "BranchService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "Breakpoint": {
       "Archivable": {
         "type": "Bool",
@@ -7260,7 +7365,7 @@
         "visible": true,
         "declaringClass": "ChatInputBarConfiguration",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -7536,7 +7641,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "AutocompleteEnabled": {
@@ -10706,6 +10817,33 @@
         "visible": true,
         "declaringClass": "Decal"
       },
+      "EmissiveMaskContent": {
+        "type": "ContentId",
+        "category": "Appearance",
+        "displayName": "EmissiveMaskContent",
+        "order": 283,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
+      "EmissiveStrength": {
+        "type": "Float32",
+        "category": "Appearance",
+        "displayName": "EmissiveStrength",
+        "order": 285,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
+      "EmissiveTint": {
+        "type": "Color3",
+        "category": "Appearance",
+        "displayName": "EmissiveTint",
+        "order": 286,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
       "MetalnessMapContent": {
         "type": "ContentId",
         "category": "Appearance",
@@ -11906,7 +12044,7 @@
         "visible": true,
         "declaringClass": "DragDetector",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -12182,7 +12320,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "KeyboardModeSwitchKeyCode": {
@@ -12194,7 +12338,7 @@
         "visible": true,
         "declaringClass": "DragDetector",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -12470,7 +12614,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "VRSwitchKeyCode": {
@@ -12482,7 +12632,7 @@
         "visible": true,
         "declaringClass": "DragDetector",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -12758,7 +12908,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "ApplyAtCenterOfMass": {
@@ -21998,6 +22154,449 @@
         "declaringClass": "Instance"
       }
     },
+    "InputActionLabel": {
+      "SelectionImageObject": {
+        "type": "Ref",
+        "category": "Appearance",
+        "displayName": "SelectionImageObject",
+        "order": 82,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "ClipsDescendants": {
+        "type": "Bool",
+        "category": "Behavior",
+        "displayName": "ClipsDescendants",
+        "order": 50,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "InputAction": {
+        "type": "Ref",
+        "category": "Data",
+        "displayName": "InputAction",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "InputSink": {
+        "type": "Enum.InputSink",
+        "category": "Data",
+        "displayName": "InputSink",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "enumItems": [
+          "None",
+          "Activate",
+          "All"
+        ]
+      },
+      "BackgroundTransparency": {
+        "type": "Float32",
+        "category": "Data",
+        "displayName": "BackgroundTransparency",
+        "order": 238,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
+      "Active": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Active",
+        "order": 417,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "AnchorPoint": {
+        "type": "Vector2",
+        "category": "Data",
+        "displayName": "AnchorPoint",
+        "order": 418,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "AutomaticSize": {
+        "type": "Enum.AutomaticSize",
+        "category": "Data",
+        "displayName": "AutomaticSize",
+        "order": 419,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "enumItems": [
+          "None",
+          "X",
+          "Y",
+          "XY"
+        ]
+      },
+      "BackgroundColor3": {
+        "type": "Color3",
+        "category": "Data",
+        "displayName": "BackgroundColor3",
+        "order": 421,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "BorderColor3": {
+        "type": "Color3",
+        "category": "Data",
+        "displayName": "BorderColor3",
+        "order": 423,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "BorderMode": {
+        "type": "Enum.BorderMode",
+        "category": "Data",
+        "displayName": "BorderMode",
+        "order": 424,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "enumItems": [
+          "Outline",
+          "Middle",
+          "Inset"
+        ]
+      },
+      "BorderSizePixel": {
+        "type": "Int32",
+        "category": "Data",
+        "displayName": "BorderSizePixel",
+        "order": 425,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "uiMinimum": 0,
+        "uiMaximum": 100
+      },
+      "Rotation": {
+        "type": "Float32",
+        "category": "Data",
+        "displayName": "Rotation",
+        "order": 426,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "uiMinimum": -180,
+        "uiMaximum": 180,
+        "uiNumTicks": 360
+      },
+      "Size": {
+        "type": "UDim2",
+        "category": "Data",
+        "displayName": "Size",
+        "order": 427,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "Visible": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Visible",
+        "order": 429,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "LayoutOrder": {
+        "type": "Int32",
+        "category": "Data",
+        "displayName": "LayoutOrder",
+        "order": 430,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "Position": {
+        "type": "UDim2",
+        "category": "Data",
+        "displayName": "Position",
+        "order": 431,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "SizeConstraint": {
+        "type": "Enum.SizeConstraint",
+        "category": "Data",
+        "displayName": "SizeConstraint",
+        "order": 432,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject",
+        "enumItems": [
+          "RelativeXY",
+          "RelativeXX",
+          "RelativeYY"
+        ]
+      },
+      "ZIndex": {
+        "type": "Int32",
+        "category": "Data",
+        "displayName": "ZIndex",
+        "order": 433,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "Interactable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Interactable",
+        "order": 976,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      },
+      "ImageColor3": {
+        "type": "Color3",
+        "category": "Image",
+        "displayName": "ImageColor3",
+        "order": 5,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "ImageTransparency": {
+        "type": "Float32",
+        "category": "Image",
+        "displayName": "ImageTransparency",
+        "order": 7,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "AutoLocalize": {
+        "type": "Bool",
+        "category": "Localization",
+        "displayName": "AutoLocalize",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d"
+      },
+      "RootLocalizationTable": {
+        "type": "Ref",
+        "category": "Localization",
+        "displayName": "RootLocalizationTable",
+        "order": 2,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d"
+      },
+      "SelectionBehaviorDown": {
+        "type": "Enum.SelectionBehavior",
+        "category": "Selection",
+        "displayName": "SelectionBehaviorDown",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d",
+        "enumItems": [
+          "Escape",
+          "Stop"
+        ]
+      },
+      "SelectionBehaviorLeft": {
+        "type": "Enum.SelectionBehavior",
+        "category": "Selection",
+        "displayName": "SelectionBehaviorLeft",
+        "order": 1,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d",
+        "enumItems": [
+          "Escape",
+          "Stop"
+        ]
+      },
+      "SelectionBehaviorRight": {
+        "type": "Enum.SelectionBehavior",
+        "category": "Selection",
+        "displayName": "SelectionBehaviorRight",
+        "order": 2,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d",
+        "enumItems": [
+          "Escape",
+          "Stop"
+        ]
+      },
+      "SelectionBehaviorUp": {
+        "type": "Enum.SelectionBehavior",
+        "category": "Selection",
+        "displayName": "SelectionBehaviorUp",
+        "order": 3,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d",
+        "enumItems": [
+          "Escape",
+          "Stop"
+        ]
+      },
+      "SelectionGroup": {
+        "type": "Bool",
+        "category": "Selection",
+        "displayName": "SelectionGroup",
+        "order": 4,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiBase2d"
+      },
+      "NextSelectionDown": {
+        "type": "Ref",
+        "category": "Selection",
+        "displayName": "NextSelectionDown",
+        "order": 5,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "NextSelectionLeft": {
+        "type": "Ref",
+        "category": "Selection",
+        "displayName": "NextSelectionLeft",
+        "order": 6,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "NextSelectionRight": {
+        "type": "Ref",
+        "category": "Selection",
+        "displayName": "NextSelectionRight",
+        "order": 7,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "NextSelectionUp": {
+        "type": "Ref",
+        "category": "Selection",
+        "displayName": "NextSelectionUp",
+        "order": 8,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "Selectable": {
+        "type": "Bool",
+        "category": "Selection",
+        "displayName": "Selectable",
+        "order": 9,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "SelectionOrder": {
+        "type": "Int32",
+        "category": "Selection",
+        "displayName": "SelectionOrder",
+        "order": 10,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "GuiObject"
+      },
+      "FontFace": {
+        "type": "Font",
+        "category": "Text",
+        "displayName": "FontFace",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "TextColor3": {
+        "type": "Color3",
+        "category": "Text",
+        "displayName": "TextColor3",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "TextSize": {
+        "type": "Float32",
+        "category": "Text",
+        "displayName": "TextSize",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "TextTransparency": {
+        "type": "Float32",
+        "category": "Text",
+        "displayName": "TextTransparency",
+        "order": 12,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "TextWrapped": {
+        "type": "Bool",
+        "category": "Text",
+        "displayName": "TextWrapped",
+        "order": 15,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel"
+      },
+      "TextYAlignment": {
+        "type": "Enum.TextYAlignment",
+        "category": "Text",
+        "displayName": "TextYAlignment",
+        "order": 16,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel",
+        "enumItems": [
+          "Top",
+          "Center",
+          "Bottom"
+        ]
+      },
+      "TextXAlignment": {
+        "type": "Enum.TextXAlignment",
+        "category": "Text",
+        "displayName": "TextXAlignment",
+        "order": 27,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "InputActionLabel",
+        "enumItems": [
+          "Left",
+          "Right",
+          "Center"
+        ]
+      }
+    },
     "InputBinding": {
       "PrimaryModifier": {
         "type": "Enum.KeyCode",
@@ -22008,7 +22607,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -22284,7 +22883,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "SecondaryModifier": {
@@ -22296,7 +22901,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -22572,7 +23177,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Type": {
@@ -22606,7 +23217,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -22882,7 +23493,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "PressedThreshold": {
@@ -22975,7 +23592,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -23251,7 +23868,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Forward": {
@@ -23263,7 +23886,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -23539,7 +24162,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Left": {
@@ -23551,7 +24180,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -23827,7 +24456,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Up": {
@@ -23839,7 +24474,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -24115,7 +24750,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Backward": {
@@ -24127,7 +24768,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -24403,7 +25044,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Right": {
@@ -24415,7 +25062,7 @@
         "visible": true,
         "declaringClass": "InputBinding",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -24691,7 +25338,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Archivable": {
@@ -24770,7 +25423,7 @@
         "visible": true,
         "declaringClass": "InputObject",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -25046,7 +25699,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "Position": {
@@ -25244,6 +25903,17 @@
         "visible": true,
         "declaringClass": "IntConstrainedValue"
       },
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
+    "IntentService": {
       "Archivable": {
         "type": "Bool",
         "category": "Data",
@@ -25464,6 +26134,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -25486,7 +26167,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -26985,6 +27666,17 @@
         "declaringClass": "Instance"
       }
     },
+    "LuauExpressionService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "LuauScriptAnalyzerService": {
       "Archivable": {
         "type": "Bool",
@@ -27272,6 +27964,51 @@
       }
     },
     "MaterialImportData": {
+      "DiffuseVersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "DiffuseVersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialImportData"
+      },
+      "EmissiveVersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "EmissiveVersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialImportData"
+      },
+      "MetalnessVersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "MetalnessVersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialImportData"
+      },
+      "NormalVersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "NormalVersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialImportData"
+      },
+      "RoughnessVersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "RoughnessVersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MaterialImportData"
+      },
       "ImportName": {
         "type": "String",
         "category": "Data",
@@ -27928,6 +28665,17 @@
         "declaringClass": "MaterialVariant"
       }
     },
+    "MemoryStoreDistributedCounter": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "MemoryStoreHashMap": {
       "Archivable": {
         "type": "Bool",
@@ -28017,6 +28765,15 @@
       }
     },
     "MeshImportData": {
+      "VersionedAssetId": {
+        "type": "Int64",
+        "category": "Data",
+        "displayName": "VersionedAssetId",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "MeshImportData"
+      },
       "ImportName": {
         "type": "String",
         "category": "Data",
@@ -28350,6 +29107,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -28372,7 +29140,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -29349,6 +30117,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -29371,7 +30150,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -31302,6 +32081,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -31324,7 +32114,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -31736,6 +32526,17 @@
         "declaringClass": "Path2D"
       }
     },
+    "Path3D": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "PathfindingLink": {
       "Attachment0": {
         "type": "Ref",
@@ -32141,6 +32942,17 @@
         "writable": true,
         "visible": true,
         "declaringClass": "PhysicsSettings"
+      }
+    },
+    "PinShortcutService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
       }
     },
     "PitchShiftSoundEffect": {
@@ -32945,6 +33757,21 @@
           "DynamicThumbstick"
         ]
       },
+      "FrustumStreaming": {
+        "type": "Enum.FrustumStreamingMode",
+        "category": "Data",
+        "displayName": "FrustumStreaming",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Player",
+        "enumItems": [
+          "Default",
+          "Enabled",
+          "Disabled",
+          "Automatic"
+        ]
+      },
       "AutoJumpEnabled": {
         "type": "Bool",
         "category": "Data",
@@ -33052,6 +33879,26 @@
         "writable": true,
         "visible": true,
         "declaringClass": "Player"
+      }
+    },
+    "PlayerControlState": {
+      "Owner": {
+        "type": "Ref",
+        "category": "Data",
+        "displayName": "Owner",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "PlayerControlState"
+      },
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
       }
     },
     "PlayerData": {
@@ -34274,7 +35121,7 @@
         "visible": true,
         "declaringClass": "ProximityPrompt",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -34550,7 +35397,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "HoldDuration": {
@@ -34571,7 +35424,7 @@
         "visible": true,
         "declaringClass": "ProximityPrompt",
         "enumItems": [
-          "Unknown",
+          "None",
           "Backspace",
           "Tab",
           "Clear",
@@ -34847,7 +35700,13 @@
           "TrackpadPinch",
           "MouseDelta",
           "TouchDelta",
-          "TouchPinch"
+          "TouchPinch",
+          "ButtonCenter",
+          "ButtonBack",
+          "ButtonUp",
+          "ButtonDown",
+          "ButtonLeft",
+          "ButtonRight"
         ]
       },
       "MaxActivationDistance": {
@@ -37073,6 +37932,17 @@
         "declaringClass": "Instance"
       }
     },
+    "RequestOrchestratorService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "ReverbSoundEffect": {
       "Archivable": {
         "type": "Bool",
@@ -37788,15 +38658,6 @@
           "Bottom",
           "Front"
         ]
-      },
-      "ValidateUgcBody": {
-        "type": "Bool",
-        "category": "Data",
-        "displayName": "ValidateUgcBody",
-        "order": 961,
-        "writable": true,
-        "visible": true,
-        "declaringClass": "RootImportData"
       },
       "KeepZeroInfluenceBones": {
         "type": "Bool",
@@ -38711,6 +39572,17 @@
       }
     },
     "ScriptRuntime": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
+    "ScriptScannerService": {
       "Archivable": {
         "type": "Bool",
         "category": "Data",
@@ -43198,6 +44070,28 @@
         "declaringClass": "Instance"
       }
     },
+    "StateMachineDefinition": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
+    "StateMachineTransitionDefinition": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "Stats": {
       "Archivable": {
         "type": "Bool",
@@ -44824,7 +45718,8 @@
         "enumItems": [
           "KeyboardAndMouse",
           "Gamepad",
-          "Touch"
+          "Touch",
+          "MicroGamepad"
         ]
       },
       "Archivable": {
@@ -49294,6 +50189,33 @@
         "visible": true,
         "declaringClass": "Decal"
       },
+      "EmissiveMaskContent": {
+        "type": "ContentId",
+        "category": "Appearance",
+        "displayName": "EmissiveMaskContent",
+        "order": 283,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
+      "EmissiveStrength": {
+        "type": "Float32",
+        "category": "Appearance",
+        "displayName": "EmissiveStrength",
+        "order": 285,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
+      "EmissiveTint": {
+        "type": "Color3",
+        "category": "Appearance",
+        "displayName": "EmissiveTint",
+        "order": 286,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Decal"
+      },
       "MetalnessMapContent": {
         "type": "ContentId",
         "category": "Appearance",
@@ -50358,6 +51280,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -50380,7 +51313,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -51598,46 +52531,6 @@
       }
     },
     "UIGradient": {
-      "Scale": {
-        "type": "Float32",
-        "category": "Appearance",
-        "displayName": "Scale",
-        "order": 0,
-        "writable": true,
-        "visible": true,
-        "declaringClass": "UIGradient",
-        "uiMinimum": 0,
-        "uiMaximum": 10,
-        "uiNumTicks": 100
-      },
-      "TileMode": {
-        "type": "Enum.GradientTileMode",
-        "category": "Appearance",
-        "displayName": "TileMode",
-        "order": 0,
-        "writable": true,
-        "visible": true,
-        "declaringClass": "UIGradient",
-        "enumItems": [
-          "Clamp",
-          "Repeat",
-          "Mirror"
-        ]
-      },
-      "Type": {
-        "type": "Enum.GradientType",
-        "category": "Appearance",
-        "displayName": "Type",
-        "order": 0,
-        "writable": true,
-        "visible": true,
-        "declaringClass": "UIGradient",
-        "enumItems": [
-          "Linear",
-          "Radial",
-          "Conical"
-        ]
-      },
       "Color": {
         "type": "ColorSequence",
         "category": "Appearance",
@@ -52275,10 +53168,41 @@
         "visible": true,
         "declaringClass": "UIShadow"
       },
+      "Inset": {
+        "type": "Bool",
+        "category": "Appearance",
+        "displayName": "Inset",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "UIShadow"
+      },
+      "Mode": {
+        "type": "Enum.ApplyShadowMode",
+        "category": "Appearance",
+        "displayName": "Mode",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "UIShadow",
+        "enumItems": [
+          "Shape",
+          "Text"
+        ]
+      },
       "Offset": {
         "type": "UDim2",
         "category": "Appearance",
         "displayName": "Offset",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "UIShadow"
+      },
+      "ShowBehindParent": {
+        "type": "Bool",
+        "category": "Appearance",
+        "displayName": "ShowBehindParent",
         "order": 0,
         "writable": true,
         "visible": true,
@@ -52814,6 +53738,17 @@
         "visible": true,
         "declaringClass": "BasePart"
       },
+      "CollisionPrecision": {
+        "type": "Float32",
+        "category": "Collision",
+        "displayName": "CollisionPrecision",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "TriangleMeshPart",
+        "uiMinimum": 0,
+        "uiMaximum": 1
+      },
       "CollisionGroup": {
         "type": "String",
         "category": "Collision",
@@ -52836,7 +53771,7 @@
           "Hull",
           "Box",
           "PreciseConvexDecomposition",
-          "Scalable"
+          "Tunable"
         ]
       },
       "CanCollide": {
@@ -55239,6 +56174,149 @@
         "declaringClass": "Instance"
       }
     },
+    "ViewportCamera": {
+      "CameraSubject": {
+        "type": "Ref",
+        "category": "Camera",
+        "displayName": "CameraSubject",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "CameraType": {
+        "type": "Enum.CameraType",
+        "category": "Camera",
+        "displayName": "CameraType",
+        "order": 1,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera",
+        "enumItems": [
+          "Fixed",
+          "Attach",
+          "Watch",
+          "Track",
+          "Follow",
+          "Custom",
+          "Scriptable",
+          "Orbital"
+        ]
+      },
+      "DiagonalFieldOfView": {
+        "type": "Float32",
+        "category": "Camera",
+        "displayName": "DiagonalFieldOfView",
+        "order": 2,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "FieldOfView": {
+        "type": "Float32",
+        "category": "Camera",
+        "displayName": "FieldOfView",
+        "order": 3,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "FieldOfViewMode": {
+        "type": "Enum.FieldOfViewMode",
+        "category": "Camera",
+        "displayName": "FieldOfViewMode",
+        "order": 4,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera",
+        "enumItems": [
+          "Vertical",
+          "Diagonal",
+          "MaxAxis"
+        ]
+      },
+      "MaxAxisFieldOfView": {
+        "type": "Float32",
+        "category": "Camera",
+        "displayName": "MaxAxisFieldOfView",
+        "order": 5,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "CFrame": {
+        "type": "CFrame",
+        "category": "Data",
+        "displayName": "CFrame",
+        "order": 197,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "Focus": {
+        "type": "CFrame",
+        "category": "Data",
+        "displayName": "Focus",
+        "order": 199,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "HeadLocked": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "HeadLocked",
+        "order": 200,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "HeadScale": {
+        "type": "Float32",
+        "category": "Data",
+        "displayName": "HeadScale",
+        "order": 201,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "VRTiltAndRollEnabled": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "VRTiltAndRollEnabled",
+        "order": 203,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Camera"
+      },
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      },
+      "Pivot Offset": {
+        "type": "CFrame",
+        "category": "Pivot",
+        "displayName": "Pivot Offset",
+        "order": 4,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "PVInstance"
+      },
+      "Origin": {
+        "type": "CFrame",
+        "category": "Transform",
+        "displayName": "Origin",
+        "order": 11,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "PVInstance"
+      }
+    },
     "ViewportFrame": {
       "SelectionImageObject": {
         "type": "Ref",
@@ -56417,6 +57495,17 @@
         "declaringClass": "WeldConstraint"
       }
     },
+    "WindowProtocolService": {
+      "Archivable": {
+        "type": "Bool",
+        "category": "Data",
+        "displayName": "Archivable",
+        "order": 990,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Instance"
+      }
+    },
     "Wire": {
       "SourceInstance": {
         "type": "Ref",
@@ -56649,6 +57738,20 @@
         "category": "Avatar",
         "displayName": "PlayerCharacterDestroyBehavior",
         "order": 187,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "Workspace",
+        "enumItems": [
+          "Default",
+          "Disabled",
+          "Enabled"
+        ]
+      },
+      "ExpandedTerrain": {
+        "type": "Enum.RolloutState",
+        "category": "Behavior",
+        "displayName": "ExpandedTerrain",
+        "order": 0,
         "writable": true,
         "visible": true,
         "declaringClass": "Workspace",
@@ -57176,6 +58279,15 @@
           "Disabled",
           "SLIM"
         ]
+      },
+      "UseWorkspaceCollisionGroups": {
+        "type": "Bool",
+        "category": "Behavior",
+        "displayName": "UseWorkspaceCollisionGroups",
+        "order": 0,
+        "writable": true,
+        "visible": true,
+        "declaringClass": "WorldModel"
       },
       "ModelStreamingMode": {
         "type": "Enum.ModelStreamingMode",

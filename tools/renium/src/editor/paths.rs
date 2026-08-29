@@ -144,6 +144,49 @@ pub(crate) fn build_editor_source_path_map(
     map
 }
 
+pub(crate) struct EditorDirectoryTarget {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) settings_ids: Vec<String>,
+}
+
+pub(crate) fn editor_directory_target(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    directory: &Path,
+) -> Option<EditorDirectoryTarget> {
+    let children_by_parent = settings_children_by_parent(document);
+    let root_index = editor_service_root_index(document, service)?;
+    let relative = directory.strip_prefix(service_dir).ok()?;
+    let mut index = root_index;
+    let mut path_segments = vec![document.instances[root_index].name.clone()];
+    let mut path_ordinals = vec![1];
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        let (child_index, _, child_ordinal) =
+            editor_child_stems(document, &children_by_parent[index])
+                .into_iter()
+                .find(|(_, stem, _)| std::ffi::OsStr::new(stem) == component)?;
+        index = child_index;
+        path_segments.push(document.instances[index].name.clone());
+        path_ordinals.push(child_ordinal);
+    }
+    let mut settings_ids = Vec::new();
+    let mut pending = vec![index];
+    while let Some(current) = pending.pop() {
+        settings_ids.push(document.instances[current].settings_id.clone());
+        pending.extend(&children_by_parent[current]);
+    }
+    Some(EditorDirectoryTarget {
+        path_segments,
+        path_ordinals,
+        settings_ids,
+    })
+}
+
 pub(crate) fn merge_editor_source_files_into_document(
     document: &mut SettingsBytecode,
     service: &str,
@@ -391,6 +434,54 @@ pub(crate) fn build_editor_instance_paths(
 ) -> Vec<Option<EditorInstancePath>> {
     let children_by_parent = settings_children_by_parent(document);
     build_editor_instance_paths_with_children(document, service, &children_by_parent)
+}
+
+pub(crate) fn build_editor_instance_paths_for_indices(
+    document: &SettingsBytecode,
+    service: &str,
+    indices: &[usize],
+) -> HashMap<usize, EditorInstancePath> {
+    let Some(root_index) = editor_service_root_index(document, service) else {
+        return HashMap::new();
+    };
+    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
+    let mut ordinals = Vec::with_capacity(document.instances.len());
+    for instance in &document.instances {
+        let ordinal = sibling_counts
+            .entry((instance.parent_index, instance.name.as_str()))
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        ordinals.push(*ordinal);
+    }
+
+    let mut paths = HashMap::with_capacity(indices.len());
+    let mut hierarchy = Vec::new();
+    for &index in indices {
+        if index >= document.instances.len() {
+            continue;
+        }
+        hierarchy.clear();
+        let mut current = Some(index);
+        while let Some(current_index) = current {
+            hierarchy.push(current_index);
+            current = document.instances[current_index].parent_index;
+        }
+        if hierarchy.last() != Some(&root_index) {
+            continue;
+        }
+        hierarchy.reverse();
+        paths.insert(
+            index,
+            EditorInstancePath {
+                path_segments: hierarchy
+                    .iter()
+                    .map(|index| document.instances[*index].name.clone())
+                    .collect(),
+                path_ordinals: hierarchy.iter().map(|index| ordinals[*index]).collect(),
+            },
+        );
+    }
+    paths
 }
 
 pub(crate) fn build_editor_instance_paths_with_children(

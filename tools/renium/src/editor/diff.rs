@@ -14,7 +14,9 @@ use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor,
     EditorInstancePath, EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
 };
+use crate::rbx::encode::rbx_logical_property_name;
 use crate::roblox::schema::{MESH_SIZE_TRANSPORT_PROPERTY, PropertySchemaMap};
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 use crate::settings::tree::editor_service_root_index;
 
@@ -23,7 +25,7 @@ const MAX_EDITOR_MATCH_VALUE_BYTES: usize = 256;
 const MAX_EDITOR_MATCH_TOTAL_BYTES: usize = 512;
 const MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE: usize = 32;
 
-pub(crate) type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str, &'a str), usize>;
+pub(crate) type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str), usize>;
 
 pub(crate) fn editor_sibling_group_counts(
     document: &SettingsBytecode,
@@ -34,11 +36,7 @@ pub(crate) fn editor_sibling_group_counts(
             continue;
         };
         *counts
-            .entry((
-                parent_index,
-                instance.name.as_str(),
-                instance.class_name.as_str(),
-            ))
+            .entry((parent_index, instance.name.as_str()))
             .or_insert(0) += 1;
     }
     counts
@@ -144,19 +142,15 @@ pub(crate) fn editor_instance_descriptor_from_path(
     sibling_counts: &EditorSiblingGroupCounts<'_>,
 ) -> Option<EditorInstanceDescriptor> {
     let instance = document.instances.get(index)?;
-    let sibling_count = instance.parent_index.map_or(0, |parent_index| {
+    let name_sibling_count = instance.parent_index.map_or(0, |parent_index| {
         sibling_counts
-            .get(&(
-                parent_index,
-                instance.name.as_str(),
-                instance.class_name.as_str(),
-            ))
+            .get(&(parent_index, instance.name.as_str()))
             .copied()
             .unwrap_or(0)
     });
-    let ambiguous_siblings = sibling_count > 1;
+    let ambiguous_siblings = name_sibling_count > 1;
     let (match_properties, match_attributes) =
-        if ambiguous_siblings && sibling_count <= MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE {
+        if ambiguous_siblings && name_sibling_count <= MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE {
             editor_match_records(instance)
         } else {
             (Map::new(), Map::new())
@@ -165,7 +159,10 @@ pub(crate) fn editor_instance_descriptor_from_path(
         settings_id: instance.settings_id.clone(),
         path_segments,
         path_ordinals,
+        previous_path_segments: Vec::new(),
+        previous_path_ordinals: Vec::new(),
         class_name: instance.class_name.clone(),
+        previous_class_name: None,
         ambiguous_siblings,
         anchor_only: false,
         match_properties,
@@ -179,12 +176,13 @@ pub(crate) fn editor_instance_descriptor_for_known_path(
     path_segments: Vec<String>,
     path_ordinals: Vec<usize>,
 ) -> Option<EditorInstanceDescriptor> {
+    let sibling_counts = editor_sibling_group_counts(document);
     editor_instance_descriptor_from_path(
         document,
         index,
         path_segments,
         path_ordinals,
-        &editor_sibling_group_counts(document),
+        &sibling_counts,
     )
 }
 
@@ -277,6 +275,7 @@ pub(crate) fn append_editor_target_instance_upserts(
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
     let sibling_counts = editor_sibling_group_counts(document);
+    let mut target_indices = HashSet::new();
     let mut selected_indices = HashSet::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id) {
@@ -285,6 +284,7 @@ pub(crate) fn append_editor_target_instance_upserts(
         if instance.class_name == "PackageLink" {
             continue;
         }
+        target_indices.insert(index);
         let mut current = Some(index);
         while let Some(current_index) = current {
             let Some(current_instance) = document.instances.get(current_index) else {
@@ -298,10 +298,34 @@ pub(crate) fn append_editor_target_instance_upserts(
         }
     }
 
+    let mut sibling_groups = HashMap::new();
+    for (index, instance) in document.instances.iter().enumerate() {
+        sibling_groups
+            .entry((instance.parent_index, instance.name.as_str()))
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    for index in selected_indices.iter().copied().collect::<Vec<_>>() {
+        let instance = &document.instances[index];
+        if let Some(siblings) = sibling_groups.get(&(instance.parent_index, instance.name.as_str()))
+            && siblings.len() > 1
+        {
+            selected_indices.extend(siblings);
+        }
+    }
+
     let instances = selected_indices
         .into_iter()
         .filter_map(|index| {
-            editor_instance_descriptor(document, &paths_by_index, service, index, &sibling_counts)
+            let mut descriptor = editor_instance_descriptor(
+                document,
+                &paths_by_index,
+                service,
+                index,
+                &sibling_counts,
+            )?;
+            descriptor.anchor_only |= !target_indices.contains(&index);
+            Some(descriptor)
         })
         .collect::<Vec<_>>();
     push_editor_instance_change(changes, "upsertInstances", service, false, instances);
@@ -323,7 +347,7 @@ pub(crate) fn append_editor_target_inline_source_changes(
         let Some(source) = instance.properties.get("Source").and_then(Value::as_str) else {
             continue;
         };
-        if source == "__SOURCE_EXTERNAL__" {
+        if source == EXTERNAL_SOURCE_MARKER {
             continue;
         }
         let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
@@ -371,27 +395,29 @@ pub(crate) fn append_editor_property_changes(
 
         let mut properties = Map::new();
         for (name, value) in &instance.properties {
+            let logical_name =
+                rbx_logical_property_name(database, &instance.class_name, name).unwrap_or(name);
             if name.eq_ignore_ascii_case("Source")
                 || name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY)
             {
                 continue;
             }
-            if !filter.includes_property(name) {
+            if !filter.includes_property(logical_name) {
                 continue;
             }
             if is_externally_managed_editor_property(
                 service,
                 &instance.class_name,
                 &path_segments,
-                name,
-            ) || is_engine_managed_editor_property(&instance.class_name, name, database)
+                logical_name,
+            ) || is_engine_managed_editor_property(&instance.class_name, logical_name, database)
             {
                 continue;
             }
             let schema_entry =
-                property_schema_entry(property_schema_by_class, &instance.class_name, name);
+                property_schema_entry(property_schema_by_class, &instance.class_name, logical_name);
             properties.insert(
-                name.clone(),
+                logical_name.to_string(),
                 normalize_editor_bridge_value(
                     value,
                     schema_entry,
@@ -401,7 +427,7 @@ pub(crate) fn append_editor_property_changes(
             );
         }
 
-        let attributes = if filter.is_active() {
+        let attributes = if !filter.property_names.is_empty() {
             Map::new()
         } else {
             normalized_editor_attributes(instance, &paths_by_index, &settings_ids_by_index)
@@ -454,7 +480,9 @@ pub(crate) fn append_native_editor_full_property_changes(
         let class_post_apply_names = rules
             .post_apply_properties_by_class
             .get(&instance.class_name);
+        let has_tags = instance.properties.contains_key("Tags");
         if !send_all
+            && !has_tags
             && class_post_apply_names.is_none()
             && rules.post_apply_properties_by_path.is_empty()
         {
@@ -487,26 +515,37 @@ pub(crate) fn append_native_editor_full_property_changes(
 
         let mut properties = Map::new();
         for (name, value) in &instance.properties {
+            let logical_name =
+                rbx_logical_property_name(rules.database, &instance.class_name, name)
+                    .unwrap_or(name);
             if name.eq_ignore_ascii_case("Source")
                 || name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY)
                 || (name == "WorldPivot" && instance.properties.contains_key("PrimaryPart"))
                 || (!send_all
-                    && post_apply_names.is_none_or(|names| !names.contains(name))
-                    && path_post_apply_names.is_none_or(|names| !names.contains(name)))
+                    && name != "Tags"
+                    && post_apply_names.is_none_or(|names| !names.contains(logical_name))
+                    && path_post_apply_names.is_none_or(|names| !names.contains(logical_name)))
                 || is_externally_managed_editor_property(
                     service,
                     &instance.class_name,
                     &path_segments,
-                    name,
+                    logical_name,
                 )
-                || is_engine_managed_editor_property(&instance.class_name, name, rules.database)
+                || is_engine_managed_editor_property(
+                    &instance.class_name,
+                    logical_name,
+                    rules.database,
+                )
             {
                 continue;
             }
-            let schema_entry =
-                property_schema_entry(rules.property_schema_by_class, &instance.class_name, name);
+            let schema_entry = property_schema_entry(
+                rules.property_schema_by_class,
+                &instance.class_name,
+                logical_name,
+            );
             properties.insert(
-                name.clone(),
+                logical_name.to_string(),
                 normalize_editor_bridge_value(
                     value,
                     schema_entry,
@@ -570,6 +609,7 @@ fn append_editor_property_change(
         path_ordinals: path.path_ordinals,
         class_name: instance.class_name.clone(),
         properties,
+        reset_properties: Vec::new(),
         attributes,
         deleted_attributes: Vec::new(),
     });

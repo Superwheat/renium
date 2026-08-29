@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use walkdir::WalkDir;
 use crate::app::build::{
     GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
 };
-use crate::app::output::print_json_output;
+use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::{
     elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
@@ -28,21 +29,26 @@ use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
     generate_project_sourcemap, write_project_sourcemap_from_service_nodes,
 };
-use crate::rbx::model::canonicalize_settings_reference_stores;
+use crate::project::structural::{
+    moved_references_between_documents, rewrite_moved_references, service_store_paths,
+};
 use crate::roblox::schema::{
     EnumValueNameMap, PropertySchemaMap, configure_bridge_property_candidates,
     load_rbx_dom_property_schema, parse_enum_value_name_map, parse_property_schema_map,
     parse_string_list,
 };
+use crate::settings::bytecode::{SettingsBytecode, encode_settings_bytecode};
+use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
 use crate::snapshot::codec::{
-    apply_compact_batch_debug_ids, decode_compact_batch_debug_ids, parse_compact_v5_instance_items,
+    apply_batch_settings_ids, apply_compact_batch_debug_ids, decode_batch_settings_ids,
+    decode_compact_batch_debug_ids, parse_compact_v5_instance_items,
     parse_compact_v5_shape_instance_items,
 };
 use crate::snapshot::import::{
     DirectImportDispatcher, SourcemapWriter, build_service_state_from_instances,
-    direct_import_export_order, fetch_script_sources, import_snapshots, merge_script_sources,
-    normalize_class_defaults, parse_services, resolve_direct_import_drain_workers,
-    resolve_direct_import_workers, resolve_source_worker_count,
+    direct_import_export_order, fetch_script_sources, import_snapshots_into_stage,
+    merge_script_sources, normalize_class_defaults, parse_services, resolve_direct_import_workers,
+    resolve_source_worker_count,
 };
 use crate::snapshot::types::{
     AdaptiveTuneCache, AdaptiveTuneEntry, CompactBatchPayload, ExportedSnapshotParts,
@@ -56,8 +62,9 @@ use crate::studio::bridge::{
 };
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use crate::system::files::{
-    OnDrop, create_unique_directory, current_unix_ts, fnv1a, read_json_file,
-    resolve_existing_project_root, sanitize_name, sha256_hex, write_json_file,
+    OnDrop, create_unique_directory, current_unix_ts, fnv1a, is_service_settings_file_name,
+    read_json_file, resolve_existing_project_root, sanitize_name, sha256_hex,
+    write_bytes_if_changed, write_json_file,
 };
 
 pub(crate) const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
@@ -440,11 +447,34 @@ pub(crate) struct ExportProjectStage {
     publish_baseline: BTreeMap<PathBuf, PublishEntryState>,
     pub(crate) loaded: Option<config::LoadedProject>,
     pub(crate) projection: Option<config::ProjectionStage>,
+    settings_already_aligned: bool,
     active: bool,
 }
 
 impl ExportProjectStage {
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
+        Self::create_inner(project_root, src_dir, services, true)
+    }
+
+    pub(crate) fn create_for_comparison(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+    ) -> Result<Self> {
+        if let Some(project) = config::try_load_project(None, Some(project_root))?
+            && config::project_requires_temporary_stage(&project)?
+        {
+            bail!("Project requires a staged comparison");
+        }
+        Self::create_inner(project_root, src_dir, services, false)
+    }
+
+    fn create_inner(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+        clone_project_data: bool,
+    ) -> Result<Self> {
         let started = Instant::now();
         let parent = project_root
             .parent()
@@ -467,20 +497,27 @@ impl ExportProjectStage {
             let project_file = loaded.path.strip_prefix(project_root)?.to_path_buf();
             clone_paths.push(project_file);
             let adapter_baseline = PathBuf::from(".renium").join("adapter-baseline.json");
-            clone_paths.push(adapter_baseline.clone());
+            if clone_project_data {
+                clone_paths.push(adapter_baseline.clone());
+            }
             publish_paths.push(adapter_baseline);
             let source_root = loaded.project.source_root.clone();
             for service in services {
-                publish_paths.push(source_root.join(sanitize_name(service)));
+                let path = source_root.join(sanitize_name(service));
+                if clone_project_data {
+                    clone_paths.push(path.clone());
+                }
+                publish_paths.push(path);
             }
-            clone_paths.push(source_root);
             let mut nested_projects = HashSet::new();
             for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
                 if let Some(path) = node.path {
-                    clone_paths.push(path.clone());
+                    if clone_project_data {
+                        clone_paths.push(path.clone());
+                    }
                     publish_paths.push(path.clone());
                     let source = loaded.root.join(&path);
-                    if project_path_is_nested(&source) && source.is_file() {
+                    if clone_project_data && project_path_is_nested(&source) && source.is_file() {
                         collect_nested_project_paths(
                             project_root,
                             &source,
@@ -532,15 +569,23 @@ impl ExportProjectStage {
         } else {
             for service in services {
                 let path = src_dir.join(sanitize_name(service));
-                clone_paths.push(path.clone());
+                if clone_project_data {
+                    clone_paths.push(path.clone());
+                }
                 publish_paths.push(path);
             }
         }
-        clone_paths.push(PathBuf::from("sourcemap.json"));
+        if clone_project_data {
+            clone_paths.push(PathBuf::from("sourcemap.json"));
+        }
         publish_paths.push(PathBuf::from("sourcemap.json"));
         normalize_owned_paths(&mut clone_paths);
         normalize_owned_paths(&mut publish_paths);
-        let publish_baseline = collect_publish_hashes(project_root, &publish_paths)?;
+        let publish_baseline = if clone_project_data {
+            collect_publish_hashes(project_root, &publish_paths)?
+        } else {
+            BTreeMap::new()
+        };
         for relative in &clone_paths {
             let source = project_root.join(relative);
             if source.exists() {
@@ -585,10 +630,29 @@ impl ExportProjectStage {
             publish_baseline,
             loaded: staged_loaded,
             projection,
+            settings_already_aligned: false,
             active: true,
         };
+        log_global(
+            5,
+            format_args!(
+                "[renium] export project stage copy: {:.1}ms",
+                elapsed_ms(started)
+            ),
+        );
         log_timing_ms("export project stage copy", elapsed_ms(started));
         Ok(stage)
+    }
+
+    pub(crate) fn mark_settings_aligned(&mut self) {
+        self.settings_already_aligned = self
+            .projection
+            .as_ref()
+            .is_none_or(|projection| !projection.is_temporary())
+            && self
+                .loaded
+                .as_ref()
+                .is_none_or(|loaded| loaded.project.adapters.is_empty());
     }
 
     pub(crate) fn finish_projection(&self, generate_sourcemap: bool) -> Result<()> {
@@ -608,6 +672,16 @@ impl ExportProjectStage {
             generate_project_sourcemap(&self.project_root)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn capture_sourcemap_needs_regeneration(&self) -> bool {
+        self.projection
+            .as_ref()
+            .is_some_and(config::ProjectionStage::is_temporary)
+            || self
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| !loaded.project.adapters.is_empty())
     }
 
     pub(crate) fn publish_paths(&self) -> &[PathBuf] {
@@ -652,28 +726,219 @@ impl ExportProjectStage {
         Ok(operations)
     }
 
-    pub(crate) fn publish(mut self, project_root: &Path) -> Result<PublishedProjectChanges> {
-        let started = Instant::now();
-        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        if current != self.publish_baseline {
-            let changed = current
+    fn source_roots(&self) -> Result<Vec<PathBuf>> {
+        if let Some(loaded) = &self.loaded {
+            return config::project_source_roots(loaded);
+        }
+        Ok(vec![self.project_root.join(&self.import_src_dir)])
+    }
+
+    fn stage_moved_reference_updates(
+        &mut self,
+        project_root: &Path,
+        settings_candidates: &[PathBuf],
+    ) -> Result<Vec<PathBuf>> {
+        let mut updated = BTreeSet::new();
+        for staged_source_root in self.source_roots()? {
+            let Ok(relative_source_root) = staged_source_root.strip_prefix(&self.project_root)
+            else {
+                continue;
+            };
+            let current_source_root = project_root.join(relative_source_root);
+            let mut before = BTreeMap::new();
+            let mut after = BTreeMap::new();
+            let document_pairs = settings_candidates
+                .par_iter()
+                .filter(|relative| relative.starts_with(relative_source_root))
+                .map(|relative| -> Result<Option<_>> {
+                    let current_path = project_root.join(relative);
+                    let staged_path = self.project_root.join(relative);
+                    let Some(service) = relative
+                        .parent()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                    else {
+                        return Ok(None);
+                    };
+                    let (current, staged) = rayon::join(
+                        || SettingsBytecode::read_structure_file(&current_path),
+                        || SettingsBytecode::read_structure_file(&staged_path),
+                    );
+                    Ok(Some((service, current?, staged?)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (service, current, staged) in document_pairs.into_iter().flatten() {
+                before.insert(service.clone(), current);
+                after.insert(service, staged);
+            }
+            let moved = moved_references_between_documents(&before, &after);
+            if moved.is_empty() {
+                continue;
+            }
+            let source_path_segments = moved
                 .keys()
-                .chain(self.publish_baseline.keys())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter(|path| current.get(*path) != self.publish_baseline.get(*path))
-                .take(10)
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>();
+                .filter_map(|key| key.split_once('\u{1}').map(|(path, _)| path))
+                .map(|path| path.split('\0').map(ToString::to_string).collect())
+                .collect::<Vec<Vec<String>>>();
+            for (_, current_path) in service_store_paths(&current_source_root)? {
+                let relative = current_path.strip_prefix(project_root)?.to_path_buf();
+                let staged_path = self.project_root.join(&relative);
+                let baseline = (!self.publish_baseline.contains_key(&relative))
+                    .then(|| collect_publish_hashes(project_root, std::slice::from_ref(&relative)))
+                    .transpose()?;
+                let source_path = if staged_path.is_file() {
+                    &staged_path
+                } else {
+                    &current_path
+                };
+                let Some(mut document) = SettingsBytecode::read_file_if_contains_any_string_set(
+                    source_path,
+                    &source_path_segments,
+                )?
+                else {
+                    continue;
+                };
+                let mut changed = false;
+                for instance in &mut document.instances {
+                    let instance_changed =
+                        rewrite_moved_references(&mut instance.properties, &moved)
+                            | rewrite_moved_references(&mut instance.attributes, &moved);
+                    if instance_changed && instance.class_name == "PackageLink" {
+                        bail!(
+                            "A PackageLink refers to a moved instance and cannot be edited directly"
+                        );
+                    }
+                    changed |= instance_changed;
+                }
+                if !changed {
+                    continue;
+                }
+                if let Some(baseline) = baseline {
+                    self.publish_baseline.extend(baseline);
+                }
+                if let Some(parent) = staged_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_bytes_if_changed(&staged_path, &encode_settings_bytecode(&document)?)?;
+                updated.insert(relative.clone());
+                self.publish_paths.push(relative);
+            }
+        }
+        normalize_owned_paths(&mut self.publish_paths);
+        Ok(updated.into_iter().collect())
+    }
+
+    pub(crate) fn publish(
+        mut self,
+        project_root: &Path,
+        repair_reference_paths: bool,
+    ) -> Result<PublishedProjectChanges> {
+        let started = Instant::now();
+        let phase = Instant::now();
+        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish current hashes: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
+        let backup_root = self.container.join("previous");
+        fs::create_dir_all(&backup_root)
+            .with_context(|| format!("Failed to create {}", backup_root.display()))?;
+        let phase = Instant::now();
+        let mut staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish staged hashes: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
+        let settings_candidates = current
+            .keys()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_service_settings_file_name)
+                    && staged.contains_key(*path)
+                    && current.get(*path) != staged.get(*path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let phase = Instant::now();
+        for relative in &settings_candidates {
+            if self.settings_already_aligned {
+                continue;
+            }
+            let current_path = project_root.join(relative);
+            let staged_path = self.project_root.join(relative);
+            let current_bytes = fs::read(&current_path)
+                .with_context(|| format!("Failed to read {}", current_path.display()))?;
+            let staged_bytes = fs::read(&staged_path)
+                .with_context(|| format!("Failed to read {}", staged_path.display()))?;
+            match align_settings_bytes_to_reference(&current_bytes, &staged_bytes)
+                .with_context(|| format!("Failed to align {}", relative.display()))?
+            {
+                SettingsAlignment::Equivalent => {
+                    fs::copy(&current_path, &staged_path).with_context(|| {
+                        format!("Failed to preserve equivalent {}", relative.display())
+                    })?;
+                }
+                SettingsAlignment::Changed(aligned) => {
+                    write_bytes_if_changed(&staged_path, &aligned)?;
+                }
+            }
+        }
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish settings alignment: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
+        let phase = Instant::now();
+        let repaired = if repair_reference_paths {
+            self.stage_moved_reference_updates(project_root, &settings_candidates)?
+        } else {
+            Vec::new()
+        };
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish reference repair: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
+        let phase = Instant::now();
+        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
+        let changed = current
+            .keys()
+            .chain(self.publish_baseline.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| path.as_path() != Path::new("sourcemap.json"))
+            .filter(|path| current.get(*path) != self.publish_baseline.get(*path))
+            .take(10)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
             bail!(
                 "Project files changed while Studio export was running; retry without overwriting: {}",
                 changed.join(", ")
             );
         }
-        let backup_root = self.container.join("previous");
-        fs::create_dir_all(&backup_root)
-            .with_context(|| format!("Failed to create {}", backup_root.display()))?;
-        let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish concurrency check: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
+        let phase = Instant::now();
+        let mut refreshed = settings_candidates;
+        refreshed.extend(repaired);
+        refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
         let operation_paths = publish_operation_paths(&current, &staged);
         let expected = current
             .keys()
@@ -686,7 +951,15 @@ impl ExportProjectStage {
             .map(|path| (path.clone(), staged.get(path).cloned()))
             .collect();
         let changed_roots = operation_paths.clone();
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish final staging plan: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
         let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
+        let phase = Instant::now();
         let publish_result = (|| -> Result<()> {
             for relative in operation_paths {
                 let staged = self.project_root.join(&relative);
@@ -752,7 +1025,15 @@ impl ExportProjectStage {
             }
             return Err(error);
         }
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish file swaps: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
         self.active = false;
+        let phase = Instant::now();
         published
             .par_iter()
             .filter_map(|(_, backup)| backup.as_ref())
@@ -766,6 +1047,13 @@ impl ExportProjectStage {
                 Err(_) => {}
             });
         let _ = fs::remove_dir_all(&self.container);
+        log_global(
+            5,
+            format_args!(
+                "[renium] export publish cleanup: {:.1}ms",
+                elapsed_ms(phase)
+            ),
+        );
         log_timing_ms("export project stage publish", elapsed_ms(started));
         Ok(PublishedProjectChanges {
             changed_roots,
@@ -914,33 +1202,29 @@ pub(crate) enum PublishEntryState {
     Symlink(PathBuf),
 }
 
+#[derive(Clone, Copy)]
+enum PublishEntryKind {
+    Directory,
+    File,
+    Symlink,
+}
+
 pub(crate) fn collect_publish_hashes(
     root: &Path,
     publish_paths: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, PublishEntryState>> {
-    let mut entries = BTreeMap::new();
+    let mut candidates = Vec::new();
     for relative in publish_paths {
         let path = root.join(relative);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
         if metadata.file_type().is_symlink() {
-            entries.insert(
-                relative.clone(),
-                PublishEntryState::Symlink(fs::read_link(&path)?),
-            );
+            candidates.push((relative.clone(), path, PublishEntryKind::Symlink));
             continue;
         }
         if metadata.is_file() {
-            let bytes = fs::read(&path)?;
-            entries.insert(
-                relative.clone(),
-                PublishEntryState::File {
-                    sha256: sha256_hex(&bytes),
-                    length: bytes.len() as u64,
-                    hash: fnv1a(&bytes),
-                },
-            );
+            candidates.push((relative.clone(), path, PublishEntryKind::File));
             continue;
         }
         if !metadata.is_dir() {
@@ -949,24 +1233,52 @@ pub(crate) fn collect_publish_hashes(
         for entry in WalkDir::new(&path).follow_links(false) {
             let entry = entry?;
             let entry_relative = entry.path().strip_prefix(root)?.to_path_buf();
-            let state = if entry.file_type().is_symlink() {
-                PublishEntryState::Symlink(fs::read_link(entry.path())?)
+            let kind = if entry.file_type().is_symlink() {
+                PublishEntryKind::Symlink
             } else if entry.file_type().is_dir() {
-                PublishEntryState::Directory
+                PublishEntryKind::Directory
             } else if entry.file_type().is_file() {
-                let bytes = fs::read(entry.path())?;
-                PublishEntryState::File {
-                    sha256: sha256_hex(&bytes),
-                    length: bytes.len() as u64,
-                    hash: fnv1a(&bytes),
-                }
+                PublishEntryKind::File
             } else {
                 continue;
             };
-            entries.insert(entry_relative, state);
+            candidates.push((entry_relative, entry.path().to_path_buf(), kind));
         }
     }
-    Ok(entries)
+    let entries = candidates
+        .into_par_iter()
+        .map(|(relative, path, kind)| {
+            let state = match kind {
+                PublishEntryKind::Directory => PublishEntryState::Directory,
+                PublishEntryKind::Symlink => PublishEntryState::Symlink(fs::read_link(path)?),
+                PublishEntryKind::File => {
+                    let bytes = fs::read(path)?;
+                    PublishEntryState::File {
+                        sha256: sha256_hex(&bytes),
+                        length: bytes.len() as u64,
+                        hash: fnv1a(&bytes),
+                    }
+                }
+            };
+            Ok((relative, state))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(entries.into_iter().collect())
+}
+
+fn refresh_publish_hashes(
+    root: &Path,
+    entries: &mut BTreeMap<PathBuf, PublishEntryState>,
+    paths: &[PathBuf],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut paths = paths.to_vec();
+    normalize_owned_paths(&mut paths);
+    entries.retain(|path, _| !paths.iter().any(|changed| path.starts_with(changed)));
+    entries.extend(collect_publish_hashes(root, &paths)?);
+    Ok(())
 }
 
 pub(crate) fn publish_operation_paths(
@@ -1064,7 +1376,22 @@ fn copy_symbolic_link(source: &Path, destination: &Path) -> Result<()> {
 #[derive(Clone, Copy)]
 enum ExportBridgeMode {
     Cold,
-    Warm { prepare_next_run: bool },
+    Warm {
+        prepare_next_run: bool,
+        repair_reference_paths: bool,
+    },
+}
+
+impl ExportBridgeMode {
+    fn repair_reference_paths(self) -> bool {
+        matches!(
+            self,
+            Self::Warm {
+                repair_reference_paths: true,
+                ..
+            }
+        )
+    }
 }
 
 fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude> {
@@ -1224,6 +1551,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     bridge_info: &BridgeInfoPayload,
     bridge_info_refresh_ms: f64,
     prepare_next_run: bool,
+    repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
     let prelude = export_snapshots_prelude(&args)?;
     println!(
@@ -1243,7 +1571,10 @@ pub(crate) fn export_snapshots_with_warm_bridge(
             wait_for_channels_ms: 0.0,
         },
         bridge_info_refresh_ms,
-        ExportBridgeMode::Warm { prepare_next_run },
+        ExportBridgeMode::Warm {
+            prepare_next_run,
+            repair_reference_paths,
+        },
     )
 }
 
@@ -1415,20 +1746,25 @@ struct ImportFinishMetrics {
     sourcemap_finalize_ms: f64,
 }
 
+struct ImportFinishRequest<'a> {
+    args: &'a ExportSnapshotsArgs,
+    services: &'a [String],
+    snapshot_dir: &'a Path,
+    project_root: &'a Path,
+    src_dir: &'a Path,
+    direct: bool,
+}
+
 fn finish_export_import(
-    args: &ExportSnapshotsArgs,
-    services: &[String],
-    snapshot_dir: &Path,
-    import_project_root: &Path,
-    import_src_dir: &Path,
+    request: ImportFinishRequest<'_>,
     dispatcher: &mut Option<DirectImportDispatcher>,
     sourcemap_writer: Option<SourcemapWriter>,
 ) -> Result<ImportFinishMetrics> {
-    if args.no_run_import {
+    if request.args.no_run_import {
         return Ok(ImportFinishMetrics::default());
     }
     let mut metrics = ImportFinishMetrics::default();
-    if args.import_mode == "direct" {
+    if request.direct {
         let mut sourcemap_nodes = HashMap::new();
         if let Some(dispatcher) = dispatcher.take() {
             let drain_started = Instant::now();
@@ -1446,26 +1782,19 @@ fn finish_export_import(
         if let Some(writer) = sourcemap_writer {
             writer.join()?;
         } else {
-            write_project_sourcemap_from_service_nodes(import_project_root, &sourcemap_nodes)?;
+            write_project_sourcemap_from_service_nodes(request.project_root, &sourcemap_nodes)?;
         }
         metrics.sourcemap_finalize_ms = elapsed_ms(sourcemap_started);
         log_timing_ms("sourcemap finalize", metrics.sourcemap_finalize_ms);
     } else {
-        import_snapshots(ImportSnapshotsArgs {
-            snapshot_dir: snapshot_dir.to_path_buf(),
-            project_root: import_project_root.to_path_buf(),
-            src_dir: import_src_dir.to_path_buf(),
-            services: services.join(","),
+        import_snapshots_into_stage(ImportSnapshotsArgs {
+            snapshot_dir: request.snapshot_dir.to_path_buf(),
+            project_root: request.project_root.to_path_buf(),
+            src_dir: request.src_dir.to_path_buf(),
+            services: request.services.join(","),
             no_project_write: false,
             threads: 0,
         })?;
-    }
-    if args.import_mode != "direct" {
-        let changed =
-            canonicalize_settings_reference_stores(&import_project_root.join(import_src_dir))?;
-        if changed > 0 {
-            println!("[renium] refreshed reference identities in {changed} service store(s)");
-        }
     }
     Ok(metrics)
 }
@@ -1495,15 +1824,12 @@ fn start_direct_import(
         return Ok(None);
     }
     let default_workers = resolve_direct_import_workers(args.import_workers);
-    let drain_workers = resolve_direct_import_drain_workers(args.import_workers, default_workers);
-    println!(
-        "[renium] direct import workers during export: {default_workers}, after export: {drain_workers}"
-    );
+    println!("[renium] direct import workers during export: {default_workers}");
     DirectImportDispatcher::start(
         project_root.to_path_buf(),
         src_dir.to_path_buf(),
         default_workers,
-        drain_workers,
+        default_workers,
         sourcemap_writer.map(SourcemapWriter::sender),
         total_started,
     )
@@ -1535,8 +1861,8 @@ fn prepare_export_execution(
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
     let run_import = !args.no_run_import;
-    let direct_import_mode = run_import && args.import_mode == "direct";
-    let project_stage = if run_import && !direct_import_mode {
+    let direct_import_mode = run_import && matches!(args.import_mode.as_str(), "direct" | "staged");
+    let project_stage = if run_import && args.import_mode != "direct" {
         Some(ExportProjectStage::create(
             project_root,
             &args.src_dir,
@@ -1553,6 +1879,18 @@ fn prepare_export_execution(
         || args.src_dir.clone(),
         |stage| stage.import_src_dir.clone(),
     );
+    if let Some(stage) = project_stage.as_ref() {
+        log_global(
+            5,
+            format_args!(
+                "[renium] export stage roots: project={} stage={} import={} src={}",
+                project_root.display(),
+                stage.project_root.display(),
+                import_project_root.display(),
+                import_src_dir.display()
+            ),
+        );
+    }
     let adaptive_instance_batches = !args.no_adaptive_throttle;
     println!(
         "[renium] adaptive instance batching: {}",
@@ -1744,17 +2082,38 @@ fn export_snapshots_core(
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
     } = finish_export_import(
-        args,
-        &services,
-        &snapshot_dir,
-        &import_project_root,
-        &import_src_dir,
+        ImportFinishRequest {
+            args,
+            services: &services,
+            snapshot_dir: &snapshot_dir,
+            project_root: &import_project_root,
+            src_dir: &import_src_dir,
+            direct: direct_import_mode,
+        },
         &mut direct_import_dispatcher,
         sourcemap_writer,
     )?;
-    let published = if let Some(stage) = project_stage.take() {
-        stage.finish_projection(!direct_import_mode)?;
-        stage.publish(&project_root)?
+    let published = if let Some(mut stage) = project_stage.take() {
+        stage.mark_settings_aligned();
+        let projection_started = Instant::now();
+        stage.finish_projection(false)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export project stage projection: {:.1}ms",
+                elapsed_ms(projection_started)
+            ),
+        );
+        let publish_started = Instant::now();
+        let published = stage.publish(&project_root, mode.repair_reference_paths())?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export project stage publish: {:.1}ms",
+                elapsed_ms(publish_started)
+            ),
+        );
+        published
     } else {
         PublishedProjectChanges::default()
     };
@@ -1800,7 +2159,8 @@ fn export_snapshots_core(
     if matches!(
         mode,
         ExportBridgeMode::Warm {
-            prepare_next_run: true
+            prepare_next_run: true,
+            ..
         }
     ) {
         prepare_bridge_for_next_run(bridge);
@@ -2108,6 +2468,40 @@ pub(crate) fn validate_bridge_chunk(chunk: &BridgeChunk) -> Result<()> {
             "Bridge payload advertises {} bytes, above the safe {MAX_BRIDGE_REASSEMBLY_BYTES}-byte limit",
             chunk.total
         );
+    }
+    if let Some(payload_hash) = &chunk.payload_hash
+        && (payload_hash.is_empty()
+            || payload_hash.len() > 128
+            || payload_hash.chars().any(char::is_whitespace))
+    {
+        bail!("Bridge chunk has an invalid payload hash");
+    }
+    if chunk.payload_cache_hit
+        && (chunk.payload_hash.is_none()
+            || !chunk.chunk.is_empty()
+            || chunk.start != 1
+            || chunk.next_start != 1
+            || chunk.total == 0)
+    {
+        bail!("Bridge chunk has an invalid payload cache hit");
+    }
+    match chunk.compression.as_deref() {
+        Some("zstd-base64-v1") => {
+            let uncompressed_bytes = chunk
+                .uncompressed_bytes
+                .context("Compressed bridge chunk omitted its uncompressed size")?;
+            if uncompressed_bytes == 0 || uncompressed_bytes > MAX_BRIDGE_REASSEMBLY_BYTES {
+                bail!("Compressed bridge chunk has an invalid uncompressed size");
+            }
+            if chunk.payload_cache_hit {
+                bail!("Compressed bridge chunk cannot be a payload cache hit");
+            }
+        }
+        Some(_) => bail!("Bridge chunk uses an unsupported compression format"),
+        None if chunk.uncompressed_bytes.is_some() => {
+            bail!("Uncompressed bridge chunk reports an uncompressed size")
+        }
+        None => {}
     }
     if chunk.total == 0 {
         if !chunk.chunk.is_empty() {
@@ -3127,11 +3521,18 @@ impl InstanceBatchContext<'_> {
         )?;
 
         let shape_batch = batch.format == "compact-v5-shape";
+        let item_count = batch.items.len();
         let debug_ids =
             decode_compact_batch_debug_ids(std::mem::take(&mut batch.debug_ids), &batch.strings)
                 .with_context(|| {
                     format!("Invalid compact debug id batch item schema for {service}")
                 })?;
+        let settings_ids = decode_batch_settings_ids(
+            std::mem::take(&mut batch.settings_ids),
+            item_count,
+            "Compact settings id",
+        )
+        .with_context(|| format!("Invalid compact settings ids for {service}"))?;
         let raw_items = Value::Array(batch.items);
         if !shape_batch && batch.format != BRIDGE_PROTOCOL_VERSION {
             bail!(
@@ -3181,6 +3582,7 @@ impl InstanceBatchContext<'_> {
             })?
         };
         apply_compact_batch_debug_ids(&mut out, debug_ids);
+        apply_batch_settings_ids(&mut out, settings_ids)?;
 
         let total_hint = batch.total.max(self.instance_count);
 
@@ -3261,6 +3663,8 @@ where
     metrics.chunks = 1;
     metrics.plugin_server_ms += first.plugin_server_ms.unwrap_or(0.0);
     metrics.plugin_encode_ms += first.plugin_encode_ms.unwrap_or(0.0);
+    let compression = first.compression.clone();
+    let uncompressed_bytes = first.uncompressed_bytes;
     if first.total > 0 && first.next_start <= 1 {
         bail!(
             "Plugin returned a non-advancing initial payload chunk (next={}, total={})",
@@ -3271,6 +3675,7 @@ where
     let first_done = first.total == 0 || first.next_start > first.total;
     let mut output = first.chunk;
     if first_done {
+        output = decompress_bridge_text(output, compression.as_deref(), uncompressed_bytes)?;
         metrics.reassembly_ms = elapsed_ms(reassembly_started);
         return Ok((output, metrics));
     }
@@ -3300,6 +3705,9 @@ where
                 "Plugin changed payload total between chunks (expected {total}, got {})",
                 chunk.total
             );
+        }
+        if chunk.compression != compression || chunk.uncompressed_bytes != uncompressed_bytes {
+            bail!("Plugin changed payload compression between chunks");
         }
         if chunk.start > 0 && chunk.start != start {
             bail!(
@@ -3336,8 +3744,155 @@ where
             output.len()
         );
     }
+    output = decompress_bridge_text(output, compression.as_deref(), uncompressed_bytes)?;
     metrics.reassembly_ms = elapsed_ms(reassembly_started);
     Ok((output, metrics))
+}
+
+const BRIDGE_TEXT_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const BRIDGE_TEXT_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Default)]
+struct BridgeTextPayloadCache {
+    entries: VecDeque<(String, Arc<str>)>,
+    last_hash_by_slot: HashMap<String, String>,
+    total_bytes: usize,
+}
+
+fn bridge_text_payload_cache() -> &'static Mutex<BridgeTextPayloadCache> {
+    static CACHE: OnceLock<Mutex<BridgeTextPayloadCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BridgeTextPayloadCache::default()))
+}
+
+fn bridge_text_payload_known_hash(slot: &str) -> Option<String> {
+    let cache = bridge_text_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let hash = cache.last_hash_by_slot.get(slot)?;
+    cache
+        .entries
+        .iter()
+        .any(|(entry_hash, _)| entry_hash == hash)
+        .then(|| hash.clone())
+}
+
+fn bridge_text_payload_get(hash: &str) -> Option<String> {
+    bridge_text_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entries
+        .iter()
+        .find_map(|(entry_hash, text)| (entry_hash == hash).then(|| text.to_string()))
+}
+
+fn bridge_text_payload_insert(slot: &str, hash: String, text: &str) {
+    if text.len() > BRIDGE_TEXT_CACHE_MAX_BYTES {
+        return;
+    }
+    let mut cache = bridge_text_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache
+        .last_hash_by_slot
+        .insert(slot.to_string(), hash.clone());
+    if cache
+        .entries
+        .iter()
+        .any(|(entry_hash, _)| entry_hash == &hash)
+    {
+        return;
+    }
+    while cache.entries.len() >= BRIDGE_TEXT_CACHE_MAX_ENTRIES
+        || cache.total_bytes.saturating_add(text.len()) > BRIDGE_TEXT_CACHE_MAX_BYTES
+    {
+        let Some((_, removed)) = cache.entries.pop_front() else {
+            break;
+        };
+        cache.total_bytes = cache.total_bytes.saturating_sub(removed.len());
+    }
+    let text: Arc<str> = Arc::from(text);
+    cache.total_bytes = cache.total_bytes.saturating_add(text.len());
+    cache.entries.push_back((hash, text));
+}
+
+pub(crate) fn fetch_text_chunks_with_cache<F>(
+    chunk_size: usize,
+    cache_slot: &str,
+    mut fetcher: F,
+) -> Result<(String, ChunkFetchMetrics)>
+where
+    F: FnMut(usize, usize, Option<&str>) -> Result<BridgeChunk>,
+{
+    let known_hash = bridge_text_payload_known_hash(cache_slot);
+    let mut first = true;
+    let mut payload_hash = None;
+    let (text, metrics) = fetch_text_chunks(chunk_size, |start, max_len| {
+        let chunk = fetcher(
+            start,
+            max_len,
+            first.then_some(known_hash.as_deref()).flatten(),
+        )?;
+        if first {
+            first = false;
+            payload_hash.clone_from(&chunk.payload_hash);
+            if chunk.payload_cache_hit {
+                let hash = chunk
+                    .payload_hash
+                    .as_deref()
+                    .context("Bridge text cache hit omitted its payload hash")?;
+                if known_hash.as_deref() != Some(hash) {
+                    bail!("Bridge returned an unexpected text payload cache hit");
+                }
+                let text = bridge_text_payload_get(hash)
+                    .context("Bridge text payload cache entry is missing")?;
+                if text.len() != chunk.total {
+                    bail!("Bridge text payload cache entry has the wrong size");
+                }
+                return Ok(BridgeChunk {
+                    start: 1,
+                    next_start: text.len() + 1,
+                    total: text.len(),
+                    chunk: text,
+                    plugin_server_ms: chunk.plugin_server_ms,
+                    plugin_encode_ms: chunk.plugin_encode_ms,
+                    serialization_complete: chunk.serialization_complete,
+                    payload_hash: chunk.payload_hash,
+                    payload_cache_hit: false,
+                    compression: None,
+                    uncompressed_bytes: None,
+                });
+            }
+        } else if chunk.payload_hash != payload_hash {
+            bail!("Plugin changed payload hash between chunks");
+        }
+        Ok(chunk)
+    })?;
+    if let Some(hash) = payload_hash {
+        bridge_text_payload_insert(cache_slot, hash, &text);
+    }
+    Ok((text, metrics))
+}
+
+fn decompress_bridge_text(
+    text: String,
+    compression: Option<&str>,
+    uncompressed_bytes: Option<usize>,
+) -> Result<String> {
+    if compression.is_none() {
+        return Ok(text);
+    }
+    let expected_len = uncompressed_bytes.context("Compressed bridge payload omitted its size")?;
+    let compressed =
+        base64::decode(text.as_bytes()).context("Compressed bridge payload is not valid base64")?;
+    let decoded = zstd::bulk::decompress(&compressed, expected_len)
+        .context("Compressed bridge payload has invalid zstd data")?;
+    if decoded.len() != expected_len {
+        bail!(
+            "Compressed bridge payload has {} bytes; expected {expected_len}",
+            decoded.len()
+        );
+    }
+    String::from_utf8(decoded).context("Compressed bridge payload is not valid UTF-8")
 }
 
 pub(crate) fn fetch_json_payload<F>(
@@ -3359,6 +3914,23 @@ where
     F: FnMut(usize, usize) -> Result<BridgeChunk>,
 {
     let (text, mut metrics) = fetch_text_chunks(chunk_size, fetcher)?;
+    metrics.bytes = text.len();
+    let parse_started = Instant::now();
+    let value = serde_json::from_slice(text.as_bytes()).context("Invalid chunked JSON payload")?;
+    metrics.json_parse_ms = elapsed_ms(parse_started);
+    Ok((value, metrics))
+}
+
+pub(crate) fn fetch_typed_payload_with_size_cached<T, F>(
+    chunk_size: usize,
+    cache_slot: &str,
+    fetcher: F,
+) -> Result<(T, ChunkFetchMetrics)>
+where
+    T: DeserializeOwned,
+    F: FnMut(usize, usize, Option<&str>) -> Result<BridgeChunk>,
+{
+    let (text, mut metrics) = fetch_text_chunks_with_cache(chunk_size, cache_slot, fetcher)?;
     metrics.bytes = text.len();
     let parse_started = Instant::now();
     let value = serde_json::from_slice(text.as_bytes()).context("Invalid chunked JSON payload")?;

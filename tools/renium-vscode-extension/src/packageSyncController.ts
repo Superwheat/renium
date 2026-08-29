@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 
+import { withPausedFileWrites } from "./pausedFileWrites";
 import type { CommandRunResult } from "./automationClient";
 import { logPackageDragDebug } from "./fileExplorer";
 import { renderCommandArgs } from "./gitSync";
@@ -217,27 +218,11 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
     write: () => Promise<T>,
     finish: (result: T) => Promise<string[]>,
   ): Promise<T> {
-    await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
-    try {
-      const result = await write();
-      const settledPaths = await finish(result);
-      await this.host.noteProgrammaticEditorWrite({
-        paths: settledPaths,
-        fileWrites: "resume",
-      });
-      return result;
-    } catch (error) {
-      try {
-        await this.host.noteProgrammaticEditorWrite({
-          fileWrites: "resume",
-        });
-      } catch (resumeError) {
-        const original = error instanceof Error ? error.message : String(error);
-        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
-        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
-      }
-      throw error;
-    }
+    return withPausedFileWrites(
+      (request) => this.host.noteProgrammaticEditorWrite(request),
+      write,
+      finish,
+    );
   }
 
   public dispose(): void {
@@ -635,8 +620,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
   public async linkApply(options: { silent?: boolean; refreshExplorer?: boolean; forceStudio?: boolean; forceTargets?: boolean; forceTargetPaths?: string[][]; taskName?: string; linkId?: string; skipStudio?: boolean; expectedProjectRoot?: string; expectedGeneration?: number } = {}): Promise<CliLinkApplyResult | undefined> {
     let result: CliLinkApplyResult | undefined;
     let executed = false;
-    await this.host.noteProgrammaticEditorWrite({ fileWrites: "pause" });
-    try {
+    const applied = await this.withPausedProjectWrite(async () => {
       await this.host.enqueue("Apply packages", async () => {
         const cfg = this.host.getConfig();
         if (
@@ -712,20 +696,22 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
       if ((options.expectedProjectRoot || options.expectedGeneration !== undefined) && !executed) {
         throw new Error("Package apply was cancelled before it started.");
       }
+      return result;
+    }, async (appliedResult) => {
       this.invalidateLinkStatusCache();
       const forceStudioAllowed = options.forceStudio === true && this.host.canUseStudioPushPipeline();
       if (options.forceStudio === true && !forceStudioAllowed) {
         this.host.noteStudioPushSkipped("serve/live sync is not active");
       }
       let settledPaths: string[] = [];
-      if (result) {
-        const changedPaths = (Array.isArray(result.changedPaths) ? result.changedPaths : [])
+      if (appliedResult) {
+        const changedPaths = (Array.isArray(appliedResult.changedPaths) ? appliedResult.changedPaths : [])
           .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
         const shouldConsiderStudio = options.skipStudio !== true
           && (forceStudioAllowed || (this.host.isEditorLiveSyncActive() && this.host.getConfig().linkSync.applyToStudio !== "never"));
         if (changedPaths.length > 0 && shouldConsiderStudio) {
           if (forceStudioAllowed) {
-            const targetSettingsIds = (Array.isArray(result.changedSettingsIds) ? result.changedSettingsIds : [])
+            const targetSettingsIds = (Array.isArray(appliedResult.changedSettingsIds) ? appliedResult.changedSettingsIds : [])
               .map((value) => String(value).trim())
               .filter((value) => value.length > 0);
             await this.host.pushEditorPathsNow(changedPaths, {
@@ -734,32 +720,18 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
               targetSettingsIds,
             });
           } else {
-            settledPaths = await this.applyLinksToStudio(result, { silent: options.silent === true });
+            settledPaths = await this.applyLinksToStudio(appliedResult, { silent: options.silent === true });
           }
         } else {
           settledPaths = changedPaths;
         }
       }
-      await this.host.noteProgrammaticEditorWrite({
-        paths: settledPaths,
-        fileWrites: "resume",
-      });
-      if (options.refreshExplorer !== false) {
-        await this.refreshFileExplorerSafe();
-      }
-      return result;
-    } catch (error) {
-      try {
-        await this.host.noteProgrammaticEditorWrite({
-          fileWrites: "resume",
-        });
-      } catch (resumeError) {
-        const original = error instanceof Error ? error.message : String(error);
-        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
-        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
-      }
-      throw error;
+      return settledPaths;
+    });
+    if (options.refreshExplorer !== false) {
+      await this.refreshFileExplorerSafe();
     }
+    return applied;
   }
 
   private async applyLinksToStudio(result: CliLinkApplyResult, options: { silent?: boolean } = {}): Promise<string[]> {

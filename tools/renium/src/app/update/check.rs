@@ -129,6 +129,14 @@ fn is_fresh(cache: &Cache) -> bool {
     cache.checked_at_unix_ms <= now && now - cache.checked_at_unix_ms < CACHE_INTERVAL_MS
 }
 
+pub(super) fn cached_manifest_status() -> (Option<SignedUpdateManifest>, bool) {
+    let Some(cache) = read_cache() else {
+        return (None, false);
+    };
+    let fresh = is_fresh(&cache);
+    (cache.manifest, fresh)
+}
+
 fn write_cache(cache: &Cache) -> Result<()> {
     install_bytes(&cache_path()?, &serde_json::to_vec(cache)?)
 }

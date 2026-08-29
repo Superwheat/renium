@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) mod support;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -48,17 +48,20 @@ use crate::editor::types::{
     EditorPropertyFilter,
 };
 use crate::project::package_links::place::place_desync_package_link;
-use crate::project::structural::move_instance_between_service_stores;
+use crate::project::structural::{
+    move_instance_between_service_stores, moved_references_between_documents,
+};
 use crate::project::version_control::{
     merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
 };
+use crate::rbx::decode::rbx_variant_to_persisted_settings_json;
 use crate::rbx::encode::{
     collect_rbx_subtree_preorder, json_to_rbx_axes, json_to_rbx_color_sequence, json_to_rbx_faces,
-    json_to_rbx_ray, model_property_name_is_skipped, rbx_model_top_level_refs,
-    synthesized_mesh_initial_size_for_rbx_export_class,
+    json_to_rbx_property_variant, json_to_rbx_ray, model_property_name_is_skipped,
+    rbx_model_top_level_refs, synthesized_mesh_initial_size_for_rbx_export_class,
 };
 use crate::rbx::model::{
-    BytecodeModelExportRefs, bytecode_export_model, bytecode_export_place,
+    BytecodeModelExportRefs, BytecodeModelImportRefs, bytecode_export_model, bytecode_export_place,
     rbx_dom_instance_by_path_unique,
 };
 use crate::roblox::schema::{
@@ -73,12 +76,15 @@ use crate::settings::bytecode::{
     write_service_settings_binary_file, write_var_u64,
 };
 use crate::snapshot::codec::{decode_compact_v5_value, parse_compact_v5_instance_items};
-use crate::snapshot::export::{parse_bridge_chunk, parse_place_guard_config};
+use crate::snapshot::export::{
+    fetch_text_chunks, fetch_text_chunks_with_cache, parse_bridge_chunk, parse_place_guard_config,
+};
 use crate::snapshot::import::{
     remove_stale_import_paths, state_with_preserved_material_service_settings,
 };
 use crate::snapshot::types::{ServiceState, SnapshotInstance};
 use crate::studio::automation::validate_luau_syntax;
+use crate::studio::bridge::BridgeRequestLease;
 use crate::studio::bridge::{MAX_BRIDGE_REASSEMBLY_BYTES, parse_bridge_raw_chunk};
 use crate::studio::native::editor::{
     encode_service_root_property_values, merge_live_service_root_property_values,
@@ -130,12 +136,18 @@ fn changed_directory_collects_every_external_script() {
     let project_root = temp_dir("changed-directory");
     let service_dir = project_root.join("src/ReplicatedStorage");
     fs::create_dir_all(&service_dir).unwrap();
-    let document = settings_document(vec![
+    let mut document = settings_document(vec![
         settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
         settings_instance("public", "Public", "Folder", Some(0)),
         settings_instance("one", "One", "ModuleScript", Some(1)),
         settings_instance("two", "Two", "ModuleScript", Some(1)),
+        settings_instance("outside", "Outside", "Folder", Some(0)),
     ]);
+    for index in 1..document.instances.len() {
+        document.instances[index]
+            .attributes
+            .insert("Selected".to_string(), Value::Bool(true));
+    }
     document
         .write_file(&service_settings_path(&service_dir))
         .unwrap();
@@ -165,6 +177,15 @@ fn changed_directory_collects_every_external_script() {
         .filter_map(|change| change.path_segments.last().cloned())
         .collect::<HashSet<_>>();
     assert_eq!(names, HashSet::from(["One".to_string(), "Two".to_string()]));
+    let property_ids = changes
+        .property_changes
+        .iter()
+        .filter_map(|change| change.settings_id.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        property_ids,
+        HashSet::from(["public".to_string(), "one".to_string(), "two".to_string(),])
+    );
 
     let _ = fs::remove_dir_all(project_root);
 }
@@ -428,6 +449,109 @@ fn parse_bridge_raw_chunk_preserves_payload() {
     assert_eq!(chunk.plugin_server_ms, Some(12.5));
     assert_eq!(chunk.plugin_encode_ms, Some(3.25));
     assert!(chunk.serialization_complete);
+}
+
+#[test]
+fn parse_bridge_raw_chunk_accepts_payload_cache_hits() {
+    let frame = "RBS3 43 1 1 5543299 0.75 0 1 1 Ymxha2Uz\n".to_string();
+    let (id, chunk) = parse_bridge_raw_chunk(frame).unwrap().unwrap();
+
+    assert_eq!(id, 43);
+    assert_eq!(chunk.total, 5_543_299);
+    assert!(chunk.chunk.is_empty());
+    assert_eq!(chunk.payload_hash.as_deref(), Some("Ymxha2Uz"));
+    assert!(chunk.payload_cache_hit);
+    assert!(chunk.serialization_complete);
+}
+
+#[test]
+fn parse_bridge_raw_chunk_accepts_compressed_payloads() {
+    let frame = "RBS4 44 1 9 8 1.25 0.5 1 0 Ymxha2Uz zstd-base64-v1 32\nYWJjZA==".to_string();
+    let (id, chunk) = parse_bridge_raw_chunk(frame).unwrap().unwrap();
+
+    assert_eq!(id, 44);
+    assert_eq!(chunk.chunk, "YWJjZA==");
+    assert_eq!(chunk.compression.as_deref(), Some("zstd-base64-v1"));
+    assert_eq!(chunk.uncompressed_bytes, Some(32));
+    assert_eq!(chunk.payload_hash.as_deref(), Some("Ymxha2Uz"));
+}
+
+#[test]
+fn fetch_text_chunks_decompresses_negotiated_payload() {
+    let expected = r#"{"items":[1,"two",{"three":3}]}"#;
+    let compressed = zstd::bulk::compress(expected.as_bytes(), 1).unwrap();
+    let encoded = base64::encode(compressed);
+    let total = encoded.len();
+    let mut fetched = false;
+    let (text, _) = fetch_text_chunks(total, |start, _| {
+        assert_eq!(start, 1);
+        assert!(!fetched);
+        fetched = true;
+        Ok(crate::studio::bridge::BridgeChunk {
+            start: 1,
+            next_start: total + 1,
+            total,
+            chunk: encoded.clone(),
+            plugin_server_ms: None,
+            plugin_encode_ms: None,
+            serialization_complete: true,
+            payload_hash: None,
+            payload_cache_hit: false,
+            compression: Some("zstd-base64-v1".to_string()),
+            uncompressed_bytes: Some(expected.len()),
+        })
+    })
+    .unwrap();
+
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn fetch_text_chunks_reuses_verified_payload_cache_hits() {
+    let expected = r#"{"cached":true}"#;
+    let compressed = base64::encode(zstd::bulk::compress(expected.as_bytes(), 1).unwrap());
+    let hash = "test-overlay-cache-hash";
+    let slot = "test-overlay-cache-slot";
+    let compressed_len = compressed.len();
+    let (first, _) = fetch_text_chunks_with_cache(compressed_len, slot, |start, _, known| {
+        assert_eq!(start, 1);
+        assert!(known.is_none());
+        Ok(crate::studio::bridge::BridgeChunk {
+            start: 1,
+            next_start: compressed_len + 1,
+            total: compressed_len,
+            chunk: compressed.clone(),
+            plugin_server_ms: None,
+            plugin_encode_ms: None,
+            serialization_complete: true,
+            payload_hash: Some(hash.to_string()),
+            payload_cache_hit: false,
+            compression: Some("zstd-base64-v1".to_string()),
+            uncompressed_bytes: Some(expected.len()),
+        })
+    })
+    .unwrap();
+    assert_eq!(first, expected);
+
+    let (second, _) = fetch_text_chunks_with_cache(256, slot, |start, _, known| {
+        assert_eq!(start, 1);
+        assert_eq!(known, Some(hash));
+        Ok(crate::studio::bridge::BridgeChunk {
+            start: 1,
+            next_start: 1,
+            total: expected.len(),
+            chunk: String::new(),
+            plugin_server_ms: None,
+            plugin_encode_ms: None,
+            serialization_complete: true,
+            payload_hash: Some(hash.to_string()),
+            payload_cache_hit: true,
+            compression: None,
+            uncompressed_bytes: None,
+        })
+    })
+    .unwrap();
+    assert_eq!(second, expected);
 }
 
 #[test]
@@ -788,6 +912,15 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
         settings_instance("widget", "Widget", "ScreenGui", Some(0)),
         script,
         settings_instance("part", "Target", "Part", Some(1)),
+        {
+            let mut holder =
+                settings_instance("external-holder", "ExternalHolder", "ObjectValue", Some(0));
+            holder.properties.insert(
+                "Value".to_string(),
+                json!({"_type":"Ref", "instanceIndex":2}),
+            );
+            holder
+        },
     ]);
     source.write_file(&source_file).unwrap();
     let source_paths = build_editor_source_paths_by_index(&source, "StarterGui", &source_dir);
@@ -838,7 +971,7 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
     )
     .unwrap();
 
-    assert!(!source_file.exists());
+    let remaining = SettingsBytecode::read_file(&source_file).unwrap();
     let moved = SettingsBytecode::read_file(&target_file).unwrap();
     let package_link = moved
         .instances
@@ -857,6 +990,23 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
         .unwrap();
     assert_eq!(moved.instances[widget_index].parent_index, Some(1));
     assert_ne!(moved.instances[widget_index].settings_id, "widget");
+    let external_ref = remaining
+        .instances
+        .iter()
+        .find(|instance| instance.settings_id == "external-holder")
+        .unwrap()
+        .properties["Value"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        external_ref.get("settingsId"),
+        Some(&json!(moved.instances[widget_index].settings_id))
+    );
+    assert_eq!(
+        external_ref.get("pathSegments"),
+        Some(&json!(["ReplicatedStorage", "Public", "Widget"]))
+    );
+    assert!(!external_ref.contains_key("instanceIndex"));
     let moved_ref = moved.instances[1].properties["MovedRef"]
         .as_object()
         .unwrap();
@@ -906,6 +1056,63 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
     );
 
     let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
+fn moved_reference_detection_handles_duplicate_ids_with_one_unchanged_instance() {
+    let before = BTreeMap::from([
+        (
+            "ReplicatedStorage".to_string(),
+            settings_document(vec![
+                settings_instance(
+                    "replicated-root",
+                    "ReplicatedStorage",
+                    "ReplicatedStorage",
+                    None,
+                ),
+                settings_instance("duplicate", "Moving", "Folder", Some(0)),
+                settings_instance("duplicate", "Stable", "Folder", Some(0)),
+            ]),
+        ),
+        (
+            "ServerStorage".to_string(),
+            settings_document(vec![settings_instance(
+                "server-root",
+                "ServerStorage",
+                "ServerStorage",
+                None,
+            )]),
+        ),
+    ]);
+    let after = BTreeMap::from([
+        (
+            "ReplicatedStorage".to_string(),
+            settings_document(vec![
+                settings_instance(
+                    "replicated-root",
+                    "ReplicatedStorage",
+                    "ReplicatedStorage",
+                    None,
+                ),
+                settings_instance("duplicate", "Stable", "Folder", Some(0)),
+            ]),
+        ),
+        (
+            "ServerStorage".to_string(),
+            settings_document(vec![
+                settings_instance("server-root", "ServerStorage", "ServerStorage", None),
+                settings_instance("duplicate", "Moving", "Folder", Some(0)),
+            ]),
+        ),
+    ]);
+
+    let moved = moved_references_between_documents(&before, &after);
+
+    assert_eq!(moved.len(), 1);
+    let target = moved.values().next().unwrap();
+    assert_eq!(target.settings_id, "duplicate");
+    assert_eq!(target.path_segments, ["ServerStorage", "Moving"]);
+    assert_eq!(target.path_ordinals, [1, 1]);
 }
 
 #[test]
@@ -1434,6 +1641,33 @@ fn append_editor_property_changes_skips_mesh_size_transport_property() {
 }
 
 #[test]
+fn append_editor_property_changes_uses_logical_property_names() {
+    let document = settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        SettingsBytecodeInstance {
+            settings_id: "value".to_string(),
+            name: "Value".to_string(),
+            class_name: "StringValue".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([("archivable".to_string(), Value::Bool(false))]),
+            attributes: Map::new(),
+        },
+    ]);
+    let mut changes = EditorChangeSet::default();
+    append_editor_property_changes(
+        &mut changes,
+        &document,
+        "ReplicatedStorage",
+        &HashMap::new(),
+        &EditorPropertyFilter::default(),
+        rbx_reflection_database::get().unwrap(),
+    );
+    let properties = &changes.property_changes[0].properties;
+    assert_eq!(properties.get("Archivable"), Some(&Value::Bool(false)));
+    assert!(!properties.contains_key("archivable"));
+}
+
+#[test]
 fn default_property_elision_never_skips_mesh_size_transport_property() {
     let mesh_size = vector3_json(7.0, 8.0, 9.0);
     let mut mesh_defaults = Map::new();
@@ -1508,6 +1742,40 @@ fn targeted_instance_upserts_include_ancestors_but_not_root() {
         changes.instance_changes[0].instances[1].path_segments.len(),
         3
     );
+    assert!(changes.instance_changes[0].instances[0].anchor_only);
+    assert!(!changes.instance_changes[0].instances[1].anchor_only);
+}
+
+#[test]
+fn targeted_instance_upserts_include_duplicate_identity_group() {
+    let document = settings_document(vec![
+        settings_instance("editor:0", "StarterGui", "StarterGui", None),
+        settings_instance("editor:1", "Parent", "Folder", Some(0)),
+        settings_instance("editor:2", "ScreenGui", "ScreenGui", Some(1)),
+        settings_instance("editor:3", "ScreenGui", "ScreenGui", Some(1)),
+        settings_instance("editor:4", "ScreenGui", "ScreenGui", Some(1)),
+    ]);
+    let filter = EditorPropertyFilter {
+        settings_ids: HashSet::from(["editor:4".to_string()]),
+        property_names: HashSet::new(),
+    };
+    let mut changes = EditorChangeSet::default();
+
+    append_editor_target_instance_upserts(&mut changes, &document, "StarterGui", &filter);
+
+    assert_eq!(changes.instance_changes.len(), 1);
+    assert_eq!(
+        changes.instance_changes[0]
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["editor:1", "editor:2", "editor:3", "editor:4"]
+    );
+    assert!(changes.instance_changes[0].instances[0].anchor_only);
+    assert!(changes.instance_changes[0].instances[1].anchor_only);
+    assert!(changes.instance_changes[0].instances[2].anchor_only);
+    assert!(!changes.instance_changes[0].instances[3].anchor_only);
 }
 
 #[test]
@@ -1760,6 +2028,14 @@ fn reconcile_instance_changes_describe_ambiguous_siblings() {
             properties: Map::from_iter([("Value".to_string(), json!("unique"))]),
             attributes: Map::new(),
         },
+        SettingsBytecodeInstance {
+            settings_id: "other-class".to_string(),
+            name: "Value".to_string(),
+            class_name: "Folder".to_string(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
     ]);
     let mut changes = EditorChangeSet::default();
 
@@ -1780,6 +2056,11 @@ fn reconcile_instance_changes_describe_ambiguous_siblings() {
         .unwrap();
     assert!(!unique.ambiguous_siblings);
     assert!(unique.match_properties.is_empty());
+    let other_class = instances
+        .iter()
+        .find(|instance| instance.settings_id == "other-class")
+        .unwrap();
+    assert!(other_class.ambiguous_siblings);
     let payload = serde_json::to_value(first).unwrap();
     assert_eq!(payload.get("ambiguousSiblings"), Some(&json!(true)));
     assert_eq!(
@@ -1946,6 +2227,8 @@ fn editor_source_target_creates_missing_bytecode_script() {
         vec!["Workspace", "Folder", "NewModule"]
     );
     assert_eq!(ensured.upsert_instances.len(), 2);
+    assert!(ensured.upsert_instances[0].anchor_only);
+    assert!(!ensured.upsert_instances[1].anchor_only);
     assert_eq!(document.instances[2].name, "NewModule");
     assert_eq!(document.instances[2].class_name, "ModuleScript");
     assert_eq!(document.instances[2].parent_index, Some(1));
@@ -2022,6 +2305,8 @@ fn editor_source_target_creates_missing_parent_folders() {
         vec!["Workspace", "NewFolder", "NewServer"]
     );
     assert_eq!(ensured.upsert_instances.len(), 2);
+    assert!(!ensured.upsert_instances[0].anchor_only);
+    assert!(!ensured.upsert_instances[1].anchor_only);
     assert_eq!(document.instances[2].name, "NewFolder");
     assert_eq!(document.instances[2].class_name, "Folder");
     assert_eq!(document.instances[2].parent_index, Some(0));
@@ -2184,6 +2469,16 @@ fn restored_init_source_reclasses_folder_back_to_script() {
     assert_eq!(
         changes.instance_changes[0].instances[0].class_name,
         "LocalScript"
+    );
+    assert_eq!(
+        changes.instance_changes[0].instances[0]
+            .previous_class_name
+            .as_deref(),
+        Some("Folder")
+    );
+    assert_eq!(
+        changes.instance_changes[0].instances[0].previous_path_segments,
+        ["ReplicatedFirst", "LoadingScreen"]
     );
     assert_eq!(changes.source_changes.len(), 1);
     let after = SettingsBytecode::read_file(&settings_path).unwrap();
@@ -2949,6 +3244,49 @@ fn protected_review_reads_migrated_mesh_id_value() {
 }
 
 #[test]
+fn unknown_property_types_survive_settings_and_binary_round_trips() {
+    let database = rbx_reflection_database::get().unwrap();
+    let import_refs = BytecodeModelImportRefs::default();
+    let export_refs = BytecodeModelExportRefs::default();
+    let content = RbxVariant::Content(RbxContent::from_uri("rbxassetid://123"));
+    let float = RbxVariant::Float32(0.75);
+
+    let content_json =
+        rbx_variant_to_persisted_settings_json(&content, None, database, &import_refs).unwrap();
+    let float_json =
+        rbx_variant_to_persisted_settings_json(&float, None, database, &import_refs).unwrap();
+    assert_eq!(content_json.get("_type"), Some(&json!("Content")));
+    assert_eq!(float_json.get("_type"), Some(&json!("Float32")));
+
+    let content_round_trip =
+        json_to_rbx_property_variant(&content_json, None, database, &export_refs).unwrap();
+    let float_round_trip =
+        json_to_rbx_property_variant(&float_json, None, database, &export_refs).unwrap();
+    assert_eq!(content_round_trip, content);
+    assert_eq!(float_round_trip, float);
+
+    let root = RbxInstanceBuilder::new("Decal")
+        .with_property("EmissiveMaskContent", content_round_trip)
+        .with_property("EmissiveStrength", float_round_trip);
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let root = dom.insert(dom.root_ref(), root);
+    let mut bytes = Vec::new();
+    rbx_binary::to_writer(&mut bytes, &dom, &[root]).unwrap();
+    let decoded = rbx_binary::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let decoded_root = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+    assert_eq!(
+        decoded_root.properties.get(&"EmissiveMaskContent".into()),
+        Some(&content),
+        "{:?}",
+        decoded_root.properties
+    );
+    assert_eq!(
+        decoded_root.properties.get(&"EmissiveStrength".into()),
+        Some(&float)
+    );
+}
+
+#[test]
 fn live_snapshot_preserves_unrelated_service_root_properties() {
     let database = rbx_reflection_database::get().unwrap();
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
@@ -3078,4 +3416,18 @@ fn protected_review_only_keeps_user_facing_properties() {
         }),
         database
     ));
+}
+
+#[test]
+fn bridge_request_lease_cancels_only_before_completion() {
+    let active = BridgeRequestLease::new("active".to_string());
+    assert_eq!(active.id(), "active");
+    assert!(!active.is_cancelled());
+    active.cancel();
+    assert!(active.is_cancelled());
+
+    let completed = BridgeRequestLease::new("completed".to_string());
+    completed.finish();
+    completed.cancel();
+    assert!(!completed.is_cancelled());
 }
