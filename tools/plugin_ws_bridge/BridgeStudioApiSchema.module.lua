@@ -25,6 +25,18 @@ return {
 		{ "WorldSecondaryAxis", "Vector3" },
 		{ "WorldCFrame", "CFrame" },
 	},
+	["AudioEmitter"] = {
+		{ "DistanceAttenuationBounds", "NumberRange" },
+		{ "DistanceAttenuationMode", "Enum.DistanceAttenuationMode" },
+	},
+	["AudioWindSynthesizer"] = {
+		{ "Archivable", "Bool" },
+		{ "PositionInstance", "Ref" },
+		{ "PositionType", "Enum.AudioPositionType" },
+		{ "Enabled", "Bool" },
+		{ "Profile", "Enum.WindSoundProfile" },
+		{ "Volume", "Float32" },
+	},
 	["BackpackItem"] = {
 		{ "TextureContent", "ContentId" },
 		{ "Pivot Offset", "CFrame" },
@@ -67,6 +79,9 @@ return {
 		{ "WorldSecondaryAxis", "Vector3" },
 		{ "WorldCFrame", "CFrame" },
 		{ "Transform", "CFrame" },
+	},
+	["BranchService"] = {
+		{ "Archivable", "Bool" },
 	},
 	["BubbleChatMessageProperties"] = {
 		{ "BackgroundColor3", "Color3" },
@@ -120,6 +135,9 @@ return {
 	["Decal"] = {
 		{ "NormalMapContent", "ContentId" },
 		{ "ColorMapContent", "ContentId" },
+		{ "EmissiveMaskContent", "ContentId" },
+		{ "EmissiveStrength", "Float32" },
+		{ "EmissiveTint", "Color3" },
 		{ "MetalnessMapContent", "ContentId" },
 		{ "RoughnessMapContent", "ContentId" },
 		{ "TextureContent", "ContentId" },
@@ -288,6 +306,51 @@ return {
 	["ImageLabel"] = {
 		{ "ImageContent", "ContentId" },
 	},
+	["InputActionLabel"] = {
+		{ "SelectionImageObject", "Ref" },
+		{ "ClipsDescendants", "Bool" },
+		{ "InputAction", "Ref" },
+		{ "InputSink", "Enum.InputSink" },
+		{ "BackgroundTransparency", "Float32" },
+		{ "Active", "Bool" },
+		{ "AnchorPoint", "Vector2" },
+		{ "AutomaticSize", "Enum.AutomaticSize" },
+		{ "BackgroundColor3", "Color3" },
+		{ "BorderColor3", "Color3" },
+		{ "BorderMode", "Enum.BorderMode" },
+		{ "BorderSizePixel", "Int32" },
+		{ "Rotation", "Float32" },
+		{ "Size", "UDim2" },
+		{ "Visible", "Bool" },
+		{ "LayoutOrder", "Int32" },
+		{ "Position", "UDim2" },
+		{ "SizeConstraint", "Enum.SizeConstraint" },
+		{ "ZIndex", "Int32" },
+		{ "Interactable", "Bool" },
+		{ "Archivable", "Bool" },
+		{ "ImageColor3", "Color3" },
+		{ "ImageTransparency", "Float32" },
+		{ "AutoLocalize", "Bool" },
+		{ "RootLocalizationTable", "Ref" },
+		{ "SelectionBehaviorDown", "Enum.SelectionBehavior" },
+		{ "SelectionBehaviorLeft", "Enum.SelectionBehavior" },
+		{ "SelectionBehaviorRight", "Enum.SelectionBehavior" },
+		{ "SelectionBehaviorUp", "Enum.SelectionBehavior" },
+		{ "SelectionGroup", "Bool" },
+		{ "NextSelectionDown", "Ref" },
+		{ "NextSelectionLeft", "Ref" },
+		{ "NextSelectionRight", "Ref" },
+		{ "NextSelectionUp", "Ref" },
+		{ "Selectable", "Bool" },
+		{ "SelectionOrder", "Int32" },
+		{ "FontFace", "Font" },
+		{ "TextColor3", "Color3" },
+		{ "TextSize", "Float32" },
+		{ "TextTransparency", "Float32" },
+		{ "TextWrapped", "Bool" },
+		{ "TextYAlignment", "Enum.TextYAlignment" },
+		{ "TextXAlignment", "Enum.TextXAlignment" },
+	},
 	["InputBinding"] = {
 		{ "DisplayImage", "ContentId" },
 		{ "DisplayName", "String" },
@@ -299,10 +362,14 @@ return {
 		{ "Delta", "Vector3" },
 		{ "UserInputState", "Enum.UserInputState" },
 	},
+	["IntentService"] = {
+		{ "Archivable", "Bool" },
+	},
 	["IntersectOperation"] = {
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
@@ -311,6 +378,16 @@ return {
 	["LocalScript"] = {
 		{ "Enabled", "Bool" },
 	},
+	["LuauExpressionService"] = {
+		{ "Archivable", "Bool" },
+	},
+	["MaterialImportData"] = {
+		{ "DiffuseVersionedAssetId", "Int64" },
+		{ "EmissiveVersionedAssetId", "Int64" },
+		{ "MetalnessVersionedAssetId", "Int64" },
+		{ "NormalVersionedAssetId", "Int64" },
+		{ "RoughnessVersionedAssetId", "Int64" },
+	},
 	["MaterialVariant"] = {
 		{ "EmissiveMaskContent", "ContentId" },
 		{ "NormalMapContent", "ContentId" },
@@ -318,11 +395,18 @@ return {
 		{ "MetalnessMapContent", "ContentId" },
 		{ "RoughnessMapContent", "ContentId" },
 	},
+	["MemoryStoreDistributedCounter"] = {
+		{ "Archivable", "Bool" },
+	},
+	["MeshImportData"] = {
+		{ "VersionedAssetId", "Int64" },
+	},
 	["MeshPart"] = {
 		{ "TextureContent", "ContentId" },
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
@@ -345,6 +429,7 @@ return {
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
@@ -367,10 +452,17 @@ return {
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
 		{ "Origin", "CFrame" },
+	},
+	["Path3D"] = {
+		{ "Archivable", "Bool" },
+	},
+	["PinShortcutService"] = {
+		{ "Archivable", "Bool" },
 	},
 	["Platform"] = {
 		{ "AssemblyLinearVelocity", "Vector3" },
@@ -381,9 +473,14 @@ return {
 	},
 	["Player"] = {
 		{ "CanLoadCharacterAppearance", "Bool" },
+		{ "FrustumStreaming", "Enum.FrustumStreamingMode" },
 		{ "DisplayName", "String" },
 		{ "HasVerifiedBadge", "Bool" },
 		{ "UserId", "Int64" },
+	},
+	["PlayerControlState"] = {
+		{ "Owner", "Ref" },
+		{ "Archivable", "Bool" },
 	},
 	["PlayerMouse"] = {
 		{ "IconContent", "ContentId" },
@@ -412,6 +509,9 @@ return {
 		{ "Pivot Offset", "CFrame" },
 		{ "Origin", "CFrame" },
 	},
+	["RequestOrchestratorService"] = {
+		{ "Archivable", "Bool" },
+	},
 	["RunService"] = {
 		{ "RunState", "Enum.RunState" },
 	},
@@ -420,6 +520,9 @@ return {
 	},
 	["Script"] = {
 		{ "Enabled", "Bool" },
+	},
+	["ScriptScannerService"] = {
+		{ "Archivable", "Bool" },
 	},
 	["ScrollingFrame"] = {
 		{ "MidImageContent", "ContentId" },
@@ -466,6 +569,12 @@ return {
 	["SpecialMesh"] = {
 		{ "MeshContent", "ContentId" },
 		{ "TextureContent", "ContentId" },
+	},
+	["StateMachineDefinition"] = {
+		{ "Archivable", "Bool" },
+	},
+	["StateMachineTransitionDefinition"] = {
+		{ "Archivable", "Bool" },
 	},
 	["Status"] = {
 		{ "Pivot Offset", "CFrame" },
@@ -567,6 +676,9 @@ return {
 	["Texture"] = {
 		{ "NormalMapContent", "ContentId" },
 		{ "ColorMapContent", "ContentId" },
+		{ "EmissiveMaskContent", "ContentId" },
+		{ "EmissiveStrength", "Float32" },
+		{ "EmissiveTint", "Color3" },
 		{ "MetalnessMapContent", "ContentId" },
 		{ "RoughnessMapContent", "ContentId" },
 		{ "TextureContent", "ContentId" },
@@ -583,6 +695,7 @@ return {
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
@@ -600,10 +713,16 @@ return {
 		{ "ActivatedCursorIconContent", "ContentId" },
 		{ "CursorIconContent", "ContentId" },
 	},
+	["UIShadow"] = {
+		{ "Inset", "Bool" },
+		{ "Mode", "Enum.ApplyShadowMode" },
+		{ "ShowBehindParent", "Bool" },
+	},
 	["UnionOperation"] = {
 		{ "AssemblyLinearVelocity", "Vector3" },
 		{ "AssemblyAngularVelocity", "Vector3" },
 		{ "FluidFidelity", "Enum.FluidFidelity" },
+		{ "CollisionPrecision", "Float32" },
 		{ "CollisionFidelity", "Enum.CollisionFidelity" },
 		{ "Rotation", "Vector3" },
 		{ "Pivot Offset", "CFrame" },
@@ -629,6 +748,22 @@ return {
 	["VideoPlayer"] = {
 		{ "VideoContent", "ContentId" },
 	},
+	["ViewportCamera"] = {
+		{ "CameraSubject", "Ref" },
+		{ "CameraType", "Enum.CameraType" },
+		{ "DiagonalFieldOfView", "Float32" },
+		{ "FieldOfView", "Float32" },
+		{ "FieldOfViewMode", "Enum.FieldOfViewMode" },
+		{ "MaxAxisFieldOfView", "Float32" },
+		{ "CFrame", "CFrame" },
+		{ "Focus", "CFrame" },
+		{ "HeadLocked", "Bool" },
+		{ "HeadScale", "Float32" },
+		{ "VRTiltAndRollEnabled", "Bool" },
+		{ "Archivable", "Bool" },
+		{ "Pivot Offset", "CFrame" },
+		{ "Origin", "CFrame" },
+	},
 	["ViewportFrame"] = {
 		{ "CurrentCamera", "Ref" },
 	},
@@ -645,11 +780,16 @@ return {
 	["WeldConstraint"] = {
 		{ "Enabled", "Bool" },
 	},
+	["WindowProtocolService"] = {
+		{ "Archivable", "Bool" },
+	},
 	["Workspace"] = {
+		{ "ExpandedTerrain", "Enum.RolloutState" },
 		{ "InsertPoint", "Vector3" },
 		{ "PredictiveStreamingMode", "Enum.PredictiveStreamingMode" },
 	},
 	["WorldModel"] = {
+		{ "UseWorkspaceCollisionGroups", "Bool" },
 		{ "Pivot Offset", "CFrame" },
 		{ "Origin", "CFrame" },
 	},

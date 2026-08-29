@@ -26,16 +26,18 @@ use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
     SourcemapNode, build_service_sourcemap_from_state, finalize_project_sourcemap_temp,
-    load_existing_sourcemap_root, path_to_sourcemap_relative,
-    write_project_sourcemap_from_service_nodes, write_project_sourcemap_with_updates,
+    load_existing_sourcemap_root, path_to_sourcemap_relative, sourcemap_root_is_current,
+    write_project_sourcemap_with_updates,
 };
 use crate::rbx::encode::settings_root_indices;
 use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, child_indices_for_instance, write_fresh_service_settings_binary_file,
-    write_service_settings_binary_file,
+    SettingsBytecode, child_indices_for_instance, encode_service_settings_binary,
+    write_fresh_service_settings_binary_file,
 };
+use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
@@ -228,11 +230,27 @@ pub(crate) struct SourcemapWriter {
     handle: Option<thread::JoinHandle<Result<()>>>,
 }
 
+fn update_sourcemap_service_node(
+    service_nodes: &mut HashMap<String, SourcemapNode>,
+    service: String,
+    node: SourcemapNode,
+) -> bool {
+    if service_nodes.get(&service) == Some(&node) {
+        return false;
+    }
+    service_nodes.insert(service, node);
+    true
+}
+
 impl SourcemapWriter {
     pub(crate) fn start(project_root: PathBuf) -> Self {
         let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
         let handle = thread::spawn(move || -> Result<()> {
-            let mut service_nodes = load_existing_sourcemap_root(&project_root)?
+            let existing_root = load_existing_sourcemap_root(&project_root)?;
+            let mut wrote_update = existing_root
+                .as_ref()
+                .is_none_or(|root| !sourcemap_root_is_current(&project_root, root));
+            let mut service_nodes = existing_root
                 .map(|root| {
                     root.children
                         .into_iter()
@@ -240,13 +258,12 @@ impl SourcemapWriter {
                         .collect::<HashMap<_, _>>()
                 })
                 .unwrap_or_default();
-            let mut wrote_update = false;
             while let Ok(message) = receiver.recv() {
                 let mut pending_finish = false;
                 match message {
                     SourcemapWriterMessage::Service(service, node) => {
-                        wrote_update = true;
-                        service_nodes.insert(service, node);
+                        wrote_update |=
+                            update_sourcemap_service_node(&mut service_nodes, service, node);
                     }
                     SourcemapWriterMessage::Finish => pending_finish = true,
                 }
@@ -254,8 +271,8 @@ impl SourcemapWriter {
                 while let Ok(pending) = receiver.try_recv() {
                     match pending {
                         SourcemapWriterMessage::Service(service, node) => {
-                            wrote_update = true;
-                            service_nodes.insert(service, node);
+                            wrote_update |=
+                                update_sourcemap_service_node(&mut service_nodes, service, node);
                         }
                         SourcemapWriterMessage::Finish => {
                             pending_finish = true;
@@ -627,10 +644,21 @@ pub(crate) fn import_service_state_with_sourcemap(
 }
 
 pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
+    import_snapshots_with_project_stage(args, true)
+}
+
+pub(crate) fn import_snapshots_into_stage(args: ImportSnapshotsArgs) -> Result<()> {
+    import_snapshots_with_project_stage(args, false)
+}
+
+fn import_snapshots_with_project_stage(
+    args: ImportSnapshotsArgs,
+    allow_project_stage: bool,
+) -> Result<()> {
     set_quiet_timings(true);
     let snapshot_dir = args.snapshot_dir.clone();
     let services = args.services.clone();
-    let changed_paths = import_snapshots_inner(args, true)?;
+    let changed_paths = import_snapshots_inner(args, allow_project_stage)?;
     emit_global_output(
         &json!({
             "ok": true,
@@ -642,11 +670,6 @@ pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
     )
 }
 
-pub(crate) fn import_snapshots_quiet(args: ImportSnapshotsArgs) -> Result<Vec<PathBuf>> {
-    set_quiet_timings(true);
-    import_snapshots_inner(args, true)
-}
-
 fn import_snapshots_inner(
     mut args: ImportSnapshotsArgs,
     allow_project_stage: bool,
@@ -655,18 +678,28 @@ fn import_snapshots_inner(
         apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
     }
     let project_root = resolve_existing_project_root(&args.project_root)?;
+    log_global(
+        5,
+        format_args!(
+            "[renium] import root: allow_stage={} project={} src={}",
+            allow_project_stage,
+            project_root.display(),
+            args.src_dir.display()
+        ),
+    );
     let services = parse_services(&args.services)?;
     if allow_project_stage
         && !args.no_project_write
         && config::try_load_project(None, Some(&project_root))?
             .is_some_and(|loaded| loaded.root == project_root)
     {
-        let stage = ExportProjectStage::create(&project_root, &args.src_dir, &services)?;
+        let mut stage = ExportProjectStage::create(&project_root, &args.src_dir, &services)?;
         args.project_root.clone_from(&stage.import_project_root);
         args.src_dir.clone_from(&stage.import_src_dir);
         import_snapshots_inner(args, false)?;
-        stage.finish_projection(true)?;
-        return stage.publish(&project_root).map(|published| {
+        stage.mark_settings_aligned();
+        stage.finish_projection(false)?;
+        return stage.publish(&project_root, false).map(|published| {
             published
                 .changed_roots
                 .into_iter()
@@ -744,7 +777,7 @@ fn import_snapshots_inner(
         sourcemap_nodes.extend(drained_nodes);
     }
 
-    finish_import_sourcemap(&project_root, sourcemap_nodes, args.no_project_write)?;
+    finish_import_sourcemap(&project_root, sourcemap_nodes)?;
 
     log_global(4, format_args!("[renium] import-snapshots done"));
     let after = collect_publish_hashes(&project_root, &tracked_paths)?;
@@ -769,7 +802,7 @@ fn import_service_inner(mut args: ImportServiceArgs, allow_project_stage: bool) 
         && config::try_load_project(None, Some(&project_root))?
             .is_some_and(|loaded| loaded.root == project_root)
     {
-        let stage = ExportProjectStage::create(
+        let mut stage = ExportProjectStage::create(
             &project_root,
             &args.src_dir,
             std::slice::from_ref(&service),
@@ -777,8 +810,9 @@ fn import_service_inner(mut args: ImportServiceArgs, allow_project_stage: bool) 
         args.project_root.clone_from(&stage.import_project_root);
         args.src_dir.clone_from(&stage.import_src_dir);
         import_service_inner(args, false)?;
-        stage.finish_projection(true)?;
-        stage.publish(&project_root)?;
+        stage.mark_settings_aligned();
+        stage.finish_projection(false)?;
+        stage.publish(&project_root, false)?;
         return Ok(());
     }
     config::refresh_script_naming(&project_root)?;
@@ -800,7 +834,7 @@ fn import_service_inner(mut args: ImportServiceArgs, allow_project_stage: bool) 
     let mut sourcemap_nodes = HashMap::new();
     sourcemap_nodes.insert(service.clone(), node);
 
-    finish_import_sourcemap(&project_root, sourcemap_nodes, args.no_project_write)?;
+    finish_import_sourcemap(&project_root, sourcemap_nodes)?;
 
     println!("[renium] import-service done: {service}");
     Ok(())
@@ -853,13 +887,8 @@ fn syncback_project_adapters_if_configured(project_root: &Path) -> Result<usize>
 fn finish_import_sourcemap(
     project_root: &Path,
     nodes: HashMap<String, SourcemapNode>,
-    update_existing: bool,
 ) -> Result<()> {
-    if update_existing {
-        write_project_sourcemap_with_updates(project_root, nodes)
-    } else {
-        write_project_sourcemap_from_service_nodes(project_root, &nodes)
-    }?;
+    write_project_sourcemap_with_updates(project_root, nodes)?;
     syncback_project_adapters_if_configured(project_root)?;
     Ok(())
 }
@@ -1149,7 +1178,7 @@ pub(crate) fn merge_script_sources(
             instance
                 .properties
                 .entry("Source".to_string())
-                .or_insert_with(|| Value::String("__SOURCE_EXTERNAL__".to_string()));
+                .or_insert_with(|| Value::String(EXTERNAL_SOURCE_MARKER.to_string()));
         }
         instance.source_key = None;
     }
@@ -1167,16 +1196,6 @@ pub(crate) fn resolve_direct_import_workers(requested: usize) -> usize {
         return requested.min(cpu_cap);
     }
     4.min(cpu_cap)
-}
-
-pub(crate) fn resolve_direct_import_drain_workers(
-    requested: usize,
-    active_workers: usize,
-) -> usize {
-    if requested > 0 {
-        return active_workers;
-    }
-    active_workers.max(8.min(direct_import_cpu_cap()))
 }
 
 pub(crate) fn load_service_state(snapshot_dir: &Path, service: &str) -> Result<ServiceState> {
@@ -2618,11 +2637,47 @@ fn write_service_settings_file(
     if fresh_stage {
         write_fresh_service_settings_binary_file(&settings_path, state)?;
     } else {
+        let lock_started = Instant::now();
         let _lock = acquire_settings_file_lock(&settings_path)?;
+        log_timing(
+            &format!("{service}: acquire settings file lock"),
+            lock_started,
+        );
+        let preservation_started = Instant::now();
         let preserved_state =
             state_with_preserved_material_service_settings(service, state, &settings_path)?;
+        log_timing(
+            &format!("{service}: preserve material settings"),
+            preservation_started,
+        );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
-        write_service_settings_binary_file(&settings_path, state_to_write)?;
+        let observed = encode_service_settings_binary(&settings_path, state_to_write)?;
+        let alignment_started = Instant::now();
+        let aligned = match fs::read(&settings_path) {
+            Ok(reference) => match align_settings_bytes_to_reference(&reference, &observed)
+                .with_context(|| format!("Failed to align {}", settings_path.display()))?
+            {
+                SettingsAlignment::Equivalent => None,
+                SettingsAlignment::Changed(aligned) => Some(aligned),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read {}", settings_path.display()));
+            }
+        };
+        log_timing(
+            &format!("{service}: align settings file"),
+            alignment_started,
+        );
+        let publish_started = Instant::now();
+        if let Some(aligned) = aligned {
+            write_bytes_if_changed_in_existing_dir(&settings_path, &aligned)?;
+        }
+        log_timing(
+            &format!("{service}: publish settings file"),
+            publish_started,
+        );
     }
     log_timing(&format!("{service}: write settings file"), started);
     Ok(())
@@ -3013,7 +3068,7 @@ fn write_import_source_file(source_path: &Path, content: &[u8], fresh_stage: boo
 }
 
 fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool) -> Result<()> {
-    if source == "__SOURCE_EXTERNAL__" {
+    if source == EXTERNAL_SOURCE_MARKER {
         if source_path.exists() {
             println!(
                 "[renium] warning: missing fetched Source for {}; keeping the existing file",

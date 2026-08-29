@@ -125,15 +125,21 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::RecordStart(args) => record_start_command(args),
         Commands::RecordEnd(args) => record_end_command(args),
         Commands::Setup(args) => setup_command(args),
-        Commands::StudioChangeState(args) => studio_change_state_command(args),
-        Commands::LiveStart(args) => studio_change_state_operation_command(args, op::LIVE_START),
-        Commands::LiveStop(args) => studio_change_state_operation_command(args, op::LIVE_STOP),
-        Commands::LiveStatus(args) => studio_change_state_operation_command(args, op::LIVE_STATUS),
+        Commands::StudioChangeState(args) => studio_change_state_command(args, project),
+        Commands::LiveStart(args) => {
+            studio_change_state_operation_command(args, op::LIVE_START, project)
+        }
+        Commands::LiveStop(args) => {
+            studio_change_state_operation_command(args, op::LIVE_STOP, project)
+        }
+        Commands::LiveStatus(args) => {
+            studio_change_state_operation_command(args, op::LIVE_STATUS, project)
+        }
         Commands::RetryPending(args) => {
-            studio_change_state_operation_command(args, op::RETRY_PENDING)
+            studio_change_state_operation_command(args, op::RETRY_PENDING, project)
         }
         Commands::DiscardPending(args) => {
-            studio_change_state_operation_command(args, op::DISCARD_PENDING)
+            studio_change_state_operation_command(args, op::DISCARD_PENDING, project)
         }
         Commands::PushEditorChanges(args) => push_editor_changes(args),
         Commands::ApplyEditorProperty(args) => apply_editor_property(args),

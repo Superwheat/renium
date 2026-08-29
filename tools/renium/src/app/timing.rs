@@ -4,6 +4,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::app::output::global_log_enabled;
 
 static QUIET_TIMINGS: AtomicBool = AtomicBool::new(false);
+const TIMING_LOG_LEVEL: u8 = 4;
 
 pub(crate) fn current_millis() -> u128 {
     SystemTime::now()
@@ -16,14 +17,14 @@ pub(crate) fn elapsed_ms(started: Instant) -> f64 {
 }
 
 pub(crate) fn log_timing(label: &str, started: Instant) {
-    if quiet_timings() || !global_log_enabled(3) {
+    if quiet_timings() || !global_log_enabled(TIMING_LOG_LEVEL) {
         return;
     }
     println!("[renium] timing: {label} took {:.1}ms", elapsed_ms(started));
 }
 
 pub(crate) fn log_timing_ms(label: &str, elapsed_ms: f64) {
-    if !global_log_enabled(3) {
+    if !global_log_enabled(TIMING_LOG_LEVEL) {
         return;
     }
     if quiet_timings()
@@ -57,5 +58,5 @@ pub(crate) fn set_quiet_timings(quiet: bool) {
 }
 
 pub(crate) fn verbose_timing_logs() -> bool {
-    !quiet_timings() && global_log_enabled(3)
+    !quiet_timings() && global_log_enabled(TIMING_LOG_LEVEL)
 }

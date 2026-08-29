@@ -23,6 +23,7 @@ use crate::editor::paths::{
     build_editor_source_paths_by_index, script_file_names,
 };
 use crate::editor::sync::is_lua_source_class;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
     encode_settings_bytecode, settings_reference_index, strict_reference_path,
@@ -69,7 +70,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     if is_lua_source_class(&class_name) {
         properties.insert(
             "Source".to_string(),
-            Value::String("__SOURCE_EXTERNAL__".to_string()),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
         );
     }
     let added = instance_api::add_instance(

@@ -19,7 +19,7 @@ local function denseArrayLength(value: any): number?
 	return if count == #value then count else nil
 end
 
-function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
+function BridgeTransactionUpload.create(beginTransaction, transactionBegan, exactValuesEqual)
 	local sessions = {}
 
 	local function removeExpired()
@@ -52,8 +52,13 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 	end
 
 	local api = {}
+	local function assertLease(session, leaseId: string?)
+		if session.leaseId ~= leaseId then
+			error("Editor transaction upload belongs to another request lease")
+		end
+	end
 
-	function api.begin(params)
+	function api.begin(params, leaseId: string?)
 		removeExpired()
 		local id = tostring(params.transactionId or "")
 		local totalChunks = tonumber(params.totalChunks)
@@ -81,12 +86,15 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 		end
 		local session = {
 			transactionId = id,
+			leaseId = leaseId,
 			services = params.services,
 			hasInstanceChanges = params.hasInstanceChanges == true,
 			destructiveServices = params.destructiveServices,
 			nativeImport = params.nativeImport == true,
 			nativeImportServices = params.nativeImportServices,
 			mutationRoots = params.mutationRoots,
+			expectedRuntimeId = params.expectedRuntimeId,
+			expectedStudioGenerations = params.expectedStudioGenerations,
 			totalChunks = totalChunks,
 			rowCount = rowCount,
 			chunks = table.create(totalChunks),
@@ -98,7 +106,7 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 		return { ok = true, transactionId = id }
 	end
 
-	function api.append(params)
+	function api.append(params, leaseId: string?)
 		removeExpired()
 		local id = tostring(params.transactionId or "")
 		local session = sessions[id]
@@ -114,7 +122,13 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 		then
 			error("Invalid editor transaction upload chunk")
 		end
-		if session.chunks[index] == nil then
+		assertLease(session, leaseId)
+		local existingRows = session.chunks[index]
+		if existingRows ~= nil then
+			if not exactValuesEqual(existingRows, params.rows) then
+				error("Editor transaction upload chunk conflicts with an earlier upload")
+			end
+		else
 			if session.receivedRows + rowCount > session.rowCount then
 				error("Editor transaction upload exceeds its declared row count")
 			end
@@ -135,11 +149,10 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 		return { ok = true, rows = rowCount }
 	end
 
-	function api.finish(params)
+	function api.finish(params, leaseId: string?)
 		removeExpired()
 		local id = tostring(params.transactionId or "")
 		local session = sessions[id]
-		sessions[id] = nil
 		if
 			type(session) ~= "table"
 			or session.receivedChunks ~= session.totalChunks
@@ -147,6 +160,7 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 		then
 			error("Editor transaction upload is incomplete")
 		end
+		assertLease(session, leaseId)
 		local transaction = {
 			transactionId = session.transactionId,
 			services = session.services,
@@ -155,6 +169,8 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 			nativeImport = session.nativeImport,
 			nativeImportServices = session.nativeImportServices,
 			mutationRoots = session.mutationRoots,
+			expectedRuntimeId = session.expectedRuntimeId,
+			expectedStudioGenerations = session.expectedStudioGenerations,
 			sourceChanges = {},
 			propertyChanges = {},
 			postCommitPropertyChanges = {},
@@ -171,15 +187,37 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan)
 			end
 		end
 		local result = beginTransaction(transaction)
-		transactionBegan(id, transaction)
+		sessions[id] = nil
+		if result.ok == true then
+			transactionBegan(id, transaction)
+		end
 		return result
 	end
 
-	function api.cancel(params)
+	function api.cancel(params, leaseId: string?)
 		local id = tostring(params.transactionId or "")
-		local found = sessions[id] ~= nil
+		local session = sessions[id]
+		if type(session) == "table" then
+			assertLease(session, leaseId)
+		end
+		local found = session ~= nil
 		sessions[id] = nil
 		return { ok = true, found = found }
+	end
+
+	function api.cancelLease(leaseId: string): number
+		local cancelled = 0
+		for id, session in pairs(sessions) do
+			if session.leaseId == leaseId then
+				sessions[id] = nil
+				cancelled += 1
+			end
+		end
+		return cancelled
+	end
+
+	function api.cleanup()
+		table.clear(sessions)
 	end
 
 	return api

@@ -23,6 +23,13 @@ type ServiceState = {
 	scriptIndices: { number }?,
 	scriptSources: { [string]: string },
 	scriptSourcesByIndex: { [number]: string },
+	nativeLuaSourceIndices: { number }?,
+	nativeNonArchivableIndices: { number }?,
+	nativeStructureGeneration: number?,
+	studioChangeGeneration: number?,
+	nativePreparationProfile: { [string]: number }?,
+	matchedSettingsIds: { { index: number, id: string } }?,
+	matchedSettingsIdVersion: number?,
 	scriptInstances: { [string]: LuaSourceContainer }?,
 	scriptInstancesByIndex: { [number]: LuaSourceContainer }?,
 	scriptKeyByInstance: { [Instance]: string },
@@ -54,6 +61,7 @@ function BridgePluginRuntime.start(context)
 	local rootScript = context.rootScript
 
 	local HttpService = game:GetService("HttpService")
+	local EncodingService = game:GetService("EncodingService")
 	local RunService = game:GetService("RunService")
 	local ScriptEditorService = game:GetService("ScriptEditorService")
 	local Selection = game:GetService("Selection")
@@ -164,9 +172,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.0"
+	local BRIDGE_VERSION = "0.3.1"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1787645055
+	local BRIDGE_BUILD_UNIX = 1787914338
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -247,6 +255,7 @@ function BridgePluginRuntime.start(context)
 	local ParallelModule = requireChildModule("BridgeParallel")
 	local ChunkingModule = requireChildModule("BridgeChunking")
 	local ContentModule = requireChildModule("BridgeContent")
+	local ValueEqualityModule = requireChildModule("BridgeValueEquality")
 	local ValueCodecModule = requireChildModule("BridgeValueCodec")
 	local CODEC_VERSION = if ValueCodecModule.configureNativeNonFiniteJson(HttpService)
 		then "compact-v5-schema-9"
@@ -323,8 +332,15 @@ function BridgePluginRuntime.start(context)
 		expectTagChange = Config.studioChanges.expectTagChange,
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
+		assertRequestLeaseActive = function()
+			editorSync.assertCurrentRequestLeaseActive()
+		end,
 	})
-	Config.creatorApi = requireChildModule("BridgeCreatorApi").create()
+	Config.creatorApi = requireChildModule("BridgeCreatorApi").create({
+		assertRequestLeaseActive = function()
+			editorSync.assertCurrentRequestLeaseActive()
+		end,
+	})
 	function Config.applyBridgeRuntimeSettings(runtimeSettings: { [string]: any })
 		Config.studioChanges.setOptions({
 			syncbackProperties = runtimeSettings.syncbackProperties,
@@ -473,6 +489,7 @@ function BridgePluginRuntime.start(context)
 	Config.studioChanges.configurePropertyCandidates(EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 
 	local stateByService: { [string]: ServiceState }
+	local nativeStateByService: { [string]: ServiceState } = {}
 	local demandSerializerGate = Instance.new("BindableEvent")
 	local activeDemandSerializers = 0
 	stateByService = {}
@@ -615,6 +632,18 @@ function BridgePluginRuntime.start(context)
 			or not instance:IsA("Player") and not instance:FindFirstAncestorWhichIsA("Player")
 	end
 	Config.includeExportInstance = includeExportInstance
+	local nativeStructureGenerationByService: { [string]: number } = {}
+	for serviceName in pairs(ALLOWED_SERVICES) do
+		nativeStructureGenerationByService[serviceName] = 0
+		local service = game:GetService(serviceName)
+		local function markStructureChanged(instance: Instance)
+			if includeExportInstance(serviceName, instance) then
+				nativeStructureGenerationByService[serviceName] += 1
+			end
+		end
+		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantAdded:Connect(markStructureChanged)
+		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantRemoving:Connect(markStructureChanged)
+	end
 
 	function Config.updateStatusText()
 		local statusState = {
@@ -641,8 +670,11 @@ function BridgePluginRuntime.start(context)
 		Config.updateStatusText()
 	end
 
+	local refreshMatchedSettingsIds
+	local matchedSettingsIdsForRange
 	editorSync = EditorSyncModule.create({
 		stats = editorSyncStats,
+		runtimeId = Config.bridgeRuntimeId,
 		allowedServices = ALLOWED_SERVICES,
 		maxChangesPerRequest = 5000,
 		maxInstanceEntriesPerChange = 5000,
@@ -654,7 +686,57 @@ function BridgePluginRuntime.start(context)
 			return getState(serviceName)
 		end,
 		prepareNativeState = function(serviceName: string, scriptSourcesByInstance)
-			local _, state = prepareService(serviceName, true, nil, scriptSourcesByInstance)
+			local structureGeneration = nativeStructureGenerationByService[serviceName] or 0
+			local studioChangeGeneration = if Config.studioChanges.isTracking(serviceName)
+				then Config.studioChanges.serviceGeneration(serviceName)
+				else nil
+			local cached = nativeStateByService[serviceName]
+			if cached ~= nil and cached.nativeStructureGeneration == structureGeneration then
+				if studioChangeGeneration == nil or cached.studioChangeGeneration ~= studioChangeGeneration then
+					table.clear(cached.batchCacheByKey)
+					table.clear(cached.batchCacheKeys)
+				end
+				table.clear(cached.sourceBatchCacheByKey)
+				table.clear(cached.sourceBatchCacheKeys)
+				table.clear(cached.scriptObjects)
+				table.clear(cached.scriptSourcesByIndex)
+				for _, instanceIndex in ipairs(cached.nativeLuaSourceIndices or {}) do
+					local instance = cached.instances[instanceIndex]
+					local source = if scriptSourcesByInstance then scriptSourcesByInstance[instance] else nil
+					if source ~= nil then
+						cached.scriptObjects[#cached.scriptObjects + 1] = instance
+						cached.scriptSourcesByIndex[instanceIndex] = source
+					end
+				end
+				local nonArchivableInstances = cached.nonArchivableInstances or {}
+				local nonArchivableIndices = cached.nativeNonArchivableIndices or {}
+				table.clear(nonArchivableInstances)
+				table.clear(nonArchivableIndices)
+				local nonArchivableInstance = nil
+				if Config.studioChanges.hasNonArchivable(serviceName) ~= false then
+					for instanceIndex, instance in ipairs(cached.instances) do
+						if not instance.Archivable then
+							nonArchivableInstance = nonArchivableInstance or instance
+							nonArchivableInstances[#nonArchivableInstances + 1] = instance
+							nonArchivableIndices[#nonArchivableIndices + 1] = instanceIndex
+						end
+					end
+				end
+				cached.nonArchivableInstance = nonArchivableInstance
+				cached.nonArchivableInstances = nonArchivableInstances
+				cached.nativeNonArchivableIndices = nonArchivableIndices
+				if refreshMatchedSettingsIds(cached) then
+					table.clear(cached.batchCacheByKey)
+					table.clear(cached.batchCacheKeys)
+				end
+				cached.studioChangeGeneration = studioChangeGeneration
+				return cached
+			end
+			local trackedInstances = Config.studioChanges.exportInstances(serviceName)
+			local _, state = prepareService(serviceName, true, nil, scriptSourcesByInstance, trackedInstances)
+			state.nativeStructureGeneration = structureGeneration
+			state.studioChangeGeneration = studioChangeGeneration
+			nativeStateByService[serviceName] = state
 			return state
 		end,
 		includeExportInstance = includeExportInstance,
@@ -666,6 +748,7 @@ function BridgePluginRuntime.start(context)
 		end,
 		invalidateService = function(serviceName: string)
 			stateByService[serviceName] = nil
+			nativeStateByService[serviceName] = nil
 		end,
 		updateStatus = Config.updateStatusText,
 		getSyncOptions = function()
@@ -697,6 +780,56 @@ function BridgePluginRuntime.start(context)
 		hasNonArchivable = Config.studioChanges.hasNonArchivable,
 		trackedExportInstances = Config.studioChanges.exportInstances,
 	})
+
+	refreshMatchedSettingsIds = function(state: ServiceState)
+		local version = editorSync.matchedSettingsIdVersion()
+		if state.matchedSettingsIdVersion == version then
+			return false
+		end
+		local rows = {}
+		if version > 0 then
+			for index, instance in ipairs(state.instances) do
+				local settingsId = editorSync.matchedSettingsId(instance)
+				if settingsId ~= nil then
+					rows[#rows + 1] = { index = index, id = settingsId }
+				end
+			end
+		end
+		state.matchedSettingsIds = rows
+		state.matchedSettingsIdVersion = version
+		return true
+	end
+
+	matchedSettingsIdsForRange = function(
+		state: ServiceState,
+		startIndex: number,
+		count: number
+	): { { any } }?
+		refreshMatchedSettingsIds(state)
+		local finish = startIndex + count - 1
+		local rows = {}
+		local matched = state.matchedSettingsIds or {}
+		local low = 1
+		local high = #matched + 1
+		while low < high do
+			local middle = math.floor((low + high) / 2)
+			if matched[middle].index < startIndex then
+				low = middle + 1
+			else
+				high = middle
+			end
+		end
+		for index = low, #matched do
+			local row = matched[index]
+			if row.index > finish then
+				break
+			end
+			if row.index >= startIndex and row.index <= finish then
+				rows[#rows + 1] = { row.index - startIndex + 1, row.id }
+			end
+		end
+		return if #rows > 0 then rows else nil
+	end
 	local function tryReadModelPivotProperty(instance: Instance, propertyName: string): (boolean, any)
 		if not (instance:IsA("Model") or instance:IsA("WorldModel")) then
 			return false, nil
@@ -1109,28 +1242,7 @@ function BridgePluginRuntime.start(context)
 			+ (if value.Front then 32 else 0)
 	end
 
-	local function deepEqual(a: any, b: any): boolean
-		if a == b then
-			return true
-		end
-		if type(a) ~= type(b) then
-			return false
-		end
-		if type(a) ~= "table" then
-			return false
-		end
-		for k, v in pairs(a) do
-			if not deepEqual(v, b[k]) then
-				return false
-			end
-		end
-		for k, _ in pairs(b) do
-			if a[k] == nil then
-				return false
-			end
-		end
-		return true
-	end
+	local deepEqual = ValueEqualityModule.exactValuesEqual
 
 	local function normalizePropertyName(name: string): string
 		return string.match(name, "^%s*(.-)%s*$")
@@ -1229,7 +1341,6 @@ function BridgePluginRuntime.start(context)
 		local ok, probe = pcall(Instance.new, className)
 		if not ok or probe == nil then
 			DEFAULT_PROPERTY_CACHE[className] = NO_DEFAULTS
-			CLASS_PROPERTY_CANDIDATES_CACHE[className] = NO_PROPERTIES
 			return nil
 		end
 
@@ -1320,52 +1431,81 @@ function BridgePluginRuntime.start(context)
 		return cached
 	end
 
-	local function configurePropertyCandidates(payload: any): { [string]: any }
-		if type(payload) ~= "table" then
-			error("configurePropertyCandidates expects table payload")
-		end
-
-		local function sanitizeSchemaEntry(className: string, rawEntry: any): { any }?
-			if type(rawEntry) == "string" then
-				local normalized = normalizePropertyName(rawEntry)
-				if normalized == "" then
-					error("Property candidate names must not be empty")
-				end
-				if shouldSkipStructuralTransportProperty(className, normalized) then
-					return nil
-				end
-				return { normalized, COMPACT_TYPE_IDS.String, false }
-			end
-			if type(rawEntry) ~= "table" then
-				error("Property candidate entries must be strings or arrays")
-			end
-			local rawName = rawEntry[1]
-			local rawTypeId = rawEntry[2]
-			if type(rawName) ~= "string" or rawName == "" then
-				error("Property candidate names must be non-empty strings")
-			end
-			if
-				type(rawTypeId) ~= "number"
-				or rawTypeId ~= rawTypeId
-				or rawTypeId % 1 ~= 0
-				or rawTypeId < COMPACT_TYPE_IDS.Bool
-				or rawTypeId > COMPACT_TYPE_IDS.Ray
-			then
-				error("Property candidate type IDs must be supported integers")
-			end
-			local normalized = normalizePropertyName(rawName)
+	local function sanitizePropertySchemaEntry(className: string, rawEntry: any): { any }?
+		if type(rawEntry) == "string" then
+			local normalized = normalizePropertyName(rawEntry)
 			if normalized == "" then
 				error("Property candidate names must not be empty")
 			end
 			if shouldSkipStructuralTransportProperty(className, normalized) then
 				return nil
 			end
-			local rawEnumType = rawEntry[3]
-			if rawEnumType ~= nil and rawEnumType ~= false and (type(rawEnumType) ~= "string" or rawEnumType == "") then
-				error("Property candidate enum types must be non-empty strings")
+			return { normalized, COMPACT_TYPE_IDS.String, false }
+		end
+		if type(rawEntry) ~= "table" then
+			error("Property candidate entries must be strings or arrays")
+		end
+
+		local rawName = rawEntry[1]
+		local rawTypeId = rawEntry[2]
+		if type(rawName) ~= "string" or rawName == "" then
+			error("Property candidate names must be non-empty strings")
+		end
+		if
+			type(rawTypeId) ~= "number"
+			or rawTypeId ~= rawTypeId
+			or rawTypeId % 1 ~= 0
+			or rawTypeId < COMPACT_TYPE_IDS.Bool
+			or rawTypeId > COMPACT_TYPE_IDS.Ray
+		then
+			error("Property candidate type IDs must be supported integers")
+		end
+
+		local normalized = normalizePropertyName(rawName)
+		if normalized == "" then
+			error("Property candidate names must not be empty")
+		end
+		if shouldSkipStructuralTransportProperty(className, normalized) then
+			return nil
+		end
+
+		local rawEnumType = rawEntry[3]
+		if rawEnumType ~= nil and rawEnumType ~= false and (type(rawEnumType) ~= "string" or rawEnumType == "") then
+			error("Property candidate enum types must be non-empty strings")
+		end
+		return { normalized, rawTypeId, if type(rawEnumType) == "string" then rawEnumType else false }
+	end
+
+	local function sanitizePropertySchema(className: string, entries: { any }): { any }
+		local numericEntryCount = 0
+		for key in pairs(entries) do
+			if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+				error("Property candidate class entries must be dense arrays")
 			end
-			local enumType = if type(rawEnumType) == "string" then rawEnumType else false
-			return { normalized, rawTypeId, enumType }
+			numericEntryCount += 1
+		end
+		if numericEntryCount == 0 or numericEntryCount ~= #entries then
+			error("Property candidate class entries must be non-empty dense arrays")
+		end
+
+		local sanitizedSchema = {}
+		local seen: { [string]: boolean } = {}
+		for _, rawEntry in ipairs(entries) do
+			local schemaEntry = sanitizePropertySchemaEntry(className, rawEntry)
+			if schemaEntry then
+				local key = propertyKey(schemaEntry[1])
+				if not seen[key] then
+					seen[key] = true
+					sanitizedSchema[#sanitizedSchema + 1] = schemaEntry
+				end
+			end
+		end
+		return sanitizedSchema
+	end
+
+	local function configurePropertyCandidates(payload: any): { [string]: any }
+		if type(payload) ~= "table" then
+			error("configurePropertyCandidates expects table payload")
 		end
 
 		local configuredSchemas = {}
@@ -1375,29 +1515,7 @@ function BridgePluginRuntime.start(context)
 			if type(className) ~= "string" or className == "" or type(names) ~= "table" then
 				error("Property candidate classes must map non-empty class names to arrays")
 			end
-			local numericEntryCount = 0
-			for key in pairs(names) do
-				if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
-					error("Property candidate class entries must be dense arrays")
-				end
-				numericEntryCount += 1
-			end
-			if numericEntryCount == 0 or numericEntryCount ~= #names then
-				error("Property candidate class entries must be non-empty dense arrays")
-			end
-
-			local sanitizedSchema = {}
-			local seen: { [string]: boolean } = {}
-			for _, rawEntry in ipairs(names) do
-				local schemaEntry = sanitizeSchemaEntry(className, rawEntry)
-				if schemaEntry then
-					local key = propertyKey(schemaEntry[1])
-					if not seen[key] then
-						seen[key] = true
-						sanitizedSchema[#sanitizedSchema + 1] = schemaEntry
-					end
-				end
-			end
+			local sanitizedSchema = sanitizePropertySchema(className, names)
 			if #sanitizedSchema > 0 then
 				configuredSchemas[className] = sanitizedSchema
 				configuredClassCount += 1
@@ -2546,6 +2664,56 @@ function BridgePluginRuntime.start(context)
 		end,
 	}
 
+	local function compactPropertyMask(maskWords: { number }?, maskWordCount: number): any
+		if maskWords == nil or maskWordCount == 0 then
+			return false
+		end
+		if maskWordCount == 1 then
+			return maskWords[1] or 0
+		end
+		local denseMask = table.create(maskWordCount)
+		for index = 1, maskWordCount do
+			denseMask[index] = maskWords[index] or 0
+		end
+		return denseMask
+	end
+
+	local function buildCompactV5Row(
+		state: ServiceState,
+		instance: Instance,
+		instanceIndex: number,
+		classValue: any,
+		parentIndex: number?,
+		attributes: any,
+		propertyMask: any,
+		propertyValues: any,
+		compactOverlay: boolean?,
+		strings: { string },
+		stringIds: { [string]: number },
+		internString: (any, any, string) -> number
+	): any
+		local hasProperties = propertyMask or propertyValues
+		if compactOverlay then
+			if not hasProperties then
+				return if attributes then { classValue, attributes } else false
+			end
+			return if attributes
+				then { classValue, attributes, propertyMask, propertyValues }
+				else { classValue, false, propertyMask, propertyValues }
+		end
+
+		local nameId = internString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
+		local parentValue = parentIndex or false
+		if not hasProperties then
+			return if attributes
+				then { nameId, classValue, parentValue, attributes }
+				else { nameId, classValue, parentValue }
+		end
+		return if attributes
+			then { nameId, classValue, parentValue, attributes, propertyMask, propertyValues }
+			else { nameId, classValue, parentValue, propertyMask, propertyValues }
+	end
+
 	function Config.buildCompactV5Exporter(className: string, hotSchema: { [string]: any }, useFallbackMap: boolean?)
 		local propertyCount = hotSchema.count
 		local propertyNames = hotSchema.names
@@ -2725,117 +2893,22 @@ function BridgePluginRuntime.start(context)
 					end
 				end
 
-				local compactMask = false
-				if maskWords ~= nil and maskWordCount > 0 then
-					if maskWordCount == 1 then
-						compactMask = maskWords[1] or 0
-					else
-						local denseMask = table.create(maskWordCount)
-						for i = 1, maskWordCount do
-							denseMask[i] = maskWords[i] or 0
-						end
-						compactMask = denseMask
-					end
-				end
-
+				local compactMask = compactPropertyMask(maskWords, maskWordCount)
 				local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
-
-				if compactOverlay then
-					if not compactMask and not compactValues then
-						if not attributes then
-							return false, 0, 0, 0, 0, 0, 0, 0
-						end
-						return {
-							classValue,
-							attributes,
-						}, 0, 0, 0, 0, 0, 0, 0
-					end
-					if not attributes then
-						return {
-							classValue,
-							false,
-							compactMask,
-							compactValues,
-						},
-							0,
-							0,
-							0,
-							0,
-							0,
-							0,
-							0
-					end
-					return {
-						classValue,
-						attributes,
-						compactMask,
-						compactValues,
-					},
-						0,
-						0,
-						0,
-						0,
-						0,
-						0,
-						0
-				end
-
-				local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
-				if not compactMask and not compactValues then
-					if not attributes then
-						return {
-							nameId,
-							classValue,
-							parentIndex or false,
-						},
-							0,
-							0,
-							0,
-							0,
-							0,
-							0,
-							0
-					end
-					return {
-						nameId,
-						classValue,
-						parentIndex or false,
-						attributes,
-					},
-						0,
-						0,
-						0,
-						0,
-						0,
-						0,
-						0
-				end
-
-				if not attributes then
-					return {
-						nameId,
-						classValue,
-						parentIndex or false,
-						compactMask,
-						compactValues,
-					},
-						0,
-						0,
-						0,
-						0,
-						0,
-						0,
-						0
-				end
-
-				return {
-					nameId,
+				return buildCompactV5Row(
+					state,
+					instance,
+					instanceIndex,
 					classValue,
-					parentIndex or false,
+					parentIndex,
 					attributes,
 					compactMask,
 					compactValues,
-				},
+					compactOverlay,
+					strings,
+					stringIds,
+					internBatchString
+				),
 					0,
 					0,
 					0,
@@ -3045,131 +3118,22 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 
-			local compactMask = false
-			if maskWords ~= nil and maskWordCount > 0 then
-				if maskWordCount == 1 then
-					compactMask = maskWords[1] or 0
-				else
-					local denseMask = table.create(maskWordCount)
-					for i = 1, maskWordCount do
-						denseMask[i] = maskWords[i] or 0
-					end
-					compactMask = denseMask
-				end
-			end
-
+			local compactMask = compactPropertyMask(maskWords, maskWordCount)
 			local compactValues = if valuesOut ~= nil and valueWriteIndex > 0 then valuesOut else false
-
-			if compactOverlay then
-				if not compactMask and not compactValues then
-					if not attributes then
-						return false,
-							modifiedDefaultChecks,
-							modifiedDefaultElided,
-							modifiedDefaultValidationReads,
-							modifiedDefaultRuntimeDenylistCount,
-							propertiesRead,
-							propertiesEncoded,
-							propertiesDefaultSkipped
-					end
-					return {
-						classValue,
-						attributes,
-					},
-						modifiedDefaultChecks,
-						modifiedDefaultElided,
-						modifiedDefaultValidationReads,
-						modifiedDefaultRuntimeDenylistCount,
-						propertiesRead,
-						propertiesEncoded,
-						propertiesDefaultSkipped
-				end
-				if not attributes then
-					return {
-						classValue,
-						false,
-						compactMask,
-						compactValues,
-					},
-						modifiedDefaultChecks,
-						modifiedDefaultElided,
-						modifiedDefaultValidationReads,
-						modifiedDefaultRuntimeDenylistCount,
-						propertiesRead,
-						propertiesEncoded,
-						propertiesDefaultSkipped
-				end
-				return {
-					classValue,
-					attributes,
-					compactMask,
-					compactValues,
-				},
-					modifiedDefaultChecks,
-					modifiedDefaultElided,
-					modifiedDefaultValidationReads,
-					modifiedDefaultRuntimeDenylistCount,
-					propertiesRead,
-					propertiesEncoded,
-					propertiesDefaultSkipped
-			end
-
-			local nameId = internBatchString(strings, stringIds, state.nameByIndex[instanceIndex] or instance.Name)
-			if not compactMask and not compactValues then
-				if not attributes then
-					return {
-						nameId,
-						classValue,
-						parentIndex or false,
-					},
-						modifiedDefaultChecks,
-						modifiedDefaultElided,
-						modifiedDefaultValidationReads,
-						modifiedDefaultRuntimeDenylistCount,
-						propertiesRead,
-						propertiesEncoded,
-						propertiesDefaultSkipped
-				end
-				return {
-					nameId,
-					classValue,
-					parentIndex or false,
-					attributes,
-				},
-					modifiedDefaultChecks,
-					modifiedDefaultElided,
-					modifiedDefaultValidationReads,
-					modifiedDefaultRuntimeDenylistCount,
-					propertiesRead,
-					propertiesEncoded,
-					propertiesDefaultSkipped
-			end
-
-			if not attributes then
-				return {
-					nameId,
-					classValue,
-					parentIndex or false,
-					compactMask,
-					compactValues,
-				},
-					modifiedDefaultChecks,
-					modifiedDefaultElided,
-					modifiedDefaultValidationReads,
-					modifiedDefaultRuntimeDenylistCount,
-					propertiesRead,
-					propertiesEncoded,
-					propertiesDefaultSkipped
-			end
-
-			return {
-				nameId,
+			return buildCompactV5Row(
+				state,
+				instance,
+				instanceIndex,
 				classValue,
-				parentIndex or false,
+				parentIndex,
 				attributes,
 				compactMask,
 				compactValues,
-			},
+				compactOverlay,
+				strings,
+				stringIds,
+				internBatchString
+			),
 				modifiedDefaultChecks,
 				modifiedDefaultElided,
 				modifiedDefaultValidationReads,
@@ -3386,8 +3350,10 @@ function BridgePluginRuntime.start(context)
 		serviceName: string,
 		nativeExportOnly: boolean?,
 		nativeSnapshot: { [string]: any }?,
-		nativeScriptSourcesOverride: { [Instance]: string }?
+		nativeScriptSourcesOverride: { [Instance]: string }?,
+		nativeInstancesOverride: { Instance }?
 	): ({ [string]: any }?, ServiceState)
+		local prepareStarted = os.clock()
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
 		end
@@ -3395,38 +3361,54 @@ function BridgePluginRuntime.start(context)
 
 		local nativeExport = nativeExportOnly == true
 		local snapshotInstances = if nativeExport and nativeSnapshot then nativeSnapshot.instances else nil
-		local descendants = snapshotInstances or service:GetDescendants()
-		if not snapshotInstances then
+		local providedInstances = snapshotInstances
+		if providedInstances == nil and nativeExport and nativeInstancesOverride and nativeInstancesOverride[1] == service then
+			providedInstances = nativeInstancesOverride
+		end
+		local descendants = providedInstances or service:GetDescendants()
+		if not providedInstances then
 			local excludedRoots = excludedExportRoots(serviceName, service)
 			local descendantCount = #descendants
 			local includedCount = 0
-			for index = 1, descendantCount do
-				local instance = descendants[index]
-				local included = includeExportInstance(serviceName, instance)
-				if included then
-					for _, root in ipairs(excludedRoots) do
-						if instance == root or instance:IsDescendantOf(root) then
-							included = false
-							break
-						end
+			if #excludedRoots == 0 then
+				for index = 1, descendantCount do
+					local instance = descendants[index]
+					if instance.ClassName ~= "TouchTransmitter" then
+						includedCount += 1
+						descendants[includedCount] = instance
 					end
 				end
-				if included then
-					includedCount += 1
-					descendants[includedCount] = instance
+			else
+				local excludedByInstance = {}
+				for _, root in ipairs(excludedRoots) do
+					excludedByInstance[root] = true
+				end
+				for index = 1, descendantCount do
+					local instance = descendants[index]
+					local excluded = excludedByInstance[instance] == true
+						or excludedByInstance[instance.Parent] == true
+					if excluded then
+						excludedByInstance[instance] = true
+					elseif instance.ClassName ~= "TouchTransmitter" then
+						includedCount += 1
+						descendants[includedCount] = instance
+					end
 				end
 			end
 			for index = includedCount + 1, descendantCount do
 				descendants[index] = nil
 			end
 		end
-		local expectedCount = if snapshotInstances then #snapshotInstances else #descendants + 1
+		local enumerationMs = (os.clock() - prepareStarted) * 1000
+		local expectedCount = if providedInstances then #providedInstances else #descendants + 1
 		local instances = table.create(expectedCount)
-		instances[1] = if snapshotInstances then snapshotInstances[1] else service
+		instances[1] = if providedInstances then providedInstances[1] else service
 		local instanceCount = 1
 
 		local scriptObjects = {}
 		local scriptCount = 0
+		local nativeLuaSourceIndices = if nativeExport then {} else nil
+		local nativeNonArchivableIndices = if nativeExport then {} else nil
 		local classNames = {}
 		local classIdByName = {}
 		local nameByIndex = if nativeExport then {} else table.create(expectedCount)
@@ -3457,9 +3439,15 @@ function BridgePluginRuntime.start(context)
 		local scriptSourcesByIndex = {}
 		local nonArchivableInstances = {}
 		local nonArchivableInstance
+		local descendantsAreArchivable = nativeExport
+			and not snapshotInstances
+			and Config.studioChanges.hasNonArchivable(serviceName) == false
 		if not snapshotInstances and not service.Archivable then
 			nonArchivableInstance = service
 			nonArchivableInstances[1] = service
+			if nativeNonArchivableIndices then
+				nativeNonArchivableIndices[1] = 1
+			end
 		end
 		local nativeDebugIdData = if nativeSnapshot
 			then nativeSnapshot.debugIdBuffer
@@ -3479,8 +3467,9 @@ function BridgePluginRuntime.start(context)
 			scriptObjects[scriptCount] = service
 		end
 
+		local instanceScanStarted = os.clock()
 		local yieldIfNeeded = if nativeExport then nil else makeExportBurstYielder()
-		local firstDescendant = if snapshotInstances then 2 else 1
+		local firstDescendant = if providedInstances then 2 else 1
 		for descendantIndex = firstDescendant, #descendants do
 			local inst = descendants[descendantIndex]
 			instanceCount += 1
@@ -3500,15 +3489,19 @@ function BridgePluginRuntime.start(context)
 			classNameByIndex[instanceCount] = className
 			classValueByIndex[instanceCount] = classIdByName[className] or className
 			if nativeExport then
-				if not inst.Archivable then
+				if not descendantsAreArchivable and not inst.Archivable then
 					nonArchivableInstance = nonArchivableInstance or inst
 					nonArchivableInstances[#nonArchivableInstances + 1] = inst
+					nativeNonArchivableIndices[#nativeNonArchivableIndices + 1] = instanceCount
 				end
-				local source = if nativeScriptSources then nativeScriptSources[inst] else nil
-				if source ~= nil and Config.LUA_SOURCE_CLASS[className] then
-					scriptCount += 1
-					scriptObjects[scriptCount] = inst
-					scriptSourcesByIndex[instanceCount] = source
+				if Config.LUA_SOURCE_CLASS[className] then
+					nativeLuaSourceIndices[#nativeLuaSourceIndices + 1] = instanceCount
+					local source = if nativeScriptSources then nativeScriptSources[inst] else nil
+					if source ~= nil then
+						scriptCount += 1
+						scriptObjects[scriptCount] = inst
+						scriptSourcesByIndex[instanceCount] = source
+					end
 				end
 			else
 				local parent = inst.Parent
@@ -3531,10 +3524,13 @@ function BridgePluginRuntime.start(context)
 				yieldIfNeeded()
 			end
 		end
+		local instanceScanMs = (os.clock() - instanceScanStarted) * 1000
 
+		local debugFinalizeStarted = os.clock()
 		if nativeDebugIdData and not nativeSnapshot and typeof(nativeDebugIdData) ~= "buffer" then
 			nativeDebugIdData = buffer.fromstring(table.concat(nativeDebugIdData, "\0"))
 		end
+		local debugFinalizeMs = (os.clock() - debugFinalizeStarted) * 1000
 
 		local state: ServiceState = {
 			instances = instances,
@@ -3565,6 +3561,12 @@ function BridgePluginRuntime.start(context)
 			scriptIndices = nil,
 			scriptSources = {},
 			scriptSourcesByIndex = scriptSourcesByIndex,
+			nativeLuaSourceIndices = nativeLuaSourceIndices,
+			nativeNonArchivableIndices = nativeNonArchivableIndices,
+			nativeStructureGeneration = nil,
+			nativePreparationProfile = nil,
+			matchedSettingsIds = nil,
+			matchedSettingsIdVersion = nil,
 			scriptInstances = nil,
 			scriptInstancesByIndex = nil,
 			scriptKeyByInstance = scriptKeyByInstance,
@@ -3583,6 +3585,15 @@ function BridgePluginRuntime.start(context)
 			modifiedDefaultRuntimeDenylist = {},
 			exportMetrics = Config.newExportMetrics(),
 			exportMetricsSinceLastRead = Config.newExportMetrics(),
+		}
+		local matchedSettingsIdsStarted = os.clock()
+		refreshMatchedSettingsIds(state)
+		state.nativePreparationProfile = {
+			enumerationMs = enumerationMs,
+			instanceScanMs = instanceScanMs,
+			debugFinalizeMs = debugFinalizeMs,
+			matchedSettingsIdsMs = (os.clock() - matchedSettingsIdsStarted) * 1000,
+			totalMs = (os.clock() - prepareStarted) * 1000,
 		}
 
 		if nativeExport then
@@ -3688,69 +3699,83 @@ function BridgePluginRuntime.start(context)
 		return candidate == instanceIndex
 	end
 
+	local function readPackedInstanceIndex(packed: buffer, offset: number): number
+		return buffer.readu8(packed, offset)
+			+ bit32.lshift(buffer.readu8(packed, offset + 1), 8)
+			+ bit32.lshift(buffer.readu8(packed, offset + 2), 16)
+	end
+
+	local function decodeNativeRefSelection(rawSelection: { [any]: any }): any
+		if type(rawSelection.packed) == "string" then
+			local packed = EncodingService:Base64Decode(buffer.fromstring(rawSelection.packed))
+			local count = tonumber(rawSelection.count)
+			if not count or count < 1 or count % 1 ~= 0 or buffer.len(packed) ~= count * 3 then
+				error("Invalid native reference selection")
+			end
+			local indices = table.create(count)
+			for index = 1, count do
+				indices[index] = readPackedInstanceIndex(packed, (index - 1) * 3)
+			end
+			return {
+				packed = packed,
+				offset = 0,
+				candidate = indices[1],
+				indices = indices,
+			}
+		end
+
+		local selection = {}
+		local selectedIndices = {}
+		for _, rawIndex in ipairs(rawSelection) do
+			local instanceIndex = tonumber(rawIndex)
+			if instanceIndex and instanceIndex % 1 == 0 and instanceIndex > 0 and not selection[instanceIndex] then
+				selection[instanceIndex] = true
+				selectedIndices[#selectedIndices + 1] = instanceIndex
+			end
+		end
+		if #selectedIndices == 0 then
+			return nil
+		end
+		table.sort(selectedIndices)
+		selection.indices = selectedIndices
+		return selection
+	end
+
+	local function requestedNativeOverlayProperties(propertyNames: { any }?): ({ [string]: number }, { [string]: any })
+		local requested = {}
+		local requestedNativeRefIndices = {}
+		if type(propertyNames) ~= "table" then
+			return requested, requestedNativeRefIndices
+		end
+		for _, propertyEntry in ipairs(propertyNames) do
+			if type(propertyEntry) == "string" then
+				requested[propertyEntry] = 1
+			elseif type(propertyEntry) == "table" and type(propertyEntry[1]) == "string" then
+				local propertyName = propertyEntry[1]
+				local selection = propertyEntry[2]
+				if selection == true then
+					requested[propertyName] = 2
+				elseif type(selection) == "table" then
+					local decodedSelection = decodeNativeRefSelection(selection)
+					if decodedSelection then
+						requested[propertyName] = 3
+						requestedNativeRefIndices[propertyName] = decodedSelection
+					end
+				else
+					requested[propertyName] = 1
+				end
+			end
+		end
+		return requested, requestedNativeRefIndices
+	end
+
 	function Config.getNativeOverlayHotSchema(
 		state: ServiceState,
 		className: string,
 		propertyNames: { any }?
 	): { [string]: any }
 		local source = Config.getHotPropertySchema(state, className)
-		local requested = {}
-		local requestedNativeRefIndices = {}
-		if type(propertyNames) == "table" then
-			for _, propertyEntry in ipairs(propertyNames) do
-				if type(propertyEntry) == "string" then
-					requested[propertyEntry] = 1
-				elseif type(propertyEntry) == "table" and type(propertyEntry[1]) == "string" then
-					if propertyEntry[2] == true then
-						requested[propertyEntry[1]] = 2
-					elseif type(propertyEntry[2]) == "table" then
-						local rawSelection = propertyEntry[2]
-						if type(rawSelection.packed) == "string" then
-							local packed = game:GetService("EncodingService")
-								:Base64Decode(buffer.fromstring(rawSelection.packed))
-							local count = tonumber(rawSelection.count)
-							if not count or count < 1 or count % 1 ~= 0 or buffer.len(packed) ~= count * 3 then
-								error("Invalid native reference selection")
-							end
-							requested[propertyEntry[1]] = 3
-							local indices = table.create(count)
-							for index = 1, count do
-								local offset = (index - 1) * 3
-								indices[index] = buffer.readu8(packed, offset)
-									+ bit32.lshift(buffer.readu8(packed, offset + 1), 8)
-									+ bit32.lshift(buffer.readu8(packed, offset + 2), 16)
-							end
-							requestedNativeRefIndices[propertyEntry[1]] = {
-								packed = packed,
-								offset = 0,
-								candidate = buffer.readu8(packed, 0)
-									+ bit32.lshift(buffer.readu8(packed, 1), 8)
-									+ bit32.lshift(buffer.readu8(packed, 2), 16),
-								indices = indices,
-							}
-						else
-							local indices = {}
-							local selectedIndices = {}
-							for _, rawIndex in ipairs(rawSelection) do
-								local index = tonumber(rawIndex)
-								if index and index % 1 == 0 and index > 0 and not indices[index] then
-									indices[index] = true
-									selectedIndices[#selectedIndices + 1] = index
-								end
-							end
-							if next(indices) then
-								table.sort(selectedIndices)
-								indices.indices = selectedIndices
-								requested[propertyEntry[1]] = 3
-								requestedNativeRefIndices[propertyEntry[1]] = indices
-							end
-						end
-					else
-						requested[propertyEntry[1]] = 1
-					end
-				end
-			end
-		end
+		local requested, requestedNativeRefIndices = requestedNativeOverlayProperties(propertyNames)
 		local fields = {
 			"typeIds",
 			"enumTypes",
@@ -3866,7 +3891,8 @@ function BridgePluginRuntime.start(context)
 		shapeBatchesEnabled: boolean?,
 		stableIdsEnabled: boolean?,
 		overlayId: string?,
-		overlayVariant: string?
+		overlayVariant: string?,
+		overlayCacheKey: string?
 	): string
 		local key = ChunkingModule.getCompactInstanceBatchCacheKey(startIndex, maxCount)
 		if shapeBatchesEnabled then
@@ -3877,7 +3903,9 @@ function BridgePluginRuntime.start(context)
 		if stableIdsEnabled then
 			key ..= ":stable-v1"
 		end
-		if type(overlayId) == "string" and overlayId ~= "" then
+		if type(overlayCacheKey) == "string" and overlayCacheKey ~= "" then
+			key ..= ":overlay-cache:" .. overlayCacheKey
+		elseif type(overlayId) == "string" and overlayId ~= "" then
 			key ..= ":overlay:" .. overlayId
 		end
 		if type(overlayVariant) == "string" and overlayVariant ~= "" then
@@ -3895,18 +3923,24 @@ function BridgePluginRuntime.start(context)
 		overlayPropertiesByClass: { [string]: { any } }?,
 		overlayId: string?,
 		overlayVariant: string?,
+		overlayCacheKey: string?,
 		stateOverride: ServiceState?
 	): (string, number)
 		local state = stateOverride or getState(serviceName)
 		local useShapeBatches = not not shapeBatchesEnabled
 		local includeStableIds = not not stableIdsEnabled
+		if refreshMatchedSettingsIds(state) then
+			table.clear(state.batchCacheByKey)
+			table.clear(state.batchCacheKeys)
+		end
 		local key = Config.getCompactInstanceBatchVariantCacheKey(
 			startIndex,
 			maxCount,
 			useShapeBatches,
 			includeStableIds,
 			overlayId,
-			overlayVariant
+			overlayVariant,
+			overlayCacheKey
 		)
 		local cachedPayload = state.batchCacheByKey[key]
 		if cachedPayload then
@@ -3929,12 +3963,16 @@ function BridgePluginRuntime.start(context)
 					total = total,
 					strings = {},
 					debugIds = if includeStableIds then {} else nil,
+					settingsIds = nil,
 					items = {},
 				}
 			end
 
 			local finish = math.min(total, startPos + take - 1)
 			local count = finish - startPos + 1
+			local settingsIds = if includeStableIds
+				then matchedSettingsIdsForRange(state, startPos, count)
+				else nil
 			local items = table.create(count)
 			local strings = table.create(math.min(count * 2, 65536))
 			local stringIds = {}
@@ -4163,6 +4201,7 @@ function BridgePluginRuntime.start(context)
 					debugIdBuffer = debugIdBuffer,
 					debugIdEncoding = if debugIdBuffer then "nul-text-v1" else nil,
 					debugIdBufferBytes = debugIdBufferBytes,
+					settingsIds = settingsIds,
 					items = classGroups,
 				}
 			end
@@ -4176,6 +4215,7 @@ function BridgePluginRuntime.start(context)
 						strings = strings,
 						shapes = shapes,
 						debugIds = debugIds,
+						settingsIds = settingsIds,
 						items = shapedItems,
 					}
 				end
@@ -4187,6 +4227,7 @@ function BridgePluginRuntime.start(context)
 				total = total,
 				strings = strings,
 				debugIds = debugIds,
+				settingsIds = settingsIds,
 				items = items,
 			}
 		end
@@ -4418,6 +4459,92 @@ function BridgePluginRuntime.start(context)
 		return ChunkingModule.chunkEncodedString(encoded, startIndex, maxLen, encodeMs)
 	end
 
+	local function hashBatchPayload(encoded: string): (string, number)
+		local started = os.clock()
+		local hash = buffer.tostring(
+			EncodingService:Base64Encode(
+				EncodingService:ComputeBufferHash(buffer.fromstring(encoded), Enum.HashAlgorithm.Blake3)
+			)
+		)
+		return hash, (os.clock() - started) * 1000
+	end
+
+	local function tryCompressBatchPayload(encoded: string, maxLen: number, encodeMs: number): { [string]: any }?
+		local started = os.clock()
+		local ok, compressedText = pcall(function()
+			local compressed = EncodingService:CompressBuffer(
+				buffer.fromstring(encoded),
+				Enum.CompressionAlgorithm.Zstd,
+				1
+			)
+			return buffer.tostring(EncodingService:Base64Encode(compressed))
+		end)
+		local compressionMs = (os.clock() - started) * 1000
+		if not ok or type(compressedText) ~= "string" or #compressedText >= #encoded or #compressedText > maxLen then
+			return nil
+		end
+		return {
+			start = 1,
+			nextStart = #compressedText + 1,
+			total = #compressedText,
+			chunk = compressedText,
+			pluginEncodeMs = encodeMs + compressionMs,
+			compression = "zstd-base64-v1",
+			uncompressedBytes = #encoded,
+		}
+	end
+
+	local function removeBatchCacheEntry(state: ServiceState, cacheKey: string)
+		state.batchCacheByKey[cacheKey] = nil
+		for index, cachedKey in ipairs(state.batchCacheKeys) do
+			if cachedKey == cacheKey then
+				table.remove(state.batchCacheKeys, index)
+				return
+			end
+		end
+	end
+
+	local function buildInstanceBatchPayload(
+		encoded: string,
+		encodeMs: number,
+		chunkStart: number?,
+		maxLen: number?,
+		compressedPayloadsEnabled: boolean?,
+		knownPayloadHash: string?,
+		payloadCacheEnabled: boolean?
+	): { [string]: any }
+		local result
+		local payloadHash
+		if payloadCacheEnabled == true then
+			local hashMs
+			payloadHash, hashMs = hashBatchPayload(encoded)
+			encodeMs += hashMs
+			if payloadHash == knownPayloadHash then
+				result = {
+					start = 1,
+					nextStart = 1,
+					total = #encoded,
+					chunk = "",
+					pluginEncodeMs = encodeMs,
+					payloadHash = payloadHash,
+					payloadCacheHit = true,
+				}
+			end
+		end
+
+		local requestedStart = math.max(1, math.floor(tonumber(chunkStart) or 1))
+		local requestedLen = math.clamp(math.floor(tonumber(maxLen) or 2000), 1, 8 * 1024 * 1024)
+		if result == nil and compressedPayloadsEnabled == true and requestedStart == 1 then
+			result = tryCompressBatchPayload(encoded, requestedLen, encodeMs)
+		end
+		if result == nil then
+			result = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
+		end
+		result.payloadHash = payloadHash
+		result.payloadCacheHit = result.payloadCacheHit == true
+		return result
+	end
+
 	function Config.getInstanceBatchCompactChunk(
 		serviceName: string,
 		startIndex: number?,
@@ -4429,7 +4556,11 @@ function BridgePluginRuntime.start(context)
 		overlayPropertiesByClass: { [string]: { any } }?,
 		overlayId: string?,
 		overlayVariant: string?,
-		stateOverride: ServiceState?
+		stateOverride: ServiceState?,
+		compressedPayloadsEnabled: boolean?,
+		knownPayloadHash: string?,
+		payloadCacheEnabled: boolean?,
+		overlayCacheKey: string?
 	): { [string]: any }
 		local encoded, encodeMs = Config.getInstanceBatchCompact(
 			serviceName,
@@ -4440,10 +4571,24 @@ function BridgePluginRuntime.start(context)
 			overlayPropertiesByClass,
 			overlayId,
 			overlayVariant,
+			overlayCacheKey,
 			stateOverride
 		)
-		local result = ChunkingModule.chunkEncodedString(encoded, chunkStart, maxLen, encodeMs)
-		if type(overlayId) == "string" and overlayId ~= "" and result.nextStart > result.total then
+		local result = buildInstanceBatchPayload(
+			encoded,
+			math.max(0, encodeMs or 0),
+			chunkStart,
+			maxLen,
+			compressedPayloadsEnabled,
+			knownPayloadHash,
+			payloadCacheEnabled
+		)
+		if
+			type(overlayId) == "string"
+			and overlayId ~= ""
+			and not (type(overlayCacheKey) == "string" and overlayCacheKey ~= "")
+			and (result.payloadCacheHit or result.nextStart > result.total)
+		then
 			local state = stateOverride or getState(serviceName)
 			local key = Config.getCompactInstanceBatchVariantCacheKey(
 				startIndex,
@@ -4451,15 +4596,10 @@ function BridgePluginRuntime.start(context)
 				not not shapeBatchesEnabled,
 				not not stableIdsEnabled,
 				overlayId,
-				overlayVariant
+				overlayVariant,
+				overlayCacheKey
 			)
-			state.batchCacheByKey[key] = nil
-			for index, cachedKey in ipairs(state.batchCacheKeys) do
-				if cachedKey == key then
-					table.remove(state.batchCacheKeys, index)
-					break
-				end
-			end
+			removeBatchCacheEntry(state, key)
 		end
 		return result
 	end
@@ -4490,6 +4630,30 @@ function BridgePluginRuntime.start(context)
 
 	Config.bridgeMethodHandlers.getBridgeInfo = function()
 		return Config.getBridgeInfo()
+	end
+	Config.bridgeMethodHandlers.cancelRequestLease = function(p)
+		local leaseId = p.leaseId
+		if type(leaseId) ~= "string" or leaseId == "" or #leaseId > 128 then
+			error("Invalid request lease id")
+		end
+		local bridgeResult = Config.cancelBridgeRequestLease(leaseId)
+		local editorResult = editorSync.cancelRequestLease(leaseId)
+		local cancelledUploads = Config.editorTransactionUploads.cancelLease(leaseId)
+		local creatorResult = Config.creatorApi.cancelRequestLease(leaseId)
+		Config.afterBridgeExclusiveIdle(function()
+			local result = editorSync.finishRequestLeaseCancellation(leaseId)
+			for _, transactionId in ipairs(result.transactionIds) do
+				transactionExpectations[transactionId] = nil
+			end
+		end)
+		return {
+			ok = true,
+			active = bridgeResult.active or editorResult.active,
+			queued = bridgeResult.queued,
+			uploads = cancelledUploads,
+			creatorJobs = creatorResult.jobs,
+			cameras = creatorResult.cameras,
+		}
 	end
 	Config.bridgeMethodHandlers.setUpdateStatus = function(p)
 		local version = p.latestVersion
@@ -4684,16 +4848,32 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.cancelEditorReconcile = editorSync.cancelReconcile
 	Config.bridgeMethodHandlers.getEditorFilterCandidates = editorSync.getFilterCandidates
 	Config.bridgeMethodHandlers.getEditorServiceChangeGenerations = editorSync.getServiceChangeGenerations
-	Config.editorTransactionUploads = TransactionUploadModule.create(editorSync.beginTransaction, function(id, params)
-		transactionExpectations[id] = params
-	end)
-	Config.bridgeMethodHandlers.beginEditorTransactionUpload = Config.editorTransactionUploads.begin
-	Config.bridgeMethodHandlers.appendEditorTransactionUpload = Config.editorTransactionUploads.append
-	Config.bridgeMethodHandlers.finishEditorTransactionUpload = Config.editorTransactionUploads.finish
-	Config.bridgeMethodHandlers.cancelEditorTransactionUpload = Config.editorTransactionUploads.cancel
+	Config.editorTransactionUploads = TransactionUploadModule.create(
+		editorSync.beginTransaction,
+		function(id, params)
+			table.clear(transactionExpectations)
+			transactionExpectations[id] = params
+		end,
+		ValueEqualityModule.exactValuesEqual
+	)
+	Config.bridgeMethodHandlers.beginEditorTransactionUpload = function(p, _, leaseId)
+		return Config.editorTransactionUploads.begin(p, leaseId)
+	end
+	Config.bridgeMethodHandlers.appendEditorTransactionUpload = function(p, _, leaseId)
+		return Config.editorTransactionUploads.append(p, leaseId)
+	end
+	Config.bridgeMethodHandlers.finishEditorTransactionUpload = function(p, _, leaseId)
+		return Config.editorTransactionUploads.finish(p, leaseId)
+	end
+	Config.bridgeMethodHandlers.cancelEditorTransactionUpload = function(p, _, leaseId)
+		return Config.editorTransactionUploads.cancel(p, leaseId)
+	end
 	Config.bridgeMethodHandlers.beginEditorTransaction = function(p)
 		local result = editorSync.beginTransaction(p)
-		transactionExpectations[tostring(p.transactionId or "")] = p
+		if result.ok == true then
+			table.clear(transactionExpectations)
+			transactionExpectations[tostring(p.transactionId or "")] = p
+		end
 		return result
 	end
 	Config.bridgeMethodHandlers.commitEditorTransaction = function(p)
@@ -4702,6 +4882,10 @@ function BridgePluginRuntime.start(context)
 		local ok, result = pcall(editorSync.commitTransaction, p)
 		task.defer(Config.studioChanges.endSuppress)
 		if not ok then
+			local state = editorSync.getTransactionState({ transactionId = transactionId })
+			if state.state == "committed" or state.state == "rolledBack" or state.state == "notFound" then
+				transactionExpectations[transactionId] = nil
+			end
 			error(result, 0)
 		end
 		transactionExpectations[transactionId] = nil
@@ -4715,6 +4899,13 @@ function BridgePluginRuntime.start(context)
 		transactionExpectations[transactionId] = nil
 		if not ok then
 			error(result, 0)
+		end
+		return result
+	end
+	Config.bridgeMethodHandlers.getEditorTransactionState = function(p)
+		local result = editorSync.getTransactionState(p)
+		if result.state == "committed" or result.state == "rolledBack" or result.state == "notFound" then
+			transactionExpectations[tostring(p.transactionId or "")] = nil
 		end
 		return result
 	end
@@ -4746,9 +4937,18 @@ function BridgePluginRuntime.start(context)
 		end
 		local runtimeSettingChanges, runtimeSettingsSeq, runtimeSettingChangeCount =
 			Config.getPendingBridgeSettingChanges()
-		local editorActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
+		local pendingActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
 		local compact = p.compact == true
 		if runtimeSettings.twoWaySync == false then
+			local guardState = nil
+			if p.includeGenerations == true then
+				guardState = Config.studioChanges.getState({
+					start = p.start,
+					services = p.services,
+					includeGenerations = true,
+					compact = true,
+				})
+			end
 			return {
 				ok = true,
 				tracking = false,
@@ -4764,8 +4964,11 @@ function BridgePluginRuntime.start(context)
 				runtimeSettingChangeCount = runtimeSettingChangeCount,
 				runtimeSettingsSeq = runtimeSettingsSeq,
 				runtimeId = Config.bridgeRuntimeId,
-				editorActions = if compact then {} else editorActions,
-				editorActionCount = #editorActions,
+				seq = if guardState ~= nil then guardState.seq else nil,
+				serviceGenerations = if guardState ~= nil then guardState.serviceGenerations else nil,
+				editorActions = if compact then {} else pendingActions,
+				editorActionCount = #pendingActions,
+				operation = editorSync.operationState(),
 			}
 		end
 		local changeState = Config.studioChanges.getState(p)
@@ -4773,8 +4976,9 @@ function BridgePluginRuntime.start(context)
 		changeState.runtimeSettingChanges = runtimeSettingChanges
 		changeState.runtimeSettingChangeCount = runtimeSettingChangeCount
 		changeState.runtimeSettingsSeq = runtimeSettingsSeq
-		changeState.editorActions = if compact then {} else editorActions
-		changeState.editorActionCount = #editorActions
+		changeState.editorActions = if compact then {} else pendingActions
+		changeState.editorActionCount = #pendingActions
+		changeState.operation = editorSync.operationState()
 		return changeState
 	end
 
@@ -4848,6 +5052,10 @@ function BridgePluginRuntime.start(context)
 			error("Invalid native export overlay id")
 		end
 		local serviceName = tostring(p.service)
+		local overlayCacheKey = tostring(p.overlayCacheKey or "")
+		if #overlayCacheKey > 128 then
+			error("Invalid native export overlay cache key")
+		end
 		local state = editorSync.getBinaryExportState(overlayId, serviceName)
 		local started = os.clock()
 		local result = Config.getInstanceBatchCompactChunk(
@@ -4861,7 +5069,11 @@ function BridgePluginRuntime.start(context)
 			p.overlayPropertiesByClass,
 			overlayId,
 			tostring(p.overlayVariant or ""),
-			state
+			state,
+			p.supportsCompressedPayload == true,
+			tostring(p.knownPayloadHash or ""),
+			p.supportsPayloadCache == true,
+			overlayCacheKey
 		)
 		editorSync.validateBinaryExportState(overlayId, serviceName)
 		result.pluginServerMs = math.max(0, (os.clock() - started) * 1000 - (result.pluginEncodeMs or 0))
@@ -4904,12 +5116,32 @@ function BridgePluginRuntime.start(context)
 		return "ok"
 	end
 
-	function Config.handleMethod(method: string, params: { [string]: any }, sessionGeneration: number?): any
+	function Config.handleMethod(
+		method: string,
+		params: { [string]: any },
+		sessionGeneration: number?,
+		leaseId: string?
+	): any
 		local handler = Config.bridgeMethodHandlers[method]
 		if not handler then
 			error("Unknown method: " .. tostring(method))
 		end
-		return handler(params, sessionGeneration)
+		local allowCancelled = method == "cancelRequestLease"
+			or method == "getEditorTransactionState"
+			or method == "rollbackEditorTransaction"
+			or method == "cancelEditorTransactionUpload"
+			or method == "cancelEditorBinaryImport"
+			or method == "cancelEditorReconcile"
+			or method == "cancelEditorPushReview"
+			or method == "finishEditorBinaryExport"
+		return editorSync.withRequestLease(
+			leaseId,
+			allowCancelled,
+			handler,
+			params,
+			sessionGeneration,
+			leaseId
+		)
 	end
 
 	Config.perfState = {
@@ -5118,6 +5350,7 @@ function BridgePluginRuntime.start(context)
 					table.clear(lifetimeConnections)
 				end
 				table.clear(Config.editorReviewUploads)
+				Config.editorTransactionUploads.cleanup()
 				editorSync.cleanup()
 				if unloading then
 					Config.studioChanges.stop()
@@ -5128,21 +5361,38 @@ function BridgePluginRuntime.start(context)
 			end
 		end,
 	})
+	local studioChangeStatusUpdatePending = false
 	Config.studioChangeNotificationConnection = Config.studioChanges.onChanged(function()
-		Config.updateStatusText()
-		local runtimeSettings = Config.getBridgeSettings()
-		local pendingCount = Config.studioChanges.pendingChangeCount()
-		if runtimeSettings.notifications ~= false and not Config.hasOpenChannel() and pendingCount > 0 then
-			local threshold = tonumber(runtimeSettings.changesThreshold) or 5
-			local detail = if pendingCount > threshold
-				then `{pendingCount} edits are waiting, above the review threshold of {threshold}.`
-				else if pendingCount == 1
-					then "One edit is waiting to sync."
-					else `{pendingCount} edits are waiting to sync.`
-			ui.notify("disconnected-dirty", "Studio changes are waiting", detail, "Connect", Config.connectAll, true)
-		else
-			ui.dismissNotification("disconnected-dirty")
+		if studioChangeStatusUpdatePending then
+			return
 		end
+		studioChangeStatusUpdatePending = true
+		task.defer(function()
+			studioChangeStatusUpdatePending = false
+			Config.updateStatusText()
+			local runtimeSettings = Config.getBridgeSettings()
+			if runtimeSettings.notifications ~= false and not Config.hasOpenChannel() then
+				local pendingCount = Config.studioChanges.pendingChangeCount()
+				if pendingCount > 0 then
+					local threshold = tonumber(runtimeSettings.changesThreshold) or 5
+					local detail = if pendingCount > threshold
+						then `{pendingCount} edits are waiting, above the review threshold of {threshold}.`
+						else if pendingCount == 1
+							then "One edit is waiting to sync."
+							else `{pendingCount} edits are waiting to sync.`
+					ui.notify(
+						"disconnected-dirty",
+						"Studio changes are waiting",
+						detail,
+						"Connect",
+						Config.connectAll,
+						true
+					)
+					return
+				end
+			end
+			ui.dismissNotification("disconnected-dirty")
+		end)
 	end)
 end
 

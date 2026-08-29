@@ -1,7 +1,7 @@
-<!-- renium-version: 0.3.0 -->
+<!-- renium-version: 0.3.1 -->
 # Renium automation
 
-Use `rbx`. If `PATH` is stale, use `%USERPROFILE%\.renium\bin\rbx.cmd` on Windows or `~/.renium/bin/rbx` on macOS/Linux. Never search editor extension folders.
+Use `rbx`. If `PATH` is stale, use `%USERPROFILE%\.renium\bin\rbx.exe` on Windows or `~/.renium/bin/rbx` on macOS/Linux. Never search editor extension folders.
 
 ## Guide hierarchy
 

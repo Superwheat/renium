@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -292,7 +292,10 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     print_json_output(&result, false)
 }
 
-pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result<()> {
+pub(crate) fn studio_change_state_command(
+    args: StudioChangeStateArgs,
+    project: Option<&Path>,
+) -> Result<()> {
     let operation = if args.stop {
         op::LIVE_STOP
     } else if args.no_start {
@@ -302,16 +305,21 @@ pub(crate) fn studio_change_state_command(args: StudioChangeStateArgs) -> Result
     } else {
         op::LIVE_START
     };
-    studio_change_state_operation_command(args, operation)
+    studio_change_state_operation_command(args, operation, project)
 }
 
 pub(crate) fn studio_change_state_operation_command(
     mut args: StudioChangeStateArgs,
     operation: u16,
+    project: Option<&Path>,
 ) -> Result<()> {
     args.stop = operation == op::LIVE_STOP;
     args.no_start = operation == op::LIVE_STATUS;
     args.clear_pending = operation == op::DISCARD_PENDING;
+    if operation == op::LIVE_START {
+        args.reset = true;
+        args.replace_services = true;
+    }
     let has_preference = args.prefer.is_some();
     let parameters = json!({
         "services": args.services,
@@ -328,16 +336,11 @@ pub(crate) fn studio_change_state_operation_command(
         "contextBound": args.context_bound,
         "resolveConflictPreference": args.prefer,
         "compact": !args.details,
+        "manageFiles": true,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-        return finish_studio_change_state_command(operation, has_preference, result);
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, _listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    let result = studio_change_state_result(args, &bridge)?;
+    let result = daemon_result(operation, project, parameters, false, Some(&args.bridge))?;
     finish_studio_change_state_command(operation, has_preference, result)
 }
 

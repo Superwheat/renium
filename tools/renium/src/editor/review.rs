@@ -108,7 +108,9 @@ pub(crate) fn is_engine_managed_editor_property(
     property_name: &str,
     database: &ReflectionDatabase<'_>,
 ) -> bool {
-    if class_name == MATERIAL_SERVICE_CLASS && property_name == USE_2022_MATERIALS_PROPERTY {
+    if property_name == "Tags"
+        || class_name == MATERIAL_SERVICE_CLASS && property_name == USE_2022_MATERIALS_PROPERTY
+    {
         return false;
     }
     let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
@@ -557,6 +559,19 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
                     }),
                 );
             }
+        }
+        for name in &change.reset_properties {
+            change_count += 1;
+            append_editor_review_entry(
+                &mut rows,
+                &mut row_index_by_key,
+                target(),
+                json!({
+                    "kind": "property",
+                    "name": name,
+                    "reset": true,
+                }),
+            );
         }
         for name in &change.deleted_attributes {
             change_count += 1;

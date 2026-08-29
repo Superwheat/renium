@@ -12,6 +12,7 @@ use crate::roblox::schema::{
     TYPE_ID_PHYSICAL_PROPERTIES, TYPE_ID_RAY, TYPE_ID_RECT, TYPE_ID_REF, TYPE_ID_STRING,
     TYPE_ID_UDIM, TYPE_ID_UDIM2, TYPE_ID_VECTOR2, TYPE_ID_VECTOR3,
 };
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::snapshot::types::{NativeOverlayItem, SnapshotInstance};
 use crate::studio::bridge::SourceBatchMap;
 use crate::studio::native::editor::decode_bridge_buffer;
@@ -106,6 +107,51 @@ pub(crate) fn apply_compact_batch_debug_ids(
             instance.debug_id = Some(debug_id);
         }
     }
+}
+
+pub(crate) fn decode_batch_settings_ids(
+    raw_settings_ids: Vec<Value>,
+    count: usize,
+    label: &str,
+) -> Result<Vec<(usize, String)>> {
+    let mut seen = vec![false; count];
+    let mut out = Vec::with_capacity(raw_settings_ids.len());
+    for raw in raw_settings_ids {
+        let Value::Array(row) = raw else {
+            bail!("{label} row must be an array");
+        };
+        if row.len() != 2 {
+            bail!("{label} row must contain an index and id");
+        }
+        let index = row[0]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|value| value.checked_sub(1))
+            .filter(|index| *index < count)
+            .with_context(|| format!("{label} index is out of range"))?;
+        let settings_id = row[1]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("{label} id must be a non-empty string"))?;
+        if std::mem::replace(&mut seen[index], true) {
+            bail!("{label} index {} is duplicated", index + 1);
+        }
+        out.push((index, settings_id.to_string()));
+    }
+    Ok(out)
+}
+
+pub(crate) fn apply_batch_settings_ids(
+    instances: &mut [SnapshotInstance],
+    settings_ids: Vec<(usize, String)>,
+) -> Result<()> {
+    for (index, settings_id) in settings_ids {
+        let instance = instances
+            .get_mut(index)
+            .context("Settings id index is out of range")?;
+        instance.transported_settings_id = Some(settings_id);
+    }
+    Ok(())
 }
 
 fn string_from_table(strings: &[String], string_id: usize, label: &str) -> Result<String> {
@@ -783,7 +829,7 @@ pub(crate) fn parse_compact_v5_shape_instance_items(
         if script_file_names(&shape.class_name).is_some() {
             properties.insert(
                 "Source".to_string(),
-                Value::String("__SOURCE_EXTERNAL__".to_string()),
+                Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
             );
         }
 
@@ -939,7 +985,7 @@ pub(crate) fn parse_compact_v5_instance_items(
         if script_file_names(&class_name).is_some() {
             properties.insert(
                 "Source".to_string(),
-                Value::String("__SOURCE_EXTERNAL__".to_string()),
+                Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
             );
         }
         out.push(SnapshotInstance {
@@ -985,4 +1031,47 @@ pub(crate) fn parse_source_range_batch(raw: Value) -> Result<SourceBatchMap> {
         out.by_key.insert(key.to_string(), source.to_string());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_settings_ids_are_validated_and_applied() {
+        let decoded = decode_batch_settings_ids(
+            vec![json!([2, "editor:stable"]), json!([4, "editor:moved"])],
+            4,
+            "Test settings id",
+        )
+        .unwrap();
+        let mut instances = vec![SnapshotInstance::default(); 4];
+
+        apply_batch_settings_ids(&mut instances, decoded).unwrap();
+
+        assert_eq!(
+            instances[1].transported_settings_id.as_deref(),
+            Some("editor:stable")
+        );
+        assert_eq!(
+            instances[3].transported_settings_id.as_deref(),
+            Some("editor:moved")
+        );
+    }
+
+    #[test]
+    fn sparse_settings_ids_reject_duplicate_and_out_of_range_indices() {
+        assert!(
+            decode_batch_settings_ids(
+                vec![json!([1, "editor:a"]), json!([1, "editor:b"])],
+                2,
+                "Test settings id",
+            )
+            .is_err()
+        );
+        assert!(
+            decode_batch_settings_ids(vec![json!([3, "editor:a"])], 2, "Test settings id",)
+                .is_err()
+        );
+    }
 }

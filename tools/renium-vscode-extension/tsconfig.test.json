@@ -9,10 +9,10 @@
   },
   "include": [
     "src/cliResolution.ts",
-    "src/conflictMerge.ts",
     "src/gitSync.ts",
     "src/agentInstructions.ts",
     "src/pluginDistribution.ts",
+    "src/pausedFileWrites.ts",
     "test/**/*.ts"
   ],
   "exclude": ["node_modules", "out", "out-test"]

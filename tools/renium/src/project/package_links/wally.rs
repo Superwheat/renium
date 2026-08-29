@@ -677,6 +677,83 @@ pub(crate) fn sync_wally_packages(args: SyncWallyPackagesArgs) -> Result<()> {
     print_json_output(&result, pretty)
 }
 
+struct WallySyncReport {
+    project_root: PathBuf,
+    manifest: PathBuf,
+    realm_results: Vec<Value>,
+    changed_paths: Vec<String>,
+    target_settings_ids: Vec<String>,
+    removed_targets: Vec<Value>,
+    applied: usize,
+    skipped: usize,
+    wally_result: Value,
+}
+
+impl WallySyncReport {
+    fn into_value(self, details: bool) -> Result<Value> {
+        let primary_fields = self
+            .realm_results
+            .iter()
+            .find(|value| value.get("skipped").and_then(Value::as_bool) == Some(false))
+            .or_else(|| self.realm_results.first())
+            .map(|primary| {
+                ["service", "targetName", "settingsFile"]
+                    .into_iter()
+                    .filter_map(|key| {
+                        primary
+                            .get(key)
+                            .filter(|value| !value.is_null())
+                            .map(|value| (key.to_string(), value.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let compact_realms = self
+            .realm_results
+            .iter()
+            .map(|realm| {
+                let mut compact = json!({
+                    "realm": realm.get("realm"),
+                    "service": realm.get("service"),
+                    "targetName": realm.get("targetName"),
+                    "skipped": realm.get("skipped"),
+                });
+                if let Some(removed) = realm.get("removed") {
+                    compact["removed"] = removed.clone();
+                }
+                compact
+            })
+            .collect::<Vec<_>>();
+        let mut result = json!({
+            "ok": true,
+            "projectRoot": self.project_root,
+            "manifest": self.manifest,
+            "appliedRealms": self.applied,
+            "skippedRealms": self.skipped,
+            "processedPathCount": self.changed_paths.len(),
+            "importedInstanceCount": self.target_settings_ids.len(),
+            "removedTargetCount": self.removed_targets.len(),
+            "realms": compact_realms,
+            "wallyInstall": self.wally_result,
+        });
+        if !details {
+            return Ok(result);
+        }
+        let object = result
+            .as_object_mut()
+            .context("Wally result was not an object")?;
+        object.extend(primary_fields);
+        object.insert("changedPaths".to_string(), json!(self.changed_paths));
+        object.insert(
+            "targetSettingsIds".to_string(),
+            json!(self.target_settings_ids),
+        );
+        object.insert("removedTargets".to_string(), json!(self.removed_targets));
+        object.insert("realms".to_string(), json!(self.realm_results));
+        Ok(result)
+    }
+}
+
 pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Result<Value> {
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let project_root = resolve_existing_project_root(&args.project.project_root)?;
@@ -930,54 +1007,18 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
     }
     drop(guards);
 
-    let primary = realm_results
-        .iter()
-        .find(|value| value.get("skipped").and_then(Value::as_bool) == Some(false))
-        .or_else(|| realm_results.first());
-    let compact_realms = realm_results
-        .iter()
-        .map(|realm| {
-            let mut compact = json!({
-                "realm": realm.get("realm"),
-                "service": realm.get("service"),
-                "targetName": realm.get("targetName"),
-                "skipped": realm.get("skipped"),
-            });
-            if let Some(removed) = realm.get("removed") {
-                compact["removed"] = removed.clone();
-            }
-            compact
-        })
-        .collect::<Vec<_>>();
-    let mut result = json!({
-        "ok": true,
-        "projectRoot": project_root,
-        "manifest": manifest,
-        "appliedRealms": applied,
-        "skippedRealms": skipped,
-        "processedPathCount": changed_paths.len(),
-        "importedInstanceCount": target_settings_ids.len(),
-        "removedTargetCount": removed_targets.len(),
-        "realms": compact_realms,
-        "wallyInstall": wally_result,
-    });
-    if args.details {
-        let object = result
-            .as_object_mut()
-            .context("Wally result was not an object")?;
-        if let Some(primary) = primary {
-            for key in ["service", "targetName", "settingsFile"] {
-                if let Some(value) = primary.get(key).filter(|value| !value.is_null()) {
-                    object.insert(key.to_string(), value.clone());
-                }
-            }
-        }
-        object.insert("changedPaths".to_string(), json!(changed_paths));
-        object.insert("targetSettingsIds".to_string(), json!(target_settings_ids));
-        object.insert("removedTargets".to_string(), json!(removed_targets));
-        object.insert("realms".to_string(), json!(realm_results));
+    WallySyncReport {
+        project_root,
+        manifest,
+        realm_results,
+        changed_paths,
+        target_settings_ids,
+        removed_targets,
+        applied,
+        skipped,
+        wally_result,
     }
-    Ok(result)
+    .into_value(args.details)
 }
 
 fn validate_wally_target_name(raw: &str, label: &str) -> Result<String> {

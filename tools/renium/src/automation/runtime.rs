@@ -1,17 +1,20 @@
-use std::io::{self, Write};
+#[cfg(any(windows, target_os = "macos"))]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::app::output::ensure_plugin_api_ok;
+use crate::app::output::{ensure_plugin_api_ok, log_global};
 use crate::automation::context as bound_context;
 use crate::automation::local;
 use crate::automation::places;
-use crate::automation::reconcile::BaselineSide;
+use crate::automation::reconcile::{
+    BaselineSide, push_project_delta, selected_push_delta_services, sync_services,
+};
 use crate::automation::studio_args;
 use crate::automation::{self, op};
 use crate::bytecode::explorer::bytecode_explorer_batch_result;
@@ -20,7 +23,7 @@ use crate::cli::{
     BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, ExportSnapshotsArgs,
     ProjectSourceArgs, PushEditorChangesArgs,
 };
-use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
+use crate::daemon::transport::MAX_DAEMON_LINE_BYTES;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::editor::review::{
     local_place_path_for_bridge, local_place_path_for_pid, studio_pid_for_bridge,
@@ -39,7 +42,9 @@ use crate::studio::automation::{
     studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
     wait_until_result,
 };
-use crate::studio::bridge::{BridgeServer, BridgeTarget, DEFAULT_EXPORT_CHUNK_SIZE};
+use crate::studio::bridge::{
+    BridgeRequestLease, BridgeServer, BridgeTarget, DEFAULT_EXPORT_CHUNK_SIZE,
+};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 
@@ -135,6 +140,7 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
         || lower.contains("broken pipe")
         || lower.contains("transport closed")
         || lower.contains("bridge channel closed")
+        || lower.contains("all compatible bridge channels are busy")
     {
         return automation::Failure::new("bridge_off", message, true, "studios");
     }
@@ -227,7 +233,7 @@ pub(super) fn automation_pull_args(
         no_adaptive_throttle: !automation_bool(object, "adaptiveThrottle", true)?,
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         no_export_all_properties: automation_bool(object, "noExportAllProperties", false)?,
-        quiet_timings: true,
+        quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
     })
 }
 
@@ -438,7 +444,7 @@ pub(super) fn acknowledge_pulled_changes(
     services: &[String],
     seq: u64,
     runtime_id: &str,
-) -> Result<()> {
+) -> Result<Value> {
     let result = bridge.call(
         "getStudioChangeState",
         json!({
@@ -448,7 +454,8 @@ pub(super) fn acknowledge_pulled_changes(
             "runtimeId": runtime_id,
         }),
     )?;
-    ensure_plugin_api_ok(&result)
+    ensure_plugin_api_ok(&result)?;
+    Ok(result)
 }
 
 fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map<String, Value> {
@@ -523,7 +530,7 @@ fn automation_pull_operation(
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
-    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
     if let Some((seq, runtime_id)) = pending_ack {
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
@@ -773,6 +780,7 @@ fn close_studio(
         }
     }
     state.remember_studio_target(context, target.clone());
+    state.clear_studio_launch(context);
     input_inject::terminate_studio_process(pid)?;
     state.clear_context_runtime(context.id);
     Ok(json!({ "closed": true, "pid": pid, "reopenTarget": target }))
@@ -793,30 +801,188 @@ fn open_studio(
     context: &automation::BoundContext,
     parameters: &Value,
     state: &automation::State,
+    bridge: &BridgeServer,
 ) -> Result<Value> {
-    if let Some(file) = parameters
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = bridge;
+    let requested_file = parameters
         .get("file")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    let game_id = context.game_id.filter(|id| *id > 0);
+    let place_id = context.place_id.filter(|id| *id > 0);
+    #[cfg(any(windows, target_os = "macos"))]
+    let connected = connected_edit_studios(bridge);
+    #[cfg(any(windows, target_os = "macos"))]
+    if requested_file.is_none()
+        && let Some(runtime_id) = context.runtime_id.as_deref()
+        && let Some(studio) = connected
+            .iter()
+            .find(|studio| studio.runtime_id == runtime_id)
     {
+        return Ok(json!({
+            "ok": true,
+            "alreadyOpen": true,
+            "pid": studio.pid,
+            "runtimeId": studio.runtime_id,
+            "target": studio.target,
+        }));
+    }
+    let target = if let Some(file) = requested_file {
         let file = bound_context::path(context, file);
-        return workflows::launch_studio(Some(&file), None);
-    }
-    let target = state
-        .studio_target(context)
-        .unwrap_or(automation::StudioReopenTarget {
+        Some(automation::StudioReopenTarget {
+            file: Some(file),
+            game_id: None,
+            place_id: None,
+        })
+    } else if let Some(target) = state.studio_target(context) {
+        Some(target)
+    } else if game_id.is_some() && place_id.is_some() {
+        Some(automation::StudioReopenTarget {
             file: None,
-            game_id: context.game_id,
-            place_id: context.place_id,
-        });
-    if target.file.is_some() || target.game_id.is_some() && target.place_id.is_some() {
-        return workflows::launch_exact_studio(
-            target.file.as_deref(),
-            target.game_id,
-            target.place_id,
-        );
+            game_id,
+            place_id,
+        })
+    } else {
+        state
+            .live_sync()
+            .saved_local_file(context)?
+            .map(|file| automation::StudioReopenTarget {
+                file: Some(file),
+                game_id: None,
+                place_id: None,
+            })
+    };
+    let Some(target) = target else {
+        return workflows::launch_studio(None, Some(Path::new(&context.project)));
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(studio) = connected.iter().find(|studio| studio.target == target) {
+        return Ok(json!({
+            "ok": true,
+            "alreadyOpen": true,
+            "pid": studio.pid,
+            "runtimeId": studio.runtime_id,
+            "target": target,
+        }));
     }
-    workflows::launch_studio(None, Some(Path::new(&context.project)))
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(target_file) = target.file.as_deref() {
+        let target_file =
+            fs::canonicalize(target_file).unwrap_or_else(|_| target_file.to_path_buf());
+        if let Some((pid, file)) = input_inject::studio_process_ids()
+            .into_iter()
+            .filter_map(|pid| local_place_path_for_pid(pid).map(|file| (pid, file)))
+            .find(|(_, file)| {
+                fs::canonicalize(file).unwrap_or_else(|_| file.clone()) == target_file
+            })
+        {
+            return Ok(json!({
+                "ok": true,
+                "alreadyOpen": true,
+                "pid": pid,
+                "target": automation::StudioReopenTarget {
+                    file: Some(file),
+                    game_id: None,
+                    place_id: None,
+                },
+            }));
+        }
+    }
+    if let Some(result) = state.recent_studio_launch(context, &target) {
+        return Ok(result);
+    }
+    let result =
+        workflows::launch_exact_studio(target.file.as_deref(), target.game_id, target.place_id)?;
+    state.remember_studio_launch(context, target, result.clone());
+    Ok(result)
+}
+
+fn studio_status_result(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    bridge: &BridgeServer,
+) -> Value {
+    let clients = bridge.list_bridge_clients();
+    let selector = if parameters.get("all").and_then(Value::as_bool) == Some(true) {
+        ""
+    } else {
+        &context.selector
+    };
+    let mut result = json!({
+        "studios": bound_context::studio_candidates_from(&clients, selector),
+        "clients": bound_context::context_clients(clients, context),
+        "selected": context.runtime_id,
+    });
+    let clients = result["clients"].as_array().cloned().unwrap_or_default();
+    let has_edit = clients.iter().any(|client| client["role"] == "edit");
+    let mut available = Vec::new();
+    if has_edit {
+        available.push("Edit");
+    }
+    if clients.iter().any(|client| client["role"] == "play-server") {
+        available.push("Server");
+    }
+    if clients.iter().any(|client| client["role"] == "play-client") {
+        available.push("Client");
+    }
+    result["availableDataModels"] = json!(available);
+    result["playState"] = json!(if clients
+        .iter()
+        .any(|client| client["role"] == "play-server" || client["role"] == "play-client")
+    {
+        "running"
+    } else {
+        "stopped"
+    });
+    if has_edit
+        && let Ok(state) = bridge.call_for_selector_with_timeout(
+            "getStudioState",
+            json!({}),
+            BridgeTarget::Edit,
+            None,
+            Some(Duration::from_millis(200)),
+        )
+    {
+        result["studioState"] = state;
+    }
+    result
+}
+
+fn creator_operation_result(
+    operation: u16,
+    parameters: &Value,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> Result<Value> {
+    bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
+    let method = match operation {
+        op::ASSET_INSERT => "insertAsset",
+        op::GENERATE_MODEL => "generateModel",
+        op::JOB_STATUS => "creatorJob",
+        _ => unreachable!(),
+    };
+    let wait_seconds = if operation == op::JOB_STATUS {
+        parameters
+            .get("waitSeconds")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if !wait_seconds.is_finite() || !(0.0..=120.0).contains(&wait_seconds) {
+        bail!("job-status waitSeconds must be from 0 through 120")
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds);
+    loop {
+        let result = bridge.call_for_target(method, parameters.clone(), BridgeTarget::Edit)?;
+        ensure_plugin_api_ok(&result)?;
+        let status = result.get("status").and_then(Value::as_str);
+        if operation != op::JOB_STATUS || status != Some("running") || Instant::now() >= deadline {
+            return Ok(result);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn automation_dispatch_operation(
@@ -844,15 +1010,22 @@ fn automation_dispatch_operation(
             bridge.wait_for_all_target(bridge_wait_seconds, target)?;
             let info = bridge.cached_bridge_info_for_target(target)?;
             let args = automation_pull_args(context, parameters, false)?;
-            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
             Ok(json!({ "direction": "snapshots" }))
         }
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
-            let summary = push_editor_changes_with_warm_bridge(
-                automation_push_args(context, parameters, reviewed)?,
-                bridge,
-            )?;
+            let args = automation_push_args(context, parameters, reviewed)?;
+            let delta_services = if push_is_filtered(parameters) {
+                selected_push_delta_services(context, &args)?
+            } else {
+                Some(sync_services())
+            };
+            if let Some(services) = delta_services {
+                let summary = push_project_delta(context, bridge, &services, args, None)?;
+                return Ok(Value::Object(compact_push_summary(&summary, parameters)));
+            }
+            let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
             Ok(Value::Object(compact_push_summary(&summary, parameters)))
         }
         op::LIVE_START
@@ -905,50 +1078,7 @@ fn automation_dispatch_operation(
         | op::PROJECT_INIT
         | op::PROJECT_VALIDATE => local::execute(operation, context, parameters),
         op::BATCH => automation_batch(context, parameters),
-        op::STUDIO_STATUS => {
-            let clients = bridge.list_bridge_clients();
-            let mut result = json!({
-                "studios": bound_context::studio_candidates_from(
-                    &clients,
-                    if parameters.get("all").and_then(Value::as_bool) == Some(true) { "" } else { &context.selector },
-                ),
-                "clients": bound_context::context_clients(clients, context),
-                "selected": context.runtime_id,
-            });
-            let clients = result["clients"].as_array().cloned().unwrap_or_default();
-            let mut available = Vec::new();
-            let has_edit = clients.iter().any(|client| client["role"] == "edit");
-            if has_edit {
-                available.push("Edit");
-            }
-            if clients.iter().any(|client| client["role"] == "play-server") {
-                available.push("Server");
-            }
-            if clients.iter().any(|client| client["role"] == "play-client") {
-                available.push("Client");
-            }
-            result["availableDataModels"] = json!(available);
-            result["playState"] = json!(if clients
-                .iter()
-                .any(|client| client["role"] == "play-server" || client["role"] == "play-client")
-            {
-                "running"
-            } else {
-                "stopped"
-            });
-            if has_edit
-                && let Ok(state) = bridge.call_for_selector_with_timeout(
-                    "getStudioState",
-                    json!({}),
-                    BridgeTarget::Edit,
-                    None,
-                    Some(Duration::from_millis(200)),
-                )
-            {
-                result["studioState"] = state;
-            }
-            Ok(result)
-        }
+        op::STUDIO_STATUS => Ok(studio_status_result(context, parameters, bridge)),
         op::LUAU => {
             let parsed = studio_args::luau(Path::new(&context.root), parameters)?;
             if parsed.player.is_none() {
@@ -1059,38 +1189,7 @@ fn automation_dispatch_operation(
         }
         op::RECORD_END => record_end_result(parameters),
         op::ASSET_INSERT | op::GENERATE_MODEL | op::JOB_STATUS => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
-            let method = match operation {
-                op::ASSET_INSERT => "insertAsset",
-                op::GENERATE_MODEL => "generateModel",
-                op::JOB_STATUS => "creatorJob",
-                _ => unreachable!(),
-            };
-            let wait_seconds = if operation == op::JOB_STATUS {
-                parameters
-                    .get("waitSeconds")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            if !wait_seconds.is_finite() || !(0.0..=120.0).contains(&wait_seconds) {
-                bail!("job-status waitSeconds must be from 0 through 120")
-            }
-            let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds);
-            loop {
-                let result =
-                    bridge.call_for_target(method, parameters.clone(), BridgeTarget::Edit)?;
-                ensure_plugin_api_ok(&result)?;
-                let status = result.get("status").and_then(Value::as_str);
-                if operation != op::JOB_STATUS
-                    || status != Some("running")
-                    || Instant::now() >= deadline
-                {
-                    break Ok(result);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            creator_operation_result(operation, parameters, bridge, bridge_wait_seconds)
         }
         op::PLACE_ADD => places::add(context, parameters),
         op::PLACE_RENAME => places::rename(context, parameters),
@@ -1162,7 +1261,7 @@ fn automation_dispatch_managed(
             .map_err(automation_failure);
     }
     if operation == op::STUDIO_OPEN {
-        return open_studio(context, parameters, state).map_err(automation_failure);
+        return open_studio(context, parameters, state, bridge).map_err(automation_failure);
     }
     let writes_project = matches!(
         operation,
@@ -1319,74 +1418,112 @@ fn automation_dispatch_managed(
     Ok(result)
 }
 
-fn automation_live_operation(
-    operation: u16,
-    context: &automation::BoundContext,
-    parameters: &Value,
-    state: &automation::State,
-    bridge: &Arc<BridgeServer>,
-    bridge_wait_seconds: f64,
-) -> std::result::Result<Value, automation::Failure> {
-    let object = automation_object(parameters)?;
-    let compact = automation_bool(object, "compact", false).map_err(automation_failure)?;
-    let manage_files = automation_bool(object, "manageFiles", true).map_err(automation_failure)?;
-    let files_only = automation_bool(object, "filesOnly", false).map_err(automation_failure)?;
-    let files_paused = automation_bool(object, "filesPaused", false).map_err(automation_failure)?;
-    let reset_files_paused =
-        automation_bool(object, "resetFilesPaused", false).map_err(automation_failure)?;
-    let settle_wait_seconds =
-        automation_number(object, "settleWaitSeconds", 0.0_f64).map_err(automation_failure)?;
-    if !settle_wait_seconds.is_finite() || !(0.0..=120.0).contains(&settle_wait_seconds) {
-        return Err(automation::Failure::new(
-            "bad_req",
-            "p.settleWaitSeconds must be between 0 and 120",
-            false,
-            "live-status",
-        ));
-    }
-    let pull_changes = object
-        .get("pullChanges")
-        .map(|_| automation_bool(object, "pullChanges", true).map_err(automation_failure))
-        .transpose()?;
-    let settle_paths = automation_strings(object, "settlePaths")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let queue_paths = automation_strings(object, "queuePaths")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let baseline_paths = automation_strings(object, "baselinePaths")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let acknowledged_side = match object.get("acknowledgedSide").and_then(Value::as_str) {
-        None => None,
-        Some("editor") => Some(BaselineSide::Editor),
-        Some("studio") => Some(BaselineSide::Studio),
-        Some(_) => {
+struct LiveOperationOptions {
+    compact: bool,
+    manage_files: bool,
+    files_only: bool,
+    files_paused: bool,
+    reset_files_paused: bool,
+    settle_wait_seconds: f64,
+    pull_changes: Option<bool>,
+    settle_paths: Vec<PathBuf>,
+    queue_paths: Vec<PathBuf>,
+    baseline_paths: Vec<PathBuf>,
+    acknowledged_side: Option<BaselineSide>,
+    file_writes: Option<String>,
+    event_wait_seconds: Option<f64>,
+}
+
+impl LiveOperationOptions {
+    fn parse(object: &Map<String, Value>) -> std::result::Result<Self, automation::Failure> {
+        let settle_wait_seconds =
+            automation_number(object, "settleWaitSeconds", 0.0_f64).map_err(automation_failure)?;
+        if !settle_wait_seconds.is_finite() || !(0.0..=120.0).contains(&settle_wait_seconds) {
             return Err(automation::Failure::new(
                 "bad_req",
-                "p.acknowledgedSide must be editor or studio",
+                "p.settleWaitSeconds must be between 0 and 120",
                 false,
                 "live-status",
             ));
         }
-    };
-    if manage_files
-        && operation == op::LIVE_STATUS
-        && let Some(file_writes) = object.get("fileWrites").and_then(Value::as_str)
-    {
+        let acknowledged_side = match object.get("acknowledgedSide").and_then(Value::as_str) {
+            None => None,
+            Some("editor") => Some(BaselineSide::Editor),
+            Some("studio") => Some(BaselineSide::Studio),
+            Some(_) => {
+                return Err(automation::Failure::new(
+                    "bad_req",
+                    "p.acknowledgedSide must be editor or studio",
+                    false,
+                    "live-status",
+                ));
+            }
+        };
+        let paths = |key| {
+            automation_strings(object, key)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        };
+        Ok(Self {
+            compact: automation_bool(object, "compact", false).map_err(automation_failure)?,
+            manage_files: automation_bool(object, "manageFiles", true)
+                .map_err(automation_failure)?,
+            files_only: automation_bool(object, "filesOnly", false).map_err(automation_failure)?,
+            files_paused: automation_bool(object, "filesPaused", false)
+                .map_err(automation_failure)?,
+            reset_files_paused: automation_bool(object, "resetFilesPaused", false)
+                .map_err(automation_failure)?,
+            settle_wait_seconds,
+            pull_changes: object
+                .get("pullChanges")
+                .map(|_| automation_bool(object, "pullChanges", true).map_err(automation_failure))
+                .transpose()?,
+            settle_paths: paths("settlePaths"),
+            queue_paths: paths("queuePaths"),
+            baseline_paths: paths("baselinePaths"),
+            acknowledged_side,
+            file_writes: object
+                .get("fileWrites")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            event_wait_seconds: object
+                .get("eventWaitSeconds")
+                .and_then(Value::as_f64)
+                .filter(|seconds| *seconds > 0.0),
+        })
+    }
+
+    fn settle_requested(&self, operation: u16) -> bool {
+        self.manage_files && operation == op::LIVE_STATUS && self.settle_wait_seconds > 0.0
+    }
+}
+
+fn handle_managed_live_status_command(
+    context: &automation::BoundContext,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    options: &LiveOperationOptions,
+) -> std::result::Result<Option<Value>, automation::Failure> {
+    if !options.manage_files {
+        return Ok(None);
+    }
+    if let Some(file_writes) = options.file_writes.as_deref() {
         let daemon = match file_writes {
             "pause" => state.live_sync().pause(context.id),
-            "resume" if settle_paths.is_empty() => {
+            "resume" if options.settle_paths.is_empty() => {
                 state.live_sync().resume(context.id, std::iter::empty())
             }
             "resume" => {
-                let captured = match state.live_sync().capture(context, Some(&settle_paths)) {
+                let captured = match state
+                    .live_sync()
+                    .capture(context, Some(&options.settle_paths))
+                {
                     Ok(Some(captured)) => captured,
                     Ok(None) => {
-                        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+                        return Ok(Some(
+                            json!({ "daemon": state.live_sync().status(context.id) }),
+                        ));
                     }
                     Err(error) => {
                         state
@@ -1395,7 +1532,7 @@ fn automation_live_operation(
                         return Err(automation_failure(error));
                     }
                 };
-                if let Some(side) = acknowledged_side {
+                if let Some(side) = options.acknowledged_side {
                     state
                         .live_sync()
                         .acknowledge_then_resume(context, bridge, captured, side)
@@ -1416,12 +1553,15 @@ fn automation_live_operation(
                 ));
             }
         };
-        return Ok(json!({ "daemon": daemon }));
+        return Ok(Some(json!({ "daemon": daemon })));
     }
-    if manage_files && operation == op::LIVE_STATUS && !settle_paths.is_empty() {
-        if let Some(side) = acknowledged_side {
+    if !options.settle_paths.is_empty() {
+        if let Some(side) = options.acknowledged_side {
             state.live_sync().pause(context.id);
-            let captured = match state.live_sync().capture(context, Some(&settle_paths)) {
+            let captured = match state
+                .live_sync()
+                .capture(context, Some(&options.settle_paths))
+            {
                 Ok(captured) => captured,
                 Err(error) => {
                     state
@@ -1441,27 +1581,132 @@ fn automation_live_operation(
                     .resume(context.id, std::iter::empty::<PathBuf>());
             }
         } else {
-            state.live_sync().settle(context.id, settle_paths);
+            state
+                .live_sync()
+                .settle(context.id, options.settle_paths.iter().cloned());
         }
-        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+        return Ok(Some(
+            json!({ "daemon": state.live_sync().status(context.id) }),
+        ));
     }
-    if manage_files && operation == op::LIVE_STATUS && !queue_paths.is_empty() {
-        return Ok(json!({
-            "daemon": state.live_sync().queue(context.id, queue_paths)
-        }));
+    if !options.queue_paths.is_empty() {
+        return Ok(Some(json!({
+            "daemon": state.live_sync().queue(context.id, options.queue_paths.iter().cloned())
+        })));
     }
-    if manage_files && operation == op::LIVE_STATUS && !baseline_paths.is_empty() {
+    if !options.baseline_paths.is_empty() {
         let baselines = state
             .live_sync()
-            .baseline_files(context, &baseline_paths)
+            .baseline_files(context, &options.baseline_paths)
             .map_err(automation_failure)?;
-        return Ok(json!({
+        return Ok(Some(json!({
             "daemon": state.live_sync().status(context.id),
             "baselines": baselines,
-        }));
+        })));
+    }
+    Ok(None)
+}
+
+fn start_managed_live_operation(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    object: &Map<String, Value>,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+    options: &LiveOperationOptions,
+) -> std::result::Result<Value, automation::Failure> {
+    let mut start_parameters = parameters.clone();
+    start_parameters["reset"] = json!(true);
+    start_parameters["replaceServices"] = json!(true);
+    let initial_plugin = {
+        let _gate = bridge.acquire_request_gate();
+        automation_dispatch_with_retry(
+            op::LIVE_START,
+            context,
+            &start_parameters,
+            bridge,
+            bridge_wait_seconds,
+            false,
+        )?
+    };
+    let cleanup_failed_start = |mut failure: automation::Failure| {
+        let cleanup = {
+            let _gate = bridge.acquire_request_gate();
+            automation_dispatch_with_retry(
+                op::LIVE_STOP,
+                context,
+                parameters,
+                bridge,
+                bridge_wait_seconds,
+                false,
+            )
+        };
+        if let Err(cleanup) = cleanup {
+            failure
+                .0
+                .m
+                .push_str("; Studio live mode also failed to stop: ");
+            failure.0.m.push_str(&cleanup.0.m);
+        }
+        failure
+    };
+    let started = pair_configuration(&initial_plugin, object)
+        .and_then(|configuration| {
+            state.live_sync().start(
+                context.clone(),
+                Arc::clone(bridge),
+                options.pull_changes,
+                options.files_paused,
+                options.reset_files_paused,
+                configuration,
+            )
+        })
+        .map_err(|error| cleanup_failed_start(automation_failure(error)))?;
+    let plugin = match live_plugin_status(context, parameters, bridge, bridge_wait_seconds) {
+        Ok(plugin) => plugin,
+        Err(failure) => {
+            state.live_sync().rollback_start(&started);
+            return Err(cleanup_failed_start(failure));
+        }
+    };
+    if let Err(error) = state.live_sync().set_enabled(context, true) {
+        state.live_sync().rollback_start(&started);
+        return Err(cleanup_failed_start(automation_failure(error)));
+    }
+    let daemon = started.status;
+    state
+        .live_sync()
+        .set_plugin_status(context.id, plugin.clone());
+    Ok(merge_live_status(plugin, daemon, options.compact))
+}
+
+fn automation_live_operation(
+    operation: u16,
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Value, automation::Failure> {
+    let object = automation_object(parameters)?;
+    let options = LiveOperationOptions::parse(object)?;
+    let attached_session = if options.manage_files {
+        state
+            .live_sync()
+            .attach(context, bridge)
+            .map_err(automation_failure)?
+    } else {
+        false
+    };
+    if operation == op::LIVE_STATUS
+        && let Some(response) =
+            handle_managed_live_status_command(context, state, bridge, &options)?
+    {
+        return Ok(response);
     }
 
-    if manage_files && matches!(operation, op::RETRY_PENDING | op::DISCARD_PENDING) {
+    if options.manage_files && matches!(operation, op::RETRY_PENDING | op::DISCARD_PENDING) {
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1481,18 +1726,18 @@ fn automation_live_operation(
                 .discard(context)
                 .map_err(automation_failure)?
         };
-        return Ok(merge_live_status(plugin, daemon, compact));
+        return Ok(merge_live_status(plugin, daemon, options.compact));
     }
 
-    if manage_files && files_only && operation == op::LIVE_STATUS {
-        return Ok(json!({ "daemon": state.live_sync().status(context.id) }));
+    if options.manage_files && options.files_only && operation == op::LIVE_STATUS {
+        return Ok(merge_live_status(
+            state.live_sync().plugin_status(context.id),
+            state.live_sync().status(context.id),
+            options.compact,
+        ));
     }
 
-    if manage_files && operation == op::LIVE_STOP {
-        state
-            .live_sync()
-            .set_enabled(context, false)
-            .map_err(automation_failure)?;
+    if options.manage_files && operation == op::LIVE_STOP {
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1502,76 +1747,31 @@ fn automation_live_operation(
                 bridge,
                 bridge_wait_seconds,
                 false,
-            )
+            )?
         };
+        let persisted = state.live_sync().set_enabled(context, false);
         let daemon = state.live_sync().stop(context.id);
-        return plugin.map(|plugin| merge_live_status(plugin, daemon, compact));
+        persisted.map_err(automation_failure)?;
+        return Ok(merge_live_status(plugin, daemon, options.compact));
     }
 
-    let settle_requested =
-        manage_files && operation == op::LIVE_STATUS && settle_wait_seconds > 0.0;
-    let daemon = match operation {
-        op::LIVE_START if manage_files => {
-            state
-                .live_sync()
-                .set_enabled(context, true)
-                .map_err(automation_failure)?;
-            let plugin = {
-                let _gate = bridge.acquire_request_gate();
-                automation_dispatch_with_retry(
-                    operation,
-                    context,
-                    parameters,
-                    bridge,
-                    bridge_wait_seconds,
-                    false,
-                )?
-            };
-            let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
-            let daemon = match state.live_sync().start(
-                context.clone(),
-                Arc::clone(bridge),
-                pull_changes,
-                files_paused,
-                reset_files_paused,
-                configuration,
-            ) {
-                Ok(daemon) => daemon,
-                Err(error) => {
-                    let cleanup = {
-                        let _gate = bridge.acquire_request_gate();
-                        automation_dispatch_with_retry(
-                            op::LIVE_STOP,
-                            context,
-                            parameters,
-                            bridge,
-                            bridge_wait_seconds,
-                            false,
-                        )
-                    };
-                    let mut failure = automation_failure(error);
-                    if let Err(cleanup) = cleanup {
-                        failure
-                            .0
-                            .m
-                            .push_str("; Studio live mode also failed to stop: ");
-                        failure.0.m.push_str(&cleanup.0.m);
-                    }
-                    return Err(failure);
-                }
-            };
-            return Ok(merge_live_status(plugin, daemon, compact));
-        }
-        _ => state.live_sync().status(context.id),
-    };
-    let event_wait_seconds = object
-        .get("eventWaitSeconds")
-        .and_then(Value::as_f64)
-        .filter(|seconds| *seconds > 0.0);
+    let settle_requested = options.settle_requested(operation);
+    if options.manage_files && operation == op::LIVE_START {
+        return start_managed_live_operation(
+            context,
+            parameters,
+            object,
+            state,
+            bridge,
+            bridge_wait_seconds,
+            &options,
+        );
+    }
+    let daemon = state.live_sync().status(context.id);
     if operation == op::LIVE_STATUS
-        && compact
+        && options.compact
         && !settle_requested
-        && event_wait_seconds.is_none()
+        && options.event_wait_seconds.is_none()
         && (daemon["paused"].as_bool() == Some(true) || daemon["syncing"].as_bool() == Some(true))
     {
         return Ok(compact_live_status(json!({
@@ -1581,15 +1781,18 @@ fn automation_live_operation(
         })));
     }
     let waits_for_change = matches!(operation, op::LIVE_START | op::LIVE_STATUS)
-        && event_wait_seconds.is_some()
+        && options.event_wait_seconds.is_some()
         && bridge.channel_count_for_target(BridgeTarget::Main) > 1;
-    let limited_parameters = event_wait_seconds.filter(|_| !waits_for_change).map(|_| {
-        let mut parameters = parameters.clone();
-        parameters["eventWaitSeconds"] = json!(0.15);
-        parameters
-    });
+    let limited_parameters = options
+        .event_wait_seconds
+        .filter(|_| !waits_for_change)
+        .map(|_| {
+            let mut parameters = parameters.clone();
+            parameters["eventWaitSeconds"] = json!(0.15);
+            parameters
+        });
     let dispatch_parameters = limited_parameters.as_ref().unwrap_or(parameters);
-    let plugin = if waits_for_change {
+    let mut plugin = if waits_for_change || operation == op::LIVE_STATUS {
         automation_dispatch_with_retry(
             operation,
             context,
@@ -1609,7 +1812,57 @@ fn automation_live_operation(
             false,
         )?
     };
-    let settings_update = if manage_files
+    let restore_files = if options.manage_files && operation == op::LIVE_STATUS {
+        let enabled = state.live_sync().enabled(context);
+        let restore = !attached_session && enabled;
+        log_global(
+            5,
+            format_args!(
+                "[renium] live status restore check: cx={} session={} enabled={} restore={}",
+                context.id, attached_session, enabled, restore
+            ),
+        );
+        restore
+    } else {
+        false
+    };
+    if restore_files && plugin.get("tracking").and_then(Value::as_bool) != Some(true) {
+        let mut start_parameters = parameters.clone();
+        start_parameters["reset"] = json!(true);
+        start_parameters["replaceServices"] = json!(true);
+        let _gate = bridge.acquire_request_gate();
+        plugin = automation_dispatch_with_retry(
+            op::LIVE_START,
+            context,
+            &start_parameters,
+            bridge,
+            bridge_wait_seconds,
+            false,
+        )?;
+    }
+    let restored_daemon = if restore_files {
+        let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
+        let started = state
+            .live_sync()
+            .start(
+                context.clone(),
+                Arc::clone(bridge),
+                options.pull_changes,
+                false,
+                false,
+                configuration,
+            )
+            .map_err(automation_failure)?;
+        if let Err(error) = state.live_sync().set_enabled(context, true) {
+            state.live_sync().rollback_start(&started);
+            return Err(automation_failure(error));
+        }
+        Some(started.status)
+    } else {
+        None
+    };
+    let settings_update = if restored_daemon.is_none()
+        && options.manage_files
         && operation == op::LIVE_STATUS
         && plugin
             .get("runtimeSettingChanges")
@@ -1624,40 +1877,43 @@ fn automation_live_operation(
     } else {
         None
     };
-    let mut daemon = if let Some(daemon) = settings_update {
-        daemon
-    } else if manage_files
-        && operation == op::LIVE_STATUS
-        && should_restore_file_watcher(&plugin, &daemon, state.live_sync().is_enabled(context))
-    {
-        let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
-        state
-            .live_sync()
-            .set_enabled(context, true)
-            .map_err(automation_failure)?;
-        state
-            .live_sync()
-            .start(
-                context.clone(),
-                Arc::clone(bridge),
-                pull_changes,
-                files_paused,
-                reset_files_paused,
-                configuration,
-            )
-            .map_err(automation_failure)?
-    } else {
-        daemon
-    };
+    let refresh_plugin = restored_daemon.is_some() || settings_update.is_some();
+    let mut daemon = restored_daemon.or(settings_update).unwrap_or(daemon);
+    if refresh_plugin {
+        plugin = live_plugin_status(context, parameters, bridge, bridge_wait_seconds)?;
+    }
+    state
+        .live_sync()
+        .set_plugin_status(context.id, plugin.clone());
     if settle_requested {
-        let settled = state
-            .live_sync()
-            .wait_settled(context.id, Duration::from_secs_f64(settle_wait_seconds));
+        let settled = state.live_sync().wait_settled(
+            context.id,
+            Duration::from_secs_f64(options.settle_wait_seconds),
+        );
+        plugin = state.live_sync().plugin_status(context.id);
+        daemon = state.live_sync().status(context.id);
         if let Some(daemon) = daemon.as_object_mut() {
             daemon.insert("settled".to_string(), Value::Bool(settled));
         }
     }
-    Ok(merge_live_status(plugin, daemon, compact))
+    Ok(merge_live_status(plugin, daemon, options.compact))
+}
+
+fn live_plugin_status(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Value, automation::Failure> {
+    let _gate = bridge.acquire_request_gate();
+    automation_dispatch_with_retry(
+        op::LIVE_STATUS,
+        context,
+        parameters,
+        bridge,
+        bridge_wait_seconds,
+        false,
+    )
 }
 
 fn merge_live_status(plugin: Value, daemon: Value, compact: bool) -> Value {
@@ -1711,11 +1967,6 @@ fn pair_configuration(
     })
 }
 
-fn should_restore_file_watcher(plugin: &Value, daemon: &Value, enabled: bool) -> bool {
-    daemon["running"].as_bool() != Some(true)
-        && (enabled || plugin["twoWaySyncEnabled"].as_bool() == Some(true))
-}
-
 fn automation_execute_request(
     request: &automation::Request,
     state: &automation::State,
@@ -1723,6 +1974,13 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let operation = request.validate()?;
+    log_global(
+        5,
+        format_args!(
+            "[renium] automation request: id={} op={} cx={:?}",
+            request.id, operation.name, request.cx
+        ),
+    );
     match operation.id {
         op::CAP => automation::capabilities().map_err(automation_failure),
         op::BIND => bound_context::bind(state, bridge, &request.p),
@@ -1747,14 +2005,7 @@ fn automation_execute_request(
             if operation.id == op::LIVE_STATUS
                 && request.p.get("filesOnly").and_then(Value::as_bool) == Some(true)
             {
-                let context = state.context(context_id).ok_or_else(|| {
-                    automation::Failure::new(
-                        "stale_cx",
-                        "Context is no longer valid",
-                        false,
-                        "bind",
-                    )
-                })?;
+                let context = bound_context::resolve(state, bridge, context_id)?;
                 return automation_live_operation(
                     operation.id,
                     &context,
@@ -1988,14 +2239,40 @@ fn automation_response(
     state: &automation::State,
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
+    request_lease: Option<Arc<BridgeRequestLease>>,
 ) -> automation::Response {
     let started = Instant::now();
-    let result = if automation::opcode_by_id(request.op).is_ok_and(|operation| !operation.queued) {
-        automation_execute_request(&request, state, bridge, bridge_wait_seconds)
-    } else {
-        let _guard = bridge.acquire_request_gate();
-        automation_execute_request(&request, state, bridge, bridge_wait_seconds)
+    let queued = automation::opcode_by_id(request.op).is_ok_and(|operation| operation.queued);
+    let cancelled = |error: anyhow::Error| {
+        automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
+    let result = (|| {
+        let _request_guard = if queued {
+            Some(match request_lease.as_deref() {
+                Some(lease) => bridge
+                    .acquire_request_gate_for_lease(lease)
+                    .map_err(cancelled)?,
+                None => bridge.acquire_request_gate(),
+            })
+        } else {
+            None
+        };
+        let _lease_guard = match request_lease.as_ref() {
+            Some(lease) => Some(
+                bridge
+                    .activate_request_lease(Arc::clone(lease))
+                    .map_err(cancelled)?,
+            ),
+            None => None,
+        };
+        let result = automation_execute_request(&request, state, bridge, bridge_wait_seconds);
+        if result.is_ok()
+            && let Some(lease) = request_lease.as_deref()
+        {
+            lease.ensure_active().map_err(cancelled)?;
+        }
+        result
+    })();
     let response = match result {
         Ok(result) => automation::Response::success(request.id, started, result),
         Err(failure) => {
@@ -2012,15 +2289,18 @@ fn automation_response(
     response.with_update(state.available_update())
 }
 
-pub(crate) fn automation_parse_response(
+pub(crate) fn automation_parse_response_with_lease(
     text: &str,
     state: &automation::State,
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
+    request_lease: Option<Arc<BridgeRequestLease>>,
 ) -> automation::Response {
     let started = Instant::now();
     match serde_json::from_str::<automation::Request>(text) {
-        Ok(request) => automation_response(request, state, bridge, bridge_wait_seconds),
+        Ok(request) => {
+            automation_response(request, state, bridge, bridge_wait_seconds, request_lease)
+        }
         Err(error) => automation::Response::failure(
             0,
             started,
@@ -2045,50 +2325,6 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
             "cap",
         ),
     )
-}
-
-pub(crate) fn run_automation_stdio(
-    bridge: &Arc<BridgeServer>,
-    state: &Arc<automation::State>,
-    bridge_wait_seconds: f64,
-) -> Result<()> {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut line = String::new();
-    let stdout_gate = Arc::new(Mutex::new(()));
-    loop {
-        match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)? {
-            BoundedLineRead::Eof => break,
-            BoundedLineRead::Line => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let request = trimmed.to_string();
-                let bridge = Arc::clone(bridge);
-                let state = Arc::clone(state);
-                let stdout_gate = Arc::clone(&stdout_gate);
-                std::thread::spawn(move || {
-                    let response =
-                        automation_parse_response(&request, &state, &bridge, bridge_wait_seconds);
-                    let Ok(response) = serde_json::to_string(&response) else {
-                        return;
-                    };
-                    let _guard = stdout_gate
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    std::println!("{response}");
-                    let _ = io::stdout().flush();
-                });
-            }
-            BoundedLineRead::TooLong => {
-                let response = oversized_automation_request_response();
-                std::println!("{}", serde_json::to_string(&response)?);
-                io::stdout().flush()?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2122,15 +2358,6 @@ mod tests {
             )),
             json!({ "ok": true, "sourceVerified": true })
         );
-    }
-
-    #[test]
-    fn restores_file_watcher_from_plugin_setting() {
-        assert!(should_restore_file_watcher(
-            &json!({ "twoWaySyncEnabled": true }),
-            &json!({ "running": false }),
-            false
-        ));
     }
 
     #[test]

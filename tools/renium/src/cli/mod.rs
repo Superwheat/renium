@@ -414,11 +414,11 @@ pub(super) struct BridgeDaemonArgs {
     pub(super) control_port: u16,
     #[arg(
         long,
-        help = "Use the editor-owned JSON stdin protocol and exit when stdin closes"
+        help = "Proxy editor requests to the shared daemon over JSON stdin"
     )]
     pub(super) editor_stdio: bool,
     #[arg(
-        help = "Exit automatically when this process dies. Passed by the editor so an editor-owned daemon can't outlive its window; omit for a shared daemon",
+        help = "Exit the editor proxy when this process dies",
         long,
         value_name = "PID"
     )]

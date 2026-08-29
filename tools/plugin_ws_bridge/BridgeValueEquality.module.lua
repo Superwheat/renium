@@ -46,6 +46,7 @@ local function contentEqualsString(content: Content, text: string): boolean
 end
 
 local valuesEqual
+local exactValuesEqual
 
 local function tablesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: any }): boolean
 	if seen[a] == b then
@@ -54,6 +55,24 @@ local function tablesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: 
 	seen[a] = b
 	for key, value in pairs(a) do
 		if not valuesEqual(value, b[key], seen) then
+			return false
+		end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+local function exactTablesEqual(a: { [any]: any }, b: { [any]: any }, seen: { [any]: any }): boolean
+	if seen[a] == b then
+		return true
+	end
+	seen[a] = b
+	for key, value in pairs(a) do
+		if not exactValuesEqual(value, b[key], seen) then
 			return false
 		end
 	end
@@ -160,6 +179,17 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 	return false
 end
 
+exactValuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
+	if a == b then
+		return true
+	end
+	if type(a) ~= "table" or type(b) ~= "table" then
+		return false
+	end
+	return exactTablesEqual(a, b, seen or {})
+end
+
 BridgeValueEquality.valuesEqual = valuesEqual
+BridgeValueEquality.exactValuesEqual = exactValuesEqual
 
 return BridgeValueEquality

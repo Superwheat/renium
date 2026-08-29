@@ -14,6 +14,7 @@ use rbx_reflection::{
     PropertyTag as RbxPropertyTag, ReflectionDatabase, Scriptability as RbxScriptability,
 };
 use serde_json::{Map, Number, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::app::timing::elapsed_ms;
 use crate::editor::sync::is_lua_source_class;
@@ -25,10 +26,12 @@ use crate::rbx::model::{BytecodeModelImportRefs, imported_instance_index};
 use crate::roblox::schema::{
     AXIS_NAMES, EnumValueNameMap, FACE_NAMES, PropertySchemaMap, TYPE_ID_REF,
 };
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::snapshot::codec::{
-    bitmask_names, decode_native_overlay_debug_ids, parse_native_overlay_class_groups,
+    bitmask_names, decode_batch_settings_ids, decode_native_overlay_debug_ids,
+    parse_native_overlay_class_groups,
 };
-use crate::snapshot::export::{fetch_typed_payload_with_size, is_supported_bridge_codec};
+use crate::snapshot::export::{fetch_typed_payload_with_size_cached, is_supported_bridge_codec};
 use crate::snapshot::types::{
     NativeOverlayFetch, NativeOverlayItem, NativeOverlayPayload, NativeSettingsProperty,
     NativeSettingsValue, SnapshotInstance,
@@ -208,9 +211,6 @@ fn native_overlay_property_is_reconstructed(
     {
         return true;
     }
-    if rbx_reflection_class_is_a(database, class_name, "Model") && property_name == "WorldPivot" {
-        return true;
-    }
     if rbx_reflection_class_is_a(database, class_name, "TriangleMeshPart")
         && property_name == "FluidFidelity"
     {
@@ -334,6 +334,72 @@ pub(crate) fn native_overlay_property_schemas(
     (combined, direct, conditional_refs)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME, TYPE_ID_REF};
+
+    #[test]
+    fn model_world_pivot_uses_the_live_overlay() {
+        let database = rbx_reflection_database::get().unwrap();
+        let schemas = PropertySchemaMap::from([(
+            "Model".to_string(),
+            vec![PropertySchemaEntry {
+                name: "WorldPivot".to_string(),
+                type_id: TYPE_ID_CFRAME,
+                enum_type: None,
+            }],
+        )]);
+        let filters = HashMap::from([(
+            "Model".to_string(),
+            native_property_filter(database, "Model"),
+        )]);
+        let (_, direct, _) = native_overlay_property_schemas(database, &schemas, &filters);
+        assert_eq!(direct["Model"][0].name, "WorldPivot");
+    }
+
+    #[test]
+    fn conditional_reference_candidates_use_overlay_indices() {
+        let schemas = PropertySchemaMap::from([(
+            "ObjectValue".to_string(),
+            vec![PropertySchemaEntry {
+                name: "Value".to_string(),
+                type_id: TYPE_ID_REF,
+                enum_type: None,
+            }],
+        )]);
+        let instance = |referent: u128,
+                        name: &str,
+                        class: &str,
+                        properties: Vec<(rbx_dom_weak::Ustr, RbxVariant)>| {
+            rbx_binary::FlatInstance {
+                referent: RbxRef::some(referent),
+                parent_index: None,
+                name: name.to_string(),
+                class: class.into(),
+                properties,
+            }
+        };
+        let instances = vec![
+            instance(1, "Workspace", "Folder", Vec::new()),
+            instance(2, "MissingNativeRef", "ObjectValue", Vec::new()),
+            instance(
+                3,
+                "HasNativeRef",
+                "ObjectValue",
+                vec![("Value".into(), RbxVariant::Ref(RbxRef::some(1)))],
+            ),
+        ];
+
+        let (_, names, candidate_count) =
+            conditional_ref_overlay_request(&instances, &schemas, &[0, 2, 1]);
+        let packed = names["ObjectValue"][0][1]["packed"].as_str().unwrap();
+
+        assert_eq!(candidate_count, 1);
+        assert_eq!(base64::decode(packed).unwrap(), vec![3, 0, 0]);
+    }
+}
+
 pub(crate) fn overlay_property_names_value(
     schema: &PropertySchemaMap,
     native_filters: &HashMap<String, NativePropertyFilter>,
@@ -372,7 +438,12 @@ pub(crate) fn overlay_property_names_value(
 pub(crate) fn conditional_ref_overlay_request(
     instances: &[rbx_binary::FlatInstance],
     schema: &PropertySchemaMap,
+    native_index_by_overlay_index: &[usize],
 ) -> (PropertySchemaMap, Value, usize) {
+    let mut overlay_index_by_native_index = vec![0; native_index_by_overlay_index.len()];
+    for (overlay_index, &native_index) in native_index_by_overlay_index.iter().enumerate() {
+        overlay_index_by_native_index[native_index] = overlay_index;
+    }
     let mut candidates = HashMap::<(&str, &str), Vec<usize>>::new();
     for (index, instance) in instances.iter().enumerate() {
         let class_name = instance.class.as_str();
@@ -392,7 +463,7 @@ pub(crate) fn conditional_ref_overlay_request(
                 candidates
                     .entry((class_name, entry.name.as_str()))
                     .or_default()
-                    .push(index + 1);
+                    .push(overlay_index_by_native_index[index] + 1);
             }
         }
     }
@@ -467,9 +538,18 @@ fn fetch_native_overlay_batch_once(
 ) -> Result<NativeOverlayFetch> {
     let service = request.service;
     let started = Instant::now();
-    let (batch, metrics) = fetch_typed_payload_with_size::<NativeOverlayPayload, _>(
+    let overlay_cache_key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(request.overlay_names)?)
+    );
+    let cache_slot = format!(
+        "native-overlay:{service}:{start_index}:{take_count}:{}:{}:{overlay_cache_key}",
+        request.overlay_variant, request.include_debug_ids,
+    );
+    let (batch, metrics) = fetch_typed_payload_with_size_cached::<NativeOverlayPayload, _>(
         DEFAULT_EXPORT_CHUNK_SIZE,
-        |chunk_start, max_len| {
+        &cache_slot,
+        |chunk_start, max_len, known_payload_hash| {
             bridge.call_chunk(
                 "getEditorBinaryOverlayChunk",
                 json!({
@@ -480,8 +560,12 @@ fn fetch_native_overlay_batch_once(
                     "maxLen": max_len,
                     "overlayId": request.overlay_id,
                     "overlayVariant": request.overlay_variant,
+                    "overlayCacheKey": overlay_cache_key,
                     "overlayPropertiesByClass": request.overlay_names,
                     "supportsStableInstanceIds": request.include_debug_ids,
+                    "supportsCompressedPayload": true,
+                    "supportsPayloadCache": true,
+                    "knownPayloadHash": known_payload_hash,
                 }),
             )
         },
@@ -499,7 +583,8 @@ fn fetch_native_overlay_batch_once(
     if !request.include_debug_ids
         && (!batch.debug_id_buffer.is_null()
             || !batch.debug_id_encoding.is_empty()
-            || batch.debug_id_buffer_bytes != 0)
+            || batch.debug_id_buffer_bytes != 0
+            || !batch.settings_ids.is_empty())
     {
         bail!("Native overlay for {service} returned unexpected debug id data");
     }
@@ -512,6 +597,12 @@ fn fetch_native_overlay_batch_once(
             take_count,
         )
         .with_context(|| format!("Invalid native debug ids for {service}"))?
+    } else {
+        Vec::new()
+    };
+    let settings_ids = if request.include_debug_ids {
+        decode_batch_settings_ids(batch.settings_ids, take_count, "Native overlay settings id")
+            .with_context(|| format!("Invalid native settings ids for {service}"))?
     } else {
         Vec::new()
     };
@@ -537,6 +628,7 @@ fn fetch_native_overlay_batch_once(
         compact_expand_ms: elapsed_ms(compact_expand_started),
         request_ms: elapsed_ms(started),
         debug_ids,
+        settings_ids,
         items,
     })
 }
@@ -765,6 +857,7 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
                 rbx_attributes,
                 database,
                 refs,
+                false,
             ));
             continue;
         }
@@ -811,7 +904,7 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
     if is_lua_source_class(class_name) {
         properties.insert(
             "Source".to_string(),
-            Value::String("__SOURCE_EXTERNAL__".to_string()),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
         );
         source = Some(source.unwrap_or_default());
     }
@@ -837,6 +930,7 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
                 rbx_attributes,
                 database,
                 refs,
+                true,
             ));
             continue;
         }
@@ -884,7 +978,9 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
                 continue;
             }
         }
-        if let Some(value) = rbx_variant_to_settings_json(variant, descriptor, database, refs) {
+        if let Some(value) =
+            rbx_variant_to_persisted_settings_json(variant, descriptor, database, refs)
+        {
             let output_name = options
                 .native_filter
                 .and_then(|filter| filter.renamed.get(property_name))
@@ -896,7 +992,7 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
     if is_lua_source_class(class_name) {
         properties.insert(
             "Source".to_string(),
-            Value::String("__SOURCE_EXTERNAL__".to_string()),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
         );
         source = Some(source.unwrap_or_default());
     }
@@ -918,6 +1014,7 @@ fn rbx_attributes_to_settings_map(
     attributes: &RbxAttributes,
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
+    preserve_type: bool,
 ) -> Map<String, Value> {
     let mut out = Map::new();
     for (name, value) in attributes {
@@ -938,7 +1035,7 @@ fn rbx_attributes_to_settings_map(
                 }
                 Some(encoded)
             }
-            _ => rbx_variant_to_settings_json(value, None, database, refs),
+            _ => rbx_variant_to_settings_json_inner(value, None, database, refs, preserve_type),
         };
         if let Some(value) = value {
             out.insert(name.clone(), value);
@@ -953,17 +1050,55 @@ pub(crate) fn rbx_variant_to_settings_json(
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
 ) -> Option<Value> {
+    rbx_variant_to_settings_json_inner(value, descriptor, database, refs, false)
+}
+
+pub(crate) fn rbx_variant_to_persisted_settings_json(
+    value: &RbxVariant,
+    descriptor: Option<&RbxPropertyDescriptor<'_>>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+) -> Option<Value> {
+    rbx_variant_to_settings_json_inner(value, descriptor, database, refs, descriptor.is_none())
+}
+
+fn rbx_variant_to_settings_json_inner(
+    value: &RbxVariant,
+    descriptor: Option<&RbxPropertyDescriptor<'_>>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+    preserve_type: bool,
+) -> Option<Value> {
     match value {
         RbxVariant::Bool(value) => Some(Value::Bool(*value)),
+        RbxVariant::Int32(value) if preserve_type => {
+            Some(json!({"_type":"Int32","value":value}))
+        }
         RbxVariant::Int32(value) => Some(Value::Number(Number::from(*value))),
+        RbxVariant::Int64(value) if preserve_type => {
+            Some(json!({"_type":"Int64","value":value}))
+        }
         RbxVariant::Int64(value) => Some(Value::Number(Number::from(*value))),
+        RbxVariant::Float32(value) if preserve_type => {
+            Some(json!({"_type":"Float32","value":json_number_f64(*value as f64)}))
+        }
         RbxVariant::Float32(value) => Some(json_number_f64(*value as f64)),
+        RbxVariant::Float64(value) if preserve_type => {
+            Some(json!({"_type":"Float64","value":json_number_f64(*value)}))
+        }
         RbxVariant::Float64(value) => Some(json_number_f64(*value)),
         RbxVariant::String(value) => Some(Value::String(value.clone())),
         RbxVariant::BinaryString(value) => {
             Some(binary_payload_json("BinaryString", value.as_ref()))
         }
+        RbxVariant::ContentId(value) if preserve_type => {
+            Some(json!({"_type":"ContentId","value":value.as_str()}))
+        }
         RbxVariant::ContentId(value) => Some(Value::String(value.as_str().to_string())),
+        RbxVariant::Content(value) if preserve_type => Some(json!({
+            "_type":"Content",
+            "value":rbx_content_to_settings_json(value, refs)?,
+        })),
         RbxVariant::Content(value) => rbx_content_to_settings_json(value, refs),
         RbxVariant::Tags(value) => Some(Value::Array(
             value.iter().map(|tag| Value::String(tag.to_string())).collect(),
@@ -1022,7 +1157,12 @@ pub(crate) fn rbx_variant_to_settings_json(
             Some(rbx_enum_to_settings_json(enum_name, value.to_u32(), database))
         }
         RbxVariant::EnumItem(value) => Some(rbx_enum_to_settings_json(Some(&value.ty), value.value, database)),
-        RbxVariant::Attributes(attributes) => Some(Value::Object(rbx_attributes_to_settings_map(attributes, database, refs))),
+        RbxVariant::Attributes(attributes) => Some(Value::Object(rbx_attributes_to_settings_map(
+            attributes,
+            database,
+            refs,
+            preserve_type,
+        ))),
         RbxVariant::Axes(value) => Some(json!({
             "_type": "Axes",
             "axes": Value::Array(bitmask_names(value.bits(), &AXIS_NAMES)),

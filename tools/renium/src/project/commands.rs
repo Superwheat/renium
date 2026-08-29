@@ -905,7 +905,7 @@ pub(crate) fn syncback_command(args: SyncbackArgs, global_project: Option<&Path>
     if args.dry_run || args.list {
         return print_json_output(&result, false);
     }
-    stage.publish(&loaded.root)?;
+    stage.publish(&loaded.root, false)?;
     print_json_output(&result, false)
 }
 

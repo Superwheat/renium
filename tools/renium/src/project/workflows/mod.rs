@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -1602,11 +1602,12 @@ fn daemon_status_values(name: Option<&str>) -> Result<Vec<Value>> {
         }
         let alive = crate::daemon::is_process_alive(daemon.pid);
         let endpoint = daemon_endpoint(&daemon).ok();
-        let responsive = endpoint
-            .and_then(|endpoint| {
-                TcpStream::connect_timeout(&endpoint, Duration::from_millis(250)).ok()
-            })
-            .is_some();
+        let responsive = endpoint.is_some_and(|endpoint| {
+            crate::automation::client::daemon_endpoint_available(
+                endpoint,
+                Duration::from_millis(250),
+            )
+        });
         result.push(json!({
             "name": daemon.name,
             "pid": daemon.pid,
@@ -1636,9 +1637,12 @@ fn stop_named_daemon(name: &str, force: bool) -> Result<String> {
         let endpoint = daemon_endpoint(&daemon).with_context(|| {
             format!("Daemon '{name}' has no valid control endpoint; use --force to stop it")
         })?;
-        TcpStream::connect_timeout(&endpoint, Duration::from_millis(250)).with_context(|| {
-            format!("Daemon '{name}' is not responding; use --force to stop it")
-        })?;
+        if !crate::automation::client::daemon_endpoint_available(
+            endpoint,
+            Duration::from_millis(250),
+        ) {
+            bail!("Daemon '{name}' is not responding; use --force to stop it");
+        }
     }
     terminate_recorded_daemon(daemon.pid)?;
     let deadline = Instant::now() + Duration::from_secs(1);

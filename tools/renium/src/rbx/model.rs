@@ -31,7 +31,6 @@ use crate::bytecode::{
 use crate::cli::{
     BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeImportModelArgs, BytecodeRepackArgs,
 };
-use crate::editor::document::read_editor_service_documents;
 use crate::editor::paths::{
     build_editor_instance_paths, build_editor_instance_paths_with_children,
     build_editor_source_paths_by_index, build_editor_source_paths_by_index_with_children,
@@ -417,8 +416,36 @@ fn insert_unique_settings_ref_target(
 pub(crate) fn canonicalize_settings_reference_documents(
     documents: &mut BTreeMap<String, SettingsBytecode>,
 ) -> BTreeSet<String> {
+    canonicalize_settings_reference_documents_scoped(documents, None)
+}
+
+pub(crate) fn canonicalize_settings_references_for_move(
+    documents: &mut BTreeMap<String, SettingsBytecode>,
+    source_service: &str,
+    moved_indices: &HashSet<usize>,
+) -> BTreeSet<String> {
+    let scope = HashMap::from([(source_service, moved_indices)]);
+    canonicalize_settings_reference_documents_scoped(documents, Some(&scope))
+}
+
+pub(crate) fn canonicalize_settings_references_for_moves(
+    documents: &mut BTreeMap<String, SettingsBytecode>,
+    moved_indices: &HashMap<String, HashSet<usize>>,
+) -> BTreeSet<String> {
+    let scope = moved_indices
+        .iter()
+        .map(|(service, indices)| (service.as_str(), indices))
+        .collect::<HashMap<_, _>>();
+    canonicalize_settings_reference_documents_scoped(documents, Some(&scope))
+}
+
+fn canonicalize_settings_reference_documents_scoped(
+    documents: &mut BTreeMap<String, SettingsBytecode>,
+    move_scope: Option<&HashMap<&str, &HashSet<usize>>>,
+) -> BTreeSet<String> {
     let mut targets = Vec::new();
     let mut local_ids = HashMap::<String, HashMap<String, usize>>::new();
+    let mut local_indices = HashMap::<String, Vec<Option<usize>>>::new();
     let mut global_ids = HashMap::<String, Option<usize>>::new();
     let mut exact_paths = HashMap::<String, Option<usize>>::new();
     let mut segment_paths = HashMap::<String, Option<usize>>::new();
@@ -436,6 +463,9 @@ pub(crate) fn canonicalize_settings_reference_documents(
                 path_segments: path.path_segments.clone(),
                 path_ordinals: path.path_ordinals.clone(),
             });
+            local_indices
+                .entry(service.clone())
+                .or_insert_with(|| vec![None; document.instances.len()])[index] = Some(target);
             local_ids
                 .entry(service.clone())
                 .or_default()
@@ -459,21 +489,27 @@ pub(crate) fn canonicalize_settings_reference_documents(
         }
     }
 
+    struct CanonicalReferenceContext<'a> {
+        targets: &'a [CanonicalSettingsRefTarget],
+        local_ids: &'a HashMap<String, HashMap<String, usize>>,
+        local_indices: &'a HashMap<String, Vec<Option<usize>>>,
+        global_ids: &'a HashMap<String, Option<usize>>,
+        exact_paths: &'a HashMap<String, Option<usize>>,
+        segment_paths: &'a HashMap<String, Option<usize>>,
+        move_scope: Option<&'a HashMap<&'a str, &'a HashSet<usize>>>,
+    }
+
     fn resolve(
         object: &Map<String, Value>,
         owner_service: &str,
-        targets: &[CanonicalSettingsRefTarget],
-        local_ids: &HashMap<String, HashMap<String, usize>>,
-        global_ids: &HashMap<String, Option<usize>>,
-        exact_paths: &HashMap<String, Option<usize>>,
-        segment_paths: &HashMap<String, Option<usize>>,
+        context: &CanonicalReferenceContext<'_>,
     ) -> Option<usize> {
         let persistent_id = object
             .get("settingsId")
             .or_else(|| object.get("instanceId"))
             .and_then(Value::as_str);
         if let Some(target) = persistent_id
-            .and_then(|id| global_ids.get(id))
+            .and_then(|id| context.global_ids.get(id))
             .copied()
             .flatten()
         {
@@ -483,7 +519,7 @@ pub(crate) fn canonicalize_settings_reference_documents(
             .get("debugId")
             .and_then(Value::as_str)
             .map(|debug_id| format!("debug:{debug_id}"))
-            .and_then(|id| global_ids.get(&id).copied().flatten())
+            .and_then(|id| context.global_ids.get(&id).copied().flatten())
         {
             return Some(target);
         }
@@ -495,14 +531,16 @@ pub(crate) fn canonicalize_settings_reference_documents(
                 .get("pathOrdinals")
                 .and_then(path_ordinals_from_value)
                 && segments.len() == ordinals.len()
-                && let Some(target) = exact_paths
+                && let Some(target) = context
+                    .exact_paths
                     .get(&instance_path_parts_key(&segments, &ordinals))
                     .copied()
                     .flatten()
             {
                 return Some(target);
             }
-            if let Some(target) = segment_paths
+            if let Some(target) = context
+                .segment_paths
                 .get(&instance_path_key(&segments))
                 .copied()
                 .flatten()
@@ -513,14 +551,18 @@ pub(crate) fn canonicalize_settings_reference_documents(
         if let Some(index) = object
             .get("instanceIndex")
             .and_then(settings_reference_index)
-            && let Some(target) = targets
-                .iter()
-                .position(|target| target.service == owner_service && target.index == index)
+            && let Some(target) = context
+                .local_indices
+                .get(owner_service)
+                .and_then(|indices| indices.get(index))
+                .copied()
+                .flatten()
         {
             return Some(target);
         }
         persistent_id.and_then(|id| {
-            local_ids
+            context
+                .local_ids
                 .get(owner_service)
                 .and_then(|ids| ids.get(id))
                 .copied()
@@ -531,6 +573,7 @@ pub(crate) fn canonicalize_settings_reference_documents(
         object: &mut Map<String, Value>,
         owner_service: &str,
         target: &CanonicalSettingsRefTarget,
+        remove_instance_index: bool,
     ) -> bool {
         let mut changed = false;
         let settings_id = Value::String(target.settings_id.clone());
@@ -565,84 +608,72 @@ pub(crate) fn canonicalize_settings_reference_documents(
             object.insert("pathOrdinals".to_string(), path_ordinals);
             changed = true;
         }
-        if target.service != owner_service && object.remove("instanceIndex").is_some() {
+        if (target.service != owner_service || remove_instance_index)
+            && object.remove("instanceIndex").is_some()
+        {
             changed = true;
         }
         changed
     }
 
+    fn selected(
+        context: &CanonicalReferenceContext<'_>,
+        owner_service: &str,
+        owner_index: usize,
+        target: &CanonicalSettingsRefTarget,
+    ) -> bool {
+        context.move_scope.is_none_or(|scope| {
+            scope
+                .get(owner_service)
+                .is_some_and(|indices| indices.contains(&owner_index))
+                || scope
+                    .get(target.service.as_str())
+                    .is_some_and(|indices| indices.contains(&target.index))
+        })
+    }
+
     fn visit(
         value: &mut Value,
         owner_service: &str,
-        targets: &[CanonicalSettingsRefTarget],
-        local_ids: &HashMap<String, HashMap<String, usize>>,
-        global_ids: &HashMap<String, Option<usize>>,
-        exact_paths: &HashMap<String, Option<usize>>,
-        segment_paths: &HashMap<String, Option<usize>>,
+        owner_index: usize,
+        context: &CanonicalReferenceContext<'_>,
     ) -> bool {
         match value {
             Value::Array(values) => {
                 let mut changed = false;
                 for value in values {
-                    changed = visit(
-                        value,
-                        owner_service,
-                        targets,
-                        local_ids,
-                        global_ids,
-                        exact_paths,
-                        segment_paths,
-                    ) || changed;
+                    changed = visit(value, owner_service, owner_index, context) || changed;
                 }
                 changed
             }
             Value::Object(object) => {
                 let direct_target = (object.get("_type").and_then(Value::as_str) == Some("Ref"))
-                    .then(|| {
-                        resolve(
-                            object,
-                            owner_service,
-                            targets,
-                            local_ids,
-                            global_ids,
-                            exact_paths,
-                            segment_paths,
-                        )
-                    })
+                    .then(|| resolve(object, owner_service, context))
                     .flatten();
                 let mut changed = direct_target
-                    .and_then(|index| targets.get(index))
-                    .is_some_and(|target| apply_target(object, owner_service, target));
-                let wrapped_target =
-                    object
-                        .get("Ref")
-                        .and_then(Value::as_object)
-                        .and_then(|reference| {
-                            resolve(
-                                reference,
-                                owner_service,
-                                targets,
-                                local_ids,
-                                global_ids,
-                                exact_paths,
-                                segment_paths,
-                            )
-                        });
-                if let Some(target) = wrapped_target.and_then(|index| targets.get(index))
+                    .and_then(|index| context.targets.get(index))
+                    .filter(|target| selected(context, owner_service, owner_index, target))
+                    .is_some_and(|target| {
+                        apply_target(object, owner_service, target, context.move_scope.is_some())
+                    });
+                let wrapped_target = object
+                    .get("Ref")
+                    .and_then(Value::as_object)
+                    .and_then(|reference| resolve(reference, owner_service, context));
+                if let Some(target) = wrapped_target
+                    .and_then(|index| context.targets.get(index))
+                    .filter(|target| selected(context, owner_service, owner_index, target))
                     && let Some(reference) = object.get_mut("Ref").and_then(Value::as_object_mut)
                 {
-                    changed = apply_target(reference, owner_service, target) || changed;
+                    changed = apply_target(
+                        reference,
+                        owner_service,
+                        target,
+                        context.move_scope.is_some(),
+                    ) || changed;
                 }
                 for nested in object.values_mut() {
-                    changed = visit(
-                        nested,
-                        owner_service,
-                        targets,
-                        local_ids,
-                        global_ids,
-                        exact_paths,
-                        segment_paths,
-                    ) || changed;
+                    changed = visit(nested, owner_service, owner_index, context) || changed;
                 }
                 changed
             }
@@ -650,31 +681,24 @@ pub(crate) fn canonicalize_settings_reference_documents(
         }
     }
 
+    let context = CanonicalReferenceContext {
+        targets: &targets,
+        local_ids: &local_ids,
+        local_indices: &local_indices,
+        global_ids: &global_ids,
+        exact_paths: &exact_paths,
+        segment_paths: &segment_paths,
+        move_scope,
+    };
     let mut changed_services = BTreeSet::new();
     for (service, document) in documents.iter_mut() {
         let mut changed = false;
-        for instance in &mut document.instances {
+        for (index, instance) in document.instances.iter_mut().enumerate() {
             for value in instance.properties.values_mut() {
-                changed = visit(
-                    value,
-                    service,
-                    &targets,
-                    &local_ids,
-                    &global_ids,
-                    &exact_paths,
-                    &segment_paths,
-                ) || changed;
+                changed = visit(value, service, index, &context) || changed;
             }
             for value in instance.attributes.values_mut() {
-                changed = visit(
-                    value,
-                    service,
-                    &targets,
-                    &local_ids,
-                    &global_ids,
-                    &exact_paths,
-                    &segment_paths,
-                ) || changed;
+                changed = visit(value, service, index, &context) || changed;
             }
         }
         if changed {
@@ -682,26 +706,6 @@ pub(crate) fn canonicalize_settings_reference_documents(
         }
     }
     changed_services
-}
-
-pub(crate) fn canonicalize_settings_reference_stores(src_root: &Path) -> Result<usize> {
-    let mut files = BTreeMap::new();
-    let mut documents = BTreeMap::new();
-    for entry in read_editor_service_documents(src_root)? {
-        files.insert(entry.service.clone(), entry.settings_file);
-        documents.insert(entry.service, entry.document);
-    }
-    let changed = canonicalize_settings_reference_documents(&mut documents);
-    if changed.is_empty() {
-        return Ok(0);
-    }
-    let mut writes = BTreeMap::new();
-    for service in &changed {
-        let path = &files[service];
-        writes.insert(path.clone(), encode_settings_bytecode(&documents[service])?);
-    }
-    apply_file_mutations(&writes, &[])?;
-    Ok(changed.len())
 }
 
 pub(crate) fn imported_instance_index(
@@ -738,6 +742,7 @@ pub(crate) struct RbxPlaceBuild {
     pub(crate) has_package_links: bool,
     pub(crate) omitted_properties_by_class: HashMap<String, HashSet<String>>,
     pub(crate) logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
+    pub(crate) unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
 }
 
 pub(crate) fn source_only_settings_document(
@@ -1281,6 +1286,7 @@ pub(crate) fn build_rbx_place(
         instances: Vec<(Option<RbxRef>, RbxInstanceBuilder)>,
         omitted_properties_by_class: HashMap<String, HashSet<String>>,
         logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
+        unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
     }
     let phase_started = Instant::now();
     let built_services = export_inputs
@@ -1306,6 +1312,7 @@ pub(crate) fn build_rbx_place(
                 let mut instances = Vec::with_capacity(subtree.len());
                 let mut omitted_properties_by_class = HashMap::new();
                 let mut logical_properties_by_ref = HashMap::new();
+                let mut unresolved_reference_properties_by_ref = HashMap::new();
                 let mut metadata = BytecodeExportMetadata::new();
                 let mut encoder = BytecodeRbxEncoder::new(document, database, &mut metadata, &refs);
                 for index in subtree.iter().copied() {
@@ -1321,6 +1328,7 @@ pub(crate) fn build_rbx_place(
                         })?)
                     };
                     let mut logical_properties = HashMap::new();
+                    let mut unresolved_reference_properties = HashSet::new();
                     let builder = encoder.build(
                         index,
                         BytecodeRbxBuildOptions {
@@ -1329,6 +1337,8 @@ pub(crate) fn build_rbx_place(
                                 .then_some(&mut omitted_properties_by_class),
                             logical_omitted_properties: capture_logical_properties
                                 .then_some(&mut logical_properties),
+                            unresolved_reference_properties: capture_logical_properties
+                                .then_some(&mut unresolved_reference_properties),
                         },
                     )?;
                     if !logical_properties.is_empty() {
@@ -1338,6 +1348,15 @@ pub(crate) fn build_rbx_place(
                                 .get(&index)
                                 .context("Export instance referent is missing")?,
                             logical_properties,
+                        );
+                    }
+                    if !unresolved_reference_properties.is_empty() {
+                        unresolved_reference_properties_by_ref.insert(
+                            *refs
+                                .by_index
+                                .get(&index)
+                                .context("Export instance referent is missing")?,
+                            unresolved_reference_properties,
                         );
                     }
                     instances.push((parent_ref, builder));
@@ -1350,6 +1369,7 @@ pub(crate) fn build_rbx_place(
                     instances,
                     omitted_properties_by_class,
                     logical_properties_by_ref,
+                    unresolved_reference_properties_by_ref,
                 })
             },
         )
@@ -1359,6 +1379,7 @@ pub(crate) fn build_rbx_place(
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let mut omitted_properties_by_class = HashMap::new();
     let mut logical_properties_by_ref = HashMap::new();
+    let mut unresolved_reference_properties_by_ref = HashMap::new();
     let mut top_level_refs = Vec::with_capacity(export_inputs.len());
     for service in built_services {
         for (class_name, names) in service.omitted_properties_by_class {
@@ -1368,6 +1389,8 @@ pub(crate) fn build_rbx_place(
                 .extend(names);
         }
         logical_properties_by_ref.extend(service.logical_properties_by_ref);
+        unresolved_reference_properties_by_ref
+            .extend(service.unresolved_reference_properties_by_ref);
         for (parent_ref, builder) in service.instances {
             let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
             dom.insert(parent_ref, builder);
@@ -1420,6 +1443,7 @@ pub(crate) fn build_rbx_place(
         has_package_links,
         omitted_properties_by_class,
         logical_properties_by_ref,
+        unresolved_reference_properties_by_ref,
     })
 }
 

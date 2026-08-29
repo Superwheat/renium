@@ -235,8 +235,10 @@ foreach ($tool in @("git", "cargo", "node")) {
         throw "Required tool is not on PATH: $tool"
     }
 }
-if (-not $SkipTests -and -not (Get-Command -Name "lune" -ErrorAction SilentlyContinue)) {
-    throw "Required tool is not on PATH: lune"
+foreach ($tool in @("lune", "selene")) {
+    if (-not $SkipTests -and -not (Get-Command -Name $tool -ErrorAction SilentlyContinue)) {
+        throw "Required tool is not on PATH: $tool"
+    }
 }
 
 $npm = if ($env:OS -eq "Windows_NT") { "npm.cmd" } else { "npm" }
@@ -414,6 +416,7 @@ if (-not $SkipTests) {
     if ([string]::IsNullOrWhiteSpace($PrebuiltCli)) {
         Invoke-Checked -File "cargo" -Arguments @("test", "--locked", "--release", "--target", $releaseTarget.Triple, "--manifest-path", $cargoManifest) -WorkingDirectory $repositoryRoot
     }
+    & (Join-Path $pluginDirectory "tests\parse-all.ps1")
     Invoke-Checked -File "lune" -Arguments @("run", "tools/plugin_ws_bridge/tests/run") -WorkingDirectory $repositoryRoot
     if ($env:OS -eq "Windows_NT") {
         Invoke-Checked -File "node" -Arguments @("tools/renium/tests/automation-replay.mjs", $cliBinary) -WorkingDirectory $repositoryRoot

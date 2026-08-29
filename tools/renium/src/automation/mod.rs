@@ -25,6 +25,7 @@ pub mod op {
 
 pub const PROTOCOL_VERSION: u8 = op::PROTOCOL_VERSION;
 const REVIEW_TTL: Duration = Duration::from_secs(300);
+const STUDIO_LAUNCH_TTL: Duration = Duration::from_secs(60);
 
 pub struct Opcode {
     pub id: u16,
@@ -193,7 +194,7 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioReopenTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +203,12 @@ pub struct StudioReopenTarget {
     pub game_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place_id: Option<i64>,
+}
+
+struct StudioLaunch {
+    target: StudioReopenTarget,
+    started: Instant,
+    result: Value,
 }
 
 impl BoundContext {
@@ -232,6 +239,7 @@ pub struct State {
     next_review: AtomicU64,
     contexts: Mutex<HashMap<u64, BoundContext>>,
     studio_reopen_targets: Mutex<HashMap<String, StudioReopenTarget>>,
+    studio_launches: Mutex<HashMap<String, StudioLaunch>>,
     reviews: Mutex<HashMap<String, Review>>,
     available_update: Mutex<Option<String>>,
     live_sync: live::Manager,
@@ -244,6 +252,7 @@ impl Default for State {
             next_review: AtomicU64::new(1),
             contexts: Mutex::new(HashMap::new()),
             studio_reopen_targets: Mutex::new(HashMap::new()),
+            studio_launches: Mutex::new(HashMap::new()),
             reviews: Mutex::new(HashMap::new()),
             available_update: Mutex::new(None),
             live_sync: live::Manager::default(),
@@ -294,7 +303,7 @@ impl State {
         contexts.insert(context.id, context.clone());
         drop(contexts);
         for id in removed {
-            self.live_sync.stop(id);
+            self.live_sync.cancel(id);
         }
         context
     }
@@ -349,6 +358,53 @@ impl State {
             .cloned()
     }
 
+    pub fn recent_studio_launch(
+        &self,
+        context: &BoundContext,
+        target: &StudioReopenTarget,
+    ) -> Option<Value> {
+        let mut launches = self
+            .studio_launches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        launches.retain(|_, launch| launch.started.elapsed() < STUDIO_LAUNCH_TTL);
+        let launch = launches
+            .get(&context.project)
+            .filter(|launch| &launch.target == target)?;
+        let mut result = launch.result.clone();
+        if let Some(object) = result.as_object_mut() {
+            object.insert("alreadyOpening".to_string(), Value::Bool(true));
+        }
+        Some(result)
+    }
+
+    pub fn remember_studio_launch(
+        &self,
+        context: &BoundContext,
+        target: StudioReopenTarget,
+        result: Value,
+    ) {
+        self.studio_launches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                context.project.clone(),
+                StudioLaunch {
+                    target,
+                    started: Instant::now(),
+                    result,
+                },
+            );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub fn clear_studio_launch(&self, context: &BoundContext) {
+        self.studio_launches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&context.project);
+    }
+
     pub fn remove_context(&self, id: u64) -> bool {
         let removed = self
             .contexts
@@ -357,7 +413,7 @@ impl State {
             .remove(&id)
             .is_some();
         if removed {
-            self.live_sync.stop(id);
+            self.live_sync.cancel(id);
         }
         removed
     }

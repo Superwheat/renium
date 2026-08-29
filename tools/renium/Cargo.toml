@@ -1,6 +1,6 @@
 [package]
 name = "renium"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.89"
 license-file = "../../LICENSE"
@@ -9,6 +9,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
+ahash = "0.8"
 mimalloc = "0.1"
 memchr = "2.7"
 clap = { version = "4.5.53", features = ["derive"] }

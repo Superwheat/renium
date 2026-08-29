@@ -3,6 +3,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import { compareExplorerNodes } from "./serviceDefaults";
+import { withPausedFileWrites } from "./pausedFileWrites";
 import {
   appendRecordAssignments,
   isProtectedStarterPlayerContainer,
@@ -71,29 +72,11 @@ export class FileExplorerModel {
     write: () => Promise<T>,
     finish: (result: T) => Promise<string[]>,
   ): Promise<T> {
-    await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-      fileWrites: "pause",
-    });
-    try {
-      const result = await write();
-      const settledPaths = await finish(result);
-      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths: settledPaths,
-        fileWrites: "resume",
-      });
-      return result;
-    } catch (error) {
-      try {
-        await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-          fileWrites: "resume",
-        });
-      } catch (resumeError) {
-        const original = error instanceof Error ? error.message : String(error);
-        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
-        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
-      }
-      throw error;
-    }
+    return withPausedFileWrites(
+      (request) => vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", request),
+      write,
+      finish,
+    );
   }
 
   public getNode(treeId: string): FileExplorerNode | undefined {
@@ -687,92 +670,56 @@ export class FileExplorerModel {
       propertyName = "Disabled";
       parsedValue = !(parsedValue === true);
     }
-    let fileWritesPaused = false;
-    const resumeFileWrites = async (paths: string[]): Promise<void> => {
-      if (!fileWritesPaused) {
-        return;
-      }
-      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        paths,
-        fileWrites: "resume",
-      });
-      fileWritesPaused = false;
-    };
-    const fail = async (error: unknown): Promise<never> => {
+    return this.withPausedProjectWrite(async () => {
+      const batchDir = path.join(config.projectRoot, ".renium", "editor-property-batches");
+      fs.mkdirSync(batchDir, { recursive: true });
+      const batchPath = path.join(
+        batchDir,
+        `explorer-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+      );
+      fs.writeFileSync(batchPath, JSON.stringify([{
+        service: loaded.service,
+        settingsId: loaded.settingsId,
+        className: loaded.className,
+        pathSegments: loaded.pathSegments,
+        pathOrdinals: loaded.pathOrdinals,
+        scope,
+        property: propertyName,
+        value: parsedValue,
+      }]), "utf8");
+      let batchResult: {
+        applied?: number;
+        filtered?: number;
+        changedPaths?: string[];
+        sourcePaths?: Array<{ path?: string }>;
+      };
       try {
-        if (fileWritesPaused) {
-          await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-            fileWrites: "resume",
-          });
-          fileWritesPaused = false;
+        batchResult = await runJsonCli(config, [
+          "bytecode-apply-property-batch",
+          "--project-root",
+          config.projectRoot,
+          "--input",
+          batchPath,
+          "--direction",
+          "files-to-studio",
+        ]);
+      } finally {
+        try {
+          fs.unlinkSync(batchPath);
+        } catch {
         }
-      } catch (resumeError) {
-        const original = error instanceof Error ? error.message : String(error);
-        const resume = resumeError instanceof Error ? resumeError.message : String(resumeError);
-        throw new Error(`${original}; live sync also failed to resume: ${resume}`);
       }
-      throw error;
-    };
-    try {
-      await vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", {
-        fileWrites: "pause",
-      });
-      fileWritesPaused = true;
-    } catch (error) {
-      return fail(error);
-    }
-    const batchDir = path.join(config.projectRoot, ".renium", "editor-property-batches");
-    fs.mkdirSync(batchDir, { recursive: true });
-    const batchPath = path.join(
-      batchDir,
-      `explorer-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
-    );
-    fs.writeFileSync(batchPath, JSON.stringify([{
-      service: loaded.service,
-      settingsId: loaded.settingsId,
-      className: loaded.className,
-      pathSegments: loaded.pathSegments,
-      pathOrdinals: loaded.pathOrdinals,
-      scope,
-      property: propertyName,
-      value: parsedValue,
-    }]), "utf8");
-    let batchResult: {
-      applied?: number;
-      filtered?: number;
-      changedPaths?: string[];
-      sourcePaths?: Array<{ path?: string }>;
-    };
-    try {
-      batchResult = await runJsonCli(config, [
-        "bytecode-apply-property-batch",
-        "--project-root",
-        config.projectRoot,
-        "--input",
-        batchPath,
-        "--direction",
-        "files-to-studio",
-      ]);
-    } catch (error) {
-      return fail(error);
-    } finally {
-      try {
-        fs.unlinkSync(batchPath);
-      } catch {
+      if (batchResult.applied !== 1) {
+        throw new Error(batchResult.filtered === 1
+          ? "This field is excluded by the project filters."
+          : "The project did not apply this property edit.");
       }
-    }
-    if (batchResult.applied !== 1) {
-      return fail(new Error(batchResult.filtered === 1
-        ? "This field is excluded by the project filters."
-        : "The project did not apply this property edit."));
-    }
-    const changedPaths = Array.from(new Set([
-      ...(batchResult.changedPaths ?? []),
-      ...(batchResult.sourcePaths ?? [])
-        .map((entry) => entry.path)
-        .filter((value): value is string => typeof value === "string" && value.length > 0),
-    ]));
-    try {
+      const changedPaths = Array.from(new Set([
+        ...(batchResult.changedPaths ?? []),
+        ...(batchResult.sourcePaths ?? [])
+          .map((entry) => entry.path)
+          .filter((value): value is string => typeof value === "string" && value.length > 0),
+      ]));
       if (generation !== this.projectGeneration) {
         throw new Error("The active Renium project changed while the edit was being applied.");
       }
@@ -813,11 +760,8 @@ export class FileExplorerModel {
           throw new Error("Studio did not apply the Explorer edit.");
         }
       }
-      await resumeFileWrites(options.skipStudioPush ? changedPaths : []);
-    } catch (error) {
-      return fail(error);
-    }
-    return changedPaths;
+      return changedPaths;
+    }, async (changedPaths) => options.skipStudioPush ? changedPaths : []);
   }
 
   private async reloadParentChildren(node: FileExplorerNode): Promise<void> {

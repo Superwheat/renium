@@ -29,7 +29,7 @@ const BOOLEAN_CONFIG_KEYS = new Set([
 ]);
 const INTEGER_CONFIG_KEYS = new Set([
   "schemaVersion", "sourceWorkers", "instanceWorkers", "importWorkers", "chunkSize",
-  "autoSyncDebounceMs", "studioLiveSyncPollMs",
+  "autoSyncDebounceMs",
   "liveSync.changesThreshold", "liveSync.diffLinesLimit",
 ]);
 const NUMBER_CONFIG_KEYS = new Set([
@@ -110,91 +110,105 @@ type ProjectScriptIdentity = {
   runContext?: "Client" | "Plugin" | "Legacy";
 };
 
-function stripJsonc(text: string): string {
-  let output = "";
-  let inString = false;
+function jsonStringEnd(text: string, start: number): number {
   let escaped = false;
-  let lineComment = false;
-  let blockComment = false;
+  for (let index = start + 1; index < text.length; index += 1) {
+    const current = text[index];
+    if (escaped) {
+      escaped = false;
+    } else if (current === "\\") {
+      escaped = true;
+    } else if (current === "\"") {
+      return index;
+    }
+  }
+  throw new Error("Unterminated JSONC string or block comment");
+}
+
+function lineCommentEnd(text: string, start: number): number {
+  for (let index = start + 2; index < text.length; index += 1) {
+    if (text[index] === "\n" || text[index] === "\r") {
+      return index - 1;
+    }
+  }
+  return text.length - 1;
+}
+
+function blockCommentEnd(text: string, start: number): number {
+  const end = text.indexOf("*/", start + 2);
+  if (end < 0) {
+    throw new Error("Unterminated JSONC string or block comment");
+  }
+  return end + 1;
+}
+
+function blockCommentLineBreaks(text: string, start: number, end: number): string {
+  let lineBreaks = "";
+  for (let index = start + 2; index < end - 1; index += 1) {
+    if (text[index] === "\n" || text[index] === "\r") {
+      lineBreaks += text[index];
+    }
+  }
+  return lineBreaks;
+}
+
+function stripJsoncComments(text: string): string {
+  const parts: string[] = [];
+  let segmentStart = 0;
   for (let index = 0; index < text.length; index += 1) {
     const current = text[index];
     const next = text[index + 1];
-    if (lineComment) {
-      if (current === "\n" || current === "\r") {
-        lineComment = false;
-        output += current;
-      }
-      continue;
-    }
-    if (blockComment) {
-      if (current === "*" && next === "/") {
-        blockComment = false;
-        index += 1;
-      } else if (current === "\n" || current === "\r") {
-        output += current;
-      }
-      continue;
-    }
-    if (inString) {
-      output += current;
-      if (escaped) {
-        escaped = false;
-      } else if (current === "\\") {
-        escaped = true;
-      } else if (current === "\"") {
-        inString = false;
-      }
-      continue;
-    }
     if (current === "\"") {
-      inString = true;
-      output += current;
-    } else if (current === "/" && next === "/") {
-      lineComment = true;
-      index += 1;
-    } else if (current === "/" && next === "*") {
-      blockComment = true;
-      index += 1;
-    } else {
-      output += current;
-    }
-  }
-  if (inString || blockComment) {
-    throw new Error("Unterminated JSONC string or block comment");
-  }
-  let withoutTrailing = "";
-  inString = false;
-  escaped = false;
-  for (let index = 0; index < output.length; index += 1) {
-    const current = output[index];
-    if (inString) {
-      withoutTrailing += current;
-      if (escaped) {
-        escaped = false;
-      } else if (current === "\\") {
-        escaped = true;
-      } else if (current === "\"") {
-        inString = false;
-      }
+      index = jsonStringEnd(text, index);
       continue;
     }
+    if (current === "/" && next === "/") {
+      parts.push(text.slice(segmentStart, index));
+      index = lineCommentEnd(text, index);
+      segmentStart = index + 1;
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      const end = blockCommentEnd(text, index);
+      parts.push(text.slice(segmentStart, index), blockCommentLineBreaks(text, index, end));
+      index = end;
+      segmentStart = end + 1;
+      continue;
+    }
+  }
+  parts.push(text.slice(segmentStart));
+  return parts.join("");
+}
+
+function followedByClosingDelimiter(text: string, start: number): boolean {
+  let index = start + 1;
+  while (index < text.length && /\s/.test(text[index])) {
+    index += 1;
+  }
+  return text[index] === "}" || text[index] === "]";
+}
+
+function stripTrailingCommas(text: string): string {
+  const parts: string[] = [];
+  let segmentStart = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const current = text[index];
     if (current === "\"") {
-      inString = true;
-      withoutTrailing += current;
+      index = jsonStringEnd(text, index);
       continue;
     }
-    if (current === ",") {
-      let next = index + 1;
-      while (next < output.length && /\s/.test(output[next])) {
-        next += 1;
-      }
-      if (output[next] === "}" || output[next] === "]") {
-        continue;
-      }
+    if (current === "," && followedByClosingDelimiter(text, index)) {
+      parts.push(text.slice(segmentStart, index));
+      segmentStart = index + 1;
+      continue;
     }
-    withoutTrailing += current;
   }
-  return withoutTrailing;
+  parts.push(text.slice(segmentStart));
+  return parts.join("");
+}
+
+function stripJsonc(text: string): string {
+  return stripTrailingCommas(stripJsoncComments(text));
 }
 
 function readObject(filePath: string): SharedConfig {

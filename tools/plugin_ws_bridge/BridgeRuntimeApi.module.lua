@@ -446,6 +446,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		if operationGeneration ~= cancellationGeneration then
 			error("Renium operation was cancelled")
 		end
+		runtimeContext.assertRequestLeaseActive()
 		runtimeContext.assertSessionOwnership(sessionGeneration)
 	end
 
@@ -642,7 +643,11 @@ end)
 		end
 		resultConnection:Disconnect()
 		logConnection:Disconnect()
-		local retained = status == "ok" and backgroundLifetimeSeconds and backgroundLifetimeSeconds > 0
+		local ownsOperation, ownershipError = pcall(assertOperationOwnership, operationGeneration)
+		if not ownsOperation then
+			logError = tostring(ownershipError)
+		end
+		local retained = logError == nil and status == "ok" and backgroundLifetimeSeconds and backgroundLifetimeSeconds > 0
 		local executionId = nil
 		if retained then
 			retainedRunnerSequence += 1
@@ -1366,6 +1371,8 @@ updateMouse()
 	end
 
 	function api.sendVirtualInput(params)
+		local operationGeneration = cancellationGeneration
+		assertOperationOwnership(operationGeneration)
 		if not RunService:IsRunning() or not RunService:IsClient() then
 			return { ok = false, error = "Virtual input requires a Play client" }
 		end
@@ -1406,7 +1413,26 @@ updateMouse()
 
 		local virtualInput = game:GetService("UserInputService"):CreateVirtualInput()
 		local verifiedClicks = 0
+		local heldKeys = {}
+		local heldButtons = {}
+		local function sendKey(down, keyCode, repeated)
+			virtualInput:SendKey(down, keyCode, repeated)
+			heldKeys[keyCode] = if down then true else nil
+		end
+		local function sendMouseButton(position, button, down, repeatCount)
+			virtualInput:SendMouseButton(position, button, down, repeatCount)
+			heldButtons[button] = if down then position else nil
+		end
+		local function releaseHeldInput()
+			for keyCode in heldKeys do
+				pcall(virtualInput.SendKey, virtualInput, false, keyCode, false)
+			end
+			for button, position in heldButtons do
+				pcall(virtualInput.SendMouseButton, virtualInput, position, button, false, 0)
+			end
+		end
 		local function sendVerifiedClick(action)
+			assertOperationOwnership(operationGeneration)
 			local bounds = api.getGuiBounds({ path = action.path, id = action.id, scroll = true })
 			if bounds.ok ~= true then
 				error(tostring(bounds.error or "GUI target could not be resolved"), 0)
@@ -1434,12 +1460,21 @@ updateMouse()
 				clicked += 1
 			end)
 			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
-			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
-			task.wait(math.clamp((tonumber(action.holdMs) or 30) / 1000, 0, 10))
-			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+			sendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
+			local okHold, holdError = pcall(function()
+				task.wait(math.clamp((tonumber(action.holdMs) or 30) / 1000, 0, 10))
+				assertOperationOwnership(operationGeneration)
+			end)
+			sendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+			if not okHold then
+				activatedConnection:Disconnect()
+				clickedConnection:Disconnect()
+				error(holdError, 0)
+			end
 			local deadline = os.clock() + 1
 			while (activated == 0 or clicked == 0) and os.clock() < deadline do
 				RunService.Heartbeat:Wait()
+				assertOperationOwnership(operationGeneration)
 			end
 			activatedConnection:Disconnect()
 			clickedConnection:Disconnect()
@@ -1448,62 +1483,82 @@ updateMouse()
 			end
 			verifiedClicks += 1
 		end
-		for _, action in actions do
-			local actionType = tostring(action.type or "")
-			if actionType == "wait" then
-				task.wait(math.clamp((tonumber(action.ms) or 0) / 1000, 0, 10))
-			elseif actionType == "key" then
-				local keyCode = Enum.KeyCode[tostring(action.key or "")]
-				if keyCode == nil then
-					error("Unknown key " .. tostring(action.key), 0)
-				end
-				virtualInput:SendKey(action.down == true, keyCode, action.repeated == true)
-			elseif actionType == "text" then
-				virtualInput:SendTextInput(tostring(action.text or ""))
-			elseif actionType == "click" then
-				sendVerifiedClick(action)
-			else
-				local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
-				if actionType == "move" then
-					virtualInput:SendMousePosition(position)
-				elseif actionType == "button" then
-					local button = Enum.UserInputType.MouseButton1
-					if action.button == "right" then
-						button = Enum.UserInputType.MouseButton2
-					elseif action.button == "middle" then
-						button = Enum.UserInputType.MouseButton3
+		local ok, result = xpcall(function()
+			for _, action in actions do
+				assertOperationOwnership(operationGeneration)
+				local actionType = tostring(action.type or "")
+				if actionType == "wait" then
+					task.wait(math.clamp((tonumber(action.ms) or 0) / 1000, 0, 10))
+					assertOperationOwnership(operationGeneration)
+				elseif actionType == "key" then
+					local keyCode = Enum.KeyCode[tostring(action.key or "")]
+					if keyCode == nil then
+						error("Unknown key " .. tostring(action.key), 0)
 					end
-					virtualInput:SendMouseButton(position, button, action.down == true, tonumber(action.repeatCount) or 0)
-				elseif actionType == "scroll" then
-					virtualInput:SendPointerAction(position, { Wheel = tonumber(action.delta) or 0 })
+					sendKey(action.down == true, keyCode, action.repeated == true)
+				elseif actionType == "text" then
+					virtualInput:SendTextInput(tostring(action.text or ""))
+				elseif actionType == "click" then
+					sendVerifiedClick(action)
 				else
-					error("Unknown virtual input action " .. actionType, 0)
+					local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
+					if actionType == "move" then
+						virtualInput:SendMousePosition(position)
+					elseif actionType == "button" then
+						local button = Enum.UserInputType.MouseButton1
+						if action.button == "right" then
+							button = Enum.UserInputType.MouseButton2
+						elseif action.button == "middle" then
+							button = Enum.UserInputType.MouseButton3
+						end
+						sendMouseButton(
+							position,
+							button,
+							action.down == true,
+							tonumber(action.repeatCount) or 0
+						)
+					elseif actionType == "scroll" then
+						virtualInput:SendPointerAction(position, { Wheel = tonumber(action.delta) or 0 })
+					else
+						error("Unknown virtual input action " .. actionType, 0)
+					end
 				end
 			end
-		end
-		if activationConnection then
-			local deadline = os.clock() + 1
-			while (activationCount == 0 or clickCount == 0) and os.clock() < deadline do
-				RunService.Heartbeat:Wait()
+			if activationConnection then
+				local deadline = os.clock() + 1
+				while (activationCount == 0 or clickCount == 0) and os.clock() < deadline do
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+				end
+				activationConnection:Disconnect()
+				clickConnection:Disconnect()
+				if activationCount ~= 1 or clickCount ~= 1 then
+					return {
+						ok = false,
+						error = `Expected one Activated and MouseButton1Click event, got {activationCount} and {clickCount}`,
+					}
+				end
+			else
+				task.wait()
+				assertOperationOwnership(operationGeneration)
 			end
-			activationConnection:Disconnect()
-			clickConnection:Disconnect()
-			if activationCount ~= 1 or clickCount ~= 1 then
-				return {
-					ok = false,
-					error = `Expected one Activated and MouseButton1Click event, got {activationCount} and {clickCount}`,
-				}
-			end
-		else
-			task.wait()
+			return {
+				ok = true,
+				actions = #actions,
+				verifiedClicks = verifiedClicks,
+				activated = if activationId ~= "" then activationCount == 1 else nil,
+				clicked = if activationId ~= "" then clickCount == 1 else nil,
+			}
+		end, function(message)
+			return message
+		end)
+		if not ok or result.ok ~= true then
+			releaseHeldInput()
 		end
-		return {
-			ok = true,
-			actions = #actions,
-			verifiedClicks = verifiedClicks,
-			activated = if activationId ~= "" then activationCount == 1 else nil,
-			clicked = if activationId ~= "" then clickCount == 1 else nil,
-		}
+		if not ok then
+			error(result, 0)
+		end
+		return result
 	end
 
 	function api.getConsoleOutput(params)
@@ -1583,8 +1638,6 @@ updateMouse()
 			end
 			captureProbeGui = nil
 			captureProbeFrame = nil
-			task.wait()
-			assertOperationOwnership(operationGeneration)
 			return { ok = true, action = "stop" }
 		end
 		local colors = params.colors
@@ -1600,9 +1653,7 @@ updateMouse()
 			packedColors[index] = packed
 		end
 		if action == "start" then
-			if captureProbeGui ~= nil then
-				captureProbeGui:Destroy()
-			end
+			local previousGui = captureProbeGui
 			local screen = Instance.new("ScreenGui")
 			screen.Name = "__ReniumCaptureProbe"
 			screen.Archivable = false
@@ -1640,29 +1691,49 @@ updateMouse()
 			end
 			frame.Parent = screen
 			screen.Parent = game:GetService("CoreGui")
+			task.wait()
+			local okLease, leaseError = pcall(assertOperationOwnership, operationGeneration)
+			if not okLease then
+				screen:Destroy()
+				error(leaseError, 0)
+			end
+			if previousGui ~= nil then
+				previousGui:Destroy()
+			end
 			captureProbeGui = screen
 			captureProbeFrame = frame
 		elseif action == "phase" then
 			if captureProbeFrame == nil or captureProbeFrame.Parent == nil then
 				return { ok = false, error = "Capture probe is not active" }
 			end
+			local previousColors = table.create(16)
 			for index = 1, 16 do
 				local packed = packedColors[index]
 				local tile = captureProbeFrame:FindFirstChild(tostring(index))
 				if tile == nil then
 					return { ok = false, error = "Capture probe tile is missing" }
 				end
+				previousColors[index] = tile.BackgroundColor3
 				tile.BackgroundColor3 = Color3.fromRGB(
 					bit32.extract(packed, 16, 8),
 					bit32.extract(packed, 8, 8),
 					bit32.extract(packed, 0, 8)
 				)
 			end
+			task.wait()
+			local okLease, leaseError = pcall(assertOperationOwnership, operationGeneration)
+			if not okLease then
+				for index = 1, 16 do
+					local tile = captureProbeFrame and captureProbeFrame:FindFirstChild(tostring(index))
+					if tile ~= nil then
+						tile.BackgroundColor3 = previousColors[index]
+					end
+				end
+				error(leaseError, 0)
+			end
 		else
 			return { ok = false, error = `Unknown capture probe action '{action}'` }
 		end
-		task.wait()
-		assertOperationOwnership(operationGeneration)
 		return { ok = true, action = action }
 	end
 
@@ -1853,25 +1924,66 @@ updateMouse()
 			if not before.ok then
 				return before
 			end
-			local okStop, stopError = pcall(service.StopSimulationAsync, service)
-			if not okStop and before.simulating then
-				return { ok = false, error = tostring(stopError) }
+			local readyAtBefore = deviceSimulatorReadyAt
+			local configurationBefore = nil
+			if before.simulating then
+				local okConfig, deviceId, resolution, previousOrientation, previousScalingMode, previousDensity =
+					pcall(function()
+						return service:GetDeviceAsync(),
+							service:GetResolutionAsync(),
+							service:GetOrientationAsync(),
+							service:GetScalingModeAsync(),
+							service:GetPixelDensityAsync()
+					end)
+				if not okConfig then
+					return { ok = false, error = tostring(deviceId) }
+				end
+				configurationBefore = {
+					deviceId = deviceId,
+					resolution = resolution,
+					orientation = previousOrientation,
+					scalingMode = previousScalingMode,
+					pixelDensity = previousDensity,
+				}
 			end
-			local after = status()
-			local deadline = os.clock() + 1
-			while after.ok and after.simulating and os.clock() < deadline do
-				RunService.Heartbeat:Wait()
+			local okStop, resultOrError = xpcall(function()
 				assertOperationOwnership(operationGeneration)
-				after = status()
+				service:StopSimulationAsync()
+				assertOperationOwnership(operationGeneration)
+				local after = status()
+				local deadline = os.clock() + 1
+				while after.ok and after.simulating and os.clock() < deadline do
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+					after = status()
+				end
+				if not after.ok then
+					error(after.error)
+				end
+				if after.simulating then
+					error("Studio did not stop device simulation")
+				end
+				deviceSimulatorReadyAt = 0
+				return { ok = true, action = "stop", stopped = true, alreadyStopped = not before.simulating }
+			end, debug.traceback)
+			if okStop then
+				return resultOrError
 			end
-			if not after.ok then
-				return after
+			local okRestore, restoreError = pcall(function()
+				if configurationBefore ~= nil then
+					service:SetDeviceAsync(configurationBefore.deviceId)
+					service:SetOrientationAsync(configurationBefore.orientation)
+					service:SetScalingModeAsync(configurationBefore.scalingMode)
+					service:SetResolutionAsync(configurationBefore.resolution.X, configurationBefore.resolution.Y)
+					service:SetPixelDensityAsync(configurationBefore.pixelDensity)
+				end
+			end)
+			deviceSimulatorReadyAt = readyAtBefore
+			status()
+			if not okRestore then
+				error(tostring(resultOrError) .. "; device simulator rollback failed: " .. tostring(restoreError), 0)
 			end
-			if after.simulating then
-				return { ok = false, error = "Studio did not stop device simulation" }
-			end
-			deviceSimulatorReadyAt = 0
-			return { ok = true, action = "stop", stopped = true, alreadyStopped = not before.simulating }
+			error(resultOrError, 0)
 		elseif action ~= "set" and action ~= "select" and action ~= "apply" then
 			return { ok = false, error = `Unknown device action '{action}'` }
 		end
@@ -1966,26 +2078,31 @@ updateMouse()
 		local changed = {}
 		local okApply, resultOrError = xpcall(function()
 			if selectedDevice ~= nil then
+				assertOperationOwnership(operationGeneration)
 				service:SetDeviceAsync(selectedDevice.id)
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "device"
 			end
 			if orientation ~= nil then
+				assertOperationOwnership(operationGeneration)
 				service:SetOrientationAsync(orientation)
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "orientation"
 			end
 			if scalingMode ~= nil then
+				assertOperationOwnership(operationGeneration)
 				service:SetScalingModeAsync(scalingMode)
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "scalingMode"
 			end
 			if width then
+				assertOperationOwnership(operationGeneration)
 				service:SetResolutionAsync(math.floor(width), math.floor(height))
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "resolution"
 			end
 			if density then
+				assertOperationOwnership(operationGeneration)
 				service:SetPixelDensityAsync(density)
 				assertOperationOwnership(operationGeneration)
 				changed[#changed + 1] = "pixelDensity"
@@ -2170,13 +2287,21 @@ updateMouse()
 			finishedAt = os.clock()
 		end)
 		activeEditExecutionThread = executionThread
+		local cancellationError = nil
 		while packed == nil and os.clock() < deadline do
 			task.wait()
-			if operationGeneration ~= cancellationGeneration then
+			local ownsOperation, ownershipError = pcall(assertOperationOwnership, operationGeneration)
+			if not ownsOperation then
+				cancellationError = tostring(ownershipError)
 				break
 			end
 		end
-		if packed == nil or (finishedAt and finishedAt > deadline) or operationGeneration ~= cancellationGeneration then
+		if
+			packed == nil
+			or (finishedAt and finishedAt > deadline)
+			or operationGeneration ~= cancellationGeneration
+			or cancellationError ~= nil
+		then
 			if coroutine.status(executionThread) ~= "dead" then
 				pcall(task.cancel, executionThread)
 			end
@@ -2184,15 +2309,27 @@ updateMouse()
 			cancelTrackedThreads(trackedThreads)
 			return {
 				ok = false,
-				error = if operationGeneration ~= cancellationGeneration
+				error = if cancellationError ~= nil
+					then cancellationError
+					elseif operationGeneration ~= cancellationGeneration
 					then "Luau execution was cancelled because Renium session ownership changed"
 					else ("Luau execution timed out after %.1fs and was stopped"):format(timeoutSeconds),
-				timedOut = operationGeneration == cancellationGeneration,
+				timedOut = operationGeneration == cancellationGeneration and cancellationError == nil,
 				stopped = true,
 				output = output,
 			}
 		end
 		activeEditExecutionThread = nil
+		local ownsOperation, ownershipError = pcall(assertOperationOwnership, operationGeneration)
+		if not ownsOperation then
+			cancelTrackedThreads(trackedThreads)
+			return {
+				ok = false,
+				error = tostring(ownershipError),
+				stopped = true,
+				output = output,
+			}
+		end
 		if not packed[1] then
 			cancelTrackedThreads(trackedThreads)
 			return {
@@ -2440,19 +2577,21 @@ updateMouse()
 				if operationGeneration ~= cancellationGeneration then
 					return
 				end
+				local studioTestService = StudioTestService :: any
+				local runService = RunService :: any
 				if api.isPlayModeRunning() or playSession.active or playSession.starting then
 					attempt("EndTest", function()
-						(StudioTestService :: any):EndTest(true)
+						studioTestService:EndTest(true)
 					end)
 				end
 				if api.isPlayModeRunning() then
 					attempt("EditModeActive", function()
-						(StudioTestService :: any).EditModeActive = true
+						studioTestService.EditModeActive = true
 					end)
 				end
 				if api.isPlayModeRunning() then
 					attempt("RunService.Stop", function()
-						(RunService :: any):Stop()
+						runService:Stop()
 					end)
 				end
 			end

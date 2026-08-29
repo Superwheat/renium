@@ -28,7 +28,7 @@ jobs:
         run: cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
 
   rust-cross-platform:
     name: Rust tests (${{ matrix.os }})
@@ -102,7 +102,9 @@ jobs:
           Copy-Item -LiteralPath $pluginBinary -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
 
       - name: Test Studio plugin modules
-        run: lune run tools/plugin_ws_bridge/tests/run
+        run: |
+          & tools/plugin_ws_bridge/tests/parse-all.ps1
+          lune run tools/plugin_ws_bridge/tests/run
 
       - name: Install, test, and package the extension
         run: |

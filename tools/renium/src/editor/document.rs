@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -28,7 +28,6 @@ pub(crate) fn read_editor_service_settings(
 
 pub(crate) struct EditorServiceDocument {
     pub service: String,
-    pub settings_file: PathBuf,
     pub document: SettingsBytecode,
 }
 
@@ -49,7 +48,6 @@ pub(crate) fn read_editor_service_documents(src_root: &Path) -> Result<Vec<Edito
             documents.push(EditorServiceDocument {
                 service: entry.file_name().to_string_lossy().into_owned(),
                 document: SettingsBytecode::read_file(&settings_file)?,
-                settings_file,
             });
         }
     }
@@ -73,6 +71,7 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
     let mut upsert_instance_paths = Vec::new();
     let mut replace_instance_paths = Vec::new();
     let mut target_class_replaced = false;
+    let mut target_previous_class_name = None;
     let root_index = if let Some(index) = editor_service_root_index(document, &spec.service) {
         index
     } else {
@@ -99,6 +98,7 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
                 current_index,
                 path_segments.clone(),
                 path_ordinals.clone(),
+                true,
             ));
             continue;
         }
@@ -125,13 +125,19 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
         ));
         changed = true;
 
-        upsert_instance_paths.push((current_index, path_segments.clone(), path_ordinals.clone()));
+        upsert_instance_paths.push((
+            current_index,
+            path_segments.clone(),
+            path_ordinals.clone(),
+            false,
+        ));
     }
 
     let target_index = if let Some(child_index) =
         editor_child_by_stem(document, current_index, &spec.instance_stem)
     {
         if document.instances[child_index].class_name != spec.class_name {
+            target_previous_class_name = Some(document.instances[child_index].class_name.clone());
             document.instances[child_index]
                 .class_name
                 .clone_from(&spec.class_name);
@@ -188,33 +194,44 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
     if target_class_replaced {
         replace_instance_paths.push((target_index, path_segments.clone(), path_ordinals.clone()));
     } else {
-        upsert_instance_paths.push((target_index, path_segments.clone(), path_ordinals.clone()));
+        upsert_instance_paths.push((
+            target_index,
+            path_segments.clone(),
+            path_ordinals.clone(),
+            false,
+        ));
     }
     let sibling_counts = editor_sibling_group_counts(document);
     let upsert_instances = upsert_instance_paths
         .into_iter()
-        .map(|(index, segments, ordinals)| {
-            editor_instance_descriptor_from_path(
+        .map(|(index, segments, ordinals, anchor_only)| {
+            let mut descriptor = editor_instance_descriptor_from_path(
                 document,
                 index,
                 segments,
                 ordinals,
                 &sibling_counts,
             )
-            .context("Failed to describe a source upsert")
+            .context("Failed to describe a source upsert")?;
+            descriptor.anchor_only = anchor_only;
+            Ok(descriptor)
         })
         .collect::<Result<Vec<_>>>()?;
     let replace_instances = replace_instance_paths
         .into_iter()
         .map(|(index, segments, ordinals)| {
-            editor_instance_descriptor_from_path(
+            let mut descriptor = editor_instance_descriptor_from_path(
                 document,
                 index,
-                segments,
-                ordinals,
+                segments.clone(),
+                ordinals.clone(),
                 &sibling_counts,
             )
-            .context("Failed to describe a source replacement")
+            .context("Failed to describe a source replacement")?;
+            descriptor.previous_path_segments = segments;
+            descriptor.previous_path_ordinals = ordinals;
+            descriptor.previous_class_name = target_previous_class_name.clone();
+            Ok(descriptor)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(EditorSourceEnsureResult {

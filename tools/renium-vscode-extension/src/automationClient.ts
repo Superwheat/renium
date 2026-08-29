@@ -117,8 +117,15 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    const contextId = await this.ensureContext(config, operationRequiresRuntime(op, parameters));
-    return this.send(config, label, op, contextId, parameters, options);
+    const requireRuntime = operationRequiresRuntime(op, parameters);
+    let contextId = await this.ensureContext(config, requireRuntime);
+    let result = await this.send(config, label, op, contextId, parameters, options);
+    if (result.automationError?.c === "stale_cx") {
+      this.context = undefined;
+      contextId = await this.ensureContext(config, requireRuntime);
+      result = await this.send(config, label, op, contextId, parameters, options);
+    }
+    return result;
   }
 
   public async runReviewedOperation(
@@ -130,31 +137,44 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    const contextId = await this.ensureContext(config, operationRequiresRuntime(op, parameters));
-    const prepared = await this.send(
-      config,
-      `${label}-review`,
-      AUTOMATION_OP.reviewPrepare,
-      contextId,
-      { op, p: parameters },
-      { ...options, quietWait: true },
-    );
-    if (prepared.code !== 0) {
-      return prepared;
+    const requireRuntime = operationRequiresRuntime(op, parameters);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const contextId = await this.ensureContext(config, requireRuntime);
+      const prepared = await this.send(
+        config,
+        `${label}-review`,
+        AUTOMATION_OP.reviewPrepare,
+        contextId,
+        { op, p: parameters },
+        { ...options, quietWait: true },
+      );
+      if (prepared.automationError?.c === "stale_cx" && attempt === 0) {
+        this.context = undefined;
+        continue;
+      }
+      if (prepared.code !== 0) {
+        return prepared;
+      }
+      const result = prepared.result as Record<string, unknown> | undefined;
+      const reviewId = typeof result?.reviewId === "string" ? result.reviewId : undefined;
+      if (!reviewId) {
+        return { code: 1, output: "Review preparation did not return reviewId." };
+      }
+      const applied = await this.send(
+        config,
+        label,
+        AUTOMATION_OP.reviewApply,
+        contextId,
+        { reviewId },
+        options,
+      );
+      if (applied.automationError?.c === "stale_cx" && attempt === 0) {
+        this.context = undefined;
+        continue;
+      }
+      return applied;
     }
-    const result = prepared.result as Record<string, unknown> | undefined;
-    const reviewId = typeof result?.reviewId === "string" ? result.reviewId : undefined;
-    if (!reviewId) {
-      return { code: 1, output: "Review preparation did not return reviewId." };
-    }
-    return this.send(
-      config,
-      label,
-      AUTOMATION_OP.reviewApply,
-      contextId,
-      { reviewId },
-      options,
-    );
+    return { code: 1, output: "Renium context remained stale after rebinding." };
   }
 
   public async ensure(

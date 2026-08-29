@@ -17,7 +17,7 @@ pub(crate) fn configured_project_layout(
     if explicit.is_none() && source_root != Path::new("src") {
         return Ok((project_root.to_path_buf(), source_root.to_path_buf()));
     }
-    let root = if explicit.is_none() {
+    let root = if explicit.is_none() && !project_root.is_absolute() {
         let selector = context::place_selector();
         match resolve_experience_place(project_root, selector.as_deref()) {
             Ok(place) => place.map_or_else(|| project_root.to_path_buf(), |place| place.root),
@@ -29,7 +29,16 @@ pub(crate) fn configured_project_layout(
     } else {
         project_root.to_path_buf()
     };
-    let Some(loaded) = config::try_load_project(explicit, Some(&root))? else {
+    let loaded = config::try_load_project(explicit, Some(&root))?;
+    let loaded = if explicit.is_none() && project_root.is_absolute() {
+        let requested = canonical_path(project_root).with_context(|| {
+            format!("Failed to resolve project root {}", project_root.display())
+        })?;
+        loaded.filter(|loaded| canonical_path(&loaded.root).is_ok_and(|loaded| loaded == requested))
+    } else {
+        loaded
+    };
+    let Some(loaded) = loaded else {
         return Ok((root, source_root.to_path_buf()));
     };
     let root = canonical_path(&loaded.root)

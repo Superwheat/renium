@@ -187,6 +187,27 @@ function BridgeValueCodec.decode(raw: any, enumHint: string?, decodeRef, context
 			return false, "Float value must be a number or non-finite marker"
 		end
 		return true, value
+	elseif typeName == "Int32" or typeName == "Int64" or typeName == "Float32" or typeName == "Float64" then
+		local value = BridgeValueCodec.decodeNumber(raw.value)
+		if value == nil then
+			return false, typeName .. " value must be numeric"
+		end
+		return true, value
+	elseif typeName == "Content" or typeName == "ContentId" then
+		local value = raw.value
+		if type(value) == "string" then
+			return true, value
+		end
+		if type(value) == "table" and (value._type == "Ref" or type(value.Ref) == "table") then
+			local object = decodeRef(value._type == "Ref" and value or value.Ref, context, serviceName)
+			if object ~= nil and Content ~= nil and (Content :: any).fromObject ~= nil then
+				local ok, content = pcall((Content :: any).fromObject, object)
+				if ok then
+					return true, content
+				end
+			end
+		end
+		return false, typeName .. " value must be a URI or object reference"
 	elseif typeName == "BinaryString" then
 		local encoded = raw.base64
 		if type(encoded) ~= "string" then

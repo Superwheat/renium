@@ -24,7 +24,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         console_daemon_parameters(&args, args.since_seq, args.clear, args.from_oldest),
         false,
     )? {
-        return print_json_output(&result, false);
+        return print_json_output(&result, true);
     }
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, _listen_metrics) =
@@ -33,7 +33,7 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         return follow_console_with_bridge(&args, &bridge);
     }
     let result = get_console_output_result(&args, &bridge)?;
-    print_json_output(&result, false)
+    print_json_output(&result, true)
 }
 
 fn console_daemon_parameters(

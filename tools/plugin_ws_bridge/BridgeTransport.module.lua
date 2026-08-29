@@ -42,15 +42,46 @@ local function sendRawChunkResponse(client, id, result, serverMs)
 	local totalValue = math.max(0, tonumber(result.total) or 0)
 	local encodeMs = math.max(0, tonumber(result.pluginEncodeMs) or 0)
 	local serializationComplete = if result.serializationComplete == true then 1 else 0
-	local header = ("RBS2 %s %d %d %d %.3f %.3f %d"):format(
-		tostring(id),
-		startValue,
-		nextStartValue,
-		totalValue,
-		serverMs,
-		encodeMs,
-		serializationComplete
-	)
+	local payloadHash = if type(result.payloadHash) == "string" then result.payloadHash else nil
+	local compression = if type(result.compression) == "string" then result.compression else nil
+	local header
+	if compression ~= nil then
+		header = ("RBS4 %s %d %d %d %.3f %.3f %d %d %s %s %d"):format(
+			tostring(id),
+			startValue,
+			nextStartValue,
+			totalValue,
+			serverMs,
+			encodeMs,
+			serializationComplete,
+			if result.payloadCacheHit == true then 1 else 0,
+			payloadHash or "-",
+			compression,
+			math.max(0, tonumber(result.uncompressedBytes) or 0)
+		)
+	elseif payloadHash ~= nil then
+		header = ("RBS3 %s %d %d %d %.3f %.3f %d %d %s"):format(
+			tostring(id),
+			startValue,
+			nextStartValue,
+			totalValue,
+			serverMs,
+			encodeMs,
+			serializationComplete,
+			if result.payloadCacheHit == true then 1 else 0,
+			payloadHash
+		)
+	else
+		header = ("RBS2 %s %d %d %d %.3f %.3f %d"):format(
+			tostring(id),
+			startValue,
+			nextStartValue,
+			totalValue,
+			serverMs,
+			encodeMs,
+			serializationComplete
+		)
+	end
 	local payload = type(result.chunk) == "string" and result.chunk or ""
 	if #payload > MAX_RAW_CHUNK_BYTES then
 		return false,

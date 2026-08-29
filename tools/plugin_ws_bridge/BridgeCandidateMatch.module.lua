@@ -45,21 +45,25 @@ function BridgeCandidateMatch.choose(
 	if #candidates == 0 then
 		return nil
 	end
-	if #candidates == 1 or #candidates > MAX_CANDIDATES_TO_SCORE then
-		return candidates[1]
+	if #candidates > MAX_CANDIDATES_TO_SCORE then
+		return nil
 	end
 
-	local best = candidates[1]
-	local bestScore = -1
+	local best = nil
+	local bestScore = 0
+	local tied = false
 	for _, candidate in ipairs(candidates) do
 		local score = scoreValues(candidate, properties, compareProperty)
 			+ scoreValues(candidate, attributes, compareAttribute)
 		if score > bestScore then
 			best = candidate
 			bestScore = score
+			tied = false
+		elseif score == bestScore and score > 0 then
+			tied = true
 		end
 	end
-	return best
+	return if tied then nil else best
 end
 
 return BridgeCandidateMatch

@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 #[cfg(any(windows, target_os = "macos", test))]
@@ -72,7 +73,8 @@ use crate::snapshot::types::{
     ServiceExportOutput, SnapshotInstance,
 };
 use crate::studio::bridge::{
-    BridgeChunk, BridgeServer, ChunkFetchMetrics, DEFAULT_EXPORT_CHUNK_SIZE, MAX_BRIDGE_CHUNK_BYTES,
+    BridgeChunk, BridgeServer, ChunkFetchMetrics, DEFAULT_EXPORT_CHUNK_SIZE,
+    MAX_BRIDGE_CHUNK_BYTES, SourceBatchMap,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use crate::system::files::sanitize_name;
@@ -147,8 +149,9 @@ fn begin_editor_binary_export_for_runtime(
         "partitioned": partitioned,
         "serviceOrder": service_order,
         "serviceFilter": service_filter,
-        "serializationWorkers": partitioned.then_some(2),
+        "serializationWorkers": partitioned.then_some(4),
         "metadataOnly": metadata_only,
+        "profile": verbose_timing_logs(),
     });
     let begin = if let Some(runtime_id) = runtime_id {
         bridge.call_for_runtime_with_timeout(
@@ -161,6 +164,11 @@ fn begin_editor_binary_export_for_runtime(
     } else {
         bridge.call("beginEditorBinaryExport", parameters)?
     };
+    if verbose_timing_logs()
+        && let Some(profile) = begin.get("profile")
+    {
+        println!("[renium] native editor begin profile: {profile}");
+    }
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -185,6 +193,11 @@ fn begin_editor_binary_export_for_runtime(
             })
         {
             bail!("Studio returned invalid native export groups");
+        }
+        if !metadata_only {
+            for group in &groups {
+                native_identity_carrier_count(group)?;
+            }
         }
         let serialization_batches = serde_json::from_value::<Vec<EditorBinarySerializationBatch>>(
             begin
@@ -308,6 +321,69 @@ fn native_binary_chunk_bytes() -> usize {
         .clamp(256 * 1024, 8 * 1024 * 1024)
 }
 
+const NATIVE_PAYLOAD_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const NATIVE_PAYLOAD_CACHE_MAX_ENTRIES: usize = 32;
+
+#[derive(Default)]
+struct NativePayloadCache {
+    entries: VecDeque<(String, Vec<u8>)>,
+    last_hash_by_slot: AHashMap<String, String>,
+    total_bytes: usize,
+}
+
+fn native_payload_cache() -> &'static Mutex<NativePayloadCache> {
+    static CACHE: OnceLock<Mutex<NativePayloadCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(NativePayloadCache::default()))
+}
+
+fn native_payload_cache_known_hash(slot: &str) -> Option<String> {
+    let cache = native_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let hash = cache.last_hash_by_slot.get(slot)?;
+    cache
+        .entries
+        .iter()
+        .any(|(entry_hash, _)| entry_hash == hash)
+        .then(|| hash.clone())
+}
+
+fn native_payload_cache_get(hash: &str) -> Option<Vec<u8>> {
+    native_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entries
+        .iter()
+        .find_map(|(entry_hash, bytes)| (entry_hash == hash).then(|| bytes.clone()))
+}
+
+fn native_payload_cache_insert(slot: String, hash: String, bytes: &[u8]) {
+    if bytes.len() > NATIVE_PAYLOAD_CACHE_MAX_BYTES {
+        return;
+    }
+    let mut cache = native_payload_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.last_hash_by_slot.insert(slot, hash.clone());
+    if cache
+        .entries
+        .iter()
+        .any(|(entry_hash, _)| entry_hash == &hash)
+    {
+        return;
+    }
+    while cache.entries.len() >= NATIVE_PAYLOAD_CACHE_MAX_ENTRIES
+        || cache.total_bytes.saturating_add(bytes.len()) > NATIVE_PAYLOAD_CACHE_MAX_BYTES
+    {
+        let Some((_, removed)) = cache.entries.pop_front() else {
+            break;
+        };
+        cache.total_bytes = cache.total_bytes.saturating_sub(removed.len());
+    }
+    cache.total_bytes = cache.total_bytes.saturating_add(bytes.len());
+    cache.entries.push_back((hash, bytes.to_vec()));
+}
+
 fn observe_native_serialization_complete(
     chunk: &BridgeChunk,
     serialization_complete: Option<&AtomicBool>,
@@ -343,6 +419,12 @@ fn receive_editor_binary_export_bytes_for_runtime(
 ) -> Result<Vec<u8>> {
     const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
     let service_label = service.map_or(String::new(), |value| format!("{value} "));
+    let cache_slot = format!(
+        "{}:{}",
+        runtime_id.unwrap_or("current"),
+        service.unwrap_or("full")
+    );
+    let known_payload_hash = native_payload_cache_known_hash(&cache_slot);
     let raw_chunk_bytes = native_binary_chunk_bytes();
     let read_started = Instant::now();
     let first_parameters = json!({
@@ -354,6 +436,8 @@ fn receive_editor_binary_export_bytes_for_runtime(
         "waitForReady": true,
         "timeoutSeconds": 80,
         "rawBase64": true,
+        "supportsPayloadCache": true,
+        "knownPayloadHash": known_payload_hash.as_deref(),
     });
     let first = if let Some(runtime_id) = runtime_id {
         bridge.call_chunk_for_runtime(
@@ -369,6 +453,25 @@ fn receive_editor_binary_export_bytes_for_runtime(
     let total_bytes = first.total;
     if total_bytes == 0 || total_bytes > MAX_EXPORT_BYTES {
         bail!("Studio returned an invalid native export size");
+    }
+    if first.payload_cache_hit {
+        let payload_hash = first
+            .payload_hash
+            .as_deref()
+            .context("Studio native export cache hit omitted its payload hash")?;
+        if known_payload_hash.as_deref() != Some(payload_hash) {
+            bail!("Studio native export returned an unexpected payload cache hit");
+        }
+        let bytes = native_payload_cache_get(payload_hash)
+            .context("Studio native export payload cache entry is missing")?;
+        if bytes.len() != total_bytes {
+            bail!("Studio native export payload cache entry has the wrong size");
+        }
+        log_timing(
+            &format!("native editor {service_label}binary cache hit"),
+            read_started,
+        );
+        return Ok(bytes);
     }
     let first_length = raw_chunk_bytes.min(total_bytes);
     if first.start != 1 || first.next_start != first_length + 1 {
@@ -430,6 +533,9 @@ fn receive_editor_binary_export_bytes_for_runtime(
             Ok(())
         })
         .collect::<Result<()>>()?;
+    if let Some(payload_hash) = first.payload_hash {
+        native_payload_cache_insert(cache_slot, payload_hash, &bytes);
+    }
     log_timing(
         &format!("native editor {service_label}binary transfer"),
         read_started,
@@ -694,12 +800,302 @@ pub(crate) fn rbx_variant_referent(value: &RbxVariant) -> Option<RbxRef> {
 pub(crate) struct NativeServiceDom {
     instances: Vec<rbx_binary::FlatInstance>,
     new_index_by_dense_ref: Option<Vec<usize>>,
+    native_index_by_overlay_index: Vec<usize>,
     path_segments_by_ref: Arc<HashMap<RbxRef, Vec<String>>>,
     path_ordinals_by_ref: Arc<HashMap<RbxRef, Vec<usize>>>,
 }
 
+struct NativeIdentityOutput {
+    instances: Vec<rbx_binary::FlatInstance>,
+    native_index_by_overlay_index: Vec<usize>,
+    new_index_by_dense_ref: Vec<usize>,
+}
+
+fn native_identity_carrier_count(group: &EditorBinaryExportGroup) -> Result<usize> {
+    if group.identity_carrier_class.is_empty()
+        || group.identity_carrier_prefix.is_empty()
+        || group.identity_carrier_slots.is_empty()
+        || group.identity_carrier_slots.iter().any(String::is_empty)
+        || group
+            .identity_carrier_slots
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != group.identity_carrier_slots.len()
+    {
+        bail!("Studio native {} identity schema is invalid", group.service);
+    }
+    let expected = group
+        .instance_count
+        .saturating_sub(1)
+        .div_ceil(group.identity_carrier_slots.len());
+    if group.identity_carrier_count != expected {
+        bail!(
+            "Studio native {} identity carrier count is invalid",
+            group.service
+        );
+    }
+    Ok(expected)
+}
+
+fn native_serialized_instance_count(group: &EditorBinaryExportGroup) -> Result<usize> {
+    group
+        .instance_count
+        .checked_add(native_identity_carrier_count(group)?)
+        .context("Native serialized instance count overflowed")
+}
+
+fn native_serialized_root_count(group: &EditorBinaryExportGroup) -> Result<usize> {
+    group
+        .count
+        .checked_add(native_identity_carrier_count(group)?)
+        .and_then(|count| count.checked_add(1))
+        .context("Native serialized root count overflowed")
+}
+
+fn decode_native_identity(
+    instances: Vec<rbx_binary::FlatInstance>,
+    group: &EditorBinaryExportGroup,
+    dense_ref_count: usize,
+) -> Result<NativeIdentityOutput> {
+    if instances.len() != native_serialized_instance_count(group)? || instances.is_empty() {
+        bail!(
+            "Studio native {} identity payload has the wrong size",
+            group.service
+        );
+    }
+    let mut instance_index_by_ref = AHashMap::with_capacity(instances.len());
+    for (index, instance) in instances.iter().enumerate() {
+        if instance_index_by_ref
+            .insert(instance.referent, index)
+            .is_some()
+        {
+            bail!(
+                "Studio native {} snapshot contains duplicate referents",
+                group.service
+            );
+        }
+    }
+    let carrier_count = native_identity_carrier_count(group)?;
+    let mut carrier_index_by_name = AHashMap::with_capacity(carrier_count);
+    for (index, instance) in instances.iter().enumerate() {
+        if instance.parent_index.is_none()
+            && instance.class.as_str() == group.identity_carrier_class
+            && instance.name.starts_with(&group.identity_carrier_prefix)
+            && carrier_index_by_name
+                .insert(instance.name.as_str(), index)
+                .is_some()
+        {
+            bail!(
+                "Studio native {} identity carrier is duplicated",
+                group.service
+            );
+        }
+    }
+    let mut carrier_indices = Vec::with_capacity(carrier_count);
+    for ordinal in 1..=carrier_count {
+        let expected_name = format!("{}{ordinal}", group.identity_carrier_prefix);
+        let index = carrier_index_by_name
+            .remove(expected_name.as_str())
+            .with_context(|| {
+                format!(
+                    "Studio native {} identity carrier {ordinal} is missing",
+                    group.service
+                )
+            })?;
+        carrier_indices.push(index);
+    }
+    if !carrier_index_by_name.is_empty() {
+        bail!(
+            "Studio native {} identity carrier is unexpected",
+            group.service
+        );
+    }
+    let carrier_index_set = carrier_indices.iter().copied().collect::<AHashSet<_>>();
+    let mut old_index_by_overlay_index = Vec::with_capacity(group.instance_count);
+    old_index_by_overlay_index.push(0);
+    for carrier_index in carrier_indices {
+        let carrier = &instances[carrier_index];
+        for property_name in &group.identity_carrier_slots {
+            if old_index_by_overlay_index.len() == group.instance_count {
+                break;
+            }
+            let target = carrier
+                .properties
+                .iter()
+                .find(|(name, _)| name.as_str() == property_name)
+                .and_then(|(_, value)| rbx_variant_referent(value))
+                .with_context(|| {
+                    format!(
+                        "Studio native {} identity carrier omitted {}",
+                        group.service, property_name
+                    )
+                })?;
+            let target_index = instance_index_by_ref
+                .get(&target)
+                .copied()
+                .context("Native identity carrier points outside its snapshot")?;
+            if carrier_index_set.contains(&target_index) {
+                bail!("Native identity carrier points to another carrier");
+            }
+            old_index_by_overlay_index.push(target_index);
+        }
+    }
+    if old_index_by_overlay_index.len() != group.instance_count
+        || old_index_by_overlay_index
+            .iter()
+            .copied()
+            .collect::<AHashSet<_>>()
+            .len()
+            != group.instance_count
+    {
+        bail!(
+            "Studio native {} identity mapping is incomplete",
+            group.service
+        );
+    }
+    let mut old_to_new = vec![usize::MAX; instances.len()];
+    let mut next_index = 0;
+    for (old_index, new_index) in old_to_new.iter_mut().enumerate() {
+        if !carrier_index_set.contains(&old_index) {
+            *new_index = next_index;
+            next_index += 1;
+        }
+    }
+    if next_index != group.instance_count {
+        bail!(
+            "Studio native {} identity payload contains extra instances",
+            group.service
+        );
+    }
+    let native_index_by_overlay_index = old_index_by_overlay_index
+        .into_iter()
+        .map(|old_index| {
+            old_to_new[old_index]
+                .ne(&usize::MAX)
+                .then_some(old_to_new[old_index])
+                .context("Native identity resolved to a removed carrier")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut new_index_by_dense_ref = vec![usize::MAX; dense_ref_count];
+    let mut output = Vec::with_capacity(group.instance_count);
+    for (old_index, mut instance) in instances.into_iter().enumerate() {
+        if carrier_index_set.contains(&old_index) {
+            continue;
+        }
+        if let Some(parent_index) = instance.parent_index {
+            instance.parent_index = Some(
+                old_to_new
+                    .get(parent_index)
+                    .copied()
+                    .filter(|index| *index != usize::MAX)
+                    .context("Native instance parent resolved to an identity carrier")?,
+            );
+        }
+        let dense_index = instance
+            .referent
+            .as_u128()
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|value| value.checked_sub(1))
+            .filter(|index| *index < dense_ref_count)
+            .context("Native snapshot contains an invalid dense referent")?;
+        new_index_by_dense_ref[dense_index] = output.len();
+        output.push(instance);
+    }
+    Ok(NativeIdentityOutput {
+        instances: output,
+        native_index_by_overlay_index,
+        new_index_by_dense_ref,
+    })
+}
+
+// These focused identity tests stay beside the transformation they characterize.
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod native_identity_tests {
+    use super::*;
+
+    fn flat_instance(
+        referent: u128,
+        parent_index: Option<usize>,
+        name: &str,
+        class: &str,
+        properties: Vec<(rbx_dom_weak::Ustr, RbxVariant)>,
+    ) -> rbx_binary::FlatInstance {
+        rbx_binary::FlatInstance {
+            referent: RbxRef::some(referent),
+            parent_index,
+            name: name.to_string(),
+            class: class.into(),
+            properties,
+        }
+    }
+
+    #[test]
+    fn identity_carriers_map_overlay_rows_to_native_order() {
+        let group = EditorBinaryExportGroup {
+            service: "Workspace".to_string(),
+            target_path: vec!["Workspace".to_string()],
+            count: 2,
+            instance_count: 3,
+            identity_carrier_class: "HumanoidRigDescription".to_string(),
+            identity_carrier_prefix: "__ReniumNativeIdentity:test:Workspace:".to_string(),
+            identity_carrier_slots: vec!["Chest".to_string(), "HeadBase".to_string()],
+            identity_carrier_count: 1,
+            script_count: 0,
+            class_names: vec!["Folder".to_string()],
+            non_archivable_indices: Vec::new(),
+            root_properties: Map::new(),
+        };
+        let identity = decode_native_identity(
+            vec![
+                flat_instance(1, None, "Workspace", "Folder", Vec::new()),
+                flat_instance(2, Some(0), "Second", "Folder", Vec::new()),
+                flat_instance(
+                    3,
+                    None,
+                    "__ReniumNativeIdentity:test:Workspace:1",
+                    "HumanoidRigDescription",
+                    vec![
+                        ("Chest".into(), RbxVariant::Ref(RbxRef::some(4))),
+                        ("HeadBase".into(), RbxVariant::Ref(RbxRef::some(2))),
+                    ],
+                ),
+                flat_instance(4, Some(0), "First", "Folder", Vec::new()),
+            ],
+            &group,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(identity.native_index_by_overlay_index, vec![0, 2, 1]);
+        assert_eq!(identity.new_index_by_dense_ref, vec![0, 1, usize::MAX, 2]);
+        assert_eq!(
+            identity
+                .instances
+                .iter()
+                .map(|instance| instance.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Workspace", "Second", "First"]
+        );
+    }
+
+    #[test]
+    fn script_sources_follow_identity_remapping() {
+        let mut sources = SourceBatchMap::default();
+        sources.by_index.insert(2, "first".to_string());
+        sources.by_index.insert(3, "second".to_string());
+
+        remap_script_source_indices(&mut sources, &[0, 2, 1]).unwrap();
+
+        assert_eq!(sources.by_index.get(&2).map(String::as_str), Some("second"));
+        assert_eq!(sources.by_index.get(&3).map(String::as_str), Some("first"));
+    }
+}
+
 struct NativeServiceExportResult {
     output: ServiceExportOutput,
+    native_index_by_overlay_index: Vec<usize>,
     metrics: ChunkFetchMetrics,
     compact_expand_ms: f64,
 }
@@ -758,12 +1154,12 @@ fn decode_native_service_dom(
         &format!("{}: native binary decode", group.service),
         decode_started,
     );
-    if flat.root_indices.len() != group.count + 1 {
+    if flat.root_indices.len() != native_serialized_root_count(group)? {
         bail!(
             "Studio native {} snapshot contains {} roots; expected {}",
             group.service,
             flat.root_indices.len(),
-            group.count + 1
+            native_serialized_root_count(group)?
         );
     }
     let marker_index = flat.root_indices[0];
@@ -773,19 +1169,27 @@ fn decode_native_service_dom(
     flat.instances[marker_index].class = group.service.as_str().into();
     flat.instances[marker_index].name.clone_from(&group.service);
     for root_index in flat.root_indices.iter().skip(1) {
-        flat.instances[*root_index].parent_index = Some(marker_index);
+        let instance = &mut flat.instances[*root_index];
+        if instance.class.as_str() != group.identity_carrier_class
+            || !instance.name.starts_with(&group.identity_carrier_prefix)
+        {
+            instance.parent_index = Some(marker_index);
+        }
     }
-    if flat.instances.len() != group.instance_count {
+    let serialized_instance_count = native_serialized_instance_count(group)?;
+    if flat.instances.len() != serialized_instance_count {
         bail!(
             "Studio native {} snapshot contains {} instances; expected {}",
             group.service,
             flat.instances.len(),
-            group.instance_count
+            serialized_instance_count
         );
     }
+    let identity = decode_native_identity(flat.instances, group, serialized_instance_count)?;
     Ok(NativeServiceDom {
-        instances: flat.instances,
-        new_index_by_dense_ref: None,
+        instances: identity.instances,
+        new_index_by_dense_ref: Some(identity.new_index_by_dense_ref),
+        native_index_by_overlay_index: identity.native_index_by_overlay_index,
         path_segments_by_ref: Arc::new(HashMap::new()),
         path_ordinals_by_ref: Arc::new(HashMap::new()),
     })
@@ -814,12 +1218,12 @@ fn decode_native_serialization_batch(
         .collect::<Result<Vec<_>>>()?;
     let expected_roots = groups.iter().try_fold(0_usize, |total, group| {
         total
-            .checked_add(group.count + 1)
+            .checked_add(native_serialized_root_count(group)?)
             .context("Native serialization batch root count overflowed")
     })?;
     let expected_instances = groups.iter().try_fold(0_usize, |total, group| {
         total
-            .checked_add(group.instance_count)
+            .checked_add(native_serialized_instance_count(group)?)
             .context("Native serialization batch instance count overflowed")
     })?;
     let decode_started = Instant::now();
@@ -859,7 +1263,7 @@ fn decode_native_serialization_batch(
     let mut root_offset = 0;
     let mut expected_start = 0;
     for group in &groups {
-        let root_end = root_offset + group.count + 1;
+        let root_end = root_offset + native_serialized_root_count(group)?;
         let start = flat.root_indices[root_offset];
         let end = flat
             .root_indices
@@ -877,12 +1281,13 @@ fn decode_native_serialization_batch(
                 group.service
             );
         }
-        if end - start != group.instance_count {
+        let serialized_instance_count = native_serialized_instance_count(group)?;
+        if end - start != serialized_instance_count {
             bail!(
                 "Studio native {} batch partition contains {} instances; expected {}",
                 group.service,
                 end - start,
-                group.instance_count
+                serialized_instance_count
             );
         }
         let marker = &flat.instances[start];
@@ -899,9 +1304,8 @@ fn decode_native_serialization_batch(
     let total_instances = flat.instances.len();
     let mut global_index_by_dense_ref = vec![usize::MAX; total_instances];
     let mut owner_by_dense_ref = vec![usize::MAX; total_instances];
-    let mut local_index_by_dense_ref = vec![vec![usize::MAX; total_instances]; groups.len()];
     for (group_index, (start, end, _, _)) in spans.iter().copied().enumerate() {
-        for (local_index, global_index) in (start..end).enumerate() {
+        for global_index in start..end {
             let dense_index = flat.instances[global_index]
                 .referent
                 .as_u128()
@@ -914,7 +1318,6 @@ fn decode_native_serialization_batch(
             }
             global_index_by_dense_ref[dense_index] = global_index;
             owner_by_dense_ref[dense_index] = group_index;
-            local_index_by_dense_ref[group_index][dense_index] = local_index;
         }
     }
     if global_index_by_dense_ref.contains(&usize::MAX) {
@@ -999,16 +1402,21 @@ fn decode_native_serialization_batch(
         instances[0].class = group.service.as_str().into();
         instances[0].name.clone_from(&group.service);
         for root_index in &root_indices[root_start + 1..root_end] {
-            instances[*root_index - start].parent_index = Some(0);
+            let instance = &mut instances[*root_index - start];
+            if instance.class.as_str() != group.identity_carrier_class
+                || !instance.name.starts_with(&group.identity_carrier_prefix)
+            {
+                instance.parent_index = Some(0);
+            }
         }
+        let identity = decode_native_identity(instances, group, total_instances)?;
         if doms
             .insert(
                 group.service.clone(),
                 NativeServiceDom {
-                    instances,
-                    new_index_by_dense_ref: Some(std::mem::take(
-                        &mut local_index_by_dense_ref[group_index],
-                    )),
+                    instances: identity.instances,
+                    new_index_by_dense_ref: Some(identity.new_index_by_dense_ref),
+                    native_index_by_overlay_index: identity.native_index_by_overlay_index,
                     path_segments_by_ref: Arc::clone(&path_segments_by_ref),
                     path_ordinals_by_ref: Arc::clone(&path_ordinals_by_ref),
                 },
@@ -1031,9 +1439,9 @@ fn native_overlay_reference_debug_id(value: &Value) -> Option<&str> {
         .flatten()
 }
 
-fn normalize_native_overlay_internal_references(
+fn normalize_native_overlay_internal_references<'a>(
     overlays: &mut [NativeOverlayItem],
-    debug_ids: &[Option<String>],
+    debug_ids: impl IntoIterator<Item = Option<&'a str>>,
 ) {
     let requested = overlays
         .iter()
@@ -1044,10 +1452,10 @@ fn normalize_native_overlay_internal_references(
         return;
     }
     let internal_indices = debug_ids
-        .iter()
+        .into_iter()
         .enumerate()
         .filter_map(|(index, debug_id)| {
-            let debug_id = debug_id.as_deref()?;
+            let debug_id = debug_id?;
             requested
                 .contains(debug_id)
                 .then(|| (debug_id.to_string(), index + 1))
@@ -1073,17 +1481,82 @@ fn normalize_native_overlay_internal_references(
     }
 }
 
+fn reorder_overlay_items<T>(
+    items: Vec<T>,
+    native_index_by_overlay_index: &[usize],
+    label: &str,
+) -> Result<Vec<T>> {
+    if items.len() != native_index_by_overlay_index.len() {
+        bail!("Native {label} index map has the wrong length");
+    }
+    let mut reordered = Vec::with_capacity(items.len());
+    reordered.resize_with(items.len(), || None);
+    for (overlay_index, item) in items.into_iter().enumerate() {
+        let slot = native_index_by_overlay_index
+            .get(overlay_index)
+            .and_then(|index| reordered.get_mut(*index))
+            .with_context(|| format!("Native {label} index map is out of range"))?;
+        if slot.replace(item).is_some() {
+            bail!("Native {label} index map contains a duplicate index");
+        }
+    }
+    reordered
+        .into_iter()
+        .map(|item| item.with_context(|| format!("Native {label} index map is incomplete")))
+        .collect()
+}
+
+fn remap_native_overlay_items(
+    items: &mut [NativeOverlayItem],
+    native_index_by_overlay_index: &[usize],
+) -> Result<()> {
+    for item in items {
+        let overlay_index = item
+            .instance_index
+            .checked_sub(1)
+            .context("Native overlay instance index is zero")?;
+        item.instance_index = native_index_by_overlay_index
+            .get(overlay_index)
+            .copied()
+            .context("Native overlay instance index is out of range")?
+            + 1;
+    }
+    Ok(())
+}
+
+fn remap_script_source_indices(
+    source_map: &mut SourceBatchMap,
+    native_index_by_overlay_index: &[usize],
+) -> Result<()> {
+    let by_overlay_index = std::mem::take(&mut source_map.by_index);
+    source_map.by_index.reserve(by_overlay_index.len());
+    for (overlay_index, source) in by_overlay_index {
+        let native_index = overlay_index
+            .checked_sub(1)
+            .and_then(|index| native_index_by_overlay_index.get(index))
+            .copied()
+            .context("Script source instance index is out of range")?
+            + 1;
+        if source_map.by_index.insert(native_index, source).is_some() {
+            bail!("Script source identity map contains a duplicate index");
+        }
+    }
+    Ok(())
+}
+
 fn convert_native_service_output(
     dependencies: &NativeServiceFinishDependencies<'_, '_>,
     group: &EditorBinaryExportGroup,
     native: NativeServiceDom,
     mut overlay_instances: Vec<NativeOverlayItem>,
     debug_ids: Vec<Option<String>>,
+    settings_ids: Vec<(usize, String)>,
     export_started_ms: f64,
-) -> Result<ServiceExportOutput> {
+) -> Result<(ServiceExportOutput, Vec<usize>)> {
     let NativeServiceDom {
         instances: native_instances,
         new_index_by_dense_ref,
+        native_index_by_overlay_index,
         path_segments_by_ref,
         path_ordinals_by_ref,
     } = native;
@@ -1095,41 +1568,59 @@ fn convert_native_service_output(
             native_instances.len()
         );
     }
-    normalize_native_overlay_internal_references(&mut overlay_instances, &debug_ids);
-    let mut overlay_by_index = Vec::with_capacity(native_instances.len());
-    overlay_by_index.resize_with(native_instances.len(), || None);
+    let debug_ids = reorder_overlay_items(debug_ids, &native_index_by_overlay_index, "debug id")?;
+    normalize_native_overlay_internal_references(
+        &mut overlay_instances,
+        debug_ids.iter().map(|debug_id| debug_id.as_deref()),
+    );
+    let new_index_by_dense_ref =
+        new_index_by_dense_ref.context("Native snapshot omitted its dense referent map")?;
+    let mut settings_id_by_dense_index = vec![None; native_instances.len()];
+    for (index, settings_id) in settings_ids {
+        let slot = settings_id_by_dense_index
+            .get_mut(index)
+            .context("Native settings id index is out of range")?;
+        if slot.replace(settings_id).is_some() {
+            bail!("Native settings id index {} is duplicated", index + 1);
+        }
+    }
+    let settings_id_by_index = reorder_overlay_items(
+        settings_id_by_dense_index,
+        &native_index_by_overlay_index,
+        "settings id",
+    )?;
+    let mut non_archivable_by_dense_index = vec![false; native_instances.len()];
+    for &instance_index in &group.non_archivable_indices {
+        let index = instance_index
+            .checked_sub(1)
+            .filter(|index| *index < non_archivable_by_dense_index.len())
+            .context("Native non-Archivable instance index is out of range")?;
+        if std::mem::replace(&mut non_archivable_by_dense_index[index], true) {
+            bail!("Native non-Archivable instance index {instance_index} is duplicated");
+        }
+    }
+    let non_archivable_by_index = reorder_overlay_items(
+        non_archivable_by_dense_index,
+        &native_index_by_overlay_index,
+        "non-Archivable",
+    )?;
+    let mut overlay_by_dense_index = Vec::with_capacity(native_instances.len());
+    overlay_by_dense_index.resize_with(native_instances.len(), || None);
     for overlay in overlay_instances {
         let index = overlay
             .instance_index
             .checked_sub(1)
-            .filter(|index| *index < overlay_by_index.len())
+            .filter(|index| *index < overlay_by_dense_index.len())
             .context("Native overlay instance index is out of range")?;
-        if overlay_by_index[index].replace(overlay).is_some() {
+        if overlay_by_dense_index[index].replace(overlay).is_some() {
             bail!("Native overlay instance index {} is duplicated", index + 1);
         }
     }
-    let new_index_by_dense_ref = if let Some(new_index_by_dense_ref) = new_index_by_dense_ref {
-        new_index_by_dense_ref
-    } else {
-        let mut new_index_by_dense_ref = vec![usize::MAX; native_instances.len()];
-        for (index, instance) in native_instances.iter().enumerate() {
-            let dense_index = instance
-                .referent
-                .as_u128()
-                .and_then(|value| usize::try_from(value).ok())
-                .and_then(|value| value.checked_sub(1))
-                .filter(|value| *value < native_instances.len())
-                .context("Native snapshot contains an invalid dense referent")?;
-            if new_index_by_dense_ref[dense_index] != usize::MAX {
-                bail!("Native snapshot contains a duplicate dense referent");
-            }
-            new_index_by_dense_ref[dense_index] = index;
-        }
-        if new_index_by_dense_ref.contains(&usize::MAX) {
-            bail!("Native snapshot has an incomplete dense referent map");
-        }
-        new_index_by_dense_ref
-    };
+    let overlay_by_index = reorder_overlay_items(
+        overlay_by_dense_index,
+        &native_index_by_overlay_index,
+        "overlay",
+    )?;
     let refs = BytecodeModelImportRefs {
         settings_id_by_ref: HashMap::new(),
         path_segments_by_ref,
@@ -1143,9 +1634,10 @@ fn convert_native_service_output(
         .into_par_iter()
         .zip(overlay_by_index.into_par_iter())
         .zip(debug_ids.into_par_iter())
+        .zip(settings_id_by_index.into_par_iter())
         .enumerate()
         .map(
-            |(index, ((rbx_instance, overlay), debug_id))| -> Result<_> {
+            |(index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
                 let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
                 let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
                 let primary_part_is_set = rbx_model_primary_part_is_set(
@@ -1203,13 +1695,21 @@ fn convert_native_service_output(
                         .class_names
                         .get(overlay.class_index)
                         .context("Native overlay class index is out of range")?;
-                    if overlay.instance_index != index + 1
-                        || overlay_class.as_str() != rbx_instance.class.as_str()
-                    {
+                    if overlay_class.as_str() != rbx_instance.class.as_str() {
+                        let native_unique_id = rbx_instance
+                            .properties
+                            .iter()
+                            .find(|(name, _)| name.as_str() == "UniqueId")
+                            .map(|(_, value)| format!("{value:?}"));
                         bail!(
-                            "Native snapshot and overlay disagree at {} instance {}",
+                            "Native snapshot and overlay disagree at {} flat instance {}: native class {}, overlay class {}, overlay instance {}, native unique id {:?}, overlay debug id {:?}",
                             group.service,
-                            index + 1
+                            index + 1,
+                            rbx_instance.class,
+                            overlay_class,
+                            overlay.instance_index,
+                            native_unique_id,
+                            debug_id,
                         );
                     }
                     let mut overlay_properties = overlay.properties;
@@ -1222,6 +1722,10 @@ fn convert_native_service_output(
                     properties.extend(overlay_properties);
                     attributes.extend(overlay.attributes);
                 }
+                if non_archivable_by_index[index] {
+                    native_properties.retain(|property| property.name != "Archivable");
+                    properties.insert("Archivable".to_string(), Value::Bool(false));
+                }
                 if primary_part_is_set {
                     native_properties.retain(|property| property.name != "WorldPivot");
                     properties.remove("WorldPivot");
@@ -1233,6 +1737,7 @@ fn convert_native_service_output(
                         properties,
                         attributes,
                         debug_id: debug_id.filter(|value| !value.is_empty()),
+                        transported_settings_id,
                         instance_index: Some(index + 1),
                         parent_index,
                         ..Default::default()
@@ -1251,19 +1756,22 @@ fn convert_native_service_output(
         conversion_started,
     );
     let export_end_ms = elapsed_ms(dependencies.run_started);
-    Ok(ServiceExportOutput {
-        parts: ExportedSnapshotParts {
-            class_defaults: Value::Object(Map::new()),
-            instances,
-            native_properties_by_instance: Some(native_properties_by_instance),
+    Ok((
+        ServiceExportOutput {
+            parts: ExportedSnapshotParts {
+                class_defaults: Value::Object(Map::new()),
+                instances,
+                native_properties_by_instance: Some(native_properties_by_instance),
+            },
+            span: ServiceExecutionSpan {
+                service: group.service.clone(),
+                export_start_ms: export_started_ms,
+                export_end_ms,
+            },
+            tune: None,
         },
-        span: ServiceExecutionSpan {
-            service: group.service.clone(),
-            export_start_ms: export_started_ms,
-            export_end_ms,
-        },
-        tune: None,
-    })
+        native_index_by_overlay_index,
+    ))
 }
 
 pub(crate) fn editor_binary_export_parts<'a>(
@@ -1571,6 +2079,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         conditional_ref_overlay_request(
                                             &native.instances,
                                             conditional_ref_schema,
+                                            &native.native_index_by_overlay_index,
                                         )
                                     })
                                     .filter(|request| request.2 > 0);
@@ -1636,12 +2145,14 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         let (native, reference_prefetched, reference_request) = native?;
                         let mut overlay = overlay?;
                         let debug_ids = std::mem::take(&mut overlay.debug_ids);
+                        let settings_ids = std::mem::take(&mut overlay.settings_ids);
                         let mut result = finish_native_service_export(
                             finish_dependencies,
                             group,
                             NativeServiceFinishInput {
                             native,
                             debug_ids,
+                            settings_ids,
                             overlay,
                             reference_prefetch: reference_prefetched
                                 .then_some(reference_receiver),
@@ -1656,13 +2167,17 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                 group.script_count,
                                 group.instance_count,
                             );
-                            let sources = fetch_script_sources(
+                            let mut sources = fetch_script_sources(
                                 bridge,
                                 &group.service,
                                 DEFAULT_EXPORT_CHUNK_SIZE,
                                 group.script_count,
                                 worker_count,
                                 Some(export_id),
+                            )?;
+                            remap_script_source_indices(
+                                &mut sources,
+                                &result.native_index_by_overlay_index,
                             )?;
                             merge_script_sources(&mut result.output.parts.instances, &sources);
                         }
@@ -1804,6 +2319,7 @@ fn finish_native_service_export(
     let NativeServiceFinishInput {
         native,
         debug_ids,
+        settings_ids,
         overlay,
         reference_prefetch,
         reference_request,
@@ -1819,10 +2335,11 @@ fn finish_native_service_export(
             native,
             overlay.items,
             debug_ids,
+            settings_ids,
             export_started_ms,
         )
     };
-    let output = if has_reference_work {
+    let (output, native_index_by_overlay_index) = if has_reference_work {
         let (output, reference_overlay) = rayon::join(convert, || {
             if let Some(receiver) = reference_prefetch {
                 return receiver
@@ -1837,7 +2354,7 @@ fn finish_native_service_export(
                 reference_request.context("Native conditional-reference request is missing")?,
             )
         });
-        let mut output = output?;
+        let (mut output, native_index_by_overlay_index) = output?;
         if let Some(reference_fetch) = reference_overlay? {
             let reference_overlay = reference_fetch.overlay;
             if verbose_timing_logs() {
@@ -1850,20 +2367,27 @@ fn finish_native_service_export(
                     reference_overlay.metrics.chunks
                 );
             }
-            merge_native_overlay_items(
-                &mut output.parts.instances,
-                reference_overlay.items,
-                &group.class_names,
-            )?;
+            let mut items = reference_overlay.items;
+            remap_native_overlay_items(&mut items, &native_index_by_overlay_index)?;
+            normalize_native_overlay_internal_references(
+                &mut items,
+                output
+                    .parts
+                    .instances
+                    .iter()
+                    .map(|instance| instance.debug_id.as_deref()),
+            );
+            merge_native_overlay_items(&mut output.parts.instances, items, &group.class_names)?;
             merge_chunk_fetch_metrics(&mut service_metrics, reference_overlay.metrics);
             service_compact_expand_ms += reference_overlay.compact_expand_ms;
         }
-        output
+        (output, native_index_by_overlay_index)
     } else {
         convert()?
     };
     Ok(NativeServiceExportResult {
         output,
+        native_index_by_overlay_index,
         metrics: service_metrics,
         compact_expand_ms: service_compact_expand_ms,
     })
@@ -2139,6 +2663,7 @@ fn write_editor_place_snapshot(
         has_package_links,
         omitted_properties_by_class: HashMap::new(),
         logical_properties_by_ref: HashMap::new(),
+        unresolved_reference_properties_by_ref: HashMap::new(),
     };
     let format_path = existing_place.unwrap_or(output_path);
     write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(format_path)?)?;

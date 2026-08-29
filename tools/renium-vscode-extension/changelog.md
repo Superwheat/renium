@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.1 - 2026-08-29
+
+### Sync safety
+
+- Small edits update only the affected Studio instances instead of rebuilding unrelated place content.
+- Packages and their links remain intact during ordinary sync, reconciliation, moves, renames, deletes, and failed updates.
+- References continue pointing to the same instances after cross-service moves and renames.
+- Duplicate-named instances and reused internal IDs remain distinct instead of being merged, replaced, or duplicated.
+- A failed or interrupted transaction leaves the previous Studio state intact and can be retried safely.
+
+### Reconciliation and Live Sync
+
+- Independent Studio and project-file edits are combined automatically; only overlapping changes require a choice.
+- Creates, deletes, moves, renames, properties, attributes, tags, and script edits sync reliably in both directions.
+- Pulls no longer turn unchanged place content into thousands of false Live Sync changes.
+- Live Sync uses the selected project consistently and resumes cleanly after Studio or the daemon reconnects.
+- Missing script files, `init` scripts, plugin scripts, and parent-sensitive instance classes keep their intended Studio structure.
+
+### Performance
+
+- Large-place pulls, cross-service moves, reference repair, and file publishing avoid reprocessing unchanged data.
+- Bridge payloads are compressed and reused when safe, reducing repeated transfer and decode work.
+- Small Live Sync edits no longer fall back to full-place reconstruction.
+
+### Fidelity
+
+- Round trips preserve package IDs, unknown properties, special Roblox value types, MeshPart sizing, Lighting settings, MaterialService settings, hierarchy, attributes, tags, scripts, and references.
+- Editor property names map to the correct Studio properties instead of creating transport-only differences.
+
+### Studio and editor reliability
+
+- Background Studio automation no longer brings Studio to the front, resizes it, or takes over keyboard and mouse input.
+- Every project command uses the same active Studio connection, avoiding false “no Studio connected” results.
+- Custom and isolated daemon ports start and connect to the same intended session.
+- Windows installs a native `rbx` launcher while keeping the command-file fallback available.
+- Console output keeps stable spacing after labels so existing scripts and filters continue to match it.
+
 ## 0.3.0 - 2026-08-26
 
 ### Agent commands

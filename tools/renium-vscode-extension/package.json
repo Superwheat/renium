@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -559,12 +559,6 @@
           "default": true,
           "description": "When editor live sync is on, import dirty Studio services back into src."
         },
-        "renium.studioLiveSyncPollMs": {
-          "type": "number",
-          "default": 250,
-          "minimum": 10,
-          "description": "Base Studio dirty-state poll interval for live sync. Polling backs off while idle or after errors."
-        },
         "renium.liveSync.initialSyncPriority": {
           "type": "string",
           "enum": ["reconcile", "verify"],
@@ -585,18 +579,6 @@
           ],
           "default": "none",
           "description": "Preferred side for ordinary initial-sync conflicts."
-        },
-        "renium.liveSync.changesThreshold": {
-          "type": "number",
-          "default": 5,
-          "minimum": 0,
-          "description": "Maximum Studio change records Renium applies through the granular fast path. Larger batches use the protected full-import path."
-        },
-        "renium.liveSync.diffLinesLimit": {
-          "type": "number",
-          "default": 3000,
-          "minimum": 100,
-          "description": "Maximum lines rendered per side in a live-sync conflict preview. Full local and Studio backup files are preserved without truncation."
         },
         "renium.liveSync.displayPrompts": {
           "type": "string",
@@ -619,26 +601,6 @@
           "enum": ["off", "error", "warn", "info", "debug", "trace"],
           "default": "info",
           "description": "Minimum Renium output level to show in the Output panel. Errors still surface in VS Code notifications."
-        },
-        "renium.liveSync.conflictResolution": {
-          "type": "string",
-          "enum": ["prompt", "filesystem", "studio"],
-          "enumDescriptions": [
-            "No side prioritized: keep your local version on disk and pop a notification with a side-by-side diff so you can review or switch to Studio's. The file always stays valid (no conflict markers are written).",
-            "Filesystem wins: your editor's version of the overlapping lines is kept automatically.",
-            "Studio wins: Studio's version of the overlapping lines is kept automatically."
-          ],
-          "default": "prompt",
-          "description": "How to resolve overlapping concurrent edits to the same script during live sync, when the same lines changed in both Studio and your editor. Non-overlapping concurrent edits are always merged automatically. Conflict markers are never written into your scripts; both sides are always backed up under .renium/conflicts. The Studio plugin's setting, when chosen there, overrides this."
-        },
-        "renium.importMode": {
-          "type": "string",
-          "enum": [
-            "direct",
-            "snapshot"
-          ],
-          "default": "direct",
-          "description": "Import mode for the export CLI."
         },
         "renium.performanceMode": {
           "type": "string",
@@ -876,7 +838,7 @@
     "refresh-studio-assets": "node scripts/sync-assets.mjs --refresh-studio-api",
     "compile": "tsc -p .",
     "test:compile": "tsc -p tsconfig.test.json",
-    "test": "npm run test:compile && node --test out-test/test/agentInstructions.test.js out-test/test/cliResolution.test.js out-test/test/conflictMerge.test.js out-test/test/gitSync.test.js out-test/test/pluginDistribution.test.js",
+    "test": "npm run test:compile && node --test out-test/test/agentInstructions.test.js out-test/test/cliResolution.test.js out-test/test/experience.test.js out-test/test/gitSync.test.js out-test/test/pausedFileWrites.test.js out-test/test/pluginDistribution.test.js out-test/test/sharedConfig.test.js",
     "verify": "npm run compile && npm run test",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run generate-automation-api && npm run sync-assets && npm run sync-cli && npm run compile",

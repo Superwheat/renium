@@ -1,5 +1,5 @@
 use std::io::{self, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,12 @@ fn print_update_notice(response: &super::Response) {
 }
 
 pub(crate) fn shared_daemon_available() -> bool {
+    crate::daemon::daemon_control_endpoints()
+        .into_iter()
+        .any(|address| daemon_endpoint_available(address, Duration::from_millis(500)))
+}
+
+pub(crate) fn daemon_endpoint_available(address: SocketAddr, timeout: Duration) -> bool {
     let request = super::Request {
         v: super::PROTOCOL_VERSION,
         id: current_millis().min(u128::from(u64::MAX)) as u64,
@@ -81,17 +87,37 @@ pub(crate) fn shared_daemon_available() -> bool {
         cx: None,
         p: json!({}),
     };
-    daemon_control_endpoints().into_iter().any(|address| {
-        let Ok(mut stream) = TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT)
-        else {
-            return false;
-        };
-        send_on_stream_with_timeout(&mut stream, &request, Duration::from_millis(500))
-            .is_ok_and(|response| response.ok == 1)
-    })
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT)
+    else {
+        return false;
+    };
+    send_on_stream_with_timeout(&mut stream, &request, timeout)
+        .is_ok_and(|response| response.ok == 1)
 }
 
-pub(crate) fn run_stdio_proxy() -> Result<()> {
+fn forward_proxy_request(
+    request: &super::Request,
+    bridge_ports: &str,
+    bridge_wait_seconds: f64,
+) -> super::Response {
+    match try_send_request(request) {
+        Ok(Some(response)) => response,
+        Ok(None) if crate::daemon::start_shared_daemon(bridge_ports, bridge_wait_seconds) => {
+            match try_send_request(request) {
+                Ok(Some(response)) => response,
+                Ok(None) => transport_failure(
+                    request.id,
+                    anyhow::anyhow!("Renium daemon did not become available"),
+                ),
+                Err(error) => transport_failure(request.id, error),
+            }
+        }
+        Ok(None) => transport_failure(request.id, anyhow::anyhow!("Renium daemon is not running")),
+        Err(error) => transport_failure(request.id, error),
+    }
+}
+
+pub(crate) fn run_stdio_proxy(bridge_ports: String, bridge_wait_seconds: f64) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
@@ -106,16 +132,12 @@ pub(crate) fn run_stdio_proxy() -> Result<()> {
                 }
                 let request = trimmed.to_string();
                 let stdout_gate = Arc::clone(&stdout_gate);
+                let bridge_ports = bridge_ports.clone();
                 std::thread::spawn(move || {
                     let response = match serde_json::from_str::<super::Request>(&request) {
-                        Ok(request) => match try_send_request(&request) {
-                            Ok(Some(response)) => response,
-                            Ok(None) => transport_failure(
-                                request.id,
-                                anyhow::anyhow!("Renium daemon is not running"),
-                            ),
-                            Err(error) => transport_failure(request.id, error),
-                        },
+                        Ok(request) => {
+                            forward_proxy_request(&request, &bridge_ports, bridge_wait_seconds)
+                        }
                         Err(error) => super::Response::failure(
                             0,
                             Instant::now(),

@@ -33,7 +33,7 @@ use crate::bytecode::edit::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::rbx::decode::{
-    nonfinite_float_from_json, rbx_reflection_class_is_a, rbx_variant_to_settings_json,
+    nonfinite_float_from_json, rbx_reflection_class_is_a, rbx_variant_to_persisted_settings_json,
 };
 use crate::rbx::model::{
     BytecodeExportClassMetadata, BytecodeExportMetadata, BytecodeExportPropertyMetadata,
@@ -42,6 +42,7 @@ use crate::rbx::model::{
 use crate::roblox::schema::{
     AXIS_NAMES, FACE_NAMES, MESH_INITIAL_SIZE_PROPERTY, MESH_SIZE_TRANSPORT_PROPERTY,
 };
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, settings_reference_index, strict_reference_path,
 };
@@ -51,6 +52,7 @@ pub(crate) struct BytecodeRbxBuildOptions<'a> {
     pub source_path: Option<&'a Path>,
     pub omitted_properties_by_class: Option<&'a mut HashMap<String, HashSet<String>>>,
     pub logical_omitted_properties: Option<&'a mut HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
+    pub unresolved_reference_properties: Option<&'a mut HashSet<rbx_dom_weak::Ustr>>,
 }
 
 pub(crate) struct BytecodeRbxEncoder<'a, 'db> {
@@ -107,6 +109,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             index,
             class_metadata.triangle_mesh_part,
         );
+        let decal = class_metadata.decal;
 
         for (name, value) in &instance.properties {
             if class_metadata.model
@@ -164,19 +167,37 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 }
                 continue;
             }
-            validate_model_export_reference_value(value, self.refs).with_context(|| {
-                format!(
-                    "{} ({}) property {name} contains an invalid reference",
-                    instance.name, instance.class_name
-                )
-            })?;
+            let unresolved_reference = validate_model_export_reference_value(value, self.refs)
+                .with_context(|| {
+                    format!(
+                        "{} ({}) property {name} contains an invalid reference",
+                        instance.name, instance.class_name
+                    )
+                })?;
+            if unresolved_reference {
+                if let Some(properties) = options.unresolved_reference_properties.as_deref_mut() {
+                    properties.insert(rbx_dom_weak::Ustr::from(name.as_str()));
+                    continue;
+                }
+                bail!(
+                    "{} ({}) property {name} contains a reference outside the model",
+                    instance.name,
+                    instance.class_name
+                );
+            }
             let property = property_metadata.property;
             let serialized_name = property_metadata.serialized_name.unwrap_or(name);
             let descriptor = property_metadata.descriptor;
             let unsupported = property.is_some()
                 && descriptor.is_none()
                 && !property_metadata.native_setter_property;
-            let variant = if unsupported {
+            let compatibility_type = property
+                .is_none()
+                .then(|| flattened_decal_property_type(decal, name))
+                .flatten();
+            let variant = if let Some(target_type) = compatibility_type {
+                json_to_rbx_variant_for_type(value, target_type, self.database, self.refs)
+            } else if unsupported {
                 None
             } else {
                 json_to_rbx_property_variant(
@@ -242,6 +263,18 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         }
 
         Ok(builder)
+    }
+}
+
+fn flattened_decal_property_type(is_decal: bool, property_name: &str) -> Option<RbxVariantType> {
+    if !is_decal {
+        return None;
+    }
+    match property_name {
+        "EmissiveMaskContent" | "TexturePackContent" => Some(RbxVariantType::Content),
+        "EmissiveStrength" => Some(RbxVariantType::Float32),
+        "EmissiveTint" => Some(RbxVariantType::Color3),
+        _ => None,
     }
 }
 
@@ -333,7 +366,7 @@ pub(crate) fn bytecode_export_script_source(
     source_path: Option<&Path>,
 ) -> Result<String> {
     let stored_source = instance.properties.get("Source").and_then(Value::as_str);
-    if stored_source == Some("__SOURCE_EXTERNAL__") {
+    if stored_source == Some(EXTERNAL_SOURCE_MARKER) {
         let path = source_path.with_context(|| {
             format!(
                 "{} ({}) has external source but no source path",
@@ -421,7 +454,6 @@ pub(crate) fn rbx_serialized_property_name_for_logical<'db>(
     serialized_name(class, property)
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn rbx_canonical_property_descriptor_for_serialized_name<'db>(
     database: &'db ReflectionDatabase<'db>,
     class_name: &str,
@@ -454,6 +486,34 @@ pub(crate) fn rbx_canonical_property_descriptor_for_serialized_name<'db>(
         }
     }
     exact
+}
+
+pub(crate) fn rbx_logical_property_name<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+    property_name: &str,
+) -> Option<&'db str> {
+    let class_descriptor = database.classes.get(class_name)?;
+    for class in database.superclasses_iter(class_descriptor) {
+        let property = class.properties.get(property_name).or_else(|| {
+            class
+                .properties
+                .values()
+                .find(|property| property.name.eq_ignore_ascii_case(property_name))
+        });
+        if let Some(property) = property {
+            return match &property.kind {
+                RbxPropertyKind::Alias { alias_for } => class
+                    .properties
+                    .get(*alias_for)
+                    .map(|property| property.name),
+                RbxPropertyKind::Canonical { .. } => Some(property.name),
+                _ => None,
+            };
+        }
+    }
+    rbx_canonical_property_descriptor_for_serialized_name(database, class_name, property_name)
+        .map(|property| property.name)
 }
 
 pub(crate) fn rbx_property_descriptor<'db>(
@@ -692,7 +752,14 @@ fn json_to_rbx_inferred_variant(
         Value::Number(_) => json_f64(value).map(RbxVariant::Float64),
         Value::String(value) => Some(RbxVariant::String(value.clone())),
         Value::Object(object) => match object.get("_type").and_then(Value::as_str) {
+            Some("Int32") => json_i32(object.get("value")?).map(RbxVariant::Int32),
+            Some("Int64") => json_i64(object.get("value")?).map(RbxVariant::Int64),
+            Some("Float32") => json_f32(object.get("value")?).map(RbxVariant::Float32),
+            Some("Float64") => json_f64(object.get("value")?).map(RbxVariant::Float64),
             Some("Float") => json_f64(value).map(RbxVariant::Float64),
+            Some("ContentId") => json_string_or_wrapped(value, "ContentId")
+                .map(|text| RbxVariant::ContentId(RbxContentId::from(text))),
+            Some("Content") => json_to_rbx_content(value, refs).map(RbxVariant::Content),
             Some("Vector2") => json_to_rbx_vector2(value).map(RbxVariant::Vector2),
             Some("Vector3") => json_to_rbx_vector3(value).map(RbxVariant::Vector3),
             Some("Vector2int16") => json_to_rbx_vector2int16(value).map(RbxVariant::Vector2int16),
@@ -789,7 +856,7 @@ pub(crate) fn normalize_project_typed_value(
         bail!("Value cannot be represented as a Roblox property literal");
     };
     let import_refs = BytecodeModelImportRefs::default();
-    rbx_variant_to_settings_json(&variant, descriptor, database, &import_refs)
+    rbx_variant_to_persisted_settings_json(&variant, descriptor, database, &import_refs)
         .context("Roblox property literal isn't supported by Renium")
 }
 
@@ -800,8 +867,11 @@ fn json_attributes_to_rbx(
 ) -> Result<RbxAttributes> {
     let mut out = RbxAttributes::new();
     for (name, value) in attributes {
-        validate_model_export_reference_value(value, refs)
-            .with_context(|| format!("Attribute {name} contains an invalid reference"))?;
+        if validate_model_export_reference_value(value, refs)
+            .with_context(|| format!("Attribute {name} contains an invalid reference"))?
+        {
+            bail!("Attribute {name} contains a reference outside the model");
+        }
         let variant = json_to_rbx_attribute_variant(value, database, refs)
             .with_context(|| format!("Attribute {name} has an unsupported value"))?;
         out.insert(name.clone(), variant);
@@ -1205,6 +1275,9 @@ fn json_to_rbx_content(value: &Value, refs: &BytecodeModelExportRefs) -> Option<
         };
     }
     if let Some(object) = value.as_object() {
+        if object.get("_type").and_then(Value::as_str) == Some("Content") {
+            return json_to_rbx_content(object.get("value")?, refs);
+        }
         if let Some(wrapped) = object.get("Content") {
             return json_to_rbx_content(wrapped, refs);
         }
@@ -1227,20 +1300,6 @@ fn json_to_rbx_content(value: &Value, refs: &BytecodeModelExportRefs) -> Option<
         }
     }
     Some(RbxContent::from_referent(json_to_rbx_ref(value, refs)))
-}
-
-fn accept_model_export_ref(
-    resolved: &mut Option<RbxRef>,
-    selector: &str,
-    candidate: Option<RbxRef>,
-) -> Result<()> {
-    let candidate =
-        candidate.with_context(|| format!("Ref {selector} does not resolve inside the model"))?;
-    if resolved.is_some_and(|resolved| resolved != candidate) {
-        bail!("Ref selectors identify different instances");
-    }
-    *resolved = Some(candidate);
-    Ok(())
 }
 
 fn model_export_ref_by_settings_id(
@@ -1280,36 +1339,39 @@ fn model_export_ref_by_path_segments_key(
 fn strict_model_export_ref(
     object: &Map<String, Value>,
     refs: &BytecodeModelExportRefs,
-) -> Result<RbxRef> {
-    let mut resolved = None;
-    for selector in ["settingsId", "instanceId"] {
-        if let Some(value) = object.get(selector) {
-            let id = value
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .with_context(|| format!("Ref {selector} must be a non-empty string"))?;
-            accept_model_export_ref(
-                &mut resolved,
-                selector,
-                model_export_ref_by_settings_id(refs, id),
-            )?;
+) -> Result<Option<RbxRef>> {
+    let mut has_stable_selector = false;
+    if let Some((selector, value)) = object
+        .get("settingsId")
+        .map(|value| ("settingsId", value))
+        .or_else(|| object.get("instanceId").map(|value| ("instanceId", value)))
+    {
+        has_stable_selector = true;
+        let id = value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("Ref {selector} must be a non-empty string"))?;
+        if let Some(referent) = model_export_ref_by_settings_id(refs, id) {
+            return Ok(Some(referent));
         }
     }
     if let Some((segments, ordinals)) = strict_reference_path(object)? {
+        has_stable_selector = true;
         let candidate = if let Some(ordinals) = ordinals {
             model_export_ref_by_path_key(refs, &instance_path_parts_key(&segments, &ordinals))
         } else {
             model_export_ref_by_path_segments_key(refs, &instance_path_key(&segments))
         };
-        accept_model_export_ref(&mut resolved, "pathSegments", candidate)?;
+        if candidate.is_some() {
+            return Ok(candidate);
+        }
     }
     if let Some(value) = object.get("instanceIndex") {
+        has_stable_selector = true;
         let index = settings_reference_index(value).context("Ref instanceIndex must be 1-based")?;
-        accept_model_export_ref(
-            &mut resolved,
-            "instanceIndex",
-            refs.by_index.get(&index).copied(),
-        )?;
+        if let Some(referent) = refs.by_index.get(&index).copied() {
+            return Ok(Some(referent));
+        }
     }
     for selector in ["referent", "ref"] {
         if let Some(value) = object.get(selector) {
@@ -1317,42 +1379,50 @@ fn strict_model_export_ref(
                 .as_str()
                 .and_then(|value| value.parse::<RbxRef>().ok())
                 .with_context(|| format!("Ref {selector} must be a valid referent"))?;
-            accept_model_export_ref(&mut resolved, selector, Some(referent))?;
+            return Ok(Some(referent));
         }
     }
-    if object.contains_key("debugId") && resolved.is_none() {
+    if object.contains_key("debugId") && !has_stable_selector {
         bail!("Ref debugId cannot resolve without a stable model selector");
     }
-    Ok(resolved.unwrap_or_else(RbxRef::none))
+    if has_stable_selector {
+        Ok(None)
+    } else {
+        Ok(Some(RbxRef::none()))
+    }
 }
 
 fn validate_model_export_reference_value(
     value: &Value,
     refs: &BytecodeModelExportRefs,
-) -> Result<()> {
+) -> Result<bool> {
     match value {
         Value::Array(values) => {
+            let mut unresolved = false;
             for value in values {
-                validate_model_export_reference_value(value, refs)?;
+                unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
             }
+            Ok(unresolved)
         }
         Value::Object(object) => {
             if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-                strict_model_export_ref(object, refs)?;
-                return Ok(());
+                return Ok(strict_model_export_ref(object, refs)?.is_none());
             }
-            if let Some(reference) = object.get("Ref").and_then(Value::as_object) {
-                strict_model_export_ref(reference, refs)?;
+            if let Some(reference) = object.get("Ref").and_then(Value::as_object)
+                && strict_model_export_ref(reference, refs)?.is_none()
+            {
+                return Ok(true);
             }
+            let mut unresolved = false;
             for (name, value) in object {
                 if name != "Ref" {
-                    validate_model_export_reference_value(value, refs)?;
+                    unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
                 }
             }
+            Ok(unresolved)
         }
-        _ => {}
+        _ => Ok(false),
     }
-    Ok(())
 }
 
 fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {

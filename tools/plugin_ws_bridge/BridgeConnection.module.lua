@@ -1,5 +1,80 @@
 local BridgeConnection = {}
 
+function BridgeConnection.removeQueuedRequestsByLease(queue, leaseId: string): { any }
+	local removed = {}
+	local retainedIndex = 1
+	for _, request in ipairs(queue) do
+		if request.leaseId == leaseId then
+			removed[#removed + 1] = request
+		else
+			queue[retainedIndex] = request
+			retainedIndex += 1
+		end
+	end
+	for index = retainedIndex, #queue do
+		queue[index] = nil
+	end
+	return removed
+end
+
+function BridgeConnection.createTransactionOutcomeStore(ttlSeconds: number, maxRecords: number, clock)
+	local records = {}
+	local now = clock or os.clock
+
+	local function prune()
+		local current = now()
+		local retained = {}
+		for transactionId, record in pairs(records) do
+			if record.expiresAt <= current then
+				records[transactionId] = nil
+			else
+				retained[#retained + 1] = record
+			end
+		end
+		if #retained <= maxRecords then
+			return
+		end
+		table.sort(retained, function(a, b)
+			return a.completedAt < b.completedAt
+		end)
+		for index = 1, #retained - maxRecords do
+			records[retained[index].transactionId] = nil
+		end
+	end
+
+	local store = {}
+	function store.record(transactionId: string, state: string, response: { [string]: any }): { [string]: any }
+		local completedAt = now()
+		local storedResponse = table.clone(response)
+		storedResponse.ok = true
+		storedResponse.found = true
+		storedResponse.transactionId = transactionId
+		storedResponse.state = state
+		storedResponse.committed = state == "committed"
+		storedResponse.rolledBack = state == "rolledBack"
+		records[transactionId] = {
+			transactionId = transactionId,
+			response = storedResponse,
+			completedAt = completedAt,
+			expiresAt = completedAt + ttlSeconds,
+		}
+		prune()
+		return table.clone(storedResponse)
+	end
+
+	function store.get(transactionId: string): { [string]: any }?
+		prune()
+		local record = records[transactionId]
+		return if record then table.clone(record.response) else nil
+	end
+
+	function store.clear()
+		table.clear(records)
+	end
+
+	return store
+end
+
 function BridgeConnection.create(context)
 	local plugin = context.plugin
 	local Config = context.config
@@ -47,10 +122,12 @@ function BridgeConnection.create(context)
 	local maxQueuedExclusiveRequests = context.maxQueuedExclusiveRequests
 	local connectionSessionGeneration = nil
 	local exclusiveRequestBusy = false
+	local activeExclusiveRequest = nil
 	local exclusiveRequestQueue = {}
 	local exclusiveIdleCallbacks = {}
 	local replayRequestsByKey = {}
 	local completedReplayRequests = {}
+	local cancelledRequestLeases = {}
 	local replayRequestTtlSeconds = 120
 	local maxCompletedReplayRequests = 64
 	local logLevelRank = {
@@ -279,6 +356,15 @@ function BridgeConnection.create(context)
 		end
 	end
 
+	local function pruneCancelledRequestLeases()
+		local now = os.clock()
+		for leaseId, expiresAt in pairs(cancelledRequestLeases) do
+			if expiresAt <= now then
+				cancelledRequestLeases[leaseId] = nil
+			end
+		end
+	end
+
 	local function addReplayRecipient(request, channel, client)
 		for _, recipient in ipairs(request.recipients) do
 			if recipient.client == client then
@@ -324,7 +410,62 @@ function BridgeConnection.create(context)
 		})
 	end
 
-	local function executeRequest(channel, client, id, method, params, replayRequest, sessionGeneration)
+	local function finishQueuedRequestAsCancelled(request)
+		local replayRequest = request.replayRequest
+		if replayRequest then
+			if replayRequest.completed then
+				return
+			end
+			replayRequest.completed = true
+			replayRequest.okCall = false
+			replayRequest.result = "Renium request lease was cancelled"
+			replayRequest.serverMs = 0
+			replayRequest.completedAt = os.clock()
+			completedReplayRequests[#completedReplayRequests + 1] = replayRequest
+			for _, recipient in ipairs(replayRequest.recipients) do
+				sendRequestResult(
+					recipient.channel,
+					recipient.client,
+					replayRequest.id,
+					replayRequest.method,
+					false,
+					replayRequest.result,
+					0
+				)
+			end
+			replayRequest.recipients = {}
+			pruneReplayRequests()
+			return
+		end
+		sendRequestResult(
+			request.channel,
+			request.client,
+			request.id,
+			request.method,
+			false,
+			"Renium request lease was cancelled",
+			0
+		)
+	end
+
+	function Config.cancelBridgeRequestLease(leaseId: string): { [string]: any }
+		pruneCancelledRequestLeases()
+		cancelledRequestLeases[leaseId] = os.clock() + replayRequestTtlSeconds
+		local removed = BridgeConnection.removeQueuedRequestsByLease(exclusiveRequestQueue, leaseId)
+		for _, request in ipairs(removed) do
+			finishQueuedRequestAsCancelled(request)
+		end
+		local active = activeExclusiveRequest ~= nil and activeExclusiveRequest.leaseId == leaseId
+		if active then
+			activeExclusiveRequest.cancelled = true
+		end
+		return {
+			active = active,
+			queued = #removed,
+		}
+	end
+
+	local function executeRequest(channel, client, id, method, params, replayRequest, sessionGeneration, leaseId)
 		if pluginUnloading or (not replayRequest and channel.client ~= client) then
 			return
 		end
@@ -333,14 +474,17 @@ function BridgeConnection.create(context)
 		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
 		local ownsSession = not sessionOwned or context.validateSessionLock(sessionGeneration)
 		local okCall, result
-		if sessionOwned and not ownsSession then
+		if leaseId ~= nil and cancelledRequestLeases[leaseId] ~= nil then
+			okCall = false
+			result = "Renium request lease was cancelled"
+		elseif sessionOwned and not ownsSession then
 			okCall = false
 			result = "Renium session ownership was lost"
 		else
 			if exclusive then
 				context.setExclusiveSessionGeneration(sessionGeneration)
 			end
-			okCall, result = pcall(context.handleMethod, method, params, sessionGeneration)
+			okCall, result = pcall(context.handleMethod, method, params, sessionGeneration, leaseId)
 			if exclusive then
 				context.setExclusiveSessionGeneration(nil)
 			end
@@ -383,28 +527,56 @@ function BridgeConnection.create(context)
 	local drainExclusiveRequestQueue
 	local function drainExclusiveIdleCallbacks()
 		if exclusiveRequestBusy then
-			return
+			return false
 		end
 		local callbacks = exclusiveIdleCallbacks
 		exclusiveIdleCallbacks = {}
-		for _, callback in ipairs(callbacks) do
-			local ok, callbackError = pcall(callback)
-			if not ok then
-				warn("[Renium] exclusive cleanup failed: " .. tostring(callbackError))
-			end
+		if #callbacks == 0 then
+			return false
 		end
+		exclusiveRequestBusy = true
+		task.spawn(function()
+			for _, callback in ipairs(callbacks) do
+				local ok, callbackError = pcall(callback)
+				if not ok then
+					warn("[Renium] exclusive cleanup failed: " .. tostring(callbackError))
+				end
+			end
+			exclusiveRequestBusy = false
+			drainExclusiveRequestQueue()
+		end)
+		return true
+	end
+
+	function Config.afterBridgeExclusiveIdle(callback)
+		local completed = Instance.new("BindableEvent")
+		local result = nil
+		exclusiveIdleCallbacks[#exclusiveIdleCallbacks + 1] = function()
+			result = table.pack(pcall(callback))
+			completed:Fire()
+		end
+		drainExclusiveIdleCallbacks()
+		completed.Event:Wait()
+		completed:Destroy()
+		if not result[1] then
+			error(result[2], 0)
+		end
+		return table.unpack(result, 2, result.n)
 	end
 
 	drainExclusiveRequestQueue = function()
 		if exclusiveRequestBusy then
 			return
 		end
-		drainExclusiveIdleCallbacks()
+		if drainExclusiveIdleCallbacks() then
+			return
+		end
 		local request = table.remove(exclusiveRequestQueue, 1)
 		if request == nil then
 			return
 		end
 		exclusiveRequestBusy = true
+		activeExclusiveRequest = request
 		task.spawn(function()
 			executeRequest(
 				request.channel,
@@ -413,127 +585,189 @@ function BridgeConnection.create(context)
 				request.method,
 				request.params,
 				request.replayRequest,
-				request.sessionGeneration
+				request.sessionGeneration,
+				request.leaseId
 			)
+			if activeExclusiveRequest == request then
+				activeExclusiveRequest = nil
+			end
 			exclusiveRequestBusy = false
 			drainExclusiveRequestQueue()
 		end)
 	end
 
-	local function onMessage(channel, client, message)
-		local channelId = channel.id
+	local function validatedRequest(channelId, client, message)
 		if type(message) ~= "string" then
 			sendRequestError(channelId, client, nil, "Bridge request must be text")
-			return
+			return nil
 		end
 		if #message > maxRequestBytes then
 			sendRequestError(channelId, client, nil, "Bridge request exceeds safe size limit")
-			return
+			return nil
 		end
 		local okDecode, payload = pcall(HttpService.JSONDecode, HttpService, message)
 		if not okDecode or not isJsonObject(payload) then
 			sendRequestError(channelId, client, nil, "Invalid JSON payload")
-			return
+			return nil
 		end
 
 		local id = payload.id
 		if type(id) ~= "number" or id < 0 or id ~= math.floor(id) then
 			sendRequestError(channelId, client, nil, "Bridge request has an invalid id")
-			return
+			return nil
 		end
 		local sessionId = payload.session_id
 		if sessionId == nil then
 			sessionId = ""
 		elseif type(sessionId) ~= "string" or #sessionId > 128 then
 			sendRequestError(channelId, client, id, "Bridge request has an invalid session id")
-			return
+			return nil
+		end
+		local leaseId = payload.lease_id
+		if leaseId == nil or leaseId == "" then
+			leaseId = nil
+		elseif type(leaseId) ~= "string" or #leaseId > 128 then
+			sendRequestError(channelId, client, id, "Bridge request has an invalid lease id")
+			return nil
 		end
 		local method = payload.method
 		if type(method) ~= "string" or method == "" or #method > 96 then
 			sendRequestError(channelId, client, id, "Missing or invalid bridge method")
-			return
+			return nil
 		end
 		if type(context.allowedMethods) == "table" and not context.allowedMethods[method] then
 			sendRequestError(channelId, client, id, "Unsupported bridge method")
-			return
+			return nil
 		end
 		local params = payload.params
 		if params == nil then
 			params = {}
 		elseif not isJsonObject(params) then
 			sendRequestError(channelId, client, id, "Bridge request params must be an object")
+			return nil
+		end
+		pruneCancelledRequestLeases()
+		if leaseId ~= nil and cancelledRequestLeases[leaseId] ~= nil then
+			sendRequestError(channelId, client, id, "Renium request lease was cancelled")
+			return nil
+		end
+		return {
+			id = id,
+			sessionId = sessionId,
+			leaseId = leaseId,
+			method = method,
+			params = params,
+		}
+	end
+
+	local function prepareReplayRequest(channel, client, request, message)
+		if not isReplayProtectedMethod(request.method) then
+			return nil, false
+		end
+		pruneReplayRequests()
+		local replayKey = ("%d:%s:%d"):format(#request.sessionId, request.sessionId, request.id)
+		local replayRequest = replayRequestsByKey[replayKey]
+		if replayRequest then
+			if replayRequest.signature ~= message then
+				sendRequestError(channel.id, client, request.id, "Bridge request id was reused for different content")
+			elseif replayRequest.completed then
+				sendRequestResult(
+					channel,
+					client,
+					request.id,
+					request.method,
+					replayRequest.okCall,
+					replayRequest.result,
+					replayRequest.serverMs
+				)
+			else
+				addReplayRecipient(replayRequest, channel, client)
+			end
+			return nil, true
+		end
+		replayRequest = {
+			id = request.id,
+			key = replayKey,
+			method = request.method,
+			signature = message,
+			recipients = {},
+			completed = false,
+		}
+		addReplayRecipient(replayRequest, channel, client)
+		replayRequestsByKey[replayKey] = replayRequest
+		return replayRequest, false
+	end
+
+	local function discardReplayRequest(replayRequest)
+		if replayRequest then
+			replayRequestsByKey[replayRequest.key] = nil
+		end
+	end
+
+	local function onMessage(channel, client, message)
+		local channelId = channel.id
+		local request = validatedRequest(channelId, client, message)
+		if request == nil then
 			return
 		end
-		local replayRequest = nil
-		if isReplayProtectedMethod(method) then
-			pruneReplayRequests()
-			local replayKey = ("%d:%s:%d"):format(#sessionId, sessionId, id)
-			replayRequest = replayRequestsByKey[replayKey]
-			if replayRequest then
-				if replayRequest.signature ~= message then
-					sendRequestError(channelId, client, id, "Bridge request id was reused for different content")
-					return
-				end
-				if replayRequest.completed then
-					sendRequestResult(
-						channel,
-						client,
-						id,
-						method,
-						replayRequest.okCall,
-						replayRequest.result,
-						replayRequest.serverMs
-					)
-				else
-					addReplayRecipient(replayRequest, channel, client)
-				end
-				return
-			end
-			replayRequest = {
-				id = id,
-				key = replayKey,
-				method = method,
-				signature = message,
-				recipients = {},
-				completed = false,
-			}
-			addReplayRecipient(replayRequest, channel, client)
-			replayRequestsByKey[replayKey] = replayRequest
+		local replayRequest, replayHandled = prepareReplayRequest(channel, client, request, message)
+		if replayHandled then
+			return
 		end
-		local exclusive = context.isExclusiveMethod(method)
-		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
+		local exclusive = context.isExclusiveMethod(request.method)
+		local sessionOwned = exclusive or context.isSessionOwnedMethod(request.method)
 		local sessionGeneration = nil
 		if sessionOwned then
 			sessionGeneration = context.captureSessionLock()
 			if sessionGeneration == nil then
-				if replayRequest then
-					replayRequestsByKey[replayRequest.key] = nil
-				end
-				sendRequestError(channelId, client, id, "Renium session ownership was lost")
+				discardReplayRequest(replayRequest)
+				sendRequestError(channelId, client, request.id, "Renium session ownership was lost")
 				return
 			end
 		end
 		if exclusive then
 			if #exclusiveRequestQueue >= maxQueuedExclusiveRequests then
-				if replayRequest then
-					replayRequestsByKey[replayRequest.key] = nil
-				end
-				sendRequestError(channelId, client, id, "Bridge mutation queue is full; retry shortly")
+				discardReplayRequest(replayRequest)
+				sendRequestError(channelId, client, request.id, "Bridge mutation queue is full; retry shortly")
 				return
 			end
 			table.insert(exclusiveRequestQueue, {
 				channel = channel,
 				client = client,
-				id = id,
-				method = method,
-				params = params,
+				id = request.id,
+				method = request.method,
+				params = request.params,
 				replayRequest = replayRequest,
 				sessionGeneration = sessionGeneration,
+				leaseId = request.leaseId,
 			})
 			drainExclusiveRequestQueue()
 			return
 		end
-		task.spawn(executeRequest, channel, client, id, method, params, replayRequest, sessionGeneration)
+		if request.method == "cancelRequestLease" then
+			executeRequest(
+				channel,
+				client,
+				request.id,
+				request.method,
+				request.params,
+				replayRequest,
+				sessionGeneration,
+				request.leaseId
+			)
+			return
+		end
+		task.spawn(
+			executeRequest,
+			channel,
+			client,
+			request.id,
+			request.method,
+			request.params,
+			replayRequest,
+			sessionGeneration,
+			request.leaseId
+		)
 	end
 
 	local function reconnectAllowed(channel): boolean
