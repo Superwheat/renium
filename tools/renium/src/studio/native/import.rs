@@ -1060,15 +1060,6 @@ fn editor_service_change_generations(
     })
 }
 
-pub(crate) fn editor_services_have_package_links(
-    bridge: &BridgeServer,
-    services: &[String],
-) -> Result<bool> {
-    Ok(editor_service_change_generations(bridge, services)?
-        .has_package_links
-        .is_none_or(|services| services.into_values().any(|present| present)))
-}
-
 struct EditorPackagePreflightLive<'a> {
     dom: Option<RbxWeakDom>,
     generations: HashMap<String, u64>,

@@ -23,11 +23,11 @@ macro_rules! eprintln {
                 format_args!($format $(, $argument)*),
             );
         } else {
-            std::eprintln!($format $(, $argument)*);
+            $crate::app::output::write_stderr(format_args!($format $(, $argument)*));
         }
     }};
     ($($argument:tt)*) => {
-        std::eprintln!($($argument)*)
+        $crate::app::output::write_stderr(format_args!($($argument)*))
     };
 }
 
@@ -39,16 +39,16 @@ macro_rules! println {
                 format_args!($format $(, $argument)*),
             );
         } else if $crate::app::context::automation_stdio() {
-            std::eprintln!($format $(, $argument)*);
+            $crate::app::output::write_stderr(format_args!($format $(, $argument)*));
         } else {
-            std::println!($format $(, $argument)*);
+            $crate::app::output::write_stdout(format_args!($format $(, $argument)*));
         }
     }};
     ($($argument:tt)*) => {{
         if $crate::app::context::automation_stdio() {
-            std::eprintln!($($argument)*);
+            $crate::app::output::write_stderr(format_args!($($argument)*));
         } else {
-            std::println!($($argument)*);
+            $crate::app::output::write_stdout(format_args!($($argument)*));
         }
     }};
 }

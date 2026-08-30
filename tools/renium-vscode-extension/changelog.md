@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.2 - 2026-08-30
+
+### Sync safety
+
+- Reconciliation updates only content that actually changed, including after Studio or the daemon restarts; one edit no longer replaces unrelated place content.
+- Independent Studio and project-file edits are combined, while true overlaps remain untouched until a side is chosen.
+- Package links and package-owned trees stay protected during ordinary pulls, pushes, moves, renames, deletes, retries, and interrupted syncs.
+- Duplicate-named instances, cross-service moves, new and deleted scripts, properties, attributes, tags, and references keep the correct identity in both directions.
+- Full pushes finish without hanging or repeating the same work, and commands that require approval are rejected before Studio is contacted.
+- A completed sync no longer returns as a false pending Studio change after Studio reconnects.
+
+### Performance
+
+- Small Live Sync edits update only their affected instances instead of exporting an entire service or rebuilding the place.
+- Clean daemon restarts resume from the saved common state without rereading unchanged Studio content.
+- Full pulls, no-change pushes, and source-only pushes skip redundant decoding, transfer, and verification work.
+- Large services reuse decoded project data and resolve script paths directly, keeping create, delete, and source edits responsive.
+
+### macOS
+
+- Renium now uses the installed Roblox Studio app directly instead of creating a separate Renium Studio copy.
+- Studio updates are detected and the Renium helper is reapplied to the official app when needed.
+- Pulling and exporting no longer opens the macOS Export Place save panel or repeatedly asks for file access.
+- Background Studio automation stays behind the user's other apps and avoids activating, resizing, or taking over global keyboard and mouse input.
+- Local-place reopening, recovery prompts, and package-change dialogs are handled without changing the selected project or losing the connected session.
+
+### CLI and installation
+
+- Studio, Live Sync, pull, and push commands consistently use the same connected runtime after reconnects.
+- macOS setup and updates install a matching CLI, Studio plugin, helper, guides, and editor bundle.
+- Command output remains compact and stable, including consistent spacing for scripts and filters that parse it.
+
 ## 0.3.1 - 2026-08-29
 
 ### Sync safety

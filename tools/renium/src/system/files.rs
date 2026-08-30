@@ -16,6 +16,11 @@ use crate::daemon::is_process_alive;
 
 pub(crate) const SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.renium";
 
+pub(crate) fn resolved_current_executable() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    Ok(fs::canonicalize(&executable).unwrap_or(executable))
+}
+
 pub(crate) struct OnDrop<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> OnDrop<F> {
@@ -372,6 +377,14 @@ fn file_contents_match(path: &Path, content: &[u8]) -> Result<(bool, bool)> {
 }
 
 pub(crate) fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_streaming_inner(path, value, true)
+}
+
+pub(crate) fn write_staged_json_streaming<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_streaming_inner(path, value, false)
+}
+
+fn write_json_streaming_inner<T: Serialize>(path: &Path, value: &T, durable: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -390,10 +403,13 @@ pub(crate) fn write_json_streaming<T: Serialize>(path: &Path, value: &T) -> Resu
         writer
             .flush()
             .with_context(|| format!("Failed to write {}", temp_path.display()))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .with_context(|| format!("Failed to write {}", temp_path.display()))
+        if durable {
+            writer
+                .get_ref()
+                .sync_all()
+                .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        }
+        Ok(())
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&temp_path);

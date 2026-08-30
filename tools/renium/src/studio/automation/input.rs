@@ -1,15 +1,15 @@
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 use std::thread;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 use super::virtual_click_actions;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 use super::{client_viewport_size, input_delta, resolve_player_window};
 use super::{ensure_plugin_api_ok, send_virtual_input, wait_for_player_bridge};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
@@ -20,6 +20,10 @@ use crate::studio::input as input_inject;
 pub(super) struct InputRequest {
     player: Option<String>,
     actions: Vec<InputAction>,
+    #[serde(rename = "bridgePorts")]
+    _bridge_ports: Option<String>,
+    #[serde(rename = "bridgeWaitSeconds")]
+    _bridge_wait_seconds: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +165,7 @@ fn action_position(
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let request: InputRequest = serde_json::from_value(parameters.clone())?;
     if request.actions.is_empty() || request.actions.len() > 256 {
@@ -315,7 +319,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
     }))
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let request: InputRequest = serde_json::from_value(parameters.clone())?;
     if request.actions.is_empty() || request.actions.len() > 256 {

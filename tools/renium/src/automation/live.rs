@@ -1094,6 +1094,27 @@ impl Manager {
         captured: CapturedState,
         side: BaselineSide,
     ) -> Result<Value> {
+        self.acknowledge_then_resume_inner(context, bridge, captured, side, false)
+    }
+
+    pub(crate) fn acknowledge_then_resume_with_gate_held(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        captured: CapturedState,
+        side: BaselineSide,
+    ) -> Result<Value> {
+        self.acknowledge_then_resume_inner(context, bridge, captured, side, true)
+    }
+
+    fn acknowledge_then_resume_inner(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        captured: CapturedState,
+        side: BaselineSide,
+        request_gate_held: bool,
+    ) -> Result<Value> {
         let full = captured.full;
         let paths = captured.scopes.iter().cloned().collect::<Vec<_>>();
         if let Some(control) = self.control(context.id) {
@@ -1111,12 +1132,14 @@ impl Manager {
                         5,
                         format_args!("[renium] reconcile reason: full acknowledgment"),
                     );
-                    let setup = self.coordinator.reconcile_current(context, bridge)?;
-                    control.set_mode(setup.mode);
-                    control.set_resolution_required(setup.resolution_required);
-                    if let Some(error) = setup.error {
-                        bail!(error);
+                    if !request_gate_held {
+                        bail!("Full push acknowledgment requires the bridge request gate");
                     }
+                    let key = self
+                        .session_key(context.id)
+                        .context("Live sync has no reconciliation context")?;
+                    self.coordinator
+                        .record_full_editor_push_with_gate_held(context, &key, bridge)?;
                 } else if let Some(key) = self.session_key(context.id) {
                     self.coordinator
                         .advance_baseline(context, &key, &paths, side)?;
@@ -2404,12 +2427,21 @@ impl LiveLoop {
     fn execute_push(&self, push: &PreparedPush) -> Option<Result<Vec<PathBuf>>> {
         let generation = self.control.generation.load(Ordering::Acquire);
         let _activity = self.control.begin_sync(generation)?;
+        let gate_started = Instant::now();
         let gate = self.bridge.acquire_request_gate();
+        log_global(
+            5,
+            format_args!(
+                "[renium] live push request gate: {:.1}ms",
+                gate_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         if self.control.generation.load(Ordering::Acquire) != generation
             || self.control.file_pause_count.load(Ordering::Acquire) > 0
         {
             return None;
         }
+        let push_started = Instant::now();
         let push_changes = || {
             if push.refresh_project {
                 let validation_paths = push.captured.keys().cloned().collect::<Vec<_>>();
@@ -2437,6 +2469,13 @@ impl LiveLoop {
             result => result,
         };
         drop(gate);
+        log_global(
+            5,
+            format_args!(
+                "[renium] live push execution: {:.1}ms",
+                push_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         Some(result)
     }
 
@@ -2656,6 +2695,16 @@ impl LiveLoop {
         ) {
             Ok(state) => {
                 self.control.set_plugin_state(state);
+                if let Err(error) = self.coordinator.record_studio_checkpoint(
+                    &self.context,
+                    &self.pair_key,
+                    &self.control.plugin_snapshot(),
+                ) {
+                    log_global(
+                        5,
+                        format_args!("[renium] Studio checkpoint update failed: {error:#}"),
+                    );
+                }
                 log_global(
                     5,
                     format_args!("[renium] live pull acknowledged seq {}", pulled.seq),

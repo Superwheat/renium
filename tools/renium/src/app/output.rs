@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
@@ -125,8 +126,16 @@ pub(crate) fn global_log_enabled(level: u8) -> bool {
 
 pub(crate) fn log_global(level: u8, message: std::fmt::Arguments<'_>) {
     if global_log_enabled(level) {
-        std::eprintln!("{message}");
+        write_stderr(message);
     }
+}
+
+pub(crate) fn write_stdout(message: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout().lock(), "{message}");
+}
+
+pub(crate) fn write_stderr(message: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
 pub(crate) fn global_yes() -> bool {

@@ -17,6 +17,8 @@ rbx inp -p 1 click "Shop.BuyButton" wait 100 key E
 
 `status` reads Studio state. `ro` reopens the remembered local file or published place; a file argument overrides it. `sx` closes Studio. Local files require `--save` or `--terminate`.
 
+Never call `PluginManager:ExportPlace`; on macOS it opens a modal save panel and takes focus. Use Renium pull/export commands.
+
 Place order uses published IDs. `pa`, `pn`, and `po` invalidate old bindings automatically.
 
 `me FILE OLD NEW [OLD NEW ...]` applies exact source edits. `--all` replaces every match; `--class` sets the class of a new script.

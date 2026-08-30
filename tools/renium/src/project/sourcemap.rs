@@ -23,7 +23,7 @@ use crate::snapshot::types::{ServiceState, SnapshotInstance};
 use crate::system::files::{
     absolutize_for_daemon, path_key, read_json_file, resolve_existing_project_root,
     service_settings_path, strip_extended_prefix, unique_child_stem, write_json_file,
-    write_utf8_file,
+    write_staged_json_streaming, write_utf8_file,
 };
 use crate::system::watch::FileWatcher;
 
@@ -128,12 +128,18 @@ pub(crate) fn write_project_sourcemap_from_service_nodes(
 pub(crate) fn finalize_project_sourcemap_temp(
     project_root: &Path,
     service_nodes: &HashMap<String, SourcemapNode>,
+    durable: bool,
 ) -> Result<()> {
     let mut root = make_sourcemap_root(project_root);
     root.children = service_nodes.values().cloned().collect();
     sort_sourcemap_root_children(&mut root);
     let output_file = project_root.join("sourcemap.json");
-    write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
+    if durable {
+        write_json_file(&output_file, &root, true).context("Failed to serialize sourcemap")?;
+    } else {
+        write_staged_json_streaming(&output_file, &root)
+            .context("Failed to serialize staged sourcemap")?;
+    }
     if !quiet_timings() {
         println!("[renium] wrote {}", output_file.display());
     }

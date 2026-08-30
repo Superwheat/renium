@@ -186,11 +186,12 @@ pub(crate) fn studio_close(args: StudioCloseArgs, project: Option<&Path>) -> Res
 }
 
 pub(crate) fn multi_edit(args: MultiEditArgs, project: Option<&Path>) -> Result<()> {
-    let pairs = args.edits.chunks_exact(2);
-    if !pairs.remainder().is_empty() {
+    let (pairs, remainder) = args.edits.as_chunks::<2>();
+    if !remainder.is_empty() {
         bail!("Each OLD value needs a following NEW value");
     }
     let edits = pairs
+        .iter()
         .map(|pair| {
             json!({
                 "oldString": pair[0],

@@ -688,6 +688,11 @@ impl ExportProjectStage {
         &self.publish_paths
     }
 
+    pub(crate) fn capture_publish_baseline(&mut self, project_root: &Path) -> Result<()> {
+        self.publish_baseline = collect_publish_hashes(project_root, &self.publish_paths)?;
+        Ok(())
+    }
+
     pub(crate) fn preview_operations(&self, project_root: &Path) -> Result<Vec<Value>> {
         let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
         let current = collect_publish_hashes(project_root, &self.publish_paths)?;
@@ -835,7 +840,7 @@ impl ExportProjectStage {
     ) -> Result<PublishedProjectChanges> {
         let started = Instant::now();
         let phase = Instant::now();
-        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
+        let mut current = collect_publish_hashes(project_root, &self.publish_paths)?;
         log_global(
             5,
             format_args!(
@@ -843,6 +848,7 @@ impl ExportProjectStage {
                 elapsed_ms(phase)
             ),
         );
+        ensure_publish_entries_unchanged(&self.publish_baseline, &current, &self.publish_paths)?;
         let backup_root = self.container.join("previous");
         fs::create_dir_all(&backup_root)
             .with_context(|| format!("Failed to create {}", backup_root.display()))?;
@@ -903,6 +909,7 @@ impl ExportProjectStage {
         } else {
             Vec::new()
         };
+        refresh_publish_hashes(project_root, &mut current, &repaired)?;
         log_global(
             5,
             format_args!(
@@ -911,23 +918,17 @@ impl ExportProjectStage {
             ),
         );
         let phase = Instant::now();
-        let current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        let changed = current
-            .keys()
-            .chain(self.publish_baseline.keys())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+        let mut refreshed = settings_candidates;
+        refreshed.extend(repaired);
+        refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
+        let operation_paths = publish_operation_paths(&current, &staged);
+        let concurrency_paths = operation_paths
+            .iter()
             .filter(|path| path.as_path() != Path::new("sourcemap.json"))
-            .filter(|path| current.get(*path) != self.publish_baseline.get(*path))
-            .take(10)
-            .map(|path| path.display().to_string())
+            .cloned()
             .collect::<Vec<_>>();
-        if !changed.is_empty() {
-            bail!(
-                "Project files changed while Studio export was running; retry without overwriting: {}",
-                changed.join(", ")
-            );
-        }
+        let latest = collect_publish_hashes(project_root, &concurrency_paths)?;
+        ensure_publish_entries_unchanged(&current, &latest, &concurrency_paths)?;
         log_global(
             5,
             format_args!(
@@ -936,10 +937,6 @@ impl ExportProjectStage {
             ),
         );
         let phase = Instant::now();
-        let mut refreshed = settings_candidates;
-        refreshed.extend(repaired);
-        refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
-        let operation_paths = publish_operation_paths(&current, &staged);
         let expected = current
             .keys()
             .chain(staged.keys())
@@ -1281,6 +1278,35 @@ fn refresh_publish_hashes(
     Ok(())
 }
 
+fn ensure_publish_entries_unchanged(
+    before: &BTreeMap<PathBuf, PublishEntryState>,
+    after: &BTreeMap<PathBuf, PublishEntryState>,
+    scopes: &[PathBuf],
+) -> Result<()> {
+    let changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| {
+            scopes
+                .iter()
+                .any(|scope| *path == scope || path.starts_with(scope))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| path.as_path() != Path::new("sourcemap.json"))
+        .filter(|path| before.get(*path) != after.get(*path))
+        .take(10)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Project files changed while Studio export was running; retry without overwriting: {}",
+        changed.join(", ")
+    )
+}
+
 pub(crate) fn publish_operation_paths(
     current: &BTreeMap<PathBuf, PublishEntryState>,
     staged: &BTreeMap<PathBuf, PublishEntryState>,
@@ -1327,8 +1353,7 @@ fn copy_isolated_path(source: &Path, destination: &Path) -> Result<()> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(source, destination)
-            .with_context(|| format!("Failed to stage {}", source.display()))?;
+        copy_isolated_file(source, destination)?;
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -1349,11 +1374,39 @@ fn copy_isolated_path(source: &Path, destination: &Path) -> Result<()> {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &target)
-                .with_context(|| format!("Failed to stage {}", entry.path().display()))?;
+            copy_isolated_file(entry.path(), &target)?;
         }
     }
     Ok(())
+}
+
+fn copy_isolated_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if clone_file(source, destination) {
+        return Ok(());
+    }
+    fs::copy(source, destination)
+        .with_context(|| format!("Failed to stage {}", source.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_source) = CString::new(source.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(c_destination) = CString::new(destination.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: both C strings remain alive for the call and contain complete filesystem paths.
+    if unsafe { libc::clonefile(c_source.as_ptr(), c_destination.as_ptr(), 0) } == 0 {
+        return true;
+    }
+    let _ = fs::remove_file(destination);
+    false
 }
 
 #[cfg(unix)]
@@ -1921,8 +1974,8 @@ fn prepare_export_execution(
         modified_default_bypass,
     );
     let adaptive_tune_cache = load_adaptive_tune_cache(project_root, &cache_key);
-    let sourcemap_writer =
-        direct_import_mode.then(|| SourcemapWriter::start(import_project_root.clone()));
+    let sourcemap_writer = direct_import_mode
+        .then(|| SourcemapWriter::start(import_project_root.clone(), project_stage.is_none()));
     let direct_import_dispatcher = start_direct_import(
         direct_import_mode,
         args,

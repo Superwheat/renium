@@ -15,12 +15,12 @@ use crate::app::timing::current_millis;
 use crate::studio::native::snapshot::{
     NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
-use crate::system::files::fnv1a;
+use crate::system::files::{atomic_write_file, sha256_hex};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
-const REQUEST_VERSION: u32 = 2;
+const REQUEST_VERSION: u32 = 3;
 const RESPONSE_SIZE: usize = 536;
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
@@ -515,7 +515,12 @@ fn process_executable_path(pid: u32) -> Result<PathBuf> {
     ))
 }
 
-fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64, f64)> {
+fn invoke_helper(
+    pid: u32,
+    trace: SerializerTrace,
+    output: &Path,
+    studio_title: &str,
+) -> Result<(u64, f64)> {
     let path = output
         .to_str()
         .context("Native snapshot path is not valid UTF-8")?;
@@ -525,23 +530,29 @@ fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64
     let path_bytes = path.as_bytes();
     let path_length =
         u32::try_from(path_bytes.len()).context("Native snapshot path is too long")?;
+    let title_bytes = studio_title.as_bytes();
+    let title_length =
+        u32::try_from(title_bytes.len()).context("Roblox Studio title is too long")?;
     let socket_path = PathBuf::from(format!("/tmp/renium-studio-{pid}.sock"));
     let mut socket = UnixStream::connect(&socket_path).with_context(|| {
         format!(
-            "Studio process {pid} is not using the Renium-managed macOS app; open Renium Studio"
+            "Studio process {pid} was not launched with Renium's native helper; restart Roblox Studio"
         )
     })?;
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut request = Vec::with_capacity(48 + path_bytes.len());
+    let mut request = Vec::with_capacity(56 + path_bytes.len() + title_bytes.len());
     request.extend_from_slice(&REQUEST_MAGIC.to_le_bytes());
     request.extend_from_slice(&REQUEST_VERSION.to_le_bytes());
     request.extend_from_slice(&1u32.to_le_bytes());
     request.extend_from_slice(&path_length.to_le_bytes());
+    request.extend_from_slice(&title_length.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes());
     request.extend_from_slice(&trace.factory_rva.to_le_bytes());
     request.extend_from_slice(&trace.execute_rva.to_le_bytes());
     request.extend_from_slice(&trace.image_uuid);
     request.extend_from_slice(path_bytes);
+    request.extend_from_slice(title_bytes);
     socket
         .write_all(&request)
         .context("Could not send the native snapshot request to Studio")?;
@@ -567,7 +578,12 @@ fn invoke_helper(pid: u32, trace: SerializerTrace, output: &Path) -> Result<(u64
     Ok((output_size, elapsed_ms))
 }
 
-fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result<NativeSnapshot> {
+fn write_live_snapshot(
+    pid: u32,
+    studio_title: &str,
+    output: &Path,
+    service: Option<&str>,
+) -> Result<NativeSnapshot> {
     if output.exists() {
         bail!(
             "Refusing to overwrite existing native snapshot {}",
@@ -582,7 +598,7 @@ fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result
     let temporary = temporary_output_path(output, pid)?;
     let result = (|| -> Result<NativeSnapshot> {
         let invoke_started = Instant::now();
-        let (reported_size, serialize_ms) = invoke_helper(pid, trace, &temporary)?;
+        let (reported_size, serialize_ms) = invoke_helper(pid, trace, &temporary, studio_title)?;
         let invoke_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
         let expected_roots = NativeSnapshotRoots {
             exact_service: None,
@@ -611,36 +627,17 @@ fn write_live_snapshot(pid: u32, output: &Path, service: Option<&str>) -> Result
     result
 }
 
-pub fn write_live_place(pid: u32, _studio_title: &str, output: &Path) -> Result<NativeSnapshot> {
-    write_live_snapshot(pid, output, None)
+pub fn write_live_place(pid: u32, studio_title: &str, output: &Path) -> Result<NativeSnapshot> {
+    write_live_snapshot(pid, studio_title, output, None)
 }
 
 pub fn write_live_service(
     pid: u32,
-    _studio_title: &str,
+    studio_title: &str,
     service: &str,
     output: &Path,
 ) -> Result<NativeSnapshot> {
-    write_live_snapshot(pid, output, Some(service))
-}
-
-fn hash_file(path: &Path) -> Result<u64> {
-    let mut file = BufReader::new(
-        File::open(path).with_context(|| format!("Could not open {}", path.display()))?,
-    );
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .with_context(|| format!("Could not read {}", path.display()))?;
-        if count == 0 {
-            return Ok(hash);
-        }
-        for byte in &buffer[..count] {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
-        }
-    }
+    write_live_snapshot(pid, studio_title, output, Some(service))
 }
 
 fn command_output(command: &mut Command, label: &str) -> Result<Output> {
@@ -658,21 +655,64 @@ fn run_command(command: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn source_studio_path() -> Result<PathBuf> {
+fn studio_bundle_version(studio: &Path) -> Result<u64> {
+    let info = studio.join("Contents/Info.plist");
+    let output = command_output(
+        Command::new("plutil")
+            .args(["-extract", "CFBundleVersion", "raw", "-o", "-"])
+            .arg(&info),
+        "Roblox Studio version check",
+    )?;
+    if !output.status.success() {
+        bail!(
+            "Could not read the Roblox Studio version from {}: {}",
+            info.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("Invalid Roblox Studio version in {}", info.display()))
+}
+
+fn installed_studio_paths() -> Result<[PathBuf; 2]> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    [
+    Ok([
         PathBuf::from("/Applications/RobloxStudio.app"),
         PathBuf::from(&home)
             .join("Applications")
             .join("RobloxStudio.app"),
-    ]
-    .into_iter()
-    .find(|path| path.join("Contents/MacOS/RobloxStudio").is_file())
-    .context("RobloxStudio.app was not found in /Applications or ~/Applications")
+    ])
+}
+
+fn studio_engine_executable(studio: &Path) -> PathBuf {
+    let patched = studio.join("Contents/MacOS/RobloxStudio.bin");
+    if patched.is_file() {
+        patched
+    } else {
+        studio.join("Contents/MacOS/RobloxStudio")
+    }
+}
+
+fn source_studio_path() -> Result<PathBuf> {
+    let candidates = installed_studio_paths()?
+        .into_iter()
+        .filter(|path| {
+            let macos = path.join("Contents/MacOS");
+            macos.join("RobloxStudio").is_file() || macos.join("RobloxStudio.bin").is_file()
+        })
+        .map(|path| studio_bundle_version(&path).map(|version| (version, path)))
+        .collect::<Result<Vec<_>>>()?;
+    candidates
+        .into_iter()
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+        .context("RobloxStudio.app was not found in /Applications or ~/Applications")
 }
 
 pub fn source_studio_platform_key() -> Result<String> {
-    let executable = source_studio_path()?.join("Contents/MacOS/RobloxStudio");
+    let executable = studio_engine_executable(&source_studio_path()?);
     let output = Command::new("lipo")
         .arg("-archs")
         .arg(&executable)
@@ -706,25 +746,358 @@ pub fn source_studio_platform_key() -> Result<String> {
     Ok(format!("macos-{architecture}"))
 }
 
-pub fn managed_studio_path() -> Result<PathBuf> {
+fn legacy_managed_studio_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join("Applications")
-        .join("Renium Studio.app"))
+    Ok(PathBuf::from(home).join("Applications/Renium Studio.app"))
 }
 
-fn source_signature(source: &Path) -> Result<String> {
-    let executable = source.join("Contents/MacOS/RobloxStudio");
-    let info = source.join("Contents/Info.plist");
-    let resources = source.join("Contents/_CodeSignature/CodeResources");
-    Ok(format!(
-        "{:016x}:{:016x}:{:016x}:{:016x}:{:016x}",
-        hash_file(&executable)?,
-        hash_file(&info)?,
-        hash_file(&resources)?,
-        fnv1a(HELPER_BYTES),
-        fnv1a(LAUNCHER_BYTES)
-    ))
+pub fn patched_studio_path() -> Result<PathBuf> {
+    source_studio_path()
+}
+
+const PATCH_FORMAT: u32 = 2;
+const PATCH_MARKER_NAME: &str = "ReniumStudioPatch.version";
+const PATCH_HELPER_NAME: &str = "ReniumStudioHelper.dylib";
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioPatchState {
+    format: u32,
+    studio: PathBuf,
+    bundle_version: u64,
+    original_sha256: String,
+    #[serde(default)]
+    patched_launcher_sha256: String,
+}
+
+fn studio_patch_root() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support/Renium")
+        .join("studio-patch"))
+}
+
+fn studio_patch_baseline() -> Result<PathBuf> {
+    Ok(studio_patch_root()?.join("baseline"))
+}
+
+fn studio_patch_journal() -> Result<PathBuf> {
+    Ok(studio_patch_root()?.join("journal.json"))
+}
+
+fn studio_patch_state_path() -> Result<PathBuf> {
+    Ok(studio_patch_baseline()?.join("state.json"))
+}
+
+fn studio_native_root() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support/Renium")
+        .join("native"))
+}
+
+fn studio_external_helper() -> Result<PathBuf> {
+    Ok(studio_native_root()?.join(PATCH_HELPER_NAME))
+}
+
+fn studio_external_helper_state() -> Result<PathBuf> {
+    Ok(studio_native_root()?.join("helper.version"))
+}
+
+fn studio_original_backup() -> Result<PathBuf> {
+    Ok(studio_patch_baseline()?.join("RobloxStudio"))
+}
+
+fn studio_signature_backup() -> Result<PathBuf> {
+    Ok(studio_patch_baseline()?.join("_CodeSignature"))
+}
+
+fn studio_launcher(studio: &Path) -> PathBuf {
+    studio.join("Contents/MacOS/RobloxStudio")
+}
+
+fn studio_patched_engine(studio: &Path) -> PathBuf {
+    studio.join("Contents/MacOS/RobloxStudio.bin")
+}
+
+fn studio_legacy_patch_helper(studio: &Path) -> PathBuf {
+    studio.join("Contents/Frameworks").join(PATCH_HELPER_NAME)
+}
+
+fn studio_patch_marker(studio: &Path) -> PathBuf {
+    studio.join("Contents/Resources").join(PATCH_MARKER_NAME)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let file = File::open(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let length = reader
+            .read(&mut buffer)
+            .with_context(|| format!("Could not read {}", path.display()))?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn expected_patch_signature(state: &StudioPatchState) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        state.format,
+        state.bundle_version,
+        state.original_sha256,
+        sha256_hex(LAUNCHER_BYTES)
+    )
+}
+
+fn external_helper_is_current() -> bool {
+    let Ok(path) = studio_external_helper() else {
+        return false;
+    };
+    let Ok(state_path) = studio_external_helper_state() else {
+        return false;
+    };
+    let Ok(state) = fs::read_to_string(state_path) else {
+        return false;
+    };
+    let Some((source_hash, installed_hash)) = state.trim().split_once(':') else {
+        return false;
+    };
+    source_hash == sha256_hex(HELPER_BYTES)
+        && sha256_file(&path).ok().as_deref() == Some(installed_hash)
+}
+
+fn install_external_helper() -> Result<()> {
+    if external_helper_is_current() {
+        return Ok(());
+    }
+    let root = studio_native_root()?;
+    fs::create_dir_all(&root).with_context(|| format!("Could not create {}", root.display()))?;
+    let helper = studio_external_helper()?;
+    let next = root.join(format!(
+        ".{PATCH_HELPER_NAME}.next-{}-{}",
+        std::process::id(),
+        current_millis()
+    ));
+    let result = (|| -> Result<()> {
+        atomic_write_file(&next, HELPER_BYTES)?;
+        fs::set_permissions(&next, fs::Permissions::from_mode(0o755))?;
+        run_command(
+            Command::new("codesign")
+                .args(["--force", "--sign", "-", "--timestamp=none"])
+                .arg(&next),
+            "Renium Studio helper signing",
+        )?;
+        run_command(
+            Command::new("codesign")
+                .args(["--verify", "--strict"])
+                .arg(&next),
+            "Renium Studio helper signature verification",
+        )?;
+        fs::rename(&next, &helper)
+            .with_context(|| format!("Could not install {}", helper.display()))?;
+        let state = format!("{}:{}\n", sha256_hex(HELPER_BYTES), sha256_file(&helper)?);
+        atomic_write_file(&studio_external_helper_state()?, state.as_bytes())
+    })();
+    if result.is_err() {
+        let _ = remove_file_if_present(&next);
+    }
+    result
+}
+
+fn read_patch_state() -> Result<Option<StudioPatchState>> {
+    let path = studio_patch_state_path()?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("Could not read {}", path.display()))?;
+    let state = serde_json::from_slice(&bytes)
+        .with_context(|| format!("Invalid Renium Studio patch state at {}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn write_patch_state(path: &Path, state: &StudioPatchState) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(state)?;
+    bytes.push(b'\n');
+    atomic_write_file(path, &bytes)
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Could not remove {}", path.display())),
+    }
+}
+
+fn remove_directory_if_present(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Could not remove {}", path.display())),
+    }
+}
+
+fn copy_directory(source: &Path, destination: &Path, label: &str) -> Result<()> {
+    run_command(Command::new("ditto").arg(source).arg(destination), label)
+}
+
+fn studio_bundle_identifier(studio: &Path) -> Result<String> {
+    let info = studio.join("Contents/Info.plist");
+    let output = command_output(
+        Command::new("plutil")
+            .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+            .arg(&info),
+        "Roblox Studio identifier check",
+    )?;
+    if !output.status.success() {
+        bail!(
+            "Could not read the Roblox Studio identifier from {}: {}",
+            info.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn verify_unmodified_studio(studio: &Path) -> Result<()> {
+    if studio_bundle_identifier(studio)? != "com.Roblox.RobloxStudio" {
+        bail!(
+            "{} is not an official Roblox Studio bundle",
+            studio.display()
+        );
+    }
+    run_command(
+        Command::new("codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(studio),
+        "Roblox Studio signature verification",
+    )
+}
+
+fn patch_artifacts_present(studio: &Path) -> bool {
+    studio_patched_engine(studio).exists()
+        || studio_legacy_patch_helper(studio).exists()
+        || studio_patch_marker(studio).exists()
+        || fs::read(studio_launcher(studio))
+            .ok()
+            .as_deref()
+            .is_some_and(|bytes| bytes == LAUNCHER_BYTES)
+}
+
+fn patch_is_current(studio: &Path, state: &StudioPatchState) -> bool {
+    state.format == PATCH_FORMAT
+        && state.studio == studio
+        && studio_bundle_version(studio).ok() == Some(state.bundle_version)
+        && fs::read(studio_patch_marker(studio))
+            .ok()
+            .is_some_and(|bytes| bytes == expected_patch_signature(state).as_bytes())
+        && !state.patched_launcher_sha256.is_empty()
+        && sha256_file(&studio_launcher(studio)).ok().as_deref()
+            == Some(state.patched_launcher_sha256.as_str())
+        && studio_patched_engine(studio).is_file()
+        && studio_original_backup()
+            .ok()
+            .and_then(|path| sha256_file(&path).ok())
+            .as_deref()
+            == Some(state.original_sha256.as_str())
+}
+
+fn ensure_studio_closed(studio: &Path) -> Result<()> {
+    let output = command_output(
+        Command::new("ps").args(["-axo", "command="]),
+        "Roblox Studio process check",
+    )?;
+    if !output.status.success() {
+        bail!("Could not inspect running Roblox Studio processes");
+    }
+    let executables = [
+        studio_launcher(studio),
+        studio_patched_engine(studio),
+        studio.join("Contents/MacOS/ReniumStudio"),
+        studio.join("Contents/MacOS/RobloxStudio.app/Contents/MacOS/RobloxStudio"),
+        studio
+            .join("Contents/MacOS/RobloxStudioInstaller.app/Contents/MacOS/RobloxStudioInstaller"),
+    ];
+    if String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let line = line.trim_start();
+        executables
+            .iter()
+            .any(|executable| line.starts_with(executable.to_string_lossy().as_ref()))
+    }) {
+        bail!("Close Roblox Studio before Renium updates its native helper");
+    }
+    Ok(())
+}
+
+fn capture_studio_baseline(studio: &Path) -> Result<StudioPatchState> {
+    verify_unmodified_studio(studio)?;
+    if patch_artifacts_present(studio) {
+        bail!(
+            "{} contains an unrecognized partial Renium patch",
+            studio.display()
+        );
+    }
+    let root = studio_patch_root()?;
+    fs::create_dir_all(&root).with_context(|| format!("Could not create {}", root.display()))?;
+    let next = root.join(format!(
+        "baseline.next-{}-{}",
+        std::process::id(),
+        current_millis()
+    ));
+    fs::create_dir(&next).with_context(|| format!("Could not create {}", next.display()))?;
+    let state = StudioPatchState {
+        format: PATCH_FORMAT,
+        studio: studio.to_path_buf(),
+        bundle_version: studio_bundle_version(studio)?,
+        original_sha256: sha256_file(&studio_launcher(studio))?,
+        patched_launcher_sha256: String::new(),
+    };
+    let result = (|| -> Result<()> {
+        fs::copy(studio_launcher(studio), next.join("RobloxStudio"))
+            .with_context(|| "Could not back up the Roblox Studio executable")?;
+        copy_directory(
+            &studio.join("Contents/_CodeSignature"),
+            &next.join("_CodeSignature"),
+            "Roblox Studio signature backup",
+        )?;
+        write_patch_state(&next.join("state.json"), &state)?;
+        if sha256_file(&next.join("RobloxStudio"))? != state.original_sha256 {
+            bail!("Roblox Studio executable backup verification failed");
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&next);
+        return Err(error);
+    }
+    let baseline = studio_patch_baseline()?;
+    let previous = root.join("baseline.previous");
+    remove_directory_if_present(&previous)?;
+    if baseline.exists() {
+        fs::rename(&baseline, &previous).with_context(|| {
+            format!(
+                "Could not move {} to {}",
+                baseline.display(),
+                previous.display()
+            )
+        })?;
+    }
+    if let Err(error) = fs::rename(&next, &baseline) {
+        if previous.exists() {
+            let _ = fs::rename(&previous, &baseline);
+        }
+        return Err(error).with_context(|| format!("Could not publish {}", baseline.display()));
+    }
+    remove_directory_if_present(&previous)?;
+    Ok(state)
 }
 
 fn extracted_entitlements(executable: &Path) -> Result<String> {
@@ -740,7 +1113,7 @@ fn extracted_entitlements(executable: &Path) -> Result<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = [stdout.as_ref(), stderr.as_ref()]
+    [stdout.as_ref(), stderr.as_ref()]
         .into_iter()
         .find_map(|text| {
             let start = text.find("<?xml").or_else(|| text.find("<plist"))?;
@@ -748,10 +1121,7 @@ fn extracted_entitlements(executable: &Path) -> Result<String> {
             let end = start + relative_end + "</plist>".len();
             Some(text[start..end].to_string())
         })
-        .unwrap_or_else(|| {
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict></dict></plist>\n".to_string()
-        });
-    Ok(text)
+        .context("codesign did not return a readable entitlement property list")
 }
 
 fn add_entitlement(mut plist: String, key: &str) -> Result<String> {
@@ -771,233 +1141,109 @@ fn add_entitlement(mut plist: String, key: &str) -> Result<String> {
     Ok(plist)
 }
 
-fn recover_managed_studio_transactions(parent: &Path, target: &Path) -> Result<()> {
-    let mut transactions = Vec::new();
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".Renium Studio.transaction-"))
-        {
-            transactions.push(entry.path());
-        }
-    }
-    transactions.sort();
-    if target.exists() {
-        for transaction in transactions {
-            if let Err(error) = fs::remove_dir_all(&transaction) {
-                eprintln!(
-                    "[renium] warning: could not remove completed managed Studio transaction {}: {error}",
-                    transaction.display()
-                );
-            }
-        }
-        return Ok(());
-    }
-    let recoveries = transactions
-        .iter()
-        .map(|transaction| transaction.join("previous.app"))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    if recoveries.len() > 1 {
+fn restore_unmodified_studio(state: &StudioPatchState) -> Result<()> {
+    let studio = &state.studio;
+    if !studio.is_dir() {
         bail!(
-            "Multiple managed Studio recovery copies exist under {}",
-            parent.display()
+            "Roblox Studio is no longer installed at {}",
+            studio.display()
         );
     }
-    if let Some(previous) = recoveries.first() {
-        fs::rename(previous, target).with_context(|| {
-            format!(
-                "Could not restore managed Studio from {} to {}",
-                previous.display(),
-                target.display()
-            )
-        })?;
+    if studio_bundle_version(studio)? != state.bundle_version {
+        bail!("Refusing to restore an older Roblox Studio executable over a newer installation");
     }
-    for transaction in transactions {
-        if let Err(error) = fs::remove_dir_all(&transaction) {
-            eprintln!(
-                "[renium] warning: could not remove managed Studio transaction {}: {error}",
-                transaction.display()
-            );
-        }
+    let original = studio_original_backup()?;
+    if sha256_file(&original)? != state.original_sha256 {
+        bail!("The Roblox Studio rollback executable no longer matches its recorded hash");
     }
-    Ok(())
-}
-
-pub fn recover_managed_studio_install() -> Result<()> {
-    let target = managed_studio_path()?;
-    let parent = target
-        .parent()
-        .context("Managed Studio path has no parent")?;
-    if parent.is_dir() {
-        recover_managed_studio_transactions(parent, &target)?;
-    }
-    Ok(())
-}
-
-fn create_managed_studio_transaction(parent: &Path) -> Result<PathBuf> {
-    for attempt in 0..1_000_u32 {
-        let transaction = parent.join(format!(
-            ".Renium Studio.transaction-{}-{}-{attempt}",
-            std::process::id(),
-            current_millis()
-        ));
-        match fs::create_dir(&transaction) {
-            Ok(()) => return Ok(transaction),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Could not create {}", transaction.display()));
-            }
-        }
-    }
-    bail!("Could not allocate a managed Studio transaction")
-}
-
-fn ensure_managed_studio_closed(target: &Path) -> Result<()> {
-    let executable = target.join("Contents/MacOS/RobloxStudio.bin");
-    if !executable.is_file() {
-        return Ok(());
-    }
-    let output = command_output(
-        Command::new("lsof").arg("-t").arg(&executable),
-        "Renium Studio process check",
+    ensure_studio_closed(studio)?;
+    let launcher = studio_launcher(studio);
+    let temporary = launcher.with_extension("renium-restore");
+    remove_file_if_present(&temporary)?;
+    fs::copy(&original, &temporary)
+        .with_context(|| format!("Could not restore {}", launcher.display()))?;
+    fs::set_permissions(&temporary, fs::metadata(&original)?.permissions())?;
+    remove_file_if_present(&launcher)?;
+    fs::rename(&temporary, &launcher)
+        .with_context(|| format!("Could not restore {}", launcher.display()))?;
+    remove_file_if_present(&studio_patched_engine(studio))?;
+    remove_file_if_present(&studio_legacy_patch_helper(studio))?;
+    remove_file_if_present(&studio_patch_marker(studio))?;
+    let signature = studio.join("Contents/_CodeSignature");
+    remove_directory_if_present(&signature)?;
+    copy_directory(
+        &studio_signature_backup()?,
+        &signature,
+        "Roblox Studio signature restore",
     )?;
-    if output.status.success() && !output.stdout.is_empty() {
-        bail!("Close Renium Studio before rebuilding or removing it");
+    verify_unmodified_studio(studio)
+}
+
+fn remove_stale_patch_from_updated_studio(state: &StudioPatchState) -> Result<bool> {
+    let studio = &state.studio;
+    if !studio.is_dir()
+        || studio_bundle_version(studio).ok() == Some(state.bundle_version)
+        || fs::read(studio_launcher(studio)).ok().as_deref() == Some(LAUNCHER_BYTES)
+    {
+        return Ok(false);
     }
-    if output.status.success() || output.status.code() == Some(1) {
+    ensure_studio_closed(studio)?;
+    remove_file_if_present(&studio_patched_engine(studio))?;
+    remove_file_if_present(&studio_legacy_patch_helper(studio))?;
+    remove_file_if_present(&studio_patch_marker(studio))?;
+    verify_unmodified_studio(studio)?;
+    remove_directory_if_present(&studio_patch_baseline()?)?;
+    remove_file_if_present(&studio_patch_journal()?)?;
+    Ok(true)
+}
+
+pub fn recover_studio_patch_install() -> Result<()> {
+    let journal = studio_patch_journal()?;
+    if !journal.is_file() {
         return Ok(());
     }
-    bail!("lsof could not inspect whether Renium Studio is running")
-}
-
-pub struct ManagedStudioRemoval {
-    target: PathBuf,
-    transaction: PathBuf,
-    previous: PathBuf,
-}
-
-impl ManagedStudioRemoval {
-    pub fn rollback(self) -> Result<()> {
-        if self.previous.exists() {
-            fs::rename(&self.previous, &self.target).with_context(|| {
-                format!(
-                    "Could not restore managed Studio from {} to {}",
-                    self.previous.display(),
-                    self.target.display()
-                )
-            })?;
-        }
-        fs::remove_dir_all(&self.transaction)
-            .with_context(|| format!("Could not remove {}", self.transaction.display()))
+    let Some(state) = read_patch_state()? else {
+        bail!("Renium Studio patch recovery is missing its rollback baseline");
+    };
+    if remove_stale_patch_from_updated_studio(&state)? {
+        return Ok(());
     }
-
-    pub fn commit(self) -> Result<()> {
-        if self.previous.exists() {
-            fs::remove_dir_all(&self.previous)
-                .with_context(|| format!("Could not remove {}", self.previous.display()))?;
-        }
-        fs::remove_dir_all(&self.transaction)
-            .with_context(|| format!("Could not remove {}", self.transaction.display()))
+    if patch_is_current(&state.studio, &state) {
+        remove_file_if_present(&journal)?;
+        return Ok(());
     }
+    restore_unmodified_studio(&state)?;
+    remove_file_if_present(&journal)
 }
 
-pub fn begin_managed_studio_removal() -> Result<ManagedStudioRemoval> {
-    let target = managed_studio_path()?;
-    ensure_managed_studio_closed(&target)?;
-    let parent = target
-        .parent()
-        .context("Managed Studio path has no parent")?;
-    fs::create_dir_all(parent)?;
-    recover_managed_studio_transactions(parent, &target)?;
-    let transaction = create_managed_studio_transaction(parent)?;
-    let previous = transaction.join("previous.app");
-    if target.exists() {
-        fs::rename(&target, &previous).with_context(|| {
-            format!(
-                "Could not stage managed Studio removal from {}",
-                target.display()
-            )
-        })?;
-    }
-    fs::write(transaction.join("phase"), b"removal-staged\n")
-        .with_context(|| format!("Could not journal {}", transaction.display()))?;
-    Ok(ManagedStudioRemoval {
-        target,
-        transaction,
-        previous,
-    })
-}
-
-fn install_managed_studio(source: &Path, target: &Path, signature: &str) -> Result<()> {
-    ensure_managed_studio_closed(target)?;
-    let parent = target
-        .parent()
-        .context("Managed Studio path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
-    recover_managed_studio_transactions(parent, target)?;
-    let transaction = create_managed_studio_transaction(parent)?;
-    let staging = transaction.join("next.app");
-    let previous = transaction.join("previous.app");
-    let entitlements = transaction.join("entitlements.plist");
+fn install_studio_patch(studio: &Path, state: &StudioPatchState) -> Result<()> {
+    ensure_studio_closed(studio)?;
+    let root = studio_patch_root()?;
+    fs::create_dir_all(&root).with_context(|| format!("Could not create {}", root.display()))?;
+    write_patch_state(&studio_patch_journal()?, state)?;
+    let entitlements = root.join("entitlements.plist");
     let result = (|| -> Result<()> {
-        run_command(
-            Command::new("ditto").arg(source).arg(&staging),
-            "Roblox Studio copy",
-        )?;
-        let _ = Command::new("xattr")
-            .args(["-r", "-d", "com.apple.quarantine"])
-            .arg(&staging)
-            .status();
-        let macos = staging.join("Contents/MacOS");
-        let frameworks = staging.join("Contents/Frameworks");
-        let resources = staging.join("Contents/Resources");
-        let original = macos.join("RobloxStudio");
-        let studio = macos.join("RobloxStudio.bin");
-        let launcher = macos.join("ReniumStudio");
-        let helper = frameworks.join("ReniumStudioHelper.dylib");
-        fs::rename(&original, &studio).with_context(|| {
-            format!(
-                "Could not rename {} to {}",
-                original.display(),
-                studio.display()
-            )
-        })?;
-        fs::write(&launcher, LAUNCHER_BYTES)
-            .with_context(|| format!("Could not write {}", launcher.display()))?;
-        fs::write(&helper, HELPER_BYTES)
-            .with_context(|| format!("Could not write {}", helper.display()))?;
-        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
-        let entitlements_text = add_entitlement(
+        let entitlement_text = add_entitlement(
             add_entitlement(
-                extracted_entitlements(&studio)?,
+                extracted_entitlements(&studio_original_backup()?)?,
                 "com.apple.security.cs.allow-dyld-environment-variables",
             )?,
             "com.apple.security.cs.disable-library-validation",
         )?;
-        fs::write(&entitlements, entitlements_text)
-            .with_context(|| format!("Could not write {}", entitlements.display()))?;
-        run_command(
-            Command::new("plutil")
-                .args(["-replace", "CFBundleExecutable", "-string", "ReniumStudio"])
-                .arg(staging.join("Contents/Info.plist")),
-            "Renium Studio bundle update",
+        atomic_write_file(&entitlements, entitlement_text.as_bytes())?;
+        fs::rename(studio_launcher(studio), studio_patched_engine(studio))
+            .with_context(|| format!("Could not prepare {} for Renium", studio.display()))?;
+        atomic_write_file(&studio_launcher(studio), LAUNCHER_BYTES)?;
+        remove_file_if_present(&studio_legacy_patch_helper(studio))?;
+        fs::set_permissions(studio_launcher(studio), fs::Permissions::from_mode(0o755))?;
+        atomic_write_file(
+            &studio_patch_marker(studio),
+            expected_patch_signature(state).as_bytes(),
         )?;
         run_command(
             Command::new("codesign")
                 .args(["--force", "--sign", "-"])
-                .arg(&helper),
-            "Renium Studio helper signing",
-        )?;
-        run_command(
-            Command::new("codesign")
-                .args(["--force", "--sign", "-"])
-                .arg(&launcher),
+                .arg(studio_launcher(studio)),
             "Renium Studio launcher signing",
         )?;
         run_command(
@@ -1011,11 +1257,9 @@ fn install_managed_studio(source: &Path, target: &Path, signature: &str) -> Resu
                     "--entitlements",
                 ])
                 .arg(&entitlements)
-                .arg(&studio),
-            "Renium Studio executable signing",
+                .arg(studio_patched_engine(studio)),
+            "Roblox Studio executable signing",
         )?;
-        fs::write(resources.join("ReniumStudio.version"), signature)
-            .context("Could not write the Renium Studio version marker")?;
         run_command(
             Command::new("codesign")
                 .args([
@@ -1027,106 +1271,145 @@ fn install_managed_studio(source: &Path, target: &Path, signature: &str) -> Resu
                     "--entitlements",
                 ])
                 .arg(&entitlements)
-                .arg(&staging),
-            "Renium Studio app signing",
+                .arg(studio),
+            "Roblox Studio app signing",
         )?;
-        fs::remove_file(&entitlements)
-            .with_context(|| format!("Could not remove {}", entitlements.display()))?;
         run_command(
             Command::new("codesign")
                 .args(["--verify", "--deep", "--strict"])
-                .arg(&staging),
-            "Renium Studio signature verification",
+                .arg(studio),
+            "Patched Roblox Studio signature verification",
         )?;
-        if target.exists() {
-            fs::rename(target, &previous).with_context(|| {
-                format!(
-                    "Could not move {} to {}",
-                    target.display(),
-                    previous.display()
-                )
-            })?;
-        }
-        if let Err(error) = fs::rename(&staging, target) {
-            let rollback = if previous.exists() {
-                fs::rename(&previous, target).with_context(|| {
-                    format!(
-                        "Could not restore {} from {}",
-                        target.display(),
-                        previous.display()
-                    )
-                })
-            } else {
-                Ok(())
-            };
-            return Err(error)
-                .with_context(|| {
-                    format!(
-                        "Could not move {} to {}",
-                        staging.display(),
-                        target.display()
-                    )
-                })
-                .context(match rollback {
-                    Ok(()) => "The previous managed Studio app was restored".to_string(),
-                    Err(error) => format!("Managed Studio rollback failed: {error:#}"),
-                });
-        }
-        if previous.exists() {
-            if let Err(error) = fs::remove_dir_all(&previous) {
-                eprintln!(
-                    "[renium] warning: could not remove managed Studio backup {}: {error}",
-                    previous.display()
-                );
-            }
-        }
+        let mut installed_state = state.clone();
+        installed_state.patched_launcher_sha256 = sha256_file(&studio_launcher(studio))?;
+        write_patch_state(&studio_patch_state_path()?, &installed_state)?;
         Ok(())
     })();
-    if result.is_err() && staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
+    let _ = remove_file_if_present(&entitlements);
+    if let Err(error) = result {
+        return match restore_unmodified_studio(state) {
+            Ok(()) => Err(error).context("The original Roblox Studio app was restored"),
+            Err(rollback) => {
+                Err(error).context(format!("Roblox Studio patch rollback failed: {rollback:#}"))
+            }
+        };
     }
-    if entitlements.exists() {
-        let _ = fs::remove_file(&entitlements);
-    }
-    if !previous.exists() {
-        if let Err(error) = fs::remove_dir_all(&transaction) {
-            eprintln!(
-                "[renium] warning: could not remove managed Studio transaction {}: {error}",
-                transaction.display()
-            );
-        }
-    }
-    result
+    remove_file_if_present(&studio_patch_journal()?)
 }
 
-pub fn setup_managed_studio(dry_run: bool) -> Result<PathBuf> {
+fn remove_legacy_managed_studio() -> Result<()> {
+    let legacy = legacy_managed_studio_path()?;
+    if legacy.join("Contents/MacOS/ReniumStudio").is_file()
+        && legacy
+            .join("Contents/Resources/ReniumStudio.version")
+            .is_file()
+    {
+        ensure_studio_closed(&legacy)?;
+        remove_directory_if_present(&legacy)?;
+    }
+    let parent = legacy
+        .parent()
+        .context("Legacy Renium Studio path has no parent")?;
+    if parent.is_dir() {
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".Renium Studio.transaction-"))
+            {
+                remove_directory_if_present(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_studio_patch_state() -> Result<()> {
+    let patch_root = studio_patch_root()?;
+    remove_directory_if_present(&patch_root)?;
+    if let Some(renium_root) = patch_root.parent() {
+        let _ = fs::remove_dir(renium_root);
+    }
+    Ok(())
+}
+
+fn remove_external_helper() -> Result<()> {
+    let native_root = studio_native_root()?;
+    remove_directory_if_present(&native_root)?;
+    if let Some(renium_root) = native_root.parent() {
+        let _ = fs::remove_dir(renium_root);
+    }
+    Ok(())
+}
+
+pub struct StudioPatchRemoval {
+    active: bool,
+}
+
+impl StudioPatchRemoval {
+    pub fn rollback(self) -> Result<()> {
+        if self.active {
+            setup_studio_patch(false)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<()> {
+        if self.active {
+            clear_studio_patch_state()?;
+        }
+        remove_external_helper()?;
+        remove_legacy_managed_studio()
+    }
+}
+
+pub fn begin_studio_patch_removal() -> Result<StudioPatchRemoval> {
+    recover_studio_patch_install()?;
+    let state = read_patch_state()?;
+    if let Some(state) = state.as_ref() {
+        if remove_stale_patch_from_updated_studio(state)? {
+            return Ok(StudioPatchRemoval { active: false });
+        }
+        if patch_artifacts_present(&state.studio) {
+            write_patch_state(&studio_patch_journal()?, state)?;
+            restore_unmodified_studio(state)?;
+            remove_file_if_present(&studio_patch_journal()?)?;
+        }
+    }
+    Ok(StudioPatchRemoval {
+        active: state.is_some(),
+    })
+}
+
+pub fn setup_studio_patch(dry_run: bool) -> Result<PathBuf> {
     if HELPER_BYTES.is_empty() || LAUNCHER_BYTES.is_empty() {
         bail!("This Renium build does not contain macOS Studio helper artifacts");
     }
-    let source = source_studio_path()?;
-    let target = managed_studio_path()?;
-    let signature = source_signature(&source)?;
-    let marker = target.join("Contents/Resources/ReniumStudio.version");
-    let launcher = target.join("Contents/MacOS/ReniumStudio");
-    let helper = target.join("Contents/Frameworks/ReniumStudioHelper.dylib");
-    let signature_valid = command_output(
-        Command::new("codesign")
-            .args(["--verify", "--deep", "--strict"])
-            .arg(&target),
-        "Renium Studio signature verification",
-    )
-    .is_ok_and(|output| output.status.success());
-    if fs::read_to_string(&marker)
-        .ok()
-        .is_some_and(|value| value == signature)
-        && fs::read(&launcher).ok().as_deref() == Some(LAUNCHER_BYTES)
-        && fs::read(&helper).ok().as_deref() == Some(HELPER_BYTES)
-        && signature_valid
-    {
-        return Ok(target);
+    let studio = source_studio_path()?;
+    if dry_run {
+        return Ok(studio);
     }
-    if !dry_run {
-        install_managed_studio(&source, &target, &signature)?;
+    recover_studio_patch_install()?;
+    install_external_helper()?;
+    if let Some(state) = read_patch_state()? {
+        if patch_is_current(&studio, &state) {
+            return Ok(studio);
+        }
+        if state.studio != studio && state.studio.is_dir() && patch_artifacts_present(&state.studio)
+        {
+            write_patch_state(&studio_patch_journal()?, &state)?;
+            restore_unmodified_studio(&state)?;
+            clear_studio_patch_state()?;
+        } else if remove_stale_patch_from_updated_studio(&state)? {
+        } else if state.studio == studio && patch_artifacts_present(&studio) {
+            write_patch_state(&studio_patch_journal()?, &state)?;
+            restore_unmodified_studio(&state)?;
+        }
     }
-    Ok(target)
+    let state = capture_studio_baseline(&studio)?;
+    install_studio_patch(&studio, &state)?;
+    remove_legacy_managed_studio()?;
+    Ok(studio)
 }

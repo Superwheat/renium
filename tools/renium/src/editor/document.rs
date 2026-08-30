@@ -1,14 +1,13 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
 use crate::editor::diff::{editor_instance_descriptor_from_path, editor_sibling_group_counts};
 use crate::editor::paths::{editor_run_context_value, run_context_name};
 use crate::editor::types::{EditorSourceEnsureResult, EditorSourcePathSpec, EditorSourceTarget};
-use crate::settings::bytecode::{
-    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
-};
+use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
 use crate::settings::tree::{editor_child_stems, editor_service_root_index};
 use crate::system::files::{service_settings_path, validate_filesystem_instance_name};
@@ -24,6 +23,18 @@ pub(crate) fn read_editor_service_settings(
         return Ok(None);
     }
     SettingsBytecode::read_file(&settings_path).map(Some)
+}
+
+pub(crate) fn read_editor_service_settings_cached(
+    src_root: &Path,
+    service: &str,
+) -> Result<Option<Arc<SettingsBytecode>>> {
+    validate_filesystem_instance_name(service, "service")?;
+    let settings_path = service_settings_path(&src_root.join(service));
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+    SettingsBytecode::read_file_cached(&settings_path).map(Some)
 }
 
 pub(crate) struct EditorServiceDocument {
@@ -52,15 +63,6 @@ pub(crate) fn read_editor_service_documents(src_root: &Path) -> Result<Vec<Edito
         }
     }
     Ok(documents)
-}
-
-pub(crate) fn ensure_editor_service_document(
-    slot: &mut Option<SettingsBytecode>,
-) -> &mut SettingsBytecode {
-    slot.get_or_insert_with(|| SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: Vec::new(),
-    })
 }
 
 pub(crate) fn ensure_editor_source_target_in_bytecode(

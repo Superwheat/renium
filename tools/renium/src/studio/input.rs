@@ -192,6 +192,11 @@ pub fn watch_auto_recovery_dialogs() {
     platform::watch_auto_recovery_dialogs();
 }
 
+#[cfg(target_os = "macos")]
+pub fn watch_auto_recovery_dialog_for_pid(pid: u32) {
+    platform::watch_auto_recovery_dialog_for_pid(pid);
+}
+
 #[cfg(windows)]
 pub fn terminate_studio_process(pid: u32) -> Result<()> {
     platform::terminate_studio_process(pid)
@@ -216,12 +221,12 @@ pub fn studio_process_ids() -> Vec<u32> {
     platform::studio_process_ids()
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_mouse_move(window: &StudioWindow, x: i32, y: i32) -> Result<()> {
     platform::post_mouse_move(&window.handle, x, y)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_mouse_button(
     window: &StudioWindow,
     x: i32,
@@ -232,12 +237,12 @@ pub fn post_mouse_button(
     platform::post_mouse_button(&window.handle, x, y, right, down)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_mouse_scroll(window: &StudioWindow, x: i32, y: i32, delta: i32) -> Result<()> {
     platform::post_mouse_scroll(&window.handle, x, y, delta)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_text(window: &StudioWindow, text: &str) -> Result<()> {
     platform::post_text(&window.handle, text)
 }
@@ -250,7 +255,7 @@ pub fn capture_window_rgba(window: &StudioWindow) -> Result<(u32, u32, Vec<u8>)>
     platform::capture_window_rgba(&window.handle)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_mouse_click(
     window: &StudioWindow,
     x: i32,
@@ -261,18 +266,18 @@ pub fn post_mouse_click(
     platform::post_mouse_click(&window.handle, x, y, right, hold_ms)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_key(window: &StudioWindow, key: &KeySpec, hold_ms: u64) -> Result<()> {
     platform::post_key(&window.handle, key, hold_ms)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn post_key_state(window: &StudioWindow, key: &KeySpec, down: bool) -> Result<()> {
     platform::post_key_state(&window.handle, key, down)
 }
 
 pub struct KeySpec {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     platform_code: u16,
     pub name: &'static str,
 }
@@ -361,8 +366,6 @@ pub fn resolve_key(name: &str) -> Result<KeySpec> {
         Some((_windows_vk, _mac_keycode, canonical)) => Ok(KeySpec {
             #[cfg(windows)]
             platform_code: _windows_vk,
-            #[cfg(target_os = "macos")]
-            platform_code: _mac_keycode,
             name: canonical,
         }),
         None => bail!("Unsupported keyboard key '{trimmed}'"),
@@ -1671,31 +1674,30 @@ mod platform {
 mod platform {
     use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow};
     use anyhow::{Context, Result, bail};
-    use std::ffi::c_void;
+    use std::ffi::{OsString, c_void};
+    use std::fs;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
 
     type CFTypeRef = *const c_void;
     type CFArrayRef = *const c_void;
     type CFDictionaryRef = *const c_void;
     type CFStringRef = *const c_void;
     type CFNumberRef = *const c_void;
-    type CGEventRef = *mut c_void;
     type AXUIElementRef = *const c_void;
     #[repr(C)]
-
     struct CGPoint {
         x: f64,
         y: f64,
     }
 
     #[repr(C)]
-
     struct CGSize {
         width: f64,
         height: f64,
     }
 
     #[repr(C)]
-
     struct CGRect {
         origin: CGPoint,
         size: CGSize,
@@ -1707,43 +1709,11 @@ mod platform {
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
     const K_CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
-    const EVENT_MOUSE_MOVED: u32 = 5;
-    const EVENT_LEFT_DOWN: u32 = 1;
-    const EVENT_LEFT_UP: u32 = 2;
-    const EVENT_RIGHT_DOWN: u32 = 3;
-    const EVENT_RIGHT_UP: u32 = 4;
-    const BUTTON_LEFT: u32 = 0;
-    const BUTTON_RIGHT: u32 = 1;
-    const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
-    const RENIUM_EVENT_MARKER: i64 = 0x5245_4e49_554d;
-
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
         fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
         -> bool;
-        fn CGEventCreateMouseEvent(
-            source: *const c_void,
-            event_type: u32,
-            location: CGPoint,
-            button: u32,
-        ) -> CGEventRef;
-        fn CGEventCreateKeyboardEvent(
-            source: *const c_void,
-            keycode: u16,
-            key_down: bool,
-        ) -> CGEventRef;
-        fn CGEventCreateScrollWheelEvent(
-            source: *const c_void,
-            units: u32,
-            wheel_count: u32,
-            wheel1: i32,
-            ...
-        ) -> CGEventRef;
-        fn CGEventPostToPid(pid: i32, event: CGEventRef);
-        fn CGEventSetLocation(event: CGEventRef, location: CGPoint);
-        fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
-        fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
         fn CGWindowListCreateImage(
             screen_bounds: CGRect,
             options: u32,
@@ -1830,8 +1800,6 @@ mod platform {
     pub struct WindowHandle {
         pid: i32,
         window_number: u32,
-        origin_x: f64,
-        origin_y: f64,
     }
 
     pub type InputShield = super::macos_shield::InputShield;
@@ -1996,8 +1964,7 @@ mod platform {
         Ok(application)
     }
 
-    pub fn studio_document_path(pid: u32) -> Result<std::path::PathBuf> {
-        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+    fn accessibility_document_path(pid: i32) -> Result<PathBuf> {
         let application = ax_application(pid)?;
         let window = ax_attribute(application, "AXMainWindow")
             .or_else(|| ax_attribute(application, "AXFocusedWindow"));
@@ -2013,6 +1980,139 @@ mod platform {
         let url = url::Url::parse(&document).context("Studio returned an invalid document URL")?;
         url.to_file_path()
             .map_err(|_| anyhow::anyhow!("Studio document is not a local file: {document}"))
+    }
+
+    fn parse_process_arguments(buffer: &[u8]) -> Result<Vec<OsString>> {
+        let argc = buffer
+            .get(..size_of::<i32>())
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_ne_bytes)
+            .filter(|count| (1..=4096).contains(count))
+            .context("Studio returned an invalid process argument count")?;
+        let mut cursor = size_of::<i32>();
+        let executable_end = buffer[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .context("Studio returned no executable path")?;
+        cursor = executable_end + 1;
+        while buffer.get(cursor) == Some(&0) {
+            cursor += 1;
+        }
+        let mut arguments = Vec::with_capacity(argc as usize);
+        for _ in 0..argc {
+            let end = buffer[cursor..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| cursor + offset)
+                .context("Studio returned an incomplete process argument list")?;
+            arguments.push(OsString::from_vec(buffer[cursor..end].to_vec()));
+            cursor = end + 1;
+        }
+        Ok(arguments)
+    }
+
+    fn process_arguments(pid: i32) -> Result<Vec<OsString>> {
+        let mut argmax = 0i32;
+        let mut argmax_size = size_of_val(&argmax);
+        let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: the MIB and output pointers refer to initialized, correctly sized values.
+        if unsafe {
+            libc::sysctl(
+                argmax_mib.as_mut_ptr(),
+                argmax_mib.len() as u32,
+                (&raw mut argmax).cast::<c_void>(),
+                &raw mut argmax_size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("Could not read the macOS process argument limit");
+        }
+        let argmax = usize::try_from(argmax)
+            .ok()
+            .filter(|size| *size >= size_of::<i32>())
+            .context("macOS returned an invalid process argument limit")?;
+        let mut buffer = vec![0u8; argmax];
+        let mut buffer_size = buffer.len();
+        let mut arguments_mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the MIB identifies this user's Studio process and buffer is writable for buffer_size bytes.
+        if unsafe {
+            libc::sysctl(
+                arguments_mib.as_mut_ptr(),
+                arguments_mib.len() as u32,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                &raw mut buffer_size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("Could not read Studio's process arguments");
+        }
+        buffer.truncate(buffer_size);
+        parse_process_arguments(&buffer)
+    }
+
+    fn process_document_candidates(arguments: &[OsString]) -> Vec<PathBuf> {
+        let mut paths = arguments
+            .iter()
+            .skip(1)
+            .map(PathBuf::from)
+            .filter(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| {
+                        matches!(value.to_ascii_lowercase().as_str(), "rbxl" | "rbxlx")
+                    })
+            })
+            .collect::<Vec<_>>();
+        for pair in arguments.windows(2) {
+            if pair[0].to_str() != Some("-launchIntentString") {
+                continue;
+            }
+            let Some(intent) = pair[1].to_str() else {
+                continue;
+            };
+            let Some(file) = serde_json::from_str::<serde_json::Value>(intent)
+                .ok()
+                .and_then(|value| value.get("localplacefile")?.as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            paths.push(PathBuf::from(file));
+        }
+        paths
+    }
+
+    fn process_document_path(pid: i32) -> Result<PathBuf> {
+        let arguments = process_arguments(pid)?;
+        let mut paths = process_document_candidates(&arguments)
+            .into_iter()
+            .filter(|path| path.is_absolute() && path.is_file())
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        if paths.len() != 1 {
+            bail!(
+                "Studio has {} absolute local place arguments; expected one",
+                paths.len()
+            );
+        }
+        Ok(paths.remove(0))
+    }
+
+    pub fn studio_document_path(pid: u32) -> Result<PathBuf> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        accessibility_document_path(pid).or_else(|accessibility_error| {
+            process_document_path(pid).with_context(|| {
+                format!("Studio did not expose its document path: {accessibility_error:#}")
+            })
+        })
     }
 
     fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {
@@ -2117,6 +2217,81 @@ mod platform {
         // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
         unsafe { CFRelease(windows) };
         None
+    }
+
+    fn auto_recovery_ignore_button(pid: i32) -> Result<Option<AXUIElementRef>> {
+        let application = ax_application(pid)?;
+        let Some(windows) = ax_attribute(application, "AXWindows") else {
+            // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+            unsafe { CFRelease(application) };
+            return Ok(None);
+        };
+        let windows = windows as CFArrayRef;
+        // SAFETY: AXWindows is an owned CFArray whose entries remain valid while it is retained.
+        let count = unsafe { CFArrayGetCount(windows) };
+        let mut button = None;
+        for index in 0..count {
+            // SAFETY: index is within the CFArray count read above.
+            let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
+            if ax_string_attribute(window, "AXTitle").as_deref() == Some("Auto-Recovery") {
+                button = find_ax_button(window, "Ignore", 16);
+                break;
+            }
+        }
+        // SAFETY: these Core Foundation objects are owned by this function.
+        unsafe {
+            CFRelease(windows);
+            CFRelease(application);
+        }
+        Ok(button)
+    }
+
+    fn dismiss_auto_recovery_dialog(pid: i32) -> Result<bool> {
+        let Some(button) = auto_recovery_ignore_button(pid)? else {
+            return Ok(false);
+        };
+        let action = cf_string("AXPress");
+        // SAFETY: button and action are valid retained accessibility objects.
+        let result = unsafe { AXUIElementPerformAction(button, action) };
+        // SAFETY: these Core Foundation objects are owned by this function.
+        unsafe {
+            CFRelease(action);
+            CFRelease(button);
+        }
+        if result != 0 {
+            bail!("Could not ignore the Auto-Recovery file (AXError {result})");
+        }
+        Ok(true)
+    }
+
+    pub fn watch_auto_recovery_dialog_for_pid(pid: u32) {
+        static WATCHED_PIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+            std::sync::OnceLock::new();
+        let Ok(platform_pid) = i32::try_from(pid) else {
+            return;
+        };
+        let watched =
+            WATCHED_PIDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if !watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pid)
+        {
+            return;
+        }
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if dismiss_auto_recovery_dialog(platform_pid).unwrap_or(false) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            watched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&pid);
+        });
     }
 
     fn package_changes_ok_button(pid: i32) -> Result<Option<AXUIElementRef>> {
@@ -2311,12 +2486,6 @@ mod platform {
         pids
     }
 
-    unsafe fn mark_renium_event(event: CGEventRef) {
-        unsafe {
-            CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, RENIUM_EVENT_MARKER)
-        };
-    }
-
     pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
         let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
         let mut records = studio_window_records(false)?
@@ -2346,146 +2515,8 @@ mod platform {
             handle: WindowHandle {
                 pid: record.pid,
                 window_number: record.window_number,
-                origin_x: record.rect.origin.x,
-                origin_y: record.rect.origin.y,
             },
         })
-    }
-
-    fn post_mouse_event(
-        handle: &WindowHandle,
-        event_type: u32,
-        button: u32,
-        x: i32,
-        y: i32,
-    ) -> Result<()> {
-        let location = CGPoint {
-            x: handle.origin_x + x as f64,
-            y: handle.origin_y + y as f64,
-        };
-        unsafe {
-            let event = CGEventCreateMouseEvent(std::ptr::null(), event_type, location, button);
-            if event.is_null() {
-                bail!(
-                    "CGEventCreateMouseEvent failed; grant the Accessibility permission to the terminal running renium"
-                );
-            }
-            mark_renium_event(event);
-            CGEventPostToPid(handle.pid, event);
-            CFRelease(event as CFTypeRef);
-        }
-        Ok(())
-    }
-
-    pub fn post_mouse_move(handle: &WindowHandle, x: i32, y: i32) -> Result<()> {
-        post_mouse_event(handle, EVENT_MOUSE_MOVED, BUTTON_LEFT, x, y)
-    }
-
-    pub fn post_mouse_button(
-        handle: &WindowHandle,
-        x: i32,
-        y: i32,
-        right: bool,
-        down: bool,
-    ) -> Result<()> {
-        let (event_type, button) = match (right, down) {
-            (false, true) => (EVENT_LEFT_DOWN, BUTTON_LEFT),
-            (false, false) => (EVENT_LEFT_UP, BUTTON_LEFT),
-            (true, true) => (EVENT_RIGHT_DOWN, BUTTON_RIGHT),
-            (true, false) => (EVENT_RIGHT_UP, BUTTON_RIGHT),
-        };
-        post_mouse_event(handle, event_type, button, x, y)
-    }
-
-    pub fn post_mouse_scroll(handle: &WindowHandle, x: i32, y: i32, delta: i32) -> Result<()> {
-        const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
-        unsafe {
-            let event = CGEventCreateScrollWheelEvent(
-                std::ptr::null(),
-                K_CG_SCROLL_EVENT_UNIT_LINE,
-                1,
-                delta.clamp(-10, 10),
-            );
-            if event.is_null() {
-                bail!("CGEventCreateScrollWheelEvent failed");
-            }
-            mark_renium_event(event);
-            CGEventSetLocation(
-                event,
-                CGPoint {
-                    x: handle.origin_x + x as f64,
-                    y: handle.origin_y + y as f64,
-                },
-            );
-            CGEventPostToPid(handle.pid, event);
-            CFRelease(event as CFTypeRef);
-        }
-        Ok(())
-    }
-
-    pub fn post_mouse_click(
-        handle: &WindowHandle,
-        x: i32,
-        y: i32,
-        right: bool,
-        hold_ms: u64,
-    ) -> Result<()> {
-        let hold = std::time::Duration::from_millis(hold_ms.clamp(10, 2000));
-        post_mouse_move(handle, x, y)?;
-        post_mouse_button(handle, x, y, right, true)?;
-        std::thread::sleep(hold);
-        post_mouse_button(handle, x, y, right, false)
-    }
-
-    pub fn post_key_state(handle: &WindowHandle, key: &super::KeySpec, down: bool) -> Result<()> {
-        unsafe {
-            let event = CGEventCreateKeyboardEvent(std::ptr::null(), key.platform_code, down);
-            if event.is_null() {
-                bail!(
-                    "CGEventCreateKeyboardEvent failed; grant the Accessibility permission to \
-                     the terminal running renium (System Settings > Privacy & Security)"
-                );
-            }
-            mark_renium_event(event);
-            CGEventPostToPid(handle.pid, event);
-            CFRelease(event as CFTypeRef);
-        }
-        Ok(())
-    }
-
-    pub fn post_key(handle: &WindowHandle, key: &super::KeySpec, hold_ms: u64) -> Result<()> {
-        post_key_state(handle, key, true)?;
-        std::thread::sleep(std::time::Duration::from_millis(hold_ms.clamp(10, 2000)));
-        post_key_state(handle, key, false)
-    }
-
-    pub fn post_text(handle: &WindowHandle, text: &str) -> Result<()> {
-        for character in text.chars() {
-            let mut units = [0u16; 2];
-            let encoded = character.encode_utf16(&mut units);
-            unsafe {
-                let down = CGEventCreateKeyboardEvent(std::ptr::null(), 0, true);
-                if down.is_null() {
-                    bail!(
-                        "CGEventCreateKeyboardEvent failed; grant the Accessibility permission \
-                         to the terminal running renium"
-                    );
-                }
-                mark_renium_event(down);
-                CGEventKeyboardSetUnicodeString(down, encoded.len(), encoded.as_ptr());
-                CGEventPostToPid(handle.pid, down);
-                CFRelease(down as CFTypeRef);
-                let up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
-                if !up.is_null() {
-                    mark_renium_event(up);
-                    CGEventKeyboardSetUnicodeString(up, encoded.len(), encoded.as_ptr());
-                    CGEventPostToPid(handle.pid, up);
-                    CFRelease(up as CFTypeRef);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        Ok(())
     }
 
     pub fn capture_window_png(handle: &WindowHandle, path: &std::path::Path) -> Result<(u32, u32)> {
@@ -2604,6 +2635,45 @@ mod platform {
                 bail!("CGBitmapContextCreate failed for Studio recording");
             }
             Ok((width as u32, height as u32, pixels))
+        }
+    }
+
+    #[cfg(test)]
+    mod process_argument_tests {
+        use super::{parse_process_arguments, process_document_candidates};
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        #[test]
+        fn parses_null_separated_process_arguments_with_spaces() {
+            let mut buffer = 3i32.to_ne_bytes().to_vec();
+            buffer.extend_from_slice(b"/Applications/RobloxStudio.app/RobloxStudio\0\0\0");
+            buffer.extend_from_slice(b"RobloxStudio\0/tmp/Place With Spaces.rbxl\0-task\0");
+            assert_eq!(
+                parse_process_arguments(&buffer).unwrap(),
+                [
+                    OsString::from("RobloxStudio"),
+                    OsString::from("/tmp/Place With Spaces.rbxl"),
+                    OsString::from("-task"),
+                ]
+            );
+        }
+
+        #[test]
+        fn extracts_local_place_from_studio_launch_intent() {
+            let arguments = [
+                OsString::from("/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio"),
+                OsString::from("-isInstallerLaunch"),
+                OsString::from("true"),
+                OsString::from("-launchIntentString"),
+                OsString::from(
+                    r#"{"task":"EditFile","localplacefile":"/tmp/Place With Spaces.rbxl"}"#,
+                ),
+            ];
+            assert_eq!(
+                process_document_candidates(&arguments),
+                [PathBuf::from("/tmp/Place With Spaces.rbxl")]
+            );
         }
     }
 }

@@ -13,7 +13,7 @@ use crate::cli::SetupArgs;
 use crate::rbx::decode::rbx_variant_to_source_string;
 #[cfg(target_os = "macos")]
 use crate::studio::native::serializer;
-use crate::system::files::sha256_hex;
+use crate::system::files::{resolved_current_executable, sha256_hex};
 use crate::system::tools::download_to_file;
 
 const GITHUB_REPO: &str = "Superwheat/renium";
@@ -130,7 +130,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     };
     let target = plugins_dir.join(PLUGIN_ASSET_NAME);
 
-    let exe_sibling = std::env::current_exe()
+    let exe_sibling = resolved_current_executable()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(PLUGIN_ASSET_NAME)))
         .filter(|path| path.is_file());
@@ -203,7 +203,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             })?;
         if args.dry_run {
             #[cfg(target_os = "macos")]
-            let managed_studio = serializer::managed_studio_path()?;
+            let studio = serializer::patched_studio_path()?;
             let response = json!({
                 "ok": true,
                 "action": "uninstall",
@@ -213,29 +213,28 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
                 "installedVersion": installed_version,
             });
             #[cfg(target_os = "macos")]
-            let response =
-                response_with(response, "wouldRemoveManagedStudio", json!(managed_studio));
+            let response = response_with(response, "wouldRestoreStudio", json!(studio));
             return emit_global_output(
                 &response,
                 &format!("Would remove the Studio plugin at {}", target.display()),
             );
         }
         #[cfg(target_os = "macos")]
-        let managed_removal = serializer::begin_managed_studio_removal()?;
+        let studio_patch_removal = serializer::begin_studio_patch_removal()?;
         if target.is_file()
             && let Err(error) = fs::remove_file(&target)
         {
             #[cfg(target_os = "macos")]
-            if let Err(rollback_error) = managed_removal.rollback() {
+            if let Err(rollback_error) = studio_patch_removal.rollback() {
                 return Err(error).context(format!(
-                    "Failed to remove {} and managed Studio rollback failed: {rollback_error:#}",
+                    "Failed to remove {} and Studio patch rollback failed: {rollback_error:#}",
                     target.display()
                 ));
             }
             return Err(error).with_context(|| format!("Failed to remove {}", target.display()));
         }
         #[cfg(target_os = "macos")]
-        managed_removal.commit()?;
+        studio_patch_removal.commit()?;
         let response = json!({
             "ok": true,
             "action": "uninstall",
@@ -270,7 +269,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
 
     if args.dry_run {
         #[cfg(target_os = "macos")]
-        let managed_studio = serializer::setup_managed_studio(true)?;
+        let studio = serializer::setup_studio_patch(true)?;
         let _ = std::fs::remove_file(&staging_download);
         let response = json!({
             "ok": true,
@@ -283,8 +282,8 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         #[cfg(target_os = "macos")]
         let response = response_with(
             response,
-            "wouldPrepareStudioAt",
-            json!(managed_studio.display().to_string()),
+            "wouldPatchStudioAt",
+            json!(studio.display().to_string()),
         );
         return emit_global_output(
             &response,
@@ -304,7 +303,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     let _ = std::fs::remove_file(&staging_download);
 
     #[cfg(target_os = "macos")]
-    let managed_studio = match serializer::setup_managed_studio(false) {
+    let studio = match serializer::setup_studio_patch(false) {
         Ok(path) => path,
         Err(error) => {
             let rollback = if let Some(previous) = previous_plugin.as_deref() {
@@ -316,7 +315,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             };
             if let Err(rollback_error) = rollback {
                 return Err(error).context(format!(
-                    "Managed Studio setup failed and plugin rollback failed: {rollback_error:#}"
+                    "Studio patch setup failed and plugin rollback failed: {rollback_error:#}"
                 ));
             }
             return Err(error);
@@ -332,13 +331,9 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     });
     #[cfg(target_os = "macos")]
     let response = response_with(
-        response_with(
-            response,
-            "managedStudio",
-            json!(managed_studio.display().to_string()),
-        ),
+        response_with(response, "studio", json!(studio.display().to_string())),
         "note",
-        json!("Open Renium Studio from Applications to use exact protected-property sync"),
+        json!("Restart Roblox Studio to load the updated Renium plugin and native helper"),
     );
     emit_global_output(
         &response,

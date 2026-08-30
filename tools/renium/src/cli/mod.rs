@@ -858,7 +858,7 @@ pub(super) struct MoveInstanceArgs {
     #[arg(long = "to-service")]
     pub(super) target_service: Option<String>,
     #[arg(short = 'I', long, alias = "parent-id")]
-    pub(super) parent_settings_id: String,
+    pub(super) parent_settings_id: Option<String>,
     #[arg(short = 'd', long)]
     pub(super) src_root: Option<PathBuf>,
     #[arg(long)]

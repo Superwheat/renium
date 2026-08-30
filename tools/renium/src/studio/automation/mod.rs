@@ -763,7 +763,7 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
     result
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 fn resolve_player_window(
     bridge: &BridgeServer,
     player: Option<&str>,
@@ -825,57 +825,6 @@ fn input_delta(
 }
 
 #[cfg(target_os = "macos")]
-fn input_delta(
-    bridge: &BridgeServer,
-    player: Option<&str>,
-    window: &input_inject::StudioWindow,
-    x: i32,
-    y: i32,
-) -> (i32, i32) {
-    let read = || -> Result<(f64, f64)> {
-        let result = bridge.call_for_selector(
-            "getMouseLocation",
-            json!({}),
-            BridgeTarget::Client,
-            player,
-        )?;
-        ensure_plugin_api_ok(&result)?;
-        Ok((
-            result
-                .get("x")
-                .and_then(Value::as_f64)
-                .context("Mouse probe returned no x coordinate")?,
-            result
-                .get("y")
-                .and_then(Value::as_f64)
-                .context("Mouse probe returned no y coordinate")?,
-        ))
-    };
-    let Ok(initial) = read() else {
-        return (0, 0);
-    };
-    if input_inject::post_mouse_move(window, x, y).is_err() {
-        return (0, 0);
-    }
-    for _ in 0..10 {
-        thread::sleep(Duration::from_millis(20));
-        if let Ok((seen_x, seen_y)) = read() {
-            let delta_x = x - seen_x.round() as i32;
-            let delta_y = y - seen_y.round() as i32;
-            let moved = (seen_x - initial.0).abs() > 0.5 || (seen_y - initial.1).abs() > 0.5;
-            if !moved && (delta_x.abs() > 1 || delta_y.abs() > 1) {
-                continue;
-            }
-            if delta_x.abs() <= 300 && delta_y.abs() <= 300 {
-                return (delta_x, delta_y);
-            }
-            break;
-        }
-    }
-    (0, 0)
-}
-
-#[cfg(target_os = "macos")]
 fn recover_client_viewport(
     _bridge: &BridgeServer,
     _player: Option<&str>,
@@ -914,7 +863,7 @@ fn send_virtual_input(
     actions: Vec<Value>,
     expect_activated_id: Option<&str>,
 ) -> Result<Value> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _shield = {
         let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
         let window = input_inject::window_for_pid(pid, client_viewport_size(bridge, player))?;
@@ -1164,7 +1113,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         result["inputMethod"] = json!("virtual");
         return Ok(result);
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     {
         let viewport = match (
             bounds.get("viewportWidth").and_then(Value::as_f64),
@@ -1189,7 +1138,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         send_virtual_input(
             bridge,
@@ -1219,7 +1168,7 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         "viewportX": args.x,
         "viewportY": args.y,
     });
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     {
         let (window, offset_x, offset_y) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
@@ -1235,7 +1184,7 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         send_virtual_input(
             bridge,
@@ -1261,13 +1210,12 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         "key": key.name,
         "holdMs": hold_ms,
     });
-    #[cfg(any(windows, target_os = "linux"))]
     if key.name == "Escape" {
         bail!(
             "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key"
         );
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     {
         let (window, _, _) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
@@ -1277,7 +1225,7 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         result["window"] = json!(window.label);
         Ok(result)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         send_virtual_input(
             bridge,
@@ -1333,7 +1281,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     {
         let (pressed, click, viewport) = if let Some(path) = args.path.as_ref() {
             let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
@@ -1379,12 +1327,12 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             "window": window.label,
         }))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         let mut pressed = Value::Null;
         let mut actions = Vec::new();
         if let Some(path) = args.path.as_ref() {
-            let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+            let (bounds, _, _) = gui_input_bounds(bridge, player, Some(path), None, path)?;
             if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
                 bail!("{path} is not a TextBox");
             }
@@ -1392,13 +1340,10 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
                 .get("fullName")
                 .cloned()
                 .unwrap_or_else(|| Value::String(path.clone()));
-            actions.extend(virtual_click_actions(
-                x.round() as i32,
-                y.round() as i32,
-                false,
-                30,
-                false,
-            ));
+            actions.push(json!({
+                "type": "focus",
+                "id": bounds.get("id").context("The target TextBox has no stable id")?,
+            }));
         }
         actions.push(json!({ "type": "text", "text": args.text }));
         if args.enter {

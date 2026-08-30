@@ -8,7 +8,8 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::PushEditorChangesArgs;
 use crate::roblox::schema::{
-    EnumValueNameMap, MATERIAL_SERVICE_CLASS, PropertySchemaMap, USE_2022_MATERIALS_PROPERTY,
+    EnumValueNameMap, MATERIAL_SERVICE_CLASS, PropertySchemaMap, TEXTURE_PACK_PROPERTY,
+    USE_2022_MATERIALS_PROPERTY, has_protected_texture_pack,
 };
 use crate::settings::bytecode::SettingsBytecode;
 
@@ -230,14 +231,18 @@ impl EditorChangeSet {
 pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) -> Vec<Value> {
     let mut rows = Vec::new();
     for change in &mut changes.property_changes {
-        if change.service != MATERIAL_SERVICE_CLASS
-            || change.class_name != MATERIAL_SERVICE_CLASS
-            || change.path_segments.len() != 1
-            || change.path_segments[0] != MATERIAL_SERVICE_CLASS
+        let property_name = if change.service == MATERIAL_SERVICE_CLASS
+            && change.class_name == MATERIAL_SERVICE_CLASS
+            && change.path_segments.len() == 1
+            && change.path_segments[0] == MATERIAL_SERVICE_CLASS
         {
+            USE_2022_MATERIALS_PROPERTY
+        } else if has_protected_texture_pack(&change.class_name) {
+            TEXTURE_PACK_PROPERTY
+        } else {
             continue;
-        }
-        let Some(value) = change.properties.remove(USE_2022_MATERIALS_PROPERTY) else {
+        };
+        let Some(value) = change.properties.remove(property_name) else {
             continue;
         };
         rows.push(json!({
@@ -247,7 +252,7 @@ pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) ->
             "pathSegments": &change.path_segments,
             "pathOrdinals": &change.path_ordinals,
             "className": &change.class_name,
-            "name": USE_2022_MATERIALS_PROPERTY,
+            "name": property_name,
             "value": value,
         }));
     }

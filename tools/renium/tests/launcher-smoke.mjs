@@ -50,6 +50,21 @@ try {
     if (hasCommand("zsh")) {
       run("zsh", [launcher, "f", "Workspace"], { RENIUM_CLI: stub });
     }
+
+    const installed = path.join(temporary, "installed");
+    const stable = path.join(temporary, "stable");
+    fs.mkdirSync(installed);
+    fs.mkdirSync(stable);
+    fs.copyFileSync(launcher, path.join(installed, "rbx"));
+    fs.copyFileSync(stub, path.join(installed, "renium"));
+    fs.chmodSync(path.join(installed, "rbx"), 0o755);
+    fs.chmodSync(path.join(installed, "renium"), 0o755);
+    fs.symlinkSync(path.join(installed, "rbx"), path.join(stable, "rbx"));
+    fs.mkdirSync(path.join(stable, "renium"));
+    run(path.join(stable, "rbx"), ["f", "Workspace"], {
+      RENIUM_CLI: "",
+      XDG_DATA_HOME: path.join(temporary, "missing-data-home"),
+    });
   }
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });

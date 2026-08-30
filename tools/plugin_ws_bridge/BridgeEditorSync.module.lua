@@ -276,6 +276,22 @@ armSessionExpiry = function(values: { [any]: any }, key: any, session: { [any]: 
 end
 
 local function beginHistoryRecording(label: string): any?
+	local boundary = ChangeHistoryService:TryBeginRecording(
+		`Renium:boundary:{os.clock()}`,
+		"Renium: Preserve current Studio state"
+	)
+	if boundary == nil then
+		return nil
+	end
+	local boundaryOk = pcall(
+		ChangeHistoryService.FinishRecording,
+		ChangeHistoryService,
+		boundary,
+		Enum.FinishRecordingOperation.Commit
+	)
+	if not boundaryOk then
+		return nil
+	end
 	return ChangeHistoryService:TryBeginRecording(`Renium:{label}:{os.clock()}`, "Renium: " .. label)
 end
 
@@ -308,6 +324,18 @@ local function cancelExpectedEvent(ctx: { [string]: any }?, token: any)
 	end
 end
 
+local function markTransactionMutation(ctx: { [string]: any }?)
+	if ctx ~= nil and type(ctx.editorTransaction) == "table" then
+		ctx.editorTransaction.mutated = true
+	end
+end
+
+local function markLiveMutation(ctx: { [string]: any }?, instance: Instance?)
+	if instance ~= nil and (instance == game or instance:IsDescendantOf(game)) then
+		markTransactionMutation(ctx)
+	end
+end
+
 local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?)
 	if instance.Parent == parent then
 		return
@@ -315,6 +343,7 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 	if instance:IsA("PackageLink") then
 		error("PackageLink instances cannot be reparented")
 	end
+	local wasLive = instance:IsDescendantOf(game)
 	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent) else nil
 	local ok, result = pcall(function()
 		instance.Parent = parent
@@ -328,6 +357,9 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		local target = if parent == nil then "nil" else parent:GetFullName()
 		error(`Roblox rejected parenting {instance:GetFullName()} to {target}`, 0)
 	end
+	if wasLive or instance:IsDescendantOf(game) then
+		markTransactionMutation(ctx)
+	end
 end
 
 local function setNameForSync(instance: Instance, name: string, ctx: { [string]: any }?)
@@ -337,9 +369,7 @@ local function setNameForSync(instance: Instance, name: string, ctx: { [string]:
 	if instance:IsA("PackageLink") then
 		error("PackageLink instances cannot be renamed")
 	end
-	local token = if instance:IsDescendantOf(game) and ctx ~= nil
-		then ctx.expectPropertyEvent(instance, "Name", name)
-		else nil
+	local token = if ctx ~= nil then ctx.expectPropertyEvent(instance, "Name", name) else nil
 	local ok, result = pcall(function()
 		instance.Name = name
 	end)
@@ -351,6 +381,7 @@ local function setNameForSync(instance: Instance, name: string, ctx: { [string]:
 		cancelExpectedEvent(ctx, token)
 		error(`Roblox rejected renaming {instance:GetFullName()} to {name}`, 0)
 	end
+	markLiveMutation(ctx, instance)
 end
 
 local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
@@ -369,6 +400,7 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 		cancelExpectedEvent(ctx, token)
 		error("Roblox did not retain Workspace.CurrentCamera", 0)
 	end
+	markLiveMutation(ctx, Workspace)
 end
 
 local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?)
@@ -636,13 +668,6 @@ local function resolveInstance(
 	if persistent ~= nil then
 		return persistent
 	end
-	local instance = resolveInstanceBySettingsId(serviceName, change.settingsId, ctx)
-	if strongSettingsId(change.settingsId) then
-		local strongMatch = matchingChangeInstance(instance, change, allowClassMismatch)
-		if strongMatch ~= nil then
-			return strongMatch
-		end
-	end
 	if type(pathSegments) == "table" and #pathSegments > 0 then
 		local pathInstance = resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
 		if
@@ -650,8 +675,13 @@ local function resolveInstance(
 		then
 			return pathInstance
 		end
+		return nil
 	end
-	return matchingChangeInstance(instance, change, allowClassMismatch)
+	return matchingChangeInstance(
+		resolveInstanceBySettingsId(serviceName, change.settingsId, ctx),
+		change,
+		allowClassMismatch
+	)
 end
 
 local function parentPathOrdinals(pathOrdinals: any): { any }
@@ -1159,16 +1189,6 @@ local function resolveEntryInstance(
 		return persistent
 	end
 
-	local settingsInstance = resolveInstanceBySettingsId(serviceName, entry.settingsId, ctx)
-	if
-		not entry.anchorOnly
-		and settingsInstance ~= nil
-		and not claimedInstances[settingsInstance]
-		and strongSettingsId(entry.settingsId)
-	then
-		return settingsInstance
-	end
-
 	local previousPathInstance = if #entry.previousPathSegments > 0
 		then resolvePathSegments(entry.previousPathSegments, nil, entry.previousPathOrdinals)
 		else nil
@@ -1190,9 +1210,6 @@ local function resolveEntryInstance(
 	if not entry.ambiguousSiblings then
 		if pathInstance ~= nil and not claimedInstances[pathInstance] and classCompatible(pathInstance) then
 			return pathInstance
-		end
-		if settingsInstance ~= nil and not claimedInstances[settingsInstance] and classCompatible(settingsInstance) then
-			return settingsInstance
 		end
 		return nil
 	end
@@ -1228,7 +1245,6 @@ local function resolveEntryInstance(
 			end
 		end
 	end
-	include(settingsInstance)
 	include(persistent)
 
 	local chosen = BridgeCandidateMatch.choose(
@@ -1248,6 +1264,11 @@ local function resolveEntryInstance(
 			return okDecode and valuesEqual(candidate:GetAttribute(attributeName), decoded)
 		end
 	)
+	if chosen == nil and pathInstance ~= nil and included[pathInstance] then
+		-- Identical duplicate siblings have no semantic discriminator. Their exact
+		-- pulled ordinal is the only stable local identity and is safe as a tie-break.
+		chosen = pathInstance
+	end
 	if chosen == nil and #candidates > 0 then
 		error(`Could not uniquely identify {entry.key}; Studio was not changed`)
 	end
@@ -1308,9 +1329,7 @@ local function writePropertyForSync(
 	if instance:IsA("PackageLink") then
 		return false, "PackageLink properties are read-only"
 	end
-	local token = if instance:IsDescendantOf(game) and ctx ~= nil
-		then ctx.expectPropertyEvent(instance, propertyName, value)
-		else nil
+	local token = if ctx ~= nil then ctx.expectPropertyEvent(instance, propertyName, value) else nil
 	local ok, result = writeProperty(instance, propertyName, value)
 	if not ok then
 		cancelExpectedEvent(ctx, token)
@@ -1321,6 +1340,7 @@ local function writePropertyForSync(
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
 	end
+	markLiveMutation(ctx, instance)
 	return true, result
 end
 
@@ -1333,9 +1353,7 @@ local function setAttributeForSync(
 	if instance:IsA("PackageLink") then
 		return false, "PackageLink attributes are read-only"
 	end
-	local token = if instance:IsDescendantOf(game) and ctx ~= nil
-		then ctx.expectAttributeEvent(instance, attributeName, value)
-		else nil
+	local token = if ctx ~= nil then ctx.expectAttributeEvent(instance, attributeName, value) else nil
 	local ok, result = pcall(instance.SetAttribute, instance, attributeName, value)
 	if not ok then
 		cancelExpectedEvent(ctx, token)
@@ -1345,6 +1363,7 @@ local function setAttributeForSync(
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain attribute {attributeName}`
 	end
+	markLiveMutation(ctx, instance)
 	return true, result
 end
 
@@ -1534,7 +1553,7 @@ local function setTagForSync(instance: Instance, tag: string, added: boolean, ct
 	if instance:IsA("PackageLink") then
 		error("PackageLink tags are read-only")
 	end
-	local token = if instance:IsDescendantOf(game) then ctx.expectTagChange(instance, tag, added) else nil
+	local token = ctx.expectTagChange(instance, tag, added)
 	local ok, result = pcall(function()
 		if added then
 			CollectionService:AddTag(instance, tag)
@@ -1550,6 +1569,7 @@ local function setTagForSync(instance: Instance, tag: string, added: boolean, ct
 		cancelExpectedEvent(ctx, token)
 		error(`Roblox did not retain tag {tag} on {instance:GetFullName()}`, 0)
 	end
+	markLiveMutation(ctx, instance)
 end
 
 local function applyTags(instance: Instance, rawTags: any, stats: { [string]: any }, ctx: { [string]: any })
@@ -1759,6 +1779,7 @@ local function writeSourceIfChanged(
 		error(`Failed to {action} Source for {instance:GetFullName()}: {writeError}`)
 	end
 	verifySourceWrite(instance, nextSource)
+	markLiveMutation(ctx, instance)
 	if writeMethod == "UpdateSourceAsync" then
 		stats.sourceUpdateAsync += 1
 	else
@@ -2946,7 +2967,9 @@ end
 local function mutationSnapshotLayout(
 	serviceNames: { string },
 	ctx: { [string]: any },
-	packageSnapshotRoots: { [Instance]: boolean }?
+	packageSnapshotRoots: { [Instance]: boolean }?,
+	mutationRootsByService: { [string]: { [Instance]: boolean } }?,
+	restrictedMutationServices: { [string]: boolean }?
 )
 	local groups = {}
 	local roots = {}
@@ -2955,6 +2978,8 @@ local function mutationSnapshotLayout(
 	for _, serviceName in ipairs(serviceNames) do
 		local service = game:GetService(serviceName)
 		local preserved = {}
+		local mutationRoots = if mutationRootsByService ~= nil then mutationRootsByService[serviceName] else nil
+		local restricted = restrictedMutationServices ~= nil and restrictedMutationServices[serviceName] == true
 		addSnapshotMetadataTarget(metadataTargets, metadataSeen, service)
 		if service == Workspace then
 			local terrain = Workspace:FindFirstChildOfClass("Terrain")
@@ -2974,20 +2999,22 @@ local function mutationSnapshotLayout(
 				if container ~= nil then
 					preserved[container] = true
 					addSnapshotMetadataTarget(metadataTargets, metadataSeen, container)
-					local children = {}
-					for _, child in ipairs(container:GetChildren()) do
-						if includeManagedInstance(ctx, serviceName, child) then
-							children[#children + 1] = child
+					if not restricted or (mutationRoots ~= nil and mutationRoots[container]) then
+						local children = {}
+						for _, child in ipairs(container:GetChildren()) do
+							if includeManagedInstance(ctx, serviceName, child) then
+								children[#children + 1] = child
+							end
 						end
-					end
-					table.insert(groups, {
-						serviceName = serviceName,
-						target = container,
-						count = #children,
-						preserved = {},
-					})
-					for _, child in ipairs(children) do
-						table.insert(roots, child)
+						table.insert(groups, {
+							serviceName = serviceName,
+							target = container,
+							count = #children,
+							preserved = {},
+						})
+						for _, child in ipairs(children) do
+							table.insert(roots, child)
+						end
 					end
 				end
 			end
@@ -2996,8 +3023,9 @@ local function mutationSnapshotLayout(
 		for _, child in ipairs(service:GetChildren()) do
 			local included = includeManagedInstance(ctx, serviceName, child)
 			if
-				(containsPackageLink(child) and not (packageSnapshotRoots and packageSnapshotRoots[child]))
+				(restricted and not (mutationRoots and mutationRoots[child]))
 				or not included
+				or (containsPackageLink(child) and not (packageSnapshotRoots and packageSnapshotRoots[child]))
 			then
 				preserved[child] = true
 			elseif not preserved[child] then
@@ -3016,9 +3044,6 @@ local function mutationSnapshotLayout(
 	end
 	return groups, roots, metadataTargets, metadataSeen
 end
-
-local captureNativeExportFingerprint
-local nativeExportFingerprintMatches
 
 local function serializeSnapshotRoots(roots: { Instance }, nonArchivable: { Instance }, ctx: { [string]: any })
 	local changed = {}
@@ -3119,6 +3144,53 @@ local function captureSnapshotRoots(groups: { any }): ({ [string]: Instance }, {
 	return originalByPath, originalRoots, nonArchivable, instanceCount
 end
 
+local function captureMutationFingerprints(groups: { any }): { [string]: any }
+	local fingerprints = {}
+	for _, group in ipairs(groups) do
+		local fingerprint = fingerprints[group.serviceName]
+		if fingerprint == nil then
+			fingerprint = { count = 0, entries = {} }
+			fingerprints[group.serviceName] = fingerprint
+		end
+		local function record(instance: Instance)
+			if fingerprint.entries[instance] == nil then
+				fingerprint.count += 1
+			end
+			fingerprint.entries[instance] = { instance.Parent, instance.Name }
+		end
+		record(group.target)
+		for _, child in ipairs(group.target:GetChildren()) do
+			if not group.preserved[child] then
+				record(child)
+				for _, descendant in ipairs(child:GetDescendants()) do
+					record(descendant)
+				end
+			end
+		end
+	end
+	return fingerprints
+end
+
+local function mutationFingerprintsMatch(expected: { [string]: any }, actual: { [string]: any }): boolean
+	for serviceName, expectedFingerprint in pairs(expected) do
+		local actualFingerprint = actual[serviceName]
+		if actualFingerprint == nil or actualFingerprint.count ~= expectedFingerprint.count then
+			return false
+		end
+		for instance, expectedEntry in pairs(expectedFingerprint.entries) do
+			local actualEntry = actualFingerprint.entries[instance]
+			if
+				actualEntry == nil
+				or actualEntry[1] ~= expectedEntry[1]
+				or actualEntry[2] ~= expectedEntry[2]
+			then
+				return false
+			end
+		end
+	end
+	return true
+end
+
 local function serializeMutationSnapshot(roots: { Instance }, nonArchivable: { Instance }, ctx: { [string]: any })
 	if #roots == 0 then
 		return nil
@@ -3132,22 +3204,29 @@ end
 
 local TransactionState = {}
 
-function TransactionState.captureServiceStates(serviceNames: { string }, ctx: { [string]: any })
-	local fingerprints = {}
+function TransactionState.captureServiceStates(serviceNames: { string }, groups: { any }, ctx: { [string]: any })
+	local fingerprints = captureMutationFingerprints(groups)
 	local generations = {}
 	for _, serviceName in ipairs(serviceNames) do
-		fingerprints[serviceName] = captureNativeExportFingerprint(serviceName, ctx)
 		generations[serviceName] = ctx.studioChangeGeneration(serviceName)
 	end
 	return fingerprints, generations
 end
 
-function TransactionState.changedService(fingerprints: { [string]: any }, generations: { [string]: any }, ctx): string?
-	for serviceName, fingerprint in pairs(fingerprints) do
-		if
-			not nativeExportFingerprintMatches(fingerprint, captureNativeExportFingerprint(serviceName, ctx))
-			or ctx.studioChangeGeneration(serviceName) ~= generations[serviceName]
-		then
+function TransactionState.changedService(
+	fingerprints: { [string]: any },
+	generations: { [string]: any },
+	groups: { any },
+	ctx
+): string?
+	local currentFingerprints = captureMutationFingerprints(groups)
+	if not mutationFingerprintsMatch(fingerprints, currentFingerprints) then
+		for serviceName in pairs(fingerprints) do
+			return serviceName
+		end
+	end
+	for serviceName, generation in pairs(generations) do
+		if ctx.studioChangeGeneration(serviceName) ~= generation then
 			return serviceName
 		end
 	end
@@ -3257,12 +3336,24 @@ function TransactionState.captureSnapshot(serviceNames: { string }, params: { [s
 	local fingerprintsByService, generationsByService = {}, {}
 	if hasStructuralChanges then
 		groups, roots, metadataTargets, metadataSeen =
-			mutationSnapshotLayout(serviceNames, ctx, params.packageSnapshotRoots)
-		fingerprintsByService, generationsByService = TransactionState.captureServiceStates(serviceNames, ctx)
+			mutationSnapshotLayout(
+				serviceNames,
+				ctx,
+				params.packageSnapshotRoots,
+				params.mutationRootsByService,
+				params.restrictedMutationServices
+			)
+		fingerprintsByService, generationsByService =
+			TransactionState.captureServiceStates(serviceNames, groups, ctx)
 	end
 	local originalByPath, originalRoots, nonArchivable, instanceCount = captureSnapshotRoots(groups)
 	local payload = serializeMutationSnapshot(roots, nonArchivable, ctx)
-	local changedService = TransactionState.changedService(fingerprintsByService, generationsByService, ctx)
+	local changedService = TransactionState.changedService(
+		fingerprintsByService,
+		generationsByService,
+		groups,
+		ctx
+	)
 	if changedService ~= nil then
 		local attempt = tonumber(params.snapshotAttempt) or 0
 		if attempt < 2 then
@@ -3301,6 +3392,7 @@ function TransactionState.captureSnapshot(serviceNames: { string }, params: { [s
 			if hasStructuralChanges or params.captureAllScriptDocuments == true then nil else sourceKeys
 		),
 		referenceOverlay = ReferenceOverlay.capture(groups),
+		fingerprintsByService = fingerprintsByService,
 	}
 end
 
@@ -3366,6 +3458,27 @@ function TransactionState.restoreMetadata(
 			end
 		end
 	end
+end
+
+function TransactionState.topologyMatchesSnapshot(snapshot: { [string]: any }): boolean
+	local fingerprints = snapshot.fingerprintsByService or {}
+	if next(fingerprints) == nil then
+		return false
+	end
+	return mutationFingerprintsMatch(fingerprints, captureMutationFingerprints(snapshot.groups or {}))
+end
+
+function TransactionState.restoreSnapshotState(
+	snapshot: { [string]: any },
+	replacements: { [Instance]: Instance },
+	ctx: { [string]: any }
+)
+	TransactionState.restoreMetadata(snapshot, replacements, ctx)
+	if snapshot.currentCamera ~= nil then
+		setCurrentCameraForSync(replacements[snapshot.currentCamera] or snapshot.currentCamera, ctx)
+	end
+	ScriptDocumentState.apply(snapshot.scriptDocuments or {}, nil, nil, replacements)
+	ReferenceOverlay.apply(snapshot.referenceOverlay or {}, replacements, ctx)
 end
 
 function TransactionState.restoreSnapshot(
@@ -3458,12 +3571,7 @@ function TransactionState.restoreSnapshot(
 			error(string.format("Could not restore %d external content references", contentFailed))
 		end
 	end
-	TransactionState.restoreMetadata(snapshot, replacements, ctx)
-	if snapshot.currentCamera ~= nil then
-		setCurrentCameraForSync(replacements[snapshot.currentCamera] or snapshot.currentCamera, ctx)
-	end
-	ScriptDocumentState.apply(snapshot.scriptDocuments or {}, nil, nil, replacements)
-	ReferenceOverlay.apply(snapshot.referenceOverlay or {}, replacements, ctx)
+	TransactionState.restoreSnapshotState(snapshot, replacements, ctx)
 	local destroyed = {}
 	for _, root in ipairs(removed) do
 		destroyed[root.instance] = true
@@ -3775,8 +3883,16 @@ function TransactionState.rollback(
 		end
 		incoming = ReferenceOverlay.rollbackNative(session.nativeUndo, ctx)
 	end
-	local snapshotReplacements =
-		TransactionState.restoreSnapshot(session.snapshot, ctx, session.instanceReplacements, beforeReplace)
+	local snapshotReplacements = {}
+	if TransactionState.topologyMatchesSnapshot(session.snapshot) then
+		if beforeReplace ~= nil then
+			beforeReplace()
+		end
+		TransactionState.restoreSnapshotState(session.snapshot, replacements, ctx)
+	else
+		snapshotReplacements =
+			TransactionState.restoreSnapshot(session.snapshot, ctx, session.instanceReplacements, beforeReplace)
+	end
 	for original, replacement in pairs(snapshotReplacements) do
 		replacements[original] = replacement
 	end
@@ -3797,9 +3913,18 @@ end
 function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
 	finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
 	session.historyRecording = nil
-	if session.mutated ~= true and session.nativeUndo == nil then
+	if session.mutated ~= true then
 		TransactionState.finishJournal(session, ctx)
 		session.changeJournal = nil
+		if session.nativeUndo ~= nil then
+			local incoming = ReferenceOverlay.rollbackNative(session.nativeUndo, ctx)
+			session.nativeUndo = nil
+			for _, instance in ipairs(incoming) do
+				if instance.Parent == nil then
+					instance:Destroy()
+				end
+			end
+		end
 		return {}
 	end
 	local ok, result = xpcall(function()
@@ -3852,7 +3977,7 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 			end
 		end
 		for _, originalRoot in ipairs(session.snapshot.originalRoots or {}) do
-			local restoredRoot = resolveReplacement(replacements[originalRoot], replacements)
+			local restoredRoot = resolveReplacement(originalRoot, replacements)
 			if restoredRoot == nil or restoredRoot.Parent == nil then
 				error(`Editor rollback did not restore {originalRoot.Name}`)
 			end
@@ -3868,64 +3993,6 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 		error(result, 0)
 	end
 	return result
-end
-
-captureNativeExportFingerprint = function(
-	serviceName: string,
-	ctx: { [string]: any },
-	instancesOnly: boolean?
-): { any }
-	local service = game:GetService(serviceName)
-	if instancesOnly then
-		local tracked = ctx.trackedExportInstances(serviceName)
-		if tracked ~= nil then
-			return tracked
-		end
-	end
-	local fingerprint = if instancesOnly then { service } else { { service, service.Parent, service.Name, 1 } }
-	local countsByParent = {}
-	for _, instance in ipairs(service:GetDescendants()) do
-		if ctx.includeExportInstance(serviceName, instance) then
-			if instancesOnly then
-				fingerprint[#fingerprint + 1] = instance
-			else
-				local parent = instance.Parent
-				local counts = countsByParent[parent]
-				if counts == nil then
-					counts = {}
-					countsByParent[parent] = counts
-				end
-				local ordinal = (counts[instance.Name] or 0) + 1
-				counts[instance.Name] = ordinal
-				fingerprint[#fingerprint + 1] = {
-					instance,
-					parent,
-					instance.Name,
-					ordinal,
-				}
-			end
-		end
-	end
-	return fingerprint
-end
-
-nativeExportFingerprintMatches = function(expected: { any }, actual: { any }): boolean
-	if #expected ~= #actual then
-		return false
-	end
-	for index, expectedEntry in ipairs(expected) do
-		local actualEntry = actual[index]
-		if
-			actualEntry == nil
-			or expectedEntry[1] ~= actualEntry[1]
-			or expectedEntry[2] ~= actualEntry[2]
-			or expectedEntry[3] ~= actualEntry[3]
-			or expectedEntry[4] ~= actualEntry[4]
-		then
-			return false
-		end
-	end
-	return true
 end
 
 local NativeSerialization = {}
@@ -4485,7 +4552,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		state: string,
 		response: { [string]: any }
 	): { [string]: any }
-		return transactionOutcomes.record(transactionId, state, response)
+		local outcome = transactionOutcomes.record(transactionId, state, response)
+		ctx.finishEditorTransactionExpectation(transactionId)
+		return outcome
 	end
 
 	function api.getTransactionState(params: { [string]: any }): { [string]: any }
@@ -4686,9 +4755,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function rollbackReconcileSnapshot(snapshot: { [string]: any }, serviceName: string)
 		local selected = captureExplorerSelection()
-		local recording = beginHistoryRecording("Cancel filesystem reconcile")
 		local okRestore, replacements = pcall(TransactionState.restoreSnapshot, snapshot, ctx, nil)
-		finishHistoryRecording(recording, Enum.FinishRecordingOperation.Cancel)
 		if not okRestore then
 			error("Could not roll back the editor reconcile: " .. tostring(replacements))
 		end
@@ -4883,14 +4950,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return nativeImportServices
 	end
 
-	local function transactionPackageSnapshotRoots(
+	local function transactionMutationRoots(
 		params: { [string]: any },
 		includedServices: { [string]: boolean }
-	): { [Instance]: boolean }
+	): ({ [string]: { [Instance]: boolean } }, { [string]: boolean }, { [Instance]: boolean })
 		local mutationRootsAreArray = denseArrayLength(params.mutationRoots or {})
 		if not mutationRootsAreArray then
 			error("Invalid editor transaction mutation roots")
 		end
+		local rootsByService = {}
+		local restrictedServices = {}
 		local packageSnapshotRoots = {}
 		for index, descriptor in ipairs(params.mutationRoots or {}) do
 			local serviceName = tostring(descriptor.service or "")
@@ -4898,12 +4967,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Invalid editor transaction mutation root service")
 			end
 			validateMutationPath(descriptor, serviceName, `Editor transaction mutation root {index}`, ctx)
+			restrictedServices[serviceName] = true
 			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
-			if root ~= nil and root.Parent == game:GetService(serviceName) and containsPackageLink(root) then
-				packageSnapshotRoots[root] = true
+			if root ~= nil and root.Parent == game:GetService(serviceName) then
+				local serviceRoots = rootsByService[serviceName]
+				if serviceRoots == nil then
+					serviceRoots = {}
+					rootsByService[serviceName] = serviceRoots
+				end
+				serviceRoots[root] = true
+				if containsPackageLink(root) then
+					packageSnapshotRoots[root] = true
+				end
 			end
 		end
-		return packageSnapshotRoots
+		return rootsByService, restrictedServices, packageSnapshotRoots
 	end
 
 	local function servicesWithoutNativeImport(
@@ -4971,7 +5049,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			captureChangedSources(params.sourceChanges or {}, includedServices)
 		local nativeImport = params.nativeImport == true
 		local nativeImportServices = includedNativeImportServices(params.nativeImportServices, includedServices)
-		local packageSnapshotRoots = transactionPackageSnapshotRoots(params, includedServices)
+		local mutationRootsByService, restrictedMutationServices, packageSnapshotRoots =
+			transactionMutationRoots(params, includedServices)
 		local snapshotServices = servicesWithoutNativeImport(serviceNames, nativeImportServices)
 		local snapshotSourceChanges = changesWithoutNativeImport(params.sourceChanges or {}, nativeImportServices)
 		local snapshotPropertyChanges = changesWithoutNativeImport(params.propertyChanges or {}, nativeImportServices)
@@ -4983,6 +5062,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			sourceChanges = snapshotSourceChanges,
 			propertyChanges = snapshotPropertyChanges,
 			packageSnapshotRoots = packageSnapshotRoots,
+			mutationRootsByService = mutationRootsByService,
+			restrictedMutationServices = restrictedMutationServices,
 		}, ctx)
 		assertSessionOwnership(operationCancellation)
 		if
@@ -5061,14 +5142,38 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		assertCommitActive()
 		for serviceName, generation in pairs(session.studioGenerations or {}) do
-			if ctx.studioChangeGeneration(serviceName) ~= generation then
-				error(`Studio changed {serviceName} while the filesystem transaction was staged; retry the sync`)
+			local currentGeneration = ctx.studioChangeGeneration(serviceName)
+			if currentGeneration ~= generation then
+				local records = TransactionState.drainJournal(session, ctx)
+				local record = records[1]
+				local detail = "no tracked event"
+				if record ~= nil then
+					local kinds = {}
+					for propertyName in pairs(record.properties or {}) do
+						kinds[#kinds + 1] = "property " .. propertyName
+					end
+					for attributeName in pairs(record.attributes or {}) do
+						kinds[#kinds + 1] = "attribute " .. attributeName
+					end
+					if record.structural then
+						kinds[#kinds + 1] = "structure"
+					end
+					if record.tagsChanged then
+						kinds[#kinds + 1] = "tags"
+					end
+					detail = `{table.concat(record.pathSegments or {}, ".")} ({table.concat(kinds, ", ")})`
+				end
+				error(
+					`Studio changed {serviceName} while the filesystem transaction was staged ({generation} -> {currentGeneration}; {detail}); retry the sync`
+				)
 			end
 		end
 		if session.nativeUndo ~= nil then
 			setTrackedOperationPhase(operation, "nativeCommit")
 			ReferenceOverlay.chainReplacements(session.instanceReplacements, session.nativeUndo.replacements)
 			TransactionState.drainJournal(session, ctx)
+			-- Native commit can replace live roots before reporting an error.
+			session.mutated = true
 			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
 			assertCommitActive()
 			for original, replacement in pairs(session.nativeUndo.replacements) do
@@ -5180,6 +5285,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		timings.cleanupMs = (os.clock() - phaseStarted) * 1000
+		for _, serviceName in ipairs(session.serviceNames) do
+			invalidateEditorService(serviceName)
+		end
+		timings.invalidatedServices = #session.serviceNames
 		editorTransactions[transactionId] = nil
 		return recordTransactionOutcome(transactionId, "committed", {
 			undoRecorded = undoRecorded,
@@ -6507,7 +6616,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					packageRoots = group.packageRoots,
 				}
 			end
-			transaction.mutated = true
 			setTrackedOperationPhase(operation, "prepareRetention")
 			local retention = ReferenceOverlay.prepareRetained(prepared, ctx, session.externalReferencesPostApplied)
 			transaction.nativeUndo = {
@@ -6847,16 +6955,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local instanceChanges = params.instanceChanges
-		if
-			outerTransaction ~= nil
-			and (
-				#(params.instanceChanges or {}) > 0
-				or #(params.sourceChanges or {}) > 0
-				or #(params.propertyChanges or {}) > 0
-			)
-		then
-			outerTransaction.mutated = true
-		end
 		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do
@@ -7042,12 +7140,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		local restoredSelectionReplacements = selectionReplacements
+		if aborted and outerTransaction == nil then
+			finishHistoryRecording(historyRecording, Enum.FinishRecordingOperation.Cancel)
+			historyRecording = nil
+		end
 		if aborted and transactionSnapshot ~= nil then
 			if chunkSessionKey ~= nil then
 				reconcileSessions[chunkSessionKey] = nil
 			end
-			local okRollback, replacements =
-				pcall(TransactionState.restoreSnapshot, transactionSnapshot, ctx, selectionReplacements)
+			local okRollback, replacements = pcall(function()
+				if TransactionState.topologyMatchesSnapshot(transactionSnapshot) then
+					TransactionState.restoreSnapshotState(transactionSnapshot, selectionReplacements, ctx)
+					return selectionReplacements
+				end
+				return TransactionState.restoreSnapshot(transactionSnapshot, ctx, selectionReplacements)
+			end)
 			if okRollback then
 				restoredSelectionReplacements = replacements
 				stats.sourceCreated = 0
@@ -7065,10 +7172,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				warn("[Renium] editor rollback failed: " .. tostring(replacements))
 			end
 		end
-		if outerTransaction == nil then
+		if outerTransaction == nil and historyRecording ~= nil then
 			finishHistoryRecording(
 				historyRecording,
-				if aborted then Enum.FinishRecordingOperation.Cancel else Enum.FinishRecordingOperation.Commit
+				Enum.FinishRecordingOperation.Commit
 			)
 		end
 		restoreExplorerSelection(explorerSelection, restoredSelectionReplacements)

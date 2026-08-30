@@ -1380,17 +1380,20 @@ updateMouse()
 		if type(actions) ~= "table" or #actions < 1 or #actions > 1024 then
 			return { ok = false, error = "Virtual input requires 1 through 1024 actions" }
 		end
-		local function findGuiButtonById(id)
+		local function findGuiObjectById(id, className)
 			local localPlayer = game:GetService("Players").LocalPlayer
 			local playerGui = if localPlayer then localPlayer:FindFirstChildOfClass("PlayerGui") else nil
 			if playerGui then
 				for _, descendant in ipairs(playerGui:GetDescendants()) do
-					if descendant:IsA("GuiButton") and getInstanceDebugId(descendant) == id then
+					if descendant:IsA(className) and getInstanceDebugId(descendant) == id then
 						return descendant
 					end
 				end
 			end
 			return nil
+		end
+		local function findGuiButtonById(id)
+			return findGuiObjectById(id, "GuiButton")
 		end
 
 		local activationId = tostring(params.expectActivatedId or "")
@@ -1498,6 +1501,20 @@ updateMouse()
 					sendKey(action.down == true, keyCode, action.repeated == true)
 				elseif actionType == "text" then
 					virtualInput:SendTextInput(tostring(action.text or ""))
+				elseif actionType == "focus" then
+					local target = findGuiObjectById(tostring(action.id or ""), "TextBox")
+					if target == nil then
+						error("The requested TextBox is no longer available", 0)
+					end
+					target:CaptureFocus()
+					local deadline = os.clock() + 1
+					while UserInputService:GetFocusedTextBox() ~= target and os.clock() < deadline do
+						RunService.Heartbeat:Wait()
+						assertOperationOwnership(operationGeneration)
+					end
+					if UserInputService:GetFocusedTextBox() ~= target then
+						error("The requested TextBox did not receive focus", 0)
+					end
 				elseif actionType == "click" then
 					sendVerifiedClick(action)
 				else
@@ -1801,6 +1818,9 @@ updateMouse()
 				simulating = false,
 				viewport = vectorSize(viewport),
 			}
+			if params.includeSettle == true then
+				inactive.settleSeconds = math.max(0, deviceSimulatorReadyAt - os.clock())
+			end
 			local okDevice, deviceId = pcall(service.GetDeviceAsync, service)
 			if not okDevice then
 				return { ok = false, error = tostring(deviceId) }

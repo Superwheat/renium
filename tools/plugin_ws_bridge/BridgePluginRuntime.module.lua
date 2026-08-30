@@ -172,9 +172,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.1"
+	local BRIDGE_VERSION = "0.3.2"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1787914338
+	local BRIDGE_BUILD_UNIX = 1788117265
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -312,13 +312,82 @@ function BridgePluginRuntime.start(context)
 		VoiceChatService = true,
 	}
 	Config.shouldIgnoreInstance = sessionLock.isLockInstance
-	Config.loadPendingStudioChanges = function()
-		return plugin:GetSetting(SETTINGS_PREFIX .. "pendingStudioChanges")
+	local pendingStudioChangesSettingPrefix = SETTINGS_PREFIX .. "pendingStudioChanges:"
+	local function pendingStudioChangesTarget(): { [string]: any }?
+		-- Plugin settings are shared by every Studio DataModel. Published places have
+		-- a stable identity; local files do not expose a path to plugins, so carrying
+		-- an anonymous dirty marker across processes could apply it to another file.
+		if game.GameId <= 0 or game.PlaceId <= 0 then
+			return nil
+		end
+		return {
+			gameId = game.GameId,
+			placeId = game.PlaceId,
+			setting = pendingStudioChangesSettingPrefix .. tostring(game.GameId) .. ":" .. tostring(game.PlaceId),
+		}
 	end
-	Config.savePendingStudioChanges = function(services)
-		plugin:SetSetting(SETTINGS_PREFIX .. "pendingStudioChanges", services)
+	Config.loadPendingStudioChanges = function()
+		local target = pendingStudioChangesTarget()
+		if target == nil then
+			return nil
+		end
+		local stored = plugin:GetSetting(target.setting)
+		if type(stored) ~= "table"
+			or (stored.version ~= 3 and stored.version ~= 4)
+			or type(stored.epoch) ~= "string"
+			or type(stored.services) ~= "table"
+		then
+			if stored ~= nil then
+				plugin:SetSetting(target.setting, nil)
+			end
+			return nil
+		end
+		return {
+			epoch = stored.epoch,
+			runtimeId = if type(stored.runtimeId) == "string" then stored.runtimeId else nil,
+			services = stored.services,
+		}
+	end
+	Config.savePendingStudioChanges = function(services, expectedEpoch)
+		local target = pendingStudioChangesTarget()
+		if target == nil then
+			return nil
+		end
+		local stored = plugin:GetSetting(target.setting)
+		local storedEpoch = if type(stored) == "table" and type(stored.epoch) == "string"
+			then stored.epoch
+			else nil
+		if storedEpoch ~= nil and storedEpoch ~= expectedEpoch then
+			return nil
+		end
+		if #services == 0 then
+			if storedEpoch ~= nil and storedEpoch == expectedEpoch then
+				plugin:SetSetting(target.setting, nil)
+			end
+			return nil
+		end
+		local epoch = Config.bridgeRuntimeId .. ":" .. HttpService:GenerateGUID(false)
+		plugin:SetSetting(target.setting, {
+			version = 4,
+			epoch = epoch,
+			runtimeId = Config.bridgeRuntimeId,
+			services = services,
+		})
+		return epoch
 	end
 	Config.studioChanges = requireChildModule("BridgeStudioChanges").create(Config, ALLOWED_SERVICES)
+	local function beginEditorTransactionExpectation(transactionId: string, params: { [string]: any })
+		table.clear(transactionExpectations)
+		transactionExpectations[transactionId] = params
+		Config.studioChanges.beginSuppress(nil, params)
+	end
+	local function finishEditorTransactionExpectation(transactionId: string)
+		if transactionExpectations[transactionId] == nil then
+			return
+		end
+		transactionExpectations[transactionId] = nil
+		task.defer(Config.studioChanges.endSuppress)
+	end
 	local RuntimeApi = requireChildModule("BridgeRuntimeApi").create(plugin, {
 		runtimeId = Config.bridgeRuntimeId,
 		assertSessionOwnership = function(sessionGeneration)
@@ -493,6 +562,10 @@ function BridgePluginRuntime.start(context)
 	local demandSerializerGate = Instance.new("BindableEvent")
 	local activeDemandSerializers = 0
 	stateByService = {}
+	function Config.invalidateRuntimeExportCache(serviceName: string)
+		stateByService[serviceName] = nil
+		nativeStateByService[serviceName] = nil
+	end
 	local editorActions = {}
 	local editorActionCounter = 0
 	local function queueEditorAction(action: { [string]: any })
@@ -747,8 +820,8 @@ function BridgePluginRuntime.start(context)
 			return Config.getEditorBinaryEnumValueNames(enumType)
 		end,
 		invalidateService = function(serviceName: string)
-			stateByService[serviceName] = nil
-			nativeStateByService[serviceName] = nil
+			Config.studioChanges.invalidateExportCache(serviceName)
+			Config.invalidateRuntimeExportCache(serviceName)
 		end,
 		updateStatus = Config.updateStatusText,
 		getSyncOptions = function()
@@ -775,6 +848,7 @@ function BridgePluginRuntime.start(context)
 		beginStudioChangeJournal = Config.studioChanges.beginChangeJournal,
 		drainStudioChangeJournal = Config.studioChanges.drainChangeJournal,
 		finishStudioChangeJournal = Config.studioChanges.finishChangeJournal,
+		finishEditorTransactionExpectation = finishEditorTransactionExpectation,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 		isStudioChangeTracking = Config.studioChanges.isTracking,
 		hasNonArchivable = Config.studioChanges.hasNonArchivable,
@@ -4851,8 +4925,7 @@ function BridgePluginRuntime.start(context)
 	Config.editorTransactionUploads = TransactionUploadModule.create(
 		editorSync.beginTransaction,
 		function(id, params)
-			table.clear(transactionExpectations)
-			transactionExpectations[id] = params
+			beginEditorTransactionExpectation(id, params)
 		end,
 		ValueEqualityModule.exactValuesEqual
 	)
@@ -4871,43 +4944,42 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.beginEditorTransaction = function(p)
 		local result = editorSync.beginTransaction(p)
 		if result.ok == true then
-			table.clear(transactionExpectations)
-			transactionExpectations[tostring(p.transactionId or "")] = p
+			beginEditorTransactionExpectation(tostring(p.transactionId or ""), p)
 		end
 		return result
 	end
 	Config.bridgeMethodHandlers.commitEditorTransaction = function(p)
 		local transactionId = tostring(p.transactionId or "")
-		Config.studioChanges.beginSuppress(nil, transactionExpectations[transactionId])
+		local transactionScoped = transactionExpectations[transactionId] ~= nil
+		if not transactionScoped then
+			Config.studioChanges.beginSuppress(nil)
+		end
 		local ok, result = pcall(editorSync.commitTransaction, p)
-		task.defer(Config.studioChanges.endSuppress)
+		if not transactionScoped then
+			task.defer(Config.studioChanges.endSuppress)
+		end
 		if not ok then
-			local state = editorSync.getTransactionState({ transactionId = transactionId })
-			if state.state == "committed" or state.state == "rolledBack" or state.state == "notFound" then
-				transactionExpectations[transactionId] = nil
-			end
 			error(result, 0)
 		end
-		transactionExpectations[transactionId] = nil
 		return result
 	end
 	Config.bridgeMethodHandlers.rollbackEditorTransaction = function(p)
 		local transactionId = tostring(p.transactionId or "")
-		Config.studioChanges.beginSuppress(nil)
+		local transactionScoped = transactionExpectations[transactionId] ~= nil
+		if not transactionScoped then
+			Config.studioChanges.beginSuppress(nil)
+		end
 		local ok, result = pcall(editorSync.rollbackTransaction, p)
-		task.defer(Config.studioChanges.endSuppress)
-		transactionExpectations[transactionId] = nil
+		if not transactionScoped then
+			task.defer(Config.studioChanges.endSuppress)
+		end
 		if not ok then
 			error(result, 0)
 		end
 		return result
 	end
 	Config.bridgeMethodHandlers.getEditorTransactionState = function(p)
-		local result = editorSync.getTransactionState(p)
-		if result.state == "committed" or result.state == "rolledBack" or result.state == "notFound" then
-			transactionExpectations[tostring(p.transactionId or "")] = nil
-		end
-		return result
+		return editorSync.getTransactionState(p)
 	end
 
 	Config.bridgeMethodHandlers.finishEditorBinaryImport = function(p)
@@ -4921,6 +4993,10 @@ function BridgePluginRuntime.start(context)
 	end
 
 	Config.bridgeMethodHandlers.applyEditorChanges = function(p)
+		local transactionScoped = transactionExpectations[tostring(p.transactionId or "")] ~= nil
+		if transactionScoped then
+			return editorSync.applyChanges(p)
+		end
 		Config.studioChanges.beginSuppress(nil, p)
 		local ok, result = pcall(editorSync.applyChanges, p)
 		task.defer(Config.studioChanges.endSuppress)
@@ -4940,15 +5016,16 @@ function BridgePluginRuntime.start(context)
 		local pendingActions = pendingEditorActions(p.ackEditorActions, p.runtimeId)
 		local compact = p.compact == true
 		if runtimeSettings.twoWaySync == false then
-			local guardState = nil
-			if p.includeGenerations == true then
-				guardState = Config.studioChanges.getState({
-					start = p.start,
-					services = p.services,
-					includeGenerations = true,
-					compact = true,
-				})
+			-- Manual pushes still need transaction guards and acknowledgements when
+			-- user-facing two-way sync is disabled. Do not silently turn an ordinary
+			-- status request into persistent tracking, but preserve every internal
+			-- guard/lease/ack parameter.
+			local internalParams = table.clone(p)
+			if type(p.trackingGuardId) ~= "string" or p.trackingGuardId == "" then
+				internalParams.start = false
 			end
+			internalParams.compact = true
+			local guardState = Config.studioChanges.getState(internalParams)
 			return {
 				ok = true,
 				tracking = false,
@@ -4964,8 +5041,10 @@ function BridgePluginRuntime.start(context)
 				runtimeSettingChangeCount = runtimeSettingChangeCount,
 				runtimeSettingsSeq = runtimeSettingsSeq,
 				runtimeId = Config.bridgeRuntimeId,
-				seq = if guardState ~= nil then guardState.seq else nil,
-				serviceGenerations = if guardState ~= nil then guardState.serviceGenerations else nil,
+				seq = guardState.seq,
+				serviceGenerations = guardState.serviceGenerations,
+				pendingEpoch = guardState.pendingEpoch,
+				restoredPendingEpoch = guardState.restoredPendingEpoch,
 				editorActions = if compact then {} else pendingActions,
 				editorActionCount = #pendingActions,
 				operation = editorSync.operationState(),

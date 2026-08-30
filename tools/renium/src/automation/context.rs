@@ -401,26 +401,43 @@ pub(super) fn resolve(
 ) -> std::result::Result<BoundContext, Failure> {
     let mut context = resolve_project(state, id)?;
     if let Some(runtime_id) = context.runtime_id.as_deref() {
-        let candidate = studio_candidates(bridge, &context.selector)
-            .into_iter()
+        let candidates = studio_candidates(bridge, &context.selector);
+        if let Some(candidate) = candidates
+            .iter()
             .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id))
-            .ok_or_else(|| {
-                state.remove_context(id);
-                Failure::new(
+        {
+            if candidate.get("bridgeBuildUnix").and_then(Value::as_i64) != context.plugin_build {
+                return Err(Failure::new(
                     "stale_cx",
-                    "The selected Studio runtime disconnected",
-                    false,
+                    "The selected Studio plugin build changed",
+                    true,
                     "bind",
+                ));
+            }
+        } else {
+            if candidates.len() > 1 {
+                return Err(ambiguous_studios(&candidates));
+            }
+            let Some(candidate) = candidates.first() else {
+                return Err(Failure::new(
+                    "no_studio",
+                    "The selected Studio runtime disconnected",
+                    true,
+                    "studios",
+                ));
+            };
+            let replacement_id = candidate
+                .get("runtimeId")
+                .and_then(Value::as_str)
+                .context("Replacement Studio runtime omitted its identity")
+                .map_err(|error| Failure::new("no_studio", error.to_string(), true, "studios"))?;
+            context = state
+                .attach_context_runtime(
+                    id,
+                    replacement_id.to_string(),
+                    candidate.get("bridgeBuildUnix").and_then(Value::as_i64),
                 )
-            })?;
-        if candidate.get("bridgeBuildUnix").and_then(Value::as_i64) != context.plugin_build {
-            state.remove_context(id);
-            return Err(Failure::new(
-                "stale_cx",
-                "The selected Studio plugin build changed",
-                false,
-                "bind",
-            ));
+                .unwrap_or(context);
         }
     } else {
         let candidates = studio_candidates(bridge, &context.selector);

@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
+use crate::app::timing::log_timing;
 use crate::bytecode::edit::{
     collect_settings_subtree_preorder, instance_path_parts_key, next_editor_settings_id_fast,
     path_ordinals_from_value, path_segments_from_value, prune_removed_source_dirs,
@@ -221,6 +224,80 @@ fn source_root_for_stores(source_file: &Path, target_file: &Path) -> Result<Path
     Ok(source_root.to_path_buf())
 }
 
+fn load_move_reference_documents(
+    files: &BTreeMap<String, PathBuf>,
+    source_service: &str,
+    target_service: &str,
+    source: SettingsBytecode,
+    target: SettingsBytecode,
+    moved_indices: &HashSet<usize>,
+    old_paths: &[Option<crate::editor::types::EditorInstancePath>],
+) -> Result<BTreeMap<String, SettingsBytecode>> {
+    let structures = files
+        .par_iter()
+        .filter(|(service, _)| {
+            service.as_str() != source_service && service.as_str() != target_service
+        })
+        .map(|(service, path)| {
+            SettingsBytecode::read_structure_file(path).map(|document| (service.clone(), document))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut documents = structures.into_iter().collect::<BTreeMap<_, _>>();
+    documents.insert(source_service.to_string(), source);
+    documents.insert(target_service.to_string(), target);
+
+    let moved_ids = moved_indices
+        .iter()
+        .map(|index| {
+            documents[source_service].instances[*index]
+                .settings_id
+                .clone()
+        })
+        .collect::<HashSet<_>>();
+    let mut moved_id_counts = moved_ids
+        .iter()
+        .map(|id| (id.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
+    for document in documents.values() {
+        for instance in &document.instances {
+            if let Some(count) = moved_id_counts.get_mut(&instance.settings_id) {
+                *count += 1;
+            }
+        }
+    }
+    let mut needles = moved_indices
+        .iter()
+        .filter_map(|index| old_paths.get(*index)?.as_ref())
+        .map(|path| path.path_segments.clone())
+        .collect::<Vec<_>>();
+    for (settings_id, count) in moved_id_counts {
+        if count != 1 {
+            continue;
+        }
+        needles.push(vec![settings_id.clone()]);
+        if let Some(debug_id) = settings_id.strip_prefix("debug:") {
+            needles.push(vec![debug_id.to_string()]);
+        }
+    }
+    needles.sort();
+    needles.dedup();
+
+    let candidates = files
+        .par_iter()
+        .filter(|(service, _)| {
+            service.as_str() != source_service && service.as_str() != target_service
+        })
+        .map(|(service, path)| {
+            SettingsBytecode::read_file_if_contains_any_string_set(path, &needles)
+                .map(|document| document.map(|document| (service.clone(), document)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (service, document) in candidates.into_iter().flatten() {
+        documents.insert(service, document);
+    }
+    Ok(documents)
+}
+
 pub(crate) fn move_instance_between_service_stores(
     source_file: &Path,
     source_service: &str,
@@ -229,6 +306,7 @@ pub(crate) fn move_instance_between_service_stores(
     target_service: &str,
     target_parent_settings_id: &str,
 ) -> Result<()> {
+    let move_started = Instant::now();
     let src_root = source_root_for_stores(source_file, target_file)?;
     let files = service_store_paths(&src_root)?;
     let lock_paths = files.values().cloned().collect::<BTreeSet<_>>();
@@ -236,19 +314,13 @@ pub(crate) fn move_instance_between_service_stores(
         .iter()
         .map(|path| lock_existing_service_store(path))
         .collect::<Result<Vec<_>>>()?;
-    let mut documents = files
-        .iter()
-        .map(|(service, path)| {
-            SettingsBytecode::read_file(path).map(|document| (service.clone(), document))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let source_before = documents
-        .get(source_service)
-        .cloned()
-        .with_context(|| format!("Source service '{source_service}' has no Renium store"))?;
-    let target_before = documents
-        .get(target_service)
-        .with_context(|| format!("Target service '{target_service}' has no Renium store"))?;
+    let load_started = Instant::now();
+    let (source_before, target_before) = rayon::join(
+        || SettingsBytecode::read_file(source_file),
+        || SettingsBytecode::read_file(target_file),
+    );
+    let source_before = source_before?;
+    let target_before = target_before?;
     let source_index = source_before
         .instances
         .iter()
@@ -280,12 +352,28 @@ pub(crate) fn move_instance_between_service_stores(
     collect_settings_subtree_preorder(&children, source_index, &mut subtree);
     reject_package_link_subtree_mutation(&source_before, &subtree, "moved between services")?;
     let moved_indices = subtree.iter().copied().collect::<HashSet<_>>();
+    let old_paths = build_editor_instance_paths(&source_before, source_service);
+    let mut documents = load_move_reference_documents(
+        &files,
+        source_service,
+        target_service,
+        source_before.clone(),
+        target_before,
+        &moved_indices,
+        &old_paths,
+    )?;
+    log_timing("cross-service move load", load_started);
     let original_package_links = documents
         .iter()
         .map(|(service, document)| (service.clone(), package_link_states(document)))
         .collect::<BTreeMap<_, _>>();
+    let canonicalize_started = Instant::now();
     let mut changed_services =
         canonicalize_settings_references_for_move(&mut documents, source_service, &moved_indices);
+    log_timing(
+        "cross-service move reference canonicalization",
+        canonicalize_started,
+    );
     changed_services.extend([source_service.to_string(), target_service.to_string()]);
 
     let mut source = documents
@@ -301,7 +389,6 @@ pub(crate) fn move_instance_between_service_stores(
             .parent()
             .context("Source settings file has no parent")?,
     );
-    let old_paths = build_editor_instance_paths(&source_before, source_service);
     let mut target_ids = target
         .instances
         .iter()
@@ -460,5 +547,7 @@ pub(crate) fn move_instance_between_service_stores(
             "changedPaths": changed_paths,
         }),
         true,
-    )
+    )?;
+    log_timing("cross-service move total", move_started);
+    Ok(())
 }
