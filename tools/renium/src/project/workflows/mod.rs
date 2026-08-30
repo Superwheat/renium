@@ -20,7 +20,7 @@ use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
 use crate::project::experience::resolve_experience_place;
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
-    exact_path_key as path_text, write_bytes_if_changed,
+    exact_path_key as path_text, resolved_current_executable, write_bytes_if_changed,
 };
 
 mod build_watch;
@@ -859,14 +859,76 @@ pub fn launch_exact_studio(
     }
 }
 
-fn spawn_studio(mut command: Command, executable: &Path) -> Result<u32> {
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to launch {}", executable.display()))?;
-    Ok(child.id())
+pub(crate) fn spawn_studio(command: Command, executable: &Path) -> Result<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        let existing = crate::studio::input::studio_process_ids()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let bundle = executable
+            .ancestors()
+            .find(|path| path.extension() == Some(OsStr::new("app")))
+            .with_context(|| {
+                format!(
+                    "Could not determine the Studio app bundle from {}",
+                    executable.display()
+                )
+            })?;
+        let forwarded = command
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>();
+        let status = Command::new("/usr/bin/open")
+            .args(["-g", "-n", "-a"])
+            .arg(bundle)
+            .arg("--args")
+            .args(forwarded)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("Failed to launch {} in the background", bundle.display()))?;
+        if !status.success() {
+            bail!("Could not launch {} in the background", bundle.display());
+        }
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if let Some(pid) = crate::studio::input::studio_process_ids()
+                .into_iter()
+                .find(|pid| !existing.contains(pid))
+            {
+                crate::studio::input::watch_auto_recovery_dialog_for_pid(pid);
+                return Ok(pid);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        bail!(
+            "{} launched, but its process did not become visible",
+            bundle.display()
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut command = command;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("Failed to launch {}", executable.display()))?;
+        Ok(child.id())
+    }
 }
 
 pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()> {
@@ -1191,7 +1253,7 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
 }
 
 fn agent_instructions() -> Result<Vec<u8>> {
-    let installed = env::current_exe()
+    let installed = resolved_current_executable()
         .context("Failed to locate the Renium executable")?
         .parent()
         .context("The Renium executable has no parent directory")?
@@ -1240,7 +1302,7 @@ fn agent_instruction_version(contents: &str) -> Option<&str> {
 }
 
 fn agent_guides_directory() -> Result<PathBuf> {
-    let installed = env::current_exe()
+    let installed = resolved_current_executable()
         .context("Failed to locate the Renium executable")?
         .parent()
         .context("The Renium executable has no parent directory")?
@@ -1894,28 +1956,11 @@ fn studio_executable() -> Result<PathBuf> {
             .context("Roblox Studio is not installed in the local Versions directory");
     }
     if cfg!(target_os = "macos") {
-        let mut candidates = Vec::new();
         #[cfg(target_os = "macos")]
         {
-            if let Ok(managed) = crate::studio::native::serializer::managed_studio_path() {
-                candidates.push(managed.join("Contents/MacOS/ReniumStudio"));
-            }
+            let studio = crate::studio::native::serializer::setup_studio_patch(false)?;
+            return Ok(studio.join("Contents/MacOS/RobloxStudio"));
         }
-        candidates.push(PathBuf::from(
-            "/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio",
-        ));
-        if let Some(home) = env::var_os("HOME") {
-            candidates.push(
-                PathBuf::from(home)
-                    .join("Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio"),
-            );
-        }
-        for path in candidates {
-            if path.is_file() {
-                return Ok(path);
-            }
-        }
-        bail!("Roblox Studio was not found in the managed or standard application locations");
     }
     bail!("Roblox Studio is only available on Windows and macOS")
 }

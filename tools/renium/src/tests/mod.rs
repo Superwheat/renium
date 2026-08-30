@@ -21,7 +21,8 @@ use crate::cli::{
     BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
     BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
     BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, EditorMutationArgs,
-    PlaceDesyncPackageLinkArgs, ProjectSourceArgs, PushEditorChangesArgs,
+    MoveInstanceArgs, PlaceDesyncPackageLinkArgs, ProjectInstanceArgs, ProjectSourceArgs,
+    PushEditorChangesArgs,
 };
 use crate::editor::diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
@@ -35,18 +36,19 @@ use crate::editor::paths::{
     build_editor_source_paths_by_index, infer_editor_source_path_spec, run_context_name,
 };
 use crate::editor::review::{
-    editor_review_payload, is_externally_managed_editor_property,
-    is_externally_managed_protected_write, is_user_facing_protected_write,
-    normalize_editor_bridge_value, patch_place_protected_writes, protected_write_matches_previous,
-    protected_write_rows_with_previous_values,
+    editor_review_payload, is_engine_managed_editor_property,
+    is_externally_managed_editor_property, is_externally_managed_protected_write,
+    is_user_facing_protected_write, normalize_editor_bridge_value, patch_place_protected_writes,
+    protected_write_matches_previous, protected_write_rows_with_previous_values,
 };
 use crate::editor::sync::{
     EditorSettingsTransaction, collect_direct_editor_delete_change, collect_editor_changes,
 };
 use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor, EditorInstancePath,
-    EditorPropertyFilter,
+    EditorPropertyChange, EditorPropertyFilter, take_pre_routed_protected_writes,
 };
+use crate::project::commands::move_instance_command;
 use crate::project::package_links::place::place_desync_package_link;
 use crate::project::structural::{
     move_instance_between_service_stores, moved_references_between_documents,
@@ -379,6 +381,32 @@ fn get_property_source_falls_back_to_externalized_mirror() {
     fs::remove_file(service_dir.join("Mod.luau")).unwrap();
     let err = bytecode_get_property(get_source_property_args(&settings_file)).unwrap_err();
     assert!(err.to_string().contains("Property not found"), "{err}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn get_property_returns_the_nil_default_for_an_unset_reference() {
+    let dir = temp_dir("get-unset-reference");
+    let service_dir = dir.join("src").join("Workspace");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_file = service_settings_path(&service_dir);
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        settings_instance("editor:1", "Reference", "ObjectValue", Some(0)),
+    ])
+    .write_file(&settings_file)
+    .unwrap();
+    let args = BytecodeGetPropertyArgs::try_parse_from([
+        "bytecode-get-property",
+        settings_file.to_str().unwrap(),
+        "-i",
+        "editor:1",
+        "-p",
+        "Value",
+    ])
+    .unwrap();
+
+    assert!(bytecode_get_property(args).is_ok());
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1056,6 +1084,55 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
     );
 
     let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
+fn move_command_defaults_to_the_target_service_root() {
+    let project_root = temp_dir("cross-service-root-move");
+    let src_root = project_root.join("src");
+    let source_file = service_settings_path(&src_root.join("Workspace"));
+    let target_file = service_settings_path(&src_root.join("ReplicatedStorage"));
+    fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance("workspace-root", "Workspace", "Workspace", None),
+        settings_instance("item", "Item", "Folder", Some(0)),
+    ])
+    .write_file(&source_file)
+    .unwrap();
+    settings_document(vec![settings_instance(
+        "replicated-root",
+        "ReplicatedStorage",
+        "ReplicatedStorage",
+        None,
+    )])
+    .write_file(&target_file)
+    .unwrap();
+
+    move_instance_command(
+        MoveInstanceArgs {
+            target: ProjectInstanceArgs {
+                service: "Workspace".to_string(),
+                settings_id: "item".to_string(),
+                project_root: project_root.clone(),
+            },
+            target_service: Some("ReplicatedStorage".to_string()),
+            parent_settings_id: None,
+            src_root: Some(PathBuf::from("src")),
+            override_packages: false,
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(!source_file.exists());
+    let target = SettingsBytecode::read_file(&target_file).unwrap();
+    let item = target
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Item")
+        .unwrap();
+    assert_eq!(item.parent_index, Some(0));
 }
 
 #[test]
@@ -2364,6 +2441,17 @@ fn deleted_source_file_removes_leaf_but_demotes_init_script() {
             )]),
             attributes: Map::new(),
         },
+        SettingsBytecodeInstance {
+            settings_id: "unrelated".to_string(),
+            name: "Unrelated".to_string(),
+            class_name: "Texture".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([(
+                "EmissiveTint".to_string(),
+                json!({ "_type": "Color3", "r": 1, "g": 1, "b": 1 }),
+            )]),
+            attributes: Map::new(),
+        },
     ]);
     let settings_path = service_settings_path(&service_dir);
     document.write_file(&settings_path).unwrap();
@@ -2405,11 +2493,17 @@ fn deleted_source_file_removes_leaf_but_demotes_init_script() {
         Some(&json!("script"))
     );
     let after = SettingsBytecode::read_file(&settings_path).unwrap();
-    assert_eq!(after.instances.len(), 4);
+    assert_eq!(after.instances.len(), 5);
     assert_eq!(after.instances[1].name, "LoadingScreen");
     assert_eq!(after.instances[1].class_name, "Folder");
     assert_eq!(after.instances[2].name, "Frame");
     assert_eq!(after.instances[2].parent_index, Some(1));
+    assert!(
+        changes
+            .property_changes
+            .iter()
+            .all(|change| change.settings_id.as_deref() != Some("unrelated"))
+    );
 
     let service_dir = project_root.join("src").join("ServerScriptService");
     fs::create_dir_all(&service_dir).unwrap();
@@ -3157,6 +3251,54 @@ fn empty_full_reconcile_is_not_discarded() {
 }
 
 #[test]
+fn serialized_texture_pack_properties_are_routed_to_offline_writes() {
+    let classes = [
+        "Decal",
+        "MaterialVariant",
+        "SurfaceAppearance",
+        "TerrainDetail",
+    ];
+    let mut changes = EditorChangeSet {
+        property_changes: classes
+            .iter()
+            .map(|class_name| EditorPropertyChange {
+                service: "Workspace".to_string(),
+                settings_id: Some((*class_name).to_string()),
+                path_segments: vec!["Workspace".to_string(), (*class_name).to_string()],
+                path_ordinals: vec![1, 1],
+                class_name: (*class_name).to_string(),
+                properties: Map::from_iter([
+                    (
+                        "TexturePack".to_string(),
+                        json!("rbxassetid://72333247722658"),
+                    ),
+                    ("Marker".to_string(), json!(12)),
+                ]),
+                reset_properties: Vec::new(),
+                attributes: Map::new(),
+                deleted_attributes: Vec::new(),
+            })
+            .collect(),
+        ..EditorChangeSet::default()
+    };
+
+    let rows = take_pre_routed_protected_writes(&mut changes);
+
+    assert_eq!(rows.len(), classes.len());
+    assert!(
+        rows.iter()
+            .all(|row| row.get("name") == Some(&json!("TexturePack")))
+    );
+    assert_eq!(changes.property_changes.len(), classes.len());
+    assert!(
+        changes
+            .property_changes
+            .iter()
+            .all(|change| change.properties.len() == 1 && change.properties.contains_key("Marker"))
+    );
+}
+
+#[test]
 fn protected_place_writes_patch_binary_properties_and_attributes() {
     let dir = temp_dir("protected-place-writes");
     let path = dir.join("place.rbxl");
@@ -3239,6 +3381,58 @@ fn protected_review_reads_migrated_mesh_id_value() {
     assert_eq!(
         patched_rows[0].get("oldValue"),
         Some(&json!("rbxassetid://131536866771677"))
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn protected_place_writes_patch_material_variant_texture_pack() {
+    let dir = temp_dir("protected-material-variant-texture-pack");
+    let path = dir.join("place.rbxl");
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let service = dom.insert(
+        dom.root_ref(),
+        RbxInstanceBuilder::new("MaterialService").with_name("MaterialService"),
+    );
+    dom.insert(
+        service,
+        RbxInstanceBuilder::new("MaterialVariant")
+            .with_name("concrete puddle")
+            .with_property(
+                "TexturePack",
+                RbxContentId::from("rbxassetid://113321028117673"),
+            ),
+    );
+    let output = File::create(&path).unwrap();
+    rbx_binary::to_writer(BufWriter::new(output), &dom, &[service]).unwrap();
+    let rows = vec![json!({
+        "kind": "property",
+        "pathSegments": ["MaterialService", "concrete puddle"],
+        "pathOrdinals": [1, 1],
+        "name": "TexturePack",
+        "value": "rbxassetid://72333247722658",
+        "oldValueMissing": true,
+    })];
+
+    let review_rows = protected_write_rows_with_previous_values(&path, &rows).unwrap();
+    assert_eq!(
+        review_rows[0].get("oldValue"),
+        Some(&json!("rbxassetid://113321028117673"))
+    );
+    assert!(review_rows[0].get("oldValueMissing").is_none());
+    assert_eq!(patch_place_protected_writes(&path, &rows).unwrap(), 1);
+    let output_dom = rbx_binary::from_reader(BufReader::new(File::open(&path).unwrap())).unwrap();
+    let material_service = output_dom
+        .get_by_ref(output_dom.root().children()[0])
+        .unwrap();
+    let material_variant = output_dom
+        .get_by_ref(material_service.children()[0])
+        .unwrap();
+    assert_eq!(
+        material_variant.properties.get(&"TexturePack".into()),
+        Some(&RbxVariant::ContentId(RbxContentId::from(
+            "rbxassetid://72333247722658"
+        )))
     );
     let _ = fs::remove_dir_all(dir);
 }
@@ -3368,6 +3562,11 @@ fn game_settings_properties_are_not_sent_or_patched() {
 #[test]
 fn protected_review_only_keeps_user_facing_properties() {
     let database = rbx_reflection_database::get().unwrap();
+    assert!(!is_engine_managed_editor_property(
+        "MaterialVariant",
+        "TexturePack",
+        database
+    ));
     assert!(!is_user_facing_protected_write(
         &json!({
             "kind": "attribute",
@@ -3405,6 +3604,14 @@ fn protected_review_only_keeps_user_facing_properties() {
             "kind": "property",
             "className": "MeshPart",
             "name": "MeshId",
+        }),
+        database
+    ));
+    assert!(is_user_facing_protected_write(
+        &json!({
+            "kind": "property",
+            "className": "MaterialVariant",
+            "name": "TexturePack",
         }),
         database
     ));

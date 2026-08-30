@@ -41,7 +41,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "mv",
-        "Examples:\n  rbx mv Workspace --settings-id editor:item --parent-settings-id editor:parent",
+        "Examples:\n  rbx mv Workspace -i editor:item -I editor:parent\n  rbx mv Workspace -i editor:item --to-service ReplicatedStorage",
     ),
     (
         "rn",

@@ -11,11 +11,20 @@ use crate::studio::bridge::BridgeServer;
 use crate::system::files::{read_json_file, write_json_file};
 
 pub(crate) const MATERIAL_SERVICE_CLASS: &str = "MaterialService";
+pub(crate) const MATERIAL_VARIANT_CLASS: &str = "MaterialVariant";
+pub(crate) const TEXTURE_PACK_PROPERTY: &str = "TexturePack";
 pub(crate) const USE_2022_MATERIALS_PROPERTY: &str = "Use2022Materials";
 pub(crate) const MESH_INITIAL_SIZE_PROPERTY: &str = "InitialSize";
 pub(crate) const MESH_SIZE_TRANSPORT_PROPERTY: &str = "MeshSize";
 pub(crate) const TRIANGLE_MESH_PART_CLASS: &str = "TriangleMeshPart";
 const PROPERTY_SCHEMA_CACHE_VERSION: u32 = 7;
+
+pub(crate) fn has_protected_texture_pack(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Decal" | MATERIAL_VARIANT_CLASS | "SurfaceAppearance" | "TerrainDetail"
+    )
+}
 
 pub(crate) type PropertySchemaMap = HashMap<String, Vec<PropertySchemaEntry>>;
 pub(crate) type EnumValueNameMap = HashMap<String, HashMap<i64, String>>;

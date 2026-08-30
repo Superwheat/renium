@@ -4,7 +4,7 @@ use rbx_reflection::ReflectionDatabase;
 use serde_json::{Map, Value};
 
 use crate::bytecode::edit::instance_path_parts_key;
-use crate::editor::paths::build_editor_instance_paths;
+use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::review::{
     is_engine_managed_editor_property, is_externally_managed_editor_property,
     is_workspace_camera_sync_target, normalize_editor_bridge_value, property_schema_entry,
@@ -72,6 +72,35 @@ fn settings_value_contains_reference(value: &Value) -> bool {
                 || object.values().any(settings_value_contains_reference)
         }
         _ => false,
+    }
+}
+
+fn collect_editor_reference_indices(value: &Value, indices: &mut HashSet<usize>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_editor_reference_indices(item, indices);
+            }
+        }
+        Value::Object(object) => {
+            let reference = if object.get("_type").and_then(Value::as_str) == Some("Ref") {
+                Some(object)
+            } else {
+                object.get("Ref").and_then(Value::as_object)
+            };
+            if let Some(index) = reference
+                .and_then(|reference| reference.get("instanceIndex"))
+                .and_then(Value::as_u64)
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| usize::try_from(index).ok())
+            {
+                indices.insert(index);
+            }
+            for nested in object.values() {
+                collect_editor_reference_indices(nested, indices);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -267,6 +296,7 @@ pub(crate) fn append_editor_instance_reconcile(
     push_editor_instance_change(changes, "reconcileService", service, true, instances);
 }
 
+#[cfg(test)]
 pub(crate) fn append_editor_target_instance_upserts(
     changes: &mut EditorChangeSet,
     document: &SettingsBytecode,
@@ -274,7 +304,39 @@ pub(crate) fn append_editor_target_instance_upserts(
     filter: &EditorPropertyFilter,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
-    let sibling_counts = editor_sibling_group_counts(document);
+    append_editor_target_instance_upserts_with_paths(
+        changes,
+        document,
+        service,
+        filter,
+        &paths_by_index,
+    );
+}
+
+fn append_editor_target_instance_upserts_with_paths(
+    changes: &mut EditorChangeSet,
+    document: &SettingsBytecode,
+    service: &str,
+    filter: &EditorPropertyFilter,
+    paths_by_index: &[Option<EditorInstancePath>],
+) {
+    let (target_indices, mut selected_indices) = editor_target_indices(document, filter);
+    let sibling_counts = expand_ambiguous_editor_siblings(document, &mut selected_indices);
+    append_editor_target_instance_upserts_for_indices(
+        changes,
+        document,
+        service,
+        paths_by_index,
+        &sibling_counts,
+        &target_indices,
+        &selected_indices,
+    );
+}
+
+fn editor_target_indices(
+    document: &SettingsBytecode,
+    filter: &EditorPropertyFilter,
+) -> (HashSet<usize>, HashSet<usize>) {
     let mut target_indices = HashSet::new();
     let mut selected_indices = HashSet::new();
     for (index, instance) in document.instances.iter().enumerate() {
@@ -297,32 +359,60 @@ pub(crate) fn append_editor_target_instance_upserts(
             current = current_instance.parent_index;
         }
     }
+    (target_indices, selected_indices)
+}
 
-    let mut sibling_groups = HashMap::new();
+fn expand_ambiguous_editor_siblings<'a>(
+    document: &'a SettingsBytecode,
+    selected_indices: &mut HashSet<usize>,
+) -> EditorSiblingGroupCounts<'a> {
+    let selected_groups = selected_indices
+        .iter()
+        .map(|index| {
+            let instance = &document.instances[*index];
+            (instance.parent_index, instance.name.as_str())
+        })
+        .collect::<HashSet<_>>();
+    let mut sibling_groups: HashMap<(Option<usize>, &str), Vec<usize>> = HashMap::new();
     for (index, instance) in document.instances.iter().enumerate() {
-        sibling_groups
-            .entry((instance.parent_index, instance.name.as_str()))
-            .or_insert_with(Vec::new)
-            .push(index);
+        let key = (instance.parent_index, instance.name.as_str());
+        if !selected_groups.contains(&key) {
+            continue;
+        }
+        sibling_groups.entry(key).or_default().push(index);
     }
-    for index in selected_indices.iter().copied().collect::<Vec<_>>() {
-        let instance = &document.instances[index];
-        if let Some(siblings) = sibling_groups.get(&(instance.parent_index, instance.name.as_str()))
-            && siblings.len() > 1
-        {
+    for siblings in sibling_groups.values() {
+        if siblings.len() > 1 {
             selected_indices.extend(siblings);
         }
     }
-
-    let instances = selected_indices
+    sibling_groups
         .into_iter()
+        .filter_map(|((parent_index, name), siblings)| {
+            parent_index.map(|parent_index| ((parent_index, name), siblings.len()))
+        })
+        .collect()
+}
+
+fn append_editor_target_instance_upserts_for_indices(
+    changes: &mut EditorChangeSet,
+    document: &SettingsBytecode,
+    service: &str,
+    paths_by_index: &[Option<EditorInstancePath>],
+    sibling_counts: &EditorSiblingGroupCounts<'_>,
+    target_indices: &HashSet<usize>,
+    selected_indices: &HashSet<usize>,
+) {
+    let instances = selected_indices
+        .iter()
+        .copied()
         .filter_map(|index| {
             let mut descriptor = editor_instance_descriptor(
                 document,
-                &paths_by_index,
+                paths_by_index,
                 service,
                 index,
-                &sibling_counts,
+                sibling_counts,
             )?;
             descriptor.anchor_only |= !target_indices.contains(&index);
             Some(descriptor)
@@ -331,6 +421,7 @@ pub(crate) fn append_editor_target_instance_upserts(
     push_editor_instance_change(changes, "upsertInstances", service, false, instances);
 }
 
+#[cfg(test)]
 pub(crate) fn append_editor_target_inline_source_changes(
     changes: &mut EditorChangeSet,
     document: &SettingsBytecode,
@@ -338,6 +429,22 @@ pub(crate) fn append_editor_target_inline_source_changes(
     filter: &EditorPropertyFilter,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
+    append_editor_target_inline_source_changes_with_paths(
+        changes,
+        document,
+        service,
+        filter,
+        &paths_by_index,
+    );
+}
+
+fn append_editor_target_inline_source_changes_with_paths(
+    changes: &mut EditorChangeSet,
+    document: &SettingsBytecode,
+    service: &str,
+    filter: &EditorPropertyFilter,
+    paths_by_index: &[Option<EditorInstancePath>],
+) {
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance(&instance.settings_id)
             || !is_lua_source_class(&instance.class_name)
@@ -368,6 +475,7 @@ pub(crate) fn append_editor_target_inline_source_changes(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn append_editor_property_changes(
     changes: &mut EditorChangeSet,
     document: &SettingsBytecode,
@@ -378,6 +486,34 @@ pub(crate) fn append_editor_property_changes(
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
     let settings_ids_by_index = editor_settings_ids(document);
+    append_editor_property_changes_with_paths(
+        changes,
+        document,
+        service,
+        property_schema_by_class,
+        filter,
+        database,
+        EditorPropertyPaths {
+            paths_by_index: &paths_by_index,
+            settings_ids_by_index: &settings_ids_by_index,
+        },
+    );
+}
+
+struct EditorPropertyPaths<'a> {
+    paths_by_index: &'a [Option<EditorInstancePath>],
+    settings_ids_by_index: &'a [&'a str],
+}
+
+fn append_editor_property_changes_with_paths(
+    changes: &mut EditorChangeSet,
+    document: &SettingsBytecode,
+    service: &str,
+    property_schema_by_class: &PropertySchemaMap,
+    filter: &EditorPropertyFilter,
+    database: &ReflectionDatabase<'_>,
+    paths: EditorPropertyPaths<'_>,
+) {
     for (index, instance) in document.instances.iter().enumerate() {
         if instance.class_name == "PackageLink" {
             continue;
@@ -385,7 +521,11 @@ pub(crate) fn append_editor_property_changes(
         if !filter.includes_instance(&instance.settings_id) {
             continue;
         }
-        let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
+        let Some(path_info) = paths
+            .paths_by_index
+            .get(index)
+            .and_then(std::clone::Clone::clone)
+        else {
             continue;
         };
         let path_segments = path_info.path_segments.clone();
@@ -421,8 +561,8 @@ pub(crate) fn append_editor_property_changes(
                 normalize_editor_bridge_value(
                     value,
                     schema_entry,
-                    &paths_by_index,
-                    &settings_ids_by_index,
+                    paths.paths_by_index,
+                    paths.settings_ids_by_index,
                 ),
             );
         }
@@ -430,11 +570,126 @@ pub(crate) fn append_editor_property_changes(
         let attributes = if !filter.property_names.is_empty() {
             Map::new()
         } else {
-            normalized_editor_attributes(instance, &paths_by_index, &settings_ids_by_index)
+            normalized_editor_attributes(
+                instance,
+                paths.paths_by_index,
+                paths.settings_ids_by_index,
+            )
         };
 
         append_editor_property_change(
             changes, service, instance, path_info, properties, attributes,
+        );
+    }
+}
+
+pub(crate) struct EditorTargetChangeOptions<'a, 'db> {
+    pub(crate) upsert_instances: bool,
+    pub(crate) properties: bool,
+    pub(crate) property_schema_by_class: &'a PropertySchemaMap,
+    pub(crate) database: &'db ReflectionDatabase<'db>,
+}
+
+pub(crate) fn append_editor_target_changes(
+    changes: &mut EditorChangeSet,
+    document: &SettingsBytecode,
+    service: &str,
+    filter: &EditorPropertyFilter,
+    options: EditorTargetChangeOptions<'_, '_>,
+) {
+    if !filter.settings_ids.is_empty() {
+        let (target_indices, mut selected_indices) = editor_target_indices(document, filter);
+        let sibling_counts = if options.upsert_instances {
+            expand_ambiguous_editor_siblings(document, &mut selected_indices)
+        } else {
+            EditorSiblingGroupCounts::new()
+        };
+        let mut path_indices = selected_indices.clone();
+        if options.properties {
+            for index in &target_indices {
+                let instance = &document.instances[*index];
+                for value in instance
+                    .properties
+                    .values()
+                    .chain(instance.attributes.values())
+                {
+                    collect_editor_reference_indices(value, &mut path_indices);
+                }
+            }
+        }
+        let path_indices = path_indices.into_iter().collect::<Vec<_>>();
+        let mut paths_by_index = vec![None; document.instances.len()];
+        for (index, path) in
+            build_editor_instance_paths_for_indices(document, service, &path_indices)
+        {
+            paths_by_index[index] = Some(path);
+        }
+        if options.upsert_instances {
+            append_editor_target_instance_upserts_for_indices(
+                changes,
+                document,
+                service,
+                &paths_by_index,
+                &sibling_counts,
+                &target_indices,
+                &selected_indices,
+            );
+            append_editor_target_inline_source_changes_with_paths(
+                changes,
+                document,
+                service,
+                filter,
+                &paths_by_index,
+            );
+        }
+        if options.properties {
+            let settings_ids_by_index = editor_settings_ids(document);
+            append_editor_property_changes_with_paths(
+                changes,
+                document,
+                service,
+                options.property_schema_by_class,
+                filter,
+                options.database,
+                EditorPropertyPaths {
+                    paths_by_index: &paths_by_index,
+                    settings_ids_by_index: &settings_ids_by_index,
+                },
+            );
+        }
+        return;
+    }
+
+    let paths_by_index = build_editor_instance_paths(document, service);
+    if options.upsert_instances {
+        append_editor_target_instance_upserts_with_paths(
+            changes,
+            document,
+            service,
+            filter,
+            &paths_by_index,
+        );
+        append_editor_target_inline_source_changes_with_paths(
+            changes,
+            document,
+            service,
+            filter,
+            &paths_by_index,
+        );
+    }
+    if options.properties {
+        let settings_ids_by_index = editor_settings_ids(document);
+        append_editor_property_changes_with_paths(
+            changes,
+            document,
+            service,
+            options.property_schema_by_class,
+            filter,
+            options.database,
+            EditorPropertyPaths {
+                paths_by_index: &paths_by_index,
+                settings_ids_by_index: &settings_ids_by_index,
+            },
         );
     }
 }

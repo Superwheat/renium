@@ -18,7 +18,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::app::timing::current_millis;
-use crate::system::files::read_file_if_present;
+use crate::system::files::{read_file_if_present, resolved_current_executable};
 
 const DEFAULT_UPDATE_MANIFEST: &str =
     "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
@@ -249,7 +249,6 @@ struct DeferredUpdateOriginals {
     file_backups: Vec<PathBackup>,
     extension_backups: Vec<ExtensionRootBackup>,
     core_backups: Vec<PathBackup>,
-    managed_studio_backup: Option<ManagedStudioBackup>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -644,7 +643,8 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
 }
 
 fn delegate_extension_owned_update(args: &UpdateApplyArgs) -> Result<bool> {
-    let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
+    let current =
+        resolved_current_executable().context("Failed to locate the running Renium CLI")?;
     if !cli_is_extension_owned(&current) {
         return Ok(false);
     }
@@ -807,7 +807,7 @@ pub(crate) fn check_agent_update() {
 }
 
 fn spawn_agent_update_check() {
-    let Ok(executable) = env::current_exe() else {
+    let Ok(executable) = resolved_current_executable() else {
         return;
     };
     let mut command = Command::new(executable);
@@ -898,7 +898,7 @@ fn apply_update(
     requested.sort();
     requested.dedup();
     if requested.contains(&UpdateComponent::Cli)
-        && env::current_exe()
+        && resolved_current_executable()
             .ok()
             .is_some_and(|path| cli_is_extension_owned(&path))
     {
@@ -982,7 +982,8 @@ fn apply_update(
         }
     }
     if apply_cli {
-        let target = env::current_exe().context("Failed to locate the running Renium CLI")?;
+        let target =
+            resolved_current_executable().context("Failed to locate the running Renium CLI")?;
         target
             .parent()
             .context("The running Renium CLI has no installation directory")?;
@@ -995,7 +996,7 @@ fn apply_update(
     let managed_studio_platform: Option<String> = None;
     #[cfg(target_os = "macos")]
     if let Some(target_platform) = managed_studio_platform.as_deref() {
-        crate::studio::native::serializer::managed_studio_path()?;
+        crate::studio::native::serializer::patched_studio_path()?;
         if manifest
             .payload
             .components
@@ -1117,7 +1118,8 @@ fn apply_update(
     if let Some(bytes) = plugin_bytes.as_deref() {
         crate::app::setup::validate_rbxm_version(bytes, &manifest.payload.version)?;
     }
-    let target = env::current_exe().context("Failed to locate the running Renium CLI")?;
+    let target =
+        resolved_current_executable().context("Failed to locate the running Renium CLI")?;
     let mut plan = DeferredUpdatePlan {
         transaction_id: format!("{}-{}", std::process::id(), current_millis()),
         phase: "staged".to_string(),
@@ -1270,14 +1272,6 @@ struct ExtensionRootBackup {
     existed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ManagedStudioBackup {
-    target: PathBuf,
-    backup: PathBuf,
-    existed: bool,
-    sha256: Option<String>,
-}
-
 fn extension_roots() -> Vec<PathBuf> {
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
@@ -1296,7 +1290,7 @@ fn extension_roots() -> Vec<PathBuf> {
     if let Some(root) = env::var_os("RENIUM_EXTENSION_ROOT") {
         roots.push(PathBuf::from(root));
     }
-    if let Ok(executable) = env::current_exe() {
+    if let Ok(executable) = resolved_current_executable() {
         for ancestor in executable.ancestors() {
             if ancestor
                 .file_name()
@@ -1314,7 +1308,8 @@ fn extension_roots() -> Vec<PathBuf> {
 }
 
 fn default_update_components(components: &PlatformArtifacts) -> Result<Vec<UpdateComponent>> {
-    let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
+    let current =
+        resolved_current_executable().context("Failed to locate the running Renium CLI")?;
     let extension_owned = cli_is_extension_owned(&current);
     let mut requested = Vec::new();
     if extension_owned {
@@ -1500,56 +1495,6 @@ fn restore_extension_installation(snapshots: &[ExtensionRootBackup]) -> Result<(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn snapshot_managed_studio(stage: &Path) -> Result<ManagedStudioBackup> {
-    let target = crate::studio::native::serializer::managed_studio_path()?;
-    let backup = stage.join("managed-studio.previous.app");
-    let existed = target.is_dir();
-    if existed {
-        let status = Command::new("ditto")
-            .arg(&target)
-            .arg(&backup)
-            .status()
-            .context("Failed to snapshot the managed Studio app")?;
-        if !status.success() {
-            bail!("Managed Studio snapshot exited with {status}");
-        }
-    }
-    Ok(ManagedStudioBackup {
-        target,
-        sha256: existed.then(|| directory_sha256(&backup)).transpose()?,
-        backup,
-        existed,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn restore_managed_studio(snapshot: &ManagedStudioBackup) -> Result<()> {
-    if snapshot.target.exists() {
-        fs::remove_dir_all(&snapshot.target)
-            .with_context(|| format!("Failed to remove {}", snapshot.target.display()))?;
-    }
-    if snapshot.existed {
-        let expected = snapshot
-            .sha256
-            .as_deref()
-            .context("The managed Studio backup hash is missing")?;
-        let actual = directory_sha256(&snapshot.backup)?;
-        if !actual.eq_ignore_ascii_case(expected) {
-            bail!("The managed Studio backup no longer matches its recorded hash");
-        }
-        let status = Command::new("ditto")
-            .arg(&snapshot.backup)
-            .arg(&snapshot.target)
-            .status()
-            .context("Failed to restore the managed Studio app")?;
-        if !status.success() {
-            bail!("Managed Studio restore exited with {status}");
-        }
-    }
-    Ok(())
-}
-
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
@@ -1715,19 +1660,10 @@ fn prepare_update_originals(plan: &DeferredUpdatePlan) -> Result<DeferredUpdateO
             }
         }
     }
-    #[cfg(target_os = "macos")]
-    let managed_studio_backup = plan
-        .plugin
-        .is_some()
-        .then(|| snapshot_managed_studio(&root))
-        .transpose()?;
-    #[cfg(not(target_os = "macos"))]
-    let managed_studio_backup = None;
     Ok(DeferredUpdateOriginals {
         file_backups,
         extension_backups,
         core_backups,
-        managed_studio_backup,
     })
 }
 
@@ -1747,17 +1683,6 @@ fn verify_update_originals(originals: &DeferredUpdateOriginals) -> Result<()> {
             }
         }
     }
-    if let Some(snapshot) = originals.managed_studio_backup.as_ref()
-        && snapshot.existed
-    {
-        let expected = snapshot
-            .sha256
-            .as_deref()
-            .context("The managed Studio backup hash is missing")?;
-        if !directory_sha256(&snapshot.backup)?.eq_ignore_ascii_case(expected) {
-            bail!("The managed Studio backup no longer matches its recorded hash");
-        }
-    }
     Ok(())
 }
 
@@ -1768,12 +1693,6 @@ fn restore_update_originals(originals: &DeferredUpdateOriginals) -> Result<()> {
             errors.push(format!("{}: {error:#}", backup.target.display()));
         }
     }
-    #[cfg(target_os = "macos")]
-    if let Some(snapshot) = originals.managed_studio_backup.as_ref() {
-        if let Err(error) = restore_managed_studio(snapshot) {
-            errors.push(format!("{}: {error:#}", snapshot.target.display()));
-        }
-    }
     if let Err(error) = restore_extension_installation(&originals.extension_backups) {
         errors.push(format!("{error:#}"));
     }
@@ -1781,6 +1700,10 @@ fn restore_update_originals(originals: &DeferredUpdateOriginals) -> Result<()> {
         if let Err(error) = restore_path_backup(backup) {
             errors.push(format!("{}: {error:#}", backup.target.display()));
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::studio::native::serializer::setup_studio_patch(false) {
+        errors.push(format!("Roblox Studio patch: {error:#}"));
     }
     if errors.is_empty() {
         Ok(())
@@ -1863,12 +1786,13 @@ fn managed_core_root(target: &Path) -> Option<PathBuf> {
 }
 
 fn recover_running_core_install() -> Result<()> {
-    let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
+    let current =
+        resolved_current_executable().context("Failed to locate the running Renium CLI")?;
     if let Some(target_root) = managed_core_root(&current) {
         recover_core_install(&target_root)?;
     }
     #[cfg(target_os = "macos")]
-    crate::studio::native::serializer::recover_managed_studio_install()?;
+    crate::studio::native::serializer::recover_studio_patch_install()?;
     Ok(())
 }
 
@@ -2012,7 +1936,8 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 
 #[cfg(windows)]
 fn plan_mutates_running_executable(plan: &DeferredUpdatePlan) -> Result<bool> {
-    let current = env::current_exe().context("Failed to locate the running Renium CLI")?;
+    let current =
+        resolved_current_executable().context("Failed to locate the running Renium CLI")?;
     if plan.components.contains(&UpdateComponent::Cli) && paths_equal(&current, &plan.target) {
         return Ok(true);
     }
@@ -2217,9 +2142,8 @@ fn apply_staged_update_plan(
         let bytes = fs::read(&plugin.source)
             .with_context(|| format!("Failed to read {}", plugin.source.display()))?;
         crate::app::setup::validate_rbxm_version(&bytes, &plan.version)?;
-        install_bytes(&plugin.target, &bytes)?;
         #[cfg(target_os = "macos")]
-        if let Some(core_root) = plan
+        let installed_by_setup = if let Some(core_root) = plan
             .managed_studio_core_stage
             .as_deref()
             .or(plan.core_stage.as_deref())
@@ -2239,10 +2163,18 @@ fn apply_staged_update_plan(
             _lifecycle_lock.apply_to_command(&mut command);
             let status = command
                 .status()
-                .context("Failed to start the updated Renium managed Studio setup")?;
+                .context("Failed to start the updated Renium Studio setup")?;
             if !status.success() {
-                bail!("Updated Renium managed Studio setup exited with {status}");
+                bail!("Updated Renium Studio setup exited with {status}");
             }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "macos"))]
+        let installed_by_setup = false;
+        if !installed_by_setup {
+            install_bytes(&plugin.target, &bytes)?;
         }
     }
     for install in &plan.extension_installs {
@@ -2375,7 +2307,9 @@ fn schedule_windows_update(plan: &DeferredUpdatePlan, core_root: Option<&Path>) 
     let plan_path = plan.stage.join("update-plan.json");
     fs::write(&plan_path, serde_json::to_vec(plan)?)
         .with_context(|| format!("Failed to write {}", plan_path.display()))?;
-    let helper_source = core_root.map_or(env::current_exe()?, |root| root.join("renium.exe"));
+    let helper_source = core_root.map_or(resolved_current_executable()?, |root| {
+        root.join("renium.exe")
+    });
     let helper = env::temp_dir().join(format!(
         "renium-update-helper-{}-{}.exe",
         std::process::id(),
@@ -2524,7 +2458,7 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
             recover_core_install(&target_root)?;
         }
         #[cfg(target_os = "macos")]
-        crate::studio::native::serializer::recover_managed_studio_install()?;
+        crate::studio::native::serializer::recover_studio_patch_install()?;
         verify_update_originals(
             plan.originals
                 .as_ref()
@@ -2862,7 +2796,7 @@ pub(crate) fn report_pending_update_result() {
     let Ok(primary) = deferred_update_result_path() else {
         return;
     };
-    let Ok(current) = env::current_exe() else {
+    let Ok(current) = resolved_current_executable() else {
         return;
     };
     let mut candidates = vec![(primary, false)];

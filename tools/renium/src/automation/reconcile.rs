@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -14,18 +14,17 @@ use walkdir::WalkDir;
 
 use super::BoundContext;
 use super::context as bound_context;
-use super::runtime::{automation_pull_args, automation_push_args};
-use crate::app::output::{ensure_plugin_api_ok, log_global};
+use super::runtime::{acknowledge_pulled_changes, automation_pull_args, automation_push_args};
+use crate::app::output::{ensure_plugin_api_ok, global_log_enabled, log_global};
 use crate::app::timing::elapsed_ms;
 use crate::cli::PushEditorChangesArgs;
 use crate::editor::diff::editor_instance_descriptor_for_known_path;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_instance_paths_for_indices,
-    build_editor_source_paths_by_index,
+    build_editor_instance_paths_for_indices, build_editor_source_paths_by_index,
 };
 use crate::editor::review::local_place_path_for_runtime;
 use crate::editor::sync::{
-    StudioChangeGuard, expand_editor_changed_paths,
+    StudioChangeGuard, expand_editor_changed_paths, is_lua_source_class,
     push_reconciled_editor_changes_with_warm_bridge, settings_file_hash,
 };
 use crate::editor::types::{
@@ -41,11 +40,14 @@ use crate::settings::bytecode::{
     encode_settings_bytecode,
 };
 use crate::settings::equivalence::{
-    align_equivalent_values, align_settings_ids_to_reference, canonicalize_settings_property_names,
-    drop_settings_documents, reconciliation_maps_equal, reconciliation_property_is_derived,
-    reconciliation_property_value, reconciliation_values_equal, reconciliation_values_map_equal,
-    remove_reconciliation_derived_properties, settings_documents_equivalent,
-    settings_documents_positionally_equivalent, stabilize_settings_reference_ids,
+    align_equivalent_values, align_reconciliation_protected_workspace_cameras,
+    align_settings_ids_to_reference, canonicalize_settings_property_names, drop_settings_document,
+    drop_settings_documents, is_reconciliation_protected_workspace_camera,
+    reconciliation_maps_equal, reconciliation_property_is_derived, reconciliation_property_value,
+    reconciliation_property_values_equal, reconciliation_values_equal,
+    reconciliation_values_map_equal, remove_reconciliation_derived_properties,
+    settings_documents_equivalent, settings_documents_positionally_equivalent,
+    stabilize_settings_reference_ids,
 };
 use crate::snapshot::export::{ExportProjectStage, export_snapshots_with_warm_bridge};
 use crate::snapshot::refs::remap_record_reference_ids;
@@ -139,6 +141,90 @@ struct PairIdentity {
     local_file: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LocalFileStamp {
+    length: u64,
+    modified_seconds: u64,
+    modified_nanos: u32,
+}
+
+fn local_file_stamp(path: Option<&str>) -> Result<Option<LocalFileStamp>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect local place file {path}"));
+        }
+    };
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("Failed to read local place timestamp for {path}"))?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok(Some(LocalFileStamp {
+        length: metadata.len(),
+        modified_seconds: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+    }))
+}
+
+fn local_file_digest(path: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to open local place file {path}"));
+        }
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("Failed to read local place file {path}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(Some(format!("{:x}", digest.finalize())))
+}
+
+fn should_bootstrap_studio_from_editor(
+    mode: PairMode,
+    previous_runtime_id: Option<&str>,
+    current_runtime_id: Option<&str>,
+    previous_local_file_digest: Option<&str>,
+    current_local_file_digest: Option<&str>,
+) -> bool {
+    mode == PairMode::Reconcile
+        && previous_runtime_id.is_some()
+        && previous_runtime_id != current_runtime_id
+        && previous_local_file_digest.is_some()
+        && previous_local_file_digest == current_local_file_digest
+}
+
+fn legacy_local_file_stamp_matches(
+    mode: PairMode,
+    runtime_replaced: bool,
+    previous_local_file_digest: Option<&str>,
+    previous_local_file_stamp: Option<&LocalFileStamp>,
+    current_local_file_stamp: Option<&LocalFileStamp>,
+) -> bool {
+    mode == PairMode::Reconcile
+        && runtime_replaced
+        && previous_local_file_digest.is_none()
+        && previous_local_file_stamp.is_some()
+        && previous_local_file_stamp == current_local_file_stamp
+}
+
 impl PairIdentity {
     fn from_context(context: &BoundContext, bridge: &BridgeServer) -> Result<Self> {
         let published = context.game_id.is_some_and(|value| value > 0)
@@ -219,6 +305,11 @@ struct ReconcilePushPlan {
     property_removals: Vec<EditorPropertyChange>,
 }
 
+struct PreparedEditorSettingsChange {
+    previous: SettingsBytecode,
+    current: SettingsBytecode,
+}
+
 #[derive(Default)]
 struct MergeChanges {
     editor: HashSet<PathBuf>,
@@ -255,6 +346,96 @@ struct RecoveryHead {
     intended: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StudioCheckpoint {
+    runtime_id: String,
+    change_tracker_version: u64,
+    seq: u64,
+    service_generations: BTreeMap<String, u64>,
+}
+
+fn checkpoint_generations(state: &Value) -> Option<&Map<String, Value>> {
+    state["checkpointGenerations"]
+        .as_object()
+        .or_else(|| state["serviceGenerations"].as_object())
+}
+
+impl StudioCheckpoint {
+    fn from_state(context: &BoundContext, state: &Value) -> Option<Self> {
+        let services = sync_services();
+        if state["tracking"].as_bool() != Some(true)
+            || state["trackedServices"].as_u64() != u64::try_from(services.len()).ok()
+            || !state["dirtyServices"].as_array().is_some_and(Vec::is_empty)
+            || !state["fullSyncServices"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        {
+            return None;
+        }
+        let runtime_id = state["runtimeId"].as_str()?;
+        if context.runtime_id.as_deref() != Some(runtime_id) {
+            return None;
+        }
+        let generations = checkpoint_generations(state)?;
+        if generations.len() != services.len() {
+            return None;
+        }
+        let service_generations = services
+            .into_iter()
+            .map(|service| Some((service.clone(), generations.get(&service)?.as_u64()?)))
+            .collect::<Option<_>>()?;
+        Some(Self {
+            runtime_id: runtime_id.to_string(),
+            change_tracker_version: state["changeTrackerVersion"].as_u64()?,
+            seq: state["seq"].as_u64()?,
+            service_generations,
+        })
+    }
+
+    fn matches_state(&self, context: &BoundContext, state: &Value) -> bool {
+        Self::from_state(context, state).as_ref() == Some(self)
+    }
+
+    fn changed_services(&self, context: &BoundContext, state: &Value) -> Option<Vec<String>> {
+        let services = sync_services();
+        if state["tracking"].as_bool() != Some(true)
+            || state["trackedServices"].as_u64() != u64::try_from(services.len()).ok()
+            || state["runtimeId"].as_str()? != self.runtime_id
+            || context.runtime_id.as_deref() != Some(self.runtime_id.as_str())
+            || state["changeTrackerVersion"].as_u64()? != self.change_tracker_version
+            || state["seq"].as_u64()? < self.seq
+            || state["referencePathsMayChange"].as_bool() == Some(true)
+        {
+            return None;
+        }
+        let generations = checkpoint_generations(state)?;
+        if generations.len() != services.len() {
+            return None;
+        }
+        let allowed = services.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut changed = BTreeSet::new();
+        for key in ["dirtyServices", "fullSyncServices"] {
+            for service in state[key].as_array()?.iter().map(Value::as_str) {
+                let service = service?;
+                if !allowed.contains(service) {
+                    return None;
+                }
+                changed.insert(service.to_string());
+            }
+        }
+        for service in &services {
+            let current = generations.get(service)?.as_u64()?;
+            if self.service_generations.get(service) != Some(&current) {
+                changed.insert(service.clone());
+            }
+        }
+        if state["seq"].as_u64()? != self.seq && changed.is_empty() {
+            return None;
+        }
+        Some(changed.into_iter().collect())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PairRecord {
     version: u8,
@@ -270,6 +451,14 @@ struct PairRecord {
     conflicts: Vec<String>,
     #[serde(default)]
     resolution_required: bool,
+    #[serde(default)]
+    last_runtime_id: Option<String>,
+    #[serde(default)]
+    local_file_stamp: Option<LocalFileStamp>,
+    #[serde(default)]
+    local_file_digest: Option<String>,
+    #[serde(default)]
+    studio_checkpoint: Option<StudioCheckpoint>,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +538,11 @@ pub(crate) struct PairSetup {
     pub(crate) resolution_required: bool,
     pub(crate) error: Option<String>,
     pub(crate) requires_reconcile: bool,
+    runtime_id: Option<String>,
+    local_file_stamp: Option<LocalFileStamp>,
+    local_file_digest: Option<String>,
+    bootstrap_studio_from_editor: bool,
+    runtime_replacement_unproven: bool,
 }
 
 #[derive(Default)]
@@ -388,6 +582,8 @@ impl Coordinator {
             runtime_settings,
         } = configuration;
         let identity = PairIdentity::from_context(context, bridge)?;
+        let current_runtime_id = context.runtime_id.clone();
+        let current_local_file_stamp = local_file_stamp(identity.local_file.as_deref())?;
         let pair_key = identity.pair_key();
         let pair_lock = self.pair_lock(&pair_key);
         let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -420,7 +616,40 @@ impl Coordinator {
             head: None,
             conflicts: Vec::new(),
             resolution_required: false,
+            last_runtime_id: None,
+            local_file_stamp: None,
+            local_file_digest: None,
+            studio_checkpoint: None,
         });
+        let runtime_replaced =
+            record.last_runtime_id.is_some() && record.last_runtime_id != current_runtime_id;
+        let current_local_file_digest = if runtime_replaced
+            || record.local_file_digest.is_none()
+            || record.local_file_stamp != current_local_file_stamp
+        {
+            local_file_digest(identity.local_file.as_deref())?
+        } else {
+            record.local_file_digest.clone()
+        };
+        let legacy_stamp_matches = legacy_local_file_stamp_matches(
+            mode,
+            runtime_replaced,
+            record.local_file_digest.as_deref(),
+            record.local_file_stamp.as_ref(),
+            current_local_file_stamp.as_ref(),
+        );
+        let runtime_replacement_unproven = runtime_replaced
+            && identity.local_file.is_some()
+            && record.local_file_digest.is_none()
+            && !legacy_stamp_matches;
+        let bootstrap_studio_from_editor = legacy_stamp_matches
+            || should_bootstrap_studio_from_editor(
+                mode,
+                record.last_runtime_id.as_deref(),
+                current_runtime_id.as_deref(),
+                record.local_file_digest.as_deref(),
+                current_local_file_digest.as_deref(),
+            );
         let configuration_changed = record.identity.fingerprint != identity.fingerprint;
         let obsolete_head = record.head.take().is_some();
         let record_changed = record_missing
@@ -428,14 +657,19 @@ impl Coordinator {
             || record.identity != identity
             || record.mode != mode
             || record.conflict_preference != conflict_preference
-            || record.runtime_settings != runtime_settings;
+            || record.runtime_settings != runtime_settings
+            || !runtime_replaced
+                && (record.local_file_stamp != current_local_file_stamp
+                    || record.local_file_digest != current_local_file_digest);
         let requires_reconcile = record_missing
             || configuration_changed
             || record.mode != mode
             || record.conflict_preference != conflict_preference
-            || !record.conflicts.is_empty();
+            || !record.conflicts.is_empty()
+            || runtime_replaced;
         if configuration_changed {
             record.baseline = None;
+            record.studio_checkpoint = None;
             record.conflicts.clear();
             record.resolution_required = false;
         }
@@ -443,6 +677,10 @@ impl Coordinator {
         record.mode = mode;
         record.conflict_preference = conflict_preference;
         record.runtime_settings = runtime_settings;
+        if !runtime_replaced {
+            record.local_file_stamp = current_local_file_stamp.clone();
+            record.local_file_digest = current_local_file_digest.clone();
+        }
         if record_changed {
             write_record(context, &pair_key, &record)?;
         }
@@ -466,6 +704,11 @@ impl Coordinator {
                     })
                 }),
             requires_reconcile,
+            runtime_id: current_runtime_id,
+            local_file_stamp: current_local_file_stamp,
+            local_file_digest: current_local_file_digest,
+            bootstrap_studio_from_editor,
+            runtime_replacement_unproven,
         })
     }
 
@@ -475,19 +718,122 @@ impl Coordinator {
         bridge: &BridgeServer,
         setup: &mut PairSetup,
     ) -> Result<()> {
+        let _gate = bridge.acquire_request_gate();
         // Every operation that needs both locks takes the bridge gate first.
         // LiveLoop::execute_push already follows this order.
-        let _gate = bridge.acquire_request_gate();
         let pair_lock = self.pair_lock(&setup.key);
         let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut record = load_record(context, &setup.key)?
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
-        let studio_guard = current_studio_change_guard(context, bridge)?;
+        let (studio_guard, studio_state) = current_studio_change_guard_with_state(context, bridge)?;
+        if setup.runtime_replacement_unproven && setup.resolution_preference.is_none() {
+            setup.mode = PairMode::Verify;
+            setup.error = Some(
+                "Renium cannot prove whether the local place file changed before this Studio restart; choose Studio or project files"
+                    .to_string(),
+            );
+            setup.resolution_required = true;
+            return Ok(());
+        }
+        if setup.bootstrap_studio_from_editor && !studio_guard.runtime_bootstrap_safe {
+            setup.mode = PairMode::Verify;
+            setup.error = Some(
+                "Studio restarted before change tracking was active; Renium left both sides unchanged"
+                    .to_string(),
+            );
+            setup.resolution_required = false;
+            return Ok(());
+        }
+        log_global(
+            5,
+            format_args!(
+                "[renium] clean restart checkpoint: stored={} matches={}",
+                record.studio_checkpoint.is_some(),
+                record
+                    .studio_checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.matches_state(context, &studio_state))
+            ),
+        );
+        if !setup.requires_reconcile
+            && let (Some(checkpoint), Some(baseline)) =
+                (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
+            && checkpoint.matches_state(context, &studio_state)
+        {
+            let phase = Instant::now();
+            let stage = project_comparison_stage(context, &sync_services())?;
+            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
+            drop(stage);
+            log_reconcile_timing("clean restart comparison", phase);
+            let differences = if baseline.matches(&editor) {
+                HashSet::new()
+            } else {
+                let previous = baseline.load(Path::new(&context.root), &setup.key)?;
+                snapshot_differences(&previous, &editor)?
+            };
+            let confirmed = read_studio_change_state(context, bridge)?;
+            if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
+                record.last_runtime_id = setup.runtime_id.clone();
+                record.local_file_stamp = setup.local_file_stamp.clone();
+                record.local_file_digest = setup.local_file_digest.clone();
+                write_record(context, &setup.key, &record)?;
+                setup.resolution_required = false;
+                return Ok(());
+            }
+            if checkpoint.matches_state(context, &confirmed) && setup.mode.writes() {
+                let mut paths = differences.into_iter().collect::<Vec<_>>();
+                paths.sort();
+                record.last_runtime_id = setup.runtime_id.clone();
+                record.local_file_stamp = setup.local_file_stamp.clone();
+                record.local_file_digest = setup.local_file_digest.clone();
+                self.push_editor_changes_locked(
+                    context,
+                    &setup.key,
+                    bridge,
+                    &paths,
+                    Some(&studio_guard),
+                    &mut record,
+                )?;
+                setup.resolution_required = false;
+                return Ok(());
+            }
+        }
         let phase = Instant::now();
-        let (stage, studio) = capture_studio_project_for_comparison(context, bridge)?;
+        let selective_services = match (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
+        {
+            (Some(checkpoint), Some(_)) => {
+                selective_studio_services(context, checkpoint, &studio_state)?
+            }
+            _ => None,
+        };
+        let mut loaded_baseline = None;
+        let selective_capture = if let Some(services) = selective_services {
+            let baseline = record
+                .baseline
+                .as_ref()
+                .context("Reconciliation baseline disappeared")?
+                .load(Path::new(&context.root), &setup.key)?;
+            let captured = capture_changed_studio_services(
+                context,
+                bridge,
+                &services,
+                &baseline,
+                &studio_state,
+            )?;
+            loaded_baseline = Some(baseline);
+            captured
+        } else {
+            None
+        };
+        let (stage, studio, editor) = if let Some(captured) = selective_capture {
+            captured
+        } else {
+            let (stage, studio) = capture_studio_project_for_comparison(context, bridge)?;
+            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
+            (stage, studio, editor)
+        };
         let publish_paths = stage.publish_paths().to_vec();
-        let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
         log_reconcile_timing("capture", phase);
         let phase = Instant::now();
         let side_differences = snapshot_differences(&editor, &studio)?;
@@ -509,35 +855,99 @@ impl Coordinator {
                 )?);
                 record.conflicts.clear();
                 record.resolution_required = false;
-                write_record(context, &setup.key, &record)?;
                 log_reconcile_timing("baseline write", phase);
             }
+            record.last_runtime_id = setup.runtime_id.clone();
+            record.local_file_stamp = setup.local_file_stamp.clone();
+            record.local_file_digest = setup.local_file_digest.clone();
+            record.studio_checkpoint =
+                reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
+            write_record(context, &setup.key, &record)?;
             setup.resolution_required = false;
             return Ok(());
         }
         let phase = Instant::now();
-        let baseline = record
-            .baseline
-            .as_ref()
-            .map(|baseline| baseline.load(Path::new(&context.root), &setup.key))
-            .transpose()?;
+        let baseline = match loaded_baseline {
+            Some(baseline) => Some(baseline),
+            None => record
+                .baseline
+                .as_ref()
+                .map(|baseline| baseline.load(Path::new(&context.root), &setup.key))
+                .transpose()?,
+        };
         log_reconcile_timing("baseline load", phase);
         let phase = Instant::now();
-        let (mut merged, conflicts, mut changes) = merge_snapshots_with_changes(
-            baseline.as_ref(),
-            &editor,
-            &studio,
-            setup
-                .resolution_preference
-                .unwrap_or(record.conflict_preference),
-            Some(&side_differences),
-        )?;
+        let merge_preference = setup
+            .resolution_preference
+            .unwrap_or(record.conflict_preference);
+        log_global(
+            5,
+            format_args!(
+                "[renium] reconcile merge input: baseline={} preference={merge_preference:?} resolution={:?}",
+                baseline.is_some(),
+                setup.resolution_preference
+            ),
+        );
+        let (mut merged, conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
+            (
+                editor.clone(),
+                Vec::new(),
+                MergeChanges {
+                    editor: HashSet::new(),
+                    studio: side_differences.clone(),
+                },
+            )
+        } else {
+            merge_snapshots_with_changes(
+                baseline.as_ref(),
+                &editor,
+                &studio,
+                merge_preference,
+                Some(&side_differences),
+            )?
+        };
+        log_global(
+            5,
+            format_args!(
+                "[renium] reconcile merge result: conflicts={} editor_paths={} studio_paths={}",
+                conflicts.len(),
+                changes.editor.len(),
+                changes.studio.len()
+            ),
+        );
+        if !changes.editor.is_empty() {
+            let mut paths = changes
+                .editor
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            log_global(
+                5,
+                format_args!("[renium] reconcile project paths: {}", paths.join(", ")),
+            );
+        }
+        if !changes.studio.is_empty() {
+            let mut paths = changes
+                .studio
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            log_global(
+                5,
+                format_args!("[renium] reconcile Studio paths: {}", paths.join(", ")),
+            );
+        }
         log_reconcile_timing("merge", phase);
 
         if !conflicts.is_empty() {
             record.conflicts = conflicts;
             record.resolution_required = setup.resolution_preference.is_none()
                 && record.conflict_preference == ConflictPreference::None;
+            record.last_runtime_id = setup.runtime_id.clone();
+            record.local_file_stamp = setup.local_file_stamp.clone();
+            record.local_file_digest = setup.local_file_digest.clone();
             write_record(context, &setup.key, &record)?;
             setup.mode = PairMode::Verify;
             setup.resolution_required = record.resolution_required;
@@ -549,6 +959,9 @@ impl Coordinator {
             record.conflicts = vec!["Studio and project files differ".to_string()];
             record.resolution_required = false;
             setup.error = Some(conflict_message(&record.conflicts));
+            record.last_runtime_id = setup.runtime_id.clone();
+            record.local_file_stamp = setup.local_file_stamp.clone();
+            record.local_file_digest = setup.local_file_digest.clone();
             write_record(context, &setup.key, &record)?;
             setup.resolution_required = false;
             return Ok(());
@@ -556,9 +969,7 @@ impl Coordinator {
 
         let _readback = if changes.studio.is_empty() {
             if !changes.editor.is_empty() {
-                capture_studio_project(context, bridge)?
-                    .0
-                    .publish(Path::new(&context.root), false)?;
+                publish_captured_studio(context, bridge, stage, &studio_guard)?;
             }
             studio
         } else {
@@ -567,9 +978,7 @@ impl Coordinator {
             log_reconcile_timing("push plan", phase);
             if push_plan.is_empty() {
                 if !changes.editor.is_empty() {
-                    capture_studio_project(context, bridge)?
-                        .0
-                        .publish(Path::new(&context.root), false)?;
+                    publish_captured_studio(context, bridge, stage, &studio_guard)?;
                 }
                 studio
             } else {
@@ -581,10 +990,13 @@ impl Coordinator {
                     context,
                     &stage,
                     bridge,
-                    push_plan,
-                    Some(&studio_guard),
-                    automation_push_args(context, &json!({}), false)?,
-                    Some(&editor),
+                    StagedPushRequest {
+                        plan: push_plan,
+                        prepared_documents: HashMap::new(),
+                        guard: Some(&studio_guard),
+                        args: automation_push_args(context, &json!({}), false)?,
+                        expected_project: Some(&editor),
+                    },
                 )?
                 .generated;
                 let generated_paths = generated.entries.keys().cloned().collect::<HashSet<_>>();
@@ -662,6 +1074,11 @@ impl Coordinator {
         )?);
         record.conflicts.clear();
         record.resolution_required = false;
+        record.last_runtime_id = setup.runtime_id.clone();
+        record.local_file_stamp = setup.local_file_stamp.clone();
+        record.local_file_digest = setup.local_file_digest.clone();
+        record.studio_checkpoint =
+            reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
         setup.resolution_required = false;
         write_record(context, &setup.key, &record)?;
         log_reconcile_timing("final baseline write", phase);
@@ -673,6 +1090,12 @@ impl Coordinator {
         context: &BoundContext,
         bridge: &BridgeServer,
     ) -> Result<PairSetup> {
+        let mut setup = self.current_setup(context, bridge)?;
+        self.reconcile(context, bridge, &mut setup)?;
+        Ok(setup)
+    }
+
+    fn current_setup(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<PairSetup> {
         log_global(
             5,
             format_args!("[renium] reconcile current: cx={}", context.id),
@@ -680,16 +1103,27 @@ impl Coordinator {
         let identity = PairIdentity::from_context(context, bridge)?;
         let key = identity.pair_key();
         let record = load_record(context, &key)?.context("Reconciliation state is missing")?;
-        let mut setup = PairSetup {
+        let current_local_file_stamp = local_file_stamp(identity.local_file.as_deref())?;
+        let current_local_file_digest = if record.local_file_digest.is_none()
+            || record.local_file_stamp != current_local_file_stamp
+        {
+            local_file_digest(identity.local_file.as_deref())?
+        } else {
+            record.local_file_digest.clone()
+        };
+        Ok(PairSetup {
             key,
             mode: record.mode,
             resolution_preference: None,
             resolution_required: record.resolution_required,
             error: None,
             requires_reconcile: true,
-        };
-        self.reconcile(context, bridge, &mut setup)?;
-        Ok(setup)
+            runtime_id: context.runtime_id.clone(),
+            local_file_stamp: current_local_file_stamp,
+            local_file_digest: current_local_file_digest,
+            bootstrap_studio_from_editor: false,
+            runtime_replacement_unproven: false,
+        })
     }
 
     pub(crate) fn advance_baseline(
@@ -726,6 +1160,55 @@ impl Coordinator {
             validate_editor_package_links(&previous, &current, &scopes)?;
         }
         baseline.replace_scopes(root, key, &scopes, &current)?;
+        write_record(context, key, &record)
+    }
+
+    pub(crate) fn record_studio_checkpoint(
+        &self,
+        context: &BoundContext,
+        key: &str,
+        state: &Value,
+    ) -> Result<()> {
+        let Some(checkpoint) = StudioCheckpoint::from_state(context, state) else {
+            return Ok(());
+        };
+        let pair_lock = self.pair_lock(key);
+        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
+        if record.baseline.is_none() || !record.conflicts.is_empty() {
+            return Ok(());
+        }
+        record.studio_checkpoint = Some(checkpoint);
+        write_record(context, key, &record)
+    }
+
+    pub(crate) fn record_full_editor_push_with_gate_held(
+        &self,
+        context: &BoundContext,
+        key: &str,
+        bridge: &BridgeServer,
+    ) -> Result<()> {
+        let pair_lock = self.pair_lock(key);
+        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
+        if record.mode != PairMode::Reconcile {
+            bail!("Live Sync is not allowed to write in verify mode");
+        }
+        if !record.conflicts.is_empty() {
+            bail!("Reconciliation state has unresolved changes");
+        }
+        let root = Path::new(&context.root);
+        let stage = project_comparison_stage(context, &sync_services())?;
+        let current = capture_snapshot(root, stage.publish_paths())?;
+        drop(stage);
+        if !record
+            .baseline
+            .as_ref()
+            .is_some_and(|baseline| baseline.matches(&current))
+        {
+            record.baseline = Some(StoredSnapshot::write(root, key, &current)?);
+        }
+        record.studio_checkpoint = current_studio_checkpoint(context, bridge);
         write_record(context, key, &record)
     }
 
@@ -773,8 +1256,24 @@ impl Coordinator {
             return Ok(Vec::new());
         }
         let pair_lock = self.pair_lock(key);
+        let phase = Instant::now();
         let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        log_reconcile_timing("incremental pair lock", phase);
+        let phase = Instant::now();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
+        log_reconcile_timing("incremental record load", phase);
+        self.push_editor_changes_locked(context, key, bridge, paths, guard, &mut record)
+    }
+
+    fn push_editor_changes_locked(
+        &self,
+        context: &BoundContext,
+        key: &str,
+        bridge: &BridgeServer,
+        paths: &[PathBuf],
+        guard: Option<&StudioChangeGuard>,
+        record: &mut PairRecord,
+    ) -> Result<Vec<PathBuf>> {
         if record.mode != PairMode::Reconcile {
             bail!("Live Sync is not allowed to write in verify mode");
         }
@@ -790,48 +1289,110 @@ impl Coordinator {
             return Ok(Vec::new());
         }
         let root = Path::new(&context.root);
+        let phase = Instant::now();
         let previous = baseline.load_scopes(root, key, &scopes)?;
+        log_reconcile_timing("incremental baseline load", phase);
+        let phase = Instant::now();
         let current = capture_snapshot(root, &scopes)?;
-        validate_editor_package_links(&previous, &current, &scopes)?;
+        log_reconcile_timing("incremental project capture", phase);
+        let phase = Instant::now();
+        let prepared_settings = prepare_editor_settings_changes(&previous, &current, &scopes)?;
+        log_reconcile_timing("incremental settings preparation", phase);
+        let phase = Instant::now();
         let changed = previous
             .entries
             .keys()
             .chain(current.entries.keys())
+            .filter(|path| {
+                !entries_equivalent(
+                    path,
+                    previous.entries.get(*path),
+                    current.entries.get(*path),
+                )
+            })
             .cloned()
             .collect::<HashSet<_>>();
-        let plan = reconciliation_push_plan_for_paths(&previous, &current, &changed)?;
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &previous,
+            &current,
+            &changed,
+            &prepared_settings,
+        )?;
+        log_reconcile_timing("incremental push plan", phase);
+        let phase = Instant::now();
+        let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
+        let mut previous_documents = Vec::with_capacity(prepared_settings.len());
+        for (path, change) in prepared_settings {
+            let service = settings_service_name(&path, &change.current, &change.previous)?;
+            previous_documents.push(change.previous);
+            prepared_documents.insert(service, change.current);
+        }
+        for document in previous_documents {
+            drop_settings_document(document);
+        }
+        log_reconcile_timing("incremental settings release", phase);
+        let phase = Instant::now();
         let supporting_scopes = supporting_settings_scopes(context, &changed)?;
         let supporting = capture_snapshot(root, &supporting_scopes)?;
         let supporting_paths = supporting.entries.keys().cloned().collect::<HashSet<_>>();
+        log_reconcile_timing("incremental supporting capture", phase);
+        let phase = Instant::now();
         let source = bound_context::source_dir(context)?;
-        let stage = ExportProjectStage::create(root, &source, &[])?;
+        let requires_stage = config::try_load_project(None, Some(root))?
+            .as_ref()
+            .map(config::project_requires_temporary_stage)
+            .transpose()?
+            .unwrap_or(false);
+        let stage = if requires_stage {
+            ExportProjectStage::create(root, &source, &[])?
+        } else {
+            ExportProjectStage::create_for_comparison(root, &source, &[])?
+        };
+        log_reconcile_timing("incremental stage", phase);
+        let phase = Instant::now();
         apply_snapshot_paths(&stage.project_root, &supporting_paths, &supporting)?;
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
+        log_reconcile_timing("incremental staged write", phase);
+        let phase = Instant::now();
         let generated = push_staged_project(
             context,
             &stage,
             bridge,
-            plan,
-            guard,
-            automation_push_args(context, &json!({}), false)?,
-            None,
+            StagedPushRequest {
+                plan,
+                prepared_documents,
+                guard,
+                args: automation_push_args(context, &json!({}), false)?,
+                expected_project: None,
+            },
         )?
         .generated;
+        log_reconcile_timing("incremental Studio push", phase);
+        let phase = Instant::now();
+        drop(stage);
+        log_reconcile_timing("incremental stage cleanup", phase);
+        let phase = Instant::now();
         let baseline = record
             .baseline
             .as_mut()
             .context("Reconciliation baseline is missing")?;
-        baseline.replace_scopes(root, key, &scopes, &current)?;
+        let mut changed_scopes = changed.iter().cloned().collect::<Vec<_>>();
+        changed_scopes.sort();
+        baseline.replace_scopes(root, key, &changed_scopes, &current)?;
         if !generated.entries.is_empty() {
             let generated_scopes = generated.entries.keys().cloned().collect::<Vec<_>>();
             baseline.replace_scopes(root, key, &generated_scopes, &generated)?;
         }
+        log_reconcile_timing("incremental baseline update", phase);
         let generated_paths = generated
             .entries
             .keys()
             .map(|path| root.join(path))
             .collect();
-        write_record(context, key, &record)?;
+        let phase = Instant::now();
+        record.studio_checkpoint = current_studio_checkpoint(context, bridge);
+        write_record(context, key, record)?;
+        log_reconcile_timing("incremental record write", phase);
         Ok(generated_paths)
     }
 
@@ -981,6 +1542,23 @@ fn validate_editor_package_links(
     current: &ProjectSnapshot,
     scopes: &[PathBuf],
 ) -> Result<()> {
+    for path in service_settings_paths(baseline, current, scopes) {
+        if baseline.entries.get(&path) == current.entries.get(&path) {
+            continue;
+        }
+        let before = settings_document(baseline.entries.get(&path))?;
+        let mut after = settings_document(current.entries.get(&path))?;
+        align_observation_ids_to_baseline(&before, &mut after);
+        validate_package_link_documents(&path, &before, &after)?;
+    }
+    Ok(())
+}
+
+fn service_settings_paths(
+    baseline: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+    scopes: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut paths = baseline
         .entries
         .keys()
@@ -996,64 +1574,89 @@ fn validate_editor_package_links(
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
-    for path in paths {
-        let before = settings_document(baseline.entries.get(&path))?;
-        let mut after = settings_document(current.entries.get(&path))?;
-        align_observation_ids_to_baseline(&before, &mut after);
-        let before_links = before
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| instance.class_name == "PackageLink")
-            .map(|(index, instance)| (instance.settings_id.as_str(), index))
-            .collect::<HashMap<_, _>>();
-        let after_links = after
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| instance.class_name == "PackageLink")
-            .map(|(index, instance)| (instance.settings_id.as_str(), index))
-            .collect::<HashMap<_, _>>();
-        let mismatch = if before_links.len() != after_links.len() {
-            Some(format!(
-                "PackageLink count changed from {} to {}",
-                before_links.len(),
-                after_links.len()
-            ))
-        } else {
-            before_links.iter().find_map(|(id, before_index)| {
-                let after_index = after_links
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| format!("PackageLink identity {id} is missing"));
-                match after_index {
-                    Ok(after_index)
-                        if package_link_instances_equal(
-                            &before,
-                            *before_index,
-                            &after,
-                            after_index,
-                        ) =>
-                    {
-                        None
-                    }
-                    Ok(after_index) => Some(package_link_mismatch_detail(
-                        id,
-                        &before,
-                        *before_index,
-                        &after,
-                        after_index,
-                    )),
-                    Err(detail) => Some(detail),
-                }
-            })
-        };
-        if let Some(mismatch) = mismatch {
-            bail!(
-                "{} changes a PackageLink directly; use the package workflow instead ({mismatch})",
-                path.display(),
+    paths
+}
+
+fn prepare_editor_settings_changes(
+    previous: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+    scopes: &[PathBuf],
+) -> Result<HashMap<PathBuf, PreparedEditorSettingsChange>> {
+    service_settings_paths(previous, current, scopes)
+        .into_iter()
+        .filter(|path| previous.entries.get(path) != current.entries.get(path))
+        .map(|path| {
+            let phase = Instant::now();
+            let (previous_document, current_document) = rayon::join(
+                || editor_settings_document(previous.entries.get(&path)),
+                || editor_settings_document(current.entries.get(&path)),
             );
-        }
+            let change = PreparedEditorSettingsChange {
+                previous: previous_document?,
+                current: current_document?,
+            };
+            log_reconcile_timing("incremental settings decode", phase);
+            let phase = Instant::now();
+            validate_package_link_documents(&path, &change.previous, &change.current)?;
+            log_reconcile_timing("incremental PackageLink validation", phase);
+            Ok((path, change))
+        })
+        .collect()
+}
+
+fn validate_package_link_documents(
+    path: &Path,
+    before: &SettingsBytecode,
+    after: &SettingsBytecode,
+) -> Result<()> {
+    let before_links = before
+        .instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| instance.class_name == "PackageLink")
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let after_links = after
+        .instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| instance.class_name == "PackageLink")
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mismatch = if before_links.len() != after_links.len() {
+        Some(format!(
+            "PackageLink count changed from {} to {}",
+            before_links.len(),
+            after_links.len()
+        ))
+    } else {
+        before_links.iter().find_map(|(id, before_index)| {
+            let after_index = after_links
+                .get(id)
+                .copied()
+                .ok_or_else(|| format!("PackageLink identity {id} is missing"));
+            match after_index {
+                Ok(after_index)
+                    if package_link_instances_equal(before, *before_index, after, after_index) =>
+                {
+                    None
+                }
+                Ok(after_index) => Some(package_link_mismatch_detail(
+                    id,
+                    before,
+                    *before_index,
+                    after,
+                    after_index,
+                )),
+                Err(detail) => Some(detail),
+            }
+        })
+    };
+    if let Some(mismatch) = mismatch {
+        bail!(
+            "{} changes a PackageLink directly; use the package workflow instead ({mismatch})",
+            path.display(),
+        );
     }
     Ok(())
 }
@@ -1239,14 +1842,32 @@ pub(crate) fn studio_change_guard_from_state(
         .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(StudioChangeGuard {
         runtime_id: state_runtime_id.to_string(),
+        change_seq: state["seq"]
+            .as_u64()
+            .context("Studio change state did not include its sequence")?,
+        tracking_guard_id: None,
+        runtime_bootstrap_safe: studio_runtime_bootstrap_safe(state),
         service_generations,
     })
 }
 
-fn current_studio_change_guard(
-    context: &BoundContext,
-    bridge: &BridgeServer,
-) -> Result<StudioChangeGuard> {
+fn studio_runtime_bootstrap_safe(state: &Value) -> bool {
+    let restored_pending_services = state["restoredPendingServices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    let has_fresh_changes = state["dirtyServices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|service| !restored_pending_services.contains(service));
+    state["tracking"].as_bool() == Some(true) && !has_fresh_changes
+}
+
+fn read_studio_change_state(context: &BoundContext, bridge: &BridgeServer) -> Result<Value> {
     let runtime_id = context
         .runtime_id
         .as_deref()
@@ -1254,13 +1875,234 @@ fn current_studio_change_guard(
     pin_edit_runtime(context, bridge)?;
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({ "start": true, "includeGenerations": true }),
+        json!({ "start": false, "includeGenerations": true }),
         BridgeTarget::Edit,
         runtime_id,
         Some(Duration::from_secs(10)),
     )?;
     ensure_plugin_api_ok(&state)?;
-    studio_change_guard_from_state(context, &state)
+    Ok(state)
+}
+
+fn current_studio_checkpoint(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+) -> Option<StudioCheckpoint> {
+    match read_studio_change_state(context, bridge) {
+        Ok(state) => {
+            let checkpoint = StudioCheckpoint::from_state(context, &state);
+            if checkpoint.is_none() {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] Studio checkpoint state rejected: tracking={:?} tracked={:?} dirty={} full={} runtime={:?} version={:?} seq={:?} generations={}",
+                        state["tracking"].as_bool(),
+                        state["trackedServices"].as_u64(),
+                        state["dirtyServices"].as_array().map_or(0, Vec::len),
+                        state["fullSyncServices"].as_array().map_or(0, Vec::len),
+                        state["runtimeId"].as_str(),
+                        state["changeTrackerVersion"].as_u64(),
+                        state["seq"].as_u64(),
+                        checkpoint_generations(&state).map_or(0, Map::len),
+                    ),
+                );
+            }
+            checkpoint
+        }
+        Err(error) => {
+            log_global(
+                5,
+                format_args!("[renium] Studio checkpoint unavailable: {error:#}"),
+            );
+            None
+        }
+    }
+}
+
+fn reconciled_studio_checkpoint(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    initial_state: &Value,
+    guard: &StudioChangeGuard,
+) -> Option<StudioCheckpoint> {
+    let services = initial_state["dirtyServices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if services.is_empty() {
+        return current_studio_checkpoint(context, bridge);
+    }
+    match acknowledge_pulled_changes(bridge, &services, guard.change_seq, &guard.runtime_id) {
+        Ok(state) => StudioCheckpoint::from_state(context, &state),
+        Err(error) => {
+            log_global(
+                5,
+                format_args!("[renium] reconciled Studio acknowledgment failed: {error:#}"),
+            );
+            None
+        }
+    }
+}
+
+struct StudioTrackingGuardRelease<'a> {
+    bridge: &'a BridgeServer,
+    runtime_id: String,
+    guard_id: Option<String>,
+}
+
+impl StudioTrackingGuardRelease<'_> {
+    fn finish(&mut self) -> Result<()> {
+        let Some(guard_id) = self.guard_id.as_ref() else {
+            return Ok(());
+        };
+        let result = self.bridge.call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({
+                "start": false,
+                "releaseTrackingGuardId": guard_id,
+            }),
+            BridgeTarget::Edit,
+            &self.runtime_id,
+            Some(Duration::from_secs(10)),
+        )?;
+        ensure_plugin_api_ok(&result)?;
+        self.guard_id = None;
+        Ok(())
+    }
+}
+
+impl Drop for StudioTrackingGuardRelease<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+fn acknowledge_verified_push(
+    bridge: &BridgeServer,
+    services: &[String],
+    guard: &StudioChangeGuard,
+) -> Result<()> {
+    let result = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({
+            "services": services,
+            "start": false,
+            "ackSeq": guard.change_seq,
+            "runtimeId": guard.runtime_id,
+        }),
+        BridgeTarget::Edit,
+        &guard.runtime_id,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&result)
+}
+
+fn current_studio_change_guard_with_state(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+) -> Result<(StudioChangeGuard, Value)> {
+    let runtime_id = context
+        .runtime_id
+        .as_deref()
+        .context("Studio context has no edit-mode runtime")?;
+    let initial = read_studio_change_state(context, bridge)?;
+    if initial["tracking"].as_bool() == Some(true) {
+        let guard = studio_change_guard_from_state(context, &initial)?;
+        return Ok((guard, initial));
+    }
+    let guard_id = format!(
+        "push-{}-{}-{}",
+        std::process::id(),
+        runtime_id,
+        crate::app::timing::current_millis()
+    );
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({
+            "start": true,
+            "trackingGuardId": guard_id,
+            "includeGenerations": true,
+        }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    let mut guard = studio_change_guard_from_state(context, &state)?;
+    guard.tracking_guard_id = Some(guard_id);
+    guard.runtime_bootstrap_safe = false;
+    Ok((guard, state))
+}
+
+fn current_studio_change_guard(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+) -> Result<StudioChangeGuard> {
+    current_studio_change_guard_with_state(context, bridge).map(|(guard, _)| guard)
+}
+
+fn studio_guard_matches_state(
+    context: &BoundContext,
+    guard: &StudioChangeGuard,
+    state: &Value,
+) -> bool {
+    studio_change_guard_from_state(context, state).is_ok_and(|current| {
+        current.runtime_id == guard.runtime_id
+            && current.change_seq == guard.change_seq
+            && current.service_generations == guard.service_generations
+    })
+}
+
+fn studio_states_share_epoch(context: &BoundContext, left: &Value, right: &Value) -> bool {
+    let services = sync_services();
+    let expected_runtime = context.runtime_id.as_deref();
+    let tracker_version = left["changeTrackerVersion"].as_u64();
+    let seq = left["seq"].as_u64();
+    let fields_match = left["tracking"].as_bool() == Some(true)
+        && right["tracking"].as_bool() == Some(true)
+        && left["trackedServices"].as_u64() == u64::try_from(services.len()).ok()
+        && right["trackedServices"].as_u64() == u64::try_from(services.len()).ok()
+        && left["runtimeId"].as_str() == expected_runtime
+        && right["runtimeId"].as_str() == expected_runtime
+        && tracker_version.is_some()
+        && tracker_version == right["changeTrackerVersion"].as_u64()
+        && seq.is_some()
+        && seq == right["seq"].as_u64();
+    if !fields_match {
+        return false;
+    }
+    let (Some(left_generations), Some(right_generations)) =
+        (checkpoint_generations(left), checkpoint_generations(right))
+    else {
+        return false;
+    };
+    if left_generations.len() != services.len() || right_generations.len() != services.len() {
+        return false;
+    }
+    services.iter().all(|service| {
+        left_generations.get(service).and_then(Value::as_u64)
+            == right_generations.get(service).and_then(Value::as_u64)
+    })
+}
+
+fn publish_captured_studio(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    stage: ExportProjectStage,
+    guard: &StudioChangeGuard,
+) -> Result<()> {
+    let confirmed = read_studio_change_state(context, bridge)?;
+    if studio_guard_matches_state(context, guard, &confirmed) {
+        stage.publish(Path::new(&context.root), false)?;
+    } else {
+        capture_studio_project(context, bridge)?
+            .0
+            .publish(Path::new(&context.root), false)?;
+    }
+    Ok(())
 }
 
 fn capture_studio_project(
@@ -1276,6 +2118,79 @@ fn capture_studio_project_for_comparison(
     bridge: &BridgeServer,
 ) -> Result<(ExportProjectStage, ProjectSnapshot)> {
     let services = sync_services();
+    let mut stage = project_comparison_stage(context, &services)?;
+    stage.capture_publish_baseline(Path::new(&context.root))?;
+    capture_studio_services_with_stage(context, bridge, &services, true, stage)
+}
+
+fn selective_studio_services(
+    context: &BoundContext,
+    checkpoint: &StudioCheckpoint,
+    state: &Value,
+) -> Result<Option<Vec<String>>> {
+    let Some(services) = checkpoint.changed_services(context, state) else {
+        return Ok(None);
+    };
+    if services.is_empty() || services.len() == sync_services().len() {
+        return Ok(None);
+    }
+    let root = Path::new(&context.root);
+    if config::try_load_project(None, Some(root))?
+        .as_ref()
+        .map(config::project_requires_temporary_stage)
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(services))
+}
+
+fn capture_changed_studio_services(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    baseline: &ProjectSnapshot,
+    initial_state: &Value,
+) -> Result<Option<(ExportProjectStage, ProjectSnapshot, ProjectSnapshot)>> {
+    let root = Path::new(&context.root);
+    let source = Path::new(&context.source)
+        .strip_prefix(root)
+        .context("Project source is outside its root")?;
+    let scopes = services
+        .iter()
+        .map(|service| source.join(service))
+        .collect::<Vec<_>>();
+    let all_services = sync_services();
+    let src_dir = bound_context::source_dir(context)?;
+    let stage = ExportProjectStage::create(root, &src_dir, &all_services)?;
+    let editor = capture_snapshot(&stage.project_root, stage.publish_paths())?;
+    let stage = import_studio_services_into_stage(context, bridge, services, true, stage)?;
+    let captured = capture_snapshot(&stage.project_root, &scopes)?;
+    let mut studio = baseline.clone();
+    studio
+        .entries
+        .retain(|path, _| !scopes.iter().any(|scope| path.starts_with(scope)));
+    studio.entries.extend(captured.entries);
+    let confirmed = read_studio_change_state(context, bridge)?;
+    if !studio_states_share_epoch(context, initial_state, &confirmed) {
+        return Ok(None);
+    }
+    let current_editor = capture_snapshot(root, stage.publish_paths())?;
+    if editor != current_editor {
+        bail!("Project files changed while Studio recovery was being captured; retry the sync");
+    }
+    log_global(
+        5,
+        format_args!("[renium] selective Studio capture: {}", services.join(",")),
+    );
+    Ok(Some((stage, studio, editor)))
+}
+
+fn project_comparison_stage(
+    context: &BoundContext,
+    services: &[String],
+) -> Result<ExportProjectStage> {
     let root = PathBuf::from(&context.root);
     let src_dir = bound_context::source_dir(context)?;
     let requires_stage = config::try_load_project(None, Some(&root))?
@@ -1283,12 +2198,11 @@ fn capture_studio_project_for_comparison(
         .map(config::project_requires_temporary_stage)
         .transpose()?
         .unwrap_or(false);
-    let stage = if requires_stage {
-        ExportProjectStage::create(&root, &src_dir, &services)?
+    if requires_stage {
+        ExportProjectStage::create(&root, &src_dir, services)
     } else {
-        ExportProjectStage::create_for_comparison(&root, &src_dir, &services)?
-    };
-    capture_studio_services_with_stage(context, bridge, &services, true, stage)
+        ExportProjectStage::create_for_comparison(&root, &src_dir, services)
+    }
 }
 
 pub(crate) fn push_project_delta(
@@ -1301,6 +2215,11 @@ pub(crate) fn push_project_delta(
     let guard = guard
         .cloned()
         .map_or_else(|| current_studio_change_guard(context, bridge), Ok)?;
+    let mut tracking_release = StudioTrackingGuardRelease {
+        bridge,
+        runtime_id: guard.runtime_id.clone(),
+        guard_id: guard.tracking_guard_id.clone(),
+    };
     let src_dir = push_args.project.src_root.clone();
     let root = push_args.project.project_root.clone();
     let requires_stage = config::try_load_project(None, Some(&root))?
@@ -1318,34 +2237,48 @@ pub(crate) fn push_project_delta(
     let project = capture_snapshot(&root, stage.publish_paths())?;
     let differences = snapshot_differences(&project, &studio)?;
     if differences.is_empty() {
+        acknowledge_verified_push(bridge, services, &guard)?;
+        tracking_release.finish()?;
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let plan = reconciliation_push_plan_for_paths(&studio, &project, &differences)?;
     if plan.is_empty() {
+        acknowledge_verified_push(bridge, services, &guard)?;
+        tracking_release.finish()?;
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
-    let mutation_paths = plan.changed_paths.iter().cloned().collect::<HashSet<_>>();
+    let mutation_paths = differences.clone();
     apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
     let pushed = push_staged_project(
         context,
         &stage,
         bridge,
-        plan,
-        Some(&guard),
-        push_args,
-        Some(&project),
+        StagedPushRequest {
+            plan,
+            prepared_documents: HashMap::new(),
+            guard: Some(&guard),
+            args: push_args,
+            expected_project: Some(&project),
+        },
     )?;
 
     let current = capture_snapshot(&root, stage.publish_paths())?;
     let mut verification_paths = differences;
     verification_paths.extend(mutation_paths);
     verification_paths.extend(pushed.generated.entries.keys().cloned());
+    if pushed.generated.entries.is_empty()
+        && exact_source_push_verified(&pushed.summary, &verification_paths)
+    {
+        acknowledge_verified_push(bridge, services, &guard)?;
+        tracking_release.finish()?;
+        return Ok(pushed.summary);
+    }
     let verification_services = services_for_snapshot_paths(context, &verification_paths);
     let (_readback_stage, readback) =
         capture_studio_services(context, bridge, &verification_services, false)?;
-    let mismatches = snapshot_path_differences(&readback, &current, &verification_paths)?;
+    let (mismatches, details) =
+        snapshot_intended_delta_mismatches(&studio, &current, &readback, &verification_paths)?;
     if !mismatches.is_empty() {
-        let details = snapshot_mismatch_details(&readback, &current, &mismatches)?;
         bail!(
             "Studio did not retain pushed project changes: {}{}",
             mismatches
@@ -1359,7 +2292,20 @@ pub(crate) fn push_project_delta(
                 .unwrap_or_default()
         );
     }
+    acknowledge_verified_push(bridge, services, &guard)?;
+    tracking_release.finish()?;
     Ok(pushed.summary)
+}
+
+fn exact_source_push_verified(
+    summary: &Map<String, Value>,
+    verification_paths: &HashSet<PathBuf>,
+) -> bool {
+    !verification_paths.is_empty()
+        && verification_paths.iter().all(|path| is_source_path(path))
+        && summary.get("sourceVerifyFailed").and_then(Value::as_u64) == Some(0)
+        && summary.get("sourceVerified").and_then(Value::as_u64)
+            == u64::try_from(verification_paths.len()).ok()
 }
 
 fn capture_studio_services(
@@ -1380,6 +2326,19 @@ fn capture_studio_services_with_stage(
     generate_sourcemap: bool,
     stage: ExportProjectStage,
 ) -> Result<(ExportProjectStage, ProjectSnapshot)> {
+    let stage =
+        import_studio_services_into_stage(context, bridge, services, generate_sourcemap, stage)?;
+    let snapshot = capture_snapshot(&stage.project_root, stage.publish_paths())?;
+    Ok((stage, snapshot))
+}
+
+fn import_studio_services_into_stage(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    generate_sourcemap: bool,
+    stage: ExportProjectStage,
+) -> Result<ExportProjectStage> {
     let capture_dir = create_unique_directory(
         &Path::new(&context.root).join(".renium"),
         "reconcile-capture-",
@@ -1400,8 +2359,7 @@ fn capture_studio_services_with_stage(
     export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
     let regenerate_sourcemap = generate_sourcemap && stage.capture_sourcemap_needs_regeneration();
     stage.finish_projection(regenerate_sourcemap)?;
-    let snapshot = capture_snapshot(&stage.project_root, stage.publish_paths())?;
-    Ok((stage, snapshot))
+    Ok(stage)
 }
 
 fn services_for_snapshot_paths(context: &BoundContext, paths: &HashSet<PathBuf>) -> Vec<String> {
@@ -1475,15 +2433,27 @@ struct StagedPushResult {
     summary: Map<String, Value>,
 }
 
+struct StagedPushRequest<'a> {
+    plan: ReconcilePushPlan,
+    prepared_documents: HashMap<String, SettingsBytecode>,
+    guard: Option<&'a StudioChangeGuard>,
+    args: PushEditorChangesArgs,
+    expected_project: Option<&'a ProjectSnapshot>,
+}
+
 fn push_staged_project(
     context: &BoundContext,
     stage: &ExportProjectStage,
     bridge: &BridgeServer,
-    plan: ReconcilePushPlan,
-    guard: Option<&StudioChangeGuard>,
-    mut push_args: PushEditorChangesArgs,
-    expected_project: Option<&ProjectSnapshot>,
+    request: StagedPushRequest<'_>,
 ) -> Result<StagedPushResult> {
+    let StagedPushRequest {
+        plan,
+        prepared_documents,
+        guard,
+        args: mut push_args,
+        expected_project,
+    } = request;
     if plan.is_empty() {
         return Ok(StagedPushResult {
             generated: ProjectSnapshot::default(),
@@ -1497,17 +2467,30 @@ fn push_staged_project(
         .collect::<Vec<_>>();
     if !supporting_paths.is_empty() {
         let root = Path::new(&context.root);
-        let staged = capture_snapshot(&stage.project_root, &supporting_paths)?;
+        let staged = expected_project
+            .is_none()
+            .then(|| capture_snapshot(&stage.project_root, &supporting_paths))
+            .transpose()?;
         let current = capture_snapshot(root, &supporting_paths)?;
         let supporting_paths = supporting_paths.into_iter().collect::<HashSet<_>>();
-        let differences = snapshot_path_differences(&staged, &current, &supporting_paths)?;
+        let differences = if let Some(expected_project) = expected_project {
+            snapshot_path_differences(expected_project, &current, &supporting_paths)?
+        } else {
+            snapshot_path_differences(
+                staged.as_ref().expect("staged snapshot exists"),
+                &current,
+                &supporting_paths,
+            )?
+        };
         if !differences.is_empty() {
             bail!(
-                "{} changed while its Studio update was being prepared; retry the sync",
+                "Supporting project data {} changed while its Studio update was being prepared; retry the sync",
                 root.join(&differences[0]).display()
             );
         }
-        apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
+        if expected_project.is_none() {
+            apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
+        }
     }
     let project_root = push_args.project.project_root.clone();
     let validate_project = || -> Result<()> {
@@ -1518,7 +2501,7 @@ fn push_staged_project(
         let differences = snapshot_differences(expected_project, &current)?;
         if let Some(changed) = differences.iter().next() {
             bail!(
-                "{} changed while its Studio update was being prepared; retry the sync",
+                "Project file {} changed while its Studio update was being prepared; retry the sync",
                 project_root.join(changed).display()
             );
         }
@@ -1549,6 +2532,7 @@ fn push_staged_project(
         push_args,
         bridge,
         guard,
+        prepared_documents,
         |changes| {
             amend_reconciled_changes(changes, plan)?;
             generated = redirect_staged_settings_writes(
@@ -1586,7 +2570,7 @@ fn redirect_staged_settings_writes(
         let destination = project_root.join(&relative);
         if settings_file_hash(&destination)? != write.expected_hash {
             bail!(
-                "{} changed while its Studio update was being prepared; retry the sync",
+                "Settings file {} changed while its Studio update was being prepared; retry the sync",
                 destination.display()
             );
         }
@@ -1669,6 +2653,20 @@ fn reconciliation_push_plan_for_paths(
     merged: &ProjectSnapshot,
     paths: &HashSet<PathBuf>,
 ) -> Result<ReconcilePushPlan> {
+    reconciliation_push_plan_for_paths_with_prepared_settings(
+        studio,
+        merged,
+        paths,
+        &HashMap::new(),
+    )
+}
+
+fn reconciliation_push_plan_for_paths_with_prepared_settings(
+    studio: &ProjectSnapshot,
+    merged: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<ReconcilePushPlan> {
     let mut paths = paths.iter().cloned().collect::<Vec<_>>();
     paths.sort();
 
@@ -1681,6 +2679,21 @@ fn reconciliation_push_plan_for_paths(
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
         {
+            if let Some(prepared) = prepared_settings.get(&path) {
+                let targets_before = plan.target_settings_ids.len();
+                let phase = Instant::now();
+                append_aligned_settings_push_plan(
+                    &path,
+                    &prepared.current,
+                    &prepared.previous,
+                    &mut plan,
+                )?;
+                log_reconcile_timing("incremental settings delta", phase);
+                if plan.target_settings_ids.len() > targets_before {
+                    plan.changed_paths.push(path);
+                }
+                continue;
+            }
             let desired = settings_document(merged_entry)?;
             let observed = settings_document(studio_entry)?;
             if settings_documents_equivalent(&desired, &observed) {
@@ -1780,111 +2793,204 @@ fn append_settings_push_plan(
     observed: &SettingsBytecode,
     plan: &mut ReconcilePushPlan,
 ) -> Result<()> {
-    let service = desired
+    let mut observed = observed.clone();
+    let service = settings_service_name(path, desired, &observed)?;
+    if !align_settings_ids_to_reference(desired, &mut observed) {
+        bail!("Could not align Studio identities in {service}; Studio was not changed");
+    }
+    align_equivalent_values(desired, &mut observed);
+    append_aligned_settings_push_plan(path, desired, &observed, plan)
+}
+
+fn settings_service_name(
+    path: &Path,
+    desired: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> Result<String> {
+    desired
         .instances
         .iter()
         .chain(&observed.instances)
         .find(|instance| instance.parent_index.is_none())
         .map(|instance| instance.name.clone())
-        .with_context(|| format!("{} has no service root", path.display()))?;
-    let mut observed = observed.clone();
-    if !align_settings_ids_to_reference(desired, &mut observed) {
-        bail!("Could not align Studio identities in {service}; Studio was not changed");
-    }
-    align_equivalent_values(desired, &mut observed);
-    let desired_by_id = desired
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let observed_by_id = observed
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    for (index, path) in build_editor_instance_paths(&observed, &service)
-        .into_iter()
-        .enumerate()
-    {
-        let Some(path) = path else {
-            continue;
-        };
-        let instance = &observed.instances[index];
-        plan.previous_paths
-            .insert((service.clone(), instance.settings_id.clone()), path);
-    }
+        .with_context(|| format!("{} has no service root", path.display()))
+}
+
+fn append_aligned_settings_push_plan(
+    path: &Path,
+    desired: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    plan: &mut ReconcilePushPlan,
+) -> Result<()> {
+    let service = settings_service_name(path, desired, observed)?;
+    let phase = Instant::now();
+    let (desired_by_id, observed_by_id) = rayon::join(
+        || {
+            desired
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                .collect::<HashMap<_, _>>()
+        },
+        || {
+            observed
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                .collect::<HashMap<_, _>>()
+        },
+    );
+    log_reconcile_timing("settings delta identity maps", phase);
+    let phase = Instant::now();
+    let mut previous_path_settings_ids = Vec::new();
     let mut pending_property_removals = Vec::new();
 
-    for (desired_index, instance) in desired.instances.iter().enumerate() {
-        if instance.class_name == "PackageLink" {
-            continue;
-        }
-        let observed_index = observed_by_id.get(instance.settings_id.as_str()).copied();
-        if observed_index.is_none_or(|observed_index| {
-            !settings_instances_equal(desired, desired_index, &observed, observed_index)
-        }) {
-            plan.target_settings_ids.push(instance.settings_id.clone());
-        }
-        let Some(observed_index) = observed_index else {
+    struct InstanceDelta {
+        desired_index: usize,
+        observed_index: Option<usize>,
+        requires_previous_path: bool,
+        reset_properties: Vec<String>,
+        deleted_attributes: Vec<String>,
+    }
+
+    let instance_deltas = desired
+        .instances
+        .par_iter()
+        .enumerate()
+        .filter_map(|(desired_index, instance)| {
+            if instance.class_name == "PackageLink" {
+                return None;
+            }
+            let observed_index = observed_by_id.get(instance.settings_id.as_str()).copied();
+            if observed_index.is_some_and(|observed_index| {
+                settings_instances_equal(desired, desired_index, observed, observed_index)
+            }) {
+                return None;
+            }
+            let Some(observed_index) = observed_index else {
+                return Some(InstanceDelta {
+                    desired_index,
+                    observed_index: None,
+                    requires_previous_path: false,
+                    reset_properties: Vec::new(),
+                    deleted_attributes: Vec::new(),
+                });
+            };
+            let observed_instance = &observed.instances[observed_index];
+            let (reset_properties, deleted_attributes) =
+                if observed_instance.class_name == instance.class_name {
+                    (
+                        observed_instance
+                            .properties
+                            .keys()
+                            .filter(|name| {
+                                name.as_str() != "ScriptGuid"
+                                    && !reconciliation_property_is_derived(name)
+                                    && !instance.properties.contains_key(*name)
+                            })
+                            .cloned()
+                            .collect(),
+                        observed_instance
+                            .attributes
+                            .keys()
+                            .filter(|name| !instance.attributes.contains_key(*name))
+                            .cloned()
+                            .collect(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+            Some(InstanceDelta {
+                desired_index,
+                observed_index: Some(observed_index),
+                requires_previous_path: observed_instance.name != instance.name
+                    || observed_instance.class_name != instance.class_name
+                    || settings_parent_id(observed, observed_index)
+                        != settings_parent_id(desired, desired_index),
+                reset_properties,
+                deleted_attributes,
+            })
+        })
+        .collect::<Vec<_>>();
+    for delta in instance_deltas {
+        let instance = &desired.instances[delta.desired_index];
+        plan.target_settings_ids.push(instance.settings_id.clone());
+        let Some(observed_index) = delta.observed_index else {
             continue;
         };
         let observed_instance = &observed.instances[observed_index];
+        if delta.requires_previous_path {
+            previous_path_settings_ids.push(instance.settings_id.as_str());
+        }
         if observed_instance.class_name != instance.class_name {
             plan.previous_class_names.insert(
                 instance.settings_id.clone(),
                 observed_instance.class_name.clone(),
             );
-            continue;
+        } else if !delta.reset_properties.is_empty() || !delta.deleted_attributes.is_empty() {
+            pending_property_removals.push((
+                delta.desired_index,
+                delta.reset_properties,
+                delta.deleted_attributes,
+            ));
         }
-        let reset_properties = observed_instance
-            .properties
-            .keys()
-            .filter(|name| {
-                name.as_str() != "ScriptGuid"
-                    && !reconciliation_property_is_derived(name)
-                    && !instance.properties.contains_key(*name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let deleted_attributes = observed_instance
-            .attributes
-            .keys()
-            .filter(|name| !instance.attributes.contains_key(*name))
-            .cloned()
-            .collect::<Vec<_>>();
-        if reset_properties.is_empty() && deleted_attributes.is_empty() {
-            continue;
-        }
-        pending_property_removals.push((desired_index, reset_properties, deleted_attributes));
     }
+    log_reconcile_timing("settings delta changed instances", phase);
 
-    let removal_indices = pending_property_removals
+    let phase = Instant::now();
+    let previous_indices = previous_path_settings_ids
         .iter()
-        .map(|(index, _, _)| *index)
+        .filter_map(|settings_id| observed_by_id.get(*settings_id).copied())
         .collect::<Vec<_>>();
-    let desired_paths =
-        build_editor_instance_paths_for_indices(desired, &service, &removal_indices);
-    for (desired_index, reset_properties, deleted_attributes) in pending_property_removals {
-        let instance = &desired.instances[desired_index];
-        let path_info = desired_paths
-            .get(&desired_index)
-            .cloned()
-            .with_context(|| format!("Could not locate {} in {}", instance.name, service))?;
-        plan.property_removals.push(EditorPropertyChange {
-            service: service.clone(),
-            settings_id: Some(instance.settings_id.clone()),
-            path_segments: path_info.path_segments,
-            path_ordinals: path_info.path_ordinals,
-            class_name: instance.class_name.clone(),
-            properties: Map::new(),
-            reset_properties,
-            attributes: Map::new(),
-            deleted_attributes,
-        });
+    if !previous_indices.is_empty() {
+        let previous_paths =
+            build_editor_instance_paths_for_indices(observed, &service, &previous_indices);
+        for index in previous_indices {
+            if let Some(path) = previous_paths.get(&index).cloned() {
+                plan.previous_paths.insert(
+                    (
+                        service.clone(),
+                        observed.instances[index].settings_id.clone(),
+                    ),
+                    path,
+                );
+            }
+        }
     }
+    log_reconcile_timing("settings delta previous paths", phase);
 
+    let phase = Instant::now();
+    if !pending_property_removals.is_empty() {
+        let removal_indices = pending_property_removals
+            .iter()
+            .map(|(index, _, _)| *index)
+            .collect::<Vec<_>>();
+        let desired_paths =
+            build_editor_instance_paths_for_indices(desired, &service, &removal_indices);
+        for (desired_index, reset_properties, deleted_attributes) in pending_property_removals {
+            let instance = &desired.instances[desired_index];
+            let path_info = desired_paths
+                .get(&desired_index)
+                .cloned()
+                .with_context(|| format!("Could not locate {} in {}", instance.name, service))?;
+            plan.property_removals.push(EditorPropertyChange {
+                service: service.clone(),
+                settings_id: Some(instance.settings_id.clone()),
+                path_segments: path_info.path_segments,
+                path_ordinals: path_info.path_ordinals,
+                class_name: instance.class_name.clone(),
+                properties: Map::new(),
+                reset_properties,
+                attributes: Map::new(),
+                deleted_attributes,
+            });
+        }
+    }
+    log_reconcile_timing("settings delta property removals", phase);
+
+    let phase = Instant::now();
     let removed = observed
         .instances
         .iter()
@@ -1895,6 +3001,10 @@ fn append_settings_push_plan(
         })
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        log_reconcile_timing("settings delta instance removals", phase);
+        return Ok(());
+    }
     let root_removals = removed
         .iter()
         .copied()
@@ -1905,6 +3015,7 @@ fn append_settings_push_plan(
         })
         .collect::<Vec<_>>();
     if root_removals.is_empty() {
+        log_reconcile_timing("settings delta instance removals", phase);
         return Ok(());
     }
     let package_ancestors = observed
@@ -1923,7 +3034,7 @@ fn append_settings_push_plan(
         })
         .collect::<HashSet<_>>();
     let observed_paths =
-        build_editor_instance_paths_for_indices(&observed, &service, &root_removals);
+        build_editor_instance_paths_for_indices(observed, &service, &root_removals);
     let mut descriptors = Vec::with_capacity(root_removals.len());
     for index in root_removals {
         if package_ancestors.contains(&index) {
@@ -1940,7 +3051,7 @@ fn append_settings_push_plan(
         })?;
         descriptors.push(
             editor_instance_descriptor_for_known_path(
-                &observed,
+                observed,
                 index,
                 path_info.path_segments,
                 path_info.path_ordinals,
@@ -1955,6 +3066,7 @@ fn append_settings_push_plan(
         instances: descriptors,
         preserve_instances: Vec::new(),
     });
+    log_reconcile_timing("settings delta instance removals", phase);
     Ok(())
 }
 
@@ -2344,7 +3456,8 @@ fn entries_equivalent(
     }
 }
 
-fn settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
+fn decoded_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
+    let phase = Instant::now();
     let mut document = match entry {
         Some(SnapshotEntry::File(bytes)) => decode_settings_bytecode(bytes),
         None => Ok(SettingsBytecode {
@@ -2353,9 +3466,92 @@ fn settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> 
         }),
         Some(_) => bail!("A Renium settings store is not a regular file"),
     }?;
+    log_reconcile_timing("settings document decode", phase);
+    let phase = Instant::now();
     stabilize_settings_reference_ids(&mut document);
-    canonicalize_settings_property_names(&mut document)?;
+    log_reconcile_timing("settings document reference stabilization", phase);
     Ok(document)
+}
+
+fn editor_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
+    decoded_settings_document(entry)
+}
+
+fn settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
+    let mut document = decoded_settings_document(entry)?;
+    let phase = Instant::now();
+    canonicalize_settings_property_names(&mut document)?;
+    log_reconcile_timing("settings document property canonicalization", phase);
+    Ok(document)
+}
+
+fn short_reconciliation_value(value: Option<&Value>) -> String {
+    let text = value.map_or_else(|| "<absent>".to_string(), Value::to_string);
+    if text.len() <= 96 {
+        text
+    } else {
+        format!("{}...", text.chars().take(93).collect::<String>())
+    }
+}
+
+fn first_three_way_property_difference(
+    baseline: &SettingsBytecode,
+    editor: &SettingsBytecode,
+    studio: &SettingsBytecode,
+) -> Option<String> {
+    let editor_by_id = editor
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance))
+        .collect::<HashMap<_, _>>();
+    let studio_by_id = studio
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance))
+        .collect::<HashMap<_, _>>();
+    for base in &baseline.instances {
+        let (Some(editor), Some(studio)) = (
+            editor_by_id.get(base.settings_id.as_str()).copied(),
+            studio_by_id.get(base.settings_id.as_str()).copied(),
+        ) else {
+            continue;
+        };
+        let keys = base
+            .properties
+            .keys()
+            .chain(editor.properties.keys())
+            .chain(studio.properties.keys())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for name in keys {
+            let baseline_value = reconciliation_property_value(&base.properties, name);
+            let editor_value = reconciliation_property_value(&editor.properties, name);
+            let studio_value = reconciliation_property_value(&studio.properties, name);
+            let editor_changed = !reconciliation_property_values_equal(
+                &base.class_name,
+                name,
+                baseline_value,
+                editor_value,
+            );
+            let studio_changed = !reconciliation_property_values_equal(
+                &base.class_name,
+                name,
+                baseline_value,
+                studio_value,
+            );
+            if editor_changed || studio_changed {
+                return Some(format!(
+                    "{} ({}) {name}: baseline={} editor={} studio={} editor_changed={editor_changed} studio_changed={studio_changed}",
+                    base.name,
+                    base.settings_id,
+                    short_reconciliation_value(baseline_value),
+                    short_reconciliation_value(editor_value),
+                    short_reconciliation_value(studio_value),
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn merge_settings_entry(
@@ -2397,6 +3593,7 @@ fn merge_settings_entry(
             preference,
             conflicts,
         );
+        align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         if conflicts.len() > previous_conflicts {
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &editor_doc);
             (editor_doc, true, studio_equivalent)
@@ -2429,6 +3626,7 @@ fn merge_settings_entry(
         align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
         align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
         align_equivalent_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc);
+        align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         align_equivalent_values(&base_doc, &mut editor_doc);
         align_equivalent_values(&base_doc, &mut studio_doc);
         align_equivalent_values(&editor_doc, &mut studio_doc);
@@ -2440,6 +3638,17 @@ fn merge_settings_entry(
             conflicts,
         );
         align_transient_script_guids(&mut base_doc, &mut editor_doc, &mut studio_doc);
+        if global_log_enabled(5) {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] reconcile first property difference in {}: {}",
+                    path.display(),
+                    first_three_way_property_difference(&base_doc, &editor_doc, &studio_doc)
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+            );
+        }
         let baseline_entries = &sides
             .baseline
             .context("A reconciliation baseline is missing")?
@@ -2968,7 +4177,11 @@ fn settings_instances_equal(
     left_instance.name == right_instance.name
         && left_instance.class_name == right_instance.class_name
         && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
-        && reconciliation_maps_equal(&left_instance.properties, &right_instance.properties)
+        && reconciliation_maps_equal(
+            &left_instance.class_name,
+            &left_instance.properties,
+            &right_instance.properties,
+        )
         && reconciliation_values_map_equal(&left_instance.attributes, &right_instance.attributes)
 }
 
@@ -3095,6 +4308,295 @@ fn snapshot_path_differences(
     Ok(differences)
 }
 
+fn snapshot_intended_delta_mismatches(
+    before: &ProjectSnapshot,
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+) -> Result<(Vec<PathBuf>, Option<String>)> {
+    let mut differences = Vec::new();
+    let mut detail = None;
+    for path in paths {
+        let before_entry = before.entries.get(path);
+        let desired_entry = desired.entries.get(path);
+        if entries_equivalent(path, before_entry, desired_entry) {
+            continue;
+        }
+        let mismatch = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+        {
+            settings_delta_mismatch(
+                path,
+                before_entry,
+                desired_entry,
+                observed.entries.get(path),
+            )?
+        } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
+            None
+        } else {
+            Some(format!(
+                "{} differs from the requested value",
+                path.display()
+            ))
+        };
+        if let Some(mismatch) = mismatch {
+            differences.push(path.clone());
+            if detail.is_none() {
+                detail = Some(mismatch);
+            }
+        }
+    }
+    differences.sort();
+    Ok((differences, detail))
+}
+
+fn settings_delta_mismatch(
+    path: &Path,
+    before: Option<&SnapshotEntry>,
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+) -> Result<Option<String>> {
+    let mut before = settings_document(before)?;
+    let desired = settings_document(desired)?;
+    let mut observed = settings_document(observed)?;
+    if !desired.instances.is_empty() {
+        if !before.instances.is_empty() && !align_settings_ids_to_reference(&desired, &mut before) {
+            bail!(
+                "Could not align the previous identities in {}",
+                path.display()
+            );
+        }
+        if !observed.instances.is_empty()
+            && !align_settings_ids_to_reference(&desired, &mut observed)
+        {
+            bail!(
+                "Could not align the Studio identities in {}",
+                path.display()
+            );
+        }
+    }
+    let before_by_id = before
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let desired_by_id = desired
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let observed_by_id = observed
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut settings_ids = before_by_id
+        .keys()
+        .chain(desired_by_id.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    settings_ids.sort_unstable();
+    settings_ids.dedup();
+    for settings_id in settings_ids {
+        let before_index = before_by_id.get(settings_id).copied();
+        let desired_index = desired_by_id.get(settings_id).copied();
+        let observed_index = observed_by_id.get(settings_id).copied();
+        let name = desired_index
+            .map(|index| desired.instances[index].name.as_str())
+            .or_else(|| before_index.map(|index| before.instances[index].name.as_str()))
+            .unwrap_or(settings_id);
+        match (before_index, desired_index, observed_index) {
+            (Some(_), None, Some(_)) => {
+                return Ok(Some(format!("{name} was not deleted from Studio")));
+            }
+            (None, Some(_), None) => {
+                return Ok(Some(format!("{name} was not created in Studio")));
+            }
+            (_, None, _) => continue,
+            (None, Some(desired_index), Some(observed_index)) => {
+                if let Some(detail) =
+                    added_instance_mismatch(&desired, desired_index, &observed, observed_index)
+                {
+                    return Ok(Some(format!("{name}.{detail}")));
+                }
+            }
+            (Some(before_index), Some(desired_index), Some(observed_index)) => {
+                if let Some(detail) = changed_instance_mismatch(
+                    &before,
+                    before_index,
+                    &desired,
+                    desired_index,
+                    &observed,
+                    observed_index,
+                ) {
+                    return Ok(Some(format!("{name}.{detail}")));
+                }
+            }
+            (Some(_), Some(_), None) => {
+                return Ok(Some(format!("{name} disappeared from Studio")));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn added_instance_mismatch(
+    desired: &SettingsBytecode,
+    desired_index: usize,
+    observed: &SettingsBytecode,
+    observed_index: usize,
+) -> Option<String> {
+    let desired_instance = &desired.instances[desired_index];
+    let observed_instance = &observed.instances[observed_index];
+    if desired_instance.name != observed_instance.name {
+        return Some("Name was not retained".to_string());
+    }
+    if desired_instance.class_name != observed_instance.class_name {
+        return Some("ClassName was not retained".to_string());
+    }
+    if settings_parent_id(desired, desired_index) != settings_parent_id(observed, observed_index) {
+        return Some("Parent was not retained".to_string());
+    }
+    expected_map_mismatch(
+        &desired_instance.properties,
+        &observed_instance.properties,
+        true,
+        &desired_instance.class_name,
+    )
+    .or_else(|| {
+        expected_map_mismatch(
+            &desired_instance.attributes,
+            &observed_instance.attributes,
+            false,
+            &desired_instance.class_name,
+        )
+    })
+}
+
+fn changed_instance_mismatch(
+    before: &SettingsBytecode,
+    before_index: usize,
+    desired: &SettingsBytecode,
+    desired_index: usize,
+    observed: &SettingsBytecode,
+    observed_index: usize,
+) -> Option<String> {
+    let before_instance = &before.instances[before_index];
+    let desired_instance = &desired.instances[desired_index];
+    let observed_instance = &observed.instances[observed_index];
+    for (label, previous, expected, actual) in [
+        (
+            "Name",
+            before_instance.name.as_str(),
+            desired_instance.name.as_str(),
+            observed_instance.name.as_str(),
+        ),
+        (
+            "ClassName",
+            before_instance.class_name.as_str(),
+            desired_instance.class_name.as_str(),
+            observed_instance.class_name.as_str(),
+        ),
+    ] {
+        if previous != expected && actual != expected {
+            return Some(format!("{label} was not retained"));
+        }
+    }
+    let previous_parent = settings_parent_id(before, before_index);
+    let expected_parent = settings_parent_id(desired, desired_index);
+    if previous_parent != expected_parent
+        && settings_parent_id(observed, observed_index) != expected_parent
+    {
+        return Some("Parent was not retained".to_string());
+    }
+    changed_map_mismatch(
+        &before_instance.properties,
+        &desired_instance.properties,
+        &observed_instance.properties,
+        true,
+        &desired_instance.class_name,
+    )
+    .or_else(|| {
+        changed_map_mismatch(
+            &before_instance.attributes,
+            &desired_instance.attributes,
+            &observed_instance.attributes,
+            false,
+            &desired_instance.class_name,
+        )
+    })
+}
+
+fn expected_map_mismatch(
+    expected: &Map<String, Value>,
+    actual: &Map<String, Value>,
+    properties: bool,
+    class_name: &str,
+) -> Option<String> {
+    expected.iter().find_map(|(name, expected)| {
+        if properties
+            && (name == "ScriptGuid"
+                || (name == "Source" && is_lua_source_class(class_name))
+                || reconciliation_property_is_derived(name))
+        {
+            return None;
+        }
+        let actual = if properties {
+            reconciliation_property_value(actual, name)
+        } else {
+            actual.get(name)
+        };
+        (!reconciliation_property_values_equal(class_name, name, Some(expected), actual))
+            .then(|| format!("{name} was not retained"))
+    })
+}
+
+fn changed_map_mismatch(
+    before: &Map<String, Value>,
+    desired: &Map<String, Value>,
+    observed: &Map<String, Value>,
+    properties: bool,
+    class_name: &str,
+) -> Option<String> {
+    let mut names = before.keys().chain(desired.keys()).collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.into_iter().find_map(|name| {
+        if properties
+            && (name == "ScriptGuid"
+                || (name == "Source" && is_lua_source_class(class_name))
+                || reconciliation_property_is_derived(name))
+        {
+            return None;
+        }
+        let previous = if properties {
+            reconciliation_property_value(before, name)
+        } else {
+            before.get(name)
+        };
+        let expected = if properties {
+            reconciliation_property_value(desired, name)
+        } else {
+            desired.get(name)
+        };
+        if reconciliation_property_values_equal(class_name, name, previous, expected) {
+            return None;
+        }
+        let actual = if properties {
+            reconciliation_property_value(observed, name)
+        } else {
+            observed.get(name)
+        };
+        (!reconciliation_property_values_equal(class_name, name, expected, actual))
+            .then(|| format!("{name} was not retained"))
+    })
+}
+
 fn snapshot_entry_equivalent(
     path: &Path,
     left: Option<&SnapshotEntry>,
@@ -3150,16 +4652,21 @@ fn snapshot_mismatch_details(
     }) else {
         return Ok(None);
     };
-    let observed = settings_document(observed.entries.get(path))?;
-    let expected = settings_document(expected.entries.get(path))?;
-    if observed.instances.len() != expected.instances.len() {
+    let observed_document = settings_document(observed.entries.get(path))?;
+    let expected_document = settings_document(expected.entries.get(path))?;
+    if observed_document.instances.len() != expected_document.instances.len() {
         return Ok(Some(format!(
             "Studio returned {} instances; expected {}",
-            observed.instances.len(),
-            expected.instances.len()
+            observed_document.instances.len(),
+            expected_document.instances.len()
         )));
     }
-    for (observed, expected) in observed.instances.iter().zip(&expected.instances) {
+    for (index, (observed, expected)) in observed_document
+        .instances
+        .iter()
+        .zip(&expected_document.instances)
+        .enumerate()
+    {
         if observed.name != expected.name
             || observed.class_name != expected.class_name
             || observed.parent_index != expected.parent_index
@@ -3168,6 +4675,9 @@ fn snapshot_mismatch_details(
                 "Studio returned a different structure at {}",
                 expected.name
             )));
+        }
+        if is_reconciliation_protected_workspace_camera(&expected_document, index) {
+            continue;
         }
         let instance_name = &expected.name;
         for (kind, observed, expected) in [
@@ -3194,6 +4704,14 @@ fn snapshot_mismatch_details(
                     expected.get(name)
                 };
                 let retained = match (observed_value, expected_value) {
+                    (Some(observed), Some(expected)) if kind == "property" => {
+                        reconciliation_property_values_equal(
+                            &expected_document.instances[index].class_name,
+                            name,
+                            Some(observed),
+                            Some(expected),
+                        )
+                    }
                     (Some(observed), Some(expected)) => {
                         reconciliation_values_equal(observed, expected, false)
                     }
@@ -3405,6 +4923,10 @@ fn load_record(context: &BoundContext, key: &str) -> Result<Option<PairRecord>> 
         head: None,
         conflicts: legacy.conflicts,
         resolution_required: legacy.resolution_required,
+        last_runtime_id: None,
+        local_file_stamp: None,
+        local_file_digest: None,
+        studio_checkpoint: None,
     };
     write_record(context, key, &record)?;
     fs::remove_file(&legacy_path)
@@ -3451,6 +4973,319 @@ mod tests {
                 .map(|(path, bytes)| (PathBuf::from(path), SnapshotEntry::File(bytes.to_vec())))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn studio_checkpoint_requires_uninterrupted_clean_tracking() {
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: String::new(),
+            root: String::new(),
+            experience: String::new(),
+            source: String::new(),
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("runtime".to_string()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let services = sync_services();
+        let generations = services
+            .iter()
+            .map(|service| (service.clone(), Value::from(7)))
+            .collect::<Map<_, _>>();
+        let state = json!({
+            "tracking": true,
+            "trackedServices": services.len(),
+            "dirtyServices": [],
+            "fullSyncServices": [],
+            "runtimeId": "runtime",
+            "changeTrackerVersion": 4,
+            "seq": 9,
+            "serviceGenerations": generations.clone(),
+            "checkpointGenerations": generations,
+        });
+        let checkpoint = StudioCheckpoint::from_state(&context, &state).unwrap();
+        assert!(checkpoint.matches_state(&context, &state));
+        assert_eq!(
+            checkpoint.changed_services(&context, &state),
+            Some(Vec::new())
+        );
+
+        let mut transaction_generation = state.clone();
+        transaction_generation["serviceGenerations"][&services[0]] = Value::from(8);
+        assert!(checkpoint.matches_state(&context, &transaction_generation));
+
+        let mut interrupted = state.clone();
+        interrupted["checkpointGenerations"][&services[0]] = Value::from(8);
+        assert!(!checkpoint.matches_state(&context, &interrupted));
+        assert_eq!(
+            checkpoint.changed_services(&context, &interrupted),
+            Some(vec![services[0].clone()])
+        );
+
+        let mut pending = state.clone();
+        pending["dirtyServices"] = json!([&services[0]]);
+        assert!(!checkpoint.matches_state(&context, &pending));
+        assert_eq!(
+            checkpoint.changed_services(&context, &pending),
+            Some(vec![services[0].clone()])
+        );
+
+        let mut moved_references = state;
+        moved_references["referencePathsMayChange"] = Value::Bool(true);
+        assert_eq!(
+            checkpoint.changed_services(&context, &moved_references),
+            None
+        );
+
+        let mut unexpected_service = moved_references;
+        unexpected_service["referencePathsMayChange"] = Value::Bool(false);
+        unexpected_service["checkpointGenerations"]["UnexpectedService"] = Value::from(7);
+        assert!(StudioCheckpoint::from_state(&context, &unexpected_service).is_none());
+        assert_eq!(
+            checkpoint.changed_services(&context, &unexpected_service),
+            None
+        );
+    }
+
+    #[test]
+    fn source_only_push_skips_service_readback_only_after_exact_verification() {
+        let paths = HashSet::from([PathBuf::from(
+            "src/ServerScriptService/Verified.server.luau",
+        )]);
+        let verified = Map::from_iter([
+            ("sourceVerified".to_string(), Value::from(1)),
+            ("sourceVerifyFailed".to_string(), Value::from(0)),
+        ]);
+        assert!(exact_source_push_verified(&verified, &paths));
+
+        let unverified = Map::from_iter([
+            ("sourceVerified".to_string(), Value::from(0)),
+            ("sourceVerifyFailed".to_string(), Value::from(0)),
+        ]);
+        assert!(!exact_source_push_verified(&unverified, &paths));
+    }
+
+    #[test]
+    fn targeted_push_verification_ignores_unrelated_studio_edits() {
+        let path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let snapshot = |anchored: bool, concurrent: Option<&str>| {
+            let mut part = SettingsBytecodeInstance {
+                settings_id: "part".to_string(),
+                name: "Part".to_string(),
+                class_name: "Part".to_string(),
+                parent_index: Some(0),
+                properties: Map::from_iter([("Anchored".to_string(), Value::Bool(anchored))]),
+                attributes: Map::new(),
+            };
+            if let Some(value) = concurrent {
+                part.attributes.insert(
+                    "ConcurrentProbe".to_string(),
+                    Value::String(value.to_string()),
+                );
+            }
+            let document = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    SettingsBytecodeInstance {
+                        settings_id: "root".to_string(),
+                        name: "ReplicatedStorage".to_string(),
+                        class_name: "ReplicatedStorage".to_string(),
+                        parent_index: None,
+                        properties: Map::new(),
+                        attributes: Map::new(),
+                    },
+                    part,
+                ],
+            };
+            ProjectSnapshot {
+                entries: [(
+                    path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+                )]
+                .into_iter()
+                .collect(),
+            }
+        };
+        let before = snapshot(true, None);
+        let desired = snapshot(false, None);
+        let observed = snapshot(false, Some("kept"));
+        let paths = HashSet::from([path.clone()]);
+        let (mismatches, _) =
+            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        assert!(mismatches.is_empty());
+
+        let overwritten = snapshot(true, Some("kept"));
+        let (mismatches, detail) =
+            snapshot_intended_delta_mismatches(&before, &desired, &overwritten, &paths).unwrap();
+        assert_eq!(mismatches, vec![path]);
+        assert!(detail.is_some_and(|detail| detail.contains("Anchored")));
+    }
+
+    #[test]
+    fn targeted_push_verification_checks_script_files_not_settings_source_metadata() {
+        let settings_path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let source_path = PathBuf::from("src/ReplicatedStorage/ProbeModule.luau");
+        let snapshot = |settings_source: &str, file_source: &str| {
+            let document = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    SettingsBytecodeInstance {
+                        settings_id: "root".to_string(),
+                        name: "ReplicatedStorage".to_string(),
+                        class_name: "ReplicatedStorage".to_string(),
+                        parent_index: None,
+                        properties: Map::new(),
+                        attributes: Map::new(),
+                    },
+                    SettingsBytecodeInstance {
+                        settings_id: "script".to_string(),
+                        name: "ProbeModule".to_string(),
+                        class_name: "ModuleScript".to_string(),
+                        parent_index: Some(0),
+                        properties: Map::from_iter([(
+                            "Source".to_string(),
+                            Value::String(settings_source.to_string()),
+                        )]),
+                        attributes: Map::new(),
+                    },
+                ],
+            };
+            ProjectSnapshot {
+                entries: [
+                    (
+                        settings_path.clone(),
+                        SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+                    ),
+                    (
+                        source_path.clone(),
+                        SnapshotEntry::File(file_source.as_bytes().to_vec()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        let before = ProjectSnapshot::default();
+        let desired = snapshot("return 'desired'", "return 'desired'\n");
+        let observed = snapshot("external", "return 'desired'\n");
+        let paths = HashSet::from([settings_path.clone(), source_path.clone()]);
+        let (mismatches, _) =
+            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        assert!(mismatches.is_empty());
+
+        let observed = snapshot("return 'desired'", "return 'wrong'\n");
+        let (mismatches, _) =
+            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        assert_eq!(mismatches, vec![source_path]);
+    }
+
+    #[test]
+    fn reconciliation_treats_elided_class_defaults_as_equal() {
+        let omitted = Map::new();
+        let default = Map::from_iter([("CanCollide".to_string(), Value::Bool(true))]);
+        let changed = Map::from_iter([("CanCollide".to_string(), Value::Bool(false))]);
+        assert!(reconciliation_maps_equal("Part", &default, &omitted));
+        assert!(reconciliation_maps_equal("Part", &omitted, &default));
+        assert!(!reconciliation_maps_equal("Part", &changed, &omitted));
+    }
+
+    #[test]
+    fn unchanged_local_file_bootstraps_a_replacement_runtime() {
+        let digest = "same-digest";
+
+        assert!(should_bootstrap_studio_from_editor(
+            PairMode::Reconcile,
+            Some("old-runtime"),
+            Some("new-runtime"),
+            Some(digest),
+            Some(digest),
+        ));
+        assert!(!should_bootstrap_studio_from_editor(
+            PairMode::Verify,
+            Some("old-runtime"),
+            Some("new-runtime"),
+            Some(digest),
+            Some(digest),
+        ));
+    }
+
+    #[test]
+    fn changed_or_unknown_local_file_uses_normal_reconciliation() {
+        assert!(!should_bootstrap_studio_from_editor(
+            PairMode::Reconcile,
+            Some("old-runtime"),
+            Some("new-runtime"),
+            Some("previous-digest"),
+            Some("changed-digest"),
+        ));
+        assert!(!should_bootstrap_studio_from_editor(
+            PairMode::Reconcile,
+            None,
+            Some("new-runtime"),
+            Some("digest"),
+            Some("digest"),
+        ));
+        assert!(!should_bootstrap_studio_from_editor(
+            PairMode::Reconcile,
+            Some("old-runtime"),
+            Some("new-runtime"),
+            None,
+            Some("digest"),
+        ));
+    }
+
+    #[test]
+    fn matching_legacy_stamp_migrates_once_to_content_identity() {
+        let stamp = LocalFileStamp {
+            length: 42,
+            modified_seconds: 123,
+            modified_nanos: 456,
+        };
+
+        assert!(legacy_local_file_stamp_matches(
+            PairMode::Reconcile,
+            true,
+            None,
+            Some(&stamp),
+            Some(&stamp),
+        ));
+        assert!(!legacy_local_file_stamp_matches(
+            PairMode::Verify,
+            true,
+            None,
+            Some(&stamp),
+            Some(&stamp),
+        ));
+        assert!(!legacy_local_file_stamp_matches(
+            PairMode::Reconcile,
+            true,
+            Some("already-migrated"),
+            Some(&stamp),
+            Some(&stamp),
+        ));
+    }
+
+    #[test]
+    fn runtime_bootstrap_requires_tracking_without_fresh_edits() {
+        assert!(studio_runtime_bootstrap_safe(&json!({
+            "tracking": true,
+            "dirtyServices": ["ReplicatedStorage"],
+            "restoredPendingServices": ["ReplicatedStorage"],
+        })));
+        assert!(!studio_runtime_bootstrap_safe(&json!({
+            "tracking": false,
+            "dirtyServices": [],
+            "restoredPendingServices": [],
+        })));
+        assert!(!studio_runtime_bootstrap_safe(&json!({
+            "tracking": true,
+            "dirtyServices": ["ReplicatedStorage", "StarterGui"],
+            "restoredPendingServices": ["ReplicatedStorage"],
+        })));
     }
 
     #[test]
@@ -4363,6 +6198,85 @@ mod tests {
         )
         .unwrap();
         assert!(order_plan.target_settings_ids.is_empty());
+    }
+
+    #[test]
+    fn incremental_editor_plan_uses_persisted_ids_for_duplicate_siblings() {
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let root = SettingsBytecodeInstance {
+            settings_id: "1".to_string(),
+            name: "Workspace".to_string(),
+            class_name: "Workspace".to_string(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let duplicate = |index: usize| SettingsBytecodeInstance {
+            settings_id: format!("debug:{index}"),
+            name: "Duplicate".to_string(),
+            class_name: "StringValue".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([("Value".to_string(), json!(index.to_string()))]),
+            attributes: Map::new(),
+        };
+        let package_link = SettingsBytecodeInstance {
+            settings_id: "debug:package-link".to_string(),
+            name: "PackageLink".to_string(),
+            class_name: "PackageLink".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([("PackageContent".to_string(), json!("rbxassetid://1"))]),
+            attributes: Map::new(),
+        };
+        let mut previous_instances = Vec::with_capacity(4_098);
+        previous_instances.push(root.clone());
+        previous_instances.extend((0..4_096).map(duplicate));
+        previous_instances.push(package_link.clone());
+        let previous_document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: previous_instances,
+        };
+        let mut current_document = previous_document.clone();
+        current_document.instances[1_001]
+            .properties
+            .insert("Value".to_string(), json!("changed"));
+        current_document.instances.remove(2_001);
+        current_document.instances.push(SettingsBytecodeInstance {
+            settings_id: "debug:new".to_string(),
+            ..duplicate(4_096)
+        });
+
+        let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+            entries: [(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let previous = snapshot(&previous_document);
+        let current = snapshot(&current_document);
+        let prepared =
+            prepare_editor_settings_changes(&previous, &current, std::slice::from_ref(&path))
+                .unwrap();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &previous,
+            &current,
+            &HashSet::from_iter([path.clone()]),
+            &prepared,
+        )
+        .unwrap();
+
+        assert_eq!(plan.changed_paths, vec![path]);
+        assert_eq!(
+            plan.target_settings_ids,
+            vec!["debug:1000".to_string(), "debug:new".to_string()]
+        );
+        assert_eq!(plan.instance_deletes.len(), 1);
+        assert_eq!(plan.instance_deletes[0].instances.len(), 1);
+        assert_eq!(
+            plan.instance_deletes[0].instances[0].settings_id,
+            "debug:2000"
+        );
     }
 
     #[test]

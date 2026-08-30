@@ -853,6 +853,66 @@ fn native_serialized_root_count(group: &EditorBinaryExportGroup) -> Result<usize
         .context("Native serialized root count overflowed")
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+fn plugin_place_service_roots(
+    dom: &mut RbxWeakDom,
+    groups: &[EditorBinaryExportGroup],
+) -> Result<Vec<(RbxRef, Vec<RbxRef>)>> {
+    let roots = dom.root().children().to_vec();
+    let expected_roots = groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(native_serialized_root_count(group)?)
+            .context("Studio plugin place snapshot root count overflowed")
+    })?;
+    if roots.len() != expected_roots {
+        bail!(
+            "Studio plugin place snapshot has {} roots; expected {expected_roots}",
+            roots.len()
+        );
+    }
+
+    let mut cursor = 0;
+    let mut carrier_refs = Vec::new();
+    let mut service_roots = Vec::with_capacity(groups.len());
+    for group in groups {
+        let marker_ref = roots[cursor];
+        cursor += 1;
+        let children_end = cursor + group.count;
+        let child_refs = roots[cursor..children_end].to_vec();
+        cursor = children_end;
+
+        let carrier_count = native_identity_carrier_count(group)?;
+        let carriers_end = cursor + carrier_count;
+        for (index, carrier_ref) in roots[cursor..carriers_end].iter().copied().enumerate() {
+            let carrier = dom
+                .get_by_ref(carrier_ref)
+                .context("Studio plugin place snapshot lost an identity carrier")?;
+            let expected_name = format!(
+                "{}{ordinal}",
+                group.identity_carrier_prefix,
+                ordinal = index + 1
+            );
+            if carrier.class.as_str() != group.identity_carrier_class
+                || carrier.name != expected_name
+                || !carrier.children().is_empty()
+            {
+                bail!(
+                    "Studio plugin {} identity carrier {} is invalid",
+                    group.service,
+                    index + 1
+                );
+            }
+            carrier_refs.push(carrier_ref);
+        }
+        cursor = carriers_end;
+        service_roots.push((marker_ref, child_refs));
+    }
+    for carrier_ref in carrier_refs {
+        dom.destroy(carrier_ref);
+    }
+    Ok(service_roots)
+}
+
 fn decode_native_identity(
     instances: Vec<rbx_binary::FlatInstance>,
     group: &EditorBinaryExportGroup,
@@ -1014,6 +1074,7 @@ fn decode_native_identity(
 #[cfg(test)]
 mod native_identity_tests {
     use super::*;
+    use rbx_dom_weak::InstanceBuilder;
 
     fn flat_instance(
         referent: u128,
@@ -1090,6 +1151,105 @@ mod native_identity_tests {
 
         assert_eq!(sources.by_index.get(&2).map(String::as_str), Some("second"));
         assert_eq!(sources.by_index.get(&3).map(String::as_str), Some("first"));
+    }
+
+    fn plugin_place_group(
+        count: usize,
+        instance_count: usize,
+        carrier_count: usize,
+    ) -> EditorBinaryExportGroup {
+        EditorBinaryExportGroup {
+            service: "Workspace".to_string(),
+            target_path: vec!["Workspace".to_string()],
+            count,
+            instance_count,
+            identity_carrier_class: "HumanoidRigDescription".to_string(),
+            identity_carrier_prefix: "__ReniumNativeIdentity:Workspace:".to_string(),
+            identity_carrier_slots: (1..=22).map(|index| format!("Slot{index}")).collect(),
+            identity_carrier_count: carrier_count,
+            script_count: 0,
+            class_names: vec!["Folder".to_string(), "Part".to_string()],
+            non_archivable_indices: Vec::new(),
+            root_properties: Map::new(),
+        }
+    }
+
+    #[test]
+    fn large_plugin_place_count_includes_identity_carriers() {
+        let group = plugin_place_group(86, 95_855, 4_357);
+
+        assert_eq!(group.count + 1, 87);
+        assert_eq!(native_serialized_root_count(&group).unwrap(), 4_444);
+    }
+
+    #[test]
+    fn plugin_place_reconstruction_removes_only_identity_carrier_roots() {
+        let mut source = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
+        let data_model = source.root_ref();
+        let marker = source.insert(
+            data_model,
+            InstanceBuilder::new("Folder").with_name("Workspace"),
+        );
+        let mut top_level_refs = vec![marker];
+        for index in 1..=17 {
+            let child_builder = if index == 17 {
+                InstanceBuilder::new("HumanoidRigDescription")
+                    .with_name("__ReniumNativeIdentity:Workspace:1")
+            } else {
+                InstanceBuilder::new("Folder").with_name(format!("Root{index}"))
+            };
+            let child = source.insert(data_model, child_builder);
+            top_level_refs.push(child);
+            if index == 1 {
+                for descendant in 1..=6 {
+                    source.insert(
+                        child,
+                        InstanceBuilder::new("Part").with_name(format!("Descendant{descendant}")),
+                    );
+                }
+            }
+        }
+        for index in 1..=2 {
+            let carrier = source.insert(
+                data_model,
+                InstanceBuilder::new("HumanoidRigDescription")
+                    .with_name(format!("__ReniumNativeIdentity:Workspace:{index}")),
+            );
+            top_level_refs.push(carrier);
+        }
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &source, &top_level_refs).unwrap();
+        let mut reconstructed = rbx_binary::from_reader(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reconstructed.root().children().len(), 20);
+
+        let groups =
+            plugin_place_service_roots(&mut reconstructed, &[plugin_place_group(17, 24, 2)])
+                .unwrap();
+        let (marker_ref, child_refs) = &groups[0];
+        for child_ref in child_refs {
+            reconstructed.transfer_within(*child_ref, *marker_ref);
+        }
+
+        assert_eq!(reconstructed.root().children(), &[*marker_ref]);
+        assert_eq!(
+            reconstructed
+                .get_by_ref(*marker_ref)
+                .unwrap()
+                .children()
+                .len(),
+            17
+        );
+        assert_eq!(reconstructed.descendants_of(*marker_ref).count(), 24);
+        assert_eq!(
+            reconstructed
+                .descendants_of(*marker_ref)
+                .filter(|instance| {
+                    instance.class.as_str() == "HumanoidRigDescription"
+                        && instance.name == "__ReniumNativeIdentity:Workspace:1"
+                })
+                .count(),
+            1
+        );
     }
 }
 
@@ -2557,15 +2717,7 @@ fn write_editor_place_snapshot(
     };
     let mut dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
         .context("Studio returned an invalid native place snapshot")?;
-    let roots = dom.root().children().to_vec();
-    let expected_roots = export
-        .groups
-        .iter()
-        .map(|group| group.count + 1)
-        .sum::<usize>();
-    if roots.len() != expected_roots {
-        bail!("Studio native place snapshot has the wrong root count");
-    }
+    let plugin_service_roots = plugin_place_service_roots(&mut dom, &export.groups)?;
     let service_names = export
         .groups
         .iter()
@@ -2598,14 +2750,9 @@ fn write_editor_place_snapshot(
     }
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
     let tags_key = rbx_dom_weak::Ustr::from("Tags");
-    let mut cursor = 0usize;
     let mut service_roots = Vec::with_capacity(export.groups.len());
     let mut live_metadata = Vec::with_capacity(export.groups.len());
-    for group in &export.groups {
-        let marker_ref = roots[cursor];
-        cursor += 1;
-        let child_refs = roots[cursor..cursor + group.count].to_vec();
-        cursor += group.count;
+    for (group, (marker_ref, child_refs)) in export.groups.iter().zip(plugin_service_roots) {
         let marker = dom
             .get_by_ref_mut(marker_ref)
             .context("Studio native place snapshot lost a service marker")?;

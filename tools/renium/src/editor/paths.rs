@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -142,6 +142,67 @@ pub(crate) fn build_editor_source_path_map(
     };
     walk.append_children(&children_by_parent[root_index], service_dir);
     map
+}
+
+pub(crate) fn editor_source_target_with_children(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    source_path: &Path,
+    children_by_parent: &[Vec<usize>],
+) -> Option<EditorSourceTarget> {
+    let spec = infer_editor_source_path_spec_in_service(service_dir, service, source_path)?;
+    let root_index = editor_service_root_index(document, service)?;
+    let mut parent_index = root_index;
+    let mut path_segments = vec![document.instances[root_index].name.clone()];
+    let mut path_ordinals = vec![1];
+
+    for component in &spec.parent_components {
+        let (index, _, ordinal) = editor_child_stems(
+            document,
+            children_by_parent
+                .get(parent_index)
+                .map_or(&[], Vec::as_slice),
+        )
+        .into_iter()
+        .find(|(_, stem, _)| stem == component)?;
+        parent_index = index;
+        path_segments.push(document.instances[index].name.clone());
+        path_ordinals.push(ordinal);
+    }
+
+    let (index, _, ordinal) = editor_child_stems(
+        document,
+        children_by_parent
+            .get(parent_index)
+            .map_or(&[], Vec::as_slice),
+    )
+    .into_iter()
+    .find(|(_, stem, _)| stem == &spec.instance_stem)?;
+    let instance = &document.instances[index];
+    if instance.class_name != spec.class_name || !is_lua_source_class(&instance.class_name) {
+        return None;
+    }
+    if let Some(expected) = spec.run_context.as_deref() {
+        let actual = instance
+            .properties
+            .get("RunContext")
+            .and_then(run_context_name);
+        if !(actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+            || expected.eq_ignore_ascii_case("Legacy") && actual.is_none())
+        {
+            return None;
+        }
+    }
+    path_segments.push(instance.name.clone());
+    path_ordinals.push(ordinal);
+    Some(EditorSourceTarget {
+        service: service.to_string(),
+        settings_id: Some(instance.settings_id.clone()),
+        path_segments,
+        path_ordinals,
+        class_name: instance.class_name.clone(),
+    })
 }
 
 pub(crate) struct EditorDirectoryTarget {
@@ -444,23 +505,14 @@ pub(crate) fn build_editor_instance_paths_for_indices(
     let Some(root_index) = editor_service_root_index(document, service) else {
         return HashMap::new();
     };
-    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
-    let mut ordinals = Vec::with_capacity(document.instances.len());
-    for instance in &document.instances {
-        let ordinal = sibling_counts
-            .entry((instance.parent_index, instance.name.as_str()))
-            .and_modify(|value| *value += 1)
-            .or_insert(1);
-        ordinals.push(*ordinal);
-    }
-
-    let mut paths = HashMap::with_capacity(indices.len());
-    let mut hierarchy = Vec::new();
+    let mut hierarchies = HashMap::with_capacity(indices.len());
+    let mut hierarchy_indices = HashSet::new();
+    let mut relevant_siblings = HashSet::new();
     for &index in indices {
         if index >= document.instances.len() {
             continue;
         }
-        hierarchy.clear();
+        let mut hierarchy = Vec::new();
         let mut current = Some(index);
         while let Some(current_index) = current {
             hierarchy.push(current_index);
@@ -470,6 +522,32 @@ pub(crate) fn build_editor_instance_paths_for_indices(
             continue;
         }
         hierarchy.reverse();
+        for current_index in &hierarchy {
+            let instance = &document.instances[*current_index];
+            hierarchy_indices.insert(*current_index);
+            relevant_siblings.insert((instance.parent_index, instance.name.as_str()));
+        }
+        hierarchies.insert(index, hierarchy);
+    }
+
+    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
+    let mut ordinals = HashMap::with_capacity(hierarchy_indices.len());
+    for (index, instance) in document.instances.iter().enumerate() {
+        let key = (instance.parent_index, instance.name.as_str());
+        if !relevant_siblings.contains(&key) {
+            continue;
+        }
+        let ordinal = sibling_counts
+            .entry(key)
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        if hierarchy_indices.contains(&index) {
+            ordinals.insert(index, *ordinal);
+        }
+    }
+
+    let mut paths = HashMap::with_capacity(hierarchies.len());
+    for (index, hierarchy) in hierarchies {
         paths.insert(
             index,
             EditorInstancePath {
@@ -477,7 +555,15 @@ pub(crate) fn build_editor_instance_paths_for_indices(
                     .iter()
                     .map(|index| document.instances[*index].name.clone())
                     .collect(),
-                path_ordinals: hierarchy.iter().map(|index| ordinals[*index]).collect(),
+                path_ordinals: hierarchy
+                    .iter()
+                    .map(|index| {
+                        ordinals
+                            .get(index)
+                            .copied()
+                            .expect("hierarchy ordinal should be recorded")
+                    })
+                    .collect(),
             },
         );
     }
@@ -696,4 +782,57 @@ pub(crate) fn service_from_changed_path(src_root: &Path, changed_path: &Path) ->
         .next()
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecodeInstance};
+
+    #[test]
+    fn source_target_follows_filesystem_stems_without_walking_the_service() {
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "ServerStorage".to_string(),
+                    "ServerStorage".to_string(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "first".to_string(),
+                    "Folder".to_string(),
+                    "Folder".to_string(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "second".to_string(),
+                    "Folder".to_string(),
+                    "Folder".to_string(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "module".to_string(),
+                    "Module".to_string(),
+                    "ModuleScript".to_string(),
+                    Some(2),
+                ),
+            ],
+        };
+        let children = settings_children_by_parent(&document);
+        let service_dir = Path::new("/tmp/src/ServerStorage");
+        let target = editor_source_target_with_children(
+            &document,
+            "ServerStorage",
+            service_dir,
+            &service_dir.join("Folder_2/Module.luau"),
+            &children,
+        )
+        .expect("source target should resolve");
+
+        assert_eq!(target.settings_id.as_deref(), Some("module"));
+        assert_eq!(target.path_segments, ["ServerStorage", "Folder", "Module"]);
+        assert_eq!(target.path_ordinals, [1, 2, 1]);
+    }
 }

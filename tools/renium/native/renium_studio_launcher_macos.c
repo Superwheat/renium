@@ -29,15 +29,19 @@ int main(int argc, char** argv)
         snprintf(studio, sizeof(studio), "%s/RobloxStudio.bin", directory);
     if (studio_length < 0 || (size_t)studio_length >= sizeof(studio))
         return 73;
-    const int helper_length = snprintf(
-            helper,
-            sizeof(helper),
-            "%s/../Frameworks/ReniumStudioHelper.dylib",
-            directory);
-    if (helper_length < 0 || (size_t)helper_length >= sizeof(helper))
-        return 74;
-    if (setenv("DYLD_INSERT_LIBRARIES", helper, 1) != 0)
-        return 75;
+    const char* home = getenv("HOME");
+    if (home)
+    {
+        const int helper_length = snprintf(
+                helper,
+                sizeof(helper),
+                "%s/Library/Application Support/Renium/native/ReniumStudioHelper.dylib",
+                home);
+        if (helper_length < 0 || (size_t)helper_length >= sizeof(helper))
+            return 74;
+        if (access(helper, R_OK) == 0 && setenv("DYLD_INSERT_LIBRARIES", helper, 1) != 0)
+            return 75;
+    }
     argv[0] = studio;
     execv(studio, argv);
     return 76;

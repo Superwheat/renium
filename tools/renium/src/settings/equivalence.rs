@@ -6,6 +6,8 @@ use std::time::Instant;
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use rbx_dom_weak::types::VariantType as RbxVariantType;
+use rbx_reflection::DataType as RbxDataType;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -15,7 +17,9 @@ use super::bytecode::{
     encode_settings_bytecode_with_dense_references, is_reference_object,
 };
 use crate::app::timing::{log_timing, verbose_timing_logs};
-use crate::rbx::encode::rbx_logical_property_name;
+use crate::rbx::decode::rbx_variant_to_settings_json;
+use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
+use crate::rbx::model::BytecodeModelImportRefs;
 use crate::snapshot::refs::{
     remap_and_stabilize_record_references, remap_record_reference_ids, stabilize_record_references,
 };
@@ -174,6 +178,17 @@ pub(crate) fn align_settings_bytes_to_reference(
     log_timing("settings alignment compare", compare_started);
     drop_settings_documents(reference, observed);
     Ok(result)
+}
+
+pub(crate) fn drop_settings_document(document: SettingsBytecode) {
+    let started = Instant::now();
+    let SettingsBytecode { instances, .. } = document;
+    if instances.len() >= 8_192 && rayon::current_num_threads() > 1 {
+        instances.into_par_iter().for_each(drop);
+    } else {
+        drop(instances);
+    }
+    log_timing("settings document release", started);
 }
 
 pub(crate) fn drop_settings_documents(left: SettingsBytecode, right: SettingsBytecode) {
@@ -1026,32 +1041,38 @@ fn positional_documents_equivalent(
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<AHashMap<_, _>>();
     log_timing("settings positional identity maps", ids_started);
-    let equivalent =
-        |(reference, observed): (&SettingsBytecodeInstance, &SettingsBytecodeInstance)| {
-            reference.class_name == "PackageLink"
-                || reconciliation_maps_equal_with_ids(
-                    &reference.properties,
-                    &observed.properties,
-                    &reference_ids,
-                    &observed_ids,
-                ) && reconciliation_values_map_equal_with_ids(
-                    &reference.attributes,
-                    &observed.attributes,
-                    &reference_ids,
-                    &observed_ids,
-                )
-        };
+    let equivalent = |(index, (reference_instance, observed_instance)): (
+        usize,
+        (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
+    )| {
+        reference_instance.class_name == "PackageLink"
+            || is_reconciliation_protected_workspace_camera(reference, index)
+            || reconciliation_maps_equal_with_ids(
+                &reference_instance.class_name,
+                &reference_instance.properties,
+                &observed_instance.properties,
+                &reference_ids,
+                &observed_ids,
+            ) && reconciliation_values_map_equal_with_ids(
+                &reference_instance.attributes,
+                &observed_instance.attributes,
+                &reference_ids,
+                &observed_ids,
+            )
+    };
     if reference.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
         reference
             .instances
             .par_iter()
             .zip(observed.instances.par_iter())
+            .enumerate()
             .all(equivalent)
     } else {
         reference
             .instances
             .iter()
             .zip(&observed.instances)
+            .enumerate()
             .all(equivalent)
     }
 }
@@ -1310,6 +1331,7 @@ fn align_settings_ids_for_contiguous_structural_change(
         let observed = &observed.instances[observed_index];
         reference.class_name == "PackageLink"
             || reconciliation_maps_equal_with_ids(
+                &reference.class_name,
                 &reference.properties,
                 &observed.properties,
                 &reference_ids,
@@ -1413,7 +1435,9 @@ pub(crate) fn settings_documents_equivalent(
                 && left_instance.class_name == right_instance.class_name
                 && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
                 && (left_instance.class_name == "PackageLink"
+                    || is_reconciliation_protected_workspace_camera(left, left_index)
                     || reconciliation_maps_equal(
+                        &left_instance.class_name,
                         &left_instance.properties,
                         &right_instance.properties,
                     ) && reconciliation_values_map_equal(
@@ -1423,14 +1447,66 @@ pub(crate) fn settings_documents_equivalent(
         })
 }
 
+pub(crate) fn is_reconciliation_protected_workspace_camera(
+    document: &SettingsBytecode,
+    index: usize,
+) -> bool {
+    let instance = &document.instances[index];
+    if instance.class_name != "Camera"
+        || !matches!(instance.name.as_str(), "Camera" | "CurrentCamera")
+    {
+        return false;
+    }
+    let Some(parent) = instance
+        .parent_index
+        .and_then(|index| document.instances.get(index))
+    else {
+        return false;
+    };
+    parent.class_name == "Workspace" && parent.parent_index.is_none()
+}
+
+pub(crate) fn align_reconciliation_protected_workspace_cameras(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+) {
+    let observed_by_id = observed
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for (reference_index, reference_instance) in reference.instances.iter().enumerate() {
+        if !is_reconciliation_protected_workspace_camera(reference, reference_index) {
+            continue;
+        }
+        let Some(observed_index) = observed_by_id.get(&reference_instance.settings_id).copied()
+        else {
+            continue;
+        };
+        if !is_reconciliation_protected_workspace_camera(observed, observed_index) {
+            continue;
+        }
+        let observed_instance = &mut observed.instances[observed_index];
+        observed_instance
+            .properties
+            .clone_from(&reference_instance.properties);
+        observed_instance
+            .attributes
+            .clone_from(&reference_instance.attributes);
+    }
+}
+
 pub(crate) fn reconciliation_maps_equal(
+    class_name: &str,
     left: &Map<String, Value>,
     right: &Map<String, Value>,
 ) -> bool {
-    reconciliation_maps_equal_with_ids(left, right, &AHashMap::new(), &AHashMap::new())
+    reconciliation_maps_equal_with_ids(class_name, left, right, &AHashMap::new(), &AHashMap::new())
 }
 
 fn reconciliation_maps_equal_with_ids(
+    class_name: &str,
     left: &Map<String, Value>,
     right: &Map<String, Value>,
     left_ids: &AHashMap<&str, usize>,
@@ -1441,30 +1517,28 @@ fn reconciliation_maps_equal_with_ids(
             && !reconciliation_property_is_derived(name)
             && !reconciliation_property_is_metadata(name, value)
     };
-    let mut left_count = 0;
     for (name, value) in left {
         if !stable(name, value) {
             continue;
         }
-        left_count += 1;
-        let Some(other) = right.get(name) else {
-            return false;
-        };
-        if !reconciliation_values_equal_with_ids(
-            value,
-            other,
-            false,
-            Some(left_ids),
-            Some(right_ids),
-        ) {
-            return false;
+        match right.get(name) {
+            Some(other)
+                if reconciliation_values_equal_with_ids(
+                    value,
+                    other,
+                    reconciliation_property_uses_f32(class_name, name),
+                    Some(left_ids),
+                    Some(right_ids),
+                ) => {}
+            None if reconciliation_property_value_is_default(class_name, name, value) => {}
+            _ => return false,
         }
     }
-    left_count
-        == right
-            .iter()
-            .filter(|(name, value)| stable(name, value))
-            .count()
+    right.iter().all(|(name, value)| {
+        !stable(name, value)
+            || left.contains_key(name)
+            || reconciliation_property_value_is_default(class_name, name, value)
+    })
 }
 
 pub(crate) fn reconciliation_values_map_equal(
@@ -1698,6 +1772,67 @@ pub(crate) fn reconciliation_property_value<'a>(
         .filter(|value| !reconciliation_property_is_metadata(name, value))
 }
 
+fn reconciliation_property_value_is_default(class_name: &str, name: &str, value: &Value) -> bool {
+    let Ok(database) = rbx_reflection_database::get() else {
+        return false;
+    };
+    let descriptor = rbx_model_property_descriptor(database, class_name, name);
+    let serialized_name = descriptor.map_or(name, |descriptor| descriptor.name);
+    let Some(default) = database
+        .classes
+        .get(class_name)
+        .and_then(|class| database.find_default_property(class, serialized_name))
+        .and_then(|default| {
+            rbx_variant_to_settings_json(
+                default,
+                descriptor,
+                database,
+                &BytecodeModelImportRefs::default(),
+            )
+        })
+    else {
+        return false;
+    };
+    reconciliation_values_equal(
+        value,
+        &default,
+        reconciliation_property_uses_f32(class_name, name),
+    )
+}
+
+fn reconciliation_property_uses_f32(class_name: &str, name: &str) -> bool {
+    rbx_reflection_database::get()
+        .ok()
+        .and_then(|database| rbx_model_property_descriptor(database, class_name, name))
+        .is_some_and(|descriptor| {
+            matches!(
+                descriptor.data_type,
+                RbxDataType::Value(RbxVariantType::Float32)
+            )
+        })
+}
+
+pub(crate) fn reconciliation_property_values_equal(
+    class_name: &str,
+    name: &str,
+    left: Option<&Value>,
+    right: Option<&Value>,
+) -> bool {
+    let left = left.filter(|value| !reconciliation_property_is_metadata(name, value));
+    let right = right.filter(|value| !reconciliation_property_is_metadata(name, value));
+    match (left, right) {
+        (Some(left), Some(right)) => reconciliation_values_equal(
+            left,
+            right,
+            reconciliation_property_uses_f32(class_name, name),
+        ),
+        (Some(value), None) | (None, Some(value)) => {
+            reconciliation_property_value_is_default(class_name, name, value)
+        }
+        (None, None) => true,
+    }
+}
+
 pub(crate) fn remove_reconciliation_derived_properties(document: &mut SettingsBytecode) {
     for instance in &mut document.instances {
         instance
@@ -1724,7 +1859,8 @@ pub(crate) fn align_equivalent_values(
             continue;
         };
         let observed_instance = &mut observed.instances[observed_index];
-        align_equivalent_map_values(
+        align_equivalent_property_map_values(
+            &reference_instance.class_name,
             &reference_instance.properties,
             &mut observed_instance.properties,
         );
@@ -1732,6 +1868,28 @@ pub(crate) fn align_equivalent_values(
             &reference_instance.attributes,
             &mut observed_instance.attributes,
         );
+    }
+}
+
+fn align_equivalent_property_map_values(
+    class_name: &str,
+    reference: &Map<String, Value>,
+    observed: &mut Map<String, Value>,
+) {
+    for (name, reference_value) in reference {
+        let Some(observed_value) = observed.get_mut(name) else {
+            continue;
+        };
+        if reference_value != observed_value
+            && reconciliation_property_values_equal(
+                class_name,
+                name,
+                Some(reference_value),
+                Some(observed_value),
+            )
+        {
+            observed_value.clone_from(reference_value);
+        }
     }
 }
 
@@ -2623,5 +2781,90 @@ mod tests {
             "pathOrdinals": [1, 1],
         });
         assert!(reconciliation_values_equal(&with_id, &without_id, false));
+    }
+
+    #[test]
+    fn workspace_camera_viewport_values_do_not_affect_reconciliation() {
+        let root = SettingsBytecodeInstance::new(
+            "root".to_string(),
+            "Workspace".to_string(),
+            "Workspace".to_string(),
+            None,
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "camera".to_string(),
+            "Camera".to_string(),
+            "Camera".to_string(),
+            Some(0),
+        );
+        camera.properties.insert(
+            "CFrame".to_string(),
+            json!({"_type": "CFrame", "components": [0.0, 1.0, 2.0]}),
+        );
+        let reference = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![root.clone(), camera.clone()],
+        };
+        let mut observed = reference.clone();
+        observed.instances[1].properties.insert(
+            "CFrame".to_string(),
+            json!({"_type": "CFrame", "components": [100.0, 200.0, 300.0]}),
+        );
+
+        assert!(settings_documents_positionally_equivalent(
+            &reference, &observed
+        ));
+        assert!(settings_documents_equivalent(&reference, &observed));
+        align_reconciliation_protected_workspace_cameras(&reference, &mut observed);
+        assert_eq!(
+            observed.instances[1].properties,
+            reference.instances[1].properties
+        );
+
+        let folder = SettingsBytecodeInstance::new(
+            "folder".to_string(),
+            "Folder".to_string(),
+            "Folder".to_string(),
+            Some(0),
+        );
+        camera.parent_index = Some(1);
+        let nested_reference = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![root, folder, camera],
+        };
+        let mut nested_observed = nested_reference.clone();
+        nested_observed.instances[2].properties.insert(
+            "CFrame".to_string(),
+            json!({"_type": "CFrame", "components": [9.0]}),
+        );
+        assert!(!settings_documents_equivalent(
+            &nested_reference,
+            &nested_observed
+        ));
+    }
+
+    #[test]
+    fn float32_properties_use_roblox_precision_without_weakening_other_numbers() {
+        let concise = json!(0.2);
+        let studio_float32 = json!(0.20000000298023224);
+        let different = json!(0.21);
+
+        assert!(reconciliation_property_values_equal(
+            "Part",
+            "Transparency",
+            Some(&concise),
+            Some(&studio_float32),
+        ));
+        assert!(!reconciliation_property_values_equal(
+            "Part",
+            "Transparency",
+            Some(&concise),
+            Some(&different),
+        ));
+        assert!(!reconciliation_values_equal(
+            &concise,
+            &studio_float32,
+            false,
+        ));
     }
 }

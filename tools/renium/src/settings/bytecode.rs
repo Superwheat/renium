@@ -1,8 +1,9 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,23 @@ const MAX_SETTINGS_COLLECTION_ITEMS: usize = 500_000;
 const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
+const MAX_CACHED_SETTINGS_DOCUMENTS: usize = 4;
+const MAX_CACHED_SETTINGS_INSTANCES: usize = 200_000;
+const MAX_CACHED_SETTINGS_BYTES: usize = 16 * 1024 * 1024;
+
+struct CachedSettingsDocument {
+    source: Box<[u8]>,
+    document: Arc<SettingsBytecode>,
+}
+
+#[derive(Default)]
+struct SettingsDocumentCache {
+    entries: VecDeque<CachedSettingsDocument>,
+    source_bytes: usize,
+    instances: usize,
+}
+
+static SETTINGS_DOCUMENT_CACHE: OnceLock<Mutex<SettingsDocumentCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SettingsBytecode {
@@ -81,6 +99,10 @@ impl SettingsBytecode {
         read_settings_file(path, decode_settings_bytecode)
     }
 
+    pub(crate) fn read_file_cached(path: &Path) -> Result<Arc<Self>> {
+        read_settings_file(path, cached_settings_document)
+    }
+
     pub(crate) fn read_structure_file(path: &Path) -> Result<Self> {
         read_settings_file(path, decode_settings_bytecode_structure)
     }
@@ -102,6 +124,66 @@ impl SettingsBytecode {
         let bytes = encode_settings_bytecode(self)?;
         write_bytes_if_changed(path, &bytes)
     }
+}
+
+fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
+    let cache =
+        SETTINGS_DOCUMENT_CACHE.get_or_init(|| Mutex::new(SettingsDocumentCache::default()));
+    {
+        let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|entry| entry.source.as_ref() == bytes)
+        {
+            let entry = cache
+                .entries
+                .remove(index)
+                .expect("cached settings document index should exist");
+            let document = Arc::clone(&entry.document);
+            cache.entries.push_back(entry);
+            return Ok(document);
+        }
+    }
+
+    let document = Arc::new(decode_settings_bytecode(bytes)?);
+    let mut evicted = Vec::new();
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(index) = cache
+        .entries
+        .iter()
+        .position(|entry| entry.source.as_ref() == bytes)
+    {
+        let entry = cache
+            .entries
+            .remove(index)
+            .expect("cached settings document index should exist");
+        let document = Arc::clone(&entry.document);
+        cache.entries.push_back(entry);
+        return Ok(document);
+    }
+    cache.source_bytes += bytes.len();
+    cache.instances += document.instances.len();
+    cache.entries.push_back(CachedSettingsDocument {
+        source: bytes.to_vec().into_boxed_slice(),
+        document: Arc::clone(&document),
+    });
+    while cache.entries.len() > 1
+        && (cache.entries.len() > MAX_CACHED_SETTINGS_DOCUMENTS
+            || cache.source_bytes > MAX_CACHED_SETTINGS_BYTES
+            || cache.instances > MAX_CACHED_SETTINGS_INSTANCES)
+    {
+        let entry = cache
+            .entries
+            .pop_front()
+            .expect("non-empty settings cache should have a front entry");
+        cache.source_bytes -= entry.source.len();
+        cache.instances -= entry.document.instances.len();
+        evicted.push(entry);
+    }
+    drop(cache);
+    drop(evicted);
+    Ok(document)
 }
 
 fn read_settings_file<T>(path: &Path, mut decode: impl FnMut(&[u8]) -> Result<T>) -> Result<T> {
@@ -346,7 +428,14 @@ fn decode_settings_bytecode_document(version: u8, decoded: &[u8]) -> Result<Sett
 
 fn decode_settings_bytecode_structure(bytes: &[u8]) -> Result<SettingsBytecode> {
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
-    let mut reader = BytecodeReader::new(&decoded);
+    decode_settings_bytecode_structure_document(version, &decoded)
+}
+
+fn decode_settings_bytecode_structure_document(
+    version: u8,
+    decoded: &[u8],
+) -> Result<SettingsBytecode> {
+    let mut reader = BytecodeReader::new(decoded);
     let header = decode_settings_payload_header(&mut reader)?;
     Ok(SettingsBytecode {
         version,

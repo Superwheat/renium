@@ -1,12 +1,15 @@
 local BridgeStudioChanges = {}
 local BridgeScriptDocuments = require(script.Parent.BridgeScriptDocuments)
 local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
+local RbxDomModule = require(script.Parent.RbxDom)
 local CHANGE_TRACKER_VERSION = 4
 local CollectionService = game:GetService("CollectionService")
 local Workspace = game:GetService("Workspace")
 local MAX_CHANGE_LOGS_PER_SERVICE = 1024
 local MAX_DIRECT_PROPERTY_CHANGES = 2048
 local MAX_DIRECT_PROPERTY_BYTES = 8 * 1024 * 1024
+local TRACKING_GUARD_TTL_SECONDS = 300
+local FLOAT32_FINGERPRINT_BUFFER = buffer.create(4)
 
 type AllowedServices = { [string]: boolean }
 type DirtySeqMap = { [string]: number }
@@ -127,9 +130,17 @@ local ATTRIBUTE_EVENT_PROPERTIES: { [string]: boolean } = {
 
 type State = {
 	started: boolean,
+	persistentTracking: boolean,
+	trackingGuards: { [string]: number },
+	pendingEpoch: string?,
+	pendingRuntimeId: string?,
+	restoredPendingEpoch: string?,
+	restoredPendingRuntimeId: string?,
 	seq: number,
 	dirtySeqByService: DirtySeqMap,
+	restoredPendingServices: { [string]: boolean },
 	mutationSeqByService: DirtySeqMap,
+	checkpointSeqByService: DirtySeqMap,
 	fullSyncSeqByService: DirtySeqMap,
 	propertyChangesByKey: { [string]: DirectPropertyChange },
 	changeLogByKey: { [string]: StudioChangeLog },
@@ -147,6 +158,7 @@ type State = {
 	tagConnections: { [string]: { RBXScriptConnection } },
 	taggedInstancesByTag: { [string]: { [Instance]: boolean } },
 	changeEvent: BindableEvent,
+	changeSignalPending: boolean,
 	waitGeneration: number,
 	suppressUntil: number,
 	suppressDepth: number,
@@ -167,6 +179,7 @@ type State = {
 	expectedInstanceProperties: ExpectedInstanceEvents,
 	expectedInstanceAttributes: ExpectedInstanceEvents,
 	expectedTags: ExpectedInstanceEvents,
+	expectedFreshInstances: { [Instance]: boolean },
 	expectedGeneration: number,
 	luaSourceDescendantCounts: { [Instance]: number },
 	archivableByInstance: { [Instance]: boolean },
@@ -243,9 +256,17 @@ end
 function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: AllowedServices)
 	local state: State = {
 		started = false,
+		persistentTracking = false,
+		trackingGuards = {},
+		pendingEpoch = nil,
+		pendingRuntimeId = nil,
+		restoredPendingEpoch = nil,
+		restoredPendingRuntimeId = nil,
 		seq = 0,
 		dirtySeqByService = {},
+		restoredPendingServices = {},
 		mutationSeqByService = {},
+		checkpointSeqByService = {},
 		fullSyncSeqByService = {},
 		propertyChangesByKey = {},
 		changeLogByKey = {},
@@ -263,6 +284,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		tagConnections = {},
 		taggedInstancesByTag = {},
 		changeEvent = Instance.new("BindableEvent"),
+		changeSignalPending = false,
 		waitGeneration = 0,
 		suppressUntil = 0,
 		suppressDepth = 0,
@@ -283,6 +305,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		expectedInstanceProperties = setmetatable({}, { __mode = "k" }) :: any,
 		expectedInstanceAttributes = setmetatable({}, { __mode = "k" }) :: any,
 		expectedTags = setmetatable({}, { __mode = "k" }) :: any,
+		expectedFreshInstances = setmetatable({}, { __mode = "k" }) :: any,
 		expectedGeneration = 0,
 		luaSourceDescendantCounts = setmetatable({}, { __mode = "k" }) :: any,
 		archivableByInstance = setmetatable({}, { __mode = "k" }) :: any,
@@ -301,16 +324,31 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			services[#services + 1] = serviceName
 		end
 		table.sort(services)
-		config.savePendingStudioChanges(services)
+		state.pendingEpoch = config.savePendingStudioChanges(services, state.pendingEpoch)
+		state.pendingRuntimeId = if state.pendingEpoch ~= nil then config.bridgeRuntimeId else nil
+	end
+
+	local function clearRestoredPendingService(serviceName: string)
+		state.restoredPendingServices[serviceName] = nil
+		if next(state.restoredPendingServices) == nil then
+			state.restoredPendingEpoch = nil
+			state.restoredPendingRuntimeId = nil
+		end
 	end
 
 	local pending = config.loadPendingStudioChanges()
-	if type(pending) == "table" then
-		for _, serviceName in pending do
+	if type(pending) == "table" and type(pending.services) == "table" then
+		state.pendingEpoch = pending.epoch
+		state.pendingRuntimeId = pending.runtimeId
+		state.restoredPendingEpoch = pending.epoch
+		state.restoredPendingRuntimeId = pending.runtimeId
+		for _, serviceName in pending.services do
 			if type(serviceName) == "string" and allowedServices[serviceName] then
 				state.seq += 1
 				state.dirtySeqByService[serviceName] = state.seq
+				state.restoredPendingServices[serviceName] = true
 				state.mutationSeqByService[serviceName] = state.seq
+				state.checkpointSeqByService[serviceName] = state.seq
 				state.fullSyncSeqByService[serviceName] = state.seq
 			end
 		end
@@ -473,6 +511,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			instances[#instances + 1] = descendant
 		end
 		for _, target in ipairs(instances) do
+			if not wasInDataModel and willBeInDataModel then
+				state.expectedFreshInstances[target] = true
+			end
 			if instance.Parent ~= nil then
 				tokens[#tokens + 1] =
 					expectInstanceEvent(state.expectedStructuralByInstance, target, "removed", nil, false, nil)
@@ -489,10 +530,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 		end
-		if state.instanceConnections[instance] ~= nil then
-			tokens[#tokens + 1] =
-				expectInstanceEvent(state.expectedInstanceProperties, instance, "parent", nil, false, nil)
-		end
+		-- DescendantAdded connects a newly parented instance before Roblox may emit its
+		-- deferred Parent change. Register this expectation even while the instance is
+		-- detached so Renium cannot mistake its own create for a Studio edit.
+		tokens[#tokens + 1] = expectInstanceEvent(state.expectedInstanceProperties, instance, "parent", nil, false, nil)
 		return { tokens = tokens }
 	end
 
@@ -543,6 +584,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	function api.serviceGeneration(serviceName: string): number
 		return state.mutationSeqByService[serviceName] or 0
+	end
+
+	function api.checkpointGeneration(serviceName: string): number
+		return state.checkpointSeqByService[serviceName] or 0
 	end
 
 	function api.isTracking(serviceName: string): boolean
@@ -624,6 +669,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	local function signalChange()
 		state.changeEvent:Fire(state.seq)
+	end
+
+	local function signalTrackedChange()
+		if state.changeSignalPending then
+			return
+		end
+		state.changeSignalPending = true
+		task.defer(function()
+			state.changeSignalPending = false
+			if state.started then
+				signalChange()
+			end
+		end)
 	end
 
 	local function hasPendingChanges(services: { string }): boolean
@@ -798,14 +856,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local wasDirty = state.dirtySeqByService[serviceName] ~= nil
 		state.seq += 1
 		state.dirtySeqByService[serviceName] = state.seq
+		clearRestoredPendingService(serviceName)
 		state.mutationSeqByService[serviceName] = state.seq
+		state.checkpointSeqByService[serviceName] = state.seq
 		state.fullSyncSeqByService[serviceName] = state.seq
 		clearPropertyChangesForService(serviceName)
 		recordChange(serviceName, true, details)
 		if not wasDirty then
 			persistPendingServices()
 		end
-		signalChange()
+		-- One Studio operation can fire structural, property, and attribute callbacks
+		-- back-to-back. Wake the daemon after that callback turn so it exports the
+		-- complete operation atomically.
+		signalTrackedChange()
 	end
 
 	local function directPropertyKey(
@@ -869,6 +932,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		if state.dirtySeqByService[serviceName] ~= nil then
 			state.dirtySeqByService[serviceName] = nil
+			clearRestoredPendingService(serviceName)
 			persistPendingServices()
 		end
 	end
@@ -1108,7 +1172,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local wasDirty = state.dirtySeqByService[serviceName] ~= nil
 		state.seq += 1
 		state.dirtySeqByService[serviceName] = state.seq
+		clearRestoredPendingService(serviceName)
 		state.mutationSeqByService[serviceName] = state.seq
+		state.checkpointSeqByService[serviceName] = state.seq
 		recordChange(serviceName, false, {
 			action = scope,
 			reason = scope .. " changed",
@@ -1137,7 +1203,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if not wasDirty then
 			persistPendingServices()
 		end
-		signalChange()
+		signalTrackedChange()
 		return true
 	end
 
@@ -1249,6 +1315,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		state.exportInstancesByService[serviceName] = instances
 		return instances
+	end
+
+	function api.invalidateExportCache(serviceName: string)
+		if not allowedServices[serviceName] then
+			return
+		end
+		state.exportInstancesByService[serviceName] = nil
+		local service = state.serviceRoots[serviceName]
+		if service ~= nil then
+			rebuildTrackedArchivable(service, serviceName)
+		end
 	end
 
 	local function isLuaSourceInstance(instance: Instance): boolean
@@ -1559,11 +1636,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return propertyName
 	end
 
-	expectedPropertyFingerprint = function(instance: Instance, propertyName: string, value: any): string?
-		if string.lower(propertyReadNameForEvent(instance, propertyName)) ~= string.lower(propertyName) then
-			return nil
+	local function propertyValueFingerprint(instance: Instance, propertyName: string, value: any): string
+		local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
+		if descriptor ~= nil and descriptor.dataType == "Float32" and type(value) == "number" then
+			buffer.writef32(FLOAT32_FINGERPRINT_BUFFER, 0, value)
+			value = buffer.readf32(FLOAT32_FINGERPRINT_BUFFER, 0)
 		end
 		return stableValueString(value)
+	end
+
+	expectedPropertyFingerprint = function(instance: Instance, propertyName: string, value: any): string?
+		local readName = propertyReadNameForEvent(instance, propertyName)
+		if string.lower(readName) ~= string.lower(propertyName) then
+			return nil
+		end
+		return propertyValueFingerprint(instance, readName, value)
 	end
 
 	local function readPropertyFingerprint(
@@ -1596,6 +1683,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 
 		local readName = propertyReadNameForEvent(instance, propertyName)
+		local fingerprintName = readName
 		local okValue, value = pcall(function()
 			return (instance :: any)[readName]
 		end)
@@ -1603,12 +1691,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			okValue, value = pcall(function()
 				return (instance :: any)[propertyName]
 			end)
+			fingerprintName = propertyName
 		end
 		if not okValue then
 			return nil, false, nil, false, nil
 		end
 		local directOk, directValue = encodeDirectValue(value)
-		return stableValueString(value), directOk, directValue, true, value
+		return propertyValueFingerprint(instance, fingerprintName, value), directOk, directValue, true, value
 	end
 
 	local function shouldRecordPropertyDirty(
@@ -1716,9 +1805,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		disconnectInstance(instance)
 	end
 
-	local function connectInstance(instance: Instance, serviceName: string)
+	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?)
 		if state.instanceConnections[instance] ~= nil or shouldIgnoreInstance(instance, serviceName) then
 			return
+		end
+
+		if primeCurrentValues or state.expectedFreshInstances[instance] then
+			shouldRecordPropertyDirty(instance, "Parent")
+			for _, propertyName in pairs((state.propertyNamesByClass or {})[instance.ClassName] or {}) do
+				shouldRecordPropertyDirty(instance, propertyName)
+			end
+			for attributeName in pairs(instance:GetAttributes()) do
+				shouldRecordAttributeDirty(instance, attributeName)
+			end
 		end
 
 		local connections: { RBXScriptConnection } = {}
@@ -1890,7 +1989,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					not shouldIgnoreInstance(instance, serviceName)
 					and (not state.onlyCodeMode or hasLuaSourceDescendant(instance))
 				then
-					connectInstance(instance, serviceName)
+					connectInstance(instance, serviceName, true)
 					reconcileAncestorConnections(instance, service, serviceName)
 					if not expected then
 						markDirty(
@@ -1955,11 +2054,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		connectExistingDescendants(descendants, serviceName)
 	end
 
+	local function endObservationEpoch(serviceName: string)
+		-- Changes can happen while this service has no listeners. Advance the
+		-- generation so snapshots proven in the old epoch cannot be reused later.
+		state.seq += 1
+		state.mutationSeqByService[serviceName] = state.seq
+		state.checkpointSeqByService[serviceName] = state.seq
+		config.invalidateRuntimeExportCache(serviceName)
+	end
+
 	local function unwatchService(serviceName: string, preservePending: boolean?)
 		local service = state.serviceRoots[serviceName]
 		if service == nil then
 			return
 		end
+		endObservationEpoch(serviceName)
 		for _, connection in ipairs(state.rootConnections[serviceName] or {}) do
 			connection:Disconnect()
 		end
@@ -1983,6 +2092,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.serviceNameByRoot[service] = nil
 		if not preservePending then
 			state.dirtySeqByService[serviceName] = nil
+			clearRestoredPendingService(serviceName)
 			state.fullSyncSeqByService[serviceName] = nil
 			clearPropertyChangesForService(serviceName)
 			clearChangeLogsForService(serviceName)
@@ -1993,6 +2103,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local function stopTracking()
 		state.started = false
 		state.tagPollToken += 1
+		for serviceName in pairs(state.watchedServices) do
+			endObservationEpoch(serviceName)
+		end
 		for _, connections in pairs(state.rootConnections) do
 			for _, connection in ipairs(connections) do
 				connection:Disconnect()
@@ -2008,6 +2121,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(state.propertyFingerprintByInstance)
 		table.clear(state.ordinalCacheByParent)
 		table.clear(state.lastParentByInstance)
+		table.clear(state.expectedFreshInstances)
 		table.clear(state.watchedServices)
 		table.clear(state.serviceRoots)
 		table.clear(state.serviceNameByRoot)
@@ -2030,6 +2144,30 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.itemChangedAvailable = false
 		state.tagSignalsAvailable = false
 		signalChange()
+	end
+
+	local function releaseTrackingGuard(rawGuardId: any)
+		if type(rawGuardId) ~= "string" or rawGuardId == "" then
+			return
+		end
+		state.trackingGuards[rawGuardId] = nil
+		if not state.persistentTracking and next(state.trackingGuards) == nil then
+			stopTracking()
+		end
+	end
+
+	local function acquireTrackingGuard(guardId: string)
+		local expiresAt = os.clock() + TRACKING_GUARD_TTL_SECONDS
+		state.trackingGuards[guardId] = expiresAt
+		task.delay(TRACKING_GUARD_TTL_SECONDS, function()
+			if state.trackingGuards[guardId] ~= expiresAt then
+				return
+			end
+			state.trackingGuards[guardId] = nil
+			if not state.persistentTracking and next(state.trackingGuards) == nil then
+				stopTracking()
+			end
+		end)
 	end
 
 	local function ensureTracking(services: { string })
@@ -2151,6 +2289,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if type(raw) ~= "table" then
 			return
 		end
+		local affectedServices = {}
+		for _, serviceName in ipairs(raw.services or {}) do
+			serviceName = tostring(serviceName)
+			if allowedServices[serviceName] then
+				affectedServices[serviceName] = true
+			end
+		end
 		local function addExpected(target: { [string]: ExpectedValueQueue }, key: string, value: any)
 			local queue = target[key]
 			if queue == nil then
@@ -2162,6 +2307,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, change in ipairs(raw.sourceChanges or {}) do
 			local serviceName = tostring(change.service or "")
 			if allowedServices[serviceName] then
+				affectedServices[serviceName] = true
 				addExpected(
 					state.expectedProperties,
 					expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, "Source"),
@@ -2172,6 +2318,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, change in ipairs(raw.propertyChanges or {}) do
 			local serviceName = tostring(change.service or "")
 			if allowedServices[serviceName] then
+				affectedServices[serviceName] = true
 				for propertyName, value in pairs(change.properties or {}) do
 					addExpected(
 						state.expectedProperties,
@@ -2195,6 +2342,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 		end
+		for serviceName in pairs(affectedServices) do
+			state.seq += 1
+			state.checkpointSeqByService[serviceName] = state.seq
+			config.invalidateRuntimeExportCache(serviceName)
+		end
 	end
 
 	local function clearExpectedEvents()
@@ -2204,6 +2356,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(state.expectedInstanceProperties)
 		table.clear(state.expectedInstanceAttributes)
 		table.clear(state.expectedTags)
+		table.clear(state.expectedFreshInstances)
 	end
 
 	function api.beginSuppress(seconds: number?, expectation: any)
@@ -2263,6 +2416,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				local dirtySeq = state.dirtySeqByService[serviceName]
 				if dirtySeq ~= nil and dirtySeq <= ackSeq then
 					state.dirtySeqByService[serviceName] = nil
+					clearRestoredPendingService(serviceName)
 				end
 				local fullSyncSeq = state.fullSyncSeqByService[serviceName]
 				if fullSyncSeq ~= nil and fullSyncSeq <= ackSeq then
@@ -2288,11 +2442,32 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if params.clearPending == true or params.reset == true then
 			for _, serviceName in ipairs(services) do
 				state.dirtySeqByService[serviceName] = nil
+				clearRestoredPendingService(serviceName)
 				state.fullSyncSeqByService[serviceName] = nil
 				clearPropertyChangesForService(serviceName)
 				clearChangeLogsForService(serviceName)
 			end
 			persistPendingServices()
+		end
+		local clearRestoredPendingEpoch = params.clearRestoredPendingEpoch
+		if type(clearRestoredPendingEpoch) == "string"
+			and clearRestoredPendingEpoch ~= ""
+			and clearRestoredPendingEpoch == state.restoredPendingEpoch
+		then
+			local changed = false
+			for _, serviceName in ipairs(services) do
+				if state.restoredPendingServices[serviceName] then
+					clearRestoredPendingService(serviceName)
+					state.dirtySeqByService[serviceName] = nil
+					state.fullSyncSeqByService[serviceName] = nil
+					clearPropertyChangesForService(serviceName)
+					clearChangeLogsForService(serviceName)
+					changed = true
+				end
+			end
+			if changed then
+				persistPendingServices()
+			end
 		end
 	end
 
@@ -2302,10 +2477,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			requested[serviceName] = true
 		end
 		local dirtyServices = {}
+		local restoredPendingServices = {}
 		local fullSyncServices = {}
 		for _, serviceName in ipairs(services) do
 			if state.dirtySeqByService[serviceName] ~= nil then
 				dirtyServices[#dirtyServices + 1] = serviceName
+			end
+			if state.restoredPendingServices[serviceName] then
+				restoredPendingServices[#restoredPendingServices + 1] = serviceName
 			end
 			if state.fullSyncSeqByService[serviceName] ~= nil then
 				fullSyncServices[#fullSyncServices + 1] = serviceName
@@ -2374,11 +2553,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return {
 			ok = true,
 			tracking = state.started,
+			persistentTracking = state.persistentTracking,
+			pendingEpoch = state.pendingEpoch,
+			pendingRuntimeId = state.pendingRuntimeId,
+			restoredPendingEpoch = state.restoredPendingEpoch,
+			restoredPendingRuntimeId = state.restoredPendingRuntimeId,
 			role = config.bridgeRole,
 			changeTrackerVersion = CHANGE_TRACKER_VERSION,
 			runtimeId = config.bridgeRuntimeId,
 			seq = state.seq,
 			dirtyServices = dirtyServices,
+			restoredPendingServices = restoredPendingServices,
 			fullSyncServices = fullSyncServices,
 			propertyChanges = propertyChanges,
 			changes = changes,
@@ -2400,8 +2585,18 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	function api.getState(params: { [string]: any }): { [string]: any }
 		local services = normalizeServices(params.services, allowedServices)
 		if params.stop == true then
+			state.persistentTracking = false
+			table.clear(state.trackingGuards)
 			stopTracking()
+		elseif params.releaseTrackingGuardId ~= nil then
+			releaseTrackingGuard(params.releaseTrackingGuardId)
 		elseif params.start ~= false then
+			local trackingGuardId = params.trackingGuardId
+			if type(trackingGuardId) == "string" and trackingGuardId ~= "" then
+				acquireTrackingGuard(trackingGuardId)
+			else
+				state.persistentTracking = true
+			end
 			if params.replaceServices == true or params.reset == true then
 				local requested = {}
 				for _, serviceName in ipairs(services) do
@@ -2438,13 +2633,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			waitTimedOut = not changed and not waitCancelled
 		end
 
-		local response = buildStateResponse(services, params.compact == true)
+		local responseServices = if params.includeAllState == true
+			then normalizeServices(nil, allowedServices)
+			else services
+		local response = buildStateResponse(responseServices, params.compact == true)
 		if params.includeGenerations == true then
 			local generations = {}
-			for _, serviceName in ipairs(services) do
+			local checkpointGenerations = {}
+			for _, serviceName in ipairs(responseServices) do
 				generations[serviceName] = api.serviceGeneration(serviceName)
+				checkpointGenerations[serviceName] = api.checkpointGeneration(serviceName)
 			end
 			response.serviceGenerations = generations
+			response.checkpointGenerations = checkpointGenerations
 		end
 		if waitedForChange then
 			response.eventDriven = true

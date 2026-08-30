@@ -37,6 +37,8 @@ struct Request
     std::uint32_t version;
     std::uint32_t command;
     std::uint32_t pathLength;
+    std::uint32_t titleLength;
+    std::uint32_t reserved;
     std::uint64_t factoryRva;
     std::uint64_t executeRva;
     unsigned char imageUuid[16];
@@ -73,20 +75,41 @@ struct SharedInstance
 struct DataModelCandidate
 {
     void* outer;
+    std::size_t instanceOffset;
+    std::size_t childrenOffset;
+    std::uint32_t rootMask;
+    std::size_t rootCount;
     std::string name;
 };
 
+struct DataModelScanStats
+{
+    std::size_t pointers = 0;
+    std::size_t outerRtti = 0;
+    std::size_t selfInstances = 0;
+    std::size_t instanceRtti = 0;
+    std::size_t childVectors = 0;
+    std::size_t requiredRoots = 0;
+    std::string vectorDetails;
+};
+
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 2;
-static constexpr std::size_t DataModelInstanceOffset = 0x1c8;
+static constexpr std::uint32_t Version = 3;
+static constexpr std::size_t DataModelInstanceOffsetMin = 0x100;
+static constexpr std::size_t DataModelInstanceOffsetMax = 0x400;
 static constexpr std::size_t InstanceClassDescriptorOffset = 0x18;
-static constexpr std::size_t InstanceChildrenOffset = 0x70;
-static constexpr std::size_t InstanceNameOffset = 0x98;
+static constexpr std::size_t InstanceChildrenOffsetMin = 0x40;
+static constexpr std::size_t InstanceChildrenOffsetMax = 0xc0;
+static constexpr std::size_t InstanceNameOffsetMin = 0x20;
+static constexpr std::size_t InstanceNameOffsetMax = 0x400;
 static std::mutex SerializeMutex;
 static char SocketPath[sizeof(((sockaddr_un*)nullptr)->sun_path)]{};
 static void* CachedDataModel = nullptr;
+static std::size_t CachedDataModelInstanceOffset = 0;
+static std::size_t CachedDataModelChildrenOffset = 0;
+static std::string CachedDataModelTitle;
 
-static_assert(sizeof(Request) == 48);
+static_assert(sizeof(Request) == 56);
 static_assert(sizeof(Response) == 536);
 
 static bool ReadMemory(std::uintptr_t address, void* output, std::size_t size)
@@ -136,7 +159,7 @@ static bool ReadLibcppString(std::uintptr_t address, std::string& value)
         std::memcpy(&data, bytes + 16, sizeof(data));
         std::memcpy(&size, bytes + 8, sizeof(size));
     }
-    if (size > 1024 * 1024 || (size && data < 0x10000))
+    if (size > 4096 || (size && data < 0x10000))
         return false;
     value.resize(size);
     if (size && !ReadMemory(data, value.data(), size))
@@ -162,37 +185,82 @@ static bool ReadInstanceClass(std::uintptr_t instance, std::string& value)
     return ReadLibcppString(descriptor + 8, value) && !value.empty();
 }
 
-static bool ReadInstanceName(std::uintptr_t instance, std::string& value)
+static std::vector<std::string> ExpectedDataModelNames(const std::string& title)
 {
-    std::uintptr_t name = 0;
-    if (ReadValue(instance + InstanceNameOffset, name) && name &&
-        ReadLibcppString(name, value))
-        return true;
-    return ReadLibcppString(instance + InstanceNameOffset, value);
+    std::string normalized = title;
+    const std::string suffix = " - Roblox Studio";
+    if (normalized.size() >= suffix.size() &&
+        normalized.compare(normalized.size() - suffix.size(), suffix.size(), suffix) == 0)
+        normalized.resize(normalized.size() - suffix.size());
+    std::vector<std::string> names;
+    if (!normalized.empty())
+        names.push_back(normalized);
+    const auto separator = normalized.find_last_of("/\\");
+    if (separator != std::string::npos && separator + 1 < normalized.size())
+    {
+        auto base = normalized.substr(separator + 1);
+        if (std::find(names.begin(), names.end(), base) == names.end())
+            names.push_back(std::move(base));
+    }
+    return names;
 }
 
-static bool IsDataModel(std::uintptr_t outer)
+static bool ReadExpectedInstanceName(
+    std::uintptr_t instance,
+    const std::vector<std::string>& expectedNames,
+    std::string& value)
 {
-    const auto instance = outer + DataModelInstanceOffset;
-    std::uintptr_t self = 0;
+    for (std::size_t offset = InstanceNameOffsetMin;
+         offset <= InstanceNameOffsetMax;
+         offset += sizeof(void*))
+    {
+        std::uintptr_t indirect = 0;
+        if (ReadValue(instance + offset, indirect) && indirect &&
+            ReadLibcppString(indirect, value) &&
+            std::find(expectedNames.begin(), expectedNames.end(), value) != expectedNames.end())
+            return true;
+        if (ReadLibcppString(instance + offset, value) &&
+            std::find(expectedNames.begin(), expectedNames.end(), value) != expectedNames.end())
+            return true;
+    }
+    value.clear();
+    return false;
+}
+
+static bool ReadRttiType(std::uintptr_t object, std::string& name)
+{
     std::uintptr_t vtable = 0;
     std::uintptr_t typeInfo = 0;
     std::uintptr_t typeName = 0;
-    std::string name;
-    return ReadValue(instance + 8, self) && self == instance &&
-        ReadValue(instance, vtable) && vtable &&
+    return ReadValue(object, vtable) && vtable &&
         ReadValue(vtable - sizeof(void*), typeInfo) && typeInfo &&
         ReadValue(typeInfo + sizeof(void*), typeName) && typeName &&
-        ReadCString(typeName, name, 128) && name == "N3RBX9DataModelE";
+        ReadCString(typeName, name, 128);
 }
 
-static bool ReadChildren(std::uintptr_t instance, std::vector<SharedInstance>& children)
+static bool IsRttiType(std::uintptr_t object, const char* expected)
+{
+    std::string name;
+    return ReadRttiType(object, name) && name == expected;
+}
+
+static bool IsDataModelInstance(std::uintptr_t instance)
+{
+    std::uintptr_t self = 0;
+    return ReadValue(instance + 8, self) && self == instance &&
+        IsRttiType(instance, "N3RBX9DataModelE");
+}
+
+static bool ReadChildren(
+    std::uintptr_t instance,
+    std::size_t childrenOffset,
+    std::vector<SharedInstance>& children)
 {
     std::uintptr_t vector = 0;
     std::uintptr_t begin = 0;
     std::uintptr_t end = 0;
     std::uintptr_t capacity = 0;
-    if (!ReadValue(instance + InstanceChildrenOffset, vector) || !vector)
+    if (!ReadValue(instance + childrenOffset, vector) || !vector)
         return false;
     if (!ReadValue(vector, begin) || !ReadValue(vector + 8, end) ||
         !ReadValue(vector + 16, capacity) || end < begin || capacity < end ||
@@ -205,33 +273,123 @@ static bool ReadChildren(std::uintptr_t instance, std::vector<SharedInstance>& c
     return ReadMemory(begin, children.data(), children.size() * sizeof(SharedInstance));
 }
 
-static bool HasRequiredRoots(std::uintptr_t outer)
+static std::uint32_t RequiredRootMask(
+    const std::vector<SharedInstance>& children,
+    std::size_t& readableClasses)
 {
-    std::vector<SharedInstance> children;
-    if (!ReadChildren(outer + DataModelInstanceOffset, children))
-        return false;
-    bool workspace = false;
-    bool players = false;
-    bool materialService = false;
-    bool studioData = false;
+    std::uint32_t mask = 0;
+    readableClasses = 0;
     for (const auto& child : children)
     {
         std::string name;
         if (!child.instance ||
-            !ReadInstanceClass(reinterpret_cast<std::uintptr_t>(child.instance), name))
+            (!ReadInstanceClass(reinterpret_cast<std::uintptr_t>(child.instance), name) &&
+             !ReadRttiType(reinterpret_cast<std::uintptr_t>(child.instance), name)))
             continue;
-        workspace = workspace || name == "Workspace";
-        players = players || name == "Players";
-        materialService = materialService || name == "MaterialService";
-        studioData = studioData || name == "StudioData";
+        ++readableClasses;
+        if (name == "Workspace" || name == "N3RBX9WorkspaceE")
+            mask |= 1;
+        else if (name == "Players" || name == "N3RBX7PlayersE")
+            mask |= 2;
+        else if (name == "MaterialService" || name == "N3RBX15MaterialServiceE")
+            mask |= 4;
+        else if (name == "StudioData" || name == "N3RBX10StudioDataE")
+            mask |= 8;
+        else if (name == "ChangeHistoryService" || name == "N3RBX20ChangeHistoryServiceE")
+            mask |= 16;
+        else if (name == "ScriptEditorService" || name == "N3RBX19ScriptEditorServiceE")
+            mask |= 32;
+        else if (name == "PluginGuiService" || name == "N3RBX16PluginGuiServiceE")
+            mask |= 64;
+        else if (name == "DraftsService" || name == "N3RBX13DraftsServiceE")
+            mask |= 128;
+        else if (name == "Selection" || name == "N3RBX9SelectionE")
+            mask |= 256;
+        else if (name == "StudioService" || name == "N3RBX13StudioServiceE")
+            mask |= 512;
     }
-    return workspace && players && materialService && studioData;
+    return mask;
+}
+
+static bool FindChildrenOffset(
+    std::uintptr_t instance,
+    std::size_t& offset,
+    std::uint32_t& rootMask,
+    std::size_t& rootCount,
+    DataModelScanStats& stats)
+{
+    for (std::size_t current = InstanceChildrenOffsetMin;
+         current <= InstanceChildrenOffsetMax;
+         current += sizeof(void*))
+    {
+        std::vector<SharedInstance> children;
+        if (!ReadChildren(instance, current, children))
+            continue;
+        ++stats.childVectors;
+        std::size_t readableClasses = 0;
+        const auto mask = RequiredRootMask(children, readableClasses);
+        if (stats.vectorDetails.size() < 240)
+        {
+            char detail[80];
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "%s0x%zx:%zu/%zu:m%u",
+                stats.vectorDetails.empty() ? "" : ",",
+                current,
+                readableClasses,
+                children.size(),
+                static_cast<unsigned>(mask));
+            stats.vectorDetails += detail;
+        }
+        if ((mask & 15) != 15)
+            continue;
+        ++stats.requiredRoots;
+        offset = current;
+        rootMask = mask;
+        rootCount = children.size();
+        return true;
+    }
+    return false;
+}
+
+static bool FindDataModelInstanceOffset(
+    std::uintptr_t outer,
+    std::size_t& instanceOffset,
+    std::size_t& childrenOffset,
+    std::uint32_t& rootMask,
+    std::size_t& rootCount,
+    DataModelScanStats& stats)
+{
+    if (!IsRttiType(outer, "N3RBX9DataModelE"))
+        return false;
+    ++stats.outerRtti;
+    for (std::size_t current = DataModelInstanceOffsetMin;
+         current <= DataModelInstanceOffsetMax;
+         current += sizeof(void*))
+    {
+        const auto instance = outer + current;
+        std::uintptr_t self = 0;
+        if (!ReadValue(instance + 8, self) || self != instance)
+            continue;
+        ++stats.selfInstances;
+        if (!IsRttiType(instance, "N3RBX9DataModelE"))
+            continue;
+        ++stats.instanceRtti;
+        if (!FindChildrenOffset(instance, childrenOffset, rootMask, rootCount, stats))
+            continue;
+        instanceOffset = current;
+        return true;
+    }
+    return false;
 }
 
 static void AddCandidates(
     const mach_header_64* header,
     std::intptr_t slide,
-    std::vector<DataModelCandidate>& candidates)
+    const std::vector<std::string>& expectedNames,
+    std::vector<DataModelCandidate>& candidates,
+    DataModelScanStats& stats)
 {
     auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
     std::unordered_set<std::uintptr_t> seen;
@@ -261,12 +419,30 @@ static void AddCandidates(
                         continue;
                     for (const auto outer : pointers)
                     {
-                        if (outer < 0x10000 || !seen.insert(outer).second ||
-                            !IsDataModel(outer) || !HasRequiredRoots(outer))
+                        std::size_t instanceOffset = 0;
+                        std::size_t childrenOffset = 0;
+                        std::uint32_t rootMask = 0;
+                        std::size_t rootCount = 0;
+                        if (outer < 0x10000 || !seen.insert(outer).second)
+                            continue;
+                        ++stats.pointers;
+                        if (!FindDataModelInstanceOffset(
+                                outer,
+                                instanceOffset,
+                                childrenOffset,
+                                rootMask,
+                                rootCount,
+                                stats))
                             continue;
                         std::string name;
-                        ReadInstanceName(outer + DataModelInstanceOffset, name);
-                        candidates.push_back({reinterpret_cast<void*>(outer), std::move(name)});
+                        ReadExpectedInstanceName(outer + instanceOffset, expectedNames, name);
+                        candidates.push_back(
+                            {reinterpret_cast<void*>(outer),
+                             instanceOffset,
+                             childrenOffset,
+                             rootMask,
+                             rootCount,
+                             std::move(name)});
                     }
                 }
             }
@@ -277,34 +453,120 @@ static void AddCandidates(
     }
 }
 
-static bool FindDataModel(void*& output, std::string& error)
+static bool FindDataModel(
+    const mach_header_64* header,
+    std::intptr_t slide,
+    const std::string& title,
+    void*& output,
+    std::string& error)
 {
     if (CachedDataModel)
     {
         const auto cached = reinterpret_cast<std::uintptr_t>(CachedDataModel);
-        if (IsDataModel(cached) && HasRequiredRoots(cached))
+        const auto instance = cached + CachedDataModelInstanceOffset;
+        std::vector<SharedInstance> children;
+        std::size_t readableClasses = 0;
+        if (CachedDataModelTitle == title && CachedDataModelInstanceOffset &&
+            CachedDataModelChildrenOffset &&
+            IsDataModelInstance(instance) &&
+            ReadChildren(instance, CachedDataModelChildrenOffset, children) &&
+            (RequiredRootMask(children, readableClasses) & 15) == 15)
         {
             output = CachedDataModel;
             return true;
         }
         CachedDataModel = nullptr;
+        CachedDataModelInstanceOffset = 0;
+        CachedDataModelChildrenOffset = 0;
+        CachedDataModelTitle.clear();
     }
-    const auto header = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
     if (!header || header->magic != MH_MAGIC_64)
     {
         error = "Studio main image is not a 64-bit Mach-O";
         return false;
     }
     std::vector<DataModelCandidate> candidates;
-    AddCandidates(header, _dyld_get_image_vmaddr_slide(0), candidates);
+    DataModelScanStats stats;
+    AddCandidates(header, slide, ExpectedDataModelNames(title), candidates, stats);
+    if (candidates.size() > 1 && std::any_of(
+            candidates.begin(),
+            candidates.end(),
+            [](const DataModelCandidate& candidate)
+            {
+                return !candidate.name.empty();
+            }))
+    {
+        candidates.erase(
+            std::remove_if(
+                candidates.begin(),
+                candidates.end(),
+                [](const DataModelCandidate& candidate)
+                {
+                    return candidate.name.empty();
+                }),
+            candidates.end());
+    }
+    if (candidates.size() > 1)
+    {
+        const auto editorScore = [](const DataModelCandidate& candidate)
+        {
+            auto bits = candidate.rootMask >> 4;
+            std::uint32_t score = 0;
+            while (bits)
+            {
+                score += bits & 1;
+                bits >>= 1;
+            }
+            return score;
+        };
+        const auto best = std::max_element(
+            candidates.begin(),
+            candidates.end(),
+            [&](const DataModelCandidate& left, const DataModelCandidate& right)
+            {
+                return editorScore(left) < editorScore(right);
+            });
+        const auto bestScore = editorScore(*best);
+        if (std::count_if(
+                candidates.begin(),
+                candidates.end(),
+                [&](const DataModelCandidate& candidate)
+                {
+                    return editorScore(candidate) == bestScore;
+                }) == 1)
+        {
+            auto selected = std::move(*best);
+            candidates.clear();
+            candidates.push_back(std::move(selected));
+        }
+    }
     if (candidates.size() != 1)
     {
+        std::string names;
+        for (const auto& candidate : candidates)
+        {
+            if (!names.empty())
+                names += ",";
+            names += (candidate.name.empty() ? "<empty>" : candidate.name) +
+                ("/m" + std::to_string(candidate.rootMask) + "/r" +
+                 std::to_string(candidate.rootCount));
+        }
         error = "active Studio DataModel selection returned " +
-            std::to_string(candidates.size()) + " candidates";
+            std::to_string(candidates.size()) + " candidates (pointers=" +
+            std::to_string(stats.pointers) + ", outerRtti=" +
+            std::to_string(stats.outerRtti) + ", self=" +
+            std::to_string(stats.selfInstances) + ", instanceRtti=" +
+            std::to_string(stats.instanceRtti) + ", childVectors=" +
+            std::to_string(stats.childVectors) + ", roots=" +
+            std::to_string(stats.requiredRoots) + ", vectors=" +
+            stats.vectorDetails + ", names=" + names + ")";
         return false;
     }
     output = candidates[0].outer;
     CachedDataModel = output;
+    CachedDataModelInstanceOffset = candidates[0].instanceOffset;
+    CachedDataModelChildrenOffset = candidates[0].childrenOffset;
+    CachedDataModelTitle = title;
     return true;
 }
 
@@ -344,6 +606,14 @@ static void ReleaseShared(StudioShared& value)
     value.owner = nullptr;
 }
 
+static std::string UuidText(const unsigned char* uuid)
+{
+    char output[33]{};
+    for (std::size_t index = 0; index < 16; ++index)
+        std::snprintf(output + index * 2, 3, "%02x", uuid[index]);
+    return output;
+}
+
 static bool ResolveTrace(
     const mach_header_64* header,
     std::intptr_t slide,
@@ -377,7 +647,8 @@ static bool ResolveTrace(
     }
     if (std::memcmp(uuid->uuid, request.imageUuid, sizeof(request.imageUuid)) != 0)
     {
-        error = "Renium Studio changed while it was open; close and reopen it";
+        error = "Studio image " + UuidText(uuid->uuid) + " does not match traced image " +
+            UuidText(request.imageUuid);
         return false;
     }
     if (request.factoryRva >= text->vmsize || request.executeRva >= text->vmsize)
@@ -396,13 +667,27 @@ static void SetError(Response& response, const std::string& error)
     std::snprintf(response.error, sizeof(response.error), "%s", error.c_str());
 }
 
-static Response Serialize(const Request& request, const std::string& path)
+static Response Serialize(
+    const Request& request,
+    const std::string& path,
+    const std::string& title)
 {
     Response response{Magic, 1, 0, 0, {}};
     std::lock_guard lock(SerializeMutex);
     const auto started = std::chrono::steady_clock::now();
-    const auto header = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
-    const auto slide = _dyld_get_image_vmaddr_slide(0);
+    const mach_header_64* header = nullptr;
+    std::intptr_t slide = 0;
+    for (std::uint32_t index = 0; index < _dyld_image_count(); ++index)
+    {
+        const auto candidate = reinterpret_cast<const mach_header_64*>(
+            _dyld_get_image_header(index));
+        if (candidate && candidate->filetype == MH_EXECUTE)
+        {
+            header = candidate;
+            slide = _dyld_get_image_vmaddr_slide(index);
+            break;
+        }
+    }
     std::uintptr_t factoryAddress = 0;
     std::uintptr_t executeAddress = 0;
     std::string error;
@@ -414,15 +699,14 @@ static Response Serialize(const Request& request, const std::string& path)
         return response;
     }
     void* dataModel = nullptr;
-    if (!FindDataModel(dataModel, error))
+    if (!FindDataModel(header, slide, title, dataModel, error))
     {
         response.status = 3;
         SetError(response, error);
         return response;
     }
     using FromUtf8 = StudioQString (*)(const char*, int);
-    using Factory =
-        StudioShared (*)(void*, const StudioQString*, void**, const bool*, const bool*);
+    using Factory = StudioShared (*)(void*, const StudioQString*, void**, const bool*);
     using Execute = void (*)(void*);
     const auto fromUtf8 = reinterpret_cast<FromUtf8>(
         dlsym(RTLD_DEFAULT, "_ZN7QString15fromUtf8_helperEPKci"));
@@ -433,14 +717,12 @@ static Response Serialize(const Request& request, const std::string& path)
         return response;
     }
     auto output = fromUtf8(path.c_str(), static_cast<int>(path.size()));
-    const bool direct = false;
-    const bool secondary = false;
+    const bool direct = true;
     auto state = reinterpret_cast<Factory>(factoryAddress)(
         nullptr,
         &output,
         &dataModel,
-        &direct,
-        &secondary);
+        &direct);
     if (!state.value || !state.owner)
     {
         ReleaseQString(output);
@@ -501,7 +783,7 @@ static void HandleClient(int client)
     Response response{Magic, 7, 0, 0, {}};
     if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
         request.version != Version || request.command != 1 || request.pathLength == 0 ||
-        request.pathLength >= PATH_MAX)
+        request.pathLength >= PATH_MAX || request.titleLength >= PATH_MAX)
     {
         SetError(response, "invalid serializer request");
         WriteExact(client, &response, sizeof(response));
@@ -514,9 +796,16 @@ static void HandleClient(int client)
         WriteExact(client, &response, sizeof(response));
         return;
     }
+    std::string title(request.titleLength, '\0');
+    if (!title.empty() && !ReadExact(client, title.data(), title.size()))
+    {
+        SetError(response, "invalid Studio title");
+        WriteExact(client, &response, sizeof(response));
+        return;
+    }
     try
     {
-        response = Serialize(request, path);
+        response = Serialize(request, path, title);
     }
     catch (const std::exception& exception)
     {

@@ -212,7 +212,7 @@ struct StudioLaunch {
 }
 
 impl BoundContext {
-    fn same_binding(&self, other: &Self) -> bool {
+    fn same_project_binding(&self, other: &Self) -> bool {
         self.initialized == other.initialized
             && self.project == other.project
             && self.root == other.root
@@ -220,15 +220,12 @@ impl BoundContext {
             && self.source == other.source
             && self.place_id == other.place_id
             && self.game_id == other.game_id
-            && self.runtime_id == other.runtime_id
-            && self.plugin_build == other.plugin_build
             && self.fingerprint == other.fingerprint
     }
 }
 
 pub struct Review {
     pub context_id: u64,
-    pub runtime_id: Option<String>,
     pub operation: u16,
     pub parameters: Value,
     pub created: Instant,
@@ -277,11 +274,13 @@ impl State {
 
     pub fn insert_context(&self, mut context: BoundContext) -> BoundContext {
         let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(existing) = contexts
-            .values()
-            .find(|existing| existing.same_binding(&context))
+        if let Some((id, existing)) = contexts
+            .iter_mut()
+            .find(|(_, existing)| existing.same_project_binding(&context))
         {
-            return existing.clone();
+            context.id = *id;
+            existing.clone_from(&context);
+            return context;
         }
         let removed = contexts
             .iter()
@@ -367,7 +366,15 @@ impl State {
             .studio_launches
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        launches.retain(|_, launch| launch.started.elapsed() < STUDIO_LAUNCH_TTL);
+        launches.retain(|_, launch| {
+            launch.started.elapsed() < STUDIO_LAUNCH_TTL
+                && launch
+                    .result
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .is_some_and(crate::daemon::is_process_alive)
+        });
         let launch = launches
             .get(&context.project)
             .filter(|launch| &launch.target == target)?;
@@ -432,7 +439,6 @@ impl State {
         let id = format!("r{sequence:x}");
         let review = Review {
             context_id: context.id,
-            runtime_id: context.runtime_id.clone(),
             operation,
             parameters,
             created: Instant::now(),
@@ -562,8 +568,62 @@ mod tests {
         let id = state.prepare_review(&context, op::PUSH, json!({ "destructive": true }));
         let review = state.take_review(&id).unwrap();
         assert_eq!(review.context_id, context.id);
-        assert_eq!(review.runtime_id, context.runtime_id);
         assert_eq!(review.operation, op::PUSH);
         assert!(state.take_review(&id).is_none());
+    }
+
+    #[test]
+    fn studio_restart_updates_the_existing_project_context() {
+        let state = State::default();
+        let first = state.insert_context(BoundContext {
+            id: 0,
+            initialized: true,
+            project: "project".to_string(),
+            root: "root".to_string(),
+            experience: "experience".to_string(),
+            source: "source".to_string(),
+            place_id: Some(1),
+            game_id: Some(2),
+            selector: "2:1".to_string(),
+            runtime_id: Some("old-runtime".to_string()),
+            plugin_build: Some(3),
+            fingerprint: "fingerprint".to_string(),
+        });
+        let restarted = state.insert_context(BoundContext {
+            runtime_id: Some("new-runtime".to_string()),
+            plugin_build: Some(4),
+            ..first.clone()
+        });
+
+        assert_eq!(restarted.id, first.id);
+        assert_eq!(restarted.runtime_id.as_deref(), Some("new-runtime"));
+        assert_eq!(state.context(first.id).unwrap().plugin_build, Some(4));
+    }
+
+    #[test]
+    fn dead_studio_launch_is_not_reported_as_opening() {
+        let state = State::default();
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: "project".to_string(),
+            root: "root".to_string(),
+            experience: "experience".to_string(),
+            source: "source".to_string(),
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: "fingerprint".to_string(),
+        };
+        let target = StudioReopenTarget {
+            file: Some(PathBuf::from("place.rbxl")),
+            game_id: None,
+            place_id: None,
+        };
+        state.remember_studio_launch(&context, target.clone(), json!({ "pid": 0 }));
+
+        assert!(state.recent_studio_launch(&context, &target).is_none());
     }
 }

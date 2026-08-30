@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,7 @@ use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::app::output::{global_json_output, global_pretty_output, global_yes, print_json_output};
+use crate::app::output::{global_pretty_output, global_yes, log_global, print_json_output};
 use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_logs};
 use crate::automation::op;
 use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
@@ -19,25 +20,25 @@ use crate::cli::{
 };
 use crate::daemon::try_daemon_control_request;
 use crate::editor::diff::{
-    append_editor_instance_reconcile, append_editor_property_changes,
-    append_editor_target_inline_source_changes, append_editor_target_instance_upserts,
+    EditorTargetChangeOptions, append_editor_instance_reconcile, append_editor_target_changes,
     editor_instance_descriptor_for_known_path,
 };
 use crate::editor::document::{
-    document_instance_index_by_settings_id, ensure_editor_service_document,
-    ensure_editor_source_target_in_bytecode, read_editor_service_settings,
+    document_instance_index_by_settings_id, ensure_editor_source_target_in_bytecode,
+    read_editor_service_settings, read_editor_service_settings_cached,
 };
 use crate::editor::history::save_editor_history_entries;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_source_path_map, editor_directory_target,
-    editor_run_context_value, infer_editor_source_path_spec, service_from_changed_path,
+    build_editor_instance_paths, editor_directory_target, editor_run_context_value,
+    editor_source_target_with_children, infer_editor_source_path_spec, service_from_changed_path,
 };
 use crate::editor::review::{
     apply_protected_writes_offline, is_externally_managed_editor_property,
     is_externally_managed_protected_write, is_user_facing_protected_write,
-    local_place_path_for_bridge, protected_root_write_rows_with_live_values,
-    protected_write_matches_previous, protected_write_rows_with_previous_values,
-    request_editor_push_review, request_protected_write_review, studio_pid_for_bridge,
+    local_place_path_for_bridge, normalize_editor_bridge_value,
+    protected_root_write_rows_with_live_values, protected_write_matches_previous,
+    protected_write_rows_with_previous_values, request_editor_push_review,
+    request_protected_write_review, studio_pid_for_bridge,
 };
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
@@ -53,8 +54,10 @@ use crate::project::package_links::{
 };
 use crate::rbx::encode::rbx_model_property_descriptor;
 use crate::roblox::schema::{PropertySchemaMap, load_rbx_dom_property_schema};
-use crate::settings::bytecode::SettingsBytecode;
+use crate::settings::bytecode::{SettingsBytecode, is_reference_object, settings_reference_index};
+use crate::settings::equivalence::drop_settings_document;
 use crate::settings::instance::remove_instances_at_indices;
+use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::export::parse_bridge_ports;
 use crate::studio::bridge::{
     BridgeRequestTooLarge, BridgeServer, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REQUEST_BYTES,
@@ -62,9 +65,7 @@ use crate::studio::bridge::{
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
 };
-use crate::studio::native::import::{
-    build_editor_binary_import, editor_services_have_package_links, prepare_native_editor_full_push,
-};
+use crate::studio::native::import::{build_editor_binary_import, prepare_native_editor_full_push};
 use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix,
@@ -81,6 +82,9 @@ struct EditorTransaction<'a> {
 #[derive(Clone)]
 pub(crate) struct StudioChangeGuard {
     pub(crate) runtime_id: String,
+    pub(crate) change_seq: u64,
+    pub(crate) tracking_guard_id: Option<String>,
+    pub(crate) runtime_bootstrap_safe: bool,
     pub(crate) service_generations: BTreeMap<String, u64>,
 }
 
@@ -383,7 +387,6 @@ impl<'a> EditorTransaction<'a> {
             current_millis(),
             fnv1a_hex(services.join("\0").as_bytes())
         );
-        let watches_package_dialog = editor_services_have_package_links(bridge, &services)?;
         let upload_services = services.clone();
         let parameters = Self::parameters(changes, binary_import, &id, services, guard);
         let result = match bridge.call("beginEditorTransaction", parameters) {
@@ -409,7 +412,7 @@ impl<'a> EditorTransaction<'a> {
         if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
             return Err(StudioChangedBeforePush.into());
         }
-        if package_mutation && watches_package_dialog {
+        if package_mutation {
             transaction.package_dialog = Some(
                 studio_pid_for_bridge(bridge)
                     .and_then(crate::studio::input::watch_package_changes_dialog)
@@ -624,12 +627,15 @@ fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorComm
 fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer> {
     let ports = parse_bridge_ports(&args.ports)?;
     let (bridge, metrics) = BridgeServer::listen(&args.host, &ports, args.wait_seconds)?;
-    println!(
-        "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-        bridge.channel_count(),
-        bridge.expected_channel_count(),
-        metrics.bind_ms,
-        metrics.wait_for_channels_ms
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
+            bridge.channel_count(),
+            bridge.expected_channel_count(),
+            metrics.bind_ms,
+            metrics.wait_for_channels_ms
+        ),
     );
     Ok(bridge)
 }
@@ -675,7 +681,7 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
     if native_editor_full_push_eligible(&args)? {
         let bridge = listen_editor_push_bridge(&args.bridge)?;
         let (changes, binary_import) = prepare_native_editor_full_push(&args, &bridge)?;
-        return push_editor_changes_with_collected(
+        let summary = push_editor_changes_with_collected(
             args,
             &bridge,
             changes,
@@ -686,12 +692,12 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
                 guard: None,
                 validate_project: None,
             },
-        )
-        .map(|_| ());
+        )?;
+        return print_editor_push_summary(&summary);
     }
     let (changes, projection) = collect_project_editor_changes(&args)?;
     let bridge = listen_editor_push_bridge(&args.bridge)?;
-    push_editor_changes_with_collected(
+    let summary = push_editor_changes_with_collected(
         args,
         &bridge,
         changes,
@@ -702,8 +708,8 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
             guard: None,
             validate_project: None,
         },
-    )
-    .map(|_| ())
+    )?;
+    print_editor_push_summary(&summary)
 }
 
 pub(crate) fn push_editor_changes_with_warm_bridge(
@@ -741,6 +747,7 @@ pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G>(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
     guard: Option<&StudioChangeGuard>,
+    prepared_documents: HashMap<String, SettingsBytecode>,
     amend: F,
     validate_project: G,
 ) -> Result<serde_json::Map<String, Value>>
@@ -757,7 +764,7 @@ where
     let (mut changes, projection) = if no_selection {
         (EditorChangeSet::default(), None)
     } else {
-        collect_project_editor_changes(&args)?
+        collect_project_editor_changes_with_documents(&args, prepared_documents)?
     };
     amend(&mut changes)?;
     push_editor_changes_with_collected(
@@ -801,10 +808,21 @@ pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> 
 fn collect_project_editor_changes(
     args: &PushEditorChangesArgs,
 ) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
+    collect_project_editor_changes_with_documents(args, HashMap::new())
+}
+
+fn collect_project_editor_changes_with_documents(
+    args: &PushEditorChangesArgs,
+    mut prepared_documents: HashMap<String, SettingsBytecode>,
+) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
+    let phase_started = Instant::now();
     let Some(loaded) = config::try_load_project(None, Some(&args.project.project_root))? else {
         return Ok((collect_editor_changes(args)?, None));
     };
+    log_editor_collection_timing("project load", phase_started);
+    let phase_started = Instant::now();
     let link_enforcement = build_loaded_project_link_enforcement(&loaded, args.override_packages)?;
+    log_editor_collection_timing("link enforcement", phase_started);
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_selection = changed_paths.is_empty();
     if full_selection {
@@ -821,18 +839,21 @@ fn collect_project_editor_changes(
     }
     changed_sources.sort();
     changed_sources.dedup();
+    let phase_started = Instant::now();
     let projection = config::stage_project_cached(&loaded, &changed_sources)?;
+    log_editor_collection_timing("projection", phase_started);
     if !projection.is_temporary() {
         let (project_root, src_root) = editor_project_roots(args)?;
-        return Ok((
-            collect_editor_changes_with_link_enforcement(
-                args,
-                &project_root,
-                &src_root,
-                &link_enforcement,
-            )?,
-            Some(projection),
-        ));
+        let phase_started = Instant::now();
+        let changes = collect_editor_changes_with_link_enforcement_and_documents(
+            args,
+            &project_root,
+            &src_root,
+            &link_enforcement,
+            &mut prepared_documents,
+        )?;
+        log_editor_collection_timing("changes", phase_started);
+        return Ok((changes, Some(projection)));
     }
     let mut projected_paths = if full_selection {
         collect_editor_full_paths(projection.root())?
@@ -864,6 +885,16 @@ fn collect_project_editor_changes(
         &link_enforcement,
     )?;
     Ok((changes, Some(projection)))
+}
+
+fn log_editor_collection_timing(label: &str, started: Instant) {
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor collection {label}: {:.1}ms",
+            elapsed_ms(started)
+        ),
+    );
 }
 
 struct OwnedEditorFilterCandidate {
@@ -1628,7 +1659,6 @@ fn verify_pushed_sources(
                 .collect(),
         ),
     );
-    emit_editor_push_summary(summary)?;
     Err(EditorSourceVerificationError {
         details: verification.failed,
     }
@@ -1651,37 +1681,56 @@ fn prepare_protected_writes(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut studio_pending = vec![true; reported.len()];
     let pre_routed_count = pre_routed.len();
-    reported.extend(
-        protected_root_write_rows_with_live_values(bridge, pre_routed).unwrap_or_else(|rows| rows),
+    let pre_routed =
+        protected_root_write_rows_with_live_values(bridge, pre_routed).unwrap_or_else(|rows| rows);
+    studio_pending.extend(
+        pre_routed
+            .iter()
+            .map(|row| !protected_write_matches_previous(row)),
     );
+    reported.extend(pre_routed);
     if pre_routed_count > 0 {
         summary.insert(
             "protectedPreRouted".to_string(),
             Value::Number(Number::from(pre_routed_count as u64)),
         );
     }
+    let reported_count = reported.len();
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let applicable = reported
-        .iter()
-        .filter(|row| {
+        .into_iter()
+        .enumerate()
+        .filter(|(_, row)| {
             !is_externally_managed_protected_write(row)
                 && is_user_facing_protected_write(row, database)
         })
-        .cloned()
+        .map(|(index, row)| (studio_pending[index], row))
         .collect::<Vec<_>>();
-    let unavailable_count = reported.len() - applicable.len();
-    let enriched = if args.no_review {
-        applicable
+    let unavailable_count = reported_count - applicable.len();
+    let applicable_rows = applicable
+        .iter()
+        .map(|(_, row)| row.clone())
+        .collect::<Vec<_>>();
+    let enriched_rows = if args.no_review {
+        applicable_rows
     } else {
         local_place_path_for_bridge(bridge)
-            .and_then(|path| protected_write_rows_with_previous_values(&path, &applicable).ok())
-            .unwrap_or(applicable)
+            .and_then(|path| {
+                protected_write_rows_with_previous_values(&path, &applicable_rows).ok()
+            })
+            .unwrap_or(applicable_rows)
     };
+    let enriched = applicable
+        .into_iter()
+        .zip(enriched_rows)
+        .map(|((studio_pending, _), row)| (studio_pending, row))
+        .collect::<Vec<_>>();
     let writes = enriched
         .iter()
-        .filter(|row| !protected_write_matches_previous(row))
-        .cloned()
+        .filter(|(studio_pending, row)| *studio_pending || !protected_write_matches_previous(row))
+        .map(|(_, row)| row.clone())
         .collect::<Vec<_>>();
     if args.no_review && !writes.is_empty() {
         bail!(
@@ -1689,7 +1738,13 @@ fn prepare_protected_writes(
             writes.len()
         );
     }
-    summary.insert("protectedWrites".to_string(), Value::Array(writes.clone()));
+    summary.remove("protectedWrites");
+    if !writes.is_empty() {
+        summary.insert(
+            "protectedPending".to_string(),
+            Value::Number(Number::from(writes.len() as u64)),
+        );
+    }
     if unavailable_count > 0 {
         summary.insert(
             "unavailableProtectedSkipped".to_string(),
@@ -1853,6 +1908,7 @@ fn push_editor_changes_with_collected(
             "protectedApplied".to_string(),
             Value::Number(serde_json::Number::from(protected.writes.len() as u64)),
         );
+        summary.remove("protectedPending");
     } else if let Some(transaction) = transaction.as_mut() {
         match transaction.commit() {
             Ok(status) => commit_status = Some(status),
@@ -1879,12 +1935,14 @@ fn push_editor_changes_with_collected(
     if let Some(history_transaction) = history_transaction {
         history_transaction.commit();
     }
-    println!(
-        "[renium] editor push done: elapsed_ms={:.1}, summary={}",
-        elapsed_ms(started),
-        Value::Object(summary.clone())
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor push done: elapsed_ms={:.1}, summary={}",
+            elapsed_ms(started),
+            Value::Object(summary.clone())
+        ),
     );
-    emit_editor_push_summary(&summary)?;
     let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
         bail!("Studio rejected or failed one or more editor push changes");
@@ -1900,12 +1958,15 @@ fn listen_editor_oneshot_bridge(
 ) -> Result<BridgeServer> {
     let ports = parse_bridge_ports(ports_raw)?;
     let (bridge, listen_metrics) = BridgeServer::listen(host, &ports, wait_seconds)?;
-    println!(
-        "[renium] editor {label} bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-        bridge.channel_count(),
-        bridge.expected_channel_count(),
-        listen_metrics.bind_ms,
-        listen_metrics.wait_for_channels_ms
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor {label} bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
+            bridge.channel_count(),
+            bridge.expected_channel_count(),
+            listen_metrics.bind_ms,
+            listen_metrics.wait_for_channels_ms
+        ),
     );
     Ok(bridge)
 }
@@ -1919,12 +1980,14 @@ fn apply_editor_change_with_warm_bridge(
     let changes = collect()?;
     if !request_editor_push_review(bridge, &changes)? {
         let summary = skipped_editor_summary(&changes);
-        println!(
-            "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
-            elapsed_ms(started),
-            Value::Object(summary.clone())
+        log_global(
+            5,
+            format_args!(
+                "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
+                elapsed_ms(started),
+                Value::Object(summary.clone())
+            ),
         );
-        emit_editor_push_summary(&summary)?;
         return Ok(summary);
     }
     let mut transaction = EditorTransaction::begin(bridge, &changes, None, None)?;
@@ -1939,23 +2002,19 @@ fn apply_editor_change_with_warm_bridge(
         let status = transaction.commit()?;
         add_editor_commit_status(&mut summary, status);
     }
-    println!(
-        "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
-        elapsed_ms(started),
-        Value::Object(summary.clone())
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
+            elapsed_ms(started),
+            Value::Object(summary.clone())
+        ),
     );
-    emit_editor_push_summary(&summary)?;
     Ok(summary)
 }
 
-fn emit_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
-    let value = Value::Object(summary.clone());
-    if global_json_output() {
-        print_json_output(&value, global_pretty_output(false))
-    } else {
-        println!("__ROBLOX_SYNC_EDITOR_PUSH_RESULT__ {value}");
-        Ok(())
-    }
+fn print_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
+    print_json_output(&Value::Object(summary.clone()), global_pretty_output(false))
 }
 
 pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result<()> {
@@ -1992,7 +2051,8 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         &args.target.bridge.ports,
         args.target.bridge.wait_seconds,
     )?;
-    apply_editor_property_with_warm_bridge(args, &bridge).map(|_| ())
+    let summary = apply_editor_property_with_warm_bridge(args, &bridge)?;
+    print_editor_push_summary(&summary)
 }
 
 pub(crate) fn apply_editor_property_with_warm_bridge(
@@ -2129,7 +2189,8 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
         &args.target.bridge.ports,
         args.target.bridge.wait_seconds,
     )?;
-    apply_editor_delete_with_warm_bridge(args, &bridge).map(|_| ())
+    let summary = apply_editor_delete_with_warm_bridge(args, &bridge)?;
+    print_editor_push_summary(&summary)
 }
 
 fn editor_mutation_parameters(target: &EditorMutationArgs) -> Result<Map<String, Value>> {
@@ -2697,6 +2758,177 @@ struct EditorChangedServices {
     dirty: HashSet<String>,
 }
 
+fn settings_value_references_target(
+    value: &Value,
+    target_index: usize,
+    target_settings_id: &str,
+    target_path_segments: &[String],
+    target_path_ordinals: &[usize],
+) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(|value| {
+            settings_value_references_target(
+                value,
+                target_index,
+                target_settings_id,
+                target_path_segments,
+                target_path_ordinals,
+            )
+        }),
+        Value::Object(object) => {
+            let directly_references_target = is_reference_object(object)
+                && (object
+                    .get("instanceIndex")
+                    .and_then(settings_reference_index)
+                    == Some(target_index)
+                    || ["settingsId", "instanceId", "referent", "ref"]
+                        .iter()
+                        .any(|key| {
+                            object.get(*key).and_then(Value::as_str) == Some(target_settings_id)
+                        })
+                    || (object
+                        .get("pathSegments")
+                        .and_then(Value::as_array)
+                        .is_some_and(|segments| {
+                            segments.len() == target_path_segments.len()
+                                && segments
+                                    .iter()
+                                    .zip(target_path_segments)
+                                    .all(|(segment, expected)| segment.as_str() == Some(expected))
+                        })
+                        && object
+                            .get("pathOrdinals")
+                            .and_then(Value::as_array)
+                            .is_none_or(|ordinals| {
+                                ordinals.len() == target_path_ordinals.len()
+                                    && ordinals.iter().zip(target_path_ordinals).all(
+                                        |(ordinal, expected)| {
+                                            ordinal.as_u64() == Some(*expected as u64)
+                                        },
+                                    )
+                            })));
+            directly_references_target
+                || object.values().any(|value| {
+                    settings_value_references_target(
+                        value,
+                        target_index,
+                        target_settings_id,
+                        target_path_segments,
+                        target_path_ordinals,
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+fn append_editor_reference_repairs(
+    changes: &mut EditorChangeSet,
+    before: &SettingsBytecode,
+    after: &SettingsBytecode,
+    service: &str,
+    target_settings_id: &str,
+) {
+    let Some(target_index) = document_instance_index_by_settings_id(before, target_settings_id)
+    else {
+        return;
+    };
+    let before_paths = build_editor_instance_paths(before, service);
+    let Some(target_path) = before_paths.get(target_index).and_then(Clone::clone) else {
+        return;
+    };
+    let after_paths = build_editor_instance_paths(after, service);
+    let after_settings_ids = after
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<Vec<_>>();
+    let after_indices = after
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+
+    for before_instance in &before.instances {
+        let Some(after_index) = after_indices
+            .get(before_instance.settings_id.as_str())
+            .copied()
+        else {
+            continue;
+        };
+        let after_instance = &after.instances[after_index];
+        let mut properties = Map::new();
+        let mut reset_properties = Vec::new();
+        for (name, value) in &before_instance.properties {
+            if !settings_value_references_target(
+                value,
+                target_index,
+                target_settings_id,
+                &target_path.path_segments,
+                &target_path.path_ordinals,
+            ) {
+                continue;
+            }
+            if let Some(value) = after_instance.properties.get(name) {
+                properties.insert(
+                    name.clone(),
+                    normalize_editor_bridge_value(value, None, &after_paths, &after_settings_ids),
+                );
+            } else {
+                reset_properties.push(name.clone());
+            }
+        }
+
+        let mut attributes = Map::new();
+        let mut deleted_attributes = Vec::new();
+        for (name, value) in &before_instance.attributes {
+            if !settings_value_references_target(
+                value,
+                target_index,
+                target_settings_id,
+                &target_path.path_segments,
+                &target_path.path_ordinals,
+            ) {
+                continue;
+            }
+            if let Some(value) = after_instance.attributes.get(name) {
+                attributes.insert(
+                    name.clone(),
+                    normalize_editor_bridge_value(value, None, &after_paths, &after_settings_ids),
+                );
+            } else {
+                deleted_attributes.push(name.clone());
+            }
+        }
+
+        if properties.is_empty()
+            && reset_properties.is_empty()
+            && attributes.is_empty()
+            && deleted_attributes.is_empty()
+        {
+            continue;
+        }
+        let Some(path) = after_paths.get(after_index).and_then(Clone::clone) else {
+            continue;
+        };
+        if !path.is_descendant_of(service) {
+            continue;
+        }
+        changes.property_changes.push(EditorPropertyChange {
+            service: service.to_string(),
+            settings_id: Some(after_instance.settings_id.clone()),
+            path_segments: path.path_segments,
+            path_ordinals: path.path_ordinals,
+            class_name: after_instance.class_name.clone(),
+            properties,
+            reset_properties,
+            attributes,
+            deleted_attributes,
+        });
+    }
+}
+
 fn sorted_services(services: HashSet<String>) -> Vec<String> {
     let mut services = services.into_iter().collect::<Vec<_>>();
     services.sort();
@@ -2706,7 +2938,7 @@ fn sorted_services(services: HashSet<String>) -> Vec<String> {
 fn validate_read_only_service_changes(
     link_enforcement: &LinkEnforcement,
     changed_services: &HashSet<String>,
-    documents: &HashMap<String, Option<SettingsBytecode>>,
+    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
     src_root: &Path,
 ) -> Result<()> {
     for target in &link_enforcement.read_only_packages {
@@ -2741,21 +2973,23 @@ fn validate_read_only_service_changes(
 
 fn finish_editor_change_collection(
     mut changes: EditorChangeSet,
-    documents: &HashMap<String, Option<SettingsBytecode>>,
+    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
     services: EditorChangedServices,
     property_filter: &EditorPropertyFilter,
     project_root: &Path,
     src_root: &Path,
     link_enforcement: &LinkEnforcement,
 ) -> Result<EditorChangeSet> {
+    let phase_started = Instant::now();
     validate_read_only_service_changes(link_enforcement, &services.settings, documents, src_root)?;
+    log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
             let path = service_settings_path(&src_root.join(&service));
             changes.settings_writes.push(EditorSettingsWrite {
                 expected_hash: settings_file_hash(&path)?,
                 path,
-                document: document.clone(),
+                document: document.as_ref().clone(),
             });
         }
     }
@@ -2768,41 +3002,40 @@ fn finish_editor_change_collection(
             })?;
         append_editor_instance_reconcile(&mut changes, document, &service);
     }
-    for service in sorted_services(services.target_upsert) {
-        if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
-            append_editor_target_instance_upserts(
-                &mut changes,
-                document,
-                &service,
-                property_filter,
-            );
-            append_editor_target_inline_source_changes(
-                &mut changes,
-                document,
-                &service,
-                property_filter,
-            );
-        }
-    }
+    let target_services = services.target_upsert;
     let settings_services = sorted_services(services.settings);
+    let phase_started = Instant::now();
     let property_schema_by_class = if settings_services.is_empty() {
         PropertySchemaMap::new()
     } else {
         load_rbx_dom_property_schema(project_root)?.unwrap_or_default()
     };
+    let mut changed_services = target_services.iter().cloned().collect::<BTreeSet<_>>();
+    changed_services.extend(settings_services.iter().cloned());
+    if changed_services.is_empty() {
+        log_editor_collection_timing("property schema", phase_started);
+        return Ok(changes);
+    }
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    for service in settings_services {
+    log_editor_collection_timing("property schema", phase_started);
+    let phase_started = Instant::now();
+    for service in changed_services {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
-            append_editor_property_changes(
+            append_editor_target_changes(
                 &mut changes,
                 document,
                 &service,
-                &property_schema_by_class,
                 property_filter,
-                database,
+                EditorTargetChangeOptions {
+                    upsert_instances: target_services.contains(&service),
+                    properties: settings_services.binary_search(&service).is_ok(),
+                    property_schema_by_class: &property_schema_by_class,
+                    database,
+                },
             );
         }
     }
+    log_editor_collection_timing("target changes", phase_started);
     Ok(changes)
 }
 
@@ -2839,10 +3072,59 @@ fn collect_editor_changes_with_link_enforcement(
     src_root: &Path,
     link_enforcement: &LinkEnforcement,
 ) -> Result<EditorChangeSet> {
+    collect_editor_changes_with_link_enforcement_and_documents(
+        args,
+        project_root,
+        src_root,
+        link_enforcement,
+        &mut HashMap::new(),
+    )
+}
+
+fn load_editor_service_document(
+    service: &str,
+    src_root: &Path,
+    documents: &mut HashMap<String, Option<Arc<SettingsBytecode>>>,
+    prepared_documents: &mut HashMap<String, SettingsBytecode>,
+) -> Result<()> {
+    if documents.contains_key(service) {
+        return Ok(());
+    }
+    let phase_started = Instant::now();
+    let document = match prepared_documents.remove(service) {
+        Some(document) => Some(Arc::new(document)),
+        None => read_editor_service_settings_cached(src_root, service)?,
+    };
+    documents.insert(service.to_string(), document);
+    log_editor_collection_timing("settings decode", phase_started);
+    Ok(())
+}
+
+fn unique_editor_changed_path(
+    project_root: &Path,
+    src_root: &Path,
+    changed_path: &Path,
+    seen_paths: &mut HashSet<String>,
+) -> Option<(PathBuf, String)> {
+    let absolute_path = canonical_editor_changed_path(project_root, changed_path);
+    if !seen_paths.insert(path_key(&absolute_path)) {
+        return None;
+    }
+    let service = service_from_changed_path(src_root, &absolute_path)?;
+    Some((absolute_path, service))
+}
+
+fn collect_editor_changes_with_link_enforcement_and_documents(
+    args: &PushEditorChangesArgs,
+    project_root: &Path,
+    src_root: &Path,
+    link_enforcement: &LinkEnforcement,
+    prepared_documents: &mut HashMap<String, SettingsBytecode>,
+) -> Result<EditorChangeSet> {
     let mut property_filter = EditorPropertyFilter::from_args(args)?;
     let mut changes = EditorChangeSet::default();
-    let mut documents: HashMap<String, Option<SettingsBytecode>> = HashMap::new();
-    let mut source_maps: HashMap<String, HashMap<String, EditorSourceTarget>> = HashMap::new();
+    let mut documents: HashMap<String, Option<Arc<SettingsBytecode>>> = HashMap::new();
+    let mut source_children: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
     let mut changed_services = EditorChangedServices::default();
     let mut seen_paths = HashSet::new();
 
@@ -2854,21 +3136,13 @@ fn collect_editor_changes_with_link_enforcement(
     let enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
     for changed_path in enforced_changed_paths {
-        let absolute_path = canonical_editor_changed_path(project_root, &changed_path);
-        let path_id = path_key(&absolute_path);
-        if !seen_paths.insert(path_id.clone()) {
-            continue;
-        }
-        let Some(service) = service_from_changed_path(src_root, &absolute_path) else {
+        let Some((absolute_path, service)) =
+            unique_editor_changed_path(project_root, src_root, &changed_path, &mut seen_paths)
+        else {
             continue;
         };
 
-        if !documents.contains_key(&service) {
-            documents.insert(
-                service.clone(),
-                read_editor_service_settings(src_root, &service)?,
-            );
-        }
+        load_editor_service_document(&service, src_root, &mut documents, prepared_documents)?;
 
         if collect_settings_file_change(
             args,
@@ -2904,21 +3178,28 @@ fn collect_editor_changes_with_link_enforcement(
             continue;
         }
 
-        if !source_maps.contains_key(&service) {
-            let map = documents
+        if !source_children.contains_key(&service) {
+            let children = documents
                 .get(&service)
                 .and_then(Option::as_ref)
-                .map(|document| {
-                    build_editor_source_path_map(document, &service, &src_root.join(&service))
-                })
+                .map(|document| settings_children_by_parent(document.as_ref()))
                 .unwrap_or_default();
-            source_maps.insert(service.clone(), map);
+            source_children.insert(service.clone(), children);
         }
 
-        let mut mapped_target = source_maps
+        let mut mapped_target = documents
             .get(&service)
-            .and_then(|map| map.get(&path_id))
-            .cloned();
+            .and_then(Option::as_ref)
+            .zip(source_children.get(&service))
+            .and_then(|(document, children)| {
+                editor_source_target_with_children(
+                    document,
+                    &service,
+                    &src_root.join(&service),
+                    &absolute_path,
+                    children,
+                )
+            });
 
         let metadata = fs::metadata(&absolute_path).ok();
         let exists_as_file = metadata.as_ref().is_some_and(std::fs::Metadata::is_file);
@@ -2949,11 +3230,19 @@ fn collect_editor_changes_with_link_enforcement(
             && exists_as_file
             && let Some(spec) = inferred_spec.as_ref()
         {
-            let settings_before = documents.get(&service).and_then(Option::as_ref).cloned();
+            let settings_before = documents
+                .get(&service)
+                .and_then(Option::as_ref)
+                .map(|document| document.as_ref().clone());
             let slot = documents
                 .get_mut(&service)
                 .expect("service document should be loaded");
-            let document = ensure_editor_service_document(slot);
+            let document = Arc::make_mut(slot.get_or_insert_with(|| {
+                Arc::new(SettingsBytecode {
+                    version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                    instances: Vec::new(),
+                })
+            }));
             let ensured = ensure_editor_source_target_in_bytecode(document, spec)?;
             mapped_target = Some(ensured.target);
             if ensured.changed {
@@ -2966,7 +3255,7 @@ fn collect_editor_changes_with_link_enforcement(
                         path_ordinals: target.path_ordinals.clone(),
                         class_name: target.class_name.clone(),
                         source_key: Some(editor_source_key_from_target(target)),
-                        settings_before,
+                        settings_before: settings_before.clone(),
                     });
                     if let Some(run_context) = spec.run_context.as_ref() {
                         let mut properties = Map::new();
@@ -2998,6 +3287,20 @@ fn collect_editor_changes_with_link_enforcement(
                     });
                 }
                 if !ensured.replace_instances.is_empty() {
+                    if let (Some(before), Some(target_settings_id)) = (
+                        settings_before.as_ref(),
+                        mapped_target
+                            .as_ref()
+                            .and_then(|target| target.settings_id.as_deref()),
+                    ) {
+                        append_editor_reference_repairs(
+                            &mut changes,
+                            before,
+                            document,
+                            &service,
+                            target_settings_id,
+                        );
+                    }
                     changes.instance_changes.push(EditorInstanceChange {
                         mode: "replaceInstances".to_string(),
                         service: service.clone(),
@@ -3005,9 +3308,8 @@ fn collect_editor_changes_with_link_enforcement(
                         instances: ensured.replace_instances,
                         preserve_instances: Vec::new(),
                     });
-                    changed_services.settings.insert(service.clone());
                 }
-                source_maps.remove(&service);
+                source_children.remove(&service);
             }
         }
 
@@ -3017,8 +3319,10 @@ fn collect_editor_changes_with_link_enforcement(
         {
             if let Some(settings_id) = target.settings_id.as_deref()
                 && let Some(document) = documents.get_mut(&service).and_then(Option::as_mut)
-                && let Some(index) = document_instance_index_by_settings_id(document, settings_id)
+                && let Some(index) =
+                    document_instance_index_by_settings_id(document.as_ref(), settings_id)
             {
+                let document = Arc::make_mut(document);
                 let original_class = document.instances[index].class_name.clone();
                 if is_lua_source_class(&original_class) {
                     let settings_before = document.clone();
@@ -3030,10 +3334,9 @@ fn collect_editor_changes_with_link_enforcement(
                         path_ordinals: target.path_ordinals.clone(),
                         class_name: original_class,
                         source_key: Some(editor_source_key_from_target(target)),
-                        settings_before: Some(settings_before),
+                        settings_before: Some(settings_before.clone()),
                     });
                     changed_services.dirty.insert(service.clone());
-                    changed_services.settings.insert(service.clone());
                     if inferred_spec.as_ref().is_some_and(|spec| spec.is_init) {
                         document.instances[index].class_name = "Folder".to_string();
                         let descriptor = editor_instance_descriptor_for_known_path(
@@ -3050,6 +3353,13 @@ fn collect_editor_changes_with_link_enforcement(
                             instances: vec![descriptor],
                             preserve_instances: Vec::new(),
                         });
+                        append_editor_reference_repairs(
+                            &mut changes,
+                            &settings_before,
+                            document,
+                            &service,
+                            settings_id,
+                        );
                     } else {
                         let descriptor = editor_instance_descriptor_for_known_path(
                             document,
@@ -3059,6 +3369,13 @@ fn collect_editor_changes_with_link_enforcement(
                         )
                         .context("Failed to describe the deleted source instance")?;
                         remove_instances_at_indices(document, &[index], true)?;
+                        append_editor_reference_repairs(
+                            &mut changes,
+                            &settings_before,
+                            document,
+                            &service,
+                            settings_id,
+                        );
                         changes.instance_changes.push(EditorInstanceChange {
                             mode: "deleteInstances".to_string(),
                             service: service.clone(),
@@ -3067,7 +3384,7 @@ fn collect_editor_changes_with_link_enforcement(
                             preserve_instances: Vec::new(),
                         });
                     }
-                    source_maps.remove(&service);
+                    source_children.remove(&service);
                 }
             }
             continue;
@@ -3122,7 +3439,7 @@ fn collect_editor_changes_with_link_enforcement(
         });
     }
 
-    finish_editor_change_collection(
+    let changes = finish_editor_change_collection(
         changes,
         &documents,
         changed_services,
@@ -3130,7 +3447,13 @@ fn collect_editor_changes_with_link_enforcement(
         project_root,
         src_root,
         link_enforcement,
-    )
+    )?;
+    for document in documents.into_values().flatten() {
+        if let Ok(document) = Arc::try_unwrap(document) {
+            drop_settings_document(document);
+        }
+    }
+    Ok(changes)
 }
 
 #[cfg(test)]

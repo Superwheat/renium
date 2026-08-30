@@ -243,7 +243,7 @@ fn update_sourcemap_service_node(
 }
 
 impl SourcemapWriter {
-    pub(crate) fn start(project_root: PathBuf) -> Self {
+    pub(crate) fn start(project_root: PathBuf, durable: bool) -> Self {
         let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
         let handle = thread::spawn(move || -> Result<()> {
             let existing_root = load_existing_sourcemap_root(&project_root)?;
@@ -283,13 +283,13 @@ impl SourcemapWriter {
 
                 if pending_finish {
                     if wrote_update {
-                        finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
+                        finalize_project_sourcemap_temp(&project_root, &service_nodes, durable)?;
                     }
                     return Ok(());
                 }
             }
             if wrote_update {
-                finalize_project_sourcemap_temp(&project_root, &service_nodes)?;
+                finalize_project_sourcemap_temp(&project_root, &service_nodes, durable)?;
             }
             Ok(())
         });

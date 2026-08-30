@@ -452,6 +452,8 @@ pub(super) fn acknowledge_pulled_changes(
             "start": false,
             "ackSeq": seq,
             "runtimeId": runtime_id,
+            "includeGenerations": true,
+            "includeAllState": true,
         }),
     )?;
     ensure_plugin_api_ok(&result)?;
@@ -762,6 +764,14 @@ fn close_studio(
         place_id,
     };
     let pid = studio_pid_for_bridge(bridge)?;
+    if (target.file.is_some() || unpublished)
+        && !matches!(local_action, Some("saveAndClose" | "terminate"))
+    {
+        bail!(
+            "Closing a local Studio place requires --save or --terminate so Renium never guesses whether to keep unsaved work"
+        );
+    }
+    state.live_sync().stop(context.id);
     if target.file.is_some() || unpublished {
         match local_action {
             Some("saveAndClose") => save_local_studio(
@@ -774,9 +784,7 @@ fn close_studio(
                 bridge,
             )?,
             Some("terminate") => {}
-            _ => bail!(
-                "Closing a local Studio place requires --save or --terminate so Renium never guesses whether to keep unsaved work"
-            ),
+            _ => unreachable!("local close action was validated before stopping Live Sync"),
         }
     }
     state.remember_studio_target(context, target.clone());
@@ -1279,7 +1287,9 @@ fn automation_dispatch_managed(
             | op::PLACE_REORDER
     ) || matches!(operation, op::SET_PROPERTY | op::REMOVE)
         && parameters.get("editor").and_then(Value::as_bool) != Some(true);
-    let pauses_file_watcher = writes_project || operation == op::PUSH;
+    let writes_studio_directly = matches!(operation, op::SET_PROPERTY | op::REMOVE)
+        && parameters.get("editor").and_then(Value::as_bool) == Some(true);
+    let pauses_file_watcher = writes_project || writes_studio_directly || operation == op::PUSH;
     if pauses_file_watcher {
         state.live_sync().pause(context.id);
     }
@@ -1402,11 +1412,18 @@ fn automation_dispatch_managed(
             if let Some(captured) = push_capture {
                 state
                     .live_sync()
-                    .acknowledge_then_resume(context, bridge, captured, BaselineSide::Editor)
+                    .acknowledge_then_resume_with_gate_held(
+                        context,
+                        bridge,
+                        captured,
+                        BaselineSide::Editor,
+                    )
                     .map_err(automation_failure)?;
             } else {
                 state.live_sync().resume(context.id, std::iter::empty());
             }
+        } else if writes_studio_directly {
+            state.live_sync().resume(context.id, std::iter::empty());
         } else if !paths.is_empty() {
             state.live_sync().settle(context.id, paths);
         }
@@ -1689,6 +1706,7 @@ fn automation_live_operation(
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
+    let operation_started = Instant::now();
     let object = automation_object(parameters)?;
     let options = LiveOperationOptions::parse(object)?;
     let attached_session = if options.manage_files {
@@ -1812,6 +1830,13 @@ fn automation_live_operation(
             false,
         )?
     };
+    log_global(
+        5,
+        format_args!(
+            "[renium] live operation plugin status: {:.1}ms",
+            operation_started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
     let restore_files = if options.manage_files && operation == op::LIVE_STATUS {
         let enabled = state.live_sync().enabled(context);
         let restore = !attached_session && enabled;
@@ -1886,17 +1911,96 @@ fn automation_live_operation(
         .live_sync()
         .set_plugin_status(context.id, plugin.clone());
     if settle_requested {
+        let settle_started = Instant::now();
         let settled = state.live_sync().wait_settled(
             context.id,
             Duration::from_secs_f64(options.settle_wait_seconds),
         );
-        plugin = state.live_sync().plugin_status(context.id);
+        log_global(
+            5,
+            format_args!(
+                "[renium] live operation settle wait: {:.1}ms settled={settled}",
+                settle_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        let refresh_started = Instant::now();
+        plugin = live_plugin_status(context, parameters, bridge, bridge_wait_seconds)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] live operation settled status refresh: {:.1}ms",
+                refresh_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        state
+            .live_sync()
+            .set_plugin_status(context.id, plugin.clone());
         daemon = state.live_sync().status(context.id);
         if let Some(daemon) = daemon.as_object_mut() {
             daemon.insert("settled".to_string(), Value::Bool(settled));
         }
     }
     Ok(merge_live_status(plugin, daemon, options.compact))
+}
+
+fn restore_persisted_live_sync(
+    context: &automation::BoundContext,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<(), automation::Failure> {
+    if context.runtime_id.is_none()
+        || !state.live_sync().enabled(context)
+        || state
+            .live_sync()
+            .attach(context, bridge)
+            .map_err(automation_failure)?
+    {
+        return Ok(());
+    }
+    automation_live_operation(
+        op::LIVE_STATUS,
+        context,
+        &json!({ "compact": true }),
+        state,
+        bridge,
+        bridge_wait_seconds,
+    )?;
+    Ok(())
+}
+
+fn restore_persisted_live_sync_for_request(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<(), automation::Failure> {
+    let Ok(operation) = request.validate() else {
+        return Ok(());
+    };
+    if matches!(
+        operation.id,
+        op::BIND
+            | op::UNBIND
+            | op::CONTEXT
+            | op::LIVE_START
+            | op::LIVE_STOP
+            | op::LIVE_STATUS
+            | op::RETRY_PENDING
+            | op::DISCARD_PENDING
+            | op::STUDIO_OPEN
+            | op::STUDIO_CLOSE
+            | op::REVIEW_PREPARE
+            | op::REVIEW_APPLY
+            | op::REVIEW_REJECT
+    ) {
+        return Ok(());
+    }
+    let Some(context_id) = request.cx else {
+        return Ok(());
+    };
+    let context = bound_context::resolve(state, bridge, context_id)?;
+    restore_persisted_live_sync(&context, state, bridge, bridge_wait_seconds)
 }
 
 fn live_plugin_status(
@@ -1967,6 +2071,35 @@ fn pair_configuration(
     })
 }
 
+fn resolve_connected_context(
+    state: &automation::State,
+    bridge: &BridgeServer,
+    context_id: u64,
+    wait_seconds: f64,
+) -> std::result::Result<automation::BoundContext, automation::Failure> {
+    let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.max(1.0));
+    loop {
+        match bound_context::resolve(state, bridge, context_id) {
+            Ok(context) if context.runtime_id.is_some() => return Ok(context),
+            Ok(_) => {}
+            Err(failure) if failure.0.rt == 1 => {}
+            Err(failure) => return Err(failure),
+        }
+        if Instant::now() >= deadline {
+            return Err(automation::Failure::new(
+                "no_studio",
+                format!(
+                    "No Studio runtime connected to this project within {:.1}s",
+                    wait_seconds.max(1.0)
+                ),
+                true,
+                "studios",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn automation_execute_request(
     request: &automation::Request,
     state: &automation::State,
@@ -2002,6 +2135,17 @@ fn automation_execute_request(
             if operation.id == op::UNBIND {
                 return Ok(json!({ "removed": state.remove_context(context_id) }));
             }
+            let requires_review = operation.review
+                && (matches!(operation.id, op::STUDIO_OPEN | op::STUDIO_CLOSE)
+                    || request.p.get("destructive").and_then(Value::as_bool) == Some(true));
+            if requires_review {
+                return Err(automation::Failure::new(
+                    "rejected",
+                    "This operation requires a review receipt",
+                    false,
+                    "review-prepare",
+                ));
+            }
             if operation.id == op::LIVE_STATUS
                 && request.p.get("filesOnly").and_then(Value::as_bool) == Some(true)
             {
@@ -2026,8 +2170,15 @@ fn automation_execute_request(
                         .and_then(Value::as_str)
                         .and_then(|id| state.review_operation(id))
                         == Some(op::STUDIO_OPEN);
+            let requires_connected_runtime = automation_requires_runtime(operation.id, &request.p)
+                || operation.id == op::REVIEW_APPLY
+                    && state
+                        .context(context_id)
+                        .is_some_and(|context| context.runtime_id.is_some());
             let context = if disconnected_open {
                 bound_context::resolve_project(state, context_id)?
+            } else if requires_connected_runtime {
+                resolve_connected_context(state, bridge, context_id, bridge_wait_seconds)?
             } else {
                 bound_context::resolve(state, bridge, context_id)?
             };
@@ -2192,7 +2343,7 @@ fn automation_execute_request(
                         "review-prepare",
                     )
                 })?;
-                if (&review.context_id, &review.runtime_id) != (&context.id, &context.runtime_id) {
+                if review.context_id != context.id {
                     return Err(automation::Failure::new(
                         "rejected",
                         "Review receipt does not match this context",
@@ -2209,17 +2360,6 @@ fn automation_execute_request(
                     bridge_wait_seconds,
                     true,
                 );
-            }
-            let requires_review = operation.review
-                && (matches!(operation.id, op::STUDIO_OPEN | op::STUDIO_CLOSE)
-                    || request.p.get("destructive").and_then(Value::as_bool) == Some(true));
-            if requires_review {
-                return Err(automation::Failure::new(
-                    "rejected",
-                    "This operation requires a review receipt",
-                    false,
-                    "review-prepare",
-                ));
             }
             automation_dispatch_managed(
                 operation.id,
@@ -2247,6 +2387,7 @@ fn automation_response(
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
     let result = (|| {
+        restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
         let _request_guard = if queued {
             Some(match request_lease.as_deref() {
                 Some(lease) => bridge

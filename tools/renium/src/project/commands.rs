@@ -32,6 +32,7 @@ use crate::project::sourcemap::{path_to_sourcemap_relative, write_project_source
 use crate::project::structural::move_instance_between_service_stores;
 use crate::rbx::model::{bytecode_export_model, bytecode_import_model};
 use crate::settings::bytecode::{SettingsBytecode, instance_settings_id};
+use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::export::ExportProjectStage;
 use crate::snapshot::import::{
     build_service_state_from_instances, import_service_state_with_sourcemap, load_service_state,
@@ -231,6 +232,13 @@ fn metadata_property_change(
     }
 }
 
+fn service_root_settings_id(settings_file: &Path, service: &str) -> Result<String> {
+    let document = SettingsBytecode::read_file(settings_file)?;
+    let root_index = editor_service_root_index(&document, service)
+        .with_context(|| format!("Service '{service}' has no root instance"))?;
+    Ok(document.instances[root_index].settings_id.clone())
+}
+
 pub(crate) fn create_instance_command(
     args: CreateInstanceArgs,
     project: Option<&Path>,
@@ -352,10 +360,13 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             loaded,
             &stage,
             &target_service,
-            Some(&args.parent_settings_id),
+            args.parent_settings_id.as_deref(),
             false,
             args.override_packages,
         )?;
+        let parent_id = parent_id
+            .map(Ok)
+            .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
         if source_file != target_file {
             return move_instance_between_service_stores(
                 &source_file,
@@ -365,16 +376,14 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
                     .context("Source instance has no canonical id")?,
                 &target_file,
                 &target_service,
-                parent_id
-                    .as_deref()
-                    .context("Target parent has no canonical id")?,
+                &parent_id,
             );
         }
         return bytecode_set_property(metadata_property_change(
             source_file,
             source_id,
             "Parent",
-            parent_id,
+            Some(parent_id),
         ));
     } else {
         let src_root =
@@ -387,16 +396,20 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
     if !source_file.is_file() {
         bail!("Source service '{}' has no Renium store", target.service);
     }
+    if !target_file.is_file() {
+        bail!("Target service '{target_service}' has no Renium store");
+    }
+    let parent_settings_id = args
+        .parent_settings_id
+        .map(Ok)
+        .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
     if target_service == target.service {
         return bytecode_set_property(metadata_property_change(
             source_file,
             Some(target.settings_id),
             "Parent",
-            Some(args.parent_settings_id),
+            Some(parent_settings_id),
         ));
-    }
-    if !target_file.is_file() {
-        bail!("Target service '{target_service}' has no Renium store");
     }
     move_instance_between_service_stores(
         &source_file,
@@ -404,7 +417,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
         &target.settings_id,
         &target_file,
         &target_service,
-        &args.parent_settings_id,
+        &parent_settings_id,
     )
 }
 

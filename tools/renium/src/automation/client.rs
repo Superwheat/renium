@@ -155,13 +155,16 @@ pub(crate) fn run_stdio_proxy(bridge_ports: String, bridge_wait_seconds: f64) ->
                     let _guard = stdout_gate
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    std::println!("{response}");
+                    crate::app::output::write_stdout(format_args!("{response}"));
                     let _ = io::stdout().flush();
                 });
             }
             BoundedLineRead::TooLong => {
                 let response = super::runtime::oversized_automation_request_response();
-                std::println!("{}", serde_json::to_string(&response)?);
+                crate::app::output::write_stdout(format_args!(
+                    "{}",
+                    serde_json::to_string(&response)?
+                ));
                 io::stdout().flush()?;
             }
         }

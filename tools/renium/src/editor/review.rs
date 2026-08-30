@@ -1,11 +1,13 @@
 use std::collections::HashMap;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::fs;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
+#[cfg(any(windows, target_os = "macos"))]
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -22,25 +24,26 @@ use crate::app::timing::current_millis;
 use crate::cli::PushEditorChangesArgs;
 use crate::editor::types::{EditorChangeSet, EditorInstancePath};
 use crate::rbx::decode::rbx_variant_to_settings_json;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::encode::{
     json_to_rbx_attribute_variant, json_to_rbx_property_variant, rbx_model_top_level_refs,
 };
 use crate::rbx::encode::{rbx_model_property_descriptor, rbx_property_descriptor};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::model::BytecodeModelExportRefs;
 use crate::rbx::model::{
     RbxPlaceFormat, rbx_dom_instance_by_path_unique, rbx_dom_path_import_refs,
 };
 use crate::roblox::schema::{
-    MATERIAL_SERVICE_CLASS, PropertySchemaEntry, PropertySchemaMap, USE_2022_MATERIALS_PROPERTY,
+    MATERIAL_SERVICE_CLASS, PropertySchemaEntry, PropertySchemaMap, TEXTURE_PACK_PROPERTY,
+    USE_2022_MATERIALS_PROPERTY, has_protected_texture_pack,
 };
 use crate::studio::bridge::BridgeServer;
 use crate::studio::bridge::BridgeTarget;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 use crate::studio::native::editor::wait_for_editor_review_decision;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::studio::native::editor::write_live_editor_place_snapshot;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::native::editor::{
@@ -110,6 +113,7 @@ pub(crate) fn is_engine_managed_editor_property(
 ) -> bool {
     if property_name == "Tags"
         || class_name == MATERIAL_SERVICE_CLASS && property_name == USE_2022_MATERIALS_PROPERTY
+        || has_protected_texture_pack(class_name) && property_name == TEXTURE_PACK_PROPERTY
     {
         return false;
     }
@@ -166,6 +170,9 @@ pub(crate) fn is_user_facing_protected_write(
                 .is_some_and(|segments| {
                     segments.len() == 1 && segments[0].as_str() == Some(MATERIAL_SERVICE_CLASS)
                 });
+    }
+    if has_protected_texture_pack(class_name) && name == TEXTURE_PACK_PROPERTY {
+        return true;
     }
     let Some(descriptor) = rbx_property_descriptor(database, class_name, name) else {
         return false;
@@ -767,6 +774,8 @@ pub(crate) fn protected_write_rows_with_previous_values(
             out.push(row);
             continue;
         };
+        object.remove("oldValue");
+        object.remove("oldValueMissing");
         let path_segments = json_string_array(object.get("pathSegments"));
         let path_ordinals = json_usize_array(object.get("pathOrdinals"));
         let Some(name) = object
@@ -989,7 +998,7 @@ pub(crate) fn local_place_path_for_runtime(
     None
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Result<usize> {
     let format = RbxPlaceFormat::from_path(path)?;
     let mut dom = format.read(path)?;
@@ -1085,20 +1094,103 @@ pub(crate) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Resul
 }
 
 #[cfg(windows)]
+fn protected_write_studio_target(pid: u32) -> Result<PathBuf> {
+    input_inject::process_executable_path(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn protected_write_studio_target(_pid: u32) -> Result<PathBuf> {
+    crate::studio::native::serializer::patched_studio_path()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn reopen_protected_write_studio(target: &Path, place: &Path) -> Result<()> {
+    let mut command = Command::new(target);
+    command.arg(place);
+    crate::project::workflows::spawn_studio(command, target)
+        .with_context(|| format!("Failed to reopen Studio with {}", place.display()))?;
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn wait_for_reopened_local_studio(
+    bridge: &BridgeServer,
+    place: &Path,
+    previous_runtime_id: &str,
+    wait_seconds: f64,
+) -> Result<String> {
+    let expected_path = fs::canonicalize(place).unwrap_or_else(|_| place.to_path_buf());
+    let required_channels = bridge.expected_channel_count();
+    let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.max(1.0));
+    loop {
+        for client in bridge.list_bridge_clients() {
+            if client.get("role").and_then(Value::as_str) != Some("edit")
+                || client.get("channels").and_then(Value::as_u64).unwrap_or(0)
+                    < required_channels as u64
+            {
+                continue;
+            }
+            let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
+                continue;
+            };
+            if runtime_id == previous_runtime_id {
+                continue;
+            }
+            let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
+                continue;
+            };
+            let Some(candidate_path) = local_place_path_for_pid(pid) else {
+                continue;
+            };
+            let candidate_path = fs::canonicalize(&candidate_path).unwrap_or(candidate_path);
+            if candidate_path == expected_path {
+                return Ok(runtime_id.to_string());
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Studio reopened {} but its replacement Renium runtime did not connect within {:.1}s",
+                place.display(),
+                wait_seconds.max(1.0)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn protected_write_place_path(bridge: &BridgeServer, pid: u32, rows: &[Value]) -> Result<PathBuf> {
+    let title = input_inject::studio_window_title(pid)?;
+    local_place_path_from_studio_title(&title).with_context(|| {
+        format!(
+            "Protected property writes require a local place file; the published Studio place was not changed: {}",
+            serde_json::to_string(rows).unwrap_or_default()
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn protected_write_place_path(_bridge: &BridgeServer, pid: u32, rows: &[Value]) -> Result<PathBuf> {
+    local_place_path_for_pid(pid).with_context(|| {
+        format!(
+            "Protected property writes require a local place file; the published Studio place was not changed: {}",
+            serde_json::to_string(rows).unwrap_or_default()
+        )
+    })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn apply_protected_writes_offline(
     bridge: &BridgeServer,
     args: &PushEditorChangesArgs,
     rows: &[Value],
 ) -> Result<Value> {
+    let previous_runtime_id = bridge
+        .cached_bridge_info_for_target(BridgeTarget::Edit)?
+        .runtime_id;
     let pid = studio_pid_for_bridge(bridge)?;
-    let executable = input_inject::process_executable_path(pid)?;
-    let title = input_inject::studio_window_title(pid)?;
-    let original_path = local_place_path_from_studio_title(&title).with_context(|| {
-        format!(
-            "Protected property writes require a local place file; the published Studio place was not changed: {}",
-            serde_json::to_string(rows).unwrap_or_default()
-        )
-    })?;
+    let target = protected_write_studio_target(pid)?;
+    let original_path = protected_write_place_path(bridge, pid, rows)?;
     let extension = original_path
         .extension()
         .and_then(|value| value.to_str())
@@ -1143,7 +1235,7 @@ pub(crate) fn apply_protected_writes_offline(
         current_millis()
     ));
     if let Err(error) = fs::rename(&original_path, &backup) {
-        let _ = Command::new(&executable).arg(&original_path).spawn();
+        let _ = reopen_protected_write_studio(&target, &original_path);
         return Err(error).with_context(|| {
             format!(
                 "Failed to prepare {} for protected snapshot replacement",
@@ -1154,7 +1246,7 @@ pub(crate) fn apply_protected_writes_offline(
     if let Err(error) = fs::rename(&snapshot, &original_path) {
         let restore = fs::rename(&backup, &original_path);
         if restore.is_ok() {
-            let _ = Command::new(&executable).arg(&original_path).spawn();
+            let _ = reopen_protected_write_studio(&target, &original_path);
         }
         if let Err(restore_error) = restore {
             return Err(error).with_context(|| {
@@ -1172,14 +1264,14 @@ pub(crate) fn apply_protected_writes_offline(
             )
         });
     }
-    if let Err(error) = Command::new(&executable).arg(&original_path).spawn() {
+    if let Err(error) = reopen_protected_write_studio(&target, &original_path) {
         let preserve = fs::rename(&original_path, &snapshot);
         let restore = preserve
             .as_ref()
             .map_err(|value| io::Error::other(format!("not attempted: {value}")))
             .and_then(|_| fs::rename(&backup, &original_path));
         if restore.is_ok() && preserve.is_ok() {
-            let _ = Command::new(&executable).arg(&original_path).spawn();
+            let _ = reopen_protected_write_studio(&target, &original_path);
         }
         return Err(error).with_context(|| {
                 format!(
@@ -1192,6 +1284,12 @@ pub(crate) fn apply_protected_writes_offline(
                 )
             });
     }
+    let reopened_runtime_id = wait_for_reopened_local_studio(
+        bridge,
+        &original_path,
+        &previous_runtime_id,
+        args.bridge.wait_seconds.max(20.0),
+    )?;
     if let Err(error) = fs::remove_file(&backup) {
         eprintln!(
             "[renium] warning: could not remove protected-write backup {}: {error}",
@@ -1204,13 +1302,14 @@ pub(crate) fn apply_protected_writes_offline(
         "applied": applied,
         "exportedInstances": exported_instances,
         "reopenedPath": reopen_path,
+        "reopenedRuntimeId": reopened_runtime_id,
         "localFile": true,
         "cloudSaved": false,
         "nativeSnapshot": true,
     }))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn apply_protected_writes_offline(
     _bridge: &BridgeServer,
     _args: &PushEditorChangesArgs,

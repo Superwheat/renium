@@ -1011,7 +1011,7 @@ pub(crate) fn parse_source_range_batch(raw: Value) -> Result<SourceBatchMap> {
     }
 
     let mut out = SourceBatchMap::default();
-    for pair in items.chunks_exact(2) {
+    for pair in items.as_chunks::<2>().0 {
         let source = pair[1]
             .as_str()
             .with_context(|| "Source range value must be a string")?;

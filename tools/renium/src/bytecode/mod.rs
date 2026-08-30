@@ -6,6 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rbx_dom_weak::types::VariantType as RbxVariantType;
+use rbx_reflection::DataType as RbxDataType;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -1187,21 +1189,28 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         let database =
             rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
         let class_name = document.instances[index].class_name.as_str();
+        let descriptor = rbx_model_property_descriptor(database, class_name, &args.property)
+            .or_else(|| rbx_property_descriptor(database, class_name, &args.property));
         if let Some(default) = database
             .classes
             .get(class_name)
             .and_then(|class| database.find_default_property(class, &args.property))
-        {
-            let descriptor = rbx_model_property_descriptor(database, class_name, &args.property)
-                .or_else(|| rbx_property_descriptor(database, class_name, &args.property));
-            if let Some(value) = rbx_variant_to_settings_json(
+            && let Some(value) = rbx_variant_to_settings_json(
                 default,
                 descriptor,
                 database,
                 &BytecodeModelImportRefs::default(),
-            ) {
-                return print_json_output(&value, args.pretty);
-            }
+            )
+        {
+            return print_json_output(&value, args.pretty);
+        }
+        if descriptor.is_some_and(|descriptor| {
+            matches!(
+                descriptor.data_type,
+                RbxDataType::Value(RbxVariantType::Ref)
+            )
+        }) {
+            return print_json_output(&Value::Null, args.pretty);
         }
     }
     bail!("Property not found: {}", args.property)
