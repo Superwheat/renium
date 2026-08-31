@@ -101,6 +101,11 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
             timeout: args.timeout,
         }),
         Commands::StudioDevice(args) => studio_device_command(args),
+        Commands::PerformanceProfile(args) => crate::cli::performance::run(args),
+        Commands::PerformanceWorker => crate::studio::performance::run_worker(),
+        Commands::PerformanceHolder(args) => {
+            crate::studio::performance::run_holder(args.pid, &args.identity, &args.locator)
+        }
         Commands::AssetSearch(args) => asset_search_command(args),
         Commands::AssetInsert(args) => asset_insert_command(args, project),
         Commands::GenerateModel(args) => generate_model_command(args, project),

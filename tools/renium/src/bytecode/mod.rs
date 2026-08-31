@@ -37,8 +37,8 @@ use crate::daemon::is_process_alive;
 use crate::editor::document::is_protected_starter_player_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
-    build_editor_source_paths_by_index, document_instance_index_by_path_unique,
-    path_ordinals_match, script_file_names,
+    build_editor_instance_paths_for_indices, build_editor_source_paths_by_index,
+    document_instance_index_by_path_unique, path_ordinals_match, script_file_names,
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::project::commands::load_structural_project;
@@ -155,6 +155,134 @@ fn parse_cli_value(
         return Ok(Value::Bool(value_bool));
     }
     Ok(Value::Null)
+}
+
+fn unqualified_reference_ids(value: &Value, settings_ids: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                unqualified_reference_ids(value, settings_ids);
+            }
+        }
+        Value::Object(object) => {
+            let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
+                || object.contains_key("settingsId")
+                || object.contains_key("instanceId");
+            let has_path = object
+                .get("pathSegments")
+                .and_then(Value::as_array)
+                .is_some_and(|segments| !segments.is_empty());
+            if is_reference
+                && !has_path
+                && let Some(settings_id) = object
+                    .get("settingsId")
+                    .or_else(|| object.get("instanceId"))
+                    .and_then(Value::as_str)
+            {
+                settings_ids.insert(settings_id.to_string());
+            }
+            for nested in object.values() {
+                unqualified_reference_ids(nested, settings_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone)]
+struct ReferenceTargetPath {
+    service: String,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+}
+
+fn qualify_reference_targets(
+    value: &mut Value,
+    documents: &BTreeMap<String, SettingsBytecode>,
+    requested_settings_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let mut targets_by_settings_id = HashMap::<String, Vec<ReferenceTargetPath>>::new();
+    for (service, document) in documents {
+        let matches = document
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| requested_settings_ids.contains(&instance.settings_id))
+            .collect::<Vec<_>>();
+        let indices = matches.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let paths = build_editor_instance_paths_for_indices(document, service, &indices);
+        for (index, instance) in matches {
+            let Some(path) = paths.get(&index) else {
+                continue;
+            };
+            targets_by_settings_id
+                .entry(instance.settings_id.clone())
+                .or_default()
+                .push(ReferenceTargetPath {
+                    service: service.clone(),
+                    path_segments: path.path_segments.clone(),
+                    path_ordinals: path.path_ordinals.clone(),
+                });
+        }
+    }
+
+    fn qualify(
+        value: &mut Value,
+        targets_by_settings_id: &HashMap<String, Vec<ReferenceTargetPath>>,
+    ) -> Result<()> {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    qualify(value, targets_by_settings_id)?;
+                }
+            }
+            Value::Object(object) => {
+                let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
+                    || object.contains_key("settingsId")
+                    || object.contains_key("instanceId");
+                let has_path = object
+                    .get("pathSegments")
+                    .and_then(Value::as_array)
+                    .is_some_and(|segments| !segments.is_empty());
+                if is_reference && !has_path {
+                    let settings_id = object
+                        .get("settingsId")
+                        .or_else(|| object.get("instanceId"))
+                        .and_then(Value::as_str);
+                    if let Some(settings_id) = settings_id {
+                        let targets = targets_by_settings_id
+                            .get(settings_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        let [target] = targets else {
+                            if targets.is_empty() {
+                                bail!("Reference target was not found: {settings_id}");
+                            }
+                            let services = targets
+                                .iter()
+                                .map(|target| target.service.as_str())
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            bail!(
+                                "Reference target is ambiguous: {settings_id} exists in {services}; include pathSegments and pathOrdinals"
+                            );
+                        };
+                        object.insert("pathSegments".to_string(), json!(target.path_segments));
+                        object.insert("pathOrdinals".to_string(), json!(target.path_ordinals));
+                    }
+                }
+                for nested in object.values_mut() {
+                    qualify(nested, targets_by_settings_id)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    qualify(value, &targets_by_settings_id)
 }
 
 fn parse_cli_source_text(value_json: Option<&str>, value_str: Option<&str>) -> Result<String> {
@@ -1231,8 +1359,18 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
             args.property.to_ascii_lowercase().as_str(),
             "name" | "parent"
         ) && matches!(scope, PropertyScope::Auto | PropertyScope::Metadata);
+    let mut value = parse_cli_value(
+        args.value_json.as_deref(),
+        args.value_str.as_deref(),
+        args.value_num,
+        args.value_bool,
+        args.value_null,
+    )?;
+    let mut unqualified_settings_ids = BTreeSet::new();
+    unqualified_reference_ids(&value, &mut unqualified_settings_ids);
+    let qualify_references = !unqualified_settings_ids.is_empty();
     let mut settings_files_to_lock = BTreeSet::from([settings_file.clone()]);
-    if structural_reference_update
+    if (structural_reference_update || qualify_references)
         && let Some(src_root) = settings_file.parent().and_then(Path::parent)
     {
         for entry in fs::read_dir(src_root)? {
@@ -1251,15 +1389,25 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         .collect::<Result<Vec<_>>>()?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
+    if qualify_references {
+        let mut documents = BTreeMap::new();
+        for path in &settings_files_to_lock {
+            let service_name = path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .context("Service settings path has no service directory")?;
+            let candidate = if *path == settings_file {
+                document.clone()
+            } else {
+                SettingsBytecode::read_file(path)?
+            };
+            documents.insert(service_name, candidate);
+        }
+        qualify_reference_targets(&mut value, &documents, &unqualified_settings_ids)?;
+    }
     let resolved =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?;
-    let value = parse_cli_value(
-        args.value_json.as_deref(),
-        args.value_str.as_deref(),
-        args.value_num,
-        args.value_bool,
-        args.value_null,
-    )?;
     let index = resolved.index;
     reject_package_link_instance_mutation(&document, index, "edited")?;
     validate_auto_property_name(&document, index, &args.property, scope)?;

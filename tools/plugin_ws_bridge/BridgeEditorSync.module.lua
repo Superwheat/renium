@@ -1003,6 +1003,19 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 		if settingsInstance ~= nil and strongSettingsId(settingsId) then
 			return settingsInstance
 		end
+		if settingsInstance == nil and type(ctx.allowedServices) == "table" then
+			for candidateServiceName, allowed in pairs(ctx.allowedServices) do
+				if allowed and candidateServiceName ~= targetServiceName then
+					local candidate = resolveInstanceBySettingsId(candidateServiceName, settingsId, ctx)
+					if candidate ~= nil then
+						if settingsInstance ~= nil and settingsInstance ~= candidate then
+							return nil
+						end
+						settingsInstance = candidate
+					end
+				end
+			end
+		end
 	end
 	return settingsInstance
 end
@@ -1157,10 +1170,7 @@ local function rememberEntryResolution(
 	ctx: { [string]: any }
 )
 	claimedInstances[instance] = true
-	if
-		entry.settingsId ~= nil
-		and (entry.ambiguousSiblings or (entry.settingsId ~= "1" and not strongSettingsId(entry.settingsId)))
-	then
+	if entry.settingsId ~= nil then
 		rememberMatchedSettingsInstance(serviceName, entry.settingsId, instance, ctx)
 	end
 end

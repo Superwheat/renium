@@ -710,6 +710,9 @@ function BridgeConnection.create(context)
 		if request == nil then
 			return
 		end
+		if request.leaseId ~= nil then
+			channel.lastRequestLeaseId = request.leaseId
+		end
 		local replayRequest, replayHandled = prepareReplayRequest(channel, client, request, message)
 		if replayHandled then
 			return
@@ -856,6 +859,8 @@ function BridgeConnection.create(context)
 		if channel.client ~= client then
 			return false
 		end
+		local leaseId = channel.lastRequestLeaseId
+		channel.lastRequestLeaseId = nil
 		channel.client = nil
 		channel.connecting = false
 		channel.open = false
@@ -868,6 +873,10 @@ function BridgeConnection.create(context)
 		end
 		if closeClient then
 			pcall(client.Close, client)
+		end
+		if leaseId ~= nil then
+			Config.cancelBridgeRequestLease(leaseId)
+			task.spawn(context.onRequestLeaseDisconnected, leaseId)
 		end
 		return true
 	end
@@ -1288,6 +1297,7 @@ function BridgeConnection.create(context)
 				port = port,
 				client = nil,
 				clientConnections = nil,
+				lastRequestLeaseId = nil,
 				open = false,
 				connecting = false,
 				reconnectScheduled = false,

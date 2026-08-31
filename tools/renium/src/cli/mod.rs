@@ -8,6 +8,7 @@ pub(crate) mod args;
 pub(crate) mod config;
 pub(crate) mod dispatch;
 mod examples;
+pub(crate) mod performance;
 
 use crate::app::update;
 use crate::automation::commands::{
@@ -174,6 +175,17 @@ pub(super) enum Commands {
         about = "Control Studio's built-in device simulator"
     )]
     StudioDevice(StudioDeviceArgs),
+    #[command(
+        name = "pf",
+        alias = "performance-profile",
+        alias = "performance",
+        about = "Constrain Studio resources for performance testing"
+    )]
+    PerformanceProfile(performance::PerformanceArgs),
+    #[command(hide = true)]
+    PerformanceWorker,
+    #[command(hide = true)]
+    PerformanceHolder(performance::PerformanceHolderArgs),
     #[command(
         name = "as",
         alias = "asset-search",

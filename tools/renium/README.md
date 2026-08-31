@@ -91,6 +91,7 @@ Agents use short names; descriptive aliases call the same commands:
 | `sc` / `rs` / `re` | `screenshot` / `record-start` / `record-end` |
 | `pr` / `clk` / `ky` / `ty` / `go` | `press` / `click` / `key` / `type` / `goto` |
 | `dev` / `cs` | `device` / `clients` |
+| `pf` | `performance-profile` |
 | `oc` | `cloud` |
 
 `rbx` lists short names. There is no separate automation layer.
@@ -295,6 +296,28 @@ density.
 Devices accept names or stable IDs. Notched presets reproduce Studio safe-area
 behavior. With emulation active, screenshots target the simulated viewport;
 `--studio` or `--client` overrides the target.
+
+Constrain Studio resources independently of device simulation and FPS:
+
+```powershell
+rbx pf ls
+rbx pf use iphone-11
+rbx pf show
+rbx pf off
+rbx pf adv cpu=25 cores=2 headroom=1g prio=low
+rbx pf adv cpu=40 cores=4 headroom=2g save=slow-test
+```
+
+Built-in device names are approximate performance tiers, not hardware
+emulation. Renium calibrates the computer and only offers tiers it can enforce
+without exceeding native performance. The selected profile applies globally to
+connected Studio process trees and follows replacement Studio processes.
+
+Advanced profiles accept aggregate CPU percent, logical cores, memory
+headroom, and `normal`, `below`, or `low` priority. Absolute memory caps use
+`mem=` and require `risk=crash` because they can terminate Studio. Windows
+enforces and reads back the limits with Job Objects. macOS and Linux report the
+feature as unavailable when equivalent reversible controls don't exist.
 
 In multiplayer, `--player <name|N>` targets one client. Without it, client
 commands use the latest focused client.

@@ -411,6 +411,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 	local LogService = game:GetService("LogService")
 	local RunService = game:GetService("RunService")
 	local StudioTestService = game:GetService("StudioTestService")
+	local UserInputService = game:GetService("UserInputService")
 	local consoleBuffer = table.create(CONSOLE_BUFFER_LIMIT)
 	local consoleStart = 1
 	local consoleCount = 0
@@ -1414,7 +1415,7 @@ updateMouse()
 			end)
 		end
 
-		local virtualInput = game:GetService("UserInputService"):CreateVirtualInput()
+		local virtualInput = UserInputService:CreateVirtualInput()
 		local verifiedClicks = 0
 		local heldKeys = {}
 		local heldButtons = {}

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
@@ -37,6 +37,14 @@ const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const ENABLED_FILE: &str = "live-watch-state.enabled";
+const ENABLED_MARKER_VERSION: u8 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnabledMarker {
+    version: u8,
+    target: String,
+}
 
 fn log_live_timing(label: &str, started: Instant) {
     log_global(
@@ -601,6 +609,7 @@ pub(crate) struct Manager {
     sessions: Mutex<HashMap<String, Session>>,
     aliases: Mutex<HashMap<u64, SessionAlias>>,
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    transitions: Arc<Mutex<()>>,
     next_session: AtomicU64,
     coordinator: Arc<Coordinator>,
 }
@@ -626,6 +635,23 @@ pub(crate) struct StartResult {
 impl Manager {
     pub(crate) fn saved_local_file(&self, context: &BoundContext) -> Result<Option<PathBuf>> {
         self.coordinator.saved_local_file(context)
+    }
+
+    pub(crate) fn transition_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.transitions)
+    }
+
+    pub(crate) fn ensure_target_available(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+    ) -> Result<()> {
+        if let Some(owner) = self.coordinator.target_owner(context, bridge)? {
+            bail!(
+                "This Studio place is already owned by {owner}; stop that project's Live Sync first"
+            );
+        }
+        Ok(())
     }
 
     fn start_lock(&self, key: &str) -> Arc<Mutex<()>> {
@@ -805,6 +831,11 @@ impl Manager {
             sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         }
         drop(sessions);
+        if let Some(owner) = self.coordinator.claim_setup_target(&setup) {
+            bail!(
+                "This Studio place is already owned by {owner}; stop that project's Live Sync first"
+            );
+        }
         let phase = Instant::now();
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
         log_live_timing("startup reconcile", phase);
@@ -983,10 +1014,19 @@ impl Manager {
             .is_some_and(|control| control.wait_settled(timeout))
     }
 
-    pub(crate) fn set_enabled(&self, context: &BoundContext, enabled: bool) -> Result<()> {
+    pub(crate) fn set_enabled(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        enabled: bool,
+    ) -> Result<()> {
         let path = enabled_path(context);
         if enabled {
-            atomic_write_file(&path, b"1")
+            let marker = EnabledMarker {
+                version: ENABLED_MARKER_VERSION,
+                target: self.coordinator.target_key(context, bridge)?,
+            };
+            atomic_write_file(&path, &serde_json::to_vec(&marker)?)
         } else {
             match fs::remove_file(&path) {
                 Ok(()) => Ok(()),
@@ -998,8 +1038,16 @@ impl Manager {
         }
     }
 
-    pub(crate) fn enabled(&self, context: &BoundContext) -> bool {
-        enabled_path(context).is_file()
+    pub(crate) fn enabled(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
+        let bytes = match fs::read(enabled_path(context)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("Failed to read persisted Live Sync state"),
+        };
+        Ok(enabled_marker_matches(
+            &bytes,
+            &self.coordinator.target_key(context, bridge)?,
+        ))
     }
 
     pub(crate) fn retry(&self, context_id: u64) -> Value {
@@ -1279,6 +1327,11 @@ impl Manager {
 
 fn enabled_path(context: &BoundContext) -> PathBuf {
     Path::new(&context.root).join(".renium").join(ENABLED_FILE)
+}
+
+fn enabled_marker_matches(bytes: &[u8], target: &str) -> bool {
+    serde_json::from_slice::<EnabledMarker>(bytes)
+        .is_ok_and(|marker| marker.version == ENABLED_MARKER_VERSION && marker.target == target)
 }
 
 struct WatchProject {
@@ -2847,6 +2900,25 @@ mod tests {
             PairMode::Reconcile,
             false,
         ))
+    }
+
+    #[test]
+    fn persisted_live_sync_only_matches_its_studio_target() {
+        let marker = serde_json::to_vec(&EnabledMarker {
+            version: ENABLED_MARKER_VERSION,
+            target: "local-file:e:/downloads/TestPlace.rbxl".to_string(),
+        })
+        .unwrap();
+
+        assert!(enabled_marker_matches(
+            &marker,
+            "local-file:e:/downloads/TestPlace.rbxl"
+        ));
+        assert!(!enabled_marker_matches(&marker, "published:123:456"));
+        assert!(!enabled_marker_matches(
+            b"1",
+            "local-file:e:/downloads/TestPlace.rbxl"
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.2 - 2026-08-30
+## 0.3.3 - 2026-08-31
 
 ### Sync safety
 
@@ -10,6 +10,9 @@
 - Duplicate-named instances, cross-service moves, new and deleted scripts, properties, attributes, tags, and references keep the correct identity in both directions.
 - Full pushes finish without hanging or repeating the same work, and commands that require approval are rejected before Studio is contacted.
 - A completed sync no longer returns as a false pending Studio change after Studio reconnects.
+- Live Sync stays attached to its exact project and Studio place after restarts, and a second project cannot take ownership of the same place.
+- Fast create, move, edit, and delete bursts no longer leave stale Studio tracking or false reconciliation differences.
+- Cross-service object references resolve correctly when their target is unique and report a clear conflict when it is ambiguous.
 
 ### Performance
 
@@ -17,6 +20,14 @@
 - Clean daemon restarts resume from the saved common state without rereading unchanged Studio content.
 - Full pulls, no-change pushes, and source-only pushes skip redundant decoding, transfer, and verification work.
 - Large services reuse decoded project data and resolve script paths directly, keeping create, delete, and source edits responsive.
+
+### Performance testing
+
+- Studio performance profiles can constrain CPU, processor cores, memory headroom, and priority without changing FPS or taking input.
+- Built-in device tiers provide quick degraded-performance tests and are offered only when the current computer can enforce them.
+- Custom profiles can be saved, inspected, replaced, and removed with short `rbx pf` commands.
+- Active profiles follow replacement Studio processes and survive daemon restarts; turning them off restores Studio's original processor and priority settings.
+- Windows applies and verifies the limits directly. macOS and Linux report the feature as unavailable instead of claiming unsupported controls are active.
 
 ### macOS
 

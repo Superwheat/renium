@@ -85,7 +85,7 @@ impl Request {
         })?;
         if !matches!(
             self.op,
-            op::CAP | op::BIND | op::STUDIOS | op::UPDATE_STUDIOS
+            op::CAP | op::BIND | op::STUDIOS | op::UPDATE_STUDIOS | op::PERFORMANCE_PROFILE
         ) && self.cx.is_none()
         {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));
@@ -383,6 +383,23 @@ impl State {
             object.insert("alreadyOpening".to_string(), Value::Bool(true));
         }
         Some(result)
+    }
+
+    pub fn studio_launch_in_progress(&self, context: &BoundContext) -> bool {
+        let mut launches = self
+            .studio_launches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        launches.retain(|_, launch| {
+            launch.started.elapsed() < STUDIO_LAUNCH_TTL
+                && launch
+                    .result
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .is_some_and(crate::daemon::is_process_alive)
+        });
+        launches.contains_key(&context.project)
     }
 
     pub fn remember_studio_launch(

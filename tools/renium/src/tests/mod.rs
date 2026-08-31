@@ -411,6 +411,100 @@ fn get_property_returns_the_nil_default_for_an_unset_reference() {
 }
 
 #[test]
+fn set_property_qualifies_a_unique_cross_service_reference() {
+    let dir = temp_dir("set-cross-service-reference");
+    let src = dir.join("src");
+    let replicated_file = service_settings_path(&src.join("ReplicatedStorage"));
+    let server_file = service_settings_path(&src.join("ServerStorage"));
+    fs::create_dir_all(replicated_file.parent().unwrap()).unwrap();
+    fs::create_dir_all(server_file.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance(
+            "replicated-root",
+            "ReplicatedStorage",
+            "ReplicatedStorage",
+            None,
+        ),
+        settings_instance("target", "Target", "Folder", Some(0)),
+    ])
+    .write_file(&replicated_file)
+    .unwrap();
+    settings_document(vec![
+        settings_instance("server-root", "ServerStorage", "ServerStorage", None),
+        settings_instance("holder", "Holder", "ObjectValue", Some(0)),
+    ])
+    .write_file(&server_file)
+    .unwrap();
+
+    let args = BytecodeSetPropertyArgs::try_parse_from([
+        "bytecode-set-property",
+        server_file.to_str().unwrap(),
+        "-i",
+        "holder",
+        "-p",
+        "Value",
+        "-j",
+        r#"{"_type":"Ref","settingsId":"target"}"#,
+    ])
+    .unwrap();
+    bytecode_set_property(args).unwrap();
+
+    let document = SettingsBytecode::read_file(&server_file).unwrap();
+    let reference = document.instances[1].properties["Value"]
+        .as_object()
+        .unwrap();
+    assert_eq!(reference.get("settingsId"), Some(&json!("target")));
+    assert_eq!(
+        reference.get("pathSegments"),
+        Some(&json!(["ReplicatedStorage", "Target"]))
+    );
+    assert_eq!(reference.get("pathOrdinals"), Some(&json!([1, 1])));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn set_property_rejects_an_ambiguous_cross_service_reference() {
+    let dir = temp_dir("set-ambiguous-reference");
+    let src = dir.join("src");
+    for service in ["ReplicatedStorage", "Workspace"] {
+        let settings_file = service_settings_path(&src.join(service));
+        fs::create_dir_all(settings_file.parent().unwrap()).unwrap();
+        settings_document(vec![
+            settings_instance(format!("{service}-root"), service, service, None),
+            settings_instance("duplicate", "Target", "Folder", Some(0)),
+        ])
+        .write_file(&settings_file)
+        .unwrap();
+    }
+    let server_file = service_settings_path(&src.join("ServerStorage"));
+    fs::create_dir_all(server_file.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance("server-root", "ServerStorage", "ServerStorage", None),
+        settings_instance("holder", "Holder", "ObjectValue", Some(0)),
+    ])
+    .write_file(&server_file)
+    .unwrap();
+
+    let args = BytecodeSetPropertyArgs::try_parse_from([
+        "bytecode-set-property",
+        server_file.to_str().unwrap(),
+        "-i",
+        "holder",
+        "-p",
+        "Value",
+        "-j",
+        r#"{"_type":"Ref","settingsId":"duplicate"}"#,
+    ])
+    .unwrap();
+    let error = bytecode_set_property(args).unwrap_err();
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+
+    let document = SettingsBytecode::read_file(&server_file).unwrap();
+    assert!(!document.instances[1].properties.contains_key("Value"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn set_source_reads_from_source_file() {
     let dir = temp_dir("set-source-file");
     let service_dir = dir.join("src").join("ReplicatedStorage");

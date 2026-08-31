@@ -29,7 +29,7 @@ const shortCommands = new Set([
   "ad", "ai", "as", "ba", "bb", "bcl", "bem", "bep", "bg", "bim", "bpack", "br", "bs", "bss",
   "cfg", "clk", "co", "cs", "dev", "dp", "f", "fmt", "gm", "go", "in", "inp", "ip", "ir", "iu", "js",
   "ky", "l", "lc", "lk", "lka", "lkb", "lkd", "lkp", "lks", "lof", "lon", "lst", "me", "mv", "oc",
-  "pa", "pl", "play", "pn", "po", "pr", "ps", "pv", "re", "ro", "rp", "rs", "sc", "sg", "si", "sm",
+  "pa", "pf", "pl", "play", "pn", "po", "pr", "ps", "pv", "re", "ro", "rp", "rs", "sc", "sg", "si", "sm",
   "sr", "ss", "status", "sx", "tr", "ty", "ui", "v", "vci", "vcm", "vct", "wait", "wally", "x", "xp",
 ]);
 for (const line of agents.split(/\r?\n/)) {

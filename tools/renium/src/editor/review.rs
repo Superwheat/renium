@@ -1159,7 +1159,7 @@ fn wait_for_reopened_local_studio(
 }
 
 #[cfg(windows)]
-fn protected_write_place_path(bridge: &BridgeServer, pid: u32, rows: &[Value]) -> Result<PathBuf> {
+fn protected_write_place_path(_bridge: &BridgeServer, pid: u32, rows: &[Value]) -> Result<PathBuf> {
     let title = input_inject::studio_window_title(pid)?;
     local_place_path_from_studio_title(&title).with_context(|| {
         format!(

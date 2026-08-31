@@ -1935,18 +1935,13 @@ pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
 }
 
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
-    if let Some(result) = try_daemon_control_request(op::STUDIOS, None, json!({}), false)? {
-        return print_json_output(
-            &json!({
-                "clients": result.get("clients").cloned().unwrap_or(Value::Array(Vec::new()))
-            }),
-            false,
-        );
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, _listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    print_json_output(&json!({ "clients": bridge.list_bridge_clients() }), false)
+    let result = daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))?;
+    print_json_output(
+        &json!({
+            "clients": result.get("clients").cloned().unwrap_or(Value::Array(Vec::new()))
+        }),
+        false,
+    )
 }
 
 pub(crate) fn editor_review_decision_result(
