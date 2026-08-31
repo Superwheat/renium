@@ -160,9 +160,10 @@ pub(super) fn apply(
     _identity: &str,
     _locator: &str,
     _plan: &ControlPlan,
-    _original: OriginalControls,
+    original: OriginalControls,
     _memory_cap: Option<u64>,
 ) -> Result<AppliedReadback> {
+    original.discard();
     bail!("{}", unsupported_reason())
 }
 
@@ -171,8 +172,9 @@ pub(super) fn neutralize(
     _pid: u32,
     _identity: &str,
     _locator: &str,
-    _original: OriginalControls,
+    original: OriginalControls,
 ) -> Result<AppliedReadback> {
+    original.discard();
     Ok(AppliedReadback {
         neutral: true,
         ..AppliedReadback::default()

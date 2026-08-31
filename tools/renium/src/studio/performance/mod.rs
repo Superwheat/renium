@@ -192,6 +192,13 @@ pub(super) struct OriginalControls {
     pub(super) priority_class: Option<u32>,
 }
 
+#[cfg(not(windows))]
+impl OriginalControls {
+    fn discard(self) {
+        let _ = (self.affinity_mask, self.priority_class);
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Enrollment {
@@ -274,9 +281,13 @@ impl Manager {
             },
             None => (StoredState::default(), None),
         };
+        #[cfg(windows)]
+        let backend = platform::BackendState::default();
+        #[cfg(not(windows))]
+        let backend = platform::BackendState;
         let manager = Arc::new(Self {
             path,
-            backend: platform::BackendState::default(),
+            backend,
             inner: Mutex::new(Inner { state, load_error }),
         });
         if let Err(error) = manager.reconcile_startup() {
