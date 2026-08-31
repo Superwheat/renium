@@ -1,4 +1,4 @@
-<!-- renium-version: 0.3.2 -->
+<!-- renium-version: 0.3.3 -->
 # Renium automation
 
 Use `rbx`. If `PATH` is stale, use `%USERPROFILE%\.renium\bin\rbx.exe` on Windows or `~/.renium/bin/rbx` on macOS/Linux. Never search editor extension folders.
@@ -15,6 +15,7 @@ Before using a feature, read its guide under `RENIUM/`:
 | Playtests, Luau, consoles, clients | `RENIUM/playtest.md` |
 | UI, input, movement, world interaction | `RENIUM/input.md` |
 | Screenshots, recordings, device simulation | `RENIUM/capture-device.md` |
+| Studio resource constraints and performance profiles | `RENIUM/performance.md` |
 | Models, places, links, packages, Git | `RENIUM/projects.md` |
 | Creator Store, Open Cloud, images, generation | `RENIUM/opencloud.md` |
 | Places, Studio lifecycle, ordered input, multi-edit | `RENIUM/advanced.md` |

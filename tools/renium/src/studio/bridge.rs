@@ -259,6 +259,7 @@ struct BridgeAcceptState {
     all_channels: Arc<Mutex<Vec<Arc<BridgeChannel>>>>,
     expected_channels: usize,
     reconcile_device_on_connect: bool,
+    performance_manager: Option<Arc<crate::studio::performance::Manager>>,
     #[cfg(any(windows, target_os = "macos"))]
     update_checked_runtimes: Arc<Mutex<HashSet<String>>>,
     #[cfg(any(windows, target_os = "macos"))]
@@ -277,6 +278,7 @@ pub(crate) struct BridgeServer {
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
     pub(crate) final_console_snapshots: Mutex<HashMap<String, FinalConsoleSnapshot>>,
     desired_device_request: Arc<Mutex<Value>>,
+    performance_manager: Option<Arc<crate::studio::performance::Manager>>,
 }
 
 pub(crate) struct BridgeRequestLease {
@@ -580,6 +582,8 @@ impl BridgeServer {
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(21335));
         let desired_device_request = Arc::new(Mutex::new(json!({ "action": "stop" })));
         let device_reconciled_runtimes = Arc::new(Mutex::new(HashSet::new()));
+        let performance_manager =
+            check_updates_on_connect.then(crate::studio::performance::Manager::load);
         let all_channels = Arc::new(Mutex::new(Vec::with_capacity(ports.len())));
         #[cfg(any(windows, target_os = "macos"))]
         let update_checked_runtimes = Arc::new(Mutex::new(HashSet::new()));
@@ -600,6 +604,7 @@ impl BridgeServer {
             all_channels: Arc::clone(&all_channels),
             expected_channels: ports.len(),
             reconcile_device_on_connect: check_updates_on_connect,
+            performance_manager: performance_manager.clone(),
             #[cfg(any(windows, target_os = "macos"))]
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
@@ -654,6 +659,7 @@ impl BridgeServer {
             runtime_pins: Mutex::new(HashMap::new()),
             final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request,
+            performance_manager,
         };
 
         let required_channels = server.channels.len();
@@ -733,6 +739,7 @@ impl BridgeServer {
             all_channels,
             expected_channels,
             reconcile_device_on_connect,
+            performance_manager,
             #[cfg(any(windows, target_os = "macos"))]
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
@@ -754,6 +761,8 @@ impl BridgeServer {
                                 let device_runtime = (reconcile_device_on_connect
                                     && socket.role == BRIDGE_ROLE_EDIT)
                                     .then(|| socket.bridge_info.runtime_id.clone());
+                                let performance_peer =
+                                    (socket.role == BRIDGE_ROLE_EDIT).then(|| socket.peer.clone());
                                 #[cfg(target_os = "macos")]
                                 let auto_recovery_peer =
                                     (socket.role == BRIDGE_ROLE_EDIT).then(|| socket.peer.clone());
@@ -784,6 +793,19 @@ impl BridgeServer {
                                 guard.insert(socket_key, socket);
                                 Self::refresh_channel_snapshots(&channel, &guard);
                                 drop(guard);
+                                if let (Some(manager), Some(peer)) =
+                                    (&performance_manager, performance_peer)
+                                    && let Ok(pid) = Self::studio_pid_for_peer(&peer)
+                                {
+                                    let manager = Arc::clone(manager);
+                                    thread::spawn(move || {
+                                        if let Err(error) = manager.enroll(pid) {
+                                            eprintln!(
+                                                "[renium] performance profile could not enroll Studio {pid}: {error:#}"
+                                            );
+                                        }
+                                    });
+                                }
                                 #[cfg(target_os = "macos")]
                                 if let Some(peer) = auto_recovery_peer
                                     && let Ok(pid) = Self::studio_pid_for_peer(&peer)
@@ -978,6 +1000,31 @@ impl BridgeServer {
             return;
         }
         current.extend(update.clone());
+    }
+
+    pub(crate) fn performance_profile_command(&self, parameters: &Value) -> Result<Value> {
+        let manager = self
+            .performance_manager
+            .as_ref()
+            .context("Performance profiles require the shared Renium daemon")?;
+        let mut pids = Vec::new();
+        if matches!(
+            parameters.get("action").and_then(Value::as_str),
+            Some("use" | "advanced")
+        ) {
+            let mut found = HashSet::new();
+            for channel in &self.channels {
+                for snapshot in Self::cached_channel_snapshots(channel) {
+                    if Self::role_matches_target(&snapshot.role_key, BridgeTarget::Main)
+                        && let Ok(pid) = Self::studio_pid_for_peer(&snapshot.peer)
+                    {
+                        found.insert(pid);
+                    }
+                }
+            }
+            pids.extend(found);
+        }
+        manager.command_with_enrollments(parameters, &pids)
     }
 
     #[cfg(any(windows, target_os = "macos"))]

@@ -153,6 +153,7 @@ type State = {
 	rootConnections: { [string]: { RBXScriptConnection } },
 	globalConnections: { RBXScriptConnection },
 	instanceConnections: ConnectionMap,
+	connectionServiceByInstance: { [Instance]: string },
 	itemChangedAvailable: boolean,
 	tagSignalsAvailable: boolean,
 	tagConnections: { [string]: { RBXScriptConnection } },
@@ -279,6 +280,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		rootConnections = {},
 		globalConnections = {},
 		instanceConnections = {},
+		connectionServiceByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		itemChangedAvailable = false,
 		tagSignalsAvailable = false,
 		tagConnections = {},
@@ -1784,12 +1786,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end)
 	end
 
-	local function disconnectInstance(instance: Instance)
+	local function disconnectInstance(instance: Instance, expectedServiceName: string?)
+		if
+			expectedServiceName ~= nil
+			and state.connectionServiceByInstance[instance] ~= expectedServiceName
+		then
+			return
+		end
 		local connections = state.instanceConnections[instance]
 		if connections == nil then
 			return
 		end
 		state.instanceConnections[instance] = nil
+		state.connectionServiceByInstance[instance] = nil
 		state.propertyFingerprintByInstance[instance] = nil
 		state.lastParentByInstance[instance] = nil
 		state.connectedInstanceCount = math.max(0, state.connectedInstanceCount - 1)
@@ -1798,15 +1807,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function disconnectInstanceTree(instance: Instance)
+	local function disconnectInstanceTree(instance: Instance, expectedServiceName: string?)
 		for _, descendant in ipairs(instance:GetDescendants()) do
-			disconnectInstance(descendant)
+			disconnectInstance(descendant, expectedServiceName)
 		end
-		disconnectInstance(instance)
+		disconnectInstance(instance, expectedServiceName)
 	end
 
 	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?)
-		if state.instanceConnections[instance] ~= nil or shouldIgnoreInstance(instance, serviceName) then
+		local connectedServiceName = state.connectionServiceByInstance[instance]
+		if state.instanceConnections[instance] ~= nil then
+			if connectedServiceName == serviceName then
+				return
+			end
+			disconnectInstance(instance, connectedServiceName)
+		end
+		if shouldIgnoreInstance(instance, serviceName) then
 			return
 		end
 
@@ -1871,6 +1887,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 		if #connections > 0 then
 			state.instanceConnections[instance] = connections
+			state.connectionServiceByInstance[instance] = serviceName
 			state.connectedInstanceCount += 1
 		end
 	end
@@ -1897,22 +1914,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		local disconnect = {}
 		for instance in pairs(state.instanceConnections) do
-			if instance:IsDescendantOf(service) and not desired[instance] then
+			if state.connectionServiceByInstance[instance] == serviceName and not desired[instance] then
 				table.insert(disconnect, instance)
 			end
 		end
 		for _, instance in ipairs(disconnect) do
-			disconnectInstance(instance)
+			disconnectInstance(instance, serviceName)
 		end
 	end
 
 	local function reconcileAncestorConnections(instance: Instance, service: Instance, serviceName: string)
 		local current = instance.Parent
-		while current ~= nil and current ~= service do
+		while current ~= nil and current ~= service and current:IsDescendantOf(service) do
 			if not state.onlyCodeMode or hasLuaSourceDescendant(current) then
 				connectInstance(current, serviceName)
 			else
-				disconnectInstance(current)
+				disconnectInstance(current, serviceName)
 			end
 			current = current.Parent
 		end
@@ -1989,8 +2006,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					not shouldIgnoreInstance(instance, serviceName)
 					and (not state.onlyCodeMode or hasLuaSourceDescendant(instance))
 				then
-					connectInstance(instance, serviceName, true)
-					reconcileAncestorConnections(instance, service, serviceName)
+					if instance:IsDescendantOf(service) then
+						connectInstance(instance, serviceName, true)
+						reconcileAncestorConnections(instance, service, serviceName)
+					end
 					if not expected then
 						markDirty(
 							serviceName,
@@ -2014,9 +2033,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				if isLuaSourceInstance(instance) then
 					adjustLuaSourceAncestors(instance, -1)
 				end
-				if state.instanceConnections[instance] == nil then
-					return
-				end
 				local ancestors = {}
 				local current = instance.Parent
 				while current ~= nil and current ~= service do
@@ -2030,15 +2046,20 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						changeDetailsForInstance(instance, "removed", nil, nil, "descendant removing")
 					)
 				end
-				disconnectInstanceTree(instance)
 				task.defer(function()
 					invalidateSiblingOrdinals(removingParent)
+					if
+						state.connectionServiceByInstance[instance] == serviceName
+						and not instance:IsDescendantOf(service)
+					then
+						disconnectInstanceTree(instance, serviceName)
+					end
 				end)
 				if state.onlyCodeMode and #ancestors > 0 then
 					task.defer(function()
 						for _, ancestor in ipairs(ancestors) do
 							if ancestor:IsDescendantOf(service) and not hasLuaSourceDescendant(ancestor) then
-								disconnectInstance(ancestor)
+								disconnectInstance(ancestor, serviceName)
 							end
 						end
 					end)
@@ -2075,12 +2096,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.rootConnections[serviceName] = nil
 		local disconnect = {}
 		for instance in pairs(state.instanceConnections) do
-			if instance:IsDescendantOf(service) then
+			if state.connectionServiceByInstance[instance] == serviceName then
 				table.insert(disconnect, instance)
 			end
 		end
 		for _, instance in ipairs(disconnect) do
-			disconnectInstance(instance)
+			disconnectInstance(instance, serviceName)
 		end
 		for _, instance in ipairs(service:GetDescendants()) do
 			state.archivableByInstance[instance] = nil
@@ -2118,6 +2139,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		table.clear(state.rootConnections)
 		table.clear(state.instanceConnections)
+		table.clear(state.connectionServiceByInstance)
 		table.clear(state.propertyFingerprintByInstance)
 		table.clear(state.ordinalCacheByParent)
 		table.clear(state.lastParentByInstance)

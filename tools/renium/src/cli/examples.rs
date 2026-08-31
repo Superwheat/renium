@@ -76,6 +76,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("l", "Examples:\n  rbx l \"return game.PlaceId\""),
     ("lc", "Examples:\n  rbx lc \"return game.PlaceId\" 1"),
     ("dev", "Examples:\n  rbx dev set \"iPhone 16 Pro\""),
+    (
+        "pf",
+        "Examples:\n  rbx pf ls\n  rbx pf use iphone-11\n  rbx pf show\n  rbx pf off\n  rbx pf adv cpu=25 cores=2 headroom=1g prio=low",
+    ),
     ("as", "Examples:\n  rbx as \"sports car\" --limit 10"),
     ("ai", "Examples:\n  rbx ai 123456789"),
     ("gm", "Examples:\n  rbx gm \"small wooden cabin\""),

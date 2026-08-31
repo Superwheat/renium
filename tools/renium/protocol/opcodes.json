@@ -68,6 +68,7 @@
     { "id": 94, "name": "job-status", "runtime": true },
     { "id": 95, "name": "image-upload" },
     { "id": 96, "name": "image-store", "queued": false },
-    { "id": 97, "name": "update-studios", "runtime": true }
+    { "id": 97, "name": "update-studios", "runtime": true },
+    { "id": 98, "name": "performance-profile", "queued": false }
   ]
 }

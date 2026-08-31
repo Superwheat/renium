@@ -736,9 +736,7 @@ fn start_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) -> 
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
-    if spawn_shared_daemon(&executable, ports, wait_seconds, control_port).is_err() {
-        return false;
-    }
+    let _ = spawn_shared_daemon(&executable, ports, wait_seconds, control_port);
     let deadline = Instant::now() + SHARED_DAEMON_START_TIMEOUT;
     while Instant::now() < deadline {
         if shared_daemon_available() {
@@ -785,7 +783,10 @@ pub(super) fn try_daemon_control_request(
     let object = parameters
         .as_object_mut()
         .context("Daemon operation parameters must be a JSON object")?;
-    if operation == automation::op::STUDIOS {
+    if matches!(
+        operation,
+        automation::op::STUDIOS | automation::op::PERFORMANCE_PROFILE
+    ) {
         let Some(response) = try_send_request(&automation::Request {
             v: automation::PROTOCOL_VERSION,
             id: current_millis().min(u128::from(u64::MAX)) as u64,

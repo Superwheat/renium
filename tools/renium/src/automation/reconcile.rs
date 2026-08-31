@@ -299,6 +299,7 @@ struct ProjectSnapshot {
 struct ReconcilePushPlan {
     changed_paths: Vec<PathBuf>,
     target_settings_ids: Vec<String>,
+    recreated_settings_ids: HashSet<String>,
     previous_class_names: HashMap<String, String>,
     previous_paths: HashMap<(String, String), EditorInstancePath>,
     instance_deletes: Vec<EditorInstanceChange>,
@@ -332,6 +333,7 @@ impl ReconcilePushPlan {
     fn is_empty(&self) -> bool {
         self.changed_paths.is_empty()
             && self.target_settings_ids.is_empty()
+            && self.recreated_settings_ids.is_empty()
             && self.previous_class_names.is_empty()
             && self.previous_paths.is_empty()
             && self.instance_deletes.is_empty()
@@ -533,6 +535,7 @@ struct TargetOwners {
 
 pub(crate) struct PairSetup {
     pub(crate) key: String,
+    identity: PairIdentity,
     pub(crate) mode: PairMode,
     resolution_preference: Option<ConflictPreference>,
     pub(crate) resolution_required: bool,
@@ -558,6 +561,31 @@ impl Coordinator {
 
     pub(crate) fn pair_key(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<String> {
         Ok(PairIdentity::from_context(context, bridge)?.pair_key())
+    }
+
+    pub(crate) fn target_key(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+    ) -> Result<String> {
+        Ok(PairIdentity::from_context(context, bridge)?.target_key())
+    }
+
+    pub(crate) fn target_owner(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+    ) -> Result<Option<String>> {
+        let identity = PairIdentity::from_context(context, bridge)?;
+        let pair = identity.pair_key();
+        Ok(self
+            .owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_target
+            .get(&identity.target_key())
+            .filter(|(owner_pair, _)| owner_pair != &pair)
+            .map(|(_, owner_project)| owner_project.clone()))
     }
 
     fn pair_lock(&self, key: &str) -> Arc<Mutex<()>> {
@@ -673,7 +701,7 @@ impl Coordinator {
             record.conflicts.clear();
             record.resolution_required = false;
         }
-        record.identity = identity;
+        record.identity = identity.clone();
         record.mode = mode;
         record.conflict_preference = conflict_preference;
         record.runtime_settings = runtime_settings;
@@ -686,6 +714,7 @@ impl Coordinator {
         }
         Ok(PairSetup {
             key: pair_key,
+            identity,
             mode,
             resolution_preference,
             resolution_required: !unresolved_local
@@ -710,6 +739,10 @@ impl Coordinator {
             bootstrap_studio_from_editor,
             runtime_replacement_unproven,
         })
+    }
+
+    pub(crate) fn claim_setup_target(&self, setup: &PairSetup) -> Option<String> {
+        self.claim_target(&setup.identity)
     }
 
     pub(crate) fn reconcile(
@@ -1113,6 +1146,7 @@ impl Coordinator {
         };
         Ok(PairSetup {
             key,
+            identity,
             mode: record.mode,
             resolution_preference: None,
             resolution_required: record.resolution_required,
@@ -2117,10 +2151,30 @@ fn capture_studio_project_for_comparison(
     context: &BoundContext,
     bridge: &BridgeServer,
 ) -> Result<(ExportProjectStage, ProjectSnapshot)> {
-    let services = sync_services();
-    let mut stage = project_comparison_stage(context, &services)?;
-    stage.capture_publish_baseline(Path::new(&context.root))?;
-    capture_studio_services_with_stage(context, bridge, &services, true, stage)
+    retry_transient_studio_capture(|| {
+        let services = sync_services();
+        let mut stage = project_comparison_stage(context, &services)?;
+        stage.capture_publish_baseline(Path::new(&context.root))?;
+        capture_studio_services_with_stage(context, bridge, &services, true, stage)
+    })
+}
+
+fn retry_transient_studio_capture<T>(mut capture: impl FnMut() -> Result<T>) -> Result<T> {
+    match capture() {
+        Err(error) if is_transient_studio_capture_change(&error) => {
+            log_global(
+                5,
+                format_args!("[renium] Studio changed during comparison capture; retrying once"),
+            );
+            capture()
+        }
+        result => result,
+    }
+}
+
+fn is_transient_studio_capture_change(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("Studio changed ") && message.contains("retry the sync")
 }
 
 fn selective_studio_services(
@@ -2727,14 +2781,15 @@ fn append_recreated_reference_pushes(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let mut recreated = plan
-        .instance_deletes
-        .iter()
-        .flat_map(|change| &change.instances)
-        .map(|instance| instance.settings_id.as_str())
-        .filter(|settings_id| targeted.contains(settings_id))
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let mut recreated = plan.recreated_settings_ids.clone();
+    recreated.extend(
+        plan.instance_deletes
+            .iter()
+            .flat_map(|change| &change.instances)
+            .map(|instance| instance.settings_id.as_str())
+            .filter(|settings_id| targeted.contains(settings_id))
+            .map(str::to_string),
+    );
     recreated.extend(plan.previous_class_names.keys().cloned());
     if recreated.is_empty() {
         return Ok(());
@@ -2918,6 +2973,8 @@ fn append_aligned_settings_push_plan(
         let instance = &desired.instances[delta.desired_index];
         plan.target_settings_ids.push(instance.settings_id.clone());
         let Some(observed_index) = delta.observed_index else {
+            plan.recreated_settings_ids
+                .insert(instance.settings_id.clone());
             continue;
         };
         let observed_instance = &observed.instances[observed_index];
@@ -4653,7 +4710,7 @@ fn snapshot_mismatch_details(
         return Ok(None);
     };
     let observed_document = settings_document(observed.entries.get(path))?;
-    let expected_document = settings_document(expected.entries.get(path))?;
+    let mut expected_document = settings_document(expected.entries.get(path))?;
     if observed_document.instances.len() != expected_document.instances.len() {
         return Ok(Some(format!(
             "Studio returned {} instances; expected {}",
@@ -4661,22 +4718,37 @@ fn snapshot_mismatch_details(
             expected_document.instances.len()
         )));
     }
-    for (index, (observed, expected)) in observed_document
+    if !align_settings_ids_to_reference(&observed_document, &mut expected_document) {
+        return Ok(Some(
+            "Studio returned instance identities that could not be aligned".to_string(),
+        ));
+    }
+    let expected_by_id = expected_document
         .instances
         .iter()
-        .zip(&expected_document.instances)
         .enumerate()
-    {
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    for (observed_index, observed) in observed_document.instances.iter().enumerate() {
+        let Some(expected_index) = expected_by_id.get(observed.settings_id.as_str()).copied()
+        else {
+            return Ok(Some(format!(
+                "Studio returned an unexpected instance identity at {}",
+                observed.name
+            )));
+        };
+        let expected = &expected_document.instances[expected_index];
         if observed.name != expected.name
             || observed.class_name != expected.class_name
-            || observed.parent_index != expected.parent_index
+            || settings_parent_id(&observed_document, observed_index)
+                != settings_parent_id(&expected_document, expected_index)
         {
             return Ok(Some(format!(
                 "Studio returned a different structure at {}",
                 expected.name
             )));
         }
-        if is_reconciliation_protected_workspace_camera(&expected_document, index) {
+        if is_reconciliation_protected_workspace_camera(&expected_document, expected_index) {
             continue;
         }
         let instance_name = &expected.name;
@@ -4706,7 +4778,7 @@ fn snapshot_mismatch_details(
                 let retained = match (observed_value, expected_value) {
                     (Some(observed), Some(expected)) if kind == "property" => {
                         reconciliation_property_values_equal(
-                            &expected_document.instances[index].class_name,
+                            &expected_document.instances[expected_index].class_name,
                             name,
                             Some(observed),
                             Some(expected),
@@ -4973,6 +5045,41 @@ mod tests {
                 .map(|(path, bytes)| (PathBuf::from(path), SnapshotEntry::File(bytes.to_vec())))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn comparison_capture_retries_one_transient_studio_change() {
+        let mut attempts = 0;
+        let value = retry_transient_studio_capture(|| {
+            attempts += 1;
+            if attempts == 1 {
+                anyhow::bail!(
+                    "Studio changed Workspace while native import was staged; retry the sync"
+                );
+            }
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 2);
+
+        let mut persistent_attempts = 0;
+        let error = retry_transient_studio_capture::<()>(|| {
+            persistent_attempts += 1;
+            anyhow::bail!("Studio changed Workspace while native import was staged; retry the sync")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("retry the sync"));
+        assert_eq!(persistent_attempts, 2);
+
+        let mut ordinary_attempts = 0;
+        let error = retry_transient_studio_capture::<()>(|| {
+            ordinary_attempts += 1;
+            anyhow::bail!("invalid snapshot")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "invalid snapshot");
+        assert_eq!(ordinary_attempts, 1);
     }
 
     #[test]
@@ -5457,6 +5564,85 @@ mod tests {
                 .iter()
                 .any(|conflict| conflict.contains("different classes"))
         );
+    }
+
+    #[test]
+    fn mismatch_details_ignore_instance_serialization_order() {
+        let instance = |id: &str,
+                        name: &str,
+                        class_name: &str,
+                        parent_index: Option<usize>,
+                        marker: Option<f64>,
+                        value: Option<&str>| {
+            let mut instance = SettingsBytecodeInstance {
+                settings_id: id.to_string(),
+                name: name.to_string(),
+                class_name: class_name.to_string(),
+                parent_index,
+                properties: Map::new(),
+                attributes: Map::new(),
+            };
+            if let Some(marker) = marker {
+                instance
+                    .attributes
+                    .insert("Marker".to_string(), json!(marker));
+            }
+            if let Some(value) = value {
+                instance
+                    .properties
+                    .insert("Value".to_string(), json!(value));
+            }
+            instance
+        };
+        let snapshot = |document: SettingsBytecode| ProjectSnapshot {
+            entries: [(
+                PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium"),
+                SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let expected = snapshot(SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("root", "ServerStorage", "ServerStorage", None, None, None),
+                instance("burst", "Burst", "Folder", Some(0), None, None),
+                instance("one", "Node", "Folder", Some(1), Some(1.0), None),
+                instance("two", "Node", "Folder", Some(1), Some(2.0), None),
+                instance(
+                    "holder",
+                    "Holder",
+                    "StringValue",
+                    Some(0),
+                    None,
+                    Some("editor"),
+                ),
+            ],
+        });
+        let observed = snapshot(SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("root", "ServerStorage", "ServerStorage", None, None, None),
+                instance(
+                    "holder",
+                    "Holder",
+                    "StringValue",
+                    Some(0),
+                    None,
+                    Some("studio"),
+                ),
+                instance("burst", "Burst", "Folder", Some(0), None, None),
+                instance("two", "Node", "Folder", Some(2), Some(2.0), None),
+                instance("one", "Node", "Folder", Some(2), Some(1.0), None),
+            ],
+        });
+        let path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+
+        let detail = snapshot_mismatch_details(&observed, &expected, &[path])
+            .unwrap()
+            .unwrap();
+        assert!(detail.contains("Holder.Value property"), "{detail}");
+        assert!(!detail.contains("different structure"), "{detail}");
     }
 
     #[test]
@@ -6358,6 +6544,167 @@ mod tests {
         );
 
         let plan = reconciliation_push_plan(&studio, &desired).unwrap();
+
+        assert!(plan.target_settings_ids.iter().any(|id| id == "target"));
+        assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));
+    }
+
+    #[test]
+    fn incremental_cross_service_recreation_reapplies_target_service_referrers() {
+        let root = |service: &str| SettingsBytecodeInstance {
+            settings_id: format!("{service}-root"),
+            name: service.to_string(),
+            class_name: service.to_string(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let target = SettingsBytecodeInstance {
+            settings_id: "target".to_string(),
+            name: "Target".to_string(),
+            class_name: "Folder".to_string(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let holder = |service: &str| SettingsBytecodeInstance {
+            settings_id: "holder".to_string(),
+            name: "Holder".to_string(),
+            class_name: "ObjectValue".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([(
+                "Value".to_string(),
+                json!({
+                    "_type": "Ref",
+                    "settingsId": "target",
+                    "pathSegments": [service, "Target"],
+                    "pathOrdinals": [1, 1]
+                }),
+            )]),
+            attributes: Map::new(),
+        };
+        let replicated_path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let storage_path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+        let previous_replicated = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root("ReplicatedStorage"), target.clone()],
+        };
+        let previous_storage = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root("ServerStorage"), holder("ReplicatedStorage")],
+        };
+        let current_replicated = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root("ReplicatedStorage")],
+        };
+        let current_storage = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root("ServerStorage"), holder("ServerStorage"), target],
+        };
+        let previous = ProjectSnapshot {
+            entries: [
+                (
+                    replicated_path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&previous_replicated).unwrap()),
+                ),
+                (
+                    storage_path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&previous_storage).unwrap()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let current = ProjectSnapshot {
+            entries: [
+                (
+                    replicated_path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&current_replicated).unwrap()),
+                ),
+                (
+                    storage_path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&current_storage).unwrap()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let scopes = vec![replicated_path.clone(), storage_path.clone()];
+        let prepared = prepare_editor_settings_changes(&previous, &current, &scopes).unwrap();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &previous,
+            &current,
+            &scopes.into_iter().collect(),
+            &prepared,
+        )
+        .unwrap();
+
+        assert!(plan.target_settings_ids.iter().any(|id| id == "target"));
+        assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));
+    }
+
+    #[test]
+    fn incremental_added_target_reapplies_existing_same_service_referrer() {
+        let root = SettingsBytecodeInstance {
+            settings_id: "storage-root".to_string(),
+            name: "ServerStorage".to_string(),
+            class_name: "ServerStorage".to_string(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let holder = |service: &str| SettingsBytecodeInstance {
+            settings_id: "holder".to_string(),
+            name: "Holder".to_string(),
+            class_name: "ObjectValue".to_string(),
+            parent_index: Some(0),
+            properties: Map::from_iter([(
+                "Value".to_string(),
+                json!({
+                    "_type": "Ref",
+                    "settingsId": "target",
+                    "pathSegments": [service, "Target"],
+                    "pathOrdinals": [1, 1]
+                }),
+            )]),
+            attributes: Map::new(),
+        };
+        let target = SettingsBytecodeInstance {
+            settings_id: "target".to_string(),
+            name: "Target".to_string(),
+            class_name: "Folder".to_string(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+        let previous_document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root.clone(), holder("ReplicatedStorage")],
+        };
+        let current_document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, holder("ServerStorage"), target],
+        };
+        let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+            entries: [(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let previous = snapshot(&previous_document);
+        let current = snapshot(&current_document);
+        let scopes = vec![path.clone()];
+        let prepared = prepare_editor_settings_changes(&previous, &current, &scopes).unwrap();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &previous,
+            &current,
+            &HashSet::from([path]),
+            &prepared,
+        )
+        .unwrap();
 
         assert!(plan.target_settings_ids.iter().any(|id| id == "target"));
         assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));

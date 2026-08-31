@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -47,6 +47,8 @@ use crate::studio::bridge::{
 };
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
+
+const RECENT_STUDIO_LAUNCH_WAIT_SECONDS: f64 = 30.0;
 
 fn automation_object(
     value: &Value,
@@ -1687,7 +1689,7 @@ fn start_managed_live_operation(
             return Err(cleanup_failed_start(failure));
         }
     };
-    if let Err(error) = state.live_sync().set_enabled(context, true) {
+    if let Err(error) = state.live_sync().set_enabled(context, bridge, true) {
         state.live_sync().rollback_start(&started);
         return Err(cleanup_failed_start(automation_failure(error)));
     }
@@ -1756,6 +1758,8 @@ fn automation_live_operation(
     }
 
     if options.manage_files && operation == op::LIVE_STOP {
+        let transition = state.live_sync().transition_lock();
+        let _transition = transition.lock().unwrap_or_else(PoisonError::into_inner);
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1767,7 +1771,7 @@ fn automation_live_operation(
                 false,
             )?
         };
-        let persisted = state.live_sync().set_enabled(context, false);
+        let persisted = state.live_sync().set_enabled(context, bridge, false);
         let daemon = state.live_sync().stop(context.id);
         persisted.map_err(automation_failure)?;
         return Ok(merge_live_status(plugin, daemon, options.compact));
@@ -1775,6 +1779,12 @@ fn automation_live_operation(
 
     let settle_requested = options.settle_requested(operation);
     if options.manage_files && operation == op::LIVE_START {
+        let transition = state.live_sync().transition_lock();
+        let _transition = transition.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .live_sync()
+            .ensure_target_available(context, bridge)
+            .map_err(automation_failure)?;
         return start_managed_live_operation(
             context,
             parameters,
@@ -1838,7 +1848,10 @@ fn automation_live_operation(
         ),
     );
     let restore_files = if options.manage_files && operation == op::LIVE_STATUS {
-        let enabled = state.live_sync().enabled(context);
+        let enabled = state
+            .live_sync()
+            .enabled(context, bridge)
+            .map_err(automation_failure)?;
         let restore = !attached_session && enabled;
         log_global(
             5,
@@ -1851,6 +1864,16 @@ fn automation_live_operation(
     } else {
         false
     };
+    let transition = restore_files.then(|| state.live_sync().transition_lock());
+    let _transition = transition
+        .as_ref()
+        .map(|transition| transition.lock().unwrap_or_else(PoisonError::into_inner));
+    if restore_files {
+        state
+            .live_sync()
+            .ensure_target_available(context, bridge)
+            .map_err(automation_failure)?;
+    }
     if restore_files && plugin.get("tracking").and_then(Value::as_bool) != Some(true) {
         let mut start_parameters = parameters.clone();
         start_parameters["reset"] = json!(true);
@@ -1878,7 +1901,7 @@ fn automation_live_operation(
                 configuration,
             )
             .map_err(automation_failure)?;
-        if let Err(error) = state.live_sync().set_enabled(context, true) {
+        if let Err(error) = state.live_sync().set_enabled(context, bridge, true) {
             state.live_sync().rollback_start(&started);
             return Err(automation_failure(error));
         }
@@ -1950,7 +1973,10 @@ fn restore_persisted_live_sync(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<(), automation::Failure> {
     if context.runtime_id.is_none()
-        || !state.live_sync().enabled(context)
+        || !state
+            .live_sync()
+            .enabled(context, bridge)
+            .map_err(automation_failure)?
         || state
             .live_sync()
             .attach(context, bridge)
@@ -2077,7 +2103,8 @@ fn resolve_connected_context(
     context_id: u64,
     wait_seconds: f64,
 ) -> std::result::Result<automation::BoundContext, automation::Failure> {
-    let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.max(1.0));
+    let wait_seconds = connected_runtime_wait_seconds(state, context_id, wait_seconds);
+    let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds);
     loop {
         match bound_context::resolve(state, bridge, context_id) {
             Ok(context) if context.runtime_id.is_some() => return Ok(context),
@@ -2090,13 +2117,29 @@ fn resolve_connected_context(
                 "no_studio",
                 format!(
                     "No Studio runtime connected to this project within {:.1}s",
-                    wait_seconds.max(1.0)
+                    wait_seconds
                 ),
                 true,
                 "studios",
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn connected_runtime_wait_seconds(
+    state: &automation::State,
+    context_id: u64,
+    requested: f64,
+) -> f64 {
+    let requested = requested.max(1.0);
+    if state
+        .context(context_id)
+        .is_some_and(|context| state.studio_launch_in_progress(&context))
+    {
+        requested.max(RECENT_STUDIO_LAUNCH_WAIT_SECONDS)
+    } else {
+        requested
     }
 }
 
@@ -2128,6 +2171,9 @@ fn automation_execute_request(
         op::UPDATE_STUDIOS => {
             prepare_studios_for_update(&request.p, bridge).map_err(automation_failure)
         }
+        op::PERFORMANCE_PROFILE => bridge
+            .performance_profile_command(&request.p)
+            .map_err(automation_failure),
         _ => {
             let context_id = request
                 .cx
@@ -2471,6 +2517,40 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_studio_launch_extends_only_its_connection_wait() {
+        let state = automation::State::default();
+        let context = state.insert_context(automation::BoundContext {
+            id: 0,
+            initialized: true,
+            project: "project".to_string(),
+            root: "root".to_string(),
+            experience: String::new(),
+            source: "source".to_string(),
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: "fingerprint".to_string(),
+        });
+        assert_eq!(connected_runtime_wait_seconds(&state, context.id, 8.0), 8.0);
+
+        state.remember_studio_launch(
+            &context,
+            automation::StudioReopenTarget {
+                file: Some(PathBuf::from("place.rbxl")),
+                game_id: None,
+                place_id: None,
+            },
+            json!({ "pid": std::process::id() }),
+        );
+        assert_eq!(
+            connected_runtime_wait_seconds(&state, context.id, 8.0),
+            RECENT_STUDIO_LAUNCH_WAIT_SECONDS
+        );
+    }
 
     #[test]
     fn omits_echoed_push_arguments_but_keeps_verification() {

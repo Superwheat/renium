@@ -172,7 +172,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.2"
+	local BRIDGE_VERSION = "0.3.3"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1788117265
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -4705,12 +4705,7 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.getBridgeInfo = function()
 		return Config.getBridgeInfo()
 	end
-	Config.bridgeMethodHandlers.cancelRequestLease = function(p)
-		local leaseId = p.leaseId
-		if type(leaseId) ~= "string" or leaseId == "" or #leaseId > 128 then
-			error("Invalid request lease id")
-		end
-		local bridgeResult = Config.cancelBridgeRequestLease(leaseId)
+	local function cancelRequestLeaseResources(leaseId: string)
 		local editorResult = editorSync.cancelRequestLease(leaseId)
 		local cancelledUploads = Config.editorTransactionUploads.cancelLease(leaseId)
 		local creatorResult = Config.creatorApi.cancelRequestLease(leaseId)
@@ -4720,6 +4715,15 @@ function BridgePluginRuntime.start(context)
 				transactionExpectations[transactionId] = nil
 			end
 		end)
+		return editorResult, cancelledUploads, creatorResult
+	end
+	Config.bridgeMethodHandlers.cancelRequestLease = function(p)
+		local leaseId = p.leaseId
+		if type(leaseId) ~= "string" or leaseId == "" or #leaseId > 128 then
+			error("Invalid request lease id")
+		end
+		local bridgeResult = Config.cancelBridgeRequestLease(leaseId)
+		local editorResult, cancelledUploads, creatorResult = cancelRequestLeaseResources(leaseId)
 		return {
 			ok = true,
 			active = bridgeResult.active or editorResult.active,
@@ -5388,6 +5392,7 @@ function BridgePluginRuntime.start(context)
 		handleMethod = Config.handleMethod,
 		updateStatusText = Config.updateStatusText,
 		onRuntimeSettingsChanged = Config.applyBridgeRuntimeSettings,
+		onRequestLeaseDisconnected = cancelRequestLeaseResources,
 		getFinalConsoleSnapshot = function()
 			local info = Config.getBridgeInfo()
 			if
