@@ -9,6 +9,7 @@ local COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT = 64 * 1024
 local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
+local PLAY_RESTART_SETTLE_SECONDS = 2
 local runnerSequence = 0
 
 local function truncateText(text, maxBytes)
@@ -431,6 +432,11 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		lastStartedAt = 0,
 		lastStoppedAt = 0,
 		launchNonce = nil,
+		executionPending = false,
+		executionToken = nil,
+		executionThread = nil,
+		stopRequested = false,
+		readyAt = 0,
 	}
 	local deviceSimulatorReadyAt = os.clock() + 4
 	local deviceSimulatorStatusCache = nil
@@ -2439,6 +2445,29 @@ updateMouse()
 		playSession.ownerRuntimeId = nil
 	end
 
+	local function markPlayStopped()
+		playSession.active = false
+		playSession.starting = false
+		playSession.stopRequested = false
+		playSession.lastStoppedAt = os.clock()
+		releasePlayOwnership()
+	end
+
+	local function cancelPendingPlayExecution()
+		local thread = playSession.executionThread
+		if thread ~= nil and coroutine.status(thread) ~= "dead" then
+			local cancelled = pcall(task.cancel, thread)
+			if not cancelled then
+				return false
+			end
+		end
+		playSession.executionPending = false
+		playSession.executionToken = nil
+		playSession.executionThread = nil
+		playSession.readyAt = os.clock() + PLAY_RESTART_SETTLE_SECONDS
+		return true
+	end
+
 	local function matchingOwnedPlayLaunch(ownerGeneration): boolean
 		return playSession.owned
 			and playSession.ownerGeneration == ownerGeneration
@@ -2449,11 +2478,16 @@ updateMouse()
 	end
 
 	local function playStatus(action)
+		local running = api.isPlayModeRunning() or playSession.active
 		return {
 			ok = true,
 			action = action,
-			running = api.isPlayModeRunning() or playSession.active,
+			running = running,
 			starting = playSession.starting,
+			readyForStart = not running
+				and not playSession.starting
+				and not playSession.executionPending
+				and os.clock() >= playSession.readyAt,
 			mode = playSession.mode,
 			launchNonce = playSession.launchNonce,
 			lastError = playSession.lastError,
@@ -2472,22 +2506,23 @@ updateMouse()
 			end
 			return StudioTestService:ExecutePlayModeAsync(testArgs)
 		end)
+		if playSession.executionToken == token then
+			playSession.executionPending = false
+			playSession.executionToken = nil
+			playSession.executionThread = nil
+			playSession.readyAt = os.clock() + PLAY_RESTART_SETTLE_SECONDS
+		end
 		if playSession.token ~= token then
 			return
 		end
 		if ok then
-			playSession.active = true
-			playSession.starting = true
 			playSession.lastResult = serializeApiValue(result)
 			playSession.lastError = nil
 			return
 		end
-		playSession.active = false
-		playSession.starting = false
-		playSession.lastStoppedAt = os.clock()
 		playSession.lastResult = nil
 		playSession.lastError = tostring(result)
-		releasePlayOwnership()
+		markPlayStopped()
 	end
 
 	local function monitorStudioTest(token)
@@ -2502,10 +2537,10 @@ updateMouse()
 			task.wait(0.05)
 		end
 		if playSession.token == token and playSession.active then
-			playSession.active = false
-			playSession.starting = false
-			playSession.lastStoppedAt = os.clock()
-			releasePlayOwnership()
+			if playSession.stopRequested then
+				cancelPendingPlayExecution()
+			end
+			markPlayStopped()
 		end
 	end
 
@@ -2532,12 +2567,15 @@ updateMouse()
 			then
 				return { ok = false, error = "A different Renium test session is already active" }
 			end
-			if not api.isPlayModeRunning() and not playSession.starting then
+			if not api.isPlayModeRunning() and not playSession.starting and not playSession.executionPending then
 				local numPlayers = tonumber(params.players)
 				if numPlayers and (numPlayers % 1 ~= 0 or numPlayers < 1 or numPlayers > 8) then
 					return { ok = false, error = "Multiplayer tests require an integer from 1 through 8" }
 				end
 				playSession.token += 1
+				playSession.executionPending = true
+				playSession.executionToken = playSession.token
+				playSession.stopRequested = false
 				playSession.active = true
 				playSession.starting = true
 				if params.mode == "run" then
@@ -2568,13 +2606,14 @@ updateMouse()
 					},
 					value = params.args,
 				}
-				task.spawn(function()
+				playSession.executionThread = task.spawn(function()
 					executeStudioTest(token, mode, testArgs, numPlayers)
 				end)
 				task.spawn(monitorStudioTest, token)
 			end
 		elseif shouldStop then
 			action = "stop"
+			playSession.stopRequested = true
 			if
 				type(params.launchNonce) == "string"
 				and params.launchNonce ~= ""
@@ -2599,22 +2638,29 @@ updateMouse()
 					return
 				end
 				local studioTestService = StudioTestService :: any
+				if runtimeContext.bridgeRole == "play-client" then
+					local canLeaveOk, canLeave = pcall(studioTestService.CanLeaveTest, studioTestService)
+					if canLeaveOk and canLeave then
+						attempt("LeaveTest", function()
+							studioTestService:LeaveTest()
+						end)
+						return
+					end
+				end
 				local runService = RunService :: any
-				if api.isPlayModeRunning() or playSession.active or playSession.starting then
-					attempt("EndTest", function()
-						studioTestService:EndTest(true)
-					end)
-				end
-				if api.isPlayModeRunning() then
-					attempt("EditModeActive", function()
-						studioTestService.EditModeActive = true
-					end)
-				end
-				if api.isPlayModeRunning() then
-					attempt("RunService.Stop", function()
-						runService:Stop()
-					end)
-				end
+				attempt("EndTest", function()
+					studioTestService:EndTest(true)
+				end)
+				attempt("EditModeActive", function()
+					studioTestService.EditModeActive = true
+				end)
+				attempt("RunService.Stop", function()
+					runService:Stop()
+				end)
+			end
+			if not api.isPlayModeRunning() then
+				cancelPendingPlayExecution()
+				markPlayStopped()
 			end
 			if params.waitForStopped == false then
 				task.defer(requestStop)
@@ -2627,10 +2673,7 @@ updateMouse()
 			local stopped =
 				waitForStopped(math.clamp(tonumber(params.timeoutSeconds) or 2, 0.1, 10), operationGeneration)
 			if stopped then
-				playSession.active = false
-				playSession.starting = false
-				playSession.lastStoppedAt = os.clock()
-				releasePlayOwnership()
+				markPlayStopped()
 			else
 				return {
 					ok = false,
@@ -2651,6 +2694,22 @@ updateMouse()
 			releasePlayOwnership()
 		end
 		return result
+	end
+
+	function api.studioState()
+		local status = playStatus("status")
+		return {
+			ok = true,
+			running = RunService:IsRunning(),
+			isEdit = RunService:IsEdit(),
+			isClient = RunService:IsClient(),
+			isServer = RunService:IsServer(),
+			runState = currentRunStateText(),
+			playRunning = status.running,
+			playStarting = status.starting,
+			readyForStart = status.readyForStart,
+			launchNonce = status.launchNonce or game:GetAttribute("__ReniumLaunchNonce"),
+		}
 	end
 
 	function api.requestCancellation()

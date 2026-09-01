@@ -34,6 +34,7 @@ use crate::system::watch::FileWatcher;
 
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(10);
 const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(100);
+const STUDIO_PULL_SETTLE_LIMIT: Duration = Duration::from_secs(2);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const ENABLED_FILE: &str = "live-watch-state.enabled";
@@ -1614,15 +1615,9 @@ fn pull_studio_changes(
     let state = if let Some(state) = pending_state {
         state
     } else {
-        bridge.call_for_runtime_with_timeout(
-            "getStudioChangeState",
-            json!({ "start": true }),
-            BridgeTarget::Edit,
-            runtime_id,
-            Some(Duration::from_secs(1)),
-        )?
+        read_live_studio_change_state(bridge, runtime_id)?
     };
-    ensure_plugin_api_ok(&state)?;
+    let state = settle_studio_change_state(bridge, runtime_id, state)?;
     if state["twoWaySyncEnabled"].as_bool() == Some(false) {
         return Ok(None);
     }
@@ -1667,6 +1662,41 @@ fn pull_studio_changes(
         seq,
         runtime_id: state_runtime_id,
     }))
+}
+
+fn read_live_studio_change_state(bridge: &BridgeServer, runtime_id: &str) -> Result<Value> {
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "start": true }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(1)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    Ok(state)
+}
+
+fn settle_studio_change_state(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    mut state: Value,
+) -> Result<Value> {
+    ensure_plugin_api_ok(&state)?;
+    let deadline = Instant::now() + STUDIO_PULL_SETTLE_LIMIT;
+    loop {
+        thread::sleep(SETTLE_QUIET_PERIOD);
+        let next = read_live_studio_change_state(bridge, runtime_id)?;
+        let revision = studio_change_revision(&state);
+        let settled = revision.is_some() && revision == studio_change_revision(&next);
+        state = next;
+        if settled || Instant::now() >= deadline {
+            return Ok(state);
+        }
+    }
+}
+
+fn studio_change_revision(state: &Value) -> Option<(&str, u64)> {
+    Some((state["runtimeId"].as_str()?, state["seq"].as_u64()?))
 }
 
 struct StudioPushState {
@@ -2900,6 +2930,27 @@ mod tests {
             PairMode::Reconcile,
             false,
         ))
+    }
+
+    #[test]
+    fn studio_pull_settles_only_on_the_same_runtime_revision() {
+        let initial = json!({ "runtimeId": "runtime-a", "seq": 10 });
+        let same = json!({ "runtimeId": "runtime-a", "seq": 10 });
+        let advanced = json!({ "runtimeId": "runtime-a", "seq": 11 });
+        let replaced = json!({ "runtimeId": "runtime-b", "seq": 10 });
+
+        assert_eq!(
+            studio_change_revision(&initial),
+            studio_change_revision(&same)
+        );
+        assert_ne!(
+            studio_change_revision(&initial),
+            studio_change_revision(&advanced)
+        );
+        assert_ne!(
+            studio_change_revision(&initial),
+            studio_change_revision(&replaced)
+        );
     }
 
     #[test]

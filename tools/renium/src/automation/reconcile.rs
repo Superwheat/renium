@@ -1657,35 +1657,30 @@ fn validate_package_link_documents(
         .filter(|(_, instance)| instance.class_name == "PackageLink")
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mismatch = if before_links.len() != after_links.len() {
-        Some(format!(
-            "PackageLink count changed from {} to {}",
-            before_links.len(),
-            after_links.len()
-        ))
-    } else {
-        before_links.iter().find_map(|(id, before_index)| {
-            let after_index = after_links
-                .get(id)
-                .copied()
-                .ok_or_else(|| format!("PackageLink identity {id} is missing"));
-            match after_index {
-                Ok(after_index)
-                    if package_link_instances_equal(before, *before_index, after, after_index) =>
-                {
-                    None
-                }
-                Ok(after_index) => Some(package_link_mismatch_detail(
-                    id,
-                    before,
-                    *before_index,
-                    after,
-                    after_index,
-                )),
-                Err(detail) => Some(detail),
+    let mismatch = before_links
+        .iter()
+        .find_map(|(id, before_index)| match after_links.get(id).copied() {
+            Some(after_index)
+                if package_link_instances_equal(before, *before_index, after, after_index) =>
+            {
+                None
             }
+            Some(after_index) => Some(package_link_mismatch_detail(
+                id,
+                before,
+                *before_index,
+                after,
+                after_index,
+            )),
+            None if package_parent_is_missing(before, *before_index, after) => None,
+            None => Some(format!("PackageLink identity {id} is missing")),
         })
-    };
+        .or_else(|| {
+            after_links
+                .keys()
+                .find(|id| !before_links.contains_key(*id))
+                .map(|id| format!("PackageLink identity {id} was created"))
+        });
     if let Some(mismatch) = mismatch {
         bail!(
             "{} changes a PackageLink directly; use the package workflow instead ({mismatch})",
@@ -3075,28 +3070,13 @@ fn append_aligned_settings_push_plan(
         log_reconcile_timing("settings delta instance removals", phase);
         return Ok(());
     }
-    let package_ancestors = observed
-        .instances
-        .iter()
-        .enumerate()
-        .filter(|(_, instance)| instance.class_name == "PackageLink")
-        .flat_map(|(index, _)| {
-            let mut ancestors = Vec::new();
-            let mut current = Some(index);
-            while let Some(index) = current {
-                ancestors.push(index);
-                current = observed.instances[index].parent_index;
-            }
-            ancestors
-        })
-        .collect::<HashSet<_>>();
     let observed_paths =
         build_editor_instance_paths_for_indices(observed, &service, &root_removals);
     let mut descriptors = Vec::with_capacity(root_removals.len());
     for index in root_removals {
-        if package_ancestors.contains(&index) {
+        if observed.instances[index].class_name == "PackageLink" {
             bail!(
-                "Reconciliation would remove a PackageLink through {}; Studio was not changed",
+                "Reconciliation would remove PackageLink {} directly; Studio was not changed",
                 observed.instances[index].name
             );
         }
@@ -3485,18 +3465,6 @@ fn is_source_path(path: &Path) -> bool {
         .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "lua" | "luau"))
 }
 
-fn normalized_source_bytes(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
-    let mut index = 0;
-    std::iter::from_fn(move || {
-        let byte = *bytes.get(index)?;
-        if byte == b'\r' {
-            index += usize::from(bytes.get(index + 1) == Some(&b'\n'));
-        }
-        index += 1;
-        Some(if byte == b'\r' { b'\n' } else { byte })
-    })
-}
-
 fn entries_equivalent(
     path: &Path,
     left: Option<&SnapshotEntry>,
@@ -3507,7 +3475,9 @@ fn entries_equivalent(
         (Some(SnapshotEntry::File(left)), Some(SnapshotEntry::File(right)))
             if is_source_path(path) =>
         {
-            left == right || normalized_source_bytes(left).eq(normalized_source_bytes(right))
+            left == right
+                || crate::system::text::normalized_source_bytes(left)
+                    .eq(crate::system::text::normalized_source_bytes(right))
         }
         _ => left == right,
     }
@@ -4146,9 +4116,9 @@ fn protect_package_links(
 ) {
     let base_by_id = base
         .into_iter()
-        .flat_map(|document| &document.instances)
-        .filter(|instance| instance.class_name == "PackageLink")
-        .map(|instance| (instance.settings_id.clone(), instance))
+        .flat_map(|document| document.instances.iter().enumerate())
+        .filter(|(_, instance)| instance.class_name == "PackageLink")
+        .map(|(index, instance)| (instance.settings_id.clone(), (index, instance)))
         .collect::<HashMap<_, _>>();
     let studio_by_id = studio
         .instances
@@ -4165,15 +4135,25 @@ fn protect_package_links(
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
 
-    for (id, base_instance) in &base_by_id {
-        if !studio_by_id.contains_key(id) {
+    for (id, (base_index, base_instance)) in &base_by_id {
+        if !studio_by_id.contains_key(id)
+            && !base
+                .is_some_and(|document| package_parent_is_missing(document, *base_index, studio))
+        {
+            let parent = base
+                .and_then(|document| settings_parent_id(document, *base_index))
+                .unwrap_or("unknown");
             conflicts.push(format!(
-                "{} would remove PackageLink {} from Studio",
+                "{} removes PackageLink {} ({id}) directly while parent {parent} remains in Studio",
                 path.display(),
                 base_instance.name
             ));
         }
-        if !editor_by_id.contains_key(id) && studio_by_id.contains_key(id) {
+        if !editor_by_id.contains_key(id)
+            && studio_by_id.contains_key(id)
+            && !base
+                .is_some_and(|document| package_parent_is_missing(document, *base_index, editor))
+        {
             conflicts.push(format!(
                 "{} omits PackageLink {}; ordinary sync preserves package relationships",
                 path.display(),
@@ -4221,6 +4201,19 @@ fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str>
         .parent_index
         .and_then(|parent| document.instances.get(parent))
         .map(|parent| parent.settings_id.as_str())
+}
+
+fn package_parent_is_missing(
+    source: &SettingsBytecode,
+    package_link_index: usize,
+    target: &SettingsBytecode,
+) -> bool {
+    settings_parent_id(source, package_link_index).is_some_and(|parent_id| {
+        !target
+            .instances
+            .iter()
+            .any(|instance| instance.settings_id == parent_id)
+    })
 }
 
 fn settings_instances_equal(
@@ -6127,6 +6120,83 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_allows_replacing_an_entire_package_root() {
+        let instance =
+            |id: &str, name: &str, class_name: &str, parent_index| SettingsBytecodeInstance {
+                settings_id: id.to_string(),
+                name: name.to_string(),
+                class_name: class_name.to_string(),
+                parent_index,
+                properties: Map::new(),
+                attributes: Map::new(),
+            };
+        let root = instance("root", "Workspace", "Workspace", None);
+        let old_package = instance("old-package", "Old car", "Model", Some(0));
+        let old_link = instance("old-link", "PackageLink", "PackageLink", Some(1));
+        let new_package = instance("new-package", "New car", "Model", Some(0));
+        let new_link = instance("new-link", "PackageLink", "PackageLink", Some(1));
+        let document = |instances| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        };
+        let settings_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let snapshot = |document: SettingsBytecode| ProjectSnapshot {
+            entries: [(
+                settings_path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let baseline = snapshot(document(vec![
+            root.clone(),
+            old_package.clone(),
+            old_link.clone(),
+        ]));
+        let editor = baseline.clone();
+        let studio = snapshot(document(vec![root.clone(), new_package, new_link]));
+
+        let (merged, conflicts) =
+            merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
+        assert!(conflicts.is_empty());
+        let merged = settings_document(merged.entries.get(&settings_path)).unwrap();
+        assert!(
+            merged
+                .instances
+                .iter()
+                .any(|instance| instance.name == "New car")
+        );
+        assert!(
+            !merged
+                .instances
+                .iter()
+                .any(|instance| instance.name == "Old car")
+        );
+
+        let removed_package = snapshot(document(vec![root]));
+        assert!(
+            validate_editor_package_links(
+                &baseline,
+                &removed_package,
+                std::slice::from_ref(&settings_path),
+            )
+            .is_ok()
+        );
+        let direct_link_removal = snapshot(document(vec![
+            instance("root", "Workspace", "Workspace", None),
+            old_package,
+        ]));
+        assert!(
+            validate_editor_package_links(
+                &baseline,
+                &direct_link_removal,
+                std::slice::from_ref(&settings_path),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn package_link_guard_uses_project_identity_not_export_ids() {
         let document = |ids: [&str; 4], moved: bool, package_content: &str| SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
@@ -6711,7 +6781,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_uses_targeted_deletes_and_blocks_package_subtrees() {
+    fn reconciliation_uses_targeted_deletes_and_blocks_direct_package_link_deletes() {
         let root = SettingsBytecodeInstance {
             settings_id: "root".to_string(),
             name: "ServerStorage".to_string(),
@@ -6777,7 +6847,21 @@ mod tests {
             properties: Map::new(),
             attributes: Map::new(),
         };
-        let studio = snapshot(vec![root, folder, package_link]);
+        let studio = snapshot(vec![root.clone(), folder.clone(), package_link]);
+        let plan = reconciliation_push_plan(&studio, &desired).unwrap();
+        assert_eq!(plan.instance_deletes.len(), 1);
+        assert_eq!(plan.instance_deletes[0].instances[0].settings_id, "folder");
+
+        let package_link = SettingsBytecodeInstance {
+            settings_id: "link".to_string(),
+            name: "PackageLink".to_string(),
+            class_name: "PackageLink".to_string(),
+            parent_index: Some(1),
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let studio = snapshot(vec![root.clone(), folder.clone(), package_link]);
+        let desired = snapshot(vec![root, folder]);
         assert!(reconciliation_push_plan(&studio, &desired).is_err());
     }
 

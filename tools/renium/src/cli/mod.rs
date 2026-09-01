@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
@@ -90,6 +90,38 @@ pub(super) struct Cli {
     pub(super) command: Commands,
 }
 
+#[derive(Parser)]
+pub(super) struct QueryPlaceArgs {
+    #[arg(value_name = "PLACE.rbxl|PLACE.rbxlx")]
+    pub(super) input: PathBuf,
+    #[arg(value_name = "QUERY")]
+    pub(super) query: Option<String>,
+    #[arg(short, long)]
+    pub(super) name: Option<String>,
+    #[arg(short, long, alias = "class")]
+    pub(super) class_name: Option<String>,
+    #[arg(short, long, value_name = "TEXT")]
+    pub(super) source: Option<String>,
+    #[arg(long, default_value = "20")]
+    pub(super) limit: NonZeroUsize,
+    #[arg(short, long)]
+    pub(super) all: bool,
+    #[arg(long)]
+    pub(super) pretty: bool,
+}
+
+#[derive(Parser)]
+pub(super) struct ComparePlaceArgs {
+    #[arg(value_name = "PLACE.rbxl|PLACE.rbxlx")]
+    pub(super) input: PathBuf,
+    #[arg(long, default_value = "50")]
+    pub(super) limit: NonZeroUsize,
+    #[arg(short, long)]
+    pub(super) all: bool,
+    #[arg(long)]
+    pub(super) pretty: bool,
+}
+
 #[derive(Subcommand)]
 pub(super) enum Commands {
     #[command(name = "fmt", alias = "fmt-project")]
@@ -108,6 +140,19 @@ pub(super) enum Commands {
     Init(workflows::InitArgs),
     #[command(name = "build", alias = "build-project")]
     Build(workflows::BuildArgs),
+    #[command(
+        name = "q",
+        alias = "query-place",
+        alias = "place-find",
+        about = "Search a place file without Studio"
+    )]
+    QueryPlace(QueryPlaceArgs),
+    #[command(
+        name = "cmp",
+        alias = "compare-place",
+        about = "Compare a place file's scripts with this project"
+    )]
+    ComparePlace(ComparePlaceArgs),
     #[command(name = "dr", alias = "doctor")]
     Doctor(workflows::DoctorArgs),
     #[command(name = "docs", alias = "open-docs")]

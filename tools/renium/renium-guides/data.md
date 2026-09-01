@@ -21,6 +21,17 @@ rbx br Workspace -i editor:id
 
 `f SERVICE text` searches text. `-n` matches an exact name; don't add wildcards.
 
+Use one lookup on the state that matters:
+
+```powershell
+rbx f Workspace -n Door                 # saved project
+rbx l "return workspace:FindFirstChild('Door') ~= nil" # live Studio
+rbx q Place.rbxl -n Door                # closed place file
+rbx q Place.rbxl --source "reward granted"
+```
+
+Refine an ambiguous lookup; don't restart the check against a different data source unless the task actually asks you to compare states.
+
 Values use `--str`, `--num`, `--bool`, `--null`, or `-j`. `--null` removes an override; writing the default stores one. Unknown class properties are rejected. Use `--scope property` for a real property missing from Renium's schema and `--scope attribute` for attributes.
 
 Set references with `-j '{"_type":"Ref","settingsId":"editor:target"}'`; clear with `--null`. Without an ID, use `pathSegments` and `pathOrdinals`.
@@ -47,7 +58,7 @@ rbx v model.rbxm --json
 rbx v model.rbxmx --json
 ```
 
-Use `--json` for exact source and references. `v` accepts `.renium`, `.rbxm`, and `.rbxmx`, not places. Verify places with `bep`'s manifest and `sm --stdout`.
+Use `--json` for exact source and references. `v` accepts `.renium`, `.rbxm`, and `.rbxmx`, not places. Use `q` to inspect a place and `cmp` to compare its scripts with the current project.
 
 RBXM and requested `bb` properties may materialize class defaults. Use `rbx v <store>.renium --json` to identify stored overrides.
 

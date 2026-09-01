@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -385,7 +385,7 @@ pub(crate) fn studio_change_state_result(
     if !action_results.is_object() {
         bail!("--ack-action-results must be a JSON object");
     }
-    let result = bridge.call(
+    let result = bridge.call_for_target(
         "getStudioChangeState",
         json!({
             "services": services,
@@ -404,6 +404,7 @@ pub(crate) fn studio_change_state_result(
             "contextBound": args.context_bound,
             "compact": !details,
         }),
+        BridgeTarget::Edit,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(if details {
@@ -575,6 +576,13 @@ fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
 }
 
 fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
+    if request_play_runtimes_to_stop(
+        bridge,
+        &test_launch_clients(bridge, launch),
+        Some(&launch.nonce),
+    ) {
+        thread::sleep(Duration::from_millis(100));
+    }
     let _ = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
         json!({
@@ -596,7 +604,7 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
     };
     let launch = new_play_launch(bridge, "play")?;
     let mut device_simulation = studio_device_status(bridge)?;
-    let mut existing = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
+    let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
     if existing.get("running").and_then(Value::as_bool) == Some(true)
         || existing.get("starting").and_then(Value::as_bool) == Some(true)
     {
@@ -623,7 +631,8 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
         {
             ensure_plugin_api_ok(&start_result)?;
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let server_deadline = Instant::now() + Duration::from_secs(30);
+        let client_deadline = Instant::now() + Duration::from_secs(60);
         let mut last_status = start_result;
         loop {
             let clients = test_launch_clients(bridge, &launch);
@@ -645,7 +654,9 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                     "clients": clients,
                 }));
             }
-            if Instant::now() >= deadline {
+            if (!server_ready && Instant::now() >= server_deadline)
+                || Instant::now() >= client_deadline
+            {
                 bail!(
                     "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
                     serde_json::to_string(&last_status)?,
@@ -688,7 +699,7 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
     }
     let launch = new_play_launch(bridge, "multi")?;
     let mut device_simulation = studio_device_status(bridge)?;
-    let existing = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id)?;
+    let existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
     if existing.get("running").and_then(Value::as_bool) == Some(true)
         || existing.get("starting").and_then(Value::as_bool) == Some(true)
     {
@@ -1978,17 +1989,9 @@ pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> 
     print_json_output(&result, false)
 }
 
-fn connected_launch_nonce(bridge: &BridgeServer, edit_runtime_id: &str) -> Result<Option<String>> {
-    let mut nonces: Vec<String> = bridge
-        .list_bridge_clients()
-        .into_iter()
-        .filter(|entry| {
-            entry.get("launchEditRuntimeId").and_then(Value::as_str) == Some(edit_runtime_id)
-                && matches!(
-                    entry.get("role").and_then(Value::as_str),
-                    Some(BRIDGE_ROLE_PLAY_SERVER | BRIDGE_ROLE_PLAY_CLIENT)
-                )
-        })
+fn single_play_launch_nonce(clients: &[Value]) -> Option<String> {
+    let mut nonces = clients
+        .iter()
         .filter_map(|entry| {
             entry
                 .get("launchNonce")
@@ -1996,46 +1999,137 @@ fn connected_launch_nonce(bridge: &BridgeServer, edit_runtime_id: &str) -> Resul
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
-        .collect();
+        .collect::<Vec<_>>();
     nonces.sort_unstable();
     nonces.dedup();
-    if nonces.len() > 1 {
-        bail!("Multiple Renium play launches are connected to the selected Studio window");
+    (nonces.len() == 1).then(|| nonces.remove(0))
+}
+
+fn studio_play_clients(bridge: &BridgeServer, edit_runtime_id: &str) -> Vec<Value> {
+    let clients = bridge.list_bridge_clients();
+    #[cfg(any(windows, target_os = "macos"))]
+    let same_process_runtime_ids = bridge
+        .studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id)
+        .map(|edit_pid| {
+            clients
+                .iter()
+                .filter_map(|entry| {
+                    let role = entry.get("role").and_then(Value::as_str)?;
+                    let target = match role {
+                        BRIDGE_ROLE_PLAY_SERVER => BridgeTarget::Main,
+                        BRIDGE_ROLE_PLAY_CLIENT => BridgeTarget::Client,
+                        _ => return None,
+                    };
+                    let runtime_id = entry.get("runtimeId").and_then(Value::as_str)?;
+                    (bridge.studio_pid_for_runtime(target, runtime_id).ok() == Some(edit_pid))
+                        .then(|| runtime_id.to_string())
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let same_process_runtime_ids = HashSet::new();
+
+    clients
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("role").and_then(Value::as_str),
+                Some(BRIDGE_ROLE_PLAY_SERVER | BRIDGE_ROLE_PLAY_CLIENT)
+            ) && (entry.get("launchEditRuntimeId").and_then(Value::as_str) == Some(edit_runtime_id)
+                || entry
+                    .get("runtimeId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|runtime_id| same_process_runtime_ids.contains(runtime_id)))
+        })
+        .collect()
+}
+
+fn play_client_is_running(bridge: &BridgeServer, client: &Value) -> bool {
+    let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
+        return false;
+    };
+    let target = match client.get("role").and_then(Value::as_str) {
+        Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
+        Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
+        _ => return false,
+    };
+    bridge
+        .call_for_runtime_with_timeout(
+            "startStopPlay",
+            json!({}),
+            target,
+            runtime_id,
+            Some(Duration::from_millis(500)),
+        )
+        .is_ok_and(|status| play_status_is_running(&status))
+}
+
+fn play_status_is_running(status: &Value) -> bool {
+    status.get("running").and_then(Value::as_bool) == Some(true)
+        || status.get("starting").and_then(Value::as_bool) == Some(true)
+}
+
+pub(crate) fn active_studio_play_clients(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+) -> Vec<Value> {
+    studio_play_clients(bridge, edit_runtime_id)
+        .into_iter()
+        .filter(|client| play_client_is_running(bridge, client))
+        .collect()
+}
+
+fn request_play_runtimes_to_stop(
+    bridge: &BridgeServer,
+    clients: &[Value],
+    launch_nonce: Option<&str>,
+) -> bool {
+    let mut params = Map::new();
+    params.insert("stop".to_string(), Value::Bool(true));
+    params.insert("waitForStopped".to_string(), Value::Bool(false));
+    if let Some(launch_nonce) = launch_nonce {
+        params.insert(
+            "launchNonce".to_string(),
+            Value::String(launch_nonce.to_string()),
+        );
     }
-    Ok(nonces.pop())
+    let mut requested = false;
+    for client in clients {
+        let target = match client.get("role").and_then(Value::as_str) {
+            Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
+            Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
+            _ => continue,
+        };
+        let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
+            continue;
+        };
+        requested = true;
+        let _ = bridge.call_for_runtime_with_timeout(
+            "startStopPlay",
+            Value::Object(params.clone()),
+            target,
+            runtime_id,
+            Some(Duration::from_secs(2)),
+        );
+    }
+    requested
 }
 
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
     let edit_runtime_id = edit_pin.runtime_id;
     let initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
+    let initial_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+    if studio_session_is_stopped(&initial, &initial_clients) {
+        bridge.clear_runtime_pins();
+        return Ok(initial);
+    }
     let launch_nonce = initial
         .get("launchNonce")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or(connected_launch_nonce(bridge, &edit_runtime_id)?);
-    let launch = launch_nonce.as_ref().map(|nonce| TestLaunch {
-        nonce: nonce.clone(),
-        edit_runtime_id: edit_runtime_id.clone(),
-    });
-    if studio_status_indicates_stopped(&initial)
-        && initial.get("starting").and_then(Value::as_bool) != Some(true)
-        && launch
-            .as_ref()
-            .is_none_or(|launch| test_launch_clients(bridge, launch).is_empty())
-    {
-        return Ok(initial);
-    }
-    let clients = launch
-        .as_ref()
-        .map_or_else(Vec::new, |launch| test_launch_clients(bridge, launch));
-    let server_runtime_id = clients.iter().find_map(|client| {
-        (client.get("role").and_then(Value::as_str) == Some(BRIDGE_ROLE_PLAY_SERVER))
-            .then(|| client.get("runtimeId").and_then(Value::as_str))
-            .flatten()
-            .map(str::to_string)
-    });
+        .map(str::to_string);
     let mut last_status = Value::Null;
     for attempt in 1..=3 {
         let mut params = Map::new();
@@ -2046,20 +2140,25 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 Value::String(launch_nonce.clone()),
             );
         }
-        if server_runtime_id.is_some() {
-            params.insert("waitForStopped".to_string(), Value::Bool(false));
+        params.insert("waitForStopped".to_string(), Value::Bool(false));
+        let clients = active_studio_play_clients(bridge, &edit_runtime_id);
+        if request_play_runtimes_to_stop(bridge, &clients, None) {
+            thread::sleep(Duration::from_millis(100));
         }
         let stop_result = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params),
-            if server_runtime_id.is_some() {
-                BridgeTarget::Main
-            } else {
-                BridgeTarget::Edit
-            },
-            server_runtime_id.as_deref().unwrap_or(&edit_runtime_id),
-            None,
-        )?;
+            BridgeTarget::Edit,
+            &edit_runtime_id,
+            Some(Duration::from_secs(2)),
+        );
+        let stop_result = match stop_result {
+            Ok(result) => result,
+            Err(error) => {
+                last_status = json!({ "error": format!("{error:#}") });
+                continue;
+            }
+        };
         ensure_plugin_api_ok(&stop_result)?;
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut stopped = false;
@@ -2067,45 +2166,22 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             let status_stopped = match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
                 Ok(status) => {
                     last_status = status.clone();
-                    studio_status_indicates_stopped(&status)
+                    let active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+                    request_play_runtimes_to_stop(bridge, &active_clients, None);
+                    studio_session_is_stopped(&status, &active_clients)
                 }
                 Err(err) => {
                     last_status = json!({ "error": format!("{:#}", err) });
                     false
                 }
             };
-            let launch_stopped = launch
-                .as_ref()
-                .is_none_or(|launch| test_launch_clients(bridge, launch).is_empty());
-            stopped = if server_runtime_id.is_some() {
-                launch_stopped
-            } else {
-                status_stopped && launch_stopped
-            };
+            stopped = status_stopped;
             if stopped {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
         if stopped {
-            if server_runtime_id.is_some() {
-                let mut cleanup = Map::new();
-                cleanup.insert("stop".to_string(), Value::Bool(true));
-                if let Some(launch_nonce) = launch_nonce.as_ref() {
-                    cleanup.insert(
-                        "launchNonce".to_string(),
-                        Value::String(launch_nonce.clone()),
-                    );
-                }
-                last_status = bridge.call_for_runtime_with_timeout(
-                    "startStopPlay",
-                    Value::Object(cleanup),
-                    BridgeTarget::Edit,
-                    &edit_runtime_id,
-                    None,
-                )?;
-                ensure_plugin_api_ok(&last_status)?;
-            }
             bridge.clear_runtime_pins();
             return Ok(json!({
                 "ok": true,
@@ -2117,7 +2193,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
         }
     }
     bail!(
-        "Studio did not report edit mode after plugin stop request; last status: {}",
+        "Studio did not finish stopping after the plugin stop request; last status: {}",
         serde_json::to_string(&last_status)?
     )
 }
@@ -2134,15 +2210,79 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
     Ok(status)
 }
 
+fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result<Value> {
+    let deadline = Instant::now() + BRIDGE_DEFAULT_RESPONSE_TIMEOUT;
+    loop {
+        let mut status = studio_play_status_for_runtime(bridge, runtime_id)?;
+        let clients = active_studio_play_clients(bridge, runtime_id);
+        if !clients.is_empty() {
+            let launch_nonce = single_play_launch_nonce(&clients);
+            status["running"] = Value::Bool(true);
+            status["starting"] = Value::Bool(false);
+            status["clients"] = json!(clients);
+            if let Some(launch_nonce) = launch_nonce {
+                status["launchNonce"] = Value::String(launch_nonce);
+            }
+            return Ok(status);
+        }
+        if status.get("running").and_then(Value::as_bool) == Some(true)
+            || status.get("starting").and_then(Value::as_bool) == Some(true)
+            || status.get("readyForStart").and_then(Value::as_bool) != Some(false)
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            bail!("Studio did not finish the previous play session before the next start");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn studio_status_indicates_stopped(status: &Value) -> bool {
     if let Some(running) = status.get("running").and_then(Value::as_bool) {
-        return !running;
+        !running
+    } else {
+        status
+            .get("studioTest")
+            .and_then(|value| value.get("editModeActive"))
+            .and_then(Value::as_bool)
+            == Some(true)
     }
-    status
-        .get("studioTest")
-        .and_then(|value| value.get("editModeActive"))
-        .and_then(Value::as_bool)
-        == Some(true)
+}
+
+fn studio_session_is_stopped(status: &Value, active_play_clients: &[Value]) -> bool {
+    studio_status_indicates_stopped(status)
+        && status.get("starting").and_then(Value::as_bool) != Some(true)
+        && active_play_clients.is_empty()
+}
+
+#[cfg(test)]
+mod play_state_tests {
+    use super::*;
+
+    #[test]
+    fn running_bridge_overrides_a_stale_stopped_controller() {
+        let status = json!({ "running": false, "starting": false });
+        let clients = vec![json!({ "role": "play-server" })];
+
+        assert!(!studio_session_is_stopped(&status, &clients));
+    }
+
+    #[test]
+    fn stopped_controller_without_play_bridges_is_stopped() {
+        let status = json!({ "running": false, "starting": false });
+
+        assert!(studio_session_is_stopped(&status, &[]));
+    }
+
+    #[test]
+    fn stale_bridge_failure_does_not_count_as_running() {
+        assert!(!play_status_is_running(&json!({
+            "ok": false,
+            "error": "DataModel stopped",
+        })));
+        assert!(play_status_is_running(&json!({ "running": true })));
+    }
 }
 
 pub(crate) fn test_command(args: TestArgs) -> Result<()> {
