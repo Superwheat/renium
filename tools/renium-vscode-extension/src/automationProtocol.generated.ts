@@ -69,6 +69,7 @@ export const AUTOMATION_OP = {
   imageUpload: 95,
   imageStore: 96,
   updateStudios: 97,
+  performanceProfile: 98,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([

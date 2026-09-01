@@ -172,7 +172,7 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.2"
+	local BRIDGE_VERSION = "0.3.3"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1788117265
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
@@ -390,6 +390,7 @@ function BridgePluginRuntime.start(context)
 	end
 	local RuntimeApi = requireChildModule("BridgeRuntimeApi").create(plugin, {
 		runtimeId = Config.bridgeRuntimeId,
+		bridgeRole = Config.bridgeRole,
 		assertSessionOwnership = function(sessionGeneration)
 			if not sessionLock.validate(sessionGeneration or activeExclusiveSessionGeneration) then
 				error("Renium session ownership was lost")
@@ -5092,7 +5093,7 @@ function BridgePluginRuntime.start(context)
 		return RuntimeApi.cancelLuauExecution(p, sessionGeneration)
 	end
 	Config.bridgeMethodHandlers.startStopPlay = RuntimeApi.startStopPlay
-	Config.bridgeMethodHandlers.getStudioState = Config.creatorApi.studioState
+	Config.bridgeMethodHandlers.getStudioState = RuntimeApi.studioState
 	Config.bridgeMethodHandlers.getCreatorContext = Config.creatorApi.creatorContext
 	Config.bridgeMethodHandlers.cameraCapture = Config.creatorApi.cameraCapture
 	Config.bridgeMethodHandlers.insertAsset = Config.creatorApi.insertAsset

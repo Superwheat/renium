@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.3 - 2026-09-01
+
+### Studio sync
+
+- Rapid Studio edit bursts settle into one complete pull instead of saving an intermediate state.
+- Live Sync status and pull acknowledgements stay attached to the Edit session while Play starts, runs, or disconnects.
+- Entire package roots can be replaced or removed normally while direct `PackageLink` edits remain protected.
+- Sync retries when Studio changes during an update, while conflicting project-file edits remain untouched.
+
+### Playtests
+
+- Play status follows the real session in the selected Studio window, including delayed starts and sessions whose server connects before the client.
+- Stop waits for the actual client and server to finish without reporting a timeout after Studio has returned to Edit mode.
+- Repeated start and stop commands finish or reuse the current session instead of creating overlapping tests.
+
+### Place inspection
+
+- Closed RBXL and RBXLX files can be searched directly with `rbx q` without opening Studio.
+- `rbx cmp` compares every projected script with the current project and reports changed, missing, and extra scripts.
+- Script comparisons ignore line-ending-only changes and duplicate sibling order.
+
+### Agent workflow
+
+- Live Sync status stays compact unless detailed diagnostics are needed.
+- Renium updates run only from an update notice or an explicit request.
+- PowerShell examples now cover Luau strings containing apostrophes.
+
 ## 0.3.2 - 2026-08-31
 
 ### Sync safety

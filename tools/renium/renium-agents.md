@@ -1,4 +1,4 @@
-<!-- renium-version: 0.3.2 -->
+<!-- renium-version: 0.3.3 -->
 # Renium automation
 
 Use `rbx`. If `PATH` is stale, use `%USERPROFILE%\.renium\bin\rbx.exe` on Windows or `~/.renium/bin/rbx` on macOS/Linux. Never search editor extension folders.
@@ -25,7 +25,7 @@ Read only relevant guides. Read several when categories overlap. Don't guess unr
 ## Rules
 
 - Use direct `rbx` commands. Renium handles the daemon, project, and Studio binding.
-- If instructions update, reread this file and the current task's guides. If an update is available, run `rbx upd` first.
+- Run `rbx upd` only when Renium reports an available version or the user asks. After an update, reread this file and the current task's guides.
 - Don't start `rbx bd`, inspect daemon internals or help, or bind a context first.
 - Don't create payload files. Use arguments; pipe larger `bb` queries through stdin.
 - Read existing targets before editing. For unique temporary targets, create once and reuse returned IDs. Find IDs again after a pull.
@@ -44,3 +44,5 @@ Single-place projects use `src`; multi-place projects use `places/<alias>/src` a
 Edit `.lua` and `.luau` directly. Use `rbx` for generated `.renium` data.
 
 `f`, `bg`, and `bs` read saved files, not Studio. Use `rbx l` for live edits, then `rbx pl`; use `rbx ps` for files → Studio. Query the service named in `src/<Service>/...`.
+
+Choose the data source once: `rbx f` searches saved project data, `rbx l` checks live Studio, and `rbx q FILE.rbxl` searches a closed place directly. Use `rbx cmp FILE.rbxl` to compare every projected script with the current project. Refine one ambiguous result instead of repeating the same check through other tools.

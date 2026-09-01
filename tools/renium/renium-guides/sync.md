@@ -8,7 +8,6 @@ rbx ps src/StarterGui/AuditClient.client.luau
 rbx lon
 rbx lst
 rbx lst --wait 10
-rbx lst --details
 rbx lof
 ```
 
@@ -34,6 +33,6 @@ Conflict preferences are `none`, `studio`, and `editor` (project files).
 
 `rbx lst --wait 10` waits up to 10 seconds for file edits to finish syncing.
 
-Status is compact by default; `--details` includes retained change records.
+Status is compact by default. Add `--details` only when compact status reports a pending change, conflict, or failure that needs diagnosis.
 
 Without Live Sync, list files or directories after `rbx ps`. Renium expands directories and batches services. `--verify` checks selected scripts. Use an unfiltered push only to replace the full place.

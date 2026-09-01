@@ -87,6 +87,7 @@ Agents use short names; descriptive aliases call the same commands:
 | `pl` / `ps` | `pull` / `push` |
 | `lon` / `lof` / `lst` | `live-start` / `live-stop` / `live-status` |
 | `f` / `tr` / `in` | `find` / `tree` / `inspect` |
+| `q` / `cmp` | `query-place` / `compare-place` |
 | `l` / `lc` / `co` | `luau` / `execute-client-luau` / `console` |
 | `sc` / `rs` / `re` | `screenshot` / `record-start` / `record-end` |
 | `pr` / `clk` / `ky` / `ty` / `go` | `press` / `click` / `key` / `type` / `goto` |
@@ -605,6 +606,18 @@ rbx script-read src/ServerScriptService/Main.server.luau --start-line 40 --end-l
 literal lines and is case-sensitive by default. Limits cap results, not totals.
 Line ranges are inclusive and one-based.
 
+Inspect a closed place without opening Studio, or compare all of its projected
+scripts with the current project:
+
+```powershell
+rbx q Place.rbxl -n RewardHandler
+rbx q Place.rbxl --source "reward granted"
+rbx cmp Place.rbxl
+```
+
+`q` reads RBXL/RBXLX directly. `cmp` ignores line-ending-only changes and
+duplicate sibling order, and reports changed, missing, and extra scripts.
+
 RBXM and requested `bb` properties may materialize class defaults. Check the
 source `.renium` store before treating one as an override.
 
@@ -724,6 +737,7 @@ PowerShell 5.1 mangles inline JSON. Pipe it instead:
 | `xp` | `explain-path` | `cfg` | `config` |
 | `ad` | `adapters` | `ir` | `import-rojo` |
 | `init` | `project-init` | `build` | `build-project` |
+| `q` | `query-place` | `cmp` | `compare-place` |
 | `dr` | `doctor` | `docs` | `open-docs` |
 | `dm` | `daemon` | `bd` | `bridge-daemon` |
 | `so` | `studio` | `ro` | `studio-open` |

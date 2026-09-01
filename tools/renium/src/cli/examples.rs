@@ -10,6 +10,11 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ir", "Examples:\n  rbx ir --project default.project.json"),
     ("init", "Examples:\n  rbx init ."),
     ("build", "Examples:\n  rbx build"),
+    (
+        "q",
+        "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"",
+    ),
+    ("cmp", "Examples:\n  rbx cmp Place.rbxl"),
     ("dr", "Examples:\n  rbx dr"),
     ("docs", "Examples:\n  rbx docs sync"),
     ("dm", "Examples:\n  rbx dm list"),

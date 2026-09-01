@@ -6,6 +6,9 @@ Also read `RENIUM/data.md` before editing saved instances.
 rbx bem Workspace -i editor:id -o model.rbxm
 rbx bim Workspace --model model.rbxm --parent-settings-id editor:parent
 rbx bep -o place.rbxl
+rbx q old-place.rbxl -n RewardHandler
+rbx q old-place.rbxl --source "reward granted"
+rbx cmp old-place.rbxl
 rbx x -d snapshots --no-run-import
 rbx si --snapshot-dir snapshots --project-root .
 rbx sm
@@ -17,6 +20,8 @@ rbx wally --realms shared --force
 ```
 
 Wally sync needs `wally`; Aftman projects must declare it. `--force` reinstalls current packages. `--details` includes full path and ID lists.
+
+`q` reads an RBXL/RBXLX directly without opening Studio or creating a project beside it. Use `-n`, `-c`, or `--source` for one existence check. `cmp` compares all scripts under the current project's services and reports source, class, missing, and extra differences; line-ending-only changes and duplicate order don't count. Use these before snapshot export/import when the input is already a place file.
 
 `bem`/`bim` copy model trees. Use `mv --to-service` to move an existing subtree across services. `x` exports Studio snapshots; `si` imports them. Both snapshot export and pull need the same bridge. `bep` builds a place. `sm` maps every instance; `--cached --stdout --filter GLOB` queries the existing map. `bpack` updates old stores only.
 

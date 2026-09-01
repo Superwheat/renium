@@ -22,6 +22,6 @@ Don't leave `l` or `lc` waiting while issuing another command; operations run in
 
 `l` and `lc` runners are removed on return. Use a temporary source script for persistent test fixtures.
 
-In PowerShell, wrap Luau containing double quotes in single quotes; `\"` isn't an escape.
+In PowerShell, wrap Luau containing double quotes in single quotes; `\"` isn't an escape. Write an apostrophe inside that string as `''`.
 
 Pipe large programs to `rbx l -` or `rbx lc - PLAYER`.

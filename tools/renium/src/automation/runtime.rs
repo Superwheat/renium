@@ -36,9 +36,9 @@ use crate::project::workflows;
 use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
-    click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
-    get_console_output_result, goto_result, input_result, key_result, press_result,
-    record_end_result, record_start_result, shot_result, start_stop_play_result,
+    active_studio_play_clients, click_result, compact_live_status, editor_review_decision_result,
+    execute_luau_result, get_console_output_result, goto_result, input_result, key_result,
+    press_result, record_end_result, record_start_result, shot_result, start_stop_play_result,
     studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
     wait_until_result,
 };
@@ -161,6 +161,9 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
     }
     if lower.contains("unsupported") || lower.contains("does not support") {
         return automation::Failure::new("unsupported", message, false, "cap");
+    }
+    if lower.contains("studio changed ") && lower.contains("retry the sync") {
+        return automation::Failure::new("conflict", message, true, "context");
     }
     if lower.contains("conflict")
         || lower.contains("changed while")
@@ -413,12 +416,13 @@ fn automation_requires_runtime(operation: u16, parameters: &Value) -> bool {
 }
 
 fn pending_change_ack(bridge: &BridgeServer, services: &[String]) -> Result<Option<(u64, String)>> {
-    let state = bridge.call(
+    let state = bridge.call_for_target(
         "getStudioChangeState",
         json!({
             "services": services,
             "start": false,
         }),
+        BridgeTarget::Edit,
     )?;
     ensure_plugin_api_ok(&state)?;
     let has_pending = ["dirtyServices", "propertyChanges", "changes"]
@@ -447,7 +451,7 @@ pub(super) fn acknowledge_pulled_changes(
     seq: u64,
     runtime_id: &str,
 ) -> Result<Value> {
-    let result = bridge.call(
+    let result = bridge.call_for_target(
         "getStudioChangeState",
         json!({
             "services": services,
@@ -457,6 +461,7 @@ pub(super) fn acknowledge_pulled_changes(
             "includeGenerations": true,
             "includeAllState": true,
         }),
+        BridgeTarget::Edit,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
@@ -924,8 +929,57 @@ fn studio_status_result(
         "clients": bound_context::context_clients(clients, context),
         "selected": context.runtime_id,
     });
-    let clients = result["clients"].as_array().cloned().unwrap_or_default();
+    let mut clients = result["clients"].as_array().cloned().unwrap_or_default();
     let has_edit = clients.iter().any(|client| client["role"] == "edit");
+    let active_play_clients = clients
+        .iter()
+        .find(|client| client["role"] == "edit")
+        .and_then(|client| client.get("runtimeId").and_then(Value::as_str))
+        .map(|runtime_id| active_studio_play_clients(bridge, runtime_id))
+        .unwrap_or_default();
+    let studio_state = if has_edit {
+        bridge
+            .call_for_selector_with_timeout(
+                "getStudioState",
+                json!({}),
+                BridgeTarget::Edit,
+                None,
+                Some(Duration::from_secs(2)),
+            )
+            .ok()
+    } else {
+        None
+    };
+    let controller_play_running = studio_state
+        .as_ref()
+        .and_then(|state| state.get("playRunning"))
+        .and_then(Value::as_bool);
+    let controller_play_starting = studio_state
+        .as_ref()
+        .and_then(|state| state.get("playStarting"))
+        .and_then(Value::as_bool);
+    let play_running = if active_play_clients.is_empty() {
+        controller_play_running
+    } else {
+        Some(true)
+    };
+    let play_starting = if active_play_clients.is_empty() {
+        controller_play_starting
+    } else {
+        Some(false)
+    };
+    if has_edit {
+        clients.retain(|client| client["role"] == "edit");
+        for client in active_play_clients {
+            if !clients.iter().any(|existing| {
+                existing.get("runtimeId").and_then(Value::as_str)
+                    == client.get("runtimeId").and_then(Value::as_str)
+            }) {
+                clients.push(client);
+            }
+        }
+        result["clients"] = json!(clients);
+    }
     let mut available = Vec::new();
     if has_edit {
         available.push("Edit");
@@ -937,23 +991,19 @@ fn studio_status_result(
         available.push("Client");
     }
     result["availableDataModels"] = json!(available);
-    result["playState"] = json!(if clients
-        .iter()
-        .any(|client| client["role"] == "play-server" || client["role"] == "play-client")
+    result["playState"] = json!(if play_starting == Some(true) {
+        "starting"
+    } else if play_running == Some(true)
+        || (play_running.is_none()
+            && clients.iter().any(|client| {
+                client["role"] == "play-server" || client["role"] == "play-client"
+            }))
     {
         "running"
     } else {
         "stopped"
     });
-    if has_edit
-        && let Ok(state) = bridge.call_for_selector_with_timeout(
-            "getStudioState",
-            json!({}),
-            BridgeTarget::Edit,
-            None,
-            Some(Duration::from_millis(200)),
-        )
-    {
+    if let Some(state) = studio_state {
         result["studioState"] = state;
     }
     result
@@ -1044,7 +1094,7 @@ fn automation_dispatch_operation(
         | op::RETRY_PENDING
         | op::DISCARD_PENDING => {
             if operation != op::LIVE_STATUS {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
+                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
             }
             studio_change_state_result(studio_args::live(operation, parameters)?, bridge)
         }
@@ -2517,6 +2567,21 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_snapshot_invalidation_is_retryable_but_project_conflict_is_not() {
+        let studio = automation_failure_ref(&anyhow::anyhow!(
+            "Studio changed Workspace while native import was staged; retry the sync"
+        ));
+        assert_eq!(studio.0.c, "conflict");
+        assert_eq!(studio.0.rt, 1);
+
+        let project = automation_failure_ref(&anyhow::anyhow!(
+            "Project files changed while Studio recovery was being captured; retry the sync"
+        ));
+        assert_eq!(project.0.c, "conflict");
+        assert_eq!(project.0.rt, 0);
+    }
 
     #[test]
     fn recent_studio_launch_extends_only_its_connection_wait() {
