@@ -2028,7 +2028,7 @@ fn studio_play_clients(bridge: &BridgeServer, edit_runtime_id: &str) -> Vec<Valu
         })
         .unwrap_or_default();
     #[cfg(not(any(windows, target_os = "macos")))]
-    let same_process_runtime_ids = HashSet::new();
+    let same_process_runtime_ids = HashSet::<String>::new();
 
     clients
         .into_iter()
