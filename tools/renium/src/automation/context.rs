@@ -7,10 +7,13 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{BoundContext, Failure, State, StudioReopenTarget};
+#[cfg(any(windows, target_os = "macos"))]
 use crate::editor::review::local_place_path_for_pid;
 use crate::project::experience::{AmbiguousExperiencePlace, resolve_experience_place};
 use crate::project::{config, workflows};
-use crate::studio::bridge::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer, BridgeTarget};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::studio::bridge::BridgeTarget;
+use crate::studio::bridge::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer};
 use crate::studio::target::{place_matches, set_place_filter};
 use crate::system::files::canonical_path;
 
@@ -121,16 +124,24 @@ fn client_matches_saved_target(
     let Some(expected_file) = target.file.as_deref() else {
         return false;
     };
-    let Some(runtime_id) = entry.get("runtimeId").and_then(Value::as_str) else {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (bridge, entry, expected_file);
         return false;
-    };
-    let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
-        return false;
-    };
-    local_place_path_for_pid(pid).is_some_and(|file| {
-        canonical_path(&file).unwrap_or(file)
-            == canonical_path(expected_file).unwrap_or_else(|_| expected_file.to_path_buf())
-    })
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let Some(runtime_id) = entry.get("runtimeId").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
+            return false;
+        };
+        local_place_path_for_pid(pid).is_some_and(|file| {
+            canonical_path(&file).unwrap_or(file)
+                == canonical_path(expected_file).unwrap_or_else(|_| expected_file.to_path_buf())
+        })
+    }
 }
 
 pub(super) fn studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
