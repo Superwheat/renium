@@ -268,6 +268,7 @@ fn editor_mutation_package_targets(
     targets
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn discover_editor_mutation_packages_with_timeout(
     bridge: &BridgeServer,
     targets: &[Value],
@@ -311,6 +312,7 @@ fn discover_editor_mutation_packages_with_timeout(
     Ok(packages.into_values().collect())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn resolve_editor_package_target(
     bridge: &BridgeServer,
     path_segments: &[String],
