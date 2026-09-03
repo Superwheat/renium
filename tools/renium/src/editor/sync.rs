@@ -63,9 +63,10 @@ use crate::settings::equivalence::drop_settings_document;
 use crate::settings::instance::remove_instances_at_indices;
 use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::export::parse_bridge_ports;
+#[cfg(any(windows, target_os = "macos"))]
+use crate::studio::bridge::BridgeTarget;
 use crate::studio::bridge::{
-    BridgeRequestTooLarge, BridgeServer, BridgeTarget, MAX_BRIDGE_CHUNK_BYTES,
-    MAX_BRIDGE_REQUEST_BYTES,
+    BridgeRequestTooLarge, BridgeServer, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REQUEST_BYTES,
 };
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
