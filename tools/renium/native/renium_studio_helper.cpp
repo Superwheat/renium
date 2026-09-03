@@ -1,7 +1,11 @@
 #include <Windows.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <ostream>
 #include <sstream>
@@ -466,4 +470,486 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
     CleanupCaught(&state);
     SetMxcsr(params->initialMxcsr);
     return result;
+}
+
+struct PackageActionParams
+{
+    std::uint64_t taskContext;
+    std::uint64_t target;
+    std::uint64_t owner;
+    std::uint64_t window;
+    std::uint64_t action;
+    std::uint32_t timeoutMs;
+    std::uint32_t status;
+    std::uint32_t exceptionCode;
+    std::uint32_t enabled;
+    std::uint32_t uiThreadId;
+    std::uint32_t found;
+    char actionName[96];
+    char error[256];
+    std::uint64_t dataModel;
+    std::uint64_t dataModelOwner;
+    std::uint64_t moduleBase;
+    std::uint64_t value;
+    std::uint64_t operationRva;
+    std::uint64_t submitTaskRva;
+    std::uint64_t deadlineTick;
+    std::uint64_t actionDeadlineTick;
+    std::uint64_t reservedRva;
+    std::uint32_t mode;
+    std::uint32_t resultValid;
+    unsigned char result[128];
+    unsigned char reserved[64];
+};
+
+static_assert(sizeof(PackageActionParams) == 688);
+
+using SubmitDataModelTask = bool(__fastcall*)(
+    void*,
+    std::function<void()>*,
+    std::uint32_t);
+using SetPackageModifiedState = void(__fastcall*)(void*, std::uint32_t);
+using PublishPackage = void(__fastcall*)(
+    void*,
+    const SharedInstance*,
+    bool,
+    const std::function<void()>*,
+    const std::function<void(std::string)>*);
+using SetPackageVersion = void(__fastcall*)(
+    void*,
+    const std::shared_ptr<void>*,
+    std::int64_t,
+    const std::function<void(std::shared_ptr<void>)>*,
+    const std::function<void(std::string)>*);
+
+static void SetPackageActionError(PackageActionParams* params, const char* message)
+{
+    strncpy_s(params->error, message, _TRUNCATE);
+}
+
+static DWORD RemainingMilliseconds(std::uint64_t deadline)
+{
+    const auto now = GetTickCount64();
+    if (now >= deadline)
+        return 0;
+    const auto remaining = deadline - now;
+    return remaining > MAXDWORD ? MAXDWORD : static_cast<DWORD>(remaining);
+}
+
+struct PackageModifiedStateTask
+{
+    volatile LONG references;
+    HANDLE completed;
+    void* target;
+    void* owner;
+    SetPackageModifiedState setter;
+    std::uint32_t value;
+    std::uint64_t deadlineTick;
+    std::uint32_t status;
+    std::uint32_t exceptionCode;
+    char error[256];
+};
+
+static void ReleasePackageModifiedStateTask(PackageModifiedStateTask* task)
+{
+    if (InterlockedDecrement(&task->references) == 0)
+    {
+        CloseHandle(task->completed);
+        delete task;
+    }
+}
+
+static int RecordPackageModifiedStateException(
+    PackageModifiedStateTask* task,
+    EXCEPTION_POINTERS* exception)
+{
+    task->exceptionCode = exception->ExceptionRecord->ExceptionCode;
+    task->status = 0xE30B;
+    sprintf_s(
+        task->error,
+        "PackageLink.ModifiedState raised exception 0x%08X at %p",
+        static_cast<unsigned>(task->exceptionCode),
+        exception->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void SetPackageModifiedStateCaught(PackageModifiedStateTask* task)
+{
+    if (!RemainingMilliseconds(task->deadlineTick))
+    {
+        task->status = 0xE30F;
+        strncpy_s(task->error, "package DataModel write task timed out", _TRUNCATE);
+        return;
+    }
+    __try
+    {
+        task->setter(task->target, task->value);
+        task->status = 4;
+    }
+    __except (RecordPackageModifiedStateException(task, GetExceptionInformation()))
+    {
+    }
+}
+
+static void RunPackageModifiedStateTask(PackageActionParams* params)
+{
+    if (!AddOwnerReference(reinterpret_cast<void*>(params->owner)))
+    {
+        params->status = 0xE30A;
+        SetPackageActionError(params, "package root owner expired");
+        return;
+    }
+    auto task = new (std::nothrow) PackageModifiedStateTask{};
+    if (!task)
+    {
+        ReleaseOwnerReference(reinterpret_cast<void*>(params->owner));
+        params->status = 0xE30C;
+        SetPackageActionError(params, "could not allocate package write task");
+        return;
+    }
+    task->references = 2;
+    task->completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    task->target = reinterpret_cast<void*>(params->target);
+    task->owner = reinterpret_cast<void*>(params->owner);
+    task->setter = reinterpret_cast<SetPackageModifiedState>(
+        params->moduleBase + params->operationRva);
+    task->value = static_cast<std::uint32_t>(params->value);
+    task->deadlineTick = params->deadlineTick;
+    task->status = 2;
+    if (!task->completed)
+    {
+        params->exceptionCode = GetLastError();
+        params->status = 0xE30D;
+        SetPackageActionError(params, "could not create package write completion event");
+        ReleaseOwnerReference(task->owner);
+        task->references = 1;
+        ReleasePackageModifiedStateTask(task);
+        return;
+    }
+
+    std::function<void()> writeTask{[task]() {
+        SetPackageModifiedStateCaught(task);
+        ReleaseOwnerReference(task->owner);
+        SetEvent(task->completed);
+        ReleasePackageModifiedStateTask(task);
+    }};
+    auto submit = reinterpret_cast<SubmitDataModelTask>(
+        params->moduleBase + params->submitTaskRva);
+    if (!submit(reinterpret_cast<void*>(params->taskContext), &writeTask, 1))
+    {
+        params->status = 0xE30E;
+        SetPackageActionError(params, "Studio rejected the package DataModel write task");
+        ReleaseOwnerReference(task->owner);
+        ReleasePackageModifiedStateTask(task);
+        ReleasePackageModifiedStateTask(task);
+        return;
+    }
+
+    const auto remaining = RemainingMilliseconds(task->deadlineTick);
+    const auto waited = remaining
+        ? WaitForSingleObject(task->completed, remaining < 4000 ? remaining : 4000)
+        : WAIT_TIMEOUT;
+    if (waited == WAIT_OBJECT_0)
+    {
+        params->status = task->status;
+        params->exceptionCode = task->exceptionCode;
+        strncpy_s(params->error, task->error, _TRUNCATE);
+        params->result[0] = task->status == 4 ? 1 : 0;
+        params->resultValid = task->status == 4 ? 1 : 0;
+    }
+    else
+    {
+        params->status = 0xE30F;
+        params->exceptionCode = waited;
+        SetPackageActionError(params, "package DataModel write task timed out");
+    }
+    ReleasePackageModifiedStateTask(task);
+}
+
+struct PackageOperationCompletion
+{
+    HANDLE completed = nullptr;
+    std::mutex mutex;
+    bool succeeded = false;
+    std::string error;
+
+    ~PackageOperationCompletion()
+    {
+        if (completed)
+            CloseHandle(completed);
+    }
+};
+
+struct PackageOperationTask
+{
+    volatile LONG references = 2;
+    HANDLE dispatched = nullptr;
+    SharedInstance root{};
+    void* service = nullptr;
+    std::uintptr_t operation = 0;
+    std::int64_t version = 0;
+    std::uint32_t mode = 0;
+    std::uint64_t deadlineTick = 0;
+    std::uint32_t status = 2;
+    std::uint32_t exceptionCode = 0;
+    char error[256]{};
+    std::shared_ptr<PackageOperationCompletion> completion;
+};
+
+static void ReleasePackageOperationTask(PackageOperationTask* task)
+{
+    if (InterlockedDecrement(&task->references) == 0)
+    {
+        if (task->dispatched)
+            CloseHandle(task->dispatched);
+        delete task;
+    }
+}
+
+static void CallPackageOperation(PackageOperationTask* task)
+{
+    if (!RemainingMilliseconds(task->deadlineTick))
+    {
+        task->status = 0xE30F;
+        strncpy_s(task->error, "package operation task timed out", _TRUNCATE);
+        return;
+    }
+    const auto completion = task->completion;
+    std::function<void(std::string)> failed{[completion](std::string message) {
+        {
+            std::lock_guard lock(completion->mutex);
+            completion->error = std::move(message);
+        }
+        SetEvent(completion->completed);
+    }};
+    if (task->mode == 7)
+    {
+        std::function<void()> succeeded{[completion]() {
+            {
+                std::lock_guard lock(completion->mutex);
+                completion->succeeded = true;
+            }
+            SetEvent(completion->completed);
+        }};
+        reinterpret_cast<PublishPackage>(task->operation)(
+            task->service,
+            &task->root,
+            false,
+            &succeeded,
+            &failed);
+    }
+    else
+    {
+        std::function<void(std::shared_ptr<void>)> succeeded{
+            [completion](std::shared_ptr<void>) {
+                {
+                    std::lock_guard lock(completion->mutex);
+                    completion->succeeded = true;
+                }
+                SetEvent(completion->completed);
+            }};
+        reinterpret_cast<SetPackageVersion>(task->operation)(
+            task->service,
+            reinterpret_cast<const std::shared_ptr<void>*>(&task->root),
+            task->version,
+            &succeeded,
+            &failed);
+    }
+    task->status = 4;
+}
+
+static void CallPackageOperationCppCaught(PackageOperationTask* task)
+{
+    try
+    {
+        CallPackageOperation(task);
+    }
+    catch (const std::exception& exception)
+    {
+        task->status = 0xE30B;
+        strncpy_s(task->error, exception.what(), _TRUNCATE);
+    }
+    catch (...)
+    {
+        task->status = 0xE30B;
+        strncpy_s(task->error, "Studio package operation raised an unknown exception", _TRUNCATE);
+    }
+}
+
+static int RecordPackageOperationException(
+    PackageOperationTask* task,
+    EXCEPTION_POINTERS* exception)
+{
+    task->exceptionCode = exception->ExceptionRecord->ExceptionCode;
+    task->status = 0xE30B;
+    sprintf_s(
+        task->error,
+        "Studio package operation raised exception 0x%08X at %p",
+        static_cast<unsigned>(task->exceptionCode),
+        exception->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void CallPackageOperationCaught(PackageOperationTask* task)
+{
+    __try
+    {
+        CallPackageOperationCppCaught(task);
+    }
+    __except (RecordPackageOperationException(task, GetExceptionInformation()))
+    {
+    }
+}
+
+static void RunPackageOperationTask(PackageActionParams* params)
+{
+    std::shared_ptr<PackageOperationCompletion> completion;
+    try
+    {
+        completion = std::make_shared<PackageOperationCompletion>();
+    }
+    catch (...)
+    {
+        params->status = 0xE30C;
+        SetPackageActionError(params, "could not allocate package operation completion");
+        return;
+    }
+    completion->completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!completion->completed)
+    {
+        params->exceptionCode = GetLastError();
+        params->status = 0xE30D;
+        SetPackageActionError(params, "could not create package operation completion event");
+        return;
+    }
+    if (!AddOwnerReference(reinterpret_cast<void*>(params->owner)))
+    {
+        params->status = 0xE30A;
+        SetPackageActionError(params, "package root owner expired");
+        return;
+    }
+    auto task = new (std::nothrow) PackageOperationTask{};
+    if (!task)
+    {
+        ReleaseOwnerReference(reinterpret_cast<void*>(params->owner));
+        params->status = 0xE30C;
+        SetPackageActionError(params, "could not allocate package operation task");
+        return;
+    }
+    task->dispatched = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    task->root = {
+        reinterpret_cast<void*>(params->target),
+        reinterpret_cast<void*>(params->owner)};
+    task->service = reinterpret_cast<void*>(params->value);
+    task->operation = params->moduleBase + params->operationRva;
+    task->version = static_cast<std::int64_t>(params->reservedRva);
+    task->mode = params->mode;
+    task->deadlineTick = params->deadlineTick;
+    task->completion = completion;
+    if (!task->dispatched)
+    {
+        params->exceptionCode = GetLastError();
+        params->status = 0xE30D;
+        SetPackageActionError(params, "could not create package operation task event");
+        ReleaseOwnerReference(task->root.owner);
+        task->references = 1;
+        ReleasePackageOperationTask(task);
+        return;
+    }
+
+    std::function<void()> operationTask{[task]() {
+        CallPackageOperationCaught(task);
+        ReleaseOwnerReference(task->root.owner);
+        SetEvent(task->dispatched);
+        ReleasePackageOperationTask(task);
+    }};
+    auto submit = reinterpret_cast<SubmitDataModelTask>(
+        params->moduleBase + params->submitTaskRva);
+    if (!submit(reinterpret_cast<void*>(params->taskContext), &operationTask, 1))
+    {
+        params->status = 0xE30E;
+        SetPackageActionError(params, "Studio rejected the package operation task");
+        ReleaseOwnerReference(task->root.owner);
+        ReleasePackageOperationTask(task);
+        ReleasePackageOperationTask(task);
+        return;
+    }
+
+    auto remaining = RemainingMilliseconds(task->deadlineTick);
+    const auto dispatched = remaining
+        ? WaitForSingleObject(task->dispatched, remaining)
+        : WAIT_TIMEOUT;
+    if (dispatched != WAIT_OBJECT_0)
+    {
+        params->status = 0xE30F;
+        params->exceptionCode = dispatched;
+        SetPackageActionError(params, "Studio package operation task timed out");
+        ReleasePackageOperationTask(task);
+        return;
+    }
+    params->status = task->status;
+    params->exceptionCode = task->exceptionCode;
+    strncpy_s(params->error, task->error, _TRUNCATE);
+    ReleasePackageOperationTask(task);
+    if (params->status != 4)
+        return;
+
+    remaining = RemainingMilliseconds(params->deadlineTick);
+    const auto completed = remaining
+        ? WaitForSingleObject(completion->completed, remaining)
+        : WAIT_TIMEOUT;
+    if (completed != WAIT_OBJECT_0)
+    {
+        params->status = 0xE30F;
+        params->exceptionCode = completed;
+        SetPackageActionError(params, "Package operation did not finish before the deadline");
+        return;
+    }
+    std::lock_guard completionLock(completion->mutex);
+    if (!completion->succeeded)
+    {
+        params->status = 0xE310;
+        SetPackageActionError(
+            params,
+            completion->error.empty()
+                ? "Studio rejected the package operation"
+                : completion->error.c_str());
+        return;
+    }
+    params->result[0] = 1;
+    params->resultValid = 1;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumPackageAction(
+    PackageActionParams* params)
+{
+    if (!params)
+        return 0xE301;
+    if ((params->mode != 6 && params->mode != 7 && params->mode != 8) ||
+        !params->taskContext || !params->target || !params->owner ||
+        !params->moduleBase || !params->timeoutMs || !params->operationRva ||
+        !params->submitTaskRva ||
+        ((params->mode == 7 || params->mode == 8) && !params->value) ||
+        (params->mode == 8 && !params->reservedRva))
+    {
+        params->status = 0xE301;
+        SetPackageActionError(params, "invalid package action parameters");
+        return params->status;
+    }
+    params->status = 1;
+    params->exceptionCode = 0;
+    params->window = 0;
+    params->action = 0;
+    params->enabled = 0;
+    params->uiThreadId = 0;
+    params->found = 0;
+    params->error[0] = '\0';
+    params->resultValid = 0;
+    params->deadlineTick = GetTickCount64() + params->timeoutMs;
+    params->actionDeadlineTick = 0;
+    if (params->mode == 6)
+        RunPackageModifiedStateTask(params);
+    else
+        RunPackageOperationTask(params);
+    return params->status == 4 ? 0 : params->status;
 }

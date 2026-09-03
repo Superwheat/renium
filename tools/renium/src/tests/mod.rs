@@ -1354,6 +1354,26 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     .write_file(&settings_path)
     .unwrap();
 
+    let error = bytecode_set_property(BytecodeSetPropertyArgs {
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
+        property: "AutoUpdate".to_string(),
+        value_json: Some("true".to_string()),
+        value_str: None,
+        value_num: None,
+        value_bool: None,
+        value_null: false,
+        scope: "property".to_string(),
+        pretty: false,
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("PackageLink instances cannot be edited; use upl"),
+        "{error}"
+    );
+
     let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("garage".into())),
@@ -1361,7 +1381,10 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
         pretty: false,
     })
     .unwrap_err();
-    assert!(error.to_string().contains("Package-bearing"), "{error}");
+    assert!(
+        error.to_string().contains("use upl on the package root"),
+        "{error}"
+    );
 
     let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
@@ -1370,7 +1393,10 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
         pretty: false,
     })
     .unwrap_err();
-    assert!(error.to_string().contains("Package-bearing"), "{error}");
+    assert!(
+        error.to_string().contains("use upl on the package root"),
+        "{error}"
+    );
 
     let decoded = SettingsBytecode::read_file(&settings_path).unwrap();
     assert!(

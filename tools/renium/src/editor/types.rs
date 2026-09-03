@@ -301,6 +301,8 @@ pub(crate) struct EditorBinaryImportGroup {
     pub(crate) retained_roots: Vec<EditorBinaryRetainedRoot>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) package_roots: Vec<EditorBinaryPackageRoot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mutation_package_roots: Vec<EditorBinaryPackageRoot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) change_generation: Option<u64>,
 }

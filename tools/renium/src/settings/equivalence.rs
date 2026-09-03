@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use super::EXTERNAL_SOURCE_MARKER;
 use super::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, decode_settings_bytecode, encode_settings_bytecode,
-    encode_settings_bytecode_with_dense_references, is_reference_object,
+    encode_settings_bytecode_with_dense_references, is_known_default_property_value,
+    is_reference_object,
 };
 use crate::app::timing::{log_timing, verbose_timing_logs};
 use crate::rbx::decode::rbx_variant_to_settings_json;
@@ -1773,6 +1774,9 @@ pub(crate) fn reconciliation_property_value<'a>(
 }
 
 fn reconciliation_property_value_is_default(class_name: &str, name: &str, value: &Value) -> bool {
+    if is_known_default_property_value(name, value) {
+        return true;
+    }
     let Ok(database) = rbx_reflection_database::get() else {
         return false;
     };

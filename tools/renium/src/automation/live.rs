@@ -12,15 +12,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use super::BoundContext;
 use super::context as bound_context;
 use super::reconcile::{
-    BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup, push_project_delta,
-    studio_change_guard_from_state,
+    AppliedEditorChanges, BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup,
+    push_project_delta, studio_change_guard_from_state,
 };
 use super::runtime::{
     acknowledge_pulled_changes, automation_failure_ref, automation_pull_args, automation_push_args,
 };
+use super::{BoundContext, StudioReopenTarget};
 use crate::app::output::{ensure_plugin_api_ok, log_global};
 use crate::app::timing::elapsed_ms;
 use crate::editor::sync::{StudioChangeGuard, StudioChangedBeforePush};
@@ -73,8 +73,37 @@ struct Status {
     pushes: u64,
     pulls: u64,
     resolution_required: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    auto_desynced_packages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_desynced_at_push: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct LivePushResult {
+    generated_paths: Vec<PathBuf>,
+    auto_desynced_packages: Vec<String>,
+}
+
+fn auto_desynced_packages(summary: &serde_json::Map<String, Value>) -> Vec<String> {
+    summary
+        .get("autoDesyncedPackages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn record_successful_push(status: &mut Status, auto_desynced_packages: Vec<String>) {
+    status.pushes = status.pushes.saturating_add(1);
+    if !auto_desynced_packages.is_empty() {
+        status.auto_desynced_packages = auto_desynced_packages;
+        status.auto_desynced_at_push = Some(status.pushes);
+    }
 }
 
 struct Control {
@@ -103,6 +132,7 @@ struct Control {
 
 #[derive(Default)]
 struct FileChanges {
+    notified: BTreeSet<PathBuf>,
     queued: BTreeSet<PathBuf>,
     settled: BTreeSet<PathBuf>,
 }
@@ -181,6 +211,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for path in paths {
+            changes.notified.remove(&path);
             changes.queued.remove(&path);
             changes.settled.insert(path);
         }
@@ -198,6 +229,7 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for path in &paths {
+            changes.notified.remove(path);
             changes.settled.remove(path);
             changes.queued.insert(path.clone());
         }
@@ -216,6 +248,18 @@ impl Control {
         }));
         status.pending_paths = pending.into_iter().collect();
         drop(status);
+        self.notify_sync_state();
+    }
+
+    fn notify_files(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut changes = self
+            .file_changes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        changes
+            .notified
+            .extend(paths.into_iter().map(|path| absolute(path, &self.root)));
+        drop(changes);
         self.notify_sync_state();
     }
 
@@ -634,6 +678,13 @@ pub(crate) struct StartResult {
 }
 
 impl Manager {
+    pub(crate) fn saved_studio_target(
+        &self,
+        context: &BoundContext,
+    ) -> Result<Option<StudioReopenTarget>> {
+        saved_studio_target_for_root(Path::new(&context.root))
+    }
+
     pub(crate) fn saved_local_file(&self, context: &BoundContext) -> Result<Option<PathBuf>> {
         self.coordinator.saved_local_file(context)
     }
@@ -663,7 +714,6 @@ impl Manager {
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
     }
-
     fn session_alias(&self, context_id: u64) -> Option<SessionAlias> {
         self.aliases
             .lock()
@@ -1125,6 +1175,17 @@ impl Manager {
         self.status(context_id)
     }
 
+    pub(crate) fn notify_files(
+        &self,
+        context_id: u64,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Value {
+        if let Some(control) = self.control(context_id) {
+            control.notify_files(paths);
+        }
+        self.status(context_id)
+    }
+
     pub(crate) fn rebase_then_resume(
         &self,
         context_id: u64,
@@ -1330,9 +1391,52 @@ fn enabled_path(context: &BoundContext) -> PathBuf {
     Path::new(&context.root).join(".renium").join(ENABLED_FILE)
 }
 
+pub(crate) fn saved_studio_target_for_root(root: &Path) -> Result<Option<StudioReopenTarget>> {
+    let path = root.join(".renium").join(ENABLED_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to read persisted Live Sync state at {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    Ok(saved_studio_target(&bytes))
+}
+
 fn enabled_marker_matches(bytes: &[u8], target: &str) -> bool {
     serde_json::from_slice::<EnabledMarker>(bytes)
         .is_ok_and(|marker| marker.version == ENABLED_MARKER_VERSION && marker.target == target)
+}
+
+fn saved_studio_target(bytes: &[u8]) -> Option<StudioReopenTarget> {
+    let marker = serde_json::from_slice::<EnabledMarker>(bytes).ok()?;
+    if marker.version != ENABLED_MARKER_VERSION {
+        return None;
+    }
+    if let Some(ids) = marker.target.strip_prefix("published:") {
+        let (game_id, place_id) = ids.split_once(':')?;
+        let game_id = game_id.parse::<i64>().ok().filter(|id| *id > 0)?;
+        let place_id = place_id.parse::<i64>().ok().filter(|id| *id > 0)?;
+        return Some(StudioReopenTarget {
+            file: None,
+            game_id: Some(game_id),
+            place_id: Some(place_id),
+        });
+    }
+    marker
+        .target
+        .strip_prefix("local-file:")
+        .filter(|path| !path.is_empty())
+        .map(|path| StudioReopenTarget {
+            file: Some(PathBuf::from(path)),
+            game_id: None,
+            place_id: None,
+        })
 }
 
 struct WatchProject {
@@ -1408,6 +1512,29 @@ fn relevant(project: &WatchProject, path: &Path) -> bool {
             .any(|root| path == root || path.starts_with(root) && !ignored_under(path, root))
 }
 
+#[cfg(windows)]
+fn transient_file_read_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+fn transient_file_read_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn read_stamp_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut retries = 0;
+    loop {
+        match fs::read(path) {
+            Err(error) if retries < 20 && transient_file_read_error(&error) => {
+                retries += 1;
+                thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn stamp(path: &Path) -> Result<Option<FileStamp>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1420,7 +1547,7 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
     let (length, hash) = if directory {
         (0, 0)
     } else {
-        let bytes = match fs::read(path) {
+        let bytes = match read_stamp_bytes(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -1574,7 +1701,7 @@ fn push_full(
     context: &BoundContext,
     bridge: &BridgeServer,
     guard: Option<&StudioChangeGuard>,
-) -> Result<()> {
+) -> Result<LivePushResult> {
     let parameters = json!({ "verifySources": true });
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
@@ -1593,7 +1720,10 @@ fn push_full(
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
         bail!("Studio changes are waiting for review");
     }
-    Ok(())
+    Ok(LivePushResult {
+        generated_paths: Vec::new(),
+        auto_desynced_packages: auto_desynced_packages(&summary),
+    })
 }
 
 struct PulledStudioChanges {
@@ -2171,18 +2301,25 @@ fn apply_file_control_changes(
     pending: &mut BTreeSet<PathBuf>,
     blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
     control: &Control,
-) -> FileControlOutcome {
-    let (queued, settled) = {
+) -> Result<FileControlOutcome> {
+    let (notified, queued, settled) = {
         let mut changes = control
             .file_changes
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (
+            std::mem::take(&mut changes.notified),
             std::mem::take(&mut changes.queued),
             std::mem::take(&mut changes.settled),
         )
     };
     let mut outcome = FileControlOutcome::default();
+    if !notified.is_empty() && queue_changed(project, baseline, pending, blocked, notified)? {
+        unblock_full_push(project, blocked);
+        outcome.push_ready = Some(true);
+        outcome.push_immediately = true;
+        control.update_pending(pending);
+    }
     if !queued.is_empty() {
         let mut accepted = false;
         for path in queued {
@@ -2200,7 +2337,7 @@ fn apply_file_control_changes(
         control.update_pending(pending);
     }
     if settled.is_empty() {
-        return outcome;
+        return Ok(outcome);
     }
     for path in settled {
         if !relevant(project, &path) {
@@ -2221,7 +2358,7 @@ fn apply_file_control_changes(
     }
     outcome.push_ready = Some(pending.iter().any(|path| !blocked.contains_key(path)));
     control.update_pending(pending);
-    outcome
+    Ok(outcome)
 }
 
 struct PreparedPush {
@@ -2363,7 +2500,7 @@ impl LiveLoop {
             &mut self.pending,
             &mut self.blocked,
             &self.control,
-        );
+        )?;
         if let Some(ready) = file_control.push_ready {
             self.push_ready = ready;
         }
@@ -2507,7 +2644,7 @@ impl LiveLoop {
         self.rescan_pending = true;
     }
 
-    fn execute_push(&self, push: &PreparedPush) -> Option<Result<Vec<PathBuf>>> {
+    fn execute_push(&self, push: &PreparedPush) -> Option<Result<LivePushResult>> {
         let generation = self.control.generation.load(Ordering::Acquire);
         let _activity = self.control.begin_sync(generation)?;
         let gate_started = Instant::now();
@@ -2530,18 +2667,25 @@ impl LiveLoop {
                 let validation_paths = push.captured.keys().cloned().collect::<Vec<_>>();
                 self.coordinator
                     .validate_editor_changes(&self.context, &self.pair_key, &validation_paths)
-                    .and_then(|()| {
-                        push_full(&self.context, &self.bridge, Some(&push.guard))
-                            .map(|()| Vec::new())
-                    })
+                    .and_then(|()| push_full(&self.context, &self.bridge, Some(&push.guard)))
             } else {
-                self.coordinator.push_editor_changes(
-                    &self.context,
-                    &self.pair_key,
-                    &self.bridge,
-                    &push.paths,
-                    Some(&push.guard),
-                )
+                self.coordinator
+                    .push_editor_changes(
+                        &self.context,
+                        &self.pair_key,
+                        &self.bridge,
+                        &push.paths,
+                        Some(&push.guard),
+                    )
+                    .map(
+                        |AppliedEditorChanges {
+                             generated_paths,
+                             summary,
+                         }| LivePushResult {
+                            generated_paths,
+                            auto_desynced_packages: auto_desynced_packages(&summary),
+                        },
+                    )
             }
         };
         let result = match push_changes() {
@@ -2647,11 +2791,11 @@ impl LiveLoop {
         }
     }
 
-    fn record_push_success(
-        &mut self,
-        push: &PreparedPush,
-        generated_paths: Vec<PathBuf>,
-    ) -> Result<bool> {
+    fn record_push_success(&mut self, push: &PreparedPush, result: LivePushResult) -> Result<bool> {
+        let LivePushResult {
+            generated_paths,
+            auto_desynced_packages,
+        } = result;
         if push.refresh_project {
             if !self.record_full_push(push)? {
                 return Ok(true);
@@ -2664,7 +2808,7 @@ impl LiveLoop {
             .status
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        status.pushes = status.pushes.saturating_add(1);
+        record_successful_push(&mut status, auto_desynced_packages);
         if self.blocked.is_empty() {
             status.error = None;
         }
@@ -2973,6 +3117,53 @@ mod tests {
     }
 
     #[test]
+    fn persisted_live_sync_restores_its_exact_studio_target() {
+        let published = serde_json::to_vec(&EnabledMarker {
+            version: ENABLED_MARKER_VERSION,
+            target: "published:123:456".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            saved_studio_target(&published),
+            Some(StudioReopenTarget {
+                file: None,
+                game_id: Some(123),
+                place_id: Some(456),
+            })
+        );
+
+        let local = serde_json::to_vec(&EnabledMarker {
+            version: ENABLED_MARKER_VERSION,
+            target: "local-file:e:/downloads/TestPlace.rbxl".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            saved_studio_target(&local),
+            Some(StudioReopenTarget {
+                file: Some(PathBuf::from("e:/downloads/TestPlace.rbxl")),
+                game_id: None,
+                place_id: None,
+            })
+        );
+        assert_eq!(saved_studio_target(b"{}"), None);
+    }
+
+    #[test]
+    fn live_status_dates_the_last_auto_desync_event() {
+        let mut status = Status::default();
+        record_successful_push(&mut status, vec!["ReplicatedStorage.Package".to_string()]);
+        record_successful_push(&mut status, Vec::new());
+
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["pushes"], 2);
+        assert_eq!(value["autoDesyncedAtPush"], 1);
+        assert_eq!(
+            value["autoDesyncedPackages"],
+            json!(["ReplicatedStorage.Package"])
+        );
+    }
+
+    #[test]
     fn settled_wait_observes_an_event_quiet_period() {
         let control = test_control();
         let notifier = Arc::clone(&control);
@@ -2999,6 +3190,55 @@ mod tests {
 
         assert!(control.wait_settled(Duration::from_secs(1)));
         event.join().expect("event thread should finish");
+    }
+
+    #[test]
+    fn editor_save_notification_queues_only_a_real_file_change() {
+        let root = crate::tests::support::temp_dir("live-save-notification");
+        let source_root = root.join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("Module.luau");
+        fs::write(&source, "return 1\n").unwrap();
+
+        let project = WatchProject {
+            watcher: FileWatcher::new(8).unwrap(),
+            root: root.clone(),
+            roots: BTreeSet::from([source_root]),
+            files: BTreeSet::new(),
+            full_push: BTreeSet::new(),
+        };
+        let mut baseline = BTreeMap::from([(source.clone(), stamp(&source).unwrap().unwrap())]);
+        let mut pending = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
+        let control = Control::new(root.clone(), true, false, PairMode::Reconcile, false);
+
+        control.notify_files([source.clone()]);
+        let unchanged = apply_file_control_changes(
+            &project,
+            &mut baseline,
+            &mut pending,
+            &mut blocked,
+            &control,
+        )
+        .unwrap();
+        assert!(unchanged.push_ready.is_none());
+        assert!(pending.is_empty());
+
+        fs::write(&source, "return 2\n").unwrap();
+        control.notify_files([source.clone()]);
+        let changed = apply_file_control_changes(
+            &project,
+            &mut baseline,
+            &mut pending,
+            &mut blocked,
+            &control,
+        )
+        .unwrap();
+        assert_eq!(changed.push_ready, Some(true));
+        assert!(changed.push_immediately);
+        assert_eq!(pending, BTreeSet::from([source]));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use walkdir::WalkDir;
 
-use crate::app::output::print_json_output;
+use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::cli::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
 use crate::editor::sync::push_editor_changes_with_warm_bridge;
@@ -231,11 +231,17 @@ pub(crate) fn save_editor_history_entries(
                 != Some(before)
         });
         if entry.settings_before.is_none() && !source_changed {
-            if let Some(error) = source_errors_by_index.get(&sequence) {
-                eprintln!(
-                    "[renium] editor history: failed to save Source for {}: {}",
-                    entry.path_segments.join("."),
-                    error
+            if let Some(error) = source_errors_by_index
+                .get(&sequence)
+                .filter(|error| error.as_str() != "Script was not found")
+            {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] editor history skipped Source for {}: {}",
+                        entry.path_segments.join("."),
+                        error
+                    ),
                 );
             }
             continue;

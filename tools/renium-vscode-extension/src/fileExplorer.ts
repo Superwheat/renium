@@ -715,9 +715,9 @@ export class FileExplorerController implements vscode.Disposable {
     const picked = await vscode.window.showWarningMessage(
       `Remove ${label} and convert this package copy to a normal instance?`,
       { modal: true },
-      "Desync Package",
+      "Unlink Package",
     );
-    if (picked !== "Desync Package") {
+    if (picked !== "Unlink Package") {
       return;
     }
     try {
@@ -725,7 +725,7 @@ export class FileExplorerController implements vscode.Disposable {
       const removed = Array.isArray(result.removedPackageLinks) ? result.removedPackageLinks.length : 0;
       vscode.window.showInformationMessage(`Removed ${removed} PackageLink${removed === 1 ? "" : "s"}.`);
     } catch (error) {
-      vscode.window.showErrorMessage(`Failed to desync package. ${error instanceof Error ? error.message : String(error)}`);
+      vscode.window.showErrorMessage(`Failed to unlink package. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

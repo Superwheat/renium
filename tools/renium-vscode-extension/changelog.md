@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.4 - 2026-09-03
+
+### Roblox packages
+
+- Editing inside a linked package automatically marks it Changed and reports the package path, while keeping its PackageLink intact.
+- `rbx pd` marks a package Changed, `rbx pp` publishes its changes, and `rbx pu` discards local changes and updates to the latest published version.
+- Package actions work directly on Windows and macOS without selecting instances, opening dialogs, moving windows, or taking input focus.
+- Package roots remain protected during sync, including duplicate names, nested packages, rapid edits, retries, and full or filtered updates.
+- Discarding package changes restores the published contents instead of only clearing the Changed marker.
+- Failed package edits restore the original properties and script source before returning the package to Up To Date.
+- Renaming or repositioning a package root remains a normal local override instead of being mistaken for changed package contents.
+- Removing a PackageLink is now consistently named **Unlink Package** and remains an explicit `rbx upl` action.
+
+### Live Sync and Studio targeting
+
+- Live Sync reports packages it marked Changed so publishing remains an explicit choice.
+- Daemon and Studio restarts reconnect to the exact saved local file or published place, even when several Studio windows are open.
+- Direct editor commands return compact results while preserving package-change warnings and actionable errors.
+- Script verification accepts Studio's normal line-ending conversion without hiding real source differences.
+- Rapid file replacements wait through brief Windows file locks and sync the final saved revision.
+- Expected command failures stay in Renium's result and logs instead of filling Studio's Output.
+- Studio status lists the available sessions when a project can't select one unambiguously.
+
 ## 0.3.3 - 2026-09-01
 
 ### Studio sync

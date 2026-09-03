@@ -15,6 +15,7 @@ fn run(command: &mut Command, label: &str) {
 }
 
 fn build_windows(out_dir: &Path) {
+    println!("cargo:rustc-link-arg=/STACK:4194304");
     let source = PathBuf::from("native").join("renium_studio_helper.cpp");
     let output = out_dir.join("renium-studio-helper.dll");
     let mut build = cc::Build::new();
@@ -60,6 +61,8 @@ fn build_macos(out_dir: &Path) {
         "-Werror",
         "-fvisibility=hidden",
         "-pthread",
+        "-framework",
+        "CoreFoundation",
         "-Wl,-dead_strip",
         "-o",
     ]);

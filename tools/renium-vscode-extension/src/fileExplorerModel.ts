@@ -1105,7 +1105,7 @@ export class FileExplorerModel {
     const config = getExplorerConfig();
     const result = await this.withPausedProjectWrite(
       () => runJsonCli<CliDesyncPackageLinkResult>(config, [
-        "desync-package-link",
+        "unlink-package-link",
         loaded.service,
         "-r",
         config.projectRoot,

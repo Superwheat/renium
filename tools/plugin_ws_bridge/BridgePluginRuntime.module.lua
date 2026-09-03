@@ -172,9 +172,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.3"
+	local BRIDGE_VERSION = "0.3.4"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1788117265
+	local BRIDGE_BUILD_UNIX = 1788436894
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -4926,6 +4926,7 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.cancelEditorBinaryImport = editorSync.cancelBinaryImport
 	Config.bridgeMethodHandlers.cancelEditorReconcile = editorSync.cancelReconcile
 	Config.bridgeMethodHandlers.getEditorFilterCandidates = editorSync.getFilterCandidates
+	Config.bridgeMethodHandlers.getEditorMutationPackages = editorSync.getMutationPackages
 	Config.bridgeMethodHandlers.getEditorServiceChangeGenerations = editorSync.getServiceChangeGenerations
 	Config.editorTransactionUploads = TransactionUploadModule.create(
 		editorSync.beginTransaction,
@@ -5333,6 +5334,7 @@ function BridgePluginRuntime.start(context)
 		requestProtectedWriteReview = true,
 		getEditorPushReviewDecision = true,
 		getEditorFilterCandidates = true,
+		getEditorMutationPackages = true,
 		setEditorPushReviewDecision = true,
 		beginEditorBinaryExport = true,
 		finishEditorBinaryExport = true,

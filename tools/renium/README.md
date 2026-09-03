@@ -747,7 +747,9 @@ PowerShell 5.1 mangles inline JSON. Pipe it instead:
 | `ip` | `import-path` | `cr` | `create` |
 | `cp` | `clone` | `mv` | `move` |
 | `rn` | `rename` | `rm` | `remove` |
-| `dpl` | `desync-package-link` | `mip` | `import-model` |
+| `upl` | `unlink-package-link` | `mip` | `import-model` |
+| `pd` | `package-desync` | `pp` | `package-publish` |
+| `pu` | `package-update` |  |  |
 | `mep` | `export-model` | `tst` | `test` |
 | `x` | `export-snapshots` | `pl` | `pull` |
 | `ps` | `push` | `lon` | `live-start` |
@@ -824,8 +826,11 @@ Code publisher.
   listeners remain active through editor disconnects.
 - Live Sync starts by reconciling both sides against their last common state.
   Conflicts remain pending unless a Studio or editor preference is configured.
-- Package descendants sync normally. Renium preserves the PackageLink object
-  itself and never treats deleting it as package desynchronization.
+- Before changing a linked package descendant, Renium marks that package
+  Changed and reports its path. Publishing remains an explicit choice. Renium
+  preserves the PackageLink itself and never treats deleting it as package
+  desynchronization. `pu` discards package changes and updates to the latest
+  published version.
 - Stable IDs preserve reparenting without duplication.
 - Files → Studio batches create one undo step and stop on the first error.
 - Snapshot imports move stale generated paths to `.renium/import-backups/`.

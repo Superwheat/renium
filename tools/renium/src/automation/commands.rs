@@ -151,13 +151,26 @@ pub(super) fn run_daemon(
 }
 
 pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> Result<()> {
-    run_daemon(
+    if args.all {
+        return run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge));
+    }
+    match daemon_result(
         op::STUDIO_STATUS,
         project,
-        json!({ "all": args.all }),
+        json!({ "all": false }),
         false,
         Some(&args.bridge),
-    )
+    ) {
+        Ok(result) => app::output::print_json_output(&result, false),
+        Err(error)
+            if error
+                .to_string()
+                .contains("More than one Studio runtime matches this project") =>
+        {
+            run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn studio_reopen(args: StudioReopenArgs, project: Option<&Path>) -> Result<()> {
