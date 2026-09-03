@@ -28,9 +28,11 @@ use crate::daemon::transport::MAX_DAEMON_LINE_BYTES;
 use crate::editor::review::{
     local_place_path_for_bridge, local_place_path_for_pid, studio_pid_for_bridge,
 };
+#[cfg(any(windows, target_os = "macos"))]
+use crate::editor::sync::resolve_editor_package_target;
 use crate::editor::sync::{
     apply_editor_delete_with_warm_bridge, apply_editor_property_with_warm_bridge,
-    push_editor_changes_with_warm_bridge, resolve_editor_package_target,
+    push_editor_changes_with_warm_bridge,
 };
 use crate::project::workflows;
 use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
