@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::mem::{size_of, transmute, zeroed};
@@ -6,11 +6,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use memchr::memmem;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use memchr::{memchr_iter, memmem};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
@@ -45,16 +47,14 @@ const PARAM_ROOTS: usize = 144;
 const PARAM_OUTPUT_PATH: usize = 4240;
 const PARAM_ERROR: usize = 5280;
 const MAX_ROOTS: usize = 256;
-const DATA_MODEL_INSTANCE_SCAN: std::ops::RangeInclusive<usize> = 0x100..=0x400;
-const INSTANCE_CLASS_DESCRIPTOR_OFFSET: usize = 0x18;
-const INSTANCE_CHILDREN_OFFSET: usize = 0x70;
-const INSTANCE_NAME_OFFSET: usize = 0x98;
-const REMOTE_TIMEOUT: u32 = 30_000;
+const REMOTE_TIMEOUT: u32 = 20_000;
+const PACKAGE_UNMODIFIED_STATE: i64 = u32::MAX as i64;
 
 static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
 static LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, CachedLayout>>> = OnceLock::new();
 static DATA_MODELS: OnceLock<Mutex<HashMap<u32, CachedDataModel>>> = OnceLock::new();
-static HELPER_EXPORT_RVA: OnceLock<usize> = OnceLock::new();
+static HELPER_EXPORT_RVAS: OnceLock<HashMap<String, usize>> = OnceLock::new();
+static PACKAGE_LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, CachedPackageLayout>>> = OnceLock::new();
 struct CachedTrace {
     len: u64,
     modified: Option<SystemTime>,
@@ -66,12 +66,17 @@ struct CachedLayout {
     data: PeSection,
     trace: SerializerTrace,
 }
+struct CachedPackageLayout {
+    len: u64,
+    modified: Option<SystemTime>,
+    layout: PackageLayout,
+}
 #[derive(Clone)]
 struct CachedDataModel {
     title: String,
     outer: usize,
     owner: usize,
-    instance_offset: usize,
+    layout: InstanceLayout,
 }
 
 #[derive(Clone, Copy)]
@@ -83,17 +88,32 @@ struct SerializerTrace {
     deallocator: usize,
 }
 
+#[derive(Clone)]
+struct PackageLayout {
+    data: PeSection,
+    submit_task: usize,
+}
+
 #[derive(Clone, Copy)]
 struct SharedEntry {
     instance: usize,
     owner: usize,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct InstanceLayout {
+    data_model_instance: usize,
+    self_pointer: usize,
+    class_descriptor: usize,
+    children: usize,
+    name: usize,
+}
+
 struct ActiveDataModel {
     outer: usize,
     owner: usize,
-    instance_offset: usize,
     roots: Vec<SharedEntry>,
+    layout: InstanceLayout,
 }
 
 struct ProcessMemory {
@@ -197,18 +217,20 @@ impl ProcessMemory {
             address: address as usize,
         })
     }
+}
 
-    fn run(&self, address: usize, parameter: usize, timeout: u32) -> Result<u32> {
+impl RemoteAllocation<'_> {
+    fn run(&mut self, address: usize, timeout: u32) -> Result<u32> {
         let start = Some(unsafe {
             transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(address)
         });
         let thread = unsafe {
             CreateRemoteThread(
-                self.handle,
+                self.memory.handle,
                 null(),
                 0,
                 start,
-                parameter as *const c_void,
+                self.address as *const c_void,
                 0,
                 null_mut(),
             )
@@ -220,18 +242,20 @@ impl ProcessMemory {
             );
         }
         let waited = unsafe { WaitForSingleObject(thread, timeout) };
-        let timed_out = waited != WAIT_OBJECT_0;
-        if timed_out {
-            let completed = unsafe { WaitForSingleObject(thread, u32::MAX) };
-            if completed != WAIT_OBJECT_0 {
-                unsafe {
-                    CloseHandle(thread);
-                }
-                bail!(
-                    "Could not confirm Studio helper completion after waiting {timeout} ms: {}",
-                    std::io::Error::last_os_error()
-                );
+        if waited != WAIT_OBJECT_0 {
+            unsafe {
+                CloseHandle(thread);
             }
+            // The helper may still reference this allocation. Studio reclaims this small buffer
+            // on exit; freeing it here would create a remote use-after-free.
+            self.address = 0;
+            if waited == WAIT_TIMEOUT {
+                bail!("Studio helper exceeded its {timeout}ms deadline");
+            }
+            bail!(
+                "Could not wait for the Studio helper: {}",
+                std::io::Error::last_os_error()
+            );
         }
         let mut exit_code = 0;
         let ok = unsafe { GetExitCodeThread(thread, &mut exit_code) };
@@ -243,9 +267,6 @@ impl ProcessMemory {
                 "Could not read the Studio helper result: {}",
                 std::io::Error::last_os_error()
             );
-        }
-        if timed_out {
-            bail!("Studio helper exceeded its {timeout} ms deadline and finished afterward");
         }
         Ok(exit_code)
     }
@@ -266,6 +287,9 @@ struct RemoteAllocation<'a> {
 
 impl Drop for RemoteAllocation<'_> {
     fn drop(&mut self) {
+        if self.address == 0 {
+            return;
+        }
         unsafe {
             VirtualFreeEx(
                 self.memory.handle,
@@ -618,6 +642,101 @@ fn hex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn masked(value: &str) -> Result<Vec<Option<u8>>> {
+    value
+        .split_ascii_whitespace()
+        .map(|token| {
+            if token == "??" {
+                Ok(None)
+            } else {
+                u8::from_str_radix(token, 16)
+                    .map(Some)
+                    .context("Invalid masked byte pattern")
+            }
+        })
+        .collect()
+}
+
+fn find_all_masked(bytes: &[u8], pattern: &[Option<u8>], start: usize, end: usize) -> Vec<usize> {
+    if pattern.is_empty() || end < start || end - start < pattern.len() {
+        return Vec::new();
+    }
+    let Some((anchor_index, anchor)) = pattern
+        .iter()
+        .enumerate()
+        .find_map(|(index, value)| value.map(|value| (index, value)))
+    else {
+        return (start..=end - pattern.len()).collect();
+    };
+    memchr_iter(anchor, &bytes[start + anchor_index..end])
+        .filter_map(|matched| {
+            (start + anchor_index + matched)
+                .checked_sub(anchor_index)
+                .filter(|offset| *offset + pattern.len() <= end)
+        })
+        .filter(|offset| {
+            pattern.iter().enumerate().all(|(index, expected)| {
+                expected.is_none_or(|expected| bytes[offset + index] == expected)
+            })
+        })
+        .collect()
+}
+
+fn renderer_submit_task_rva(executable: &[u8], image: &PeImage<'_>) -> Result<usize> {
+    let signature = masked(
+        "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ?? 41 8B F8 48 8B F2 48 8B D9 \
+         0F 57 C0 F3 0F 7F 44 24 ?? 4C 8B 49 30 4D 85 C9",
+    )?;
+    let text = image.section(b".text")?;
+    let matches = find_all_masked(
+        executable,
+        &signature,
+        text.raw_offset,
+        text.raw_offset + text.raw_size,
+    );
+    if matches.len() != 1 {
+        bail!(
+            "Studio DataModel task submitter signature resolved {} candidates",
+            matches.len()
+        );
+    }
+    image.offset_to_rva(matches[0])
+}
+
+fn package_layout(path: &Path) -> Result<PackageLayout> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
+    let modified = metadata.modified().ok();
+    let cache = PACKAGE_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(layout) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
+        .map(|cached| cached.layout.clone())
+    {
+        return Ok(layout);
+    }
+    let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let image = PeImage::parse(&bytes)?;
+    let layout = PackageLayout {
+        data: image.section(b".data")?,
+        submit_task: renderer_submit_task_rva(&bytes, &image)?,
+    };
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            path.to_path_buf(),
+            CachedPackageLayout {
+                len: metadata.len(),
+                modified,
+                layout: layout.clone(),
+            },
+        );
+    Ok(layout)
+}
+
 fn modules(pid: u32) -> Result<Vec<ModuleEntry>> {
     let snapshot =
         unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
@@ -710,27 +829,64 @@ fn read_rtti_type(
     name.starts_with(".?A").then_some(name)
 }
 
-fn read_instance_class(memory: &ProcessMemory, instance: usize) -> Option<String> {
-    let descriptor = memory
-        .read_u64(instance + INSTANCE_CLASS_DESCRIPTOR_OFFSET)
-        .ok()? as usize;
-    let name = memory.read_u64(descriptor + 8).ok()? as usize;
+fn read_instance_class_at(
+    memory: &ProcessMemory,
+    instance: usize,
+    offset: usize,
+) -> Option<String> {
+    let descriptor = memory.read_u64(instance.checked_add(offset)?).ok()? as usize;
+    if !likely_pointer(descriptor) {
+        return None;
+    }
+    let name = memory.read_u64(descriptor.checked_add(8)?).ok()? as usize;
+    if !likely_pointer(name) {
+        return None;
+    }
     read_msvc_string(memory, name)
 }
 
-fn read_instance_name(memory: &ProcessMemory, instance: usize) -> Option<String> {
-    let name = memory.read_u64(instance + INSTANCE_NAME_OFFSET).ok()? as usize;
+fn read_instance_class(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+) -> Option<String> {
+    read_instance_class_at(memory, instance, layout.class_descriptor)
+}
+
+fn read_instance_name_at(memory: &ProcessMemory, instance: usize, offset: usize) -> Option<String> {
+    let name = memory.read_u64(instance.checked_add(offset)?).ok()? as usize;
+    if !likely_pointer(name) {
+        return None;
+    }
     read_msvc_string(memory, name)
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_msvc_string(memory, name.checked_add(8)?))
+}
+
+fn read_instance_name(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+) -> Option<String> {
+    read_instance_name_at(memory, instance, layout.name)
+        .or_else(|| read_instance_class(memory, instance, layout))
 }
 
 fn likely_pointer(value: usize) -> bool {
     (0x10000..0x0000_8000_0000_0000).contains(&value)
 }
 
-fn read_children(memory: &ProcessMemory, instance: usize) -> Option<Vec<SharedEntry>> {
-    let vector = memory.read_u64(instance + INSTANCE_CHILDREN_OFFSET).ok()? as usize;
+fn read_children_at(
+    memory: &ProcessMemory,
+    instance: usize,
+    offset: usize,
+) -> Option<Vec<SharedEntry>> {
+    let vector = memory.read_u64(instance.checked_add(offset)?).ok()? as usize;
     if vector == 0 {
         return Some(Vec::new());
+    }
+    if !likely_pointer(vector) {
+        return None;
     }
     let header = memory.read_vec(vector, 24).ok()?;
     let begin = u64::from_le_bytes(header[0..8].try_into().ok()?) as usize;
@@ -747,7 +903,7 @@ fn read_children(memory: &ProcessMemory, instance: usize) -> Option<Vec<SharedEn
     if count == 0 {
         return Some(Vec::new());
     }
-    let bytes = memory.read_vec(begin, count * 16).ok()?;
+    let bytes = memory.read_vec(begin, count.checked_mul(16)?).ok()?;
     let mut children = Vec::with_capacity(count);
     for index in 0..count {
         let offset = index * 16;
@@ -758,6 +914,14 @@ fn read_children(memory: &ProcessMemory, instance: usize) -> Option<Vec<SharedEn
         }
     }
     Some(children)
+}
+
+fn read_children(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+) -> Option<Vec<SharedEntry>> {
+    read_children_at(memory, instance, layout.children)
 }
 
 fn valid_owner(
@@ -772,10 +936,16 @@ fn valid_owner(
     let Ok(vtable) = memory.read_u64(owner).map(|value| value as usize) else {
         return false;
     };
-    let Ok(uses) = memory.read_u32(owner + 8) else {
+    let Some(uses_address) = owner.checked_add(8) else {
         return false;
     };
-    let Ok(weaks) = memory.read_u32(owner + 12) else {
+    let Ok(uses) = memory.read_u32(uses_address) else {
+        return false;
+    };
+    let Some(weaks_address) = owner.checked_add(12) else {
+        return false;
+    };
+    let Ok(weaks) = memory.read_u32(weaks_address) else {
         return false;
     };
     vtable >= module_base
@@ -802,10 +972,14 @@ fn expected_data_model_names(title: &str) -> Vec<String> {
     values
 }
 
-fn has_required_data_model_roots(memory: &ProcessMemory, roots: &[SharedEntry]) -> bool {
+fn has_required_data_model_roots(
+    memory: &ProcessMemory,
+    roots: &[SharedEntry],
+    layout: InstanceLayout,
+) -> bool {
     let mut found = 0u8;
     for root in roots {
-        found |= match read_instance_class(memory, root.instance).as_deref() {
+        found |= match read_instance_class(memory, root.instance, layout).as_deref() {
             Some("Workspace") => 1,
             Some("Players") => 2,
             Some("MaterialService") => 4,
@@ -816,6 +990,84 @@ fn has_required_data_model_roots(memory: &ProcessMemory, roots: &[SharedEntry]) 
         }
     }
     false
+}
+
+fn discover_instance_layout(
+    memory: &ProcessMemory,
+    module: &ModuleEntry,
+    outer: usize,
+) -> Vec<(InstanceLayout, String, Vec<SharedEntry>)> {
+    let required_classes = ["Workspace", "Players", "MaterialService"];
+    let mut layouts = HashSet::new();
+    let mut candidates = Vec::new();
+    for data_model_instance in (0..=0x800).step_by(8) {
+        let Some(instance) = outer.checked_add(data_model_instance) else {
+            continue;
+        };
+        for self_pointer in (0..=0x80).step_by(8).filter(|offset| {
+            instance
+                .checked_add(*offset)
+                .and_then(|address| memory.read_u64(address).ok())
+                .map(|value| value as usize)
+                == Some(instance)
+        }) {
+            for class_descriptor in (0..=0x100).step_by(8).filter(|offset| {
+                read_instance_class_at(memory, instance, *offset).as_deref() == Some("DataModel")
+            }) {
+                for children in (0..=0x180).step_by(8) {
+                    let Some(roots) = read_children_at(memory, instance, children) else {
+                        continue;
+                    };
+                    if roots.is_empty()
+                        || roots.len() > MAX_ROOTS
+                        || roots
+                            .iter()
+                            .any(|root| !valid_owner(memory, root.owner, module.base, module.size))
+                    {
+                        continue;
+                    }
+                    let root_classes = roots
+                        .iter()
+                        .filter_map(|root| {
+                            read_instance_class_at(memory, root.instance, class_descriptor)
+                                .map(|class| (root.instance, class))
+                        })
+                        .collect::<Vec<_>>();
+                    if !required_classes
+                        .iter()
+                        .all(|required| root_classes.iter().any(|(_, class)| class == required))
+                    {
+                        continue;
+                    }
+                    let direct_name = (0..=0x180).step_by(8).find_map(|name| {
+                        let data_model_name = read_instance_name_at(memory, instance, name)?;
+                        (!data_model_name.is_empty()
+                            && required_classes.iter().all(|required| {
+                                root_classes.iter().any(|(root, class)| {
+                                    class == required
+                                        && read_instance_name_at(memory, *root, name).as_deref()
+                                            == Some(*required)
+                                })
+                            }))
+                        .then_some((name, data_model_name))
+                    });
+                    let (name, data_model_name) =
+                        direct_name.unwrap_or_else(|| (0, "DataModel".to_string()));
+                    let layout = InstanceLayout {
+                        data_model_instance,
+                        self_pointer,
+                        class_descriptor,
+                        children,
+                        name,
+                    };
+                    if layouts.insert(layout) {
+                        candidates.push((layout, data_model_name, roots.clone()));
+                    }
+                }
+            }
+        }
+    }
+    candidates
 }
 
 fn find_active_data_model(
@@ -853,34 +1105,6 @@ fn find_active_data_model(
         {
             continue;
         }
-        let Some((instance_offset, instance)) = DATA_MODEL_INSTANCE_SCAN
-            .clone()
-            .step_by(8)
-            .find_map(|instance_offset| {
-                let instance = outer.checked_add(instance_offset)?;
-                (memory
-                    .read_u64(instance + 8)
-                    .ok()
-                    .map(|value| value as usize)
-                    == Some(instance)
-                    && read_instance_class(memory, instance).as_deref() == Some("DataModel"))
-                .then_some((instance_offset, instance))
-            })
-        else {
-            continue;
-        };
-        let Some(name) = read_instance_name(memory, instance) else {
-            continue;
-        };
-        let Some(roots) = read_children(memory, instance) else {
-            continue;
-        };
-        if roots.is_empty() || roots.len() > MAX_ROOTS {
-            continue;
-        }
-        if !has_required_data_model_roots(memory, &roots) {
-            continue;
-        }
         let owner = offsets
             .iter()
             .filter_map(|offset| {
@@ -896,28 +1120,24 @@ fn find_active_data_model(
         let Some(owner) = owner else {
             continue;
         };
-        if roots
-            .iter()
-            .any(|root| !valid_owner(memory, root.owner, module.base, module.size))
-        {
-            continue;
+        for (layout, name, roots) in discover_instance_layout(memory, module, outer) {
+            let exact_name = expected_names
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(&name));
+            let score = usize::from(exact_name) * 1000
+                + usize::from(!name.eq_ignore_ascii_case("Game")) * 100
+                + offsets.len().min(20);
+            candidates.push((
+                score,
+                name,
+                ActiveDataModel {
+                    outer,
+                    owner,
+                    roots,
+                    layout,
+                },
+            ));
         }
-        let exact_name = expected_names
-            .iter()
-            .any(|expected| expected.eq_ignore_ascii_case(&name));
-        let score = usize::from(exact_name) * 1000
-            + usize::from(!name.eq_ignore_ascii_case("Game")) * 100
-            + offsets.len().min(20);
-        candidates.push((
-            score,
-            name,
-            ActiveDataModel {
-                outer,
-                owner,
-                instance_offset,
-                roots,
-            },
-        ));
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     let Some((best_score, best_name, _)) = candidates.first() else {
@@ -948,18 +1168,20 @@ fn refresh_active_data_model(
     {
         return None;
     }
-    let instance = cached.outer.checked_add(cached.instance_offset)?;
+    let instance = cached
+        .outer
+        .checked_add(cached.layout.data_model_instance)?;
     if memory
-        .read_u64(instance + 8)
+        .read_u64(instance + cached.layout.self_pointer)
         .ok()
         .map(|value| value as usize)
         != Some(instance)
-        || read_instance_class(memory, instance).as_deref() != Some("DataModel")
+        || read_instance_class(memory, instance, cached.layout).as_deref() != Some("DataModel")
         || !valid_owner(memory, cached.owner, module.base, module.size)
     {
         return None;
     }
-    let roots = read_children(memory, instance)?;
+    let roots = read_children(memory, instance, cached.layout)?;
     if roots.is_empty()
         || roots.len() > MAX_ROOTS
         || roots
@@ -968,14 +1190,14 @@ fn refresh_active_data_model(
     {
         return None;
     }
-    if !has_required_data_model_roots(memory, &roots) {
+    if !has_required_data_model_roots(memory, &roots, cached.layout) {
         return None;
     }
     Some(ActiveDataModel {
         outer: cached.outer,
         owner: cached.owner,
-        instance_offset: cached.instance_offset,
         roots,
+        layout: cached.layout,
     })
 }
 
@@ -1008,7 +1230,7 @@ fn active_data_model(
                 title: title.to_string(),
                 outer: data_model.outer,
                 owner: data_model.owner,
-                instance_offset: data_model.instance_offset,
+                layout: data_model.layout,
             },
         );
     Ok(data_model)
@@ -1022,8 +1244,9 @@ fn select_service_root(
     let mut selected = None;
     let mut count = 0;
     for root in data_model.roots.iter().copied() {
-        if read_instance_class(memory, root.instance).as_deref() == Some(service)
-            || read_instance_name(memory, root.instance).as_deref() == Some(service)
+        if read_instance_class(memory, root.instance, data_model.layout).as_deref() == Some(service)
+            || read_instance_name(memory, root.instance, data_model.layout).as_deref()
+                == Some(service)
         {
             selected = selected.or(Some(root));
             count += 1;
@@ -1099,13 +1322,13 @@ fn ensure_helper_loaded(
         )
         .context("Remote LoadLibraryW address overflowed")?;
     let path_bytes = wide(path.as_os_str());
-    let remote_path = memory.allocate(path_bytes.len() * 2)?;
+    let mut remote_path = memory.allocate(path_bytes.len() * 2)?;
     let bytes = path_bytes
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
     memory.write(remote_path.address, &bytes)?;
-    memory.run(load_library, remote_path.address, REMOTE_TIMEOUT)?;
+    remote_path.run(load_library, REMOTE_TIMEOUT)?;
     let loaded = modules(pid)?
         .into_iter()
         .find(|module| module_path_matches(module, &path))
@@ -1121,9 +1344,9 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
         .collect()
 }
 
-fn helper_export_rva() -> Result<usize> {
-    if let Some(rva) = HELPER_EXPORT_RVA.get() {
-        return Ok(*rva);
+fn helper_export_rvas() -> Result<&'static HashMap<String, usize>> {
+    if let Some(exports) = HELPER_EXPORT_RVAS.get() {
+        return Ok(exports);
     }
     let image = PeImage::parse(HELPER_BYTES)?;
     let pe_offset = read_u32(HELPER_BYTES, 0x3c)? as usize;
@@ -1135,6 +1358,7 @@ fn helper_export_rva() -> Result<usize> {
     let functions = image.rva_to_offset(read_u32(HELPER_BYTES, export_offset + 28)? as usize)?;
     let names = image.rva_to_offset(read_u32(HELPER_BYTES, export_offset + 32)? as usize)?;
     let ordinals = image.rva_to_offset(read_u32(HELPER_BYTES, export_offset + 36)? as usize)?;
+    let mut exports = HashMap::with_capacity(name_count);
     for index in 0..name_count {
         let name_rva = read_u32(HELPER_BYTES, names + index * 4)? as usize;
         let name_offset = image.rva_to_offset(name_rva)?;
@@ -1142,18 +1366,25 @@ fn helper_export_rva() -> Result<usize> {
             .iter()
             .position(|byte| *byte == 0)
             .context("Studio helper export name is unterminated")?;
-        if &HELPER_BYTES[name_offset..name_offset + end] != b"ReniumRun" {
-            continue;
-        }
+        let name = std::str::from_utf8(&HELPER_BYTES[name_offset..name_offset + end])?.to_string();
         let ordinal = read_u16(HELPER_BYTES, ordinals + index * 2)? as usize;
         if ordinal >= function_count {
             bail!("Studio helper export ordinal is invalid");
         }
         let rva = read_u32(HELPER_BYTES, functions + ordinal * 4)? as usize;
-        let _ = HELPER_EXPORT_RVA.set(rva);
-        return Ok(rva);
+        exports.insert(name, rva);
     }
-    bail!("Studio helper is missing ReniumRun")
+    let _ = HELPER_EXPORT_RVAS.set(exports);
+    Ok(HELPER_EXPORT_RVAS
+        .get()
+        .expect("Studio helper exports were initialized"))
+}
+
+fn helper_export_rva(name: &str) -> Result<usize> {
+    helper_export_rvas()?
+        .get(name)
+        .copied()
+        .with_context(|| format!("Studio helper is missing {name}"))
 }
 
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -1162,6 +1393,650 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64(bytes: &mut [u8], offset: usize, value: usize) {
     bytes[offset..offset + 8].copy_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn find_class_member_descriptor(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+    member_name: &str,
+) -> Result<usize> {
+    let class_descriptor = memory.read_u64(instance + layout.class_descriptor)? as usize;
+    let mut matches = HashSet::new();
+    for offset in (0..=0x200usize).step_by(8) {
+        let Ok(entries) = memory
+            .read_u64(class_descriptor + offset)
+            .map(|value| value as usize)
+        else {
+            continue;
+        };
+        let Ok(count) = memory
+            .read_u64(class_descriptor + offset + 8)
+            .map(|value| value as usize)
+        else {
+            continue;
+        };
+        let Ok(capacity) = memory
+            .read_u64(class_descriptor + offset + 16)
+            .map(|value| value as usize)
+        else {
+            continue;
+        };
+        if count == 0
+            || count > 512
+            || capacity < count
+            || capacity > 1024
+            || !likely_pointer(entries)
+        {
+            continue;
+        }
+        for index in 0..count {
+            let Ok(member) = memory
+                .read_u64(entries + index * 16)
+                .map(|value| value as usize)
+            else {
+                continue;
+            };
+            if !likely_pointer(member) {
+                continue;
+            }
+            let Ok(name_object) = memory.read_u64(member + 8).map(|value| value as usize) else {
+                continue;
+            };
+            if read_msvc_string(memory, name_object).as_deref() == Some(member_name) {
+                matches.insert(member);
+            }
+        }
+    }
+    if matches.len() != 1 {
+        bail!(
+            "Class member '{member_name}' resolved to {} descriptors",
+            matches.len()
+        );
+    }
+    matches
+        .into_iter()
+        .next()
+        .context("Class member descriptor was not found")
+}
+
+fn property_class_adjustment(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+    descriptor: usize,
+    binding: usize,
+    property_name: &str,
+) -> Result<i32> {
+    let read_adjustment = |binding: usize| -> Option<i32> {
+        let cast = memory.read_u64(binding + 16).ok()? as usize;
+        let code = memory.read_vec(cast, 12).ok()?;
+        (code[..8] == [0x48, 0x8b, 0xc1, 0x33, 0xd2, 0x48, 0x81, 0xc1])
+            .then(|| i32::from_le_bytes([code[8], code[9], code[10], code[11]]))
+    };
+    let adjustment = read_adjustment(binding)
+        .or_else(|| {
+            let fallback =
+                find_class_member_descriptor(memory, instance, layout, "VersionNumber").ok()?;
+            let declaring_class = memory.read_u64(descriptor + 0x30).ok()?;
+            (memory.read_u64(fallback + 0x30).ok()? == declaring_class).then_some(())?;
+            let fallback_binding = memory.read_u64(fallback + 0x90).ok()? as usize;
+            read_adjustment(fallback_binding)
+        })
+        .with_context(|| format!("Property '{property_name}' cast has an unsupported layout"))?;
+    if adjustment >= 0 {
+        bail!("Property '{property_name}' resolved an invalid class adjustment");
+    }
+    Ok(adjustment)
+}
+
+#[derive(Clone, Copy)]
+struct IntegerPropertyLayout {
+    offset: usize,
+    width: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PackageStatusLayout {
+    modified: IntegerPropertyLayout,
+    has_new_version: IntegerPropertyLayout,
+    version: IntegerPropertyLayout,
+}
+
+fn integer_property_layout(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: InstanceLayout,
+    property_name: &str,
+) -> Result<IntegerPropertyLayout> {
+    let descriptor = find_class_member_descriptor(memory, instance, layout, property_name)?;
+    let binding = memory.read_u64(descriptor + 0x90)? as usize;
+    let getter = memory.read_u64(binding + 8)? as usize;
+    let code = memory.read_vec(getter, 8)?;
+    let (getter_offset, width) = if code[..3] == [0x48, 0x8b, 0x81] && code[7] == 0xc3 {
+        (
+            u32::from_le_bytes(code[3..7].try_into().expect("getter offset is four bytes"))
+                as usize,
+            8,
+        )
+    } else if code[..2] == [0x8b, 0x81] && code[6] == 0xc3 {
+        (
+            u32::from_le_bytes(code[2..6].try_into().expect("getter offset is four bytes"))
+                as usize,
+            4,
+        )
+    } else if code[..3] == [0x0f, 0xb6, 0x81] && code[7] == 0xc3 {
+        (
+            u32::from_le_bytes(code[3..7].try_into().expect("getter offset is four bytes"))
+                as usize,
+            1,
+        )
+    } else {
+        bail!("Property '{property_name}' getter has an unsupported layout");
+    };
+    let adjustment =
+        property_class_adjustment(memory, instance, layout, descriptor, binding, property_name)?;
+    let offset = getter_offset
+        .checked_add(adjustment.unsigned_abs() as usize)
+        .context("Property field offset overflowed")?;
+    if offset >= 0x1000 {
+        bail!("Property '{property_name}' resolved an invalid field offset");
+    }
+    Ok(IntegerPropertyLayout { offset, width })
+}
+
+fn read_integer_property(
+    memory: &ProcessMemory,
+    instance: usize,
+    layout: IntegerPropertyLayout,
+) -> Result<i64> {
+    match layout.width {
+        8 => Ok(memory.read_u64(instance + layout.offset)? as i64),
+        4 => Ok(i64::from(memory.read_u32(instance + layout.offset)?)),
+        1 => Ok(i64::from(memory.read_vec(instance + layout.offset, 1)?[0])),
+        _ => unreachable!(),
+    }
+}
+
+fn package_status_layout(
+    memory: &ProcessMemory,
+    link: usize,
+    layout: InstanceLayout,
+) -> Result<PackageStatusLayout> {
+    Ok(PackageStatusLayout {
+        modified: integer_property_layout(memory, link, layout, "ModifiedState")?,
+        has_new_version: integer_property_layout(memory, link, layout, "HasNewVersion")?,
+        version: integer_property_layout(memory, link, layout, "VersionNumber")?,
+    })
+}
+
+fn package_status(
+    memory: &ProcessMemory,
+    link: usize,
+    layout: PackageStatusLayout,
+) -> Result<(String, i64, i64)> {
+    let modified = read_integer_property(memory, link, layout.modified)?;
+    let has_new_version = read_integer_property(memory, link, layout.has_new_version)? != 0;
+    let version = read_integer_property(memory, link, layout.version)?;
+    let status = match (modified != PACKAGE_UNMODIFIED_STATE, has_new_version) {
+        (false, false) => "Up To Date",
+        (true, false) => "Changed",
+        (false, true) => "New Version Available",
+        (true, true) => "Changed + New Version Available",
+    };
+    Ok((status.to_string(), version, modified))
+}
+
+struct ResolvedPackage {
+    root: SharedEntry,
+    link: SharedEntry,
+    path: String,
+}
+
+fn resolve_package_target(
+    memory: &ProcessMemory,
+    data_model: &ActiveDataModel,
+    target: &super::PackageTarget,
+) -> Result<ResolvedPackage> {
+    if target.path_segments.len() < 2 {
+        bail!("Package target must include a service and package root");
+    }
+    if !target.path_ordinals.is_empty() && target.path_ordinals.len() != target.path_segments.len()
+    {
+        bail!("Package path ordinals must match the number of path segments");
+    }
+    let service = &target.path_segments[0];
+    let roots = data_model
+        .roots
+        .iter()
+        .copied()
+        .filter(|entry| {
+            read_instance_name(memory, entry.instance, data_model.layout).as_deref()
+                == Some(service)
+                || read_instance_class(memory, entry.instance, data_model.layout).as_deref()
+                    == Some(service)
+        })
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        bail!(
+            "Studio DataModel contains {} roots matching {service}",
+            roots.len()
+        );
+    }
+    let mut current = roots[0];
+    for (index, name) in target.path_segments.iter().enumerate().skip(1) {
+        let children = read_children(memory, current.instance, data_model.layout)
+            .context("Package target children changed while resolving its path")?;
+        let matches = children
+            .into_iter()
+            .filter(|entry| {
+                read_instance_name(memory, entry.instance, data_model.layout).as_deref()
+                    == Some(name)
+            })
+            .collect::<Vec<_>>();
+        let ordinal = target.path_ordinals.get(index).copied();
+        current = match ordinal {
+            Some(0) => bail!("Package path ordinals must be positive"),
+            Some(ordinal) => matches.get(ordinal - 1).copied().with_context(|| {
+                format!(
+                    "Package path segment '{name}' has {} matches, not ordinal {ordinal}",
+                    matches.len()
+                )
+            })?,
+            None if matches.len() == 1 => matches[0],
+            None => bail!(
+                "Package path segment '{name}' has {} matches; add --ords to select one",
+                matches.len()
+            ),
+        };
+    }
+    if read_instance_class(memory, current.instance, data_model.layout).as_deref()
+        == Some("PackageLink")
+    {
+        bail!("Target the package root, not its PackageLink child");
+    }
+    let links = read_children(memory, current.instance, data_model.layout)
+        .context("Package root children changed while locating PackageLink")?
+        .into_iter()
+        .filter(|entry| {
+            read_instance_class(memory, entry.instance, data_model.layout).as_deref()
+                == Some("PackageLink")
+        })
+        .collect::<Vec<_>>();
+    if links.len() != 1 {
+        bail!(
+            "Package root {} has {} direct PackageLink children",
+            target.path_segments.join("."),
+            links.len()
+        );
+    }
+    Ok(ResolvedPackage {
+        root: current,
+        link: links[0],
+        path: target.path_segments.join("."),
+    })
+}
+
+fn invoke_package_helper(
+    pid: u32,
+    memory: &ProcessMemory,
+    modules: &[ModuleEntry],
+    parameters: &mut [u8],
+    timeout: u32,
+) -> Result<()> {
+    put_u32(parameters, 40, timeout);
+    let helper = ensure_helper_loaded(pid, memory, modules)?;
+    let run = helper
+        .checked_add(helper_export_rva("ReniumPackageAction")?)
+        .context("Studio package helper address overflowed")?;
+    let mut remote = memory.allocate(parameters.len())?;
+    memory.write(remote.address, parameters)?;
+    let exit_code = remote.run(run, timeout)?;
+    memory.read(remote.address, parameters)?;
+    let status = read_u32(parameters, 44)?;
+    if exit_code != 0 || status != 4 {
+        bail!(
+            "Studio package action failed with status 0x{status:X}, exit 0x{exit_code:X}, exception 0x{:X}: {}",
+            read_u32(parameters, 48)?,
+            error_text_at(parameters, 160)
+        );
+    }
+    Ok(())
+}
+
+fn error_text_at(parameters: &[u8], offset: usize) -> String {
+    let bytes = &parameters[offset..];
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn package_timeout_ms(started: Instant, timeout: Duration) -> Result<u32> {
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .context("Package action exceeded its deadline")?;
+    u32::try_from(remaining.as_millis().max(1))
+        .context("Package action timeout exceeds the Windows limit")
+}
+
+fn data_model_task_context(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    data_model: &ActiveDataModel,
+) -> Result<usize> {
+    let data_model_instance = data_model
+        .outer
+        .checked_add(data_model.layout.data_model_instance)
+        .context("DataModel instance address overflowed")?;
+    let task_context = (memory.read_u64(data_model_instance + 0x58)? as usize) & !7;
+    if !likely_pointer(task_context) {
+        bail!("Studio DataModel task context is not ready");
+    }
+    let submit = studio
+        .base
+        .checked_add(layout.submit_task)
+        .context("Studio DataModel task submitter address overflowed")?;
+    let vtable = memory.read_u64(task_context)? as usize;
+    let valid = (0..16usize).any(|index| {
+        memory
+            .read_u64(vtable + index * 8)
+            .map(|value| value as usize)
+            .is_ok_and(|method| {
+                (studio.base..studio.base + studio.size).contains(&method)
+                    && submit >= method
+                    && submit - method <= 0x2000
+            })
+    });
+    if !valid {
+        bail!("Studio DataModel task submitter failed task-context validation");
+    }
+    Ok(task_context)
+}
+
+#[derive(Clone, Copy)]
+struct PackageUiBinding {
+    service: usize,
+    operation_rva: usize,
+}
+
+fn package_ui_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    data_model: &ActiveDataModel,
+    member_name: &str,
+) -> Result<PackageUiBinding> {
+    let services = data_model
+        .roots
+        .iter()
+        .copied()
+        .filter(|entry| {
+            read_instance_class(memory, entry.instance, data_model.layout).as_deref()
+                == Some("PackageUIService")
+        })
+        .collect::<Vec<_>>();
+    if services.len() != 1 {
+        bail!(
+            "Active Studio DataModel has {} PackageUIService instances",
+            services.len()
+        );
+    }
+    let service = services[0].instance;
+    let descriptor = find_class_member_descriptor(memory, service, data_model.layout, member_name)?;
+    let descriptor_type = read_rtti_type(memory, descriptor, studio.base, studio.size)
+        .with_context(|| format!("PackageUIService.{member_name} descriptor has no Studio RTTI"))?;
+    if !descriptor_type.contains("BoundYieldFuncDesc")
+        || !descriptor_type.contains("PackageUIService")
+        || !descriptor_type.contains("shared_ptr")
+    {
+        bail!("PackageUIService.{member_name} has an unsupported reflection binding");
+    }
+    let kind = memory.read_u64(descriptor + 0x28)? as usize;
+    if read_msvc_string(memory, kind).as_deref() != Some("YieldFunction") {
+        bail!("PackageUIService.{member_name} is not a yielding engine method");
+    }
+    let thunk = memory.read_u64(descriptor + 0x78)? as usize;
+    let code = memory.read_vec(thunk, 9)?;
+    if code[..5] != [0x48, 0x8b, 0x01, 0xff, 0xa0] {
+        bail!("PackageUIService.{member_name} dispatcher has an unsupported layout");
+    }
+    let slot = u32::from_le_bytes(
+        code[5..9]
+            .try_into()
+            .expect("virtual dispatch slot is four bytes"),
+    ) as usize;
+    if slot >= 0x1000 || !slot.is_multiple_of(8) {
+        bail!("PackageUIService.{member_name} resolved an invalid virtual slot");
+    }
+    let vtable = memory.read_u64(service)? as usize;
+    let operation = memory.read_u64(vtable + slot)? as usize;
+    if !(studio.base..studio.base + studio.size).contains(&operation) {
+        bail!("PackageUIService.{member_name} implementation is outside Studio");
+    }
+    Ok(PackageUiBinding {
+        service,
+        operation_rva: operation - studio.base,
+    })
+}
+
+pub(super) fn platform_package_action(
+    pid: u32,
+    studio_title: &str,
+    target: &super::PackageTarget,
+    action: super::PackageAction,
+    timeout: Duration,
+) -> Result<super::PackageActionResult> {
+    let started = Instant::now();
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Roblox Studio module was not found")?;
+    let layout = package_layout(&studio.path)?;
+    let memory = ProcessMemory::open(pid)?;
+    let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)?;
+    let package = resolve_package_target(&memory, &data_model, target)?;
+    let status_layout = package_status_layout(&memory, package.link.instance, data_model.layout)?;
+    let (initial_status, initial_version, initial_modified) =
+        package_status(&memory, package.link.instance, status_layout)?;
+    if initial_version != target.expected_version {
+        bail!(
+            "Package '{}' changed while Renium was preparing the action; expected version {}, found {}",
+            package.path,
+            target.expected_version,
+            initial_version
+        );
+    }
+    let changed = match action {
+        super::PackageAction::Desync | super::PackageAction::Restore => {
+            let target_state = if action == super::PackageAction::Desync {
+                1
+            } else {
+                PACKAGE_UNMODIFIED_STATE
+            };
+            let target_state_parameter = usize::try_from(target_state)
+                .context("PackageLink.ModifiedState exceeds the native parameter width")?;
+            if initial_modified != target_state {
+                let descriptor = find_class_member_descriptor(
+                    &memory,
+                    package.link.instance,
+                    data_model.layout,
+                    "ModifiedState",
+                )?;
+                let binding = memory.read_u64(descriptor + 0x90)? as usize;
+                let setter = memory.read_u64(binding + 16)? as usize;
+                if !(studio.base..studio.base + studio.size).contains(&setter) {
+                    bail!("PackageLink.ModifiedState setter is outside Studio");
+                }
+                let adjustment = property_class_adjustment(
+                    &memory,
+                    package.link.instance,
+                    data_model.layout,
+                    descriptor,
+                    binding,
+                    "ModifiedState",
+                )?;
+                let adjusted_link = package
+                    .link
+                    .instance
+                    .checked_add(adjustment.unsigned_abs() as usize)
+                    .context("Adjusted PackageLink address overflowed")?;
+                let task_context = data_model_task_context(&memory, studio, &layout, &data_model)?;
+                let mut parameters = vec![0; 688];
+                put_u64(&mut parameters, 0, task_context);
+                put_u64(&mut parameters, 8, adjusted_link);
+                put_u64(&mut parameters, 16, package.root.owner);
+                put_u64(&mut parameters, 416, data_model.outer);
+                put_u64(&mut parameters, 424, data_model.owner);
+                put_u64(&mut parameters, 432, studio.base);
+                put_u64(&mut parameters, 440, target_state_parameter);
+                put_u64(&mut parameters, 448, setter - studio.base);
+                put_u64(&mut parameters, 456, layout.submit_task);
+                put_u32(&mut parameters, 488, 6);
+                invoke_package_helper(
+                    pid,
+                    &memory,
+                    &current_modules,
+                    &mut parameters,
+                    package_timeout_ms(started, timeout)?,
+                )?;
+                let current =
+                    read_integer_property(&memory, package.link.instance, status_layout.modified)?;
+                if current != target_state {
+                    bail!(
+                        "Studio PackageLink.ModifiedState remained {current}, expected {target_state}"
+                    );
+                }
+                true
+            } else {
+                false
+            }
+        }
+        super::PackageAction::Publish => {
+            if initial_modified == PACKAGE_UNMODIFIED_STATE {
+                bail!(
+                    "Package '{}' is '{initial_status}'; publishing requires the Changed state",
+                    package.path
+                );
+            }
+            let binding = package_ui_binding(&memory, studio, &data_model, "PublishPackage")?;
+            let task_context = data_model_task_context(&memory, studio, &layout, &data_model)?;
+            let mut parameters = vec![0; 688];
+            put_u64(&mut parameters, 0, task_context);
+            put_u64(&mut parameters, 8, package.root.instance);
+            put_u64(&mut parameters, 16, package.root.owner);
+            put_u64(&mut parameters, 432, studio.base);
+            put_u64(&mut parameters, 440, binding.service);
+            put_u64(&mut parameters, 448, binding.operation_rva);
+            put_u64(&mut parameters, 456, layout.submit_task);
+            put_u32(&mut parameters, 488, 7);
+            invoke_package_helper(
+                pid,
+                &memory,
+                &current_modules,
+                &mut parameters,
+                package_timeout_ms(started, timeout)?,
+            )?;
+            loop {
+                let (_, version, modified) =
+                    package_status(&memory, package.link.instance, status_layout)?;
+                if modified == PACKAGE_UNMODIFIED_STATE && version >= initial_version {
+                    break version > initial_version;
+                }
+                if started.elapsed() >= timeout {
+                    bail!(
+                        "Package '{}' did not finish publishing within {:.1}s",
+                        package.path,
+                        timeout.as_secs_f64()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        super::PackageAction::Update => {
+            if initial_modified == PACKAGE_UNMODIFIED_STATE
+                && !initial_status.contains("New Version")
+            {
+                false
+            } else {
+                let binding =
+                    package_ui_binding(&memory, studio, &data_model, "SetPackageVersion")?;
+                let task_context = data_model_task_context(&memory, studio, &layout, &data_model)?;
+                let mut parameters = vec![0; 688];
+                put_u64(&mut parameters, 0, task_context);
+                put_u64(&mut parameters, 8, package.root.instance);
+                put_u64(&mut parameters, 16, package.root.owner);
+                put_u64(&mut parameters, 432, studio.base);
+                put_u64(&mut parameters, 440, binding.service);
+                put_u64(&mut parameters, 448, binding.operation_rva);
+                put_u64(&mut parameters, 456, layout.submit_task);
+                put_u64(
+                    &mut parameters,
+                    480,
+                    usize::try_from(initial_version)
+                        .context("Package version exceeds the native parameter range")?,
+                );
+                put_u32(&mut parameters, 488, 8);
+                invoke_package_helper(
+                    pid,
+                    &memory,
+                    &current_modules,
+                    &mut parameters,
+                    package_timeout_ms(started, timeout)?,
+                )?;
+                loop {
+                    if let Ok(updated) = resolve_package_target(&memory, &data_model, target)
+                        && let Ok(updated_layout) =
+                            package_status_layout(&memory, updated.link.instance, data_model.layout)
+                        && let Ok((status, version, modified)) =
+                            package_status(&memory, updated.link.instance, updated_layout)
+                        && modified == PACKAGE_UNMODIFIED_STATE
+                        && status == "Up To Date"
+                        && version >= initial_version
+                    {
+                        break true;
+                    }
+                    if started.elapsed() >= timeout {
+                        bail!(
+                            "Package '{}' did not finish updating within {:.1}s",
+                            package.path,
+                            timeout.as_secs_f64()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    };
+    let current_package = if matches!(action, super::PackageAction::Update) {
+        resolve_package_target(&memory, &data_model, target)?
+    } else {
+        package
+    };
+    let current_status_layout = if matches!(action, super::PackageAction::Update) {
+        package_status_layout(&memory, current_package.link.instance, data_model.layout)?
+    } else {
+        status_layout
+    };
+    let (status, version, _) = package_status(
+        &memory,
+        current_package.link.instance,
+        current_status_layout,
+    )?;
+    Ok(super::PackageActionResult {
+        action: match action {
+            super::PackageAction::Desync => "desync",
+            super::PackageAction::Restore => "restore",
+            super::PackageAction::Publish => "publish",
+            super::PackageAction::Update => "update",
+        },
+        changed,
+        path: current_package.path,
+        status,
+        version,
+    })
 }
 
 fn build_parameters(
@@ -1242,7 +2117,7 @@ fn write_live_snapshot(
     let helper_started = Instant::now();
     let helper = ensure_helper_loaded(pid, &memory, &current_modules)?;
     let helper_run = helper
-        .checked_add(helper_export_rva()?)
+        .checked_add(helper_export_rva("ReniumRun")?)
         .context("Studio helper address overflowed")?;
     let helper_ms = helper_started.elapsed().as_secs_f64() * 1000.0;
     let temporary = temporary_output_path(output, pid)?;
@@ -1254,10 +2129,10 @@ fn write_live_snapshot(
             &temporary,
             service.is_none(),
         )?;
-        let remote = memory.allocate(parameters.len())?;
+        let mut remote = memory.allocate(parameters.len())?;
         memory.write(remote.address, &parameters)?;
         let invoke_started = Instant::now();
-        let exit_code = memory.run(helper_run, remote.address, REMOTE_TIMEOUT)?;
+        let exit_code = remote.run(helper_run, REMOTE_TIMEOUT)?;
         let invoke_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
         memory.read(remote.address, &mut parameters)?;
         let status = read_u32(&parameters, PARAM_STATUS)?;

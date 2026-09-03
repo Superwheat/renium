@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{BoundContext, Failure, State};
+use super::{BoundContext, Failure, State, StudioReopenTarget};
+use crate::editor::review::local_place_path_for_pid;
 use crate::project::experience::{AmbiguousExperiencePlace, resolve_experience_place};
 use crate::project::{config, workflows};
-use crate::studio::bridge::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer};
+use crate::studio::bridge::{BRIDGE_ROLE_EDIT, BridgeInfoPayload, BridgeServer, BridgeTarget};
 use crate::studio::target::{place_matches, set_place_filter};
 use crate::system::files::canonical_path;
 
@@ -106,6 +107,30 @@ fn client_selector(entry: &Value) -> Option<String> {
         || place_id.to_string(),
         |game_id| format!("{game_id}:{place_id}"),
     ))
+}
+
+fn client_matches_saved_target(
+    bridge: &BridgeServer,
+    entry: &Value,
+    target: &StudioReopenTarget,
+) -> bool {
+    if let (Some(game_id), Some(place_id)) = (target.game_id, target.place_id) {
+        return entry.get("gameId").and_then(Value::as_i64) == Some(game_id)
+            && entry.get("placeId").and_then(Value::as_i64) == Some(place_id);
+    }
+    let Some(expected_file) = target.file.as_deref() else {
+        return false;
+    };
+    let Some(runtime_id) = entry.get("runtimeId").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
+        return false;
+    };
+    local_place_path_for_pid(pid).is_some_and(|file| {
+        canonical_path(&file).unwrap_or(file)
+            == canonical_path(expected_file).unwrap_or_else(|_| expected_file.to_path_buf())
+    })
 }
 
 pub(super) fn studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
@@ -296,6 +321,15 @@ pub(super) fn bind(
     }
     let manifest_game_id = identity.as_ref().and_then(|place| place.game_id);
     let manifest_place_id = identity.as_ref().and_then(|place| place.place_id);
+    let saved_target =
+        super::live::saved_studio_target_for_root(&project_root).map_err(|error| {
+            Failure::new(
+                "no_project",
+                format!("{error:#}"),
+                false,
+                "project-validate",
+            )
+        })?;
     let alias = identity.as_ref().map(|place| place.alias.clone());
     let selector =
         requested_place
@@ -305,11 +339,23 @@ pub(super) fn bind(
                     format!("{game_id}:{place_id}")
                 }
                 (_, Some(place_id)) if place_id > 0 => place_id.to_string(),
-                _ => alias.clone().unwrap_or_default(),
+                _ => saved_target
+                    .as_ref()
+                    .and_then(|target| match (target.game_id, target.place_id) {
+                        (Some(game_id), Some(place_id)) => Some(format!("{game_id}:{place_id}")),
+                        _ => None,
+                    })
+                    .or_else(|| alias.clone())
+                    .unwrap_or_default(),
             });
     let mut candidates = studio_candidates(bridge, &selector);
     if let Some(runtime) = requested_runtime.as_deref() {
         candidates.retain(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime));
+    } else if requested_place.is_none()
+        && manifest_place_id.is_none()
+        && let Some(target) = saved_target.as_ref()
+    {
+        candidates.retain(|entry| client_matches_saved_target(bridge, entry, target));
     }
     if candidates.len() > 1 {
         return Err(ambiguous_studios(&candidates));
@@ -331,16 +377,20 @@ pub(super) fn bind(
                 .parse::<i64>()
                 .ok()
         })
+        .or(manifest_place_id)
+        .or_else(|| saved_target.as_ref().and_then(|target| target.place_id))
         .or_else(|| {
             candidate
                 .and_then(|entry| entry.get("placeId"))
                 .and_then(Value::as_i64)
-        })
-        .or(manifest_place_id);
-    let game_id = candidate
-        .and_then(|entry| entry.get("gameId"))
-        .and_then(Value::as_i64)
-        .or(manifest_game_id);
+        });
+    let game_id = manifest_game_id
+        .or_else(|| saved_target.as_ref().and_then(|target| target.game_id))
+        .or_else(|| {
+            candidate
+                .and_then(|entry| entry.get("gameId"))
+                .and_then(Value::as_i64)
+        });
     let fingerprint = fingerprint(&project_path, &experience).map_err(|error| {
         Failure::new(
             "no_project",

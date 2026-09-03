@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::app::output::{global_pretty_output, global_yes, log_global, print_json_output};
+use crate::app::output::{
+    global_log_enabled, global_pretty_output, global_yes, log_global, print_json_output,
+};
 use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_logs};
 use crate::automation::op;
 use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
@@ -30,7 +32,8 @@ use crate::editor::document::{
 use crate::editor::history::save_editor_history_entries;
 use crate::editor::paths::{
     build_editor_instance_paths, editor_directory_target, editor_run_context_value,
-    editor_source_target_with_children, infer_editor_source_path_spec, service_from_changed_path,
+    editor_source_target_with_children, infer_editor_source_path_spec, infer_source_script,
+    service_from_changed_path,
 };
 use crate::editor::review::{
     apply_protected_writes_offline, is_externally_managed_editor_property,
@@ -52,6 +55,7 @@ use crate::project::package_links::{
     apply_link_enforcement_to_changed_paths, build_link_enforcement,
     build_loaded_project_link_enforcement, package_target_fingerprint_with_external_sources,
 };
+use crate::rbx::decode::rbx_reflection_class_is_a;
 use crate::rbx::encode::rbx_model_property_descriptor;
 use crate::roblox::schema::{PropertySchemaMap, load_rbx_dom_property_schema};
 use crate::settings::bytecode::{SettingsBytecode, is_reference_object, settings_reference_index};
@@ -60,7 +64,8 @@ use crate::settings::instance::remove_instances_at_indices;
 use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::export::parse_bridge_ports;
 use crate::studio::bridge::{
-    BridgeRequestTooLarge, BridgeServer, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REQUEST_BYTES,
+    BridgeRequestTooLarge, BridgeServer, BridgeTarget, MAX_BRIDGE_CHUNK_BYTES,
+    MAX_BRIDGE_REQUEST_BYTES,
 };
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
@@ -70,6 +75,7 @@ use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix,
 };
+use crate::system::text::normalized_source_bytes;
 
 struct EditorTransaction<'a> {
     bridge: &'a BridgeServer,
@@ -77,6 +83,10 @@ struct EditorTransaction<'a> {
     active: bool,
     package_mutation: bool,
     package_dialog: Option<crate::studio::input::PackageChangesDialogWatcher>,
+    auto_desynced_packages: Vec<String>,
+    auto_desynced_package_targets: Vec<EditorPackageTarget>,
+    package_runtime: Option<(u32, String)>,
+    auto_desync_confirmed: bool,
 }
 
 #[derive(Clone)]
@@ -103,10 +113,235 @@ impl std::error::Error for StudioChangedBeforePush {}
 struct EditorCommitStatus {
     package_mutation: bool,
     package_dialog_accepted: bool,
+    auto_desynced_packages: Vec<String>,
+    auto_desync_confirmed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorPackageTarget {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) expected_version: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorMutationPackages {
+    packages: Vec<EditorPackageTarget>,
+}
+
+fn package_root_property_is_override(class_name: &str, property_name: &str) -> bool {
+    if property_name == "Name" {
+        return true;
+    }
+    let Ok(database) = rbx_reflection_database::get() else {
+        return false;
+    };
+    (rbx_reflection_class_is_a(database, class_name, "Model") && property_name == "WorldPivot")
+        || (rbx_reflection_class_is_a(database, class_name, "BasePart")
+            && matches!(property_name, "CFrame" | "Position" | "Orientation"))
+        || (rbx_reflection_class_is_a(database, class_name, "GuiObject")
+            && matches!(property_name, "Position" | "Rotation"))
+        || (matches!(class_name, "ScreenGui" | "SurfaceGui" | "BillboardGui")
+            && property_name == "Enabled")
+}
+
+fn property_change_can_modify_package_root(change: &EditorPropertyChange) -> bool {
+    change
+        .properties
+        .keys()
+        .chain(&change.reset_properties)
+        .any(|name| !package_root_property_is_override(&change.class_name, name))
 }
 
 fn editor_transaction_state(result: &Value) -> Option<&str> {
     result.get("state").and_then(Value::as_str)
+}
+
+fn editor_mutation_package_targets(
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+) -> Vec<Value> {
+    let native_services = binary_import
+        .into_iter()
+        .flat_map(|import| import.groups.iter().map(|group| group.service.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut keys = BTreeSet::new();
+    let mut targets = Vec::new();
+    let mut add =
+        |service: &str, path: &[String], ordinals: &[usize], include_self: bool, kind: &str| {
+            let service_prefixed = path.first().is_some_and(|segment| segment == service);
+            let path = if service_prefixed {
+                path.to_vec()
+            } else {
+                std::iter::once(service.to_string())
+                    .chain(path.iter().cloned())
+                    .collect()
+            };
+            let ordinals = if ordinals.is_empty() || service_prefixed {
+                ordinals.to_vec()
+            } else {
+                std::iter::once(1).chain(ordinals.iter().copied()).collect()
+            };
+            if path.len() < 2 {
+                return;
+            }
+            let key = (
+                service.to_string(),
+                path.clone(),
+                ordinals.clone(),
+                include_self,
+                kind.to_string(),
+            );
+            if keys.insert(key) {
+                targets.push(json!({
+                    "service": service,
+                    "pathSegments": path,
+                    "pathOrdinals": ordinals,
+                    "includeSelf": include_self,
+                    "kind": kind,
+                }));
+            }
+        };
+    for change in &changes.source_changes {
+        if change.class_name != "PackageLink" {
+            add(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+                true,
+                "source",
+            );
+        }
+    }
+    for change in &changes.property_changes {
+        if change.class_name != "PackageLink" {
+            add(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+                property_change_can_modify_package_root(change),
+                "property",
+            );
+        }
+    }
+    for change in &changes.instance_changes {
+        if native_services.contains(change.service.as_str()) {
+            continue;
+        }
+        for instance in &change.instances {
+            if instance.anchor_only || instance.class_name == "PackageLink" {
+                continue;
+            }
+            add(
+                &change.service,
+                &instance.path_segments,
+                &instance.path_ordinals,
+                false,
+                "instance",
+            );
+            if !instance.previous_path_segments.is_empty() {
+                add(
+                    &change.service,
+                    &instance.previous_path_segments,
+                    &instance.previous_path_ordinals,
+                    false,
+                    "instance",
+                );
+            }
+        }
+    }
+    if let Some(binary_import) = binary_import {
+        for group in &binary_import.groups {
+            for package_root in &group.mutation_package_roots {
+                add(
+                    &group.service,
+                    &package_root.path_segments,
+                    &package_root.path_ordinals,
+                    true,
+                    "binary",
+                );
+            }
+        }
+    }
+    targets
+}
+
+fn discover_editor_mutation_packages_with_timeout(
+    bridge: &BridgeServer,
+    targets: &[Value],
+    runtime_id: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<Vec<EditorPackageTarget>> {
+    let mut packages = BTreeMap::new();
+    for chunk in targets.chunks(256) {
+        let params = json!({ "targets": chunk });
+        let value = if let Some(runtime_id) = runtime_id {
+            bridge.call_for_runtime_with_timeout(
+                "getEditorMutationPackages",
+                params,
+                BridgeTarget::Edit,
+                runtime_id,
+                timeout,
+            )?
+        } else {
+            bridge.call_for_selector_with_timeout(
+                "getEditorMutationPackages",
+                params,
+                BridgeTarget::Edit,
+                None,
+                timeout,
+            )?
+        };
+        let result: EditorMutationPackages = serde_json::from_value(value)
+            .context("Studio returned invalid mutation package targets")?;
+        for package in result.packages {
+            if package.expected_version <= 0 {
+                bail!("Studio returned an invalid package version");
+            }
+            let key = (package.path_segments.clone(), package.path_ordinals.clone());
+            if let Some(previous) = packages.insert(key, package.clone())
+                && previous.expected_version != package.expected_version
+            {
+                bail!("Package changed while Renium was resolving the mutation; retry");
+            }
+        }
+    }
+    Ok(packages.into_values().collect())
+}
+
+pub(crate) fn resolve_editor_package_target(
+    bridge: &BridgeServer,
+    path_segments: &[String],
+    path_ordinals: &[usize],
+    runtime_id: &str,
+    timeout: Duration,
+) -> Result<EditorPackageTarget> {
+    let service = path_segments
+        .first()
+        .context("Package target must include a service")?;
+    let targets = [json!({
+        "service": service,
+        "pathSegments": path_segments,
+        "pathOrdinals": path_ordinals,
+        "includeSelf": true,
+    })];
+    let mut packages = discover_editor_mutation_packages_with_timeout(
+        bridge,
+        &targets,
+        Some(runtime_id),
+        Some(timeout),
+    )?;
+    packages.retain(|package| {
+        package.path_segments == path_segments
+            && (path_ordinals.is_empty() || package.path_ordinals == path_ordinals)
+    });
+    match packages.len() {
+        1 => Ok(packages.pop().expect("one package target remains")),
+        0 => bail!("Target is not a Roblox package root"),
+        count => bail!("Package target resolved to {count} roots; add --ords"),
+    }
 }
 
 impl<'a> EditorTransaction<'a> {
@@ -263,6 +498,7 @@ impl<'a> EditorTransaction<'a> {
             "sourceChanges": source_changes,
             "propertyChanges": property_changes,
             "mutationRoots": mutation_roots,
+            "mutationPackageTargets": editor_mutation_package_targets(changes, binary_import),
             "postCommitPropertyChanges": post_commit_property_changes,
             "nativeImport": native_import,
             "nativeImportServices": native_import_services,
@@ -290,6 +526,9 @@ impl<'a> EditorTransaction<'a> {
             .unwrap_or_else(|| Value::Array(Vec::new()));
         let mutation_roots = object
             .remove("mutationRoots")
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mutation_package_targets = object
+            .remove("mutationPackageTargets")
             .unwrap_or_else(|| Value::Array(Vec::new()));
         let expected_runtime_id = object.remove("expectedRuntimeId").unwrap_or(Value::Null);
         let expected_studio_generations = object
@@ -339,6 +578,7 @@ impl<'a> EditorTransaction<'a> {
                 "nativeImport": native_import,
                 "nativeImportServices": native_import_services,
                 "mutationRoots": mutation_roots,
+                "mutationPackageTargets": mutation_package_targets,
                 "expectedRuntimeId": expected_runtime_id,
                 "expectedStudioGenerations": expected_studio_generations,
                 "totalChunks": chunks.len(),
@@ -398,6 +638,9 @@ impl<'a> EditorTransaction<'a> {
             )?,
             Err(error) => return Err(error),
         };
+        if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
+            return Err(StudioChangedBeforePush.into());
+        }
         let package_mutation = result
             .get("packageMutation")
             .and_then(Value::as_bool)
@@ -408,11 +651,83 @@ impl<'a> EditorTransaction<'a> {
             active: true,
             package_mutation,
             package_dialog: None,
+            auto_desynced_packages: Vec::new(),
+            auto_desynced_package_targets: Vec::new(),
+            package_runtime: None,
+            auto_desync_confirmed: false,
         };
-        if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
-            return Err(StudioChangedBeforePush.into());
+
+        let packages: EditorMutationPackages = serde_json::from_value(json!({
+            "packages": result
+                .get("mutationPackages")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        }))
+        .context("Studio returned invalid transaction package targets")?;
+        if global_log_enabled(5) {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] editor package preflight: source={}, property={}, instance={}, packages={:?}",
+                    changes.source_changes.len(),
+                    changes.property_changes.len(),
+                    changes.instance_changes.len(),
+                    packages
+                        .packages
+                        .iter()
+                        .map(|package| package.path_segments.join("."))
+                        .collect::<Vec<_>>()
+                ),
+            );
         }
-        if package_mutation {
+        #[cfg(any(windows, target_os = "macos"))]
+        if !packages.packages.is_empty() {
+            let started = Instant::now();
+            let timeout = Duration::from_secs(20);
+            let pid = studio_pid_for_bridge(bridge)?;
+            let title = crate::studio::input::studio_window_title(pid)?;
+            transaction.package_runtime = Some((pid, title.clone()));
+            for root in &packages.packages {
+                let result = (|| {
+                    let remaining = timeout
+                        .checked_sub(started.elapsed())
+                        .context("Automatic package desync exceeded 20 seconds")?;
+                    crate::studio::native::serializer::run_package_action(
+                        pid,
+                        &title,
+                        &crate::studio::native::serializer::PackageTarget {
+                            path_segments: root.path_segments.clone(),
+                            path_ordinals: root.path_ordinals.clone(),
+                            expected_version: root.expected_version,
+                        },
+                        crate::studio::native::serializer::PackageAction::Desync,
+                        remaining,
+                    )
+                })();
+                match result {
+                    Ok(result) if result.changed => {
+                        transaction.auto_desynced_packages.push(result.path);
+                        transaction.auto_desynced_package_targets.push(root.clone());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if let Err(rollback_error) = transaction.rollback() {
+                            return Err(error.context(format!(
+                                "Automatic package desync rollback also failed: {rollback_error:#}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            transaction.auto_desync_confirmed = true;
+        }
+        if package_mutation && !cfg!(any(windows, target_os = "macos")) {
+            transaction.auto_desynced_packages = packages
+                .packages
+                .iter()
+                .map(|package| package.path_segments.join("."))
+                .collect();
             transaction.package_dialog = Some(
                 studio_pid_for_bridge(bridge)
                     .and_then(crate::studio::input::watch_package_changes_dialog)
@@ -420,6 +735,50 @@ impl<'a> EditorTransaction<'a> {
             );
         }
         Ok(Some(transaction))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn restore_auto_desynced_packages(&mut self) -> Result<()> {
+        if self.auto_desynced_package_targets.is_empty() {
+            return Ok(());
+        }
+        let (pid, title) = self
+            .package_runtime
+            .as_ref()
+            .context("Studio package runtime was not retained for rollback")?;
+        let started = Instant::now();
+        let timeout = Duration::from_secs(20);
+        for root in self.auto_desynced_package_targets.iter().rev() {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .context("Automatic package state rollback exceeded 20 seconds")?;
+            crate::studio::native::serializer::run_package_action(
+                *pid,
+                title,
+                &crate::studio::native::serializer::PackageTarget {
+                    path_segments: root.path_segments.clone(),
+                    path_ordinals: root.path_ordinals.clone(),
+                    expected_version: root.expected_version,
+                },
+                crate::studio::native::serializer::PackageAction::Restore,
+                remaining,
+            )?;
+        }
+        self.auto_desynced_package_targets.clear();
+        self.auto_desynced_packages.clear();
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn restore_auto_desynced_packages(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish_rollback(&mut self) -> Result<()> {
+        self.package_dialog.take();
+        self.restore_auto_desynced_packages()?;
+        self.active = false;
+        Ok(())
     }
 
     fn commit(&mut self) -> Result<EditorCommitStatus> {
@@ -441,8 +800,9 @@ impl<'a> EditorTransaction<'a> {
                     Ok(result) => match editor_transaction_state(&result) {
                         Some("committed") => result,
                         Some("rolledBack") => {
-                            self.active = false;
-                            self.package_dialog.take();
+                            self.finish_rollback().context(
+                                "Studio rolled the transaction back, but Renium could not restore its automatic package state changes",
+                            )?;
                             return Err(commit_error.context(
                                 "Studio rolled the transaction back before its commit response was received",
                             ));
@@ -480,8 +840,9 @@ impl<'a> EditorTransaction<'a> {
         };
         match editor_transaction_state(&result) {
             Some("rolledBack") => {
-                self.active = false;
-                self.package_dialog.take();
+                self.finish_rollback().context(
+                    "Studio rolled the transaction back, but Renium could not restore its automatic package state changes",
+                )?;
                 bail!("Studio rolled the transaction back instead of committing it");
             }
             Some("open" | "prepared" | "notFound") => {
@@ -494,6 +855,8 @@ impl<'a> EditorTransaction<'a> {
             Some(state) => bail!("Studio returned an invalid transaction state: {state}"),
         }
         self.active = false;
+        self.auto_desynced_package_targets.clear();
+        self.package_runtime = None;
         let package_dialog_accepted = self
             .package_dialog
             .take()
@@ -510,6 +873,8 @@ impl<'a> EditorTransaction<'a> {
         Ok(EditorCommitStatus {
             package_mutation: self.package_mutation,
             package_dialog_accepted,
+            auto_desynced_packages: std::mem::take(&mut self.auto_desynced_packages),
+            auto_desync_confirmed: self.auto_desync_confirmed,
         })
     }
 
@@ -518,6 +883,7 @@ impl<'a> EditorTransaction<'a> {
             return Ok(());
         }
         self.package_dialog.take();
+        self.restore_auto_desynced_packages()?;
         let rollback_result = self.bridge.call(
             "rollbackEditorTransaction",
             json!({ "transactionId": &self.id }),
@@ -617,9 +983,22 @@ pub(crate) fn settings_file_hash(path: &Path) -> Result<Option<[u8; 32]>> {
 fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorCommitStatus) {
     if status.package_mutation {
         summary.insert("packageModified".to_string(), Value::Bool(true));
+    }
+    if status.package_dialog_accepted {
+        summary.insert("packageDialogAccepted".to_string(), Value::Bool(true));
+    }
+    if !status.auto_desynced_packages.is_empty()
+        && (status.auto_desync_confirmed || status.package_dialog_accepted)
+    {
         summary.insert(
-            "packageDialogAccepted".to_string(),
-            Value::Bool(status.package_dialog_accepted),
+            "autoDesyncedPackages".to_string(),
+            Value::Array(
+                status
+                    .auto_desynced_packages
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
     }
 }
@@ -859,13 +1238,26 @@ fn collect_project_editor_changes_with_documents(
         collect_editor_full_paths(projection.root())?
     } else {
         let mut paths = Vec::new();
+        let naming = config::project_script_naming(&loaded.project);
         for changed_path in changed_paths {
             let absolute = absolutize_under(&loaded.root, &changed_path);
-            paths.extend(config::project_source_to_staged_paths(
-                &loaded,
-                &absolute,
-                projection.root(),
-            )?);
+            let source_file = absolute.is_file()
+                && absolute
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| infer_source_script(name, &naming))
+                    .is_some();
+            let mut mapped =
+                config::project_source_to_staged_paths(&loaded, &absolute, projection.root())?;
+            if source_file {
+                mapped.retain(|path| {
+                    !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_service_settings_file_name)
+                });
+            }
+            paths.extend(mapped);
         }
         paths
     };
@@ -1812,14 +2204,20 @@ fn push_editor_changes_with_collected(
     } else {
         build_editor_binary_import(&args, &changes, bridge)?
     };
+    let unstaged_replacements = changes
+        .instance_changes
+        .iter()
+        .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
+        .map(|change| change.service.as_str())
+        .collect::<Vec<_>>();
     if binary_import.is_none()
         && !changes.files_to_studio_filters_active
-        && changes
-            .instance_changes
-            .iter()
-            .any(|change| change.mode == "reconcileService" && change.allow_deletes)
+        && !unstaged_replacements.is_empty()
     {
-        bail!("A full service replacement could not be staged; Studio was not changed");
+        bail!(
+            "A full replacement of {} could not be staged; Studio was not changed",
+            unstaged_replacements.join(", ")
+        );
     }
     let mut history_transaction = if review_skipped || binary_import.is_some() {
         None
@@ -1835,119 +2233,134 @@ fn push_editor_changes_with_collected(
     } else {
         EditorTransaction::begin(bridge, &changes, binary_import.as_ref(), guard)?
     };
-    log_timing("native editor transaction begin", phase_started);
-    let mut summary = if review_skipped {
-        skipped_editor_summary(&changes)
-    } else {
-        let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
-        let phase_started = Instant::now();
-        let result = send_editor_change_batches(
-            bridge,
-            &changes,
-            args.probe_events,
-            false,
-            false,
-            binary_import.as_ref(),
-            transaction_id,
-        );
-        log_timing("native editor change batches", phase_started);
-        match result {
-            Ok(summary) => summary,
-            Err(error) => {
-                if let Some(transaction) = transaction.as_mut()
-                    && let Err(rollback_error) = transaction.rollback()
-                {
-                    return Err(
-                        error.context(format!("Studio rollback also failed: {rollback_error:#}"))
-                    );
+    let result = (|| {
+        log_timing("native editor transaction begin", phase_started);
+        let mut summary = if review_skipped {
+            skipped_editor_summary(&changes)
+        } else {
+            let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
+            let phase_started = Instant::now();
+            let result = send_editor_change_batches(
+                bridge,
+                &changes,
+                args.probe_events,
+                false,
+                false,
+                binary_import.as_ref(),
+                transaction_id,
+            );
+            log_timing("native editor change batches", phase_started);
+            match result {
+                Ok(summary) => summary,
+                Err(error) => {
+                    if let Some(transaction) = transaction.as_mut()
+                        && let Err(rollback_error) = transaction.rollback()
+                    {
+                        return Err(error
+                            .context(format!("Studio rollback also failed: {rollback_error:#}")));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+            }
+        };
+        if !review_skipped {
+            let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
+            if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
+                bail!("Studio rejected or failed one or more editor push changes");
             }
         }
-    };
-    if !review_skipped {
+        if args.verify_sources && !review_skipped {
+            verify_pushed_sources(
+                bridge,
+                &changes,
+                transaction.as_ref().map(|value| value.id.as_str()),
+                &mut summary,
+            )?;
+        }
+        let phase_started = Instant::now();
+        let protected =
+            prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
+        log_timing("native editor protected write preparation", phase_started);
+        let phase_started = Instant::now();
+        if !review_skipped && let Some(validate_project) = validate_project {
+            validate_project()?;
+        }
+        let settings_transaction = if review_skipped {
+            None
+        } else {
+            Some(EditorSettingsTransaction::apply(&changes)?)
+        };
+        if let Some(history_transaction) = history_transaction.as_mut() {
+            history_transaction.publish()?;
+        }
+        log_timing("native editor settings apply", phase_started);
+        let phase_started = Instant::now();
+        let mut commit_status = None;
+        if protected.apply_offline {
+            let result = apply_protected_writes_offline(bridge, &args, &protected.writes)?;
+            if let Some(transaction) = transaction.as_mut() {
+                transaction.disarm();
+            }
+            summary.insert("protectedOfflineApply".to_string(), result);
+            summary.insert(
+                "protectedApplied".to_string(),
+                Value::Number(serde_json::Number::from(protected.writes.len() as u64)),
+            );
+            summary.remove("protectedPending");
+        } else if let Some(transaction) = transaction.as_mut() {
+            match transaction.commit() {
+                Ok(status) => commit_status = Some(status),
+                Err(commit_error) => {
+                    if !transaction.active {
+                        return Err(commit_error);
+                    }
+                    if let Err(rollback_error) = transaction.rollback() {
+                        return Err(commit_error
+                            .context(format!("Studio rollback also failed: {rollback_error:#}")));
+                    }
+                    return Err(commit_error
+                        .context("Studio rejected the commit; its changes were rolled back"));
+                }
+            }
+        }
+        if let Some(status) = commit_status {
+            add_editor_commit_status(&mut summary, status);
+        }
+        log_timing("native editor transaction commit", phase_started);
+        if let Some(settings_transaction) = settings_transaction {
+            settings_transaction.commit();
+        }
+        if let Some(history_transaction) = history_transaction {
+            history_transaction.commit();
+        }
+        log_global(
+            5,
+            format_args!(
+                "[renium] editor push done: elapsed_ms={:.1}, summary={}",
+                elapsed_ms(started),
+                Value::Object(summary.clone())
+            ),
+        );
         let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
         }
-    }
-    if args.verify_sources && !review_skipped {
-        verify_pushed_sources(
-            bridge,
-            &changes,
-            transaction.as_ref().map(|value| value.id.as_str()),
-            &mut summary,
-        )?;
-    }
-    let phase_started = Instant::now();
-    let protected =
-        prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
-    log_timing("native editor protected write preparation", phase_started);
-    let phase_started = Instant::now();
-    if !review_skipped && let Some(validate_project) = validate_project {
-        validate_project()?;
-    }
-    let settings_transaction = if review_skipped {
-        None
-    } else {
-        Some(EditorSettingsTransaction::apply(&changes)?)
-    };
-    if let Some(history_transaction) = history_transaction.as_mut() {
-        history_transaction.publish()?;
-    }
-    log_timing("native editor settings apply", phase_started);
-    let phase_started = Instant::now();
-    let mut commit_status = None;
-    if protected.apply_offline {
-        let result = apply_protected_writes_offline(bridge, &args, &protected.writes)?;
-        if let Some(transaction) = transaction.as_mut() {
-            transaction.disarm();
-        }
-        summary.insert("protectedOfflineApply".to_string(), result);
-        summary.insert(
-            "protectedApplied".to_string(),
-            Value::Number(serde_json::Number::from(protected.writes.len() as u64)),
-        );
-        summary.remove("protectedPending");
-    } else if let Some(transaction) = transaction.as_mut() {
-        match transaction.commit() {
-            Ok(status) => commit_status = Some(status),
-            Err(commit_error) => {
-                if !transaction.active {
-                    return Err(commit_error);
-                }
-                if let Err(rollback_error) = transaction.rollback() {
-                    return Err(commit_error
-                        .context(format!("Studio rollback also failed: {rollback_error:#}")));
-                }
-                return Err(commit_error
-                    .context("Studio rejected the commit; its changes were rolled back"));
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            if let Some(transaction) = transaction.as_mut()
+                && transaction.active
+                && let Err(rollback_error) = transaction.rollback()
+            {
+                return Err(
+                    error.context(format!("Studio rollback also failed: {rollback_error:#}"))
+                );
             }
+            Err(error)
         }
     }
-    if let Some(status) = commit_status {
-        add_editor_commit_status(&mut summary, status);
-    }
-    log_timing("native editor transaction commit", phase_started);
-    if let Some(settings_transaction) = settings_transaction {
-        settings_transaction.commit();
-    }
-    if let Some(history_transaction) = history_transaction {
-        history_transaction.commit();
-    }
-    log_global(
-        5,
-        format_args!(
-            "[renium] editor push done: elapsed_ms={:.1}, summary={}",
-            elapsed_ms(started),
-            Value::Object(summary.clone())
-        ),
-    );
-    let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
-    if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
-        bail!("Studio rejected or failed one or more editor push changes");
-    }
-    Ok(summary)
 }
 
 fn listen_editor_oneshot_bridge(
@@ -1991,30 +2404,76 @@ fn apply_editor_change_with_warm_bridge(
         return Ok(summary);
     }
     let mut transaction = EditorTransaction::begin(bridge, &changes, None, None)?;
-    let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
-    let mut summary =
-        send_editor_change_batches(bridge, &changes, false, false, false, None, transaction_id)?;
-    let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
-    if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
-        bail!("Studio rejected or failed editor {label} apply");
+    let result = (|| {
+        let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
+        let mut summary = send_editor_change_batches(
+            bridge,
+            &changes,
+            false,
+            false,
+            false,
+            None,
+            transaction_id,
+        )?;
+        let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
+        if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
+            bail!("Studio rejected or failed editor {label} apply");
+        }
+        if let Some(transaction) = transaction.as_mut() {
+            let status = transaction.commit()?;
+            add_editor_commit_status(&mut summary, status);
+        }
+        log_global(
+            5,
+            format_args!(
+                "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
+                elapsed_ms(started),
+                Value::Object(summary.clone())
+            ),
+        );
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            if let Some(transaction) = transaction.as_mut()
+                && transaction.active
+                && let Err(rollback_error) = transaction.rollback()
+            {
+                return Err(
+                    error.context(format!("Studio rollback also failed: {rollback_error:#}"))
+                );
+            }
+            Err(error)
+        }
     }
-    if let Some(transaction) = transaction.as_mut() {
-        let status = transaction.commit()?;
-        add_editor_commit_status(&mut summary, status);
-    }
-    log_global(
-        5,
-        format_args!(
-            "[renium] editor {label} apply done: elapsed_ms={:.1}, summary={}",
-            elapsed_ms(started),
-            Value::Object(summary.clone())
-        ),
-    );
-    Ok(summary)
 }
 
 fn print_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
     print_json_output(&Value::Object(summary.clone()), global_pretty_output(false))
+}
+
+fn print_direct_editor_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
+    let changed = [
+        "attributeUpdated",
+        "instanceCreated",
+        "instanceDeleted",
+        "instanceReplaced",
+        "propertyUpdated",
+        "sourceCreated",
+        "sourceDeleted",
+        "sourceUpdated",
+    ]
+    .into_iter()
+    .any(|key| summary.get(key).and_then(Value::as_f64).unwrap_or(0.0) > 0.0);
+    let mut output = Map::from_iter([
+        ("ok".to_string(), Value::Bool(true)),
+        ("changed".to_string(), Value::Bool(changed)),
+    ]);
+    if let Some(packages) = summary.get("autoDesyncedPackages") {
+        output.insert("autoDesyncedPackages".to_string(), packages.clone());
+    }
+    print_json_output(&Value::Object(output), false)
 }
 
 pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result<()> {
@@ -2043,7 +2502,11 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         Value::Object(parameters),
         approved,
     )? {
-        return print_json_output(&result, false);
+        return print_direct_editor_summary(
+            result
+                .as_object()
+                .context("The daemon returned an invalid property result")?,
+        );
     }
     let bridge = listen_editor_oneshot_bridge(
         "property",
@@ -2052,7 +2515,7 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         args.target.bridge.wait_seconds,
     )?;
     let summary = apply_editor_property_with_warm_bridge(args, &bridge)?;
-    print_editor_push_summary(&summary)
+    print_direct_editor_summary(&summary)
 }
 
 pub(crate) fn apply_editor_property_with_warm_bridge(
@@ -2181,7 +2644,11 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
         Value::Object(parameters),
         false,
     )? {
-        return print_json_output(&result, false);
+        return print_direct_editor_summary(
+            result
+                .as_object()
+                .context("The daemon returned an invalid delete result")?,
+        );
     }
     let bridge = listen_editor_oneshot_bridge(
         "delete",
@@ -2190,7 +2657,7 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
         args.target.bridge.wait_seconds,
     )?;
     let summary = apply_editor_delete_with_warm_bridge(args, &bridge)?;
-    print_editor_push_summary(&summary)
+    print_direct_editor_summary(&summary)
 }
 
 fn editor_mutation_parameters(target: &EditorMutationArgs) -> Result<Map<String, Value>> {
@@ -2275,10 +2742,16 @@ fn parse_direct_editor_target(target: &EditorMutationArgs) -> Result<DirectEdito
     if service.is_empty() {
         bail!("--service is required");
     }
-    let path_segments: Vec<String> = serde_json::from_str(&target.path_segments_json)
+    let mut path_segments: Vec<String> = serde_json::from_str(&target.path_segments_json)
         .context("Failed to parse --path-segments-json")?;
-    let path_ordinals: Vec<usize> = serde_json::from_str(&target.path_ordinals_json)
+    let mut path_ordinals: Vec<usize> = serde_json::from_str(&target.path_ordinals_json)
         .context("Failed to parse --path-ordinals-json")?;
+    if path_segments.first().map(String::as_str) != Some(service.as_str()) {
+        path_segments.insert(0, service.clone());
+        if !path_ordinals.is_empty() {
+            path_ordinals.insert(0, 1);
+        }
+    }
     reject_direct_read_only_package_change(
         &target.project.project_root,
         target.override_packages,
@@ -2489,8 +2962,19 @@ fn verify_editor_source_changes(
 
 fn editor_sources_match(expected: &str, actual: &str) -> bool {
     expected == actual
-        || expected.strip_suffix('\n') == Some(actual)
-        || expected.strip_suffix("\r\n") == Some(actual)
+        || normalized_source_bytes(expected.as_bytes())
+            .eq(normalized_source_bytes(actual.as_bytes()))
+        || strip_one_source_line_ending(expected).is_some_and(|expected| {
+            normalized_source_bytes(expected.as_bytes())
+                .eq(normalized_source_bytes(actual.as_bytes()))
+        })
+}
+
+fn strip_one_source_line_ending(source: &str) -> Option<&str> {
+    source
+        .strip_suffix("\r\n")
+        .or_else(|| source.strip_suffix('\r'))
+        .or_else(|| source.strip_suffix('\n'))
 }
 
 fn editor_source_key(change: &EditorSourceChange) -> String {
@@ -3483,5 +3967,201 @@ mod sync_tests {
         sort_post_commit_model_pivots(&mut changes);
         assert_eq!(changes[0].path_segments, ["Workspace", "Parent"]);
         assert_eq!(changes[1].path_segments, ["Workspace", "Parent", "Child"]);
+    }
+
+    #[test]
+    fn source_verification_accepts_studio_newline_normalization() {
+        assert!(editor_sources_match(
+            "first\r\nsecond\rthird\r\n",
+            "first\nsecond\nthird\n"
+        ));
+        assert!(editor_sources_match("return true\r\n", "return true"));
+        assert!(!editor_sources_match("return true", "return false"));
+    }
+
+    #[test]
+    fn projected_script_change_does_not_expand_to_the_whole_service_store() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("projected-script-push");
+        let first = root.join("src/ReplicatedStorage/Package/First/Thing.lua");
+        let second = root.join("src/ReplicatedStorage/Package/Second/Thing.lua");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "return true\r\n").unwrap();
+        fs::write(&second, "return false\r\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            r#"{
+                "name": "projected-script-push",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": {
+                        "$className": "ReplicatedStorage",
+                        "$ignoreUnknownInstances": true,
+                        "$path": "src/ReplicatedStorage"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.extend([first, second]);
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        assert_eq!(changes.source_changes.len(), 2);
+        assert!(changes.instance_changes.is_empty());
+        assert_eq!(
+            changes.source_changes[0].path_segments,
+            ["ReplicatedStorage", "Package", "First", "Thing"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_preflight_uses_exact_mutation_paths_once() {
+        let source = EditorSourceChange {
+            service: "ReplicatedStorage".to_string(),
+            settings_id: Some("script".to_string()),
+            path_segments: ["ReplicatedStorage", "Package", "Script"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            path_ordinals: vec![1, 1, 1],
+            class_name: "ModuleScript".to_string(),
+            source: Some("return true".to_string()),
+            deleted: false,
+        };
+        let changes = EditorChangeSet {
+            source_changes: vec![source.clone(), source],
+            ..Default::default()
+        };
+        let targets = editor_mutation_package_targets(&changes, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0]["pathSegments"],
+            json!(["ReplicatedStorage", "Package", "Script"])
+        );
+        assert_eq!(targets[0]["includeSelf"], true);
+
+        let mut without_ordinals = model_pivot(&["Package", "Value"]);
+        without_ordinals.service = "ReplicatedStorage".to_string();
+        without_ordinals.path_ordinals.clear();
+        without_ordinals.properties.clear();
+        without_ordinals
+            .properties
+            .insert("Value".to_string(), json!("changed"));
+        let targets = editor_mutation_package_targets(
+            &EditorChangeSet {
+                property_changes: vec![without_ordinals],
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(targets[0]["pathOrdinals"], json!([]));
+
+        let mut relative = model_pivot(&["Package", "Value"]);
+        relative.service = "ReplicatedStorage".to_string();
+        relative.class_name = "StringValue".to_string();
+        relative.properties.clear();
+        relative
+            .properties
+            .insert("Value".to_string(), json!("changed"));
+        let targets = editor_mutation_package_targets(
+            &EditorChangeSet {
+                property_changes: vec![relative],
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            targets[0]["pathSegments"],
+            json!(["ReplicatedStorage", "Package", "Value"])
+        );
+        assert_eq!(targets[0]["pathOrdinals"], json!([1, 1, 1]));
+    }
+
+    #[test]
+    fn package_root_overrides_do_not_trigger_desync_but_content_properties_do() {
+        let mut root_override = model_pivot(&["Workspace", "Package"]);
+        root_override
+            .properties
+            .insert("WorldPivot".to_string(), json!({}));
+        root_override
+            .attributes
+            .insert("Configuration".to_string(), json!(true));
+        let override_targets = editor_mutation_package_targets(
+            &EditorChangeSet {
+                property_changes: vec![root_override],
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(override_targets[0]["includeSelf"], false);
+
+        let mut content_change = model_pivot(&["Workspace", "Package"]);
+        content_change
+            .properties
+            .insert("Archivable".to_string(), json!(false));
+        let content_targets = editor_mutation_package_targets(
+            &EditorChangeSet {
+                property_changes: vec![content_change],
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(content_targets[0]["includeSelf"], true);
+    }
+
+    #[test]
+    fn native_import_preflights_only_changed_actual_package_roots() {
+        use crate::editor::types::{EditorBinaryImportGroup, EditorBinaryPackageRoot};
+
+        let binary_import = EditorBinaryImport {
+            bytes: Vec::new(),
+            groups: vec![EditorBinaryImportGroup {
+                service: "ReplicatedStorage".to_string(),
+                target_path: vec!["ReplicatedStorage".to_string()],
+                count: 1,
+                payload_root_name: "payload".to_string(),
+                root_paths: Vec::new(),
+                retained_roots: Vec::new(),
+                package_roots: vec![EditorBinaryPackageRoot {
+                    path_segments: ["ReplicatedStorage", "Outer"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    path_ordinals: vec![1, 1],
+                    class_name: "Folder".to_string(),
+                }],
+                mutation_package_roots: vec![EditorBinaryPackageRoot {
+                    path_segments: ["ReplicatedStorage", "Outer", "Package"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    path_ordinals: vec![1, 1, 1],
+                    class_name: "Model".to_string(),
+                }],
+                change_generation: Some(1),
+            }],
+            instance_count: 0,
+            post_apply_properties_by_class: HashMap::new(),
+            post_apply_properties_by_path: HashMap::new(),
+            external_references_post_applied: false,
+        };
+        let targets =
+            editor_mutation_package_targets(&EditorChangeSet::default(), Some(&binary_import));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0]["pathSegments"],
+            json!(["ReplicatedStorage", "Outer", "Package"])
+        );
+        assert_eq!(targets[0]["includeSelf"], true);
     }
 }

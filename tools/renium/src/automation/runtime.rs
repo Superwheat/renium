@@ -30,7 +30,7 @@ use crate::editor::review::{
 };
 use crate::editor::sync::{
     apply_editor_delete_with_warm_bridge, apply_editor_property_with_warm_bridge,
-    push_editor_changes_with_warm_bridge,
+    push_editor_changes_with_warm_bridge, resolve_editor_package_target,
 };
 use crate::project::workflows;
 use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
@@ -481,6 +481,7 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "protectedWrites",
         "protectedApplied",
         "packageModified",
+        "autoDesyncedPackages",
     ] {
         let value = parameters.get(key).or_else(|| summary.get(key));
         if let Some(value) = value.filter(|value| automation_value_is_non_empty(value)) {
@@ -828,21 +829,6 @@ fn open_studio(
     let place_id = context.place_id.filter(|id| *id > 0);
     #[cfg(any(windows, target_os = "macos"))]
     let connected = connected_edit_studios(bridge);
-    #[cfg(any(windows, target_os = "macos"))]
-    if requested_file.is_none()
-        && let Some(runtime_id) = context.runtime_id.as_deref()
-        && let Some(studio) = connected
-            .iter()
-            .find(|studio| studio.runtime_id == runtime_id)
-    {
-        return Ok(json!({
-            "ok": true,
-            "alreadyOpen": true,
-            "pid": studio.pid,
-            "runtimeId": studio.runtime_id,
-            "target": studio.target,
-        }));
-    }
     let target = if let Some(file) = requested_file {
         let file = bound_context::path(context, file);
         Some(automation::StudioReopenTarget {
@@ -850,7 +836,7 @@ fn open_studio(
             game_id: None,
             place_id: None,
         })
-    } else if let Some(target) = state.studio_target(context) {
+    } else if let Some(target) = state.live_sync().saved_studio_target(context)? {
         Some(target)
     } else if game_id.is_some() && place_id.is_some() {
         Some(automation::StudioReopenTarget {
@@ -858,6 +844,8 @@ fn open_studio(
             game_id,
             place_id,
         })
+    } else if let Some(target) = state.studio_target(context) {
+        Some(target)
     } else {
         state
             .live_sync()
@@ -1045,6 +1033,19 @@ fn creator_operation_result(
     }
 }
 
+fn select_bridge_context(
+    context: &automation::BoundContext,
+    bridge: &BridgeServer,
+) -> bound_context::Selection {
+    let selection = bound_context::select(context);
+    bridge.clear_runtime_pins();
+    if let Some(runtime_id) = context.runtime_id.as_deref() {
+        bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
+    }
+    selection
+}
+
 fn automation_dispatch_operation(
     operation: u16,
     context: &automation::BoundContext,
@@ -1056,12 +1057,7 @@ fn automation_dispatch_operation(
     if automation_requires_runtime(operation, parameters) && context.runtime_id.is_none() {
         bail!("No Studio runtime is bound to this context");
     }
-    let _selection = bound_context::select(context);
-    bridge.clear_runtime_pins();
-    if let Some(runtime_id) = context.runtime_id.as_deref() {
-        bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
-    }
+    let _selection = select_bridge_context(context, bridge);
     match operation {
         op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
             .map(|(result, _)| result),
@@ -1177,6 +1173,14 @@ fn automation_dispatch_operation(
         op::DEVICE => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
             studio_device_result(&studio_args::device(parameters)?, bridge)
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE => {
+            package_action_result(operation, parameters, bridge, bridge_wait_seconds)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE => {
+            bail!("Native Roblox package actions require Windows or macOS")
         }
         op::UI => {
             if parameters.get("player").is_none() {
@@ -1380,6 +1384,7 @@ fn automation_dispatch_managed(
         None
     };
     let mut published = None;
+    let _pull_selection = (operation == op::PULL).then(|| select_bridge_context(context, bridge));
     let result = if operation == op::PULL {
         let first = automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
             .map_err(automation_failure);
@@ -1496,6 +1501,7 @@ struct LiveOperationOptions {
     settle_wait_seconds: f64,
     pull_changes: Option<bool>,
     settle_paths: Vec<PathBuf>,
+    notify_paths: Vec<PathBuf>,
     queue_paths: Vec<PathBuf>,
     baseline_paths: Vec<PathBuf>,
     acknowledged_side: Option<BaselineSide>,
@@ -1549,6 +1555,7 @@ impl LiveOperationOptions {
                 .map(|_| automation_bool(object, "pullChanges", true).map_err(automation_failure))
                 .transpose()?,
             settle_paths: paths("settlePaths"),
+            notify_paths: paths("notifyPaths"),
             queue_paths: paths("queuePaths"),
             baseline_paths: paths("baselinePaths"),
             acknowledged_side,
@@ -1661,6 +1668,14 @@ fn handle_managed_live_status_command(
     if !options.queue_paths.is_empty() {
         return Ok(Some(json!({
             "daemon": state.live_sync().queue(context.id, options.queue_paths.iter().cloned())
+        })));
+    }
+    if !options.notify_paths.is_empty() {
+        return Ok(Some(json!({
+            "daemon": state.live_sync().notify_files(
+                context.id,
+                options.notify_paths.iter().cloned(),
+            )
         })));
     }
     if !options.baseline_paths.is_empty() {
@@ -2177,6 +2192,111 @@ fn resolve_connected_context(
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn package_action_result(
+    operation: u16,
+    parameters: &Value,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> Result<Value> {
+    let started = Instant::now();
+    let object = parameters
+        .as_object()
+        .context("Package parameters must be an object")?;
+    let raw_target = automation_string(object, "target").context("Package target is required")?;
+    let path_segments = if raw_target.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(&raw_target)
+            .context("Package target JSON must be a string array")?
+    } else {
+        raw_target
+            .split('.')
+            .map(str::trim)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    if path_segments.iter().any(String::is_empty) {
+        bail!("Package target contains an empty path segment");
+    }
+    let path_ordinals = object
+        .get("ords")
+        .cloned()
+        .map(serde_json::from_value::<Vec<usize>>)
+        .transpose()
+        .context("Package ordinals must be positive integers")?
+        .unwrap_or_default();
+    if path_ordinals.contains(&0) {
+        bail!("Package ordinals must be positive integers");
+    }
+    let timeout_seconds = object
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(20.0);
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 || timeout_seconds > 20.0 {
+        bail!("Package timeout must be >0 and <=20s");
+    }
+    let timeout = Duration::from_secs_f64(timeout_seconds);
+    let requested_pid = object.get("pid").and_then(Value::as_u64);
+    let (runtime_id, pid) = if let Some(pid) = requested_pid {
+        let pid = u32::try_from(pid).context("Studio process ID is out of range")?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .context("Package action exceeded its deadline")?;
+        let deadline = Instant::now()
+            + Duration::from_secs_f64(bridge_wait_seconds.min(remaining.as_secs_f64()));
+        let runtime_id = loop {
+            match bridge.runtime_id_for_studio_pid(BridgeTarget::Edit, pid) {
+                Ok(runtime_id) => break runtime_id,
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        };
+        (runtime_id, pid)
+    } else {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .context("Package action exceeded its deadline")?;
+        bridge.wait_for_target(
+            bridge_wait_seconds.min(remaining.as_secs_f64()),
+            BridgeTarget::Edit,
+        )?;
+        let runtime = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
+        let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &runtime.runtime_id)?;
+        (runtime.runtime_id, pid)
+    };
+    let title = input_inject::studio_window_title(pid)?;
+    let action = match operation {
+        op::PACKAGE_DESYNC => crate::studio::native::serializer::PackageAction::Desync,
+        op::PACKAGE_PUBLISH => crate::studio::native::serializer::PackageAction::Publish,
+        op::PACKAGE_UPDATE => crate::studio::native::serializer::PackageAction::Update,
+        _ => unreachable!("package action opcode was validated"),
+    };
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .context("Package action exceeded its deadline")?;
+    let target = resolve_editor_package_target(
+        bridge,
+        &path_segments,
+        &path_ordinals,
+        &runtime_id,
+        remaining,
+    )?;
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .context("Package action exceeded its deadline")?;
+    let result = crate::studio::native::serializer::run_package_action(
+        pid,
+        &title,
+        &crate::studio::native::serializer::PackageTarget {
+            path_segments: target.path_segments,
+            path_ordinals: target.path_ordinals,
+            expected_version: target.expected_version,
+        },
+        action,
+        remaining,
+    )?;
+    serde_json::to_value(result).context("Could not encode package result")
+}
+
 fn connected_runtime_wait_seconds(
     state: &automation::State,
     context_id: u64,
@@ -2224,6 +2344,13 @@ fn automation_execute_request(
         op::PERFORMANCE_PROFILE => bridge
             .performance_profile_command(&request.p)
             .map_err(automation_failure),
+        #[cfg(any(windows, target_os = "macos"))]
+        op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE
+            if request.p.get("pid").and_then(Value::as_u64).is_some() =>
+        {
+            package_action_result(operation.id, &request.p, bridge, bridge_wait_seconds)
+                .map_err(automation_failure)
+        }
         _ => {
             let context_id = request
                 .cx
@@ -2644,6 +2771,19 @@ mod tests {
             )),
             json!({ "ok": true, "sourceVerified": true })
         );
+
+        let package = json!({
+            "ok": true,
+            "packageModified": true,
+            "autoDesyncedPackages": ["ReplicatedStorage.Package"]
+        });
+        assert_eq!(
+            Value::Object(compact_push_summary(
+                package.as_object().unwrap(),
+                &parameters
+            )),
+            package
+        );
     }
 
     #[test]
@@ -2690,6 +2830,8 @@ mod tests {
                 "daemon": {
                     "running": true,
                     "pendingPaths": ["a", "b"],
+                    "autoDesyncedPackages": ["ReplicatedStorage.Package"],
+                    "autoDesyncedAtPush": 3,
                     "error": "timed out"
                 }
             })),
@@ -2706,6 +2848,8 @@ mod tests {
                     "running": true,
                     "pendingCount": 2,
                     "pendingPaths": ["a", "b"],
+                    "autoDesyncedPackages": ["ReplicatedStorage.Package"],
+                    "autoDesyncedAtPush": 3,
                     "error": "timed out"
                 }
             })

@@ -46,10 +46,10 @@ use crate::snapshot::export::{export_snapshots, pull_from_studio};
 use crate::snapshot::import::{import_service, import_snapshots};
 use crate::studio::automation::{
     click_command, editor_review_decision_command, execute_luau_command,
-    get_console_output_command, goto_command, key_command, list_clients_command, press_command,
-    record_end_command, record_start_command, shot_command, start_stop_play_command,
-    studio_change_state_command, studio_change_state_operation_command, studio_device_command,
-    test_command, type_command, ui_command, wait_until_command,
+    get_console_output_command, goto_command, key_command, list_clients_command,
+    package_action_command, press_command, record_end_command, record_start_command, shot_command,
+    start_stop_play_command, studio_change_state_command, studio_change_state_operation_command,
+    studio_device_command, test_command, type_command, ui_command, wait_until_command,
 };
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
@@ -83,6 +83,11 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::Rename(args) => rename_instance_command(args, project),
         Commands::Remove(args) => remove_instance_command(args, project),
         Commands::DesyncPackageLink(args) => desync_package_link_command(args, project),
+        Commands::PackageDesync(args) => package_action_command(args, project, op::PACKAGE_DESYNC),
+        Commands::PackagePublish(args) => {
+            package_action_command(args, project, op::PACKAGE_PUBLISH)
+        }
+        Commands::PackageUpdate(args) => package_action_command(args, project, op::PACKAGE_UPDATE),
         Commands::ImportModel(args) => import_model_command(args, project),
         Commands::ExportModel(args) => export_model_command(args, project),
         Commands::Test(args) => test_command(args),

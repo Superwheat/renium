@@ -20,17 +20,20 @@ use crate::system::files::{atomic_write_file, sha256_hex};
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
-const REQUEST_VERSION: u32 = 3;
+const REQUEST_VERSION: u32 = 6;
 const RESPONSE_SIZE: usize = 536;
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
 const SECTION_64_SIZE: usize = 80;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_UUID: u32 = 0x1b;
+const LC_FUNCTION_STARTS: u32 = 0x26;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 
 static TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedTrace>>> = OnceLock::new();
+static PACKAGE_ACTION_TRACES: OnceLock<Mutex<HashMap<PathBuf, CachedPackageActionTrace>>> =
+    OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct SerializerTrace {
@@ -42,6 +45,18 @@ struct CachedTrace {
     len: u64,
     modified: Option<SystemTime>,
     trace: SerializerTrace,
+}
+
+#[derive(Clone)]
+struct PackageActionTrace {
+    submit_rva: u64,
+    image_uuid: [u8; 16],
+}
+
+struct CachedPackageActionTrace {
+    len: u64,
+    modified: Option<SystemTime>,
+    trace: PackageActionTrace,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +73,7 @@ struct MachImage<'a> {
     image_uuid: [u8; 16],
     text: MachSection,
     sections: Vec<MachSection>,
+    function_starts: Vec<u64>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -102,6 +118,7 @@ impl<'a> MachImage<'a> {
         let mut text = None;
         let mut image_base = None;
         let mut image_uuid = None;
+        let mut function_starts_command = None;
         for _ in 0..command_count {
             let command =
                 read_u32(bytes, cursor).context("Studio Mach-O load command is truncated")?;
@@ -176,12 +193,61 @@ impl<'a> MachImage<'a> {
                 if image_uuid.replace(uuid).is_some() {
                     bail!("Studio Mach-O contains multiple UUID commands");
                 }
+            } else if command == LC_FUNCTION_STARTS {
+                if command_size < 16 || function_starts_command.is_some() {
+                    bail!("Studio Mach-O contains an invalid function-starts command");
+                }
+                function_starts_command = Some((
+                    read_u32(bytes, cursor + 8)
+                        .context("Studio function starts offset is truncated")?
+                        as usize,
+                    read_u32(bytes, cursor + 12)
+                        .context("Studio function starts size is truncated")?
+                        as usize,
+                ));
             }
             cursor = command_end.expect("load command bounds were validated");
         }
         let text = text.context("Studio Mach-O is missing __TEXT,__text")?;
         let image_base = image_base.context("Studio Mach-O is missing __TEXT")?;
         let image_uuid = image_uuid.context("Studio Mach-O is missing LC_UUID")?;
+        let (function_starts_offset, function_starts_size) =
+            function_starts_command.context("Studio Mach-O is missing LC_FUNCTION_STARTS")?;
+        let function_starts_end = function_starts_offset
+            .checked_add(function_starts_size)
+            .filter(|end| *end <= bytes.len())
+            .context("Studio function starts are truncated")?;
+        let mut function_starts = Vec::new();
+        let mut function_address = image_base;
+        let mut function_cursor = function_starts_offset;
+        while function_cursor < function_starts_end {
+            let mut delta = 0u64;
+            let mut shift = 0;
+            loop {
+                let byte = *bytes
+                    .get(function_cursor)
+                    .context("Studio function start is truncated")?;
+                function_cursor += 1;
+                delta |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift >= 64 {
+                    bail!("Studio function start overflowed");
+                }
+            }
+            if delta == 0 {
+                break;
+            }
+            function_address = function_address
+                .checked_add(delta)
+                .context("Studio function address overflowed")?;
+            function_starts.push(function_address);
+        }
+        if function_starts.is_empty() {
+            bail!("Studio Mach-O contains no function starts");
+        }
         Ok(Self {
             bytes,
             cpu,
@@ -189,6 +255,7 @@ impl<'a> MachImage<'a> {
             image_uuid,
             text,
             sections,
+            function_starts,
         })
     }
 
@@ -234,7 +301,7 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], label: &str) -> Result<usiz
     Ok(first)
 }
 
-fn arm64_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> {
+fn arm64_address_xrefs(image: &MachImage<'_>, target_address: u64) -> Result<Vec<u64>> {
     let text = image.text_bytes()?;
     let mut hits = Vec::new();
     for offset in (0..text.len().saturating_sub(28)).step_by(4) {
@@ -258,11 +325,18 @@ fn arm64_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> 
             }
             let shift = if add & (1 << 22) == 0 { 0 } else { 12 };
             let value = page + ((((add >> 10) & 0xfff) as u64) << shift);
-            if value == string_address {
+            if value == target_address {
                 hits.push(address);
             }
         }
     }
+    hits.sort_unstable();
+    hits.dedup();
+    Ok(hits)
+}
+
+fn arm64_string_xref(image: &MachImage<'_>, string_address: u64) -> Result<u64> {
+    let hits = arm64_address_xrefs(image, string_address)?;
     if hits.len() != 1 {
         bail!(
             "Studio serializer log reference count changed from one to {}",
@@ -495,6 +569,108 @@ fn trace_studio(path: &Path) -> Result<SerializerTrace> {
     Ok(trace)
 }
 
+fn trace_arm64_task_submitter(image: &MachImage<'_>) -> Result<u64> {
+    let mut matches = Vec::new();
+    for &start in &image.function_starts {
+        let Some(offset) = image.text_offset_for_address(start) else {
+            continue;
+        };
+        let Some(words) = image.bytes.get(offset..offset.saturating_add(28 * 4)) else {
+            continue;
+        };
+        let word = |index: usize| read_u32(words, index * 4);
+        let branch =
+            |index: usize| word(index).is_some_and(|value| value & 0xfc00_0000 == 0x9400_0000);
+        if word(0) == Some(0xd101_83ff)
+            && word(1) == Some(0xa903_57f6)
+            && word(2) == Some(0xa904_4ff4)
+            && word(3) == Some(0xa905_7bfd)
+            && word(4) == Some(0x9101_43fd)
+            && word(5) == Some(0xaa02_03f3)
+            && word(6) == Some(0xaa01_03f4)
+            && word(7) == Some(0xaa00_03f5)
+            && word(8) == Some(0x9100_03e8)
+            && branch(9)
+            && word(10) == Some(0x9100_43e8)
+            && word(11) == Some(0x9100_03e0)
+            && branch(12)
+            && word(13) == Some(0xf940_07e0)
+            && branch(15)
+            && word(16) == Some(0x3940_a3e8)
+            && word(17) == Some(0x7100_051f)
+            && word(18).is_some_and(|value| value & 0xff00_001f == 0x5400_0001)
+            && word(19) == Some(0xf940_12a0)
+            && word(20) == Some(0xf100_001f)
+            && word(21) == Some(0x1a9f_07f5)
+            && word(22).is_some_and(|value| value & 0xff00_001f == 0xb400_0000)
+            && word(23) == Some(0xf940_0008)
+            && word(24) == Some(0xf940_2508)
+            && word(25) == Some(0xaa14_03e1)
+            && word(26) == Some(0xaa13_03e2)
+            && word(27) == Some(0xd63f_0100)
+        {
+            matches.push(start);
+        }
+    }
+    if matches.len() != 1 {
+        bail!(
+            "Studio DataModel task submitter resolved {} candidates",
+            matches.len()
+        );
+    }
+    matches[0]
+        .checked_sub(image.image_base)
+        .context("Studio DataModel task submitter precedes __TEXT")
+}
+
+fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
+    let modified = metadata.modified().ok();
+    let cache = PACKAGE_ACTION_TRACES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(trace) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(path)
+        .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
+        .map(|cached| cached.trace.clone())
+        .filter(|trace| trace.submit_rva != 0)
+    {
+        return Ok(trace);
+    }
+    let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let image = MachImage::parse(&bytes)?;
+    let mut trace = PackageActionTrace {
+        submit_rva: 0,
+        image_uuid: image.image_uuid,
+    };
+    trace.submit_rva = match image.cpu {
+        CPU_TYPE_ARM64 => trace_arm64_task_submitter(&image)?,
+        CPU_TYPE_X86_64 => bail!("Package actions require Apple Silicon Roblox Studio"),
+        _ => unreachable!(),
+    };
+    let mut traces = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = traces
+        .get_mut(path)
+        .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
+    {
+        if trace.submit_rva != 0 {
+            cached.trace.submit_rva = trace.submit_rva;
+        }
+        cached.trace.image_uuid = trace.image_uuid;
+        return Ok(cached.trace.clone());
+    }
+    traces.insert(
+        path.to_path_buf(),
+        CachedPackageActionTrace {
+            len: metadata.len(),
+            modified,
+            trace: trace.clone(),
+        },
+    );
+    Ok(trace)
+}
+
 #[link(name = "proc")]
 unsafe extern "C" {
     fn proc_pidpath(pid: i32, buffer: *mut c_void, buffer_size: u32) -> i32;
@@ -576,6 +752,139 @@ fn invoke_helper(
         bail!("Studio native serializer failed with status {status}: {error}");
     }
     Ok((output_size, elapsed_ms))
+}
+
+fn invoke_package_helper(
+    pid: u32,
+    target: &super::PackageTarget,
+    action: super::PackageAction,
+    timeout: Duration,
+    studio_title: &str,
+    action_trace: PackageActionTrace,
+) -> Result<(bool, i64, String)> {
+    if target.path_segments.len() < 2 || target.path_segments.len() > 64 {
+        bail!("Package target must contain 2-64 path segments");
+    }
+    if !target.path_ordinals.is_empty() && target.path_ordinals.len() != target.path_segments.len()
+    {
+        bail!("Package path ordinals must match the number of path segments");
+    }
+    if target.expected_version <= 0 {
+        bail!("Package target has an invalid expected version");
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&9u32.to_le_bytes());
+    payload.extend_from_slice(&target.expected_version.to_le_bytes());
+    payload.extend_from_slice(
+        &u32::try_from(target.path_segments.len())
+            .context("Package path contains too many segments")?
+            .to_le_bytes(),
+    );
+    for (index, segment) in target.path_segments.iter().enumerate() {
+        if segment.is_empty() {
+            bail!("Package target contains an empty path segment");
+        }
+        payload.extend_from_slice(
+            &u32::try_from(segment.len())
+                .context("Package path segment is too long")?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u32::try_from(target.path_ordinals.get(index).copied().unwrap_or(0))
+                .context("Package path ordinal is out of range")?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(segment.as_bytes());
+    }
+    let payload_length =
+        u32::try_from(payload.len()).context("Encoded package target is too long")?;
+    let title_bytes = studio_title.as_bytes();
+    let title_length =
+        u32::try_from(title_bytes.len()).context("Roblox Studio title is too long")?;
+    let socket_path = PathBuf::from(format!("/tmp/renium-studio-{pid}.sock"));
+    let mut socket = UnixStream::connect(&socket_path).with_context(|| {
+        format!(
+            "Studio process {pid} was not launched with Renium's native helper; restart Roblox Studio"
+        )
+    })?;
+    socket.set_read_timeout(Some(timeout.saturating_add(Duration::from_secs(1))))?;
+    socket.set_write_timeout(Some(timeout.min(Duration::from_secs(5))))?;
+    let mut request = Vec::with_capacity(56 + payload.len() + title_bytes.len());
+    request.extend_from_slice(&REQUEST_MAGIC.to_le_bytes());
+    request.extend_from_slice(&REQUEST_VERSION.to_le_bytes());
+    request.extend_from_slice(&2u32.to_le_bytes());
+    request.extend_from_slice(&payload_length.to_le_bytes());
+    request.extend_from_slice(&title_length.to_le_bytes());
+    request.extend_from_slice(
+        &(match action {
+            super::PackageAction::Desync => 1u32,
+            super::PackageAction::Restore => 4u32,
+            super::PackageAction::Publish => 2u32,
+            super::PackageAction::Update => 3u32,
+        })
+        .to_le_bytes(),
+    );
+    request.extend_from_slice(
+        &u64::try_from(timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    request.extend_from_slice(&action_trace.submit_rva.to_le_bytes());
+    request.extend_from_slice(&action_trace.image_uuid);
+    request.extend_from_slice(&payload);
+    request.extend_from_slice(title_bytes);
+    socket
+        .write_all(&request)
+        .context("Could not send the native package request to Studio")?;
+    let mut response = [0u8; RESPONSE_SIZE];
+    socket
+        .read_exact(&mut response)
+        .context("Studio native package helper closed without a complete response")?;
+    if read_u32(&response, 0) != Some(REQUEST_MAGIC) {
+        bail!("Studio native package helper returned an invalid response");
+    }
+    let status = read_u32(&response, 4).unwrap_or(u32::MAX);
+    let version = i64::try_from(read_u64(&response, 8).unwrap_or(0))
+        .context("Studio package version exceeds the supported range")?;
+    let changed = read_u64(&response, 16).unwrap_or(0) != 0;
+    let text_bytes = &response[24..];
+    let end = text_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(text_bytes.len());
+    let text = String::from_utf8_lossy(&text_bytes[..end]).into_owned();
+    if status != 0 {
+        bail!("Studio native package action failed with status {status}: {text}");
+    }
+    Ok((changed, version, text))
+}
+
+pub(super) fn platform_package_action(
+    pid: u32,
+    studio_title: &str,
+    target: &super::PackageTarget,
+    action: super::PackageAction,
+    timeout: Duration,
+) -> Result<super::PackageActionResult> {
+    let started = Instant::now();
+    let action_trace = trace_package_action(&process_executable_path(pid)?)?;
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .context("Package action exceeded its deadline while tracing Studio")?;
+    let (changed, version, status) =
+        invoke_package_helper(pid, target, action, remaining, studio_title, action_trace)?;
+    Ok(super::PackageActionResult {
+        action: match action {
+            super::PackageAction::Desync => "desync",
+            super::PackageAction::Restore => "restore",
+            super::PackageAction::Publish => "publish",
+            super::PackageAction::Update => "update",
+        },
+        changed,
+        path: target.path_segments.join("."),
+        status,
+        version,
+    })
 }
 
 fn write_live_snapshot(

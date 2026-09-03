@@ -13,8 +13,9 @@ use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
-    ListClientsArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs, StartStopPlayArgs,
-    StudioChangeStateArgs, StudioDeviceArgs, TestArgs, TypeArgs, UiArgs, WaitUntilArgs,
+    ListClientsArgs, PackageActionArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs,
+    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs, TestArgs, TypeArgs, UiArgs,
+    WaitUntilArgs,
 };
 use crate::daemon::try_daemon_control_request;
 use crate::snapshot::export::parse_bridge_ports;
@@ -146,6 +147,29 @@ pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
     )?;
     bridge.wait_for_target(args.bridge.wait_seconds, BridgeTarget::Edit)?;
     let result = studio_device_result(&args, &bridge)?;
+    print_json_output(&result, false)
+}
+
+pub(crate) fn package_action_command(
+    args: PackageActionArgs,
+    project: Option<&Path>,
+    operation: u16,
+) -> Result<()> {
+    if !args.timeout.is_finite() || args.timeout <= 0.0 || args.timeout > 20.0 {
+        bail!("Package timeout must be >0 and <=20s");
+    }
+    let result = daemon_result(
+        operation,
+        project,
+        json!({
+            "target": args.target,
+            "ords": args.ords,
+            "pid": args.pid,
+            "timeout": args.timeout,
+        }),
+        false,
+        Some(&args.bridge),
+    )?;
     print_json_output(&result, false)
 }
 
@@ -501,6 +525,8 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         "settled",
         "pushes",
         "pulls",
+        "autoDesyncedPackages",
+        "autoDesyncedAtPush",
         "error",
     ] {
         if let Some(value) = source.get(key) {

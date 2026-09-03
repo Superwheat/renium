@@ -17,9 +17,21 @@ rbx sm --cached --stdout --filter "*Tutorial*"
 rbx bpack
 rbx wally --realms shared
 rbx wally --realms shared --force
+rbx pd ReplicatedStorage.testPackage
+rbx pp ReplicatedStorage.testPackage
+rbx pu ReplicatedStorage.testPackage
+rbx upl ReplicatedStorage --settings-id editor:package
 ```
 
 Wally sync needs `wally`; Aftman projects must declare it. `--force` reinstalls current packages. `--details` includes full path and ID lists.
+
+Files → Studio edits automatically mark each affected linked package Changed before modifying its descendants. The same command returns `autoDesyncedPackages`; tell the user those paths changed and ask whether to publish. Never publish automatically.
+
+If the edit then fails, its error still names every package that Renium already marked Changed. The PackageLinks remain intact; review those packages before publishing.
+
+On Windows and macOS, `pd` marks one linked Roblox package as Changed without altering its contents or PackageLink. `pp` publishes its changes. `pu` discards its changes and updates it to the latest published version. All three target the package root, finish within 20 seconds, and don't use selection, dialogs, or input focus. Add `--pid PID` only when several Studio processes match. Use a JSON string array for names containing dots and `--ords` for duplicate names.
+
+`upl` is different: it removes the PackageLink and keeps the package contents as normal editable instances.
 
 `q` reads an RBXL/RBXLX directly without opening Studio or creating a project beside it. Use `-n`, `-c`, or `--source` for one existence check. `cmp` compares all scripts under the current project's services and reports source, class, missing, and extra differences; line-ending-only changes and duplicate order don't count. Use these before snapshot export/import when the input is already a place file.
 

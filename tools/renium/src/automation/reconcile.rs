@@ -1285,9 +1285,9 @@ impl Coordinator {
         bridge: &BridgeServer,
         paths: &[PathBuf],
         guard: Option<&StudioChangeGuard>,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AppliedEditorChanges> {
         if paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AppliedEditorChanges::default());
         }
         let pair_lock = self.pair_lock(key);
         let phase = Instant::now();
@@ -1307,7 +1307,7 @@ impl Coordinator {
         paths: &[PathBuf],
         guard: Option<&StudioChangeGuard>,
         record: &mut PairRecord,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AppliedEditorChanges> {
         if record.mode != PairMode::Reconcile {
             bail!("Live Sync is not allowed to write in verify mode");
         }
@@ -1320,7 +1320,7 @@ impl Coordinator {
             .context("Reconciliation baseline is missing")?;
         let scopes = baseline_scopes(context, paths)?;
         if scopes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AppliedEditorChanges::default());
         }
         let root = Path::new(&context.root);
         let phase = Instant::now();
@@ -1388,7 +1388,7 @@ impl Coordinator {
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
         log_reconcile_timing("incremental staged write", phase);
         let phase = Instant::now();
-        let generated = push_staged_project(
+        let StagedPushResult { generated, summary } = push_staged_project(
             context,
             &stage,
             bridge,
@@ -1399,8 +1399,7 @@ impl Coordinator {
                 args: automation_push_args(context, &json!({}), false)?,
                 expected_project: None,
             },
-        )?
-        .generated;
+        )?;
         log_reconcile_timing("incremental Studio push", phase);
         let phase = Instant::now();
         drop(stage);
@@ -1427,7 +1426,10 @@ impl Coordinator {
         record.studio_checkpoint = current_studio_checkpoint(context, bridge);
         write_record(context, key, record)?;
         log_reconcile_timing("incremental record write", phase);
-        Ok(generated_paths)
+        Ok(AppliedEditorChanges {
+            generated_paths,
+            summary,
+        })
     }
 
     pub(crate) fn baseline_files(
@@ -2480,6 +2482,12 @@ fn project_relative_source_root(project_root: &Path, source_root: &Path) -> Resu
 struct StagedPushResult {
     generated: ProjectSnapshot,
     summary: Map<String, Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct AppliedEditorChanges {
+    pub(crate) generated_paths: Vec<PathBuf>,
+    pub(crate) summary: Map<String, Value>,
 }
 
 struct StagedPushRequest<'a> {
@@ -4456,6 +4464,12 @@ fn settings_delta_mismatch(
         let before_index = before_by_id.get(settings_id).copied();
         let desired_index = desired_by_id.get(settings_id).copied();
         let observed_index = observed_by_id.get(settings_id).copied();
+        if before_index.is_some_and(|index| before.instances[index].class_name == "PackageLink")
+            && desired_index
+                .is_some_and(|index| desired.instances[index].class_name == "PackageLink")
+        {
+            continue;
+        }
         let name = desired_index
             .map(|index| desired.instances[index].name.as_str())
             .or_else(|| before_index.map(|index| before.instances[index].name.as_str()))
@@ -5223,6 +5237,75 @@ mod tests {
             snapshot_intended_delta_mismatches(&before, &desired, &overwritten, &paths).unwrap();
         assert_eq!(mismatches, vec![path]);
         assert!(detail.is_some_and(|detail| detail.contains("Anchored")));
+    }
+
+    #[test]
+    fn targeted_push_verification_ignores_package_modified_state() {
+        let path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let instance = |id: &str, name: &str, class_name: &str, parent_index: Option<usize>| {
+            SettingsBytecodeInstance {
+                settings_id: id.to_string(),
+                name: name.to_string(),
+                class_name: class_name.to_string(),
+                parent_index,
+                properties: Map::new(),
+                attributes: Map::new(),
+            }
+        };
+        let snapshot = |modified_state: i64, archivable: Option<bool>| {
+            let event_properties = archivable
+                .map(|archivable| {
+                    Map::from_iter([("Archivable".to_string(), Value::Bool(archivable))])
+                })
+                .unwrap_or_default();
+            let document = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+                    instance("package", "testPackage", "Folder", Some(0)),
+                    SettingsBytecodeInstance {
+                        settings_id: "link".to_string(),
+                        name: "PackageLink".to_string(),
+                        class_name: "PackageLink".to_string(),
+                        parent_index: Some(1),
+                        properties: Map::from_iter([(
+                            "ModifiedState".to_string(),
+                            Value::from(modified_state),
+                        )]),
+                        attributes: Map::new(),
+                    },
+                    SettingsBytecodeInstance {
+                        settings_id: "event".to_string(),
+                        name: "RemoteEvent".to_string(),
+                        class_name: "RemoteEvent".to_string(),
+                        parent_index: Some(1),
+                        properties: event_properties,
+                        attributes: Map::new(),
+                    },
+                ],
+            };
+            ProjectSnapshot {
+                entries: [(
+                    path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+                )]
+                .into_iter()
+                .collect(),
+            }
+        };
+        let before = snapshot(1, Some(false));
+        let desired = snapshot(-1, Some(true));
+        let observed = snapshot(1, None);
+        let paths = HashSet::from([path.clone()]);
+        let (mismatches, _) =
+            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        assert!(mismatches.is_empty());
+
+        let observed = snapshot(1, Some(false));
+        let (mismatches, detail) =
+            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        assert_eq!(mismatches, vec![path]);
+        assert!(detail.is_some_and(|detail| detail.contains("Archivable")));
     }
 
     #[test]

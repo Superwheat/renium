@@ -1,4 +1,4 @@
-<!-- renium-version: 0.3.3 -->
+<!-- renium-version: 0.3.4 -->
 # Renium automation
 
 Use `rbx`. If `PATH` is stale, use `%USERPROFILE%\.renium\bin\rbx.exe` on Windows or `~/.renium/bin/rbx` on macOS/Linux. Never search editor extension folders.
@@ -35,7 +35,7 @@ Read only relevant guides. Read several when categories overlap. Don't guess unr
 - Launch, close, or replace Studio only when required. Renium handles confirmation.
 - Run one mutation command at a time and inspect its result before the next. Never chain edits, deletes, pulls, pushes, Undo, Redo, package insertion, or recovery in one shell command.
 - After a failed mutation, stop and verify affected live roots before any recovery or sync.
-- Never alter a package root to bypass a failed edit. Desync it only when removing the package link is intended.
+- Renium marks linked packages Changed before editing their descendants. If a result includes `autoDesyncedPackages`, tell the user which packages changed and ask before `pp`; never publish automatically. Use `pd` to mark one manually, `pu` to discard its changes and update it, and `upl` only to remove its PackageLink.
 
 ## Projects and targeting
 

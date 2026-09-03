@@ -55,6 +55,7 @@ struct PendingEditorBinaryGroup {
 struct EditorPackageGroupPlan {
     retained_roots: Vec<EditorBinaryRetainedRoot>,
     package_roots: Vec<EditorBinaryPackageRoot>,
+    mutation_package_roots: Vec<EditorBinaryPackageRoot>,
     change_generation: Option<u64>,
 }
 
@@ -131,6 +132,30 @@ fn package_roots_for_groups(
         .collect()
 }
 
+fn has_direct_package_link(dom: &RbxWeakDom, referent: RbxRef) -> bool {
+    dom.get_by_ref(referent).is_some_and(|instance| {
+        instance.children().iter().any(|child| {
+            dom.get_by_ref(*child)
+                .is_some_and(|child| child.class.as_str() == "PackageLink")
+        })
+    })
+}
+
+fn actual_package_roots(dom: &RbxWeakDom, roots: &[RbxRef]) -> Vec<RbxRef> {
+    let mut pending = roots.to_vec();
+    let mut package_roots = Vec::new();
+    while let Some(referent) = pending.pop() {
+        let Some(instance) = dom.get_by_ref(referent) else {
+            continue;
+        };
+        if has_direct_package_link(dom, referent) {
+            package_roots.push(referent);
+        }
+        pending.extend(instance.children().iter().rev().copied());
+    }
+    package_roots
+}
+
 fn desired_package_reference_services(
     dom: &RbxWeakDom,
     package_roots: &HashSet<RbxRef>,
@@ -192,6 +217,7 @@ struct CanonicalRbxSubtree<'a> {
     json_properties: Option<&'a HashMap<RbxRef, Map<String, Value>>>,
 }
 
+#[derive(Clone)]
 struct CanonicalRbxSubtreePair {
     desired_root: RbxRef,
     entries: Vec<(RbxRef, RbxRef)>,
@@ -388,6 +414,28 @@ fn canonical_rbx_subtrees_equal(
     Ok(settings_documents_equivalent(&left, &right))
 }
 
+fn canonical_rbx_package_contents_equal(
+    left: CanonicalRbxSubtree<'_>,
+    right: CanonicalRbxSubtree<'_>,
+    database: &ReflectionDatabase<'_>,
+    property_filters: &HashMap<String, NativePropertyFilter>,
+) -> Result<bool> {
+    let mut left = canonical_rbx_subtree_document(left, database, property_filters, "desired")?;
+    let mut right = canonical_rbx_subtree_document(right, database, property_filters, "live")?;
+    for root in [left.instances.first_mut(), right.instances.first_mut()]
+        .into_iter()
+        .flatten()
+    {
+        root.name = "__ReniumPackageRoot".to_string();
+        root.properties.clear();
+        root.attributes.clear();
+    }
+    stabilize_settings_reference_ids(&mut left);
+    stabilize_settings_reference_ids(&mut right);
+    align_settings_ids_to_reference(&left, &mut right);
+    Ok(settings_documents_equivalent(&left, &right))
+}
+
 fn canonical_rbx_subtree_document(
     subtree: CanonicalRbxSubtree<'_>,
     database: &ReflectionDatabase<'_>,
@@ -444,6 +492,94 @@ fn canonical_rbx_subtree_document(
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
+
+    fn package_dom(root_name: &str, root_archivable: bool, value: &str) -> (RbxWeakDom, RbxRef) {
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let outer = dom.insert(
+            dom.root_ref(),
+            RbxInstanceBuilder::new("Folder").with_name("Outer"),
+        );
+        let package = dom.insert(
+            outer,
+            RbxInstanceBuilder::new("Model")
+                .with_name(root_name)
+                .with_property("Archivable", RbxVariant::Bool(root_archivable)),
+        );
+        dom.insert(package, RbxInstanceBuilder::new("PackageLink"));
+        dom.insert(
+            package,
+            RbxInstanceBuilder::new("StringValue")
+                .with_name("Value")
+                .with_property("Value", RbxVariant::String(value.to_string())),
+        );
+        (dom, package)
+    }
+
+    #[test]
+    fn actual_package_roots_are_the_direct_link_parents() {
+        let (dom, package) = package_dom("Package", true, "same");
+        let outer = dom.get_by_ref(package).unwrap().parent();
+        assert_eq!(actual_package_roots(&dom, &[outer]), vec![package]);
+    }
+
+    #[test]
+    fn package_content_comparison_ignores_root_overrides_but_detects_descendant_edits() {
+        let (desired, desired_root) = package_dom("Renamed", false, "same");
+        let (live, live_root) = package_dom("Package", true, "same");
+        let desired_refs = canonical_rbx_import_refs(&desired);
+        let live_refs = canonical_rbx_import_refs(&live);
+        let database = rbx_reflection_database::get().unwrap();
+        let property_filters = ["Model", "StringValue"]
+            .into_iter()
+            .map(|class_name| {
+                (
+                    class_name.to_string(),
+                    native_property_filter(database, class_name),
+                )
+            })
+            .collect();
+        let desired_subtree = CanonicalRbxSubtree {
+            dom: &desired,
+            root: desired_root,
+            refs: &desired_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        let live_subtree = CanonicalRbxSubtree {
+            dom: &live,
+            root: live_root,
+            refs: &live_refs,
+            logical_properties: None,
+            json_properties: None,
+        };
+        assert!(
+            canonical_rbx_package_contents_equal(
+                desired_subtree,
+                live_subtree,
+                database,
+                &property_filters,
+            )
+            .unwrap()
+        );
+
+        let (changed, changed_root) = package_dom("Package", true, "changed");
+        let changed_refs = canonical_rbx_import_refs(&changed);
+        assert!(
+            !canonical_rbx_package_contents_equal(
+                CanonicalRbxSubtree {
+                    dom: &changed,
+                    root: changed_root,
+                    refs: &changed_refs,
+                    logical_properties: None,
+                    json_properties: None,
+                },
+                live_subtree,
+                database,
+                &property_filters,
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn package_link_runtime_state_does_not_change_package_content_equality() {
@@ -1209,6 +1345,43 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     })
 }
 
+fn matching_editor_package_roots(
+    desired_dom: &RbxWeakDom,
+    live_dom: &RbxWeakDom,
+    groups: &[PendingEditorBinaryGroup],
+    desired_package_roots: &HashSet<RbxRef>,
+    live_package_roots: &HashSet<RbxRef>,
+) -> Result<Vec<(RbxRef, RbxRef)>> {
+    let mut pairs = Vec::new();
+    for group in groups {
+        for desired_root in &group.roots {
+            if !desired_package_roots.contains(desired_root) {
+                continue;
+            }
+            let (path_segments, path_ordinals) =
+                rbx_dom_instance_path_parts(desired_dom, *desired_root);
+            let Ok(live_root) =
+                rbx_dom_instance_by_path_unique(live_dom, &path_segments, &path_ordinals)
+            else {
+                continue;
+            };
+            if !live_package_roots.contains(&live_root) {
+                continue;
+            }
+            let desired_instance = desired_dom
+                .get_by_ref(*desired_root)
+                .context("Package-bearing project root is missing")?;
+            let live_instance = live_dom
+                .get_by_ref(live_root)
+                .context("Package-bearing Studio root is missing")?;
+            if desired_instance.class == live_instance.class {
+                pairs.push((*desired_root, live_root));
+            }
+        }
+    }
+    Ok(pairs)
+}
+
 fn plan_editor_package_root_retention(
     bridge: &BridgeServer,
     desired_dom: &RbxWeakDom,
@@ -1242,6 +1415,7 @@ fn plan_editor_package_root_retention(
                 Ok(EditorPackageGroupPlan {
                     retained_roots: Vec::new(),
                     package_roots: Vec::new(),
+                    mutation_package_roots: Vec::new(),
                     change_generation: Some(change_generation),
                 })
             })
@@ -1270,35 +1444,52 @@ fn plan_editor_package_root_retention(
         .into_par_iter()
         .filter(|root| rbx_subtree_contains_class(&live_dom, *root, "PackageLink"))
         .collect::<HashSet<_>>();
-    let mut package_pairs = Vec::new();
-    for group in groups {
-        for desired_root in &group.roots {
-            if !desired_package_roots.contains(desired_root) {
-                continue;
-            }
+    let package_pairs = matching_editor_package_roots(
+        desired_dom,
+        &live_dom,
+        groups,
+        desired_package_roots,
+        &live_package_roots,
+    )?;
+    let mut actual_package_pairs_by_group = vec![Vec::new(); groups.len()];
+    for (group_index, group) in groups.iter().enumerate() {
+        for desired_root in actual_package_roots(desired_dom, &group.roots) {
             let (path_segments, path_ordinals) =
-                rbx_dom_instance_path_parts(desired_dom, *desired_root);
-            let Ok(live_root) =
-                rbx_dom_instance_by_path_unique(&live_dom, &path_segments, &path_ordinals)
-            else {
-                continue;
-            };
-            if !live_package_roots.contains(&live_root) {
-                continue;
-            }
+                rbx_dom_instance_path_parts(desired_dom, desired_root);
+            let live_root = rbx_dom_instance_by_path_unique(
+                &live_dom,
+                &path_segments,
+                &path_ordinals,
+            )
+            .with_context(|| {
+                format!(
+                    "Project package root {} has no matching package in Studio; ordinary push cannot create or replace package relationships",
+                    path_segments.join(".")
+                )
+            })?;
             let desired_instance = desired_dom
-                .get_by_ref(*desired_root)
-                .context("Package-bearing project root is missing")?;
+                .get_by_ref(desired_root)
+                .context("Project package root is missing")?;
             let live_instance = live_dom
                 .get_by_ref(live_root)
-                .context("Package-bearing Studio root is missing")?;
-            if desired_instance.class != live_instance.class {
-                continue;
+                .context("Studio package root is missing")?;
+            if desired_instance.class != live_instance.class
+                || !has_direct_package_link(&live_dom, live_root)
+            {
+                bail!(
+                    "Project package root {} has no matching package in Studio; ordinary push cannot create or replace package relationships",
+                    path_segments.join(".")
+                );
             }
-            package_pairs.push((*desired_root, live_root));
+            actual_package_pairs_by_group[group_index].push((desired_root, live_root));
         }
     }
-    let (desired_refs, live_refs) = if package_pairs.is_empty() {
+    let actual_package_pairs = actual_package_pairs_by_group
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let (desired_refs, live_refs) = if package_pairs.is_empty() && actual_package_pairs.is_empty() {
         (None, None)
     } else {
         let started = Instant::now();
@@ -1338,13 +1529,45 @@ fn plan_editor_package_root_retention(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+    let canonical_actual_package_pairs = actual_package_pairs
+        .par_iter()
+        .map(|(desired_root, live_root)| {
+            canonical_rbx_subtree_pair(
+                &CanonicalRbxSubtree {
+                    dom: desired_dom,
+                    root: *desired_root,
+                    refs: desired_refs
+                        .as_ref()
+                        .context("Desired package paths were not prepared")?,
+                    logical_properties: None,
+                    json_properties: None,
+                },
+                &CanonicalRbxSubtree {
+                    dom: &live_dom,
+                    root: *live_root,
+                    refs: live_refs
+                        .as_ref()
+                        .context("Live package paths were not prepared")?,
+                    logical_properties: None,
+                    json_properties: None,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     log_timing("package preflight native package comparison", started);
     let canonical_package_pairs_by_root = canonical_package_pairs
         .iter()
         .map(|pair| (pair.desired_root, pair))
         .collect::<HashMap<_, _>>();
+    let canonical_actual_package_pairs_by_root = canonical_actual_package_pairs
+        .iter()
+        .map(|pair| (pair.desired_root, pair))
+        .collect::<HashMap<_, _>>();
     let mut package_property_filters = HashMap::new();
-    if !canonical_package_pairs.is_empty() {
+    if !canonical_package_pairs.is_empty() || !canonical_actual_package_pairs.is_empty() {
         for class_name in live_export
             .as_ref()
             .context("Package preflight export was not prepared")?
@@ -1358,10 +1581,12 @@ fn plan_editor_package_root_retention(
         }
     }
     let started = Instant::now();
+    let mut comparison_pairs = canonical_package_pairs.clone();
+    comparison_pairs.extend(canonical_actual_package_pairs.iter().cloned());
     let overlay_requests = package_preflight_overlay_property_requests(
         desired_dom,
         &live_dom,
-        &canonical_package_pairs,
+        &comparison_pairs,
         logical_properties_by_ref,
         desired_refs
             .as_ref()
@@ -1397,13 +1622,15 @@ fn plan_editor_package_root_retention(
     let started = Instant::now();
     let package_services = groups
         .iter()
-        .filter(|group| {
+        .enumerate()
+        .filter(|(index, group)| {
             group
                 .roots
                 .iter()
                 .any(|root| canonical_package_pairs_by_root.contains_key(root))
+                || !actual_package_pairs_by_group[*index].is_empty()
         })
-        .map(|group| group.service.clone())
+        .map(|(_, group)| group.service.clone())
         .collect::<HashSet<_>>();
     let live_properties_by_ref = if overlay_schema.is_empty() {
         HashMap::new()
@@ -1429,7 +1656,7 @@ fn plan_editor_package_root_retention(
     }
     let started = Instant::now();
     let mut plans = Vec::with_capacity(groups.len());
-    for group in groups {
+    for (group_index, group) in groups.iter().enumerate() {
         let live_target = match rbx_dom_instance_by_path_unique(
             &live_dom,
             &group.target_path,
@@ -1449,6 +1676,7 @@ fn plan_editor_package_root_retention(
                 plans.push(EditorPackageGroupPlan {
                     retained_roots: Vec::new(),
                     package_roots: Vec::new(),
+                    mutation_package_roots: Vec::new(),
                     change_generation: Some(change_generation),
                 });
                 continue;
@@ -1480,6 +1708,52 @@ fn plan_editor_package_root_retention(
                 class_name: instance.class.to_string(),
             });
         }
+        let mut mutation_package_roots = Vec::new();
+        for (desired_root, live_root) in &actual_package_pairs_by_group[group_index] {
+            let unchanged = if canonical_actual_package_pairs_by_root.contains_key(desired_root) {
+                canonical_rbx_package_contents_equal(
+                    CanonicalRbxSubtree {
+                        dom: desired_dom,
+                        root: *desired_root,
+                        refs: desired_refs
+                            .as_ref()
+                            .context("Desired package paths were not prepared")?,
+                        logical_properties: Some(logical_properties_by_ref),
+                        json_properties: None,
+                    },
+                    CanonicalRbxSubtree {
+                        dom: &live_dom,
+                        root: *live_root,
+                        refs: live_refs
+                            .as_ref()
+                            .context("Live package paths were not prepared")?,
+                        logical_properties: None,
+                        json_properties: Some(&live_properties_by_ref),
+                    },
+                    database,
+                    &package_property_filters,
+                )?
+            } else {
+                false
+            };
+            if unchanged {
+                continue;
+            }
+            let instance = live_dom
+                .get_by_ref(*live_root)
+                .context("Studio package root is missing")?;
+            let (path_segments, path_ordinals) = rbx_dom_instance_path_parts(&live_dom, *live_root);
+            mutation_package_roots.push(EditorBinaryPackageRoot {
+                path_segments,
+                path_ordinals,
+                class_name: instance.class.to_string(),
+            });
+        }
+        mutation_package_roots.sort_by(|left, right| {
+            left.path_segments
+                .cmp(&right.path_segments)
+                .then_with(|| left.path_ordinals.cmp(&right.path_ordinals))
+        });
         let mut retained_roots = Vec::new();
         let retained_root = |desired_root: RbxRef,
                              live_root: RbxRef,
@@ -1619,6 +1893,7 @@ fn plan_editor_package_root_retention(
         plans.push(EditorPackageGroupPlan {
             retained_roots,
             package_roots,
+            mutation_package_roots,
             change_generation,
         });
     }
@@ -1985,6 +2260,7 @@ fn build_editor_binary_import_for_services(
             root_paths,
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,
+            mutation_package_roots: package_plan.mutation_package_roots,
             change_generation: package_plan.change_generation,
         });
     }

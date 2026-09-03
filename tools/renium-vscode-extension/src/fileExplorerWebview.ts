@@ -1649,7 +1649,7 @@ tree.addEventListener('contextmenu',function(e){
   if(n&&n.kind!=='service'&&(linkSt==='linked'||linkSt==='broken'))html+='<div class="mi" data-c="resaveLink">Save New Package Version</div>';
   if(n&&n.kind!=='service'&&linkSt==='linked')html+='<div class="mi" data-c="breakLink">Break Link</div>';
   if(n&&n.kind!=='service'&&linkSt==='broken')html+='<div class="mi" data-c="relinkLink">Relink Package</div>';
-  if(canDesyncPackage(n))html+='<div class="mi" data-c="desyncPackageLink">Desync Roblox Package</div>';
+  if(canDesyncPackage(n))html+='<div class="mi" data-c="desyncPackageLink">Unlink Roblox Package</div>';
   if(n&&n.kind!=='service'&&n.canDelete!==false)html+='<div class="mi" data-c="deleteInstance">Delete</div>';
   html+='<div class="mi" data-c="copyPath">Copy Roblox Path</div>';
   classPicker.classList.add('hidden');

@@ -2716,7 +2716,7 @@ class RobloxSyncController {
       this.liveSyncStartupFilePauseHeld = false;
       this.updateStatusBar();
       if (!options.silent) {
-        vscode.window.showInformationMessage("Live sync started.");
+        vscode.window.showInformationMessage("Live sync started: saved files ↔ Studio.");
       }
     } catch (err) {
       if (this.liveSyncStopRequested) {
@@ -3276,7 +3276,7 @@ class RobloxSyncController {
 
   private async controlDaemonFileWrites(
     cfg: SyncConfig,
-    action: "pause" | "resume" | "settle" | "queue",
+    action: "pause" | "resume" | "settle" | "queue" | "notify",
     paths: string[],
     acknowledgedSide?: "editor" | "studio",
   ): Promise<void> {
@@ -3288,7 +3288,7 @@ class RobloxSyncController {
       !this.automationClient.isRunning()
       || this.daemonFileSyncGeneration !== this.automationClient.processGeneration()
     ) {
-      startedPaused = action !== "queue";
+      startedPaused = action !== "queue" && action !== "notify";
       await this.setDaemonFileSync(cfg, true, startedPaused);
       if (action === "pause") {
         return;
@@ -3306,6 +3306,7 @@ class RobloxSyncController {
           manageFiles: true,
           ...(fileWrites === "pause" || fileWrites === "resume" ? { fileWrites } : {}),
           ...(action === "queue" ? { queuePaths: paths } : {}),
+          ...(action === "notify" ? { notifyPaths: paths } : {}),
           ...(fileWrites === "resume" || action === "settle" ? { settlePaths: paths } : {}),
           ...(acknowledgedSide && paths.length > 0 ? { acknowledgedSide } : {}),
         },
@@ -3322,7 +3323,7 @@ class RobloxSyncController {
       if (attempt > 0) {
         throw new Error("Live sync file watcher did not start.");
       }
-      startedPaused = action !== "queue";
+      startedPaused = action !== "queue" && action !== "notify";
       await this.setDaemonFileSync(cfg, true, startedPaused);
       if (action === "pause") {
         return;
@@ -3938,6 +3939,14 @@ class RobloxSyncController {
       this.editorLiveSyncRuntimeEnabled &&
       this.isProjectSourcePath(doc.uri.fsPath, cfg)
     ) {
+      try {
+        await this.controlDaemonFileWrites(cfg, "notify", [doc.uri.fsPath]);
+      } catch (error) {
+        this.output.appendLine(
+          `[renium] live sync could not forward saved file: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        this.scheduleDaemonFileSyncRestart();
+      }
       return;
     }
 

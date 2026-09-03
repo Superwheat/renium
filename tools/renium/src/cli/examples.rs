@@ -57,9 +57,12 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx rm Workspace --settings-id editor:item",
     ),
     (
-        "dpl",
-        "Examples:\n  rbx dpl ReplicatedStorage --settings-id editor:package",
+        "upl",
+        "Examples:\n  rbx upl ReplicatedStorage --settings-id editor:package",
     ),
+    ("pd", "Examples:\n  rbx pd ReplicatedStorage.testPackage"),
+    ("pp", "Examples:\n  rbx pp ReplicatedStorage.testPackage"),
+    ("pu", "Examples:\n  rbx pu ReplicatedStorage.testPackage"),
     (
         "mip",
         "Examples:\n  rbx mip ReplicatedStorage --parent-settings-id editor:parent --model car.rbxm",

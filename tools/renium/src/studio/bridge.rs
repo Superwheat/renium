@@ -163,10 +163,19 @@ pub(crate) struct BridgeApplicationError {
 
 impl std::fmt::Display for BridgeApplicationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first_line = self.message.lines().next().unwrap_or(&self.message);
+        let message = first_line
+            .split_once(": ")
+            .filter(|(prefix, _)| {
+                prefix
+                    .rsplit_once(':')
+                    .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+            })
+            .map_or(first_line, |(_, message)| message);
         write!(
             formatter,
             "Bridge method {} failed: {}",
-            self.method, self.message
+            self.method, message
         )
     }
 }
@@ -225,6 +234,7 @@ pub(crate) struct SourceBatchMap {
 pub(crate) struct BridgeSocket {
     pub(crate) port: u16,
     pub(crate) peer: String,
+    pub(crate) studio_pid: Option<u32>,
     pub(crate) role: String,
     pub(crate) last_focused_at: Instant,
     pub(crate) bridge_info: BridgeInfoPayload,
@@ -239,6 +249,7 @@ pub(crate) struct BridgeSocket {
 struct BridgeSocketSnapshot {
     port: u16,
     peer: String,
+    studio_pid: Option<u32>,
     role_key: String,
     bridge_info: BridgeInfoPayload,
 }
@@ -1188,6 +1199,7 @@ impl BridgeServer {
         let mut bridge_socket = BridgeSocket {
             port,
             peer,
+            studio_pid: None,
             role: BRIDGE_ROLE_UNKNOWN.to_string(),
             last_focused_at: accepted_at,
             bridge_info: BridgeInfoPayload::default(),
@@ -1202,6 +1214,7 @@ impl BridgeServer {
             .with_context(|| format!("readiness getBridgeInfo failed on {bind_host}:{port}"))?;
         bridge_socket.role = normalize_bridge_role(&bridge_info.bridge_role).to_string();
         bridge_socket.bridge_info = bridge_info;
+        bridge_socket.studio_pid = Self::studio_pid_for_peer(&bridge_socket.peer).ok();
 
         let _ = bridge_socket
             .socket
@@ -1766,12 +1779,11 @@ impl BridgeServer {
     ) -> Result<String> {
         let runtime_pin = self.runtime_pin_for_selector(target, player)?;
         for channel in &self.channels {
-            let mut guard = match channel.sockets.try_lock() {
+            let guard = match channel.sockets.try_lock() {
                 Ok(guard) => guard,
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                 Err(TryLockError::WouldBlock) => continue,
             };
-            Self::ensure_place_unambiguous(&mut guard, target, player)?;
             if let Some(role) =
                 Self::select_role_for_selector_with_pin(&guard, target, player, &runtime_pin)
                 && let Some(socket) = guard.get(&role)
@@ -1879,6 +1891,7 @@ impl BridgeServer {
                     BridgeSocketSnapshot {
                         port: socket.port,
                         peer: socket.peer.clone(),
+                        studio_pid: socket.studio_pid,
                         role_key: role_key.clone(),
                         bridge_info: socket.bridge_info.clone(),
                     },
@@ -1941,7 +1954,6 @@ impl BridgeServer {
     fn try_call_pinned_socket<T>(
         &self,
         context: &BridgeCallContext<'_>,
-        validate_place: bool,
         last_error: &mut Option<String>,
         call: BridgeSocketCall<T>,
     ) -> Result<(Option<T>, bool)> {
@@ -1958,9 +1970,6 @@ impl BridgeServer {
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                 Err(TryLockError::WouldBlock) => continue,
             };
-            if validate_place {
-                Self::ensure_place_unambiguous(&mut sockets, context.target, context.player)?;
-            }
             let Some(socket_role) = Self::select_role_for_selector_with_pin(
                 &sockets,
                 context.target,
@@ -2017,14 +2026,12 @@ impl BridgeServer {
     fn call_pinned_socket<T>(
         &self,
         context: &BridgeCallContext<'_>,
-        validate_place: bool,
         call: BridgeSocketCall<T>,
         label: &str,
     ) -> Result<T> {
         let mut last_error = None;
         for _ in 0..64 {
-            let (result, _) =
-                self.try_call_pinned_socket(context, validate_place, &mut last_error, call)?;
+            let (result, _) = self.try_call_pinned_socket(context, &mut last_error, call)?;
             if let Some(result) = result {
                 return Ok(result);
             }
@@ -2037,7 +2044,7 @@ impl BridgeServer {
         }
         while Instant::now() < lock_deadline {
             let (result, attempted_socket) =
-                self.try_call_pinned_socket(context, false, &mut last_error, call)?;
+                self.try_call_pinned_socket(context, &mut last_error, call)?;
             if let Some(result) = result {
                 return Ok(result);
             }
@@ -2084,7 +2091,6 @@ impl BridgeServer {
         };
         self.call_pinned_socket(
             &call_context,
-            false,
             Self::call_on_socket_with_timeout,
             "Bridge cancellation",
         )
@@ -2193,7 +2199,6 @@ impl BridgeServer {
 
         self.call_pinned_socket(
             &call_context,
-            runtime_id.is_none(),
             Self::call_on_socket_with_timeout,
             "Bridge call",
         )
@@ -2424,7 +2429,10 @@ impl BridgeServer {
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn cached_snapshot_is_live(snapshot: &BridgeSocketSnapshot) -> bool {
-        Self::studio_pid_for_peer(&snapshot.peer).is_ok()
+        snapshot.studio_pid.map_or_else(
+            || Self::studio_pid_for_peer(&snapshot.peer).is_ok(),
+            crate::daemon::is_process_alive,
+        )
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -2647,7 +2655,6 @@ impl BridgeServer {
 
         self.call_pinned_socket(
             &call_context,
-            false,
             Self::call_on_socket_chunk,
             "Bridge chunk call",
         )
@@ -2692,7 +2699,6 @@ impl BridgeServer {
 
         self.call_pinned_socket(
             &call_context,
-            false,
             Self::call_on_socket_chunk,
             "Bridge chunk call",
         )
@@ -2716,6 +2722,15 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Result<u32> {
         let peer = self.peer_for_selector(target, player)?;
+        for channel in &self.channels {
+            if let Some(pid) = Self::cached_channel_snapshots(channel)
+                .into_iter()
+                .find(|snapshot| snapshot.peer == peer)
+                .and_then(|snapshot| snapshot.studio_pid)
+            {
+                return Ok(pid);
+            }
+        }
         Self::studio_pid_for_peer(&peer)
     }
 
@@ -2729,13 +2744,41 @@ impl BridgeServer {
             for snapshot in Self::cached_channel_snapshots(channel) {
                 if Self::role_matches_target(&snapshot.role_key, target)
                     && snapshot.bridge_info.runtime_id == runtime_id
-                    && let Ok(pid) = Self::studio_pid_for_peer(&snapshot.peer)
+                    && let Some(pid) = snapshot
+                        .studio_pid
+                        .or_else(|| Self::studio_pid_for_peer(&snapshot.peer).ok())
                 {
                     return Ok(pid);
                 }
             }
         }
         bail!("No connected Studio bridge found for runtime {runtime_id}")
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn runtime_id_for_studio_pid(
+        &self,
+        target: BridgeTarget,
+        pid: u32,
+    ) -> Result<String> {
+        let mut matches = HashSet::new();
+        for channel in &self.channels {
+            for snapshot in Self::cached_channel_snapshots(channel) {
+                if Self::role_matches_target(&snapshot.role_key, target)
+                    && snapshot
+                        .studio_pid
+                        .or_else(|| Self::studio_pid_for_peer(&snapshot.peer).ok())
+                        == Some(pid)
+                {
+                    matches.insert(snapshot.bridge_info.runtime_id);
+                }
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.into_iter().next().expect("one runtime remains")),
+            0 => bail!("Studio process {pid} has no connected edit bridge"),
+            count => bail!("Studio process {pid} has {count} edit runtimes"),
+        }
     }
 
     fn studio_pid_for_peer(peer: &str) -> Result<u32> {

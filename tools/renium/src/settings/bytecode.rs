@@ -348,11 +348,7 @@ pub(crate) fn is_default_property_value(
     if property_name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY) {
         return false;
     }
-    if matches!(
-        (property_name, property_value),
-        ("Archivable" | "CharacterAutoLoads", Value::Bool(true))
-            | ("Sandboxed", Value::Bool(false))
-    ) {
+    if is_known_default_property_value(property_name, property_value) {
         return true;
     }
     state
@@ -360,6 +356,14 @@ pub(crate) fn is_default_property_value(
         .get(class_name)
         .and_then(|properties| properties.get(property_name))
         .is_some_and(|default| default == property_value)
+}
+
+pub(crate) fn is_known_default_property_value(property_name: &str, value: &Value) -> bool {
+    matches!(
+        (property_name, value),
+        ("Archivable" | "CharacterAutoLoads", Value::Bool(true))
+            | ("Sandboxed", Value::Bool(false))
+    )
 }
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {

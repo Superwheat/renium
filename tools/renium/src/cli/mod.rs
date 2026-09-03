@@ -25,12 +25,14 @@ use crate::project::workflows;
 use crate::studio::bridge::DEFAULT_EXPORT_CHUNK_SIZE;
 
 pub(crate) fn command() -> clap::Command {
-    examples::COMMAND_EXAMPLES
-        .iter()
-        .fold(Cli::command(), |command, (name, examples)| {
-            command.mut_subcommand(*name, |subcommand| subcommand.override_help(*examples))
-        })
-        .override_help(
+    let mut command = Cli::command();
+    for (name, examples) in examples::COMMAND_EXAMPLES {
+        let subcommand = command
+            .find_subcommand_mut(name)
+            .expect("command example must name an existing command");
+        *subcommand = std::mem::take(subcommand).override_help(*examples);
+    }
+    command.override_help(
             "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
         )
 }
@@ -189,8 +191,18 @@ pub(super) enum Commands {
     Rename(RenameInstanceArgs),
     #[command(name = "rm", alias = "remove")]
     Remove(RemoveInstanceCommandArgs),
-    #[command(name = "dpl", alias = "desync-package-link")]
+    #[command(
+        name = "upl",
+        visible_alias = "unlink-package-link",
+        aliases = ["dpl", "desync-package-link"]
+    )]
     DesyncPackageLink(DesyncPackageLinkCommandArgs),
+    #[command(name = "pd", alias = "package-desync")]
+    PackageDesync(PackageActionArgs),
+    #[command(name = "pp", alias = "package-publish")]
+    PackagePublish(PackageActionArgs),
+    #[command(name = "pu", alias = "package-update", alias = "package-revert")]
+    PackageUpdate(PackageActionArgs),
     #[command(name = "mip", alias = "import-model")]
     ImportModel(ImportModelCommandArgs),
     #[command(name = "mep", alias = "export-model")]
@@ -949,6 +961,24 @@ pub(super) struct DesyncPackageLinkCommandArgs {
     pub(super) target: ProjectInstanceArgs,
     #[arg(long)]
     pub(super) override_packages: bool,
+}
+
+#[derive(Parser)]
+pub(super) struct PackageActionArgs {
+    #[arg(help = "Package root path; use a JSON string array when names contain dots")]
+    pub(super) target: String,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "One-based ordinal for each path segment"
+    )]
+    pub(super) ords: Vec<usize>,
+    #[arg(long, help = "Target Studio process when more than one is connected")]
+    pub(super) pid: Option<u32>,
+    #[arg(long, default_value_t = 20.0)]
+    pub(super) timeout: f64,
+    #[command(flatten)]
+    pub(super) bridge: BridgeConnectionArgs,
 }
 
 #[derive(Parser)]

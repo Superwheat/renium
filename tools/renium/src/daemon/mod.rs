@@ -783,10 +783,17 @@ pub(super) fn try_daemon_control_request(
     let object = parameters
         .as_object_mut()
         .context("Daemon operation parameters must be a JSON object")?;
+    let direct_package = matches!(
+        operation,
+        automation::op::PACKAGE_DESYNC
+            | automation::op::PACKAGE_PUBLISH
+            | automation::op::PACKAGE_UPDATE
+    ) && object.get("pid").and_then(Value::as_u64).is_some();
     if matches!(
         operation,
         automation::op::STUDIOS | automation::op::PERFORMANCE_PROFILE
-    ) {
+    ) || direct_package
+    {
         let Some(response) = try_send_request(&automation::Request {
             v: automation::PROTOCOL_VERSION,
             id: current_millis().min(u128::from(u64::MAX)) as u64,

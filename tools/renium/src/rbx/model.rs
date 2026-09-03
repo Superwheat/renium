@@ -1523,7 +1523,7 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         .any(|instance| instance.class_name == "PackageLink")
     {
         bail!(
-            "Models containing PackageLink instances cannot be imported; desync the package first"
+            "Models containing PackageLink instances cannot be imported; remove the link from the model first"
         );
     }
 

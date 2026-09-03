@@ -31,7 +31,7 @@ use crate::editor::review::request_editor_push_review;
 use crate::editor::review::{studio_pid_for_bridge, studio_title_for_bridge};
 use crate::editor::types::{
     EditorBinaryExport, EditorBinaryExportGroup, EditorBinaryImport,
-    EditorBinarySerializationBatch, EditorChangeSet, EditorPropertyChange,
+    EditorBinarySerializationBatch, EditorChangeSet, EditorPropertyChange, EditorSourceChange,
 };
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::decode::rbx_variant_to_settings_json;
@@ -3133,13 +3133,14 @@ pub(crate) fn send_editor_change_batches(
         }
     }
 
-    let source_changes = changes
+    let mut source_changes = changes
         .source_changes
         .iter()
         .filter(|change| {
             !binary_import.is_some_and(|import| import.imports_service(&change.service))
         })
         .collect::<Vec<_>>();
+    source_changes.sort_by(|left, right| source_change_apply_order(left, right));
     summary.insert(
         "sourceSent".to_string(),
         Value::Number(serde_json::Number::from(source_changes.len() as u64)),
@@ -3250,6 +3251,17 @@ pub(crate) fn send_editor_change_batches(
     Ok(summary)
 }
 
+fn source_change_apply_order(
+    left: &EditorSourceChange,
+    right: &EditorSourceChange,
+) -> std::cmp::Ordering {
+    left.service
+        .cmp(&right.service)
+        .then_with(|| left.path_segments.len().cmp(&right.path_segments.len()))
+        .then_with(|| left.path_segments.cmp(&right.path_segments))
+        .then_with(|| left.path_ordinals.cmp(&right.path_ordinals))
+}
+
 fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
     let Some(result) = result.as_object() else {
         return;
@@ -3289,4 +3301,33 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
         bail!("Studio rejected or failed an editor push batch");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod source_change_tests {
+    use super::*;
+
+    fn source_change(path: &[&str]) -> EditorSourceChange {
+        EditorSourceChange {
+            service: path[0].to_string(),
+            settings_id: None,
+            path_segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+            path_ordinals: vec![1; path.len()],
+            class_name: "ModuleScript".to_string(),
+            source: Some("return true".to_string()),
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn source_containers_are_applied_before_their_children() {
+        let parent = source_change(&["ReplicatedStorage", "Package", "Controller"]);
+        let child = source_change(&["ReplicatedStorage", "Package", "Controller", "Maid"]);
+        let mut changes = [&child, &parent];
+
+        changes.sort_by(|left, right| source_change_apply_order(left, right));
+
+        assert_eq!(changes[0].path_segments, parent.path_segments);
+        assert_eq!(changes[1].path_segments, child.path_segments);
+    }
 }

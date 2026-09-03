@@ -88,7 +88,7 @@ pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
     platform::process_executable_path(pid)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn studio_window_title(pid: u32) -> Result<String> {
     platform::studio_window_title(pid)
 }
@@ -2113,6 +2113,41 @@ mod platform {
                 format!("Studio did not expose its document path: {accessibility_error:#}")
             })
         })
+    }
+
+    pub fn studio_window_title(pid: u32) -> Result<String> {
+        let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("Studio PID is out of range"))?;
+        let application = ax_application(pid)?;
+        let Some(windows) = ax_attribute(application, "AXWindows") else {
+            // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
+            unsafe { CFRelease(application) };
+            bail!("Studio exposed no accessibility windows");
+        };
+        let windows = windows as CFArrayRef;
+        // SAFETY: AXWindows is an owned CFArray whose entries remain valid while it is retained.
+        let count = unsafe { CFArrayGetCount(windows) };
+        let mut titles = Vec::new();
+        for index in 0..count {
+            // SAFETY: index is within the CFArray count read above.
+            let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
+            if let Some(title) = ax_string_attribute(window, "AXTitle")
+                && title.contains("Roblox Studio")
+                && ax_string_attribute(window, "AXSubrole").as_deref() == Some("AXStandardWindow")
+            {
+                titles.push(title);
+            }
+        }
+        // SAFETY: these Core Foundation objects are owned by this function.
+        unsafe {
+            CFRelease(windows);
+            CFRelease(application);
+        }
+        titles.sort();
+        titles.dedup();
+        if titles.len() != 1 {
+            bail!("Studio process exposed {} document windows", titles.len());
+        }
+        Ok(titles.remove(0))
     }
 
     fn device_emulator_elements(pid: i32) -> Result<(AXUIElementRef, Option<AXUIElementRef>)> {

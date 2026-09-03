@@ -389,7 +389,9 @@ pub(crate) fn reject_package_link_instance_mutation(
         .get(index)
         .with_context(|| format!("Invalid instance index {index}"))?;
     if instance.class_name == "PackageLink" {
-        bail!("PackageLink instances cannot be {action}; desync the package to remove its link");
+        bail!(
+            "PackageLink instances cannot be {action}; use upl on the package root to remove its link"
+        );
     }
     Ok(())
 }
@@ -405,7 +407,7 @@ pub(crate) fn reject_package_link_subtree_mutation(
             .get(*index)
             .is_some_and(|instance| instance.class_name == "PackageLink")
     }) {
-        bail!("Package-bearing instances cannot be {action}; desync the package first");
+        bail!("Package-bearing instances cannot be {action}; use upl on the package root first");
     }
     Ok(())
 }

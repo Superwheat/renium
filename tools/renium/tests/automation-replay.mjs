@@ -182,9 +182,12 @@ try {
 } finally {
   daemon.stdin.end();
   await new Promise((resolve) => {
+    if (daemon.exitCode !== null) {
+      resolve();
+      return;
+    }
     const timer = setTimeout(() => {
       daemon.kill();
-      resolve();
     }, 2000);
     daemon.once("exit", () => {
       clearTimeout(timer);
@@ -201,7 +204,7 @@ try {
       throw new Error(`Could not stop replay daemon: ${stopped.stderr || stopped.stdout}`);
     }
   }
-  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 }
 
 console.log("Renium automation replay passed");

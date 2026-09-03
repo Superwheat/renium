@@ -42,7 +42,6 @@ int main(int argc, char** argv)
         if (access(helper, R_OK) == 0 && setenv("DYLD_INSERT_LIBRARIES", helper, 1) != 0)
             return 75;
     }
-    argv[0] = studio;
     execv(studio, argv);
     return 76;
 }

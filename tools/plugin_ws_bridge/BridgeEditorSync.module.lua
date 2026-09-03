@@ -352,13 +352,13 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
 	end
+	if wasLive or instance:IsDescendantOf(game) then
+		markTransactionMutation(ctx)
+	end
 	if instance.Parent ~= parent then
 		cancelExpectedEvent(ctx, token)
 		local target = if parent == nil then "nil" else parent:GetFullName()
 		error(`Roblox rejected parenting {instance:GetFullName()} to {target}`, 0)
-	end
-	if wasLive or instance:IsDescendantOf(game) then
-		markTransactionMutation(ctx)
 	end
 end
 
@@ -377,11 +377,11 @@ local function setNameForSync(instance: Instance, name: string, ctx: { [string]:
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
 	end
+	markLiveMutation(ctx, instance)
 	if instance.Name ~= name then
 		cancelExpectedEvent(ctx, token)
 		error(`Roblox rejected renaming {instance:GetFullName()} to {name}`, 0)
 	end
-	markLiveMutation(ctx, instance)
 end
 
 local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
@@ -396,11 +396,11 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
 	end
+	markLiveMutation(ctx, Workspace)
 	if Workspace.CurrentCamera ~= camera then
 		cancelExpectedEvent(ctx, token)
 		error("Roblox did not retain Workspace.CurrentCamera", 0)
 	end
-	markLiveMutation(ctx, Workspace)
 end
 
 local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?)
@@ -1345,12 +1345,12 @@ local function writePropertyForSync(
 		cancelExpectedEvent(ctx, token)
 		return false, result
 	end
+	markLiveMutation(ctx, instance)
 	local okRead, current = readProperty(instance, propertyName)
 	if not okRead or not valuesEqual(current, value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
 	end
-	markLiveMutation(ctx, instance)
 	return true, result
 end
 
@@ -1369,11 +1369,11 @@ local function setAttributeForSync(
 		cancelExpectedEvent(ctx, token)
 		return false, result
 	end
+	markLiveMutation(ctx, instance)
 	if not valuesEqual(instance:GetAttribute(attributeName), value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain attribute {attributeName}`
 	end
-	markLiveMutation(ctx, instance)
 	return true, result
 end
 
@@ -1575,11 +1575,11 @@ local function setTagForSync(instance: Instance, tag: string, added: boolean, ct
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
 	end
+	markLiveMutation(ctx, instance)
 	if CollectionService:HasTag(instance, tag) ~= added then
 		cancelExpectedEvent(ctx, token)
 		error(`Roblox did not retain tag {tag} on {instance:GetFullName()}`, 0)
 	end
-	markLiveMutation(ctx, instance)
 end
 
 local function applyTags(instance: Instance, rawTags: any, stats: { [string]: any }, ctx: { [string]: any })
@@ -1754,12 +1754,19 @@ local function ensureSourceParentPath(
 	return current
 end
 
+local function normalizedSource(source: string): string
+	if string.find(source, "\r", 1, true) == nil then
+		return source
+	end
+	return (string.gsub(string.gsub(source, "\r\n", "\n"), "\r", "\n"))
+end
+
 local function verifySourceWrite(instance: Instance, expectedSource: string)
 	local okRead, appliedSource = readScriptSource(instance)
 	if not okRead then
 		error(`Failed to verify Source for {instance:GetFullName()}: {appliedSource}`)
 	end
-	if appliedSource ~= expectedSource then
+	if normalizedSource(appliedSource) ~= normalizedSource(expectedSource) then
 		error(
 			`Source verification failed for {instance:GetFullName()}: expected {#expectedSource} bytes, got {#appliedSource} bytes`
 		)
@@ -1780,7 +1787,7 @@ local function writeSourceIfChanged(
 	stats: { [string]: any }
 ): boolean
 	local okRead, currentSource = readScriptSource(instance)
-	if okRead and currentSource == nextSource then
+	if okRead and normalizedSource(currentSource) == normalizedSource(nextSource) then
 		return false
 	end
 
@@ -1788,8 +1795,8 @@ local function writeSourceIfChanged(
 	if not okWrite then
 		error(`Failed to {action} Source for {instance:GetFullName()}: {writeError}`)
 	end
-	verifySourceWrite(instance, nextSource)
 	markLiveMutation(ctx, instance)
+	verifySourceWrite(instance, nextSource)
 	if writeMethod == "UpdateSourceAsync" then
 		stats.sourceUpdateAsync += 1
 	else
@@ -2564,7 +2571,9 @@ local function applyPropertyChange(
 
 	local instance = resolveInstance(change, ctx)
 	if instance == nil then
-		error(`Target instance was not found: {pathKey(cloneArray(change.pathSegments))} [{change.className or ""}]`)
+		error(
+			`Target instance was not found: {table.concat(cloneArray(change.pathSegments), ".")} [{change.className or ""}]`
+		)
 	end
 	local staged = if ctx.resolveStagedPath ~= nil
 		then ctx.resolveStagedPath(change.pathSegments, change.pathOrdinals)
@@ -2859,8 +2868,8 @@ local function validatePropertyChange(change, serviceName, ctx)
 	if change.className == "PackageLink" then
 		error("PackageLink instances are read-only")
 	end
-	if type(change.className) ~= "string" or change.className == "" then
-		error("Editor property className must be a non-empty string")
+	if type(change.className) ~= "string" then
+		error("Editor property className must be a string")
 	end
 	if change.properties ~= nil then
 		validateObjectTable(change.properties, "Editor properties")
@@ -3118,7 +3127,8 @@ local function mutationNeedsStructuralSnapshot(params: { [string]: any }, ctx: {
 	end
 	for _, change in ipairs(params.propertyChanges or {}) do
 		local instance = resolveInstance(change, ctx, true)
-		if instance ~= nil and instance.ClassName ~= tostring(change.className or "") then
+		local className = tostring(change.className or "")
+		if instance ~= nil and className ~= "" and instance.ClassName ~= className then
 			return true
 		end
 	end
@@ -3288,7 +3298,6 @@ end
 
 function TransactionState.captureProperties(
 	changes: { any },
-	hasStructuralChanges: boolean,
 	metadataTargets: { Instance },
 	metadataSeen: { [Instance]: boolean },
 	ctx: { [string]: any }
@@ -3298,7 +3307,7 @@ function TransactionState.captureProperties(
 	local unreadablePropertyNames = {}
 	for _, change in ipairs(changes) do
 		local instance = resolveInstance(change, ctx, true)
-		if instance ~= nil and (not hasStructuralChanges or metadataSeen[instance]) then
+		if instance ~= nil then
 			addSnapshotMetadataTarget(metadataTargets, metadataSeen, instance)
 			local seenNames = propertySeen[instance] or {}
 			propertySeen[instance] = seenNames
@@ -3374,13 +3383,9 @@ function TransactionState.captureSnapshot(serviceNames: { string }, params: { [s
 		error(`Studio kept changing {changedService} while Renium prepared rollback data`)
 	end
 
-	local sources, sourceKeys = {}, {}
-	if not hasStructuralChanges then
-		sources, sourceKeys = TransactionState.captureSources(params.sourceChanges or {}, ctx)
-	end
+	local sources, sourceKeys = TransactionState.captureSources(params.sourceChanges or {}, ctx)
 	local properties, unreadablePropertyNames = TransactionState.captureProperties(
 		params.propertyChanges or {},
-		hasStructuralChanges,
 		metadataTargets,
 		metadataSeen,
 		ctx
@@ -4804,6 +4809,179 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return { generations = generations, hasPackageLinks = hasPackageLinks }
 	end
 
+	local function hasDirectPackageLink(instance: Instance): boolean
+		return instance:FindFirstChildWhichIsA("PackageLink") ~= nil
+	end
+
+	local function directPackageVersion(instance: Instance): number
+		local packageLink = instance:FindFirstChildWhichIsA("PackageLink")
+		if packageLink == nil then
+			error("Package root no longer contains a PackageLink")
+		end
+		local ok, version = readProperty(packageLink, "VersionNumber")
+		if not ok or type(version) ~= "number" or version <= 0 or version % 1 ~= 0 then
+			error("PackageLink.VersionNumber is unavailable")
+		end
+		return version
+	end
+
+	local function tagsWouldChange(instance: Instance, rawTags: any): boolean
+		local desired = {}
+		for _, tag in pairs(if type(rawTags) == "table" then rawTags else {}) do
+			if type(tag) == "string" and tag ~= "" then
+				desired[tag] = true
+			end
+		end
+		for _, tag in ipairs(CollectionService:GetTags(instance)) do
+			if not desired[tag] then
+				return true
+			end
+			desired[tag] = nil
+		end
+		return next(desired) ~= nil
+	end
+
+	local function propertyChangeWouldMutate(change: { [string]: any }): boolean
+		local instance = resolveInstance(change, ctx)
+		if instance == nil then
+			return true
+		end
+		if isProtectedWorkspaceCameraPath(change.pathSegments) or isProtectedWorkspaceCameraInstance(instance) then
+			return false
+		end
+		local serviceName = tostring(change.service or "")
+		for _, propertyName in ipairs(changedPropertyNames(change.properties or {})) do
+			local rawValue = change.properties[propertyName]
+			if propertyName == "Name" then
+				if instance.Name ~= tostring(rawValue) then
+					return true
+				end
+			elseif propertyName == "Tags" then
+				if tagsWouldChange(instance, rawValue) then
+					return true
+				end
+			elseif propertyName ~= "Source" then
+				local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
+				local okRead, current = readProperty(instance, propertyName)
+				if not okDecode or not okRead or not valuesEqual(current, decoded) then
+					return true
+				end
+			end
+		end
+		for _, propertyName in ipairs(change.resetProperties or {}) do
+			local okCreate, defaultInstance = pcall(Instance.new, instance.ClassName)
+			if not okCreate or defaultInstance == nil then
+				return true
+			end
+			local okDefault, defaultValue = readProperty(defaultInstance, propertyName)
+			defaultInstance:Destroy()
+			local okRead, current = readProperty(instance, propertyName)
+			if not okDefault or not okRead or not valuesEqual(current, defaultValue) then
+				return true
+			end
+		end
+		for _, attributeName in ipairs(change.deletedAttributes or {}) do
+			if instance:GetAttribute(attributeName) ~= nil then
+				return true
+			end
+		end
+		for attributeName, rawValue in pairs(change.attributes or {}) do
+			local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
+			if not okDecode or not valuesEqual(instance:GetAttribute(attributeName), decoded) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function activeMutationPackageTargets(params: { [string]: any }): { any }
+		local activePropertyPaths = {}
+		for _, change in ipairs(params.propertyChanges or {}) do
+			if propertyChangeWouldMutate(change) then
+				activePropertyPaths[pathCacheKey(change.pathSegments, change.pathOrdinals)] = true
+			end
+		end
+		local targets = {}
+		for _, target in ipairs(params.mutationPackageTargets or {}) do
+			if
+				target.kind ~= "property"
+				or activePropertyPaths[pathCacheKey(target.pathSegments, target.pathOrdinals)]
+			then
+				targets[#targets + 1] = target
+			end
+		end
+		return targets
+	end
+
+	local function mutationPackages(rawTargets: any, maxTargets: number): { any }
+		local targetsAreArray, targetCount = denseArrayLength(rawTargets)
+		if
+			not targetsAreArray
+			or targetCount > math.min(maxTargets, tonumber(ctx.maxChangesPerRequest) or 5000)
+		then
+			error("Invalid editor mutation package request")
+		end
+		local packages = {}
+		local packageKeys = {}
+		for index, descriptor in ipairs(rawTargets) do
+			if type(descriptor) ~= "table" then
+				error(`Editor mutation package target {index} must be an object`)
+			end
+			local serviceName = tostring(descriptor.service or "")
+			if not ctx.allowedServices[serviceName] then
+				error(`Editor mutation package target {index} has an invalid service`)
+			end
+			validateMutationPath(descriptor, serviceName, `Editor mutation package target {index}`, ctx)
+			local pathSegments = table.clone(descriptor.pathSegments)
+			local pathOrdinals = cloneArray(descriptor.pathOrdinals)
+			local exact = true
+			local instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
+			while instance == nil and #pathSegments > 1 do
+				exact = false
+				table.remove(pathSegments)
+				table.remove(pathOrdinals)
+				instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
+			end
+			if exact and instance ~= nil and instance:IsA("PackageLink") then
+				error("PackageLink instances are read-only")
+			end
+			if exact and descriptor.includeSelf ~= true and instance ~= nil then
+				instance = instance.Parent
+			end
+			local service = game:GetService(serviceName)
+			while instance ~= nil and instance ~= service do
+				if hasDirectPackageLink(instance) then
+					local packageSegments, packageOrdinals = BridgeIdentity.getRefPathParts(instance)
+					if packageSegments == nil then
+						error("Package root has no stable Studio path")
+					end
+					local key = pathCacheKey(packageSegments, packageOrdinals)
+					if not packageKeys[key] then
+						packageKeys[key] = true
+						packages[#packages + 1] = {
+							pathSegments = packageSegments,
+							pathOrdinals = packageOrdinals,
+							expectedVersion = directPackageVersion(instance),
+							_key = key,
+						}
+					end
+				end
+				instance = instance.Parent
+			end
+		end
+		table.sort(packages, function(left, right)
+			return left._key < right._key
+		end)
+		for _, package in ipairs(packages) do
+			package._key = nil
+		end
+		return packages
+	end
+
+	function api.getMutationPackages(params: { [string]: any }): { [string]: any }
+		return { packages = mutationPackages(params.targets, 256) }
+	end
+
 	local function validatedTransactionServices(params: { [string]: any }): (string, { string }, { [string]: boolean })
 		local transactionId = tostring(params.transactionId or "")
 		local servicesAreArray, serviceCount = denseArrayLength(params.services)
@@ -4971,6 +5149,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local rootsByService = {}
 		local restrictedServices = {}
 		local packageSnapshotRoots = {}
+		local explicitPackageRoots = params.packageRoots ~= nil
 		for index, descriptor in ipairs(params.mutationRoots or {}) do
 			local serviceName = tostring(descriptor.service or "")
 			if not includedServices[serviceName] then
@@ -4986,9 +5165,38 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					rootsByService[serviceName] = serviceRoots
 				end
 				serviceRoots[root] = true
-				if containsPackageLink(root) then
+				if not explicitPackageRoots and containsPackageLink(root) then
 					packageSnapshotRoots[root] = true
 				end
+			end
+		end
+		if explicitPackageRoots then
+			local packageRootsAreArray, packageRootCount = denseArrayLength(params.packageRoots)
+			if
+				not packageRootsAreArray
+				or packageRootCount > (tonumber(ctx.maxChangesPerRequest) or 5000)
+			then
+				error("Invalid editor transaction package roots")
+			end
+			for index, descriptor in ipairs(params.packageRoots) do
+				if type(descriptor) ~= "table" then
+					error(`Editor transaction package root {index} must be an object`)
+				end
+				local serviceName = tostring(descriptor.pathSegments and descriptor.pathSegments[1] or "")
+				if not includedServices[serviceName] then
+					error("Invalid editor transaction package root service")
+				end
+				validateMutationPath(
+					descriptor,
+					serviceName,
+					`Editor transaction package root {index}`,
+					ctx
+				)
+				local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
+				if root == nil or not hasDirectPackageLink(root) then
+					error(`Editor transaction package root {index} changed before the transaction began`)
+				end
+				packageSnapshotRoots[root] = true
 			end
 		end
 		return rootsByService, restrictedServices, packageSnapshotRoots
@@ -5059,8 +5267,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			captureChangedSources(params.sourceChanges or {}, includedServices)
 		local nativeImport = params.nativeImport == true
 		local nativeImportServices = includedNativeImportServices(params.nativeImportServices, includedServices)
+		local mutationPackageRoots = mutationPackages(
+			activeMutationPackageTargets(params),
+			tonumber(ctx.maxChangesPerRequest) or 5000
+		)
+		local transactionParams = table.clone(params)
+		transactionParams.packageRoots = table.clone(params.packageRoots or {})
+		for _, packageRoot in ipairs(mutationPackageRoots) do
+			transactionParams.packageRoots[#transactionParams.packageRoots + 1] = packageRoot
+		end
 		local mutationRootsByService, restrictedMutationServices, packageSnapshotRoots =
-			transactionMutationRoots(params, includedServices)
+			transactionMutationRoots(transactionParams, includedServices)
 		local snapshotServices = servicesWithoutNativeImport(serviceNames, nativeImportServices)
 		local snapshotSourceChanges = changesWithoutNativeImport(params.sourceChanges or {}, nativeImportServices)
 		local snapshotPropertyChanges = changesWithoutNativeImport(params.propertyChanges or {}, nativeImportServices)
@@ -5125,6 +5342,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			transactionId = transactionId,
 			state = "open",
 			packageMutation = next(packageSnapshotRoots) ~= nil,
+			mutationPackages = mutationPackageRoots,
 		}
 	end
 
@@ -6998,7 +7216,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					stats.ok = false
 					stats.errors += 1
 					stats.error = tostring(err)
-					warn("[Renium] editor instance sync failed: " .. tostring(err))
 					aborted = true
 					break
 				end
@@ -7022,7 +7239,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					stats.ok = false
 					stats.errors += 1
 					stats.error = tostring(err)
-					warn("[Renium] editor source sync failed: " .. tostring(err))
 					aborted = true
 					break
 				end
@@ -7042,7 +7258,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				stats.ok = false
 				stats.errors += 1
 				stats.error = tostring(err)
-				warn("[Renium] editor reference sync failed: " .. tostring(err))
 				aborted = true
 			end
 		end
@@ -7070,7 +7285,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local ownsSession = pcall(assertSessionOwnership, operationGeneration)
 				if ownsSession then
 					stats.meshPartPreloadErrors += 1
-					warn("[Renium] editor mesh preload failed: " .. tostring(preloadCountOrError))
 				else
 					stats.ok = false
 					stats.errors += 1
@@ -7094,7 +7308,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						stats.ok = false
 						stats.errors += 1
 						stats.error = tostring(err)
-						warn("[Renium] editor property sync failed: " .. tostring(err))
 						aborted = true
 						break
 					end

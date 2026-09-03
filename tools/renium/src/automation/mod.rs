@@ -83,10 +83,15 @@ impl Request {
                 "cap",
             )
         })?;
+        let direct_package = matches!(
+            self.op,
+            op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE
+        ) && self.p.get("pid").and_then(Value::as_u64).is_some();
         if !matches!(
             self.op,
             op::CAP | op::BIND | op::STUDIOS | op::UPDATE_STUDIOS | op::PERFORMANCE_PROFILE
-        ) && self.cx.is_none()
+        ) && !direct_package
+            && self.cx.is_none()
         {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));
         }
@@ -194,7 +199,7 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioReopenTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -553,11 +558,47 @@ mod tests {
         ));
         assert!(
             Request {
+                v: 1,
+                id: 1,
                 op: op::STUDIOS,
-                ..request
+                cx: None,
+                p: json!({}),
             }
             .validate()
             .is_ok()
+        );
+        assert!(
+            Request {
+                v: 1,
+                id: 1,
+                op: op::PACKAGE_PUBLISH,
+                cx: None,
+                p: json!({ "pid": 123 }),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Request {
+                v: 1,
+                id: 1,
+                op: op::PACKAGE_UPDATE,
+                cx: None,
+                p: json!({ "pid": 123 }),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Request {
+                v: 1,
+                id: 1,
+                op: op::PACKAGE_PUBLISH,
+                cx: None,
+                p: json!({}),
+            }
+            .validate()
+            .is_err()
         );
         assert!(
             serde_json::from_str::<Request>(r#"{"v":1,"id":1,"op":0,"p":{},"command":"find"}"#)
