@@ -127,7 +127,7 @@ fn client_matches_saved_target(
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (bridge, entry, expected_file);
-        return false;
+        false
     }
     #[cfg(any(windows, target_os = "macos"))]
     {
