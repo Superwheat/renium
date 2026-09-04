@@ -3166,15 +3166,24 @@ mod tests {
     #[test]
     fn settled_wait_observes_an_event_quiet_period() {
         let control = test_control();
+        control.set_plugin_state(json!({ "pendingChanges": 1 }));
+        let (notified, notification) = mpsc::sync_channel(1);
         let notifier = Arc::clone(&control);
         let event = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
+            let notified_at = Instant::now();
             notifier.set_plugin_state(json!({}));
+            notified
+                .send(notified_at)
+                .expect("waiter should receive the notification time");
         });
 
-        let started = Instant::now();
         assert!(control.wait_settled(Duration::from_secs(1)));
-        assert!(started.elapsed() >= Duration::from_millis(140));
+        let settled_at = Instant::now();
+        let notified_at = notification
+            .recv()
+            .expect("event thread should report its notification time");
+        assert!(settled_at.duration_since(notified_at) >= SETTLE_QUIET_PERIOD);
         event.join().expect("event thread should finish");
     }
 
