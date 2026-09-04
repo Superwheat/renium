@@ -117,6 +117,9 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
+    if (op === AUTOMATION_OP.studios) {
+      return this.send(config, label, op, undefined, parameters, options);
+    }
     const requireRuntime = operationRequiresRuntime(op, parameters);
     let contextId = await this.ensureContext(config, requireRuntime);
     let result = await this.send(config, label, op, contextId, parameters, options);
