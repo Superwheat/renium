@@ -2333,6 +2333,18 @@ fn automation_execute_request(
         op::CAP => automation::capabilities().map_err(automation_failure),
         op::BIND => bound_context::bind(state, bridge, &request.p),
         op::STUDIOS => {
+            let wait_seconds = request
+                .p
+                .get("waitSeconds")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if wait_seconds.is_finite() && wait_seconds > 0.0 {
+                bridge.wait_for_ready_channels_for_target(
+                    1,
+                    Duration::from_secs_f64(wait_seconds.min(bridge_wait_seconds)),
+                    BridgeTarget::Edit,
+                );
+            }
             let clients = studio_clients(bridge);
             Ok(json!({
                 "studios": bound_context::studio_candidates_from(&clients, ""),

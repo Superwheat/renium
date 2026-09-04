@@ -1137,15 +1137,16 @@ class RobloxSyncController {
     }
   }
 
-  private async connectedStudioPlaces(attempt = 0): Promise<ConnectedStudioPlace[]> {
+  private async connectedStudioPlaces(): Promise<ConnectedStudioPlace[]> {
     const cfg = this.getConfig();
+    const waitSeconds = editorBridgeWaitSeconds(cfg);
     const result = await this.runAutomationOperation(
       cfg.cliPath,
       cfg,
       "current-place",
       AUTOMATION_OP.studios,
-      { all: true },
-      { timeoutMs: 1_000 },
+      { all: true, waitSeconds },
+      { timeoutMs: waitSeconds * 1_000 + 1_000 },
     );
     if (result.code !== 0) {
       throw new Error("Could not read the connected Studio places.");
@@ -1182,12 +1183,6 @@ class RobloxSyncController {
         client,
       ]),
     ).values());
-    if (unique.length === 0 && attempt < 2) {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, attempt === 0 ? 200 : 800);
-      });
-      return this.connectedStudioPlaces(attempt + 1);
-    }
     return unique;
   }
 
