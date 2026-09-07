@@ -202,10 +202,12 @@ for (const fileName of logoFiles) {
   }
 }
 
-if (refreshStudioApi || !fs.existsSync(path.join(extensionResources, "roblox-properties.generated.json"))) {
-  generateRobloxPropertiesMetadata({ extensionRoot, repoRoot, refreshStudioApi });
-}
-syncStudioPluginBundle();
-syncProjectSchema();
 syncAgentInstructions();
-syncInsertableObjectIcons();
+if (!process.argv.includes("--docs-only")) {
+  if (refreshStudioApi || !fs.existsSync(path.join(extensionResources, "roblox-properties.generated.json"))) {
+    generateRobloxPropertiesMetadata({ extensionRoot, repoRoot, refreshStudioApi });
+  }
+  syncStudioPluginBundle();
+  syncProjectSchema();
+  syncInsertableObjectIcons();
+}

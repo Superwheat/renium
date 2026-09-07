@@ -2562,6 +2562,26 @@ fn ensure_import_service_dir(service_dir: &Path) -> Result<bool> {
     }
 }
 
+pub(crate) fn is_import_stage_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".renium-import"))
+    else {
+        return false;
+    };
+    let Some((service, nonce)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let Some((pid, sequence)) = nonce.split_once('-') else {
+        return false;
+    };
+    !service.is_empty()
+        && !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn prepare_split_import_service_dir(final_service_dir: &Path) -> Result<(PathBuf, bool, bool)> {
     match fs::metadata(final_service_dir) {
         Ok(metadata) if metadata.is_dir() => {

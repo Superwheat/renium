@@ -10,7 +10,11 @@ use crate::project::config;
 pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
     if matches!(
         &cli.command,
-        Commands::Config(_) | Commands::Doctor(_) | Commands::UpdateHelper(_)
+        Commands::Config(_)
+            | Commands::Doctor(_)
+            | Commands::UpdateHelper(_)
+            | Commands::Plugin(_)
+            | Commands::External(_)
     ) {
         return Ok(());
     }

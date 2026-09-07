@@ -1061,6 +1061,7 @@ impl ExportProjectStage {
 
 impl Drop for ExportProjectStage {
     fn drop(&mut self) {
+        config::remove_cached_script_naming(&self.project_root);
         if self.active {
             let _ = fs::remove_dir_all(&self.container);
         }
@@ -2279,21 +2280,6 @@ impl ServiceExportContext<'_> {
         };
         let mut prepared_service = release();
         log_timing(&format!("{service}: prepare"), prepare_started);
-        let instance_count = prepare
-            .get("instanceCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let script_count = prepare
-            .get("scriptCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let prepare_class_names = parse_string_list(prepare.get("classNames"))
-            .context("prepare.classNames must be an array of strings")?;
-        if verbose_timing_logs() {
-            println!(
-                "[renium] {service}: prepared instances={instance_count}, scripts={script_count}"
-            );
-        }
         let mut service_property_schema_by_class =
             parse_property_schema_map(prepare.get("propertySchemaByClass"))?;
         if service_property_schema_by_class.is_empty()
@@ -2314,6 +2300,23 @@ impl ServiceExportContext<'_> {
             );
             service_property_schema_by_class =
                 parse_property_schema_map(prepare.get("propertySchemaByClass"))?;
+        }
+        // A schema recovery releases and prepares the service again. Counts and
+        // class indexes must describe that final snapshot, not the discarded one.
+        let instance_count = prepare
+            .get("instanceCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let script_count = prepare
+            .get("scriptCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let prepare_class_names = parse_string_list(prepare.get("classNames"))
+            .context("prepare.classNames must be an array of strings")?;
+        if verbose_timing_logs() {
+            println!(
+                "[renium] {service}: prepared instances={instance_count}, scripts={script_count}"
+            );
         }
         let enum_value_names_by_type =
             parse_enum_value_name_map(prepare.get("enumValueNamesByType"))?;

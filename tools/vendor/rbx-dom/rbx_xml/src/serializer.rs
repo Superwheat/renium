@@ -258,6 +258,22 @@ fn serialize_instance<'dom, W: Write>(
         } else {
             match state.options.property_behavior {
                 EncodePropertyBehavior::IgnoreUnknown => {}
+                EncodePropertyBehavior::WriteUnknown
+                    if state
+                        .options
+                        .database
+                        .classes
+                        .get(instance.class.as_str())
+                        .is_some_and(|class| {
+                            state
+                                .options
+                                .database
+                                .superclasses_iter(class)
+                                .any(|class| class.properties.contains_key(property_name))
+                        }) =>
+                {
+                    // A known non-serializing property is not an unknown one.
+                }
                 EncodePropertyBehavior::WriteUnknown | EncodePropertyBehavior::NoReflection => {
                     // We'll take this value as-is with no conversions on
                     // either the name or value.

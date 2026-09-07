@@ -2174,7 +2174,9 @@ function BridgeUi.create(plugin, bridgeInfo)
 	function ui.updateStatus(view)
 		ui._lastView = view
 		local mode = tostring(view.mode or "disconnected")
-		local color = if mode == "connected"
+		local color = if mode == "connected" and view.syncFailed
+			then ERROR_RED
+			elseif mode == "connected"
 			then OK_GREEN
 			elseif mode == "connecting" then WARN_AMBER
 			elseif string.find(tostring(view.connectionStatus or ""), "interrupted", 1, true) then ERROR_RED

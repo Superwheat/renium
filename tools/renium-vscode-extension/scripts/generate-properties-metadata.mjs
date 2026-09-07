@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import metadata from "../src/propertyMetadata.js";
+const { MODEL_PIVOT_CLASSES, WORKSPACE_HIDDEN_STUDIO_PROPERTIES, WORKSPACE_VISIBLE_NON_SERIALIZED_PROPERTIES, WORKSPACE_VISIBLE_SERVICE_REF_PROPERTIES, WORKSPACE_SERVER_AUTHORITY_PROPERTIES, normalizeApiDump } = metadata;
 
 const GENERATED_FILE_NAME = "roblox-properties.generated.json";
 const GENERATED_STUDIO_API_SCHEMA_FILE_NAME = "BridgeStudioApiSchema.module.lua";
@@ -54,28 +56,8 @@ const VALUE_INSTANCE_TYPES = new Set([
   "Vector3Value",
 ]);
 const ALLOWED_WRITE_SECURITY = new Set(["None", "PluginSecurity"]);
-const MODEL_PIVOT_CLASSES = new Set(["Model", "WorldModel", "Workspace"]);
 const LIGHTING_HIDDEN_STUDIO_PROPERTIES = new Set([
   "ExtendLightRangeTo120",
-]);
-const WORKSPACE_HIDDEN_STUDIO_PROPERTIES = new Set([
-  "AirTurbulenceIntensity",
-  "CurrentCamera",
-  "LevelOfDetail",
-  "ModelStreamingMode",
-  "Origin",
-  "Pivot Offset",
-  "Scale",
-  "StreamingEnabledAlias",
-]);
-const WORKSPACE_VISIBLE_NON_SERIALIZED_PROPERTIES = new Set(["InsertPoint"]);
-const WORKSPACE_VISIBLE_SERVICE_REF_PROPERTIES = new Set(["PrimaryPart"]);
-const WORKSPACE_SERVER_AUTHORITY_PROPERTIES = new Set([
-  "AuthorityMode",
-  "NextGenerationReplication",
-  "PlayerScriptsUseInputActionSystem",
-  "SignalBehavior",
-  "UseFixedSimulation",
 ]);
 const CURRENT_WORKSPACE_API_PROPERTIES = {
   NextGenerationReplication: { type: "Enum.RolloutState", category: "Server Authority", order: 210 },
@@ -254,29 +236,6 @@ function categoryLabel(category) {
   return CATEGORY_LABELS[key] ?? titleCase(String(category ?? "Data").replace(/-/g, " "));
 }
 
-function rbxDomDataTypeFromApiDumpValueType(name, category) {
-  if (!name) {
-    return undefined;
-  }
-  if (category === "Enum") {
-    return { Enum: name.replace(/^Enum\./, "") };
-  }
-  if (category === "Class") {
-    return { Value: "Ref" };
-  }
-  const primitiveMap = {
-    bool: "Bool",
-    boolean: "Bool",
-    int: "Int32",
-    int64: "Int64",
-    float: "Float32",
-    double: "Float64",
-    string: "String",
-    BinaryString: "BinaryString",
-    Content: "ContentId",
-  };
-  return { Value: primitiveMap[name] ?? name };
-}
 
 function normalizePropertySource(raw) {
   const record = safeObject(raw);
@@ -305,63 +264,7 @@ function normalizePropertySource(raw) {
     return { classes, enums, sourceKind: "rbx-dom" };
   }
 
-  const classes = {};
-  for (const rawClass of record.Classes) {
-    const classRecord = safeObject(rawClass);
-    const className = String(classRecord.Name ?? "");
-    if (!className) {
-      continue;
-    }
-    const properties = {};
-    for (const rawMember of safeArray(classRecord.Members)) {
-      const member = safeObject(rawMember);
-      if (member.MemberType !== "Property") {
-        continue;
-      }
-      const propertyName = String(member.Name ?? "");
-      if (!propertyName) {
-        continue;
-      }
-      const valueType = safeObject(member.ValueType);
-      const valueTypeName = typeof valueType.Name === "string" ? valueType.Name : undefined;
-      const valueTypeCategory = typeof valueType.Category === "string" ? valueType.Category : undefined;
-      properties[propertyName] = {
-        Name: propertyName,
-        MemberType: "Property",
-        Security: safeObject(member.Security),
-        Scriptability: typeof member.Scriptability === "string" ? member.Scriptability : undefined,
-        SourceKind: "api-dump",
-        ValueType: { Name: valueTypeName, Category: valueTypeCategory },
-        DataType: rbxDomDataTypeFromApiDumpValueType(valueTypeName, valueTypeCategory),
-        Category: typeof member.Category === "string" ? member.Category : undefined,
-        Tags: safeArray(member.Tags).map(String),
-      };
-    }
-    classes[className] = {
-      Name: className,
-      Superclass: typeof classRecord.Superclass === "string" ? classRecord.Superclass : undefined,
-      Tags: safeArray(classRecord.Tags).map(String),
-      Properties: properties,
-    };
-  }
-  const enums = {};
-  for (const rawEnum of safeArray(record.Enums)) {
-    const enumRecord = safeObject(rawEnum);
-    const enumName = String(enumRecord.Name ?? "");
-    if (!enumName) {
-      continue;
-    }
-    const items = {};
-    for (const rawItem of safeArray(enumRecord.Items)) {
-      const item = safeObject(rawItem);
-      const itemName = String(item.Name ?? "");
-      const itemValue = Number(item.Value);
-      if (itemName && Number.isFinite(itemValue)) {
-        items[itemName] = itemValue;
-      }
-    }
-    enums[enumName] = { items };
-  }
+  const { Classes: classes, Enums: enums } = normalizeApiDump(record);
   return { classes, enums, sourceKind: "api-dump" };
 }
 

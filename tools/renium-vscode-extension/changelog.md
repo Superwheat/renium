@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.3.5 - 2026-09-07
+
+### Sync and Studio connections
+
+- More reliable two-way Live Sync through rapid edits, reconnects, and Play transitions, including when several places are open.
+- Resolving a conflict releases the previous sync connection promptly. Stopping Live Sync succeeds even when unresolved changes still need review.
+- Deleted temporary instances no longer leave phantom changes waiting to sync. Create, rename, move, and delete bursts preserve the final state and instance references.
+- Sync handles Studio's linked corner-radius properties without reporting false conflicts or overwriting genuine edits.
+- Duplicate-named instances and cross-service references reconcile correctly without rebuilding unrelated place content. Cross-service moves still recreate the moved Studio object; its saved data and references are preserved.
+- Cached exports stay current when properties outside normal Live Sync tracking change.
+- Mesh collision-fidelity changes preserve cooked geometry, mass, and inertia in both sync directions, including non-Archivable meshes. Sync waits for Studio to finish applying the change before checking it.
+- Live Sync completion no longer waits out its timeout after a successful reconciliation has already cleared the queue.
+- Large-place sync avoids repeated project lookups, redundant comparisons, and unnecessary per-instance property listeners without dropping saved properties.
+- Restarting Renium reconnects Studio windows opened by an earlier daemon instead of leaving stale connections alive.
+- Closing and immediately reopening a local place no longer targets its retired Studio connection.
+- Place-name targeting uses the Studio window name instead of the unreliable DataModel name. Commands stay attached to the selected place and reject ambiguous targets.
+- Busy connections remain distinguishable from disconnected ones; one slow place no longer holds up unrelated places.
+- Play clients and servers follow the correct session through starts, stops, reconnects, and delayed replies.
+- macOS automatically ignores Auto-Recovery prompts while preserving recovery files, and explains missing Accessibility permission instead of silently failing.
+
+### Performance monitoring
+
+- New `rbx perf` commands capture frame timing, memory, network traffic, and object counters for Edit mode, servers, or individual clients.
+- Inspect slow frames, timing percentiles, and memory categories; export complete recordings when detailed analysis is needed. Unavailable measurements are clearly identified.
+- Capture and analyze MicroProfiler data without opening its UI or asking users to save a dump manually. Reports highlight slow frames and relevant scopes, with filters for deeper investigation.
+- Built-in profiling is a trusted, authenticated workflow and does not require enabling unrestricted property access or starting a new Play session.
+
+### Network simulation
+
+- New `rbx net` commands change latency, jitter, and packet loss during an existing playtest, including different settings for separate clients.
+- Start with `normal`, `mid`, `high`, or `poor` connection presets, or set each direction separately.
+- Restore previous settings after testing. Renium rejects configurations that cannot be isolated to the requested client.
+
+### Protected Studio properties
+
+- New `rbx access` commands read and edit supported engine-protected properties directly on Windows and macOS, without restarting Studio.
+- Ask mode is the default. Individual approvals apply only to the exact instance and operation; read-only and explicitly enabled read-write modes are also available.
+- CollisionFidelity is available by default with validated values. Package edits still mark the containing package Changed and preserve its PackageLink.
+- Native entry points are rediscovered and validated after Studio updates. Unsupported layouts return a bounded, actionable error instead of using stale addresses.
+- Package auto-desync on macOS no longer mistakes adjacent memory for a second package layout and rejects a valid package.
+
+### Recording and saved-place inspection
+
+- Recording completion includes a timestamped frame overview. Review every captured frame through paginated contact sheets or open an individual full-resolution frame with `rbx rf`.
+- Full comparisons now support RBXL and RBXLX files against another file or the local project, covering saved instances, scripts, properties, attributes, references, packages, and Terrain data.
+- Comparison output stays compact by default, with optional complete differences and before/after values.
+- Temporary import folders no longer appear as game instances in the extension's Explorer.
+
+### Workflow plugins
+
+- Add custom commands without modifying Renium. `rbx plugin new` creates a small starter with a command manifest, Rust handler, SDK, and guide.
+- Plugin commands reuse Renium's project targeting and APIs. Persistent exclusive leases protect shared testing resources across tasks and interruptions.
+- A configurable sandbox workflow is included as source only; it is not built or installed automatically, and `rbx sandbox` is unavailable until that plugin is installed.
+
+### Agent workflow and editor reliability
+
+- Rewritten documentation teaches shorter, offline-first workflows. Agents use Play only for a specific runtime question, not after every small edit.
+- `rbx ck` checks Luau syntax without executing code or enabling `loadstring` in Studio.
+- More reliable extension startup, message handling, selection updates, and rapid property edits. Installation and update checks keep the CLI, plugin, and bundled guides aligned.
+
 ## 0.3.4 - 2026-09-03
 
 ### Roblox packages

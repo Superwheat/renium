@@ -120,18 +120,30 @@ export function resolveReniumCliPath(options: {
 }): string {
   const platform = options.platform ?? process.platform;
   const configuredPath = options.configuredPath?.trim();
-  const candidates = reniumCliCandidates({
-    ...options,
-    configuredPath,
-    fallbackRelativePaths: reniumCliFallbackRelativePaths(platform),
-  });
-  const existing = candidates.find((candidate) => {
+  const isFile = (candidate: string): boolean => {
     try {
       return fs.statSync(candidate).isFile();
     } catch {
       return false;
     }
+  };
+  // Do not probe PATH (which can include unavailable network drives) when a
+  // higher-priority local executable already exists.
+  const bundled = options.extensionRoot
+    ? bundledReniumCliPath(options.extensionRoot, platform, options.arch ?? process.arch)
+    : undefined;
+  for (const candidate of [configuredPath, bundled]) {
+    if (candidate && isFile(candidate)) {
+      return path.normalize(candidate);
+    }
+  }
+  const candidates = reniumCliCandidates({
+    ...options,
+    configuredPath: undefined,
+    extensionRoot: undefined,
+    fallbackRelativePaths: reniumCliFallbackRelativePaths(platform),
   });
+  const existing = candidates.find(isFile);
   if (existing) {
     return existing;
   }

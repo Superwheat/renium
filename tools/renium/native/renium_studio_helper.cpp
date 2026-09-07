@@ -953,3 +953,190 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumPackageAction(
         RunPackageOperationTask(params);
     return params->status == 4 ? 0 : params->status;
 }
+
+// C++ ABI boundary only: the host resolves/validates reflection descriptors and
+// owns authorization. The engine supplies the string conversion and runs it on
+// the selected DataModel's queue, never on this remote entry thread.
+struct PropertyReadParams
+{
+    std::uint64_t taskContext;
+    std::uint64_t submitTask;
+    std::uint64_t target;
+    std::uint64_t owner;
+    std::uint64_t dataModelOwner;
+    std::uint64_t descriptor;
+    std::uint64_t getter;
+    std::uint64_t classDescriptor;
+    std::uint64_t descriptorVtable;
+    std::uint64_t classOffset;
+    std::uint32_t timeoutMs;
+    std::uint32_t status;
+    std::uint32_t outputSize;
+    std::uint32_t exceptionCode;
+    char output[65536];
+    char error[256];
+    std::uint64_t identityBinding;
+    std::uint64_t identityGetter;
+    std::uint64_t setter;
+    std::uint32_t operation; // 0 identity only, 1 read, 2 write/read-back
+    std::uint32_t inputSize;
+    unsigned char identity[16];
+    unsigned char expectedIdentity[16];
+    char input[65536];
+    std::uint64_t parentOffset;
+    std::uint32_t ancestorCount;
+    std::uint32_t reserved;
+    std::uint64_t ancestors[65]; // target first; selected DataModel last
+    std::uint64_t selfOffset;
+};
+static_assert(sizeof(PropertyReadParams) == 132032);
+
+struct PropertyReadTask
+{
+    PropertyReadParams result{};
+    HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::uint64_t deadline = 0;
+    ~PropertyReadTask() { if (completed) CloseHandle(completed); }
+};
+
+static void ReadPropertyCore(PropertyReadTask* task)
+{
+    auto& p = task->result;
+    if (!RemainingMilliseconds(task->deadline))
+    {
+        p.status = 0xE40F;
+        strncpy_s(p.error, "property read expired before Studio could run it", _TRUNCATE);
+        return;
+    }
+    if (*reinterpret_cast<std::uint64_t*>(p.target + p.classOffset) != p.classDescriptor ||
+        *reinterpret_cast<std::uint64_t*>(p.descriptor) != p.descriptorVtable)
+    {
+        p.status = 0xE402;
+        strncpy_s(p.error, "property identity changed before execution", _TRUNCATE);
+        return;
+    }
+    try
+    {
+        for (std::uint32_t i = 0; i + 1 < p.ancestorCount; ++i)
+            if (*reinterpret_cast<std::uint64_t*>(p.ancestors[i] + p.parentOffset) != p.ancestors[i + 1])
+                throw std::runtime_error("property target hierarchy changed before execution");
+        if (*reinterpret_cast<std::uint64_t*>(p.target + p.selfOffset) != p.target ||
+            *reinterpret_cast<std::uint64_t*>(p.target + p.selfOffset + 8) != p.owner)
+            throw std::runtime_error("property target ownership changed before execution");
+        // Only pin the target after validating it under the DataModel lock.
+        // The raw pointer from an earlier lookup may already have been deleted.
+        auto owner = reinterpret_cast<void*>(p.owner);
+        if (!AddOwnerReference(owner))
+            throw std::runtime_error("property target was destroyed before execution");
+        auto targetHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
+        using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
+        reinterpret_cast<IdentityGetter>(p.identityGetter)(
+            reinterpret_cast<void*>(p.identityBinding), p.identity,
+            reinterpret_cast<void*>(p.target));
+        if (!p.operation)
+        {
+            p.status = 4;
+            return;
+        }
+        if (memcmp(p.identity, p.expectedIdentity, sizeof(p.identity)))
+            throw std::runtime_error("property target was replaced; request access again");
+        if (p.operation == 2)
+        {
+            const std::string input(p.input, p.inputSize);
+            using Setter = bool(__fastcall*)(void*, void*, const std::string*);
+            if (!reinterpret_cast<Setter>(p.setter)(
+                    reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.target), &input))
+                throw std::runtime_error("Studio rejected this property's text value");
+        }
+        // MSVC puts a member's hidden nontrivial return buffer after `this`.
+        // The descriptor constructs the returned std::string in that buffer.
+        alignas(std::string) unsigned char storage[sizeof(std::string)];
+        using Getter = void*(__fastcall*)(void*, void*, void*);
+        reinterpret_cast<Getter>(p.getter)(
+            reinterpret_cast<void*>(p.descriptor), storage, reinterpret_cast<void*>(p.target));
+        auto value = reinterpret_cast<std::string*>(storage);
+        if (value->size() > sizeof(p.output))
+        {
+            p.status = 0xE403;
+            strncpy_s(p.error, "property value exceeds the 64 KiB response limit", _TRUNCATE);
+        }
+        else
+        {
+            p.outputSize = static_cast<std::uint32_t>(value->size());
+            memcpy(p.output, value->data(), value->size());
+            p.status = 4;
+        }
+        value->~basic_string();
+    }
+    catch (const std::exception& error)
+    {
+        p.status = 0xE404;
+        strncpy_s(p.error, error.what(), _TRUNCATE);
+    }
+}
+
+static void ReadPropertyCaught(PropertyReadTask* task)
+{
+    __try { ReadPropertyCore(task); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        task->result.status = 0xE405;
+        task->result.exceptionCode = GetExceptionCode();
+        strncpy_s(task->result.error, "Studio raised an exception while reading the property", _TRUNCATE);
+    }
+}
+
+static DWORD RunPropertyRead(PropertyReadParams* params)
+{
+    if (!params || !params->taskContext || !params->submitTask || !params->target ||
+        !params->owner || !params->dataModelOwner || !params->descriptor || !params->getter ||
+        !params->classDescriptor || !params->descriptorVtable || params->classOffset > 0x100 ||
+        !params->identityBinding || !params->identityGetter || params->operation > 2 ||
+        (params->operation == 2 && !params->setter) || params->inputSize > sizeof(params->input) ||
+        params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 2 || params->ancestorCount > 65 ||
+        params->ancestors[0] != params->target ||
+        !params->timeoutMs || params->timeoutMs > 3000)
+        return 0xE401;
+    auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
+    if (!AddOwnerReference(modelOwner)) return 0xE402;
+    auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
+    auto task = std::make_shared<PropertyReadTask>();
+    task->result = *params;
+    task->deadline = GetTickCount64() + params->timeoutMs;
+    if (!task->completed) return 0xE406;
+    // Keep the DataModel alive through submission/wait, but do not put a strong
+    // reference to it inside its own queue (which could form a shutdown cycle).
+    std::function<void()> readTask{[task]() {
+        ReadPropertyCaught(task.get());
+        SetEvent(task->completed);
+    }};
+    auto submit = reinterpret_cast<SubmitDataModelTask>(params->submitTask);
+    if (!submit(reinterpret_cast<void*>(params->taskContext), &readTask, 1)) return 0xE407;
+    const auto remaining = RemainingMilliseconds(task->deadline);
+    if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)
+        return 0xE40F;
+    *params = task->result;
+    return params->status == 4 ? 0 : params->status;
+}
+
+static DWORD PropertyReadBoundary(PropertyReadParams* params)
+{
+    try { return RunPropertyRead(params); }
+    catch (const std::exception& error)
+    {
+        if (params) strncpy_s(params->error, error.what(), _TRUNCATE);
+        return 0xE408;
+    }
+    catch (...) { return 0xE409; }
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumReadProperty(PropertyReadParams* params)
+{
+    __try { return PropertyReadBoundary(params); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        params->exceptionCode = GetExceptionCode();
+        strncpy_s(params->error, "Studio target expired before the property task was submitted", _TRUNCATE);
+        return 0xE40A;
+    }
+}

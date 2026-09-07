@@ -2596,122 +2596,60 @@ class RobloxSyncController {
     this.stopStudioActionPolling();
     this.liveSyncStartupInProgress = true;
     this.liveSyncStartupFilePauseHeld = false;
+    const alreadyRunning = this.editorLiveSyncRuntimeEnabled;
     try {
-      if (this.editorLiveSyncRuntimeEnabled) {
-        await this.setEditorLiveSyncEnabled(true);
-        const cfg = this.getConfig();
-        if (this.liveSyncStopRequested) {
-          return;
-        }
-        let initialState: StudioChangeState | undefined;
-        if (cfg.studioLiveSyncEnabled && !this.studioLiveSyncStarted) {
-          if (!await this.ensureLiveSyncServeReady(cfg, options)) {
-            return;
-          }
-          if (this.liveSyncStopRequested) {
-            return;
-          }
-        }
-        initialState = await this.setDaemonFileSync(cfg, true);
-        if (this.liveSyncStopRequested) {
-          return;
-        }
-        const liveCfg = this.effectiveLiveSyncConfig(cfg);
-        initialState = await this.resolveReconciliation(liveCfg, initialState, false);
-        if (!initialState) {
-          await this.stopUnresolvedLiveSync();
-          return;
-        }
-        if (cfg.studioLiveSyncEnabled && !this.studioLiveSyncStarted) {
-          await this.startStudioLiveSyncRuntime(liveCfg, { ...options, initialState });
-        }
-        if (initialState.daemon?.mode === "verify") {
-          if (!options.silent) {
-            vscode.window.showInformationMessage("Studio and project files were checked. Live sync is off in Verify mode.");
-          }
-          return;
-        }
-        if (!options.silent) {
-          vscode.window.showInformationMessage("Live sync is already running.");
-        }
-        return;
-      }
-
       const cfg = this.getConfig();
-      try {
-        ensureFileExists(cfg.cliPath);
-      } catch (err) {
-        if (!options.bestEffort) {
-          throw err;
+      if (!alreadyRunning) {
+        try {
+          ensureFileExists(cfg.cliPath);
+        } catch (error) {
+          if (!options.bestEffort) { throw error; }
+          this.output.appendLine('[renium] editor live sync skipped: ' + String(error));
+          return;
         }
-        const message = err instanceof Error ? err.message : String(err);
-        this.output.appendLine(`[renium] editor live sync skipped: ${message}`);
-        return;
-      }
-
-      this.liveSyncProjectRoot = cfg.projectRoot;
-      invalidateProjectSourceGraph(cfg.projectRoot);
-      const sourceGraph = loadProjectSourceGraph(cfg.projectRoot);
-      if (sourceGraph.locations.length === 0) {
-        const message = `No project source directory exists for ${cfg.projectRoot}`;
-        if (!options.bestEffort) {
-          throw new Error(message);
+        this.liveSyncProjectRoot = cfg.projectRoot;
+        invalidateProjectSourceGraph(cfg.projectRoot);
+        if (loadProjectSourceGraph(cfg.projectRoot).locations.length === 0) {
+          const message = `No project source directory exists for ${cfg.projectRoot}`;
+          if (!options.bestEffort) { throw new Error(message); }
+          this.output.appendLine('[renium] editor live sync skipped: ' + message);
+          return;
         }
-        this.output.appendLine(`[renium] editor live sync skipped: ${message}`);
+      }
+      if ((!alreadyRunning || (cfg.studioLiveSyncEnabled && !this.studioLiveSyncStarted))
+        && !await this.ensureLiveSyncServeReady(cfg, options)) {
         return;
       }
-
-      if (!await this.ensureLiveSyncServeReady(cfg, options)) {
-        return;
-      }
-      if (this.liveSyncStopRequested) {
-        return;
-      }
-
+      if (this.liveSyncStopRequested) { return; }
       await this.setEditorLiveSyncEnabled(true);
-      if (this.liveSyncStopRequested) {
-        return;
-      }
+      if (this.liveSyncStopRequested) { return; }
       let liveCfg = this.getConfig();
-      this.displayedLiveSyncPrompt = false;
-      let initialState = await this.setDaemonFileSync(liveCfg, true, true);
-      if (this.liveSyncStopRequested && !initialState) {
-        return;
-      }
-      this.liveSyncStartupFilePauseHeld = true;
-      if (this.liveSyncStopRequested) {
-        return;
-      }
+      if (!alreadyRunning) { this.displayedLiveSyncPrompt = false; }
+      let initialState = await this.setDaemonFileSync(liveCfg, true, !alreadyRunning);
+      // Only this fresh-start path owns the file-write pause.
+      this.liveSyncStartupFilePauseHeld = !alreadyRunning && !!initialState;
+      if (this.liveSyncStopRequested) { return; }
       liveCfg = this.effectiveLiveSyncConfig(liveCfg);
-      initialState = await this.resolveReconciliation(liveCfg, initialState, true);
+      initialState = await this.resolveReconciliation(liveCfg, initialState, !alreadyRunning);
       if (!initialState) {
         await this.stopUnresolvedLiveSync();
         this.liveSyncStartupFilePauseHeld = false;
         return;
       }
-      if (this.liveSyncStopRequested) {
-        return;
+      if (this.liveSyncStopRequested) { return; }
+      if (!alreadyRunning || (liveCfg.studioLiveSyncEnabled && !this.studioLiveSyncStarted)) {
+        await this.startStudioLiveSyncRuntime(liveCfg, { ...options, initialState });
       }
-      await this.startStudioLiveSyncRuntime(liveCfg, {
-        ...options,
-        initialState,
-      });
-      if (initialState.daemon?.mode === "verify") {
+      if (this.liveSyncStopRequested) { return; }
+      if (this.liveSyncStartupFilePauseHeld) {
         await this.controlDaemonFileWrites(liveCfg, "resume", []);
         this.liveSyncStartupFilePauseHeld = false;
-        if (!options.silent) {
-          vscode.window.showInformationMessage("Studio and project files were checked. Live sync is off in Verify mode.");
-        }
-        return;
       }
-      if (this.liveSyncStopRequested) {
-        return;
-      }
-      await this.controlDaemonFileWrites(liveCfg, "resume", []);
-      this.liveSyncStartupFilePauseHeld = false;
       this.updateStatusBar();
       if (!options.silent) {
-        vscode.window.showInformationMessage("Live sync started: saved files ↔ Studio.");
+        vscode.window.showInformationMessage(initialState.daemon?.mode === "verify"
+          ? "Studio and project files were checked. Live sync is off in Verify mode."
+          : alreadyRunning ? "Live sync is already running." : "Live sync started: saved files ↔ Studio.");
       }
     } catch (err) {
       if (this.liveSyncStopRequested) {
@@ -3182,9 +3120,6 @@ class RobloxSyncController {
         if ((state?.editorActionCount ?? 0) > 0 || (state?.runtimeSettingChangeCount ?? 0) > 0) {
           await this.getStudioChangeState(cfg, cfg.services, { start: false });
         }
-        if (daemon?.running !== true) {
-          this.scheduleDaemonFileSyncRestart();
-        }
       }
     } catch (error) {
       this.output.appendLine(
@@ -3196,12 +3131,7 @@ class RobloxSyncController {
     }
   }
 
-  private updateDaemonFileSyncStatus(value: unknown, cfg = this.tryGetConfig()): void {
-    const status = recordValue(value);
-    if (!status || !cfg) {
-      return;
-    }
-    const liveCfg = this.effectiveLiveSyncConfig(cfg);
+  private renderDaemonFileSyncStatus(status: Record<string, unknown>): void {
     this.daemonPendingCount = Array.isArray(status.pendingPaths)
       ? status.pendingPaths.filter((entry) => typeof entry === "string" && entry.length > 0).length
       : 0;
@@ -3214,6 +3144,16 @@ class RobloxSyncController {
         this.output.appendLine(`[renium] live sync file watcher failed: ${error}`);
       }
     }
+    this.updateStatusBar();
+  }
+
+  private updateDaemonFileSyncStatus(value: unknown, cfg = this.tryGetConfig()): void {
+    const status = recordValue(value);
+    if (!status || !cfg) {
+      return;
+    }
+    this.renderDaemonFileSyncStatus(status);
+    const liveCfg = this.effectiveLiveSyncConfig(cfg);
     if (this.daemonFileSyncEnabled && status.running !== true) {
       this.scheduleDaemonFileSyncRestart();
     }

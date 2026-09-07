@@ -1,18 +1,17 @@
 # Renium Studio plugin
 
-`Renium.project.json` defines the Studio plugin bundle. Release builds generate:
+Connects Studio to the Renium CLI and editor extension.
+Install it with Renium; `rbx setup --repair` repairs the local plugin.
+Restart Studio after replacing the plugin.
 
-- `Renium.rbxm` — binary model for normal Studio installation.
-- `Renium.rbxmx` — XML model for inspection and source-control review.
-
-Bundles aren't stored in Git. Build them from the repository root:
+Sources are bundled by `Renium.project.json`. From the repository root:
 
 ```powershell
-.\tools\build-release.ps1 -LocalBuild
+./tools/build-release.ps1 -LocalBuild
 ```
 
-This uses the pinned Rojo version, checks component versions, and writes to
-`dist/`.
+The pinned Rojo build produces `Renium.rbxm` (installation) and
+`Renium.rbxmx` (inspectable XML) under `dist/`.
+Generated bundles are not stored in Git.
 
-For a public release, omit `-LocalBuild`; release checks require a clean
-checkout, license, and VS Code publisher.
+[Usage and troubleshooting](../renium/README.md).

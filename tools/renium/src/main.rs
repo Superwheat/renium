@@ -60,6 +60,7 @@ mod cli;
 mod cloud;
 mod daemon;
 mod editor;
+mod plugins;
 mod project;
 mod rbx;
 mod roblox;
@@ -157,6 +158,11 @@ fn checks_agent_update(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::UpdateHelper(_)
+            | Commands::Plugin(_)
+            | Commands::External(_)
+            | Commands::CheckLuau(_)
+            | Commands::RecordEnd(_)
+            | Commands::RecordReview(_)
             | Commands::BridgeDaemon(_)
             | Commands::ExplorerDaemon(_)
             | Commands::BridgeGetSource(_)
@@ -167,6 +173,9 @@ fn checks_agent_update(command: &Commands) -> bool {
 }
 
 fn is_agent_launcher() -> bool {
+    if std::env::var_os("RENIUM_PLUGIN_CHILD").is_some_and(|value| value == "1") {
+        return false;
+    }
     if std::env::var_os("RENIUM_AGENT_CLI").is_some_and(|value| value != "0") {
         return true;
     }
@@ -182,6 +191,11 @@ fn checks_agent_instructions(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Init(_)
+            | Commands::Plugin(_)
+            | Commands::External(_)
+            | Commands::CheckLuau(_)
+            | Commands::RecordEnd(_)
+            | Commands::RecordReview(_)
             | Commands::Update(_)
             | Commands::UpdateHelper(_)
             | Commands::Setup(_)

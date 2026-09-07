@@ -1,0 +1,21 @@
+[package]
+name = "renium-sandbox"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license-file = "../../../LICENSE"
+description = "Exclusive disposable Studio workflows for Renium"
+
+# Deliberately not a member of Renium's build. This plugin is source-only until explicitly built.
+[workspace]
+
+[dependencies]
+renium-plugin-sdk = { path = "../../renium-plugin-sdk" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "=2.10.1", features = ["json"] }
+url = "=2.4.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

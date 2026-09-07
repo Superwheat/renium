@@ -20,6 +20,15 @@ local Settings = require("../BridgeSettings.module")
 local TransactionUpload = require("../BridgeTransactionUpload.module")
 local Update = require("../BridgeUpdate.module")
 local ValueEquality = require("../BridgeValueEquality.module")
+require("./identity-workloads")
+require("./connection-workloads")
+require("./play-status-workloads")
+require("./corner-change-workloads")
+require("./session-lock-workloads")
+require("./network-workloads")
+require("./performance-workloads")
+require("./microprofiler-workloads")
+require("./microprofiler-analysis-workloads")
 
 local function equal(actual, expected, label)
 	if actual ~= expected then
@@ -29,19 +38,176 @@ end
 
 local Runtime = require("../BridgePluginRuntime.module")
 equal(type(Runtime.start), "function", "runtime module compilation")
+do
+	local deferred = {}
+	task.defer = function(callback)
+		deferred[#deferred + 1] = callback
+	end
+	local depth = 0
+	local scope = {}
+	local changes = {
+		beginSuppress = function(_, receivedScope)
+			equal(receivedScope, scope, "suppression scope forwarded")
+			depth += 1
+		end,
+		endSuppress = function()
+			depth -= 1
+		end,
+	}
+	for _, shouldFail in { false, true } do
+		local ok, result = pcall(Runtime.withSuppression, changes, function(params)
+			equal(params, scope, "suppression params forwarded")
+			if shouldFail then
+				error("expected apply failure", 0)
+			end
+			return "applied"
+		end, scope, scope)
+		equal(ok, not shouldFail, "suppression preserves outcome")
+		equal(result, if shouldFail then "expected apply failure" else "applied", "suppression result")
+		equal(depth, 1, "suppression survives until deferred cleanup")
+		table.remove(deferred, 1)()
+		equal(depth, 0, "suppression cleans up after success and failure")
+	end
+	task.defer = nil
+end
 local editorSyncSource = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
-local editorSyncTopLevelLocals = 0
-for line in string.gmatch(editorSyncSource, "[^\r\n]+") do
-	if string.match(line, "^local function ") or string.match(line, "^local [%a_]") then
-		editorSyncTopLevelLocals += 1
+do
+	local first = assert(editorSyncSource:find("local function writePropertyForSync(", 1, true))
+	local last = assert(editorSyncSource:find("local function setAttributeForSync(", first, true))
+	local source = editorSyncSource:sub(first, last - 1) .. "\nreturn writePropertyForSync"
+	for _, case in {
+		{ property = "CollisionFidelity", class = "MeshPart", delay = 0, ok = true },
+		{ property = "CollisionFidelity", class = "MeshPart", delay = 3, ok = true },
+		{ property = "CollisionFidelity", class = "MeshPart", delay = 100, ok = false },
+		{ property = "Transparency", class = "MeshPart", delay = 3, ok = false },
+		{ property = "CollisionFidelity", class = "Part", delay = 3, ok = false },
+	} do
+		local waits, elapsed, cancelled = 0, 0, 0
+		local current = "Box"
+		local instance = { IsA = function(_, class) return class == case.class end }
+		local write = luau.load(source, { environment = {
+			writeProperty = function()
+				if case.delay == 0 then current = "Hull" end
+				return true, nil
+			end,
+			readProperty = function() return true, current end,
+			valuesEqual = function(a, b) return a == b end,
+			markLiveMutation = function() end,
+			cancelExpectedEvent = function(_, token) equal(token, "expected", "write token"); cancelled += 1 end,
+			os = { clock = function() return elapsed end },
+			RunService = { Heartbeat = { Wait = function()
+				waits += 1
+				elapsed += 1
+				if waits >= case.delay then current = "Hull" end
+			end } },
+		} })()
+		local ok = write(instance, case.property, "Hull", {
+			expectPropertyEvent = function() return "expected" end,
+			assertSessionOwnership = function() end,
+		})
+		equal(ok, case.ok, "asynchronous collision write outcome")
+		equal(cancelled, if case.ok then 0 else 1, "expected event retained until confirmed")
+		equal(waits, if case.property == "CollisionFidelity" and case.class == "MeshPart" then math.min(case.delay, 3) else 0, "only asynchronous geometry waits, bounded")
 	end
 end
-if editorSyncTopLevelLocals > 190 then
-	error(`editor sync module has {editorSyncTopLevelLocals} top-level local declarations; maximum is 190`)
+do
+	local first = assert(editorSyncSource:find("function TransactionState.captureMeshGeometry(", 1, true))
+	local last = assert(editorSyncSource:find("function TransactionState.captureProperties(", first, true))
+	local captures, destroyed = 0, 0
+	local mesh = { IsA = function(_, class) return class == "MeshPart" end }
+	local state = {}
+	luau.load(editorSyncSource:sub(first, last - 1), { environment = {
+		TransactionState = state,
+		isMeshGeometryProperty = function(name) return name == "UnscaledCofm" or name == "UnscaledVolume" end,
+		readProperty = function() return false, nil end,
+		Instance = { new = function()
+			return {
+				ApplyMesh = function(_, original) equal(original, mesh, "snapshot original geometry") end,
+				Destroy = function() destroyed += 1 end,
+			}
+		end },
+		SerializationService = { SerializeInstancesAsync = function(_, roots)
+			equal(#roots, 1, "snapshot geometry only")
+			captures += 1
+			return "serialized geometry"
+		end },
+	} })()
+	local seen, properties, unreadable = {}, {}, {}
+	state.captureProperty(mesh, "Transparency", seen, properties, unreadable)
+	equal(captures, 0, "ordinary mesh property needs no geometry snapshot")
+	state.captureProperty(mesh, "UnscaledCofm", seen, properties, unreadable)
+	state.captureProperty(mesh, "UnscaledVolume", seen, properties, unreadable)
+	state.captureProperty(mesh, "CollisionFidelity", seen, properties, unreadable)
+	equal(captures, 1, "one geometry snapshot for related writes")
+	equal(destroyed, 1, "temporary mesh released")
+	equal(#properties, 1, "unreadable fields retain geometry rollback")
+	equal(properties[1].value, "serialized geometry", "rollback retains serialized values")
 end
 local editorSyncCompiled, editorSyncCompileError = pcall(luau.compile, editorSyncSource)
 if not editorSyncCompiled then
 	error("editor sync module compilation failed: " .. tostring(editorSyncCompileError))
+end
+
+do
+	-- Exercise the production cache proof functions without a Studio serializer.
+	local first = assert(editorSyncSource:find("local NativeSerialization = {}", 1, true))
+	local last = assert(editorSyncSource:find("function NativeSerialization.appendIdentityCarriers", first, true))
+	local proofs = {}
+	local native = luau.load(editorSyncSource:sub(first, last - 1) .. "\nreturn NativeSerialization", {
+		environment = { nativePayloadProofs = proofs },
+	})()
+	local revision = 10
+	local tracking = true
+	local session = {
+		ctx = {
+			isStudioChangeTracking = function() return tracking end,
+			studioChangeGeneration = function() return 1 end,
+			nativeExportGeneration = function() return revision end,
+		},
+		originalNonArchivableInstances = {}, cachedPayloadProofs = {},
+		payloadHashes = {}, payloadSizes = {}, serializationJobs = {}, pendingPayloads = 0,
+		payloadReadyEvent = { Fire = function() end },
+	}
+	for _ = 1, 100 do
+		local proof = { generations = native.captureGenerations(session, { "Workspace" }), payloadHash = "hash", totalBytes = 42 }
+		proofs.Workspace = proof
+		native.appendJob(session, "Workspace", { "Workspace" }, {}, {})
+		equal(session.cachedPayloadProofs.Workspace.proof, proof, "unchanged export reuses bytes")
+		session.cachedPayloadProofs.Workspace = nil
+		revision += 1 -- Camera structure/content changes, without a Live Sync edit.
+		equal(native.proofMatches(session, proof), false, "ignored live edit still invalidates export")
+		local jobs = #session.serializationJobs
+		native.appendJob(session, "Workspace", { "Workspace" }, {}, {})
+		equal(#session.serializationJobs, jobs + 1, "changed export serializes fresh bytes")
+		equal(session.cachedPayloadProofs.Workspace, nil, "stale bytes are not offered")
+	end
+	tracking = false
+	assert(native.captureGenerations(session, { "Workspace" }) == nil)
+	assert(not native.proofMatches(session, proofs.Workspace))
+end
+
+do
+	local Status = require("../BridgeStatus.module")
+	local editor = { lastAtUnix = 0, requests = 0, lastMs = 0, sourceCreated = 0, sourceUpdated = 0,
+		sourceDeleted = 0, instanceCreated = 0, instanceReplaced = 0, instanceDeleted = 0,
+		propertyUpdated = 0, attributeUpdated = 0, noops = 0, errors = 0 }
+	local state = { channels = { { open = true, ready = true } }, editorSyncStats = editor,
+		connectionStatus = "Connected", connectRequested = true, pendingEditCount = 8, host = "localhost",
+		ports = { "34872" }, bridgeVersion = "test", bridgeBuildUnix = 0, target = "test", runtimeId = "edit",
+		codecVersion = 1, pendingReviewCount = 0 }
+	equal(Status.view(state).title, "Connected", "older daemon status still works")
+	editor.liveSync = { running = true, error = "native snapshot count mismatch" }
+	local failed = Status.view(state)
+	equal(failed.title, "Sync failed", "transport connection does not hide sync failure")
+	equal(failed.syncFailed, true, "sync failure uses error indicator")
+	assert(not failed.subtitle:find("native snapshot", 1, true), "raw diagnostic stays out of routine status")
+	editor.liveSync = { running = true }
+	equal(Status.view(state).title, "Connected", "successful retry clears failure")
+	equal(Status.view(state).syncFailed, false, "successful retry clears error indicator")
+	editor.liveSync = { running = false }
+	equal(Status.view(state).subtitle, "Live Sync is off.", "stopped watcher is explicit")
+	editor.liveSync = { running = true, paused = true }
+	equal(Status.view(state).subtitle, "Live Sync is paused. Changes will wait.", "paused watcher is explicit")
 end
 
 local uploadedTransactions = {}

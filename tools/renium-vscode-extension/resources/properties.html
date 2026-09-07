@@ -83,6 +83,8 @@
         let currentNodeClassName = null;
         let audioPlaying = false;
         let audioScrubbing = false;
+        let stopAudioScrub = null;
+        let stopNumberRepeat = null;
         let activePropertyEdit = null;
         let activePropertyRow = null;
         let lastEditorFocusSnapshot = null;
@@ -196,6 +198,8 @@
         }
 
         function render() {
+            stopAudioScrub?.();
+            stopNumberRepeat?.();
             const focusSnapshot = captureCurrentEditorFocus() || (restoreEditorFocusOnNextRender ? lastEditorFocusSnapshot : null);
             container.innerHTML = "";
 
@@ -341,12 +345,10 @@
             scrubberHandle.style.left = `${Math.min(100, Math.max(0, progress))}%`;
             scrubberTrack.appendChild(scrubberHandle);
 
-            let isDragging = false;
-
             const updateScrubPosition = (e) => {
                 const rect = scrubberTrack.getBoundingClientRect();
                 const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
-                const percent = x / rect.width;
+                const percent = rect.width > 0 ? x / rect.width : 0;
                 const newTime = percent * timeLength;
 
                 scrubberFill.style.width = `${percent * 100}%`;
@@ -355,25 +357,23 @@
                 return newTime;
             };
 
+            const move = (e) => setSoundTimePosition(updateScrubPosition(e));
+            const stop = () => {
+                document.removeEventListener("mousemove", move);
+                document.removeEventListener("mouseup", stop);
+                window.removeEventListener("blur", stop);
+                audioScrubbing = false;
+                stopAudioScrub = null;
+            };
             scrubberTrack.addEventListener("mousedown", (e) => {
-                isDragging = true;
+                if (e.button !== 0) return;
+                stopAudioScrub?.();
                 audioScrubbing = true;
-                const newTime = updateScrubPosition(e);
-                setSoundTimePosition(newTime);
-            });
-
-            document.addEventListener("mousemove", (e) => {
-                if (isDragging) {
-                    const newTime = updateScrubPosition(e);
-                    setSoundTimePosition(newTime);
-                }
-            });
-
-            document.addEventListener("mouseup", () => {
-                if (isDragging) {
-                    isDragging = false;
-                    audioScrubbing = false;
-                }
+                stopAudioScrub = stop;
+                document.addEventListener("mousemove", move);
+                document.addEventListener("mouseup", stop);
+                window.addEventListener("blur", stop);
+                move(e);
             });
 
             scrubberContainer.appendChild(scrubberTrack);
@@ -1037,6 +1037,54 @@
             return Number(formatNumber(value));
         }
 
+        function makeNumberStepperButton(input, step, direction, className, label) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = `number-stepper-button ${className}`;
+            button.tabIndex = -1;
+            button.title = label;
+            button.setAttribute("aria-label", label);
+            let delay = null;
+            let interval = null;
+            const stop = () => {
+                if (delay !== null) {
+                    clearTimeout(delay);
+                    delay = null;
+                }
+                if (interval !== null) {
+                    clearInterval(interval);
+                    interval = null;
+                }
+                document.removeEventListener("pointerup", stop);
+                document.removeEventListener("pointercancel", stop);
+                window.removeEventListener("blur", stop);
+                stopNumberRepeat = null;
+                keepEditorTextFocus(input);
+            };
+            button.addEventListener("mousedown", (event) => event.preventDefault());
+            button.addEventListener("pointerdown", (event) => {
+                event.preventDefault();
+                stopNumberRepeat?.();
+                keepEditorTextFocus(input);
+                step(direction);
+                delay = setTimeout(() => {
+                    interval = setInterval(() => step(direction), 70);
+                }, 350);
+                document.addEventListener("pointerup", stop);
+                document.addEventListener("pointercancel", stop);
+                window.addEventListener("blur", stop);
+                stopNumberRepeat = stop;
+            });
+            button.addEventListener("click", (event) => event.preventDefault());
+            button.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    step(direction);
+                }
+            });
+            return button;
+        }
+
         function createNumberStepperEditor(options) {
             const allowDecimal = options.allowDecimal !== false;
             const wrapper = document.createElement("div");
@@ -1071,49 +1119,8 @@
                 commit(allowDecimal ? steppedNumberValue(next, decimalPlaces) : Math.trunc(next));
             };
 
-            const makeButton = (direction, className, label) => {
-                const button = document.createElement("button");
-                button.type = "button";
-                button.className = `number-stepper-button ${className}`;
-                button.tabIndex = -1;
-                button.title = label;
-                button.setAttribute("aria-label", label);
-                let delay = null;
-                let interval = null;
-                const stop = () => {
-                    if (delay !== null) {
-                        clearTimeout(delay);
-                        delay = null;
-                    }
-                    if (interval !== null) {
-                        clearInterval(interval);
-                        interval = null;
-                    }
-                    document.removeEventListener("pointerup", stop);
-                    document.removeEventListener("pointercancel", stop);
-                    keepEditorTextFocus(input);
-                };
-                button.addEventListener("mousedown", (event) => event.preventDefault());
-                button.addEventListener("pointerdown", (event) => {
-                    event.preventDefault();
-                    keepEditorTextFocus(input);
-                    step(direction);
-                    stop();
-                    delay = setTimeout(() => {
-                        interval = setInterval(() => step(direction), 70);
-                    }, 350);
-                    document.addEventListener("pointerup", stop);
-                    document.addEventListener("pointercancel", stop);
-                });
-                button.addEventListener("click", (event) => event.preventDefault());
-                button.addEventListener("keydown", (event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        step(direction);
-                    }
-                });
-                return button;
-            };
+            const makeButton = (direction, className, label) =>
+                makeNumberStepperButton(input, step, direction, className, label);
 
             input.addEventListener("change", commitInput);
             input.addEventListener("keydown", (event) => {
@@ -1189,49 +1196,8 @@
                 commitFinal(current + direction * bounds.step);
             };
 
-            const makeButton = (direction, className, label) => {
-                const button = document.createElement("button");
-                button.type = "button";
-                button.className = `number-stepper-button ${className}`;
-                button.tabIndex = -1;
-                button.title = label;
-                button.setAttribute("aria-label", label);
-                let delay = null;
-                let interval = null;
-                const stop = () => {
-                    if (delay !== null) {
-                        clearTimeout(delay);
-                        delay = null;
-                    }
-                    if (interval !== null) {
-                        clearInterval(interval);
-                        interval = null;
-                    }
-                    document.removeEventListener("pointerup", stop);
-                    document.removeEventListener("pointercancel", stop);
-                    keepEditorTextFocus(input);
-                };
-                button.addEventListener("mousedown", (event) => event.preventDefault());
-                button.addEventListener("pointerdown", (event) => {
-                    event.preventDefault();
-                    keepEditorTextFocus(input);
-                    step(direction);
-                    stop();
-                    delay = setTimeout(() => {
-                        interval = setInterval(() => step(direction), 70);
-                    }, 350);
-                    document.addEventListener("pointerup", stop);
-                    document.addEventListener("pointercancel", stop);
-                });
-                button.addEventListener("click", (event) => event.preventDefault());
-                button.addEventListener("keydown", (event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        step(direction);
-                    }
-                });
-                return button;
-            };
+            const makeButton = (direction, className, label) =>
+                makeNumberStepperButton(input, step, direction, className, label);
 
             setValue(Number(prop?.value));
 

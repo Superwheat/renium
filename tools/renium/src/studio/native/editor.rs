@@ -2803,9 +2803,6 @@ fn write_editor_place_snapshot(
     let build = RbxPlaceBuild {
         dom,
         service_roots,
-        documents_by_service: HashMap::new(),
-        paths_by_service: HashMap::new(),
-        settings_writes: Vec::new(),
         total_instances,
         has_package_links,
         omitted_properties_by_class: HashMap::new(),
@@ -3248,6 +3245,7 @@ pub(crate) fn send_editor_change_batches(
         property_start = property_end;
     }
 
+    crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
     Ok(summary)
 }
 
@@ -3273,7 +3271,7 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
         if key == "ok" {
             continue;
         }
-        if key == "protectedWrites" {
+        if key == "protectedWrites" || key == "nativeGeometryWrites" {
             let target = summary
                 .entry(key.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));

@@ -8,14 +8,17 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) mod authorization;
 pub(crate) mod client;
 pub(crate) mod commands;
 pub(crate) mod context;
 pub(crate) mod live;
 pub(crate) mod local;
 pub(crate) mod places;
+pub(crate) mod property_access;
 pub(crate) mod reconcile;
 pub(crate) mod runtime;
+mod stdio_proxy;
 pub(crate) mod studio_args;
 pub(crate) mod tools;
 
@@ -187,6 +190,8 @@ pub struct BoundContext {
     pub root: String,
     pub experience: String,
     pub source: String,
+    #[serde(skip)]
+    pub resource_lease: Option<renium_plugin_sdk::lease::Claim>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +228,7 @@ impl BoundContext {
             && self.root == other.root
             && self.experience == other.experience
             && self.source == other.source
+            && self.resource_lease == other.resource_lease
             && self.place_id == other.place_id
             && self.game_id == other.game_id
             && self.fingerprint == other.fingerprint
@@ -237,6 +243,8 @@ pub struct Review {
 }
 
 pub struct State {
+    pub(crate) authority: std::sync::OnceLock<authorization::Authority>,
+    pub(crate) property_access: Mutex<property_access::Policy>,
     next_context: AtomicU64,
     next_review: AtomicU64,
     contexts: Mutex<HashMap<u64, BoundContext>>,
@@ -250,6 +258,8 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            authority: std::sync::OnceLock::new(),
+            property_access: Mutex::new(property_access::Policy::default()),
             next_context: AtomicU64::new(1),
             next_review: AtomicU64::new(1),
             contexts: Mutex::new(HashMap::new()),
@@ -501,6 +511,9 @@ impl State {
 pub fn capabilities() -> Result<Value> {
     Ok(json!({
         "v": PROTOCOL_VERSION,
+        "controlAuthentication": "local-ed25519-v1",
+        "protectedPropertyDefaultMode": "ask",
+        "pluginResourceLeases": 1,
         "ops": registry().iter().map(|operation| json!({
             "id": operation.id,
             "name": operation.name,
@@ -616,6 +629,7 @@ mod tests {
             root: "root".to_string(),
             experience: "experience".to_string(),
             source: "source".to_string(),
+            resource_lease: None,
             place_id: Some(1),
             game_id: Some(2),
             selector: "2:1".to_string(),
@@ -640,6 +654,7 @@ mod tests {
             root: "root".to_string(),
             experience: "experience".to_string(),
             source: "source".to_string(),
+            resource_lease: None,
             place_id: Some(1),
             game_id: Some(2),
             selector: "2:1".to_string(),
@@ -656,6 +671,22 @@ mod tests {
         assert_eq!(restarted.id, first.id);
         assert_eq!(restarted.runtime_id.as_deref(), Some("new-runtime"));
         assert_eq!(state.context(first.id).unwrap().plugin_build, Some(4));
+        let owned = state.insert_context(BoundContext {
+            resource_lease: Some(renium_plugin_sdk::lease::Claim {
+                resource: "studio-place-1".into(),
+                token: "private-owner-token".into(),
+            }),
+            ..restarted.clone()
+        });
+        assert_ne!(
+            owned.id, restarted.id,
+            "contexts with different resource owners must not merge"
+        );
+        assert!(
+            !serde_json::to_string(&owned)
+                .unwrap()
+                .contains("private-owner-token")
+        );
     }
 
     #[test]
@@ -668,6 +699,7 @@ mod tests {
             root: "root".to_string(),
             experience: "experience".to_string(),
             source: "source".to_string(),
+            resource_lease: None,
             place_id: None,
             game_id: None,
             selector: String::new(),

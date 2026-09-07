@@ -228,34 +228,21 @@ export class FileExplorerModel {
 
   public async sourcePathsForSubtree(node: FileExplorerNode): Promise<string[]> {
     const generation = this.projectGeneration;
-    const root = await this.ensureLoaded(node);
-    if (!this.isProjectGenerationCurrent(generation)) {
-      return [];
+    const config = getExplorerConfig();
+    const op: CliBatchOp = { type: "sources" };
+    if (node.kind !== "service") {
+      if (node.projectionSettingsId ?? node.settingsId) {
+        op.id = node.projectionSettingsId ?? node.settingsId;
+      } else if (node.index !== undefined) {
+        op.x = node.index;
+      } else {
+        throw new Error("Instance identity is unavailable; refresh Explorer.");
+      }
     }
-    const paths = new Set<string>();
-    const visited = new Set<string>();
-    const visit = async (current: FileExplorerNode): Promise<void> => {
-      if (!this.isProjectGenerationCurrent(generation)) {
-        return;
-      }
-      if (!visited.add(current.treeId)) {
-        return;
-      }
-      if (current.sourcePath) {
-        paths.add(current.sourcePath);
-      }
-      if (current.hasChildren || current.children.length > 0) {
-        await this.loadChildren(current);
-        if (!this.isProjectGenerationCurrent(generation)) {
-          return;
-        }
-        for (const child of this.getChildren(current)) {
-          await visit(child);
-        }
-      }
-    };
-    await visit(root);
-    return [...paths];
+    const result = await runBytecodeBatchOne<{ sourcePaths?: string[] }>(
+      config, settingsFileForService(config, node.service), node.service, op,
+    );
+    return this.isProjectGenerationCurrent(generation) ? result.sourcePaths ?? [] : [];
   }
 
   public sort(nodes: FileExplorerNode[]): FileExplorerNode[] {

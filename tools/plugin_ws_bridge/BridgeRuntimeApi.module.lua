@@ -2410,6 +2410,9 @@ updateMouse()
 	end
 
 	function api.isPlayModeRunning()
+		if runtimeContext.bridgeRole == "play-server" or runtimeContext.bridgeRole == "play-client" then
+			return RunService:IsRunning() or RunService.RunState ~= Enum.RunState.Stopped
+		end
 		return not RunService:IsEdit()
 			or RunService:IsRunning()
 			or RunService.RunState ~= Enum.RunState.Stopped
@@ -2545,6 +2548,9 @@ updateMouse()
 	end
 
 	function api.startStopPlay(params)
+		if next(params) == nil then
+			return playStatus("status")
+		end
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
 		if playSession.active and api.isPlayModeRunning() then

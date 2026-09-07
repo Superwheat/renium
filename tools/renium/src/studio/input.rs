@@ -1072,7 +1072,17 @@ mod platform {
     }
 
     pub fn studio_window_title(pid: u32) -> Result<String> {
-        main_studio_window(pid).map(|(_, _, title)| title)
+        let titles = windows_for_pid(pid)
+            .into_iter()
+            .filter(|(hwnd, _, title)| {
+                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+            })
+            .map(|(_, _, title)| title)
+            .collect::<Vec<_>>();
+        if titles.len() != 1 {
+            bail!("Studio process exposed {} document windows", titles.len());
+        }
+        Ok(titles.into_iter().next().unwrap())
     }
 
     fn main_studio_window(pid: u32) -> Result<(isize, u32, String)> {
@@ -1954,7 +1964,9 @@ mod platform {
     fn ax_application(pid: i32) -> Result<AXUIElementRef> {
         // SAFETY: this read-only system query has no preconditions.
         if !unsafe { AXIsProcessTrusted() } {
-            bail!("Renium needs macOS Accessibility permission to inspect Studio controls");
+            bail!(
+                "macOS Accessibility permission is disabled for the app launching Renium; enable it in System Settings > Privacy & Security > Accessibility (for SSH, sshd-keygen-wrapper/Remote Login)"
+            );
         }
         // SAFETY: pid belongs to the connected Studio process.
         let application = unsafe { AXUIElementCreateApplication(pid) };
@@ -2317,8 +2329,15 @@ mod platform {
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
-                if dismiss_auto_recovery_dialog(platform_pid).unwrap_or(false) {
-                    break;
+                match dismiss_auto_recovery_dialog(platform_pid) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "[renium] Could not dismiss Studio {pid}'s Auto-Recovery dialog: {error:#}"
+                        );
+                        break;
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

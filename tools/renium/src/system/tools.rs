@@ -7,7 +7,22 @@ use serde_json::{Value, json};
 
 pub(crate) fn download_to_file(url: &str, destination: &Path) -> Result<()> {
     let status = Command::new("curl")
-        .args(["-fsSL", "--retry", "2", "--connect-timeout", "15", "-o"])
+        .args([
+            "-fsSL",
+            "--retry",
+            "2",
+            "--connect-timeout",
+            "15",
+            "--speed-time",
+            "30",
+            "--speed-limit",
+            "1",
+            "--max-time",
+            "600",
+            "--retry-max-time",
+            "600",
+            "-o",
+        ])
         .arg(destination)
         .arg(url)
         .status()

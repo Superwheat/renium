@@ -112,6 +112,7 @@ pub(crate) fn is_engine_managed_editor_property(
     database: &ReflectionDatabase<'_>,
 ) -> bool {
     if property_name == "Tags"
+        || super::native_geometry::is_mesh_geometry_property(class_name, property_name)
         || class_name == MATERIAL_SERVICE_CLASS && property_name == USE_2022_MATERIALS_PROPERTY
         || has_protected_texture_pack(class_name) && property_name == TEXTURE_PACK_PROPERTY
     {

@@ -207,6 +207,7 @@ pub(crate) struct EditorChangeSet {
     pub(crate) property_changes: Vec<EditorPropertyChange>,
     pub(crate) history_entries: Vec<EditorHistoryEntry>,
     pub(crate) settings_writes: Vec<EditorSettingsWrite>,
+    pub(crate) geometry_readbacks: Vec<super::native_geometry::GeometryReadback>,
     pub(crate) files_to_studio_filters_active: bool,
 }
 

@@ -85,10 +85,7 @@ function BridgeConnection.create(context)
 
 	local host = SettingsModule.loadHost(plugin, context.settingsPrefix, context.defaultHost)
 	local ports = SettingsModule.loadPorts(plugin, context.settingsPrefix, context.defaultPorts)
-	local runtimeSettings = context.runtimeSettings
-	if runtimeSettings == nil then
-		runtimeSettings = SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
-	end
+	local runtimeSettings = context.runtimeSettings or SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
 	local pendingRuntimeSettingsKey = context.settingsPrefix .. "pendingRuntimeSettingChanges"
 	local pendingRuntimeSettingChanges = {}
 	local runtimeSettingsSeq = 0
@@ -113,6 +110,7 @@ function BridgeConnection.create(context)
 	local channels = {}
 	local connectChannel
 	local releaseClient
+	local recoverClient
 	local prepareChannelsForNextRun
 	local handleSessionLockUnavailable
 	local pluginUnloading = false
@@ -377,11 +375,23 @@ function BridgeConnection.create(context)
 		}
 	end
 
+	local function markChannelReady(channel)
+		channel.ready = true
+		Config.bridgeConnectionStatus = "Connected"
+		updateStatusText()
+	end
+
 	local function sendRequestResult(channel, client, id, method, okCall, result, serverMs)
 		if okCall then
+			if method == "getBridgeInfo" then
+				result.registrationAck = true
+			end
 			local sent, sendError =
 				TransportModule.sendSuccessResponse(channel.id, client, id, method, result, serverMs)
 			if sent then
+				if method == "getBridgeInfo" and not channel.registrationAckExpected then
+					markChannelReady(channel)
+				end
 				return
 			end
 			local responseError = conciseConnectionError(sendError or "could not send bridge response")
@@ -395,11 +405,11 @@ function BridgeConnection.create(context)
 				},
 			})
 			if not errorSent then
-				releaseClient(channel, client, true)
+				recoverClient(channel, client, true, responseError)
 			end
 			return
 		end
-		TransportModule.sendEnvelope(client, {
+		local sent, sendError = TransportModule.sendEnvelope(client, {
 			id = id,
 			ok = false,
 			error = tostring(result),
@@ -408,6 +418,9 @@ function BridgeConnection.create(context)
 				serverMs = serverMs,
 			},
 		})
+		if not sent then
+			recoverClient(channel, client, true, sendError or "could not send bridge error response")
+		end
 	end
 
 	local function finishQueuedRequestAsCancelled(request)
@@ -470,7 +483,7 @@ function BridgeConnection.create(context)
 			return
 		end
 		local started = os.clock()
-		local exclusive = context.isExclusiveMethod(method)
+		local exclusive = context.isExclusiveMethod(method, params)
 		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
 		local ownsSession = not sessionOwned or context.validateSessionLock(sessionGeneration)
 		local okCall, result
@@ -556,7 +569,9 @@ function BridgeConnection.create(context)
 			completed:Fire()
 		end
 		drainExclusiveIdleCallbacks()
-		completed.Event:Wait()
+		if result == nil then
+			completed.Event:Wait()
+		end
 		completed:Destroy()
 		if not result[1] then
 			error(result[2], 0)
@@ -635,7 +650,7 @@ function BridgeConnection.create(context)
 			sendRequestError(channelId, client, id, "Missing or invalid bridge method")
 			return nil
 		end
-		if type(context.allowedMethods) == "table" and not context.allowedMethods[method] then
+		if method ~= "bridgeRegistered" and type(context.allowedMethods) == "table" and not context.allowedMethods[method] then
 			sendRequestError(channelId, client, id, "Unsupported bridge method")
 			return nil
 		end
@@ -710,6 +725,15 @@ function BridgeConnection.create(context)
 		if request == nil then
 			return
 		end
+		if request.method == "getBridgeInfo" then
+			channel.registrationSession = request.sessionId
+			channel.registrationAckExpected = request.params.registrationAck == true
+		elseif request.method == "bridgeRegistered" then
+			if channel.registrationAckExpected and channel.registrationSession == request.sessionId then
+				markChannelReady(channel)
+			end
+			return
+		end
 		if request.leaseId ~= nil then
 			channel.lastRequestLeaseId = request.leaseId
 		end
@@ -717,7 +741,7 @@ function BridgeConnection.create(context)
 		if replayHandled then
 			return
 		end
-		local exclusive = context.isExclusiveMethod(request.method)
+		local exclusive = context.isExclusiveMethod(request.method, request.params)
 		local sessionOwned = exclusive or context.isSessionOwnedMethod(request.method)
 		local sessionGeneration = nil
 		if sessionOwned then
@@ -864,6 +888,9 @@ function BridgeConnection.create(context)
 		channel.client = nil
 		channel.connecting = false
 		channel.open = false
+		channel.ready = false
+		channel.registrationSession = nil
+		channel.registrationAckExpected = false
 		local connections = channel.clientConnections
 		channel.clientConnections = nil
 		if connections then
@@ -995,6 +1022,32 @@ function BridgeConnection.create(context)
 		end
 	end
 
+	recoverClient = function(channel, client, closeClient, message)
+		if channel.client ~= client then
+			return
+		end
+		local wasOpen = channel.open
+		debugBridgeConnection(`channel {channel.id} closed wasOpen={wasOpen} error={message}`)
+		releaseClient(channel, client, closeClient)
+		if pluginUnloading then
+			return
+		end
+		recordReconnectClose(channel, wasOpen)
+		if message ~= nil then
+			markConnectionFailure(channel, message)
+		elseif not wasOpen and Config.bridgeConnectRequested then
+			markConnectionFailure(channel, "connection closed before opening")
+		end
+		if wasOpen then
+			channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
+		else
+			keepFastReconnectIfNextRunActive(channel)
+		end
+		updateStatusText()
+		handleConnectionInterruption()
+		scheduleReconnect(channel)
+	end
+
 	connectChannel = function(channel)
 		if not reconnectAllowed(channel) then
 			return
@@ -1051,6 +1104,7 @@ function BridgeConnection.create(context)
 		local clientConnections = {}
 		channel.clientConnections = clientConnections
 		channel.open = false
+		channel.ready = false
 
 		clientConnections[#clientConnections + 1] = client.Opened:Connect(function(_statusCode, _headers)
 			if pluginUnloading then
@@ -1086,7 +1140,7 @@ function BridgeConnection.create(context)
 			channel.nextRunFastUntil = 0
 			channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
 			Config.bridgeConnectedOnce = true
-			Config.bridgeConnectionStatus = "Connected"
+			Config.bridgeConnectionStatus = "Registering Studio..."
 			updateStatusText()
 			if channel.id == 1 then
 				task.spawn(function()
@@ -1117,61 +1171,11 @@ function BridgeConnection.create(context)
 		end)
 
 		clientConnections[#clientConnections + 1] = client.Error:Connect(function(_statusCode, _errorMessage)
-			if pluginUnloading then
-				return
-			end
-			if channel.client ~= client then
-				return
-			end
-			local wasOpen = channel.open
-			debugBridgeConnection(
-				("channel %d error wasOpen=%s shouldReconnect=%s error=%s"):format(
-					channel.id,
-					tostring(wasOpen),
-					tostring(channel.shouldReconnect),
-					tostring(_errorMessage)
-				)
-			)
-			releaseClient(channel, client, true)
-			recordReconnectClose(channel, wasOpen)
-			markConnectionFailure(channel, _errorMessage or "WebSocket error")
-			if wasOpen then
-				channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
-			else
-				keepFastReconnectIfNextRunActive(channel)
-			end
-			updateStatusText()
-			handleConnectionInterruption()
-			scheduleReconnect(channel)
+			recoverClient(channel, client, true, _errorMessage or "WebSocket error")
 		end)
 
 		clientConnections[#clientConnections + 1] = client.Closed:Connect(function()
-			if channel.client ~= client then
-				return
-			end
-			local wasOpen = channel.open
-			debugBridgeConnection(
-				("channel %d closed wasOpen=%s shouldReconnect=%s"):format(
-					channel.id,
-					tostring(wasOpen),
-					tostring(channel.shouldReconnect)
-				)
-			)
-			releaseClient(channel, client, false)
-			recordReconnectClose(channel, wasOpen)
-			if not wasOpen and Config.bridgeConnectRequested then
-				markConnectionFailure(channel, "connection closed before opening")
-			end
-			if wasOpen then
-				channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
-			else
-				keepFastReconnectIfNextRunActive(channel)
-			end
-			if not pluginUnloading then
-				updateStatusText()
-				handleConnectionInterruption()
-				scheduleReconnect(channel)
-			end
+			recoverClient(channel, client, false)
 		end)
 
 		task.delay(context.connectSessionTimeoutSeconds, function()

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -61,7 +61,8 @@ pub const PROJECT_SCHEMA_URL: &str = "https://raw.githubusercontent.com/Superwhe
 static SCRIPT_NAMING_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectScriptNaming>>> =
     OnceLock::new();
 static GLOB_MATCHER_CACHE: OnceLock<Mutex<HashMap<String, GlobMatcher>>> = OnceLock::new();
-static PROJECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedProjection>>> = OnceLock::new();
+type ProjectionCacheEntry = Arc<Mutex<Option<CachedProjection>>>;
+static PROJECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectionCacheEntry>>> = OnceLock::new();
 thread_local! {
     static NESTED_STAGE_STACK: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     static PROJECTION_TRANSFORM_STACK: RefCell<Vec<Vec<ProjectionTransform>>> = const { RefCell::new(Vec::new()) };
@@ -678,8 +679,8 @@ pub struct ProjectionStage {
     root: PathBuf,
     temporary: bool,
     cleanup: bool,
-    transforms: Vec<ProjectionTransform>,
-    identities: HashMap<String, ProjectionIdentity>,
+    transforms: Arc<Vec<ProjectionTransform>>,
+    identities: Arc<HashMap<String, ProjectionIdentity>>,
 }
 #[derive(Clone)]
 struct ProjectionTransform {
@@ -697,8 +698,8 @@ struct CachedProjection {
     root: PathBuf,
     project_hash: String,
     source_shape: HashMap<String, u8>,
-    transforms: Vec<ProjectionTransform>,
-    identities: HashMap<String, ProjectionIdentity>,
+    transforms: Arc<Vec<ProjectionTransform>>,
+    identities: Arc<HashMap<String, ProjectionIdentity>>,
 }
 
 impl ProjectionStage {
@@ -2304,7 +2305,7 @@ pub fn cache_script_naming(root: &Path, project: &ReniumProject) {
         .insert(absolute_path(root), naming);
 }
 
-fn remove_cached_script_naming(root: &Path) {
+pub(crate) fn remove_cached_script_naming(root: &Path) {
     if let Some(cache) = SCRIPT_NAMING_CACHE.get() {
         let root = absolute_path(root);
         cache
@@ -2342,13 +2343,10 @@ pub fn cached_script_naming(root: &Path) -> ProjectScriptNaming {
     SCRIPT_NAMING_CACHE
         .get()
         .and_then(|cache| {
-            cache
+            let cache = cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .filter(|(path, _)| root.starts_with(path))
-                .max_by_key(|(path, _)| path.components().count())
-                .map(|(_, naming)| naming.clone())
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            root.ancestors().find_map(|path| cache.get(path).cloned())
         })
         .unwrap_or_default()
 }
@@ -3516,6 +3514,42 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_naming_uses_nearest_ancestor_not_a_textual_prefix() {
+        let root = crate::tests::support::temp_dir("naming-ancestor-cache");
+        let nested = root.join("nested");
+        {
+            let mut cache = SCRIPT_NAMING_CACHE
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            cache.insert(
+                root.clone(),
+                ProjectScriptNaming {
+                    server_suffix: ".outer".into(),
+                    ..Default::default()
+                },
+            );
+            cache.insert(
+                nested.clone(),
+                ProjectScriptNaming {
+                    server_suffix: ".inner".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            cached_script_naming(&nested.join("src/deep")).server_suffix,
+            ".inner"
+        );
+        assert_eq!(
+            cached_script_naming(&root.join("nested-other/src")).server_suffix,
+            ".outer"
+        );
+        remove_cached_script_naming(&root);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn jsonc_removes_comments_and_trailing_commas() {

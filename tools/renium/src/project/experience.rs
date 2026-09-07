@@ -112,21 +112,23 @@ fn load_experience(start: &Path) -> Result<Option<ExperienceLayout>> {
     }))
 }
 
-fn matches_selector(layout: &ExperienceLayout, place: &ExperiencePlace, selector: &str) -> bool {
-    let selector = selector.trim();
-    if let Some((game_id, place_id)) = selector.split_once(':')
-        && let (Ok(game_id), Ok(place_id)) = (game_id.parse::<i64>(), place_id.parse::<i64>())
-    {
-        return layout.game_id == Some(game_id) && place.place_id == Some(place_id);
+impl ExperiencePlace {
+    pub(crate) fn matches_selector(&self, selector: &str) -> bool {
+        let selector = selector.trim();
+        if let Some((game_id, place_id)) = selector.split_once(':')
+            && let (Ok(game_id), Ok(place_id)) = (game_id.parse::<i64>(), place_id.parse::<i64>())
+        {
+            return self.game_id == Some(game_id) && self.place_id == Some(place_id);
+        }
+        if let Ok(place_id) = selector.parse::<i64>() {
+            return self.place_id == Some(place_id);
+        }
+        self.alias.eq_ignore_ascii_case(selector)
+            || self
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(selector))
     }
-    if let Ok(place_id) = selector.parse::<i64>() {
-        return place.place_id == Some(place_id);
-    }
-    place.alias.eq_ignore_ascii_case(selector)
-        || place
-            .name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(selector))
 }
 
 fn choices(layout: &ExperienceLayout) -> String {
@@ -155,9 +157,7 @@ pub(crate) fn resolve_experience_place(
             .places
             .iter()
             .enumerate()
-            .filter_map(|(index, place)| {
-                matches_selector(&layout, place, selector).then_some(index)
-            })
+            .filter_map(|(index, place)| place.matches_selector(selector).then_some(index))
             .collect::<Vec<_>>();
         return match matches.len() {
             1 => Ok(Some(layout.places.swap_remove(matches[0]))),

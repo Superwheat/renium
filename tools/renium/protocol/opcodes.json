@@ -72,6 +72,9 @@
     { "id": 95, "name": "image-upload" },
     { "id": 96, "name": "image-store", "queued": false },
     { "id": 97, "name": "update-studios", "runtime": true },
-    { "id": 98, "name": "performance-profile", "queued": false }
+    { "id": 98, "name": "performance-profile", "queued": false },
+    { "id": 99, "name": "network-simulation", "runtime": true },
+    { "id": 100, "name": "property-access", "runtime": true },
+    { "id": 101, "name": "performance-monitor", "runtime": true }
   ]
 }

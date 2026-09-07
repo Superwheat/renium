@@ -1,28 +1,31 @@
 # Renium
 
-Renium is a fast, two-way Roblox Studio sync and automation tool written mostly
-in Rust. Bug reports and suggestions are welcome.
+Two-way Roblox Studio sync and automation. Edit code in VS Code or Cursor,
+build in Studio, and keep both in the same project.
+
+## Install
+
+Download the Windows installer or your platform's ZIP from
+[Releases](https://github.com/Superwheat/renium/releases/latest).
+Install, then restart your editor and Studio.
+
+[Get started and browse commands](tools/renium/README.md).
+Agents use the generated `RENIUM.md` in their project.
 
 ## Components
 
-- [`tools/renium`](tools/renium) — the Rust CLI and daemon. Full reference in its [README](tools/renium/README.md).
-- [`tools/renium-vscode-extension`](tools/renium-vscode-extension) — the VS Code/Cursor extension with a virtualized explorer, live sync, and Git integration.
-- [`tools/plugin_ws_bridge`](tools/plugin_ws_bridge) — the Roblox Studio plugin that bridges Studio to the CLI over WebSockets.
+- [CLI and daemon](tools/renium): project tools, sync, and automation.
+- [VS Code/Cursor extension](tools/renium-vscode-extension): Explorer, Live Sync, and Git.
+- [Studio plugin](tools/plugin_ws_bridge): the Studio connection.
 
-## Getting started
+Build from source:
 
-1. Download **Install-Renium.cmd** on Windows, or the matching platform ZIP on
-   macOS/Linux, from [GitHub Releases](https://github.com/Superwheat/renium/releases/latest).
-2. Restart the selected editor and Roblox Studio.
-3. See [tools/renium/README.md](tools/renium/README.md) for the command reference, and [AGENTS.md](AGENTS.md) if you are pointing an AI agent at it.
+```powershell
+cargo build --locked --release --manifest-path tools/renium/Cargo.toml
+```
 
-Signed updates install matching CLI, extension, and Studio plugin versions.
+Builds and release bundles are not stored in Git.
+For contributor guidance, read [AGENTS.md](AGENTS.md).
 
-To build from source, run `cargo build --release --manifest-path tools/renium/Cargo.toml`.
-Built executables, VSIX files, and plugin models aren't stored in Git.
-
-## License
-
-Licensed under [AGPL-3.0 with the Commons Clause](LICENSE). Commercial game
-development is allowed. Forks must stay open source; selling Renium or paid
-hosting/support isn't permitted.
+[Report a bug](https://github.com/Superwheat/renium/issues) ·
+[License](LICENSE)

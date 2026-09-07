@@ -112,8 +112,8 @@ fn create_adapter_stage(loaded: &LoadedProject, name: &str) -> Result<Projection
         root,
         temporary: true,
         cleanup: true,
-        transforms: Vec::new(),
-        identities: HashMap::new(),
+        transforms: Vec::new().into(),
+        identities: HashMap::new().into(),
     })
 }
 

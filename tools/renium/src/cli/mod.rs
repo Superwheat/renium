@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
@@ -9,6 +10,7 @@ pub(crate) mod config;
 pub(crate) mod dispatch;
 mod examples;
 pub(crate) mod performance;
+pub(crate) mod syntax;
 
 use crate::app::update;
 use crate::automation::commands::{
@@ -30,9 +32,9 @@ pub(crate) fn command() -> clap::Command {
         let subcommand = command
             .find_subcommand_mut(name)
             .expect("command example must name an existing command");
-        *subcommand = std::mem::take(subcommand).override_help(*examples);
+        *subcommand = std::mem::take(subcommand).after_help(*examples);
     }
-    command.override_help(
+    command.after_help(
             "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
         )
 }
@@ -116,6 +118,23 @@ pub(super) struct QueryPlaceArgs {
 pub(super) struct ComparePlaceArgs {
     #[arg(value_name = "PLACE.rbxl|PLACE.rbxlx")]
     pub(super) input: PathBuf,
+    #[arg(
+        long,
+        value_name = "PLACE.rbxl|PLACE.rbxlx",
+        help = "Compare against another place file instead of the project"
+    )]
+    pub(super) against: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Compare all saved instances and values, not only scripts"
+    )]
+    pub(super) full: bool,
+    #[arg(
+        long,
+        requires = "full",
+        help = "Include before/after values and source (may contain secrets)"
+    )]
+    pub(super) values: bool,
     #[arg(long, default_value = "50")]
     pub(super) limit: NonZeroUsize,
     #[arg(short, long)]
@@ -126,6 +145,19 @@ pub(super) struct ComparePlaceArgs {
 
 #[derive(Subcommand)]
 pub(super) enum Commands {
+    #[command(
+        name = "plugin",
+        about = "Create, install and inspect workflow plugins"
+    )]
+    Plugin(crate::plugins::PluginArgs),
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
+    #[command(
+        name = "ck",
+        alias = "check",
+        about = "Check Luau syntax offline without executing code"
+    )]
+    CheckLuau(syntax::CheckArgs),
     #[command(name = "fmt", alias = "fmt-project")]
     FmtProject(project_config::FmtProjectArgs),
     #[command(name = "pv", alias = "project-validate", alias = "validate-project")]
@@ -152,7 +184,7 @@ pub(super) enum Commands {
     #[command(
         name = "cmp",
         alias = "compare-place",
-        about = "Compare a place file's scripts with this project"
+        about = "Compare saved places or a place with this project; --full includes instances and properties"
     )]
     ComparePlace(ComparePlaceArgs),
     #[command(name = "dr", alias = "doctor")]
@@ -233,6 +265,22 @@ pub(super) enum Commands {
     )]
     StudioDevice(StudioDeviceArgs),
     #[command(
+        name = "net",
+        alias = "network",
+        about = "Inspect or change Studio network simulation, including a live play client"
+    )]
+    NetworkSimulation(crate::studio::automation::network::NetworkArgs),
+    #[command(
+        name = "access",
+        about = "Control access to security-protected Studio properties"
+    )]
+    PropertyAccess(crate::studio::automation::property_access::PropertyAccessArgs),
+    #[command(
+        name = "perf",
+        about = "Read runtime performance or capture frame, memory and network measurements"
+    )]
+    PerformanceMonitor(crate::studio::automation::monitor::MonitorArgs),
+    #[command(
         name = "pf",
         alias = "performance-profile",
         alias = "performance",
@@ -310,6 +358,9 @@ pub(super) enum Commands {
     RecordStart(RecordStartArgs),
     #[command(name = "re", alias = "record-end")]
     RecordEnd(RecordEndArgs),
+    /// Inspect a saved recording as a timestamped image, without Studio.
+    #[command(name = "rf", alias = "record-review", alias = "record-frames")]
+    RecordReview(RecordReviewArgs),
     #[command(name = "setup", alias = "setup-renium")]
     Setup(SetupArgs),
     #[command(name = "st", alias = "studio-change-state")]
@@ -432,6 +483,7 @@ mod tests {
 
     #[test]
     fn every_visible_command_has_a_short_example() {
+        command().debug_assert();
         for subcommand in command()
             .get_subcommands()
             .filter(|subcommand| !subcommand.is_hide_set())
@@ -440,11 +492,6 @@ mod tests {
             assert!(
                 examples.contains(&format!("rbx {}", subcommand.get_name())),
                 "{} does not use its short name in examples",
-                subcommand.get_name()
-            );
-            assert!(
-                !examples.contains("Options:") && !examples.contains("Usage:"),
-                "{} exposes implementation details in help",
                 subcommand.get_name()
             );
         }
@@ -1187,6 +1234,23 @@ pub(super) struct RecordStartArgs {
 #[derive(Parser)]
 pub(super) struct RecordEndArgs {
     pub(super) recording_id: Option<String>,
+    /// Finish the video without generating its overview image.
+    #[arg(long)]
+    pub(super) no_review: bool,
+}
+
+#[derive(Parser)]
+pub(super) struct RecordReviewArgs {
+    pub(super) file: PathBuf,
+    /// Show 12 consecutive frames (pages start at 1). Default: sampled overview.
+    #[arg(long, conflicts_with = "frame", value_parser = clap::value_parser!(u32).range(1..))]
+    pub(super) page: Option<u32>,
+    /// Extract one full-resolution frame (frames start at 1).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub(super) frame: Option<u32>,
+    /// Write the PNG here instead of beside the recording in its .review folder.
+    #[arg(short, long)]
+    pub(super) output: Option<PathBuf>,
 }
 
 #[derive(Parser)]

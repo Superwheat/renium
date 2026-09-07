@@ -54,6 +54,9 @@ use crate::studio::automation::{
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
     match command {
+        Commands::Plugin(args) => crate::plugins::manage(args),
+        Commands::External(args) => crate::plugins::run(args, project),
+        Commands::CheckLuau(args) => crate::cli::syntax::run(args),
         Commands::FmtProject(args) => config::run_fmt_project(args, project),
         Commands::ProjectValidate(args) => config::run_validate_project(args, project),
         Commands::ExplainPath(args) => config::run_explain_path(args, project),
@@ -108,6 +111,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
             timeout: args.timeout,
         }),
         Commands::StudioDevice(args) => studio_device_command(args),
+        Commands::NetworkSimulation(args) => crate::studio::automation::network::command(args),
+        Commands::PropertyAccess(args) => crate::studio::automation::property_access::command(args),
+        Commands::PerformanceMonitor(args) => crate::studio::automation::monitor::command(args),
         Commands::PerformanceProfile(args) => crate::cli::performance::run(args),
         Commands::PerformanceWorker => crate::studio::performance::run_worker(),
         Commands::PerformanceHolder(args) => {
@@ -136,6 +142,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::Input(args) => commands::input(args, project),
         Commands::RecordStart(args) => record_start_command(args),
         Commands::RecordEnd(args) => record_end_command(args),
+        Commands::RecordReview(args) => crate::studio::automation::record_review_command(args),
         Commands::Setup(args) => setup_command(args),
         Commands::StudioChangeState(args) => studio_change_state_command(args, project),
         Commands::LiveStart(args) => {

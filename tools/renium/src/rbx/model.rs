@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,8 +36,6 @@ use crate::editor::paths::{
     build_editor_source_paths_by_index, build_editor_source_paths_by_index_with_children,
     editor_run_context_value, infer_source_script, merge_editor_source_files_into_document,
 };
-use crate::editor::sync::settings_file_hash;
-use crate::editor::types::{EditorInstancePath, EditorSettingsWrite};
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::package_links::local_project_package_paths;
@@ -233,19 +231,36 @@ impl RbxPlaceFormat {
         match self {
             Self::Binary => rbx_binary::from_reader(reader)
                 .with_context(|| format!("Failed to read {}", path.display())),
-            Self::Xml => rbx_xml::from_reader_default(reader)
-                .with_context(|| format!("Failed to read {}", path.display())),
+            Self::Xml => rbx_xml::from_reader(
+                reader,
+                rbx_xml::DecodeOptions::new()
+                    .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
+            )
+            .with_context(|| format!("Failed to read {}", path.display())),
         }
     }
 
     pub(crate) fn write(self, path: &Path, dom: &RbxWeakDom, roots: &[RbxRef]) -> Result<()> {
-        let writer = create_output_writer(path)?;
+        let temporary = crate::system::files::sibling_temp_path(path);
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_file(&temporary);
+        });
+        let mut writer = create_output_writer(&temporary)?;
         match self {
-            Self::Binary => rbx_binary::to_writer(writer, dom, roots)
+            Self::Binary => rbx_binary::to_writer(&mut writer, dom, roots)
                 .with_context(|| format!("Failed to write {}", path.display())),
-            Self::Xml => rbx_xml::to_writer_default(writer, dom, roots)
-                .with_context(|| format!("Failed to write {}", path.display())),
-        }
+            Self::Xml => rbx_xml::to_writer(
+                &mut writer,
+                dom,
+                roots,
+                rbx_xml::EncodeOptions::new()
+                    .property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown),
+            )
+            .with_context(|| format!("Failed to write {}", path.display())),
+        }?;
+        writer.flush()?;
+        drop(writer);
+        crate::system::files::replace_file_with_backup(&temporary, path, "place")
     }
 }
 
@@ -735,9 +750,6 @@ pub(crate) struct BytecodeModelImportOutcome {
 pub(crate) struct RbxPlaceBuild {
     pub(crate) dom: RbxWeakDom,
     pub(crate) service_roots: Vec<(String, RbxRef)>,
-    pub(crate) documents_by_service: HashMap<String, SettingsBytecode>,
-    pub(crate) paths_by_service: HashMap<String, Vec<Option<EditorInstancePath>>>,
-    pub(crate) settings_writes: Vec<EditorSettingsWrite>,
     pub(crate) total_instances: usize,
     pub(crate) has_package_links: bool,
     pub(crate) omitted_properties_by_class: HashMap<String, HashSet<String>>,
@@ -1403,21 +1415,6 @@ pub(crate) fn build_rbx_place(
         .zip(top_level_refs)
         .map(|((service, _, _, _, _, _, _, _, _), referent)| (service.clone(), referent))
         .collect::<Vec<_>>();
-    let mut settings_writes = export_inputs
-        .iter()
-        .filter(|(_, _, _, _, _, _, _, _, changed)| *changed)
-        .map(
-            |(service, _, _, document, _, _, _, _, _)| -> Result<EditorSettingsWrite> {
-                let path = service_settings_path(&src_root.join(service));
-                Ok(EditorSettingsWrite {
-                    expected_hash: settings_file_hash(&path)?,
-                    path,
-                    document: document.clone(),
-                })
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
-    settings_writes.sort_by(|left, right| left.path.cmp(&right.path));
     let has_package_links = export_inputs
         .iter()
         .any(|(_, _, _, document, _, _, _, _, _)| {
@@ -1426,19 +1423,10 @@ pub(crate) fn build_rbx_place(
                 .iter()
                 .any(|instance| instance.class_name == "PackageLink")
         });
-    let mut documents_by_service = HashMap::with_capacity(export_inputs.len());
-    let mut paths_by_service = HashMap::with_capacity(export_inputs.len());
-    for (service, _, _, document, _, instance_paths, _, _, _) in export_inputs {
-        paths_by_service.insert(service.clone(), instance_paths);
-        documents_by_service.insert(service, document);
-    }
     log_timing("native editor place DOM assembly", phase_started);
     Ok(RbxPlaceBuild {
         dom,
         service_roots,
-        documents_by_service,
-        paths_by_service,
-        settings_writes,
         total_instances,
         has_package_links,
         omitted_properties_by_class,

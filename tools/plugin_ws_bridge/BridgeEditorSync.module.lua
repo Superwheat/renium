@@ -1347,6 +1347,18 @@ local function writePropertyForSync(
 	end
 	markLiveMutation(ctx, instance)
 	local okRead, current = readProperty(instance, propertyName)
+	if propertyName == "CollisionFidelity" and instance:IsA("MeshPart") then
+		-- Collision geometry is cooked asynchronously, even when assignment succeeds.
+		-- Keep its expected event alive until the engine exposes the requested value.
+		local deadline = os.clock() + 3
+		while okRead and not valuesEqual(current, value) and os.clock() < deadline do
+			if ctx ~= nil then
+				ctx.assertSessionOwnership()
+			end
+			RunService.Heartbeat:Wait()
+			okRead, current = readProperty(instance, propertyName)
+		end
+	end
 	if not okRead or not valuesEqual(current, value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
@@ -1461,17 +1473,24 @@ local function preloadPropertyMeshPartSources(changes: { any }, ctx: { [string]:
 	return #sources, (os.clock() - started) * 1000
 end
 
-local function applyMeshPartMeshId(instance: Instance, meshId: any, ctx: { [string]: any }): (boolean, any)
+local function applyMeshPartMeshId(
+	instance: Instance,
+	meshId: any,
+	ctx: { [string]: any },
+	suppliedSource: MeshPart?
+): (boolean, any)
 	if not instance:IsA("MeshPart") then
 		return false, "MeshId can only be applied to MeshPart"
 	end
 
 	local targetMeshPart = instance :: MeshPart
 	local meshIdText = tostring(meshId or "")
-	local sourceMeshPart
+	local sourceMeshPart = suppliedSource
 	local destroySource = false
 	local sourceReady = false
-	if meshIdText == "" then
+	if suppliedSource ~= nil then
+		sourceReady = true
+	elseif meshIdText == "" then
 		sourceMeshPart = Instance.new("MeshPart")
 		destroySource = true
 		sourceReady = true
@@ -2005,8 +2024,9 @@ local function removeUnknownInstances(
 	local descendants = service:GetDescendants()
 	local unknown = {}
 	local removedCount = 0
+	local pathSnapshot = BridgeIdentity.newPathSnapshot()
 	for _, instance in descendants do
-		local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+		local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance, pathSnapshot)
 		local key = if pathSegments then pathCacheKey(pathSegments, pathOrdinals) else ""
 		if
 			key ~= ""
@@ -2432,6 +2452,11 @@ local function writeDecodedProperty(instance, propertyName, decoded, ctx, stats)
 	return true, nil
 end
 
+local function isMeshGeometryProperty(propertyName: string): boolean
+	return propertyName == "UnscaledCofm" or propertyName == "UnscaledVolInertiaDiags"
+		or propertyName == "UnscaledVolInertiaOffDiags" or propertyName == "UnscaledVolume"
+end
+
 local function applyChangedProperty(instance, propertyName, rawValue, change, ctx, stats, unreadableNames, serviceName)
 	if propertyName == "Source" then
 		stats.noops += 1
@@ -2460,6 +2485,22 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 	end
 	if not classHasProperty(instance, propertyName) then
 		error(`{propertyName} is not a property of {instance.ClassName}`)
+	end
+	if instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName) then
+		if ctx.editorTransaction == nil then
+			error("Mesh geometry sync requires an active transaction")
+		end
+		if resolvePathSegments(change.pathSegments, nil, change.pathOrdinals) ~= instance then
+			error("Mesh geometry target path changed; retry the sync")
+		end
+		stats.nativeGeometryWrites = stats.nativeGeometryWrites or {}
+		table.insert(stats.nativeGeometryWrites, {
+			className = instance.ClassName, pathSegments = change.pathSegments,
+			pathOrdinals = change.pathOrdinals, name = propertyName, value = rawValue,
+		})
+		markLiveMutation(ctx, instance)
+		stats.propertyUpdated += 1
+		return
 	end
 	if type(unreadableNames) == "table" and unreadableNames[propertyName] then
 		recordProtectedWrite(stats, change, "property", propertyName, rawValue)
@@ -3272,6 +3313,19 @@ function TransactionState.captureSources(sourceChanges: { any }, ctx: { [string]
 	return sources, sourceKeys
 end
 
+function TransactionState.captureMeshGeometry(instance: MeshPart): buffer
+	local copy = Instance.new("MeshPart")
+	local ok, payload = pcall(function()
+		copy:ApplyMesh(instance)
+		return SerializationService:SerializeInstancesAsync({ copy })
+	end)
+	copy:Destroy()
+	if not ok then
+		error(`Could not snapshot mesh geometry for {instance:GetFullName()}: {payload}`)
+	end
+	return payload
+end
+
 function TransactionState.captureProperty(
 	instance: Instance,
 	propertyName: string,
@@ -3281,6 +3335,17 @@ function TransactionState.captureProperty(
 )
 	if seenNames[propertyName] then
 		return
+	end
+	-- ApplyMesh preserves the engine's serialized mass/inertia fields even though
+	-- plugins cannot read them. Store bytes, not retained temporary instances.
+	if instance:IsA("MeshPart") and not seenNames.__meshGeometry and (
+		isMeshGeometryProperty(propertyName) or propertyName == "MeshId"
+		or propertyName == "CollisionFidelity" or propertyName == "RenderFidelity" or propertyName == "FluidFidelity"
+	) then
+		seenNames.__meshGeometry = true
+		properties[#properties + 1] = {
+			instance = instance, name = "__meshGeometry", value = TransactionState.captureMeshGeometry(instance :: MeshPart),
+		}
 	end
 	local okRead, value = readProperty(instance, propertyName)
 	if okRead then
@@ -3452,6 +3517,18 @@ function TransactionState.restoreMetadata(
 	end
 	for _, entry in ipairs(snapshot.properties) do
 		local instance = replacements[entry.instance] or entry.instance
+		if entry.name == "__meshGeometry" then
+			local meshes = SerializationService:DeserializeInstancesAsync(entry.value)
+			if #meshes ~= 1 or not meshes[1]:IsA("MeshPart") then
+				error("Invalid mesh geometry rollback snapshot")
+			end
+			local ok, result = applyMeshPartMeshId(instance, nil, ctx, meshes[1])
+			meshes[1]:Destroy()
+			if not ok then
+				error(`Could not restore mesh geometry for {instance:GetFullName()}: {result}`)
+			end
+			continue
+		end
 		local value = if typeof(entry.value) == "Instance"
 			then replacements[entry.value] or entry.value
 			else entry.value
@@ -4057,7 +4134,7 @@ function NativeSerialization.completePayload(
 				for serviceName, generation in pairs(generations) do
 					if
 						not session.ctx.isStudioChangeTracking(serviceName)
-						or session.ctx.studioChangeGeneration(serviceName) ~= generation
+						or session.ctx.nativeExportGeneration(serviceName) ~= generation
 					then
 						unchanged = false
 						break
@@ -4112,7 +4189,7 @@ function NativeSerialization.captureGenerations(
 		if not session.ctx.isStudioChangeTracking(serviceName) then
 			return nil
 		end
-		generations[serviceName] = session.ctx.studioChangeGeneration(serviceName)
+		generations[serviceName] = session.ctx.nativeExportGeneration(serviceName)
 	end
 	return generations
 end
@@ -4121,7 +4198,7 @@ function NativeSerialization.proofMatches(session: { [string]: any }, proof: { [
 	for serviceName, generation in pairs(proof.generations) do
 		if
 			not session.ctx.isStudioChangeTracking(serviceName)
-			or session.ctx.studioChangeGeneration(serviceName) ~= generation
+			or session.ctx.nativeExportGeneration(serviceName) ~= generation
 		then
 			return false
 		end
@@ -4580,6 +4657,24 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local session = editorTransactions[transactionId]
 		if type(session) == "table" then
 			local state = if session.rollbackFailed ~= nil then "rollbackFailed" else tostring(session.state or "open")
+			local geometry = nil
+			if params.meshGeometry ~= nil then
+				assertTransactionLease(session)
+				if state ~= "open" and state ~= "prepared" then
+					error("Mesh geometry readback requires an active transaction")
+				end
+				local target = params.meshGeometry
+				if type(target) ~= "table" or not table.find(session.serviceNames, target.service) then
+					error("Mesh geometry readback is outside its transaction services")
+				end
+				validateMutationPath(target, target.service, "Mesh geometry readback", ctx)
+				local instance = resolvePathSegments(target.pathSegments, nil, target.pathOrdinals)
+				if instance == nil or instance.ClassName ~= "MeshPart" then
+					error("Mesh geometry target was removed or changed class")
+				end
+				geometry = buffer.tostring(EncodingService:Base64Encode(TransactionState.captureMeshGeometry(instance :: MeshPart)))
+				assertTransactionLease(session)
+			end
 			return {
 				ok = true,
 				found = true,
@@ -4588,6 +4683,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				committed = false,
 				rolledBack = false,
 				rollbackError = session.rollbackFailed,
+				meshGeometry = geometry,
 			}
 		end
 		local outcome = transactionOutcomes.get(transactionId)
@@ -6969,9 +7065,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			local service = game:GetService(params.service)
 			local snapshotItems = {}
+			local pathSnapshot = BridgeIdentity.newPathSnapshot()
 			for _, instance in ipairs(service:GetDescendants()) do
 				if includeManagedInstance(ctx, params.service, instance) then
-					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance, pathSnapshot)
 					if pathSegments ~= nil then
 						local attributes = {}
 						for name in pairs(instance:GetAttributes()) do

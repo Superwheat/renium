@@ -2,29 +2,10 @@ import * as fs from "fs";
 import * as path from "path";
 
 import type { ExplorerConfig, FileExplorerNode } from "./fileExplorerCore";
-import { recordValue, safeArray, safeObject } from "./utils";
+import { MODEL_PIVOT_CLASSES, WORKSPACE_HIDDEN_STUDIO_PROPERTIES, WORKSPACE_VISIBLE_NON_SERIALIZED_PROPERTIES, WORKSPACE_VISIBLE_SERVICE_REF_PROPERTIES, WORKSPACE_SERVER_AUTHORITY_PROPERTIES, normalizeApiDump } from "./propertyMetadata";
+import { recordValue, safeObject } from "./utils";
 
 const PROTECTED_STARTER_PLAYER_CONTAINERS = new Set(["StarterCharacterScripts", "StarterPlayerScripts"]);
-const MODEL_PIVOT_CLASSES = new Set(["Model", "WorldModel", "Workspace"]);
-const WORKSPACE_HIDDEN_STUDIO_PROPERTIES = new Set([
-  "AirTurbulenceIntensity",
-  "CurrentCamera",
-  "LevelOfDetail",
-  "ModelStreamingMode",
-  "Origin",
-  "Pivot Offset",
-  "Scale",
-  "StreamingEnabledAlias",
-]);
-const WORKSPACE_VISIBLE_NON_SERIALIZED_PROPERTIES = new Set(["InsertPoint"]);
-const WORKSPACE_VISIBLE_SERVICE_REF_PROPERTIES = new Set(["PrimaryPart"]);
-const WORKSPACE_SERVER_AUTHORITY_PROPERTIES = new Set([
-  "AuthorityMode",
-  "NextGenerationReplication",
-  "PlayerScriptsUseInputActionSystem",
-  "SignalBehavior",
-  "UseFixedSimulation",
-]);
 const LIGHTING_APPEARANCE_PROPERTY_TERMS = [
   "ambient",
   "brightness",
@@ -221,7 +202,8 @@ function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined 
     path.join(config.projectRoot, "tools", "plugin_ws_bridge", "rbx_dom_lua", "database.json"),
   ].find((candidate) => fs.existsSync(candidate));
   const sourceKey = metadataSourceKey(databasePath);
-  const cached = rbxDomDatabaseCache.get(projectKey);
+  const cacheKey = databasePath ?? "missing";
+  const cached = rbxDomDatabaseCache.get(cacheKey);
   if (cached?.sourceKey === sourceKey) {
     return cached.value;
   }
@@ -233,7 +215,7 @@ function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined 
   } catch {
     value = {};
   }
-  rbxDomDatabaseCache.set(projectKey, { sourceKey, value });
+  rbxDomDatabaseCache.set(cacheKey, { sourceKey, value });
   propertyTemplateCache.clear();
   return value;
 }
@@ -247,7 +229,8 @@ function loadGeneratedRobloxProperties(config: ExplorerConfig): GeneratedRobloxP
     path.join(config.projectRoot, "tools", "renium-vscode-extension", "resources", "roblox-properties.generated.json"),
   ].find((candidate) => fs.existsSync(candidate));
   const sourceKey = metadataSourceKey(metadataPath);
-  const cached = generatedRobloxPropertiesCache.get(projectKey);
+  const cacheKey = metadataPath ?? "missing";
+  const cached = generatedRobloxPropertiesCache.get(cacheKey);
   if (cached?.sourceKey === sourceKey) {
     return cached.value;
   }
@@ -259,7 +242,7 @@ function loadGeneratedRobloxProperties(config: ExplorerConfig): GeneratedRobloxP
   } catch {
     value = {};
   }
-  generatedRobloxPropertiesCache.set(projectKey, { sourceKey, value });
+  generatedRobloxPropertiesCache.set(cacheKey, { sourceKey, value });
   propertyTemplateCache.clear();
   return value;
 }
@@ -287,94 +270,7 @@ function isGeneratedPropertyVisible(
 }
 
 function normalizeRbxDomDatabase(raw: unknown): RbxDomDatabase {
-  const record = safeObject(raw);
-  if (!Array.isArray(record.Classes)) {
-    return record as RbxDomDatabase;
-  }
-
-  const classes: Record<string, RbxDomClass> = {};
-  for (const rawClass of record.Classes) {
-    const classRecord = safeObject(rawClass);
-    const className = String(classRecord.Name ?? "");
-    if (!className) {
-      continue;
-    }
-    const properties: Record<string, RbxDomProperty> = {};
-    for (const rawMember of safeArray(classRecord.Members)) {
-      const member = safeObject(rawMember);
-      if (member.MemberType !== "Property") {
-        continue;
-      }
-      const propertyName = String(member.Name ?? "");
-      if (!propertyName) {
-        continue;
-      }
-      const valueType = safeObject(member.ValueType);
-      const valueTypeName = typeof valueType.Name === "string" ? valueType.Name : undefined;
-      const valueTypeCategory = typeof valueType.Category === "string" ? valueType.Category : undefined;
-      properties[propertyName] = {
-        Name: propertyName,
-        MemberType: "Property",
-        Security: safeObject(member.Security) as RbxDomProperty["Security"],
-        ValueType: { Name: valueTypeName, Category: valueTypeCategory },
-        DataType: rbxDomDataTypeFromApiDumpValueType(valueTypeName, valueTypeCategory),
-        Category: typeof member.Category === "string" ? member.Category : undefined,
-        Tags: safeArray(member.Tags).map((tag) => String(tag)),
-      };
-    }
-    classes[className] = {
-      Name: className,
-      Superclass: typeof classRecord.Superclass === "string" ? classRecord.Superclass : undefined,
-      Tags: safeArray(classRecord.Tags).map((tag) => String(tag)),
-      Properties: properties,
-      DefaultProperties: {},
-    };
-  }
-
-  const enums: Record<string, { items?: Record<string, number> }> = {};
-  for (const rawEnum of safeArray(record.Enums)) {
-    const enumRecord = safeObject(rawEnum);
-    const enumName = String(enumRecord.Name ?? "");
-    if (!enumName) {
-      continue;
-    }
-    const items: Record<string, number> = {};
-    for (const rawItem of safeArray(enumRecord.Items)) {
-      const item = safeObject(rawItem);
-      const itemName = String(item.Name ?? "");
-      const itemValue = typeof item.Value === "number" ? item.Value : Number(item.Value);
-      if (itemName && Number.isFinite(itemValue)) {
-        items[itemName] = itemValue;
-      }
-    }
-    enums[enumName] = { items };
-  }
-
-  return { Classes: classes, Enums: enums };
-}
-
-function rbxDomDataTypeFromApiDumpValueType(name: string | undefined, category: string | undefined): RbxDomProperty["DataType"] {
-  if (!name) {
-    return undefined;
-  }
-  if (category === "Enum") {
-    return { Enum: name.replace(/^Enum\./, "") };
-  }
-  if (category === "Class") {
-    return { Value: "Ref" };
-  }
-  const primitiveMap: Record<string, string> = {
-    bool: "Bool",
-    boolean: "Bool",
-    int: "Int32",
-    int64: "Int64",
-    float: "Float32",
-    double: "Float64",
-    string: "String",
-    BinaryString: "BinaryString",
-    Content: "ContentId",
-  };
-  return { Value: primitiveMap[name] ?? name };
+  return Array.isArray(safeObject(raw).Classes) ? normalizeApiDump(raw, true) as RbxDomDatabase : safeObject(raw) as RbxDomDatabase;
 }
 
 function findRbxDomProperty(classes: Record<string, RbxDomClass>, className: string, propertyName: string): RbxDomProperty | undefined {

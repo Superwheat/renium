@@ -16,7 +16,7 @@ import {
 import { delay, prefixProcessOutput } from "./utils";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_OUTPUT_BUFFER_BYTES = 1024 * 1024;
+const MAX_OUTPUT_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_CHANNEL_WAIT_MS = 30_000;
 
 type AutomationClientConfig = {
@@ -49,6 +49,7 @@ type AutomationResponse = {
   ms: number;
   r?: unknown;
   e?: AutomationError;
+  proxyCancellation?: boolean;
 };
 
 type PendingRequest = {
@@ -80,8 +81,10 @@ export class AutomationClient {
   private process: childProcess.ChildProcessWithoutNullStreams | undefined;
   private processKey: string | undefined;
   private requestId = 1;
-  private outputBuffer = "";
+  private outputChunks: Buffer[] = [];
+  private outputBufferBytes = 0;
   private ready = false;
+  private proxyCancellation = false;
   private readyPromise: Promise<void> | undefined;
   private readyResolve: (() => void) | undefined;
   private readyReject: ((error: Error) => void) | undefined;
@@ -207,7 +210,8 @@ export class AutomationClient {
     this.process = child;
     this.generation += 1;
     this.processKey = key;
-    this.outputBuffer = "";
+    this.outputChunks = [];
+    this.outputBufferBytes = 0;
     this.ready = false;
     this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
@@ -371,10 +375,21 @@ export class AutomationClient {
         if (!this.pending.has(id)) {
           return;
         }
-        const message = `[renium] ${label}: daemon request timed out after ${Math.round(timeoutMs / 1000)}s; restarting the bridge daemon.\n`;
+        const message = `[renium] ${label}: request timed out after ${Math.round(timeoutMs / 1000)}s; cancelling the request.\n`;
         this.output.appendLine(message.trim());
         this.finishRequest(id, { code: 124, output: pending.output + `\n${message}` });
-        void this.stop(new Error(`Persistent bridge daemon request timed out (${label}).`));
+        if (this.proxyCancellation) {
+          try {
+            proc.stdin.write(`${JSON.stringify({ cancel: id })}\n`, "utf8", error => {
+              if (error) { void this.stop(error); }
+            });
+          } catch (error) {
+            void this.stop(error instanceof Error ? error : new Error(String(error)));
+          }
+        } else {
+          // Older proxies cancel only by closing their control sockets on exit.
+          void this.stop(new Error(`Persistent bridge request timed out (${label}).`));
+        }
       }, timeoutMs);
       this.pending.set(id, pending);
       const request = `${JSON.stringify({
@@ -463,27 +478,37 @@ export class AutomationClient {
   }
 
   private handleOutput(prefix: string, data: Buffer | string, isStderr: boolean): void {
-    const text = data.toString();
     if (isStderr && !Array.from(this.pending.values()).some((pending) => pending.quiet)) {
       this.output.append(prefixProcessOutput(prefix, data));
     }
     if (isStderr) {
-      this.appendOutputToActiveRequest(text);
+      this.appendOutputToActiveRequest(data.toString());
       return;
     }
-    this.outputBuffer += text;
-    if (this.outputBuffer.length > MAX_OUTPUT_BUFFER_BYTES) {
-      const error = new Error("Persistent bridge daemon emitted more than 1 MiB without a complete protocol line.");
-      this.output.appendLine(`[renium] bridge daemon protocol error: ${error.message}`);
-      void this.stop(error);
-      return;
-    }
-    let newlineIndex = this.outputBuffer.indexOf("\n");
-    while (newlineIndex >= 0) {
-      const line = this.outputBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      this.outputBuffer = this.outputBuffer.slice(newlineIndex + 1);
-      this.processLine(line);
-      newlineIndex = this.outputBuffer.indexOf("\n");
+    const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline < 0 ? chunk.length : newline;
+      const part = chunk.subarray(offset, end);
+      this.outputBufferBytes += part.length;
+      if (this.outputBufferBytes > MAX_OUTPUT_BUFFER_BYTES) {
+        const error = new Error("Bridge proxy response exceeded the 8 MiB protocol limit.");
+        this.output.appendLine(`[renium] bridge protocol error: ${error.message}`);
+        void this.stop(error);
+        return;
+      }
+      this.outputChunks.push(part);
+      if (newline < 0) {
+        return;
+      }
+      const frame = this.outputChunks.length === 1
+        ? part
+        : Buffer.concat(this.outputChunks, this.outputBufferBytes);
+      this.outputChunks = [];
+      this.outputBufferBytes = 0;
+      this.processLine(frame.toString("utf8").replace(/\r$/, ""));
+      offset = newline + 1;
     }
   }
 
@@ -514,6 +539,7 @@ export class AutomationClient {
       this.output.appendLine("[renium] bridge daemon returned an incompatible protocol response.");
       return;
     }
+    this.proxyCancellation = payload.proxyCancellation === true;
     const id = Number(payload.id ?? 0);
     const pending = this.pending.get(id);
     if (!pending) {
@@ -572,9 +598,11 @@ export class AutomationClient {
     }
     this.process = undefined;
     this.processKey = undefined;
-    this.outputBuffer = "";
+    this.outputChunks = [];
+    this.outputBufferBytes = 0;
     this.ready = false;
     this.readyPromise = undefined;
+    this.proxyCancellation = false;
     this.readyResolve = undefined;
     this.readyReject = undefined;
     this.closePromise = undefined;

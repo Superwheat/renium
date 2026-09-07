@@ -30,9 +30,7 @@ use crate::editor::sync::{
 use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstancePath, EditorPropertyChange,
 };
-use crate::project::version_control::{
-    VcMergeConflict, merge_settings_documents_with_policy_and_source_changes,
-};
+use crate::project::version_control::{VcMergeConflict, merge_aligned_settings_documents};
 use crate::project::{config, config::project_watch_inputs};
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::bytecode::{
@@ -49,11 +47,13 @@ use crate::settings::equivalence::{
     settings_documents_equivalent, settings_documents_positionally_equivalent,
     stabilize_settings_reference_ids,
 };
-use crate::snapshot::export::{ExportProjectStage, export_snapshots_with_warm_bridge};
+use crate::snapshot::export::{
+    ExportProjectStage, PublishEntryState, export_snapshots_with_warm_bridge,
+};
 use crate::snapshot::refs::remap_record_reference_ids;
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::system::files::{
-    OnDrop, absolutize_under, atomic_write_file, canonical_path, create_unique_directory,
+    OnDrop, absolutize_under, atomic_write_file, canonical_path, create_unique_directory, fnv1a,
     is_service_settings_file_name, service_settings_path,
 };
 
@@ -304,6 +304,7 @@ struct ReconcilePushPlan {
     previous_paths: HashMap<(String, String), EditorInstancePath>,
     instance_deletes: Vec<EditorInstanceChange>,
     property_removals: Vec<EditorPropertyChange>,
+    geometry_properties: HashMap<(String, String), Vec<String>>,
 }
 
 struct PreparedEditorSettingsChange {
@@ -480,19 +481,19 @@ struct LegacyPairRecord {
     resolution_required: bool,
 }
 
-fn saved_local_file_for_context(context: &BoundContext) -> Result<Option<PathBuf>> {
-    let record_dir = Path::new(&context.root).join(".renium").join(RECORD_DIR);
+fn saved_pair_identities(root: &Path, experience: &Path) -> Result<Vec<PairIdentity>> {
+    let record_dir = root.join(".renium").join(RECORD_DIR);
     let entries = match fs::read_dir(&record_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("Failed to inspect {}", record_dir.display()));
         }
     };
-    let project = canonical_string(Path::new(&context.root))?;
-    let experience = canonical_string(Path::new(&context.experience))?;
-    let mut files = HashSet::new();
+    let project = canonical_string(root)?;
+    let experience = canonical_string(experience)?;
+    let mut identities = Vec::new();
     for entry in entries {
         let entry = entry?;
         if entry
@@ -513,12 +514,44 @@ fn saved_local_file_for_context(context: &BoundContext) -> Result<Option<PathBuf
         {
             continue;
         }
-        if let Some(file) = record.identity.local_file.map(PathBuf::from)
-            && file.is_file()
-        {
-            files.insert(file);
+        identities.push(record.identity);
+    }
+    Ok(identities)
+}
+
+pub(super) fn saved_studio_target_for_root(
+    root: &Path,
+    experience: &Path,
+) -> Result<Option<super::StudioReopenTarget>> {
+    let mut targets = Vec::new();
+    for identity in saved_pair_identities(root, experience)? {
+        let file = identity
+            .local_file
+            .map(PathBuf::from)
+            .filter(|path| path.is_file());
+        let game_id = identity.game_id.filter(|id| *id > 0);
+        let place_id = identity.place_id.filter(|id| *id > 0);
+        if file.is_none() && place_id.is_none() {
+            continue;
+        }
+        let target = super::StudioReopenTarget {
+            file,
+            game_id,
+            place_id,
+        };
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
+    Ok((targets.len() == 1).then(|| targets.pop().unwrap()))
+}
+
+fn saved_local_file_for_context(context: &BoundContext) -> Result<Option<PathBuf>> {
+    let files = saved_pair_identities(Path::new(&context.root), Path::new(&context.experience))?
+        .into_iter()
+        .filter_map(|identity| identity.local_file.map(PathBuf::from))
+        .filter(|file| file.is_file())
+        .collect::<HashSet<_>>();
     if files.len() > 1 {
         bail!(
             "More than one local Studio file is paired with this project; pass the file to rbx ro"
@@ -1417,19 +1450,12 @@ impl Coordinator {
             baseline.replace_scopes(root, key, &generated_scopes, &generated)?;
         }
         log_reconcile_timing("incremental baseline update", phase);
-        let generated_paths = generated
-            .entries
-            .keys()
-            .map(|path| root.join(path))
-            .collect();
+        let accepted = accepted_editor_entries(root, &previous, &current, &generated);
         let phase = Instant::now();
         record.studio_checkpoint = current_studio_checkpoint(context, bridge);
         write_record(context, key, record)?;
         log_reconcile_timing("incremental record write", phase);
-        Ok(AppliedEditorChanges {
-            generated_paths,
-            summary,
-        })
+        Ok(AppliedEditorChanges { accepted, summary })
     }
 
     pub(crate) fn baseline_files(
@@ -2263,9 +2289,12 @@ pub(crate) fn push_project_delta(
     push_args: PushEditorChangesArgs,
     guard: Option<&StudioChangeGuard>,
 ) -> Result<Map<String, Value>> {
+    let phase = Instant::now();
     let guard = guard
         .cloned()
         .map_or_else(|| current_studio_change_guard(context, bridge), Ok)?;
+    log_reconcile_timing("full push guard", phase);
+    let phase = Instant::now();
     let mut tracking_release = StudioTrackingGuardRelease {
         bridge,
         runtime_id: guard.runtime_id.clone(),
@@ -2286,32 +2315,52 @@ pub(crate) fn push_project_delta(
     let (stage, studio) =
         capture_studio_services_with_stage(context, bridge, services, false, stage)?;
     let project = capture_snapshot(&root, stage.publish_paths())?;
-    let differences = snapshot_differences(&project, &studio)?;
+    log_reconcile_timing("full push capture", phase);
+    let phase = Instant::now();
+    let mut prepared_settings = HashMap::new();
+    let differences =
+        snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?;
+    log_reconcile_timing("full push comparison", phase);
     if differences.is_empty() {
         acknowledge_verified_push(bridge, services, &guard)?;
         tracking_release.finish()?;
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
-    let plan = reconciliation_push_plan_for_paths(&studio, &project, &differences)?;
+    let phase = Instant::now();
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &studio,
+        &project,
+        &differences,
+        &prepared_settings,
+    )?;
+    log_reconcile_timing("full push plan", phase);
     if plan.is_empty() {
         acknowledge_verified_push(bridge, services, &guard)?;
         tracking_release.finish()?;
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let mutation_paths = differences.clone();
+    let phase = Instant::now();
     apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
+    let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
+    for (path, change) in prepared_settings {
+        let service = settings_service_name(&path, &change.current, &change.previous)?;
+        drop_settings_document(change.previous);
+        prepared_documents.insert(service, change.current);
+    }
     let pushed = push_staged_project(
         context,
         &stage,
         bridge,
         StagedPushRequest {
             plan,
-            prepared_documents: HashMap::new(),
+            prepared_documents,
             guard: Some(&guard),
             args: push_args,
             expected_project: Some(&project),
         },
     )?;
+    log_reconcile_timing("full push mutation", phase);
 
     let current = capture_snapshot(&root, stage.publish_paths())?;
     let mut verification_paths = differences;
@@ -2325,10 +2374,14 @@ pub(crate) fn push_project_delta(
         return Ok(pushed.summary);
     }
     let verification_services = services_for_snapshot_paths(context, &verification_paths);
+    let phase = Instant::now();
     let (_readback_stage, readback) =
         capture_studio_services(context, bridge, &verification_services, false)?;
+    log_reconcile_timing("full push readback", phase);
+    let phase = Instant::now();
     let (mismatches, details) =
         snapshot_intended_delta_mismatches(&studio, &current, &readback, &verification_paths)?;
+    log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
         bail!(
             "Studio did not retain pushed project changes: {}{}",
@@ -2486,8 +2539,64 @@ struct StagedPushResult {
 
 #[derive(Default)]
 pub(crate) struct AppliedEditorChanges {
-    pub(crate) generated_paths: Vec<PathBuf>,
+    pub(crate) accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
     pub(crate) summary: Map<String, Value>,
+}
+
+fn accepted_editor_entries(
+    root: &Path,
+    previous: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+    generated: &ProjectSnapshot,
+) -> BTreeMap<PathBuf, Option<PublishEntryState>> {
+    previous
+        .entries
+        .keys()
+        .chain(current.entries.keys())
+        .chain(generated.entries.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|path| {
+            let entry = generated
+                .entries
+                .get(path)
+                .or_else(|| current.entries.get(path));
+            let state = entry.map(|entry| match entry {
+                SnapshotEntry::Directory => PublishEntryState::Directory,
+                SnapshotEntry::File(bytes) => PublishEntryState::File {
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    length: bytes.len() as u64,
+                    hash: fnv1a(bytes),
+                },
+                SnapshotEntry::Symlink { target, .. } => PublishEntryState::Symlink(target.clone()),
+            });
+            (root.join(path), state)
+        })
+        .collect()
+}
+
+#[test]
+fn editor_acknowledgment_uses_captured_and_generated_bytes_including_deletions() {
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let removed = PathBuf::from("src/removed.luau");
+    let previous = ProjectSnapshot {
+        entries: BTreeMap::from([
+            (path.clone(), SnapshotEntry::File(b"old".to_vec())),
+            (removed.clone(), SnapshotEntry::File(b"removed".to_vec())),
+        ]),
+    };
+    let current = ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), SnapshotEntry::File(b"captured".to_vec()))]),
+    };
+    let generated = ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), SnapshotEntry::File(b"generated".to_vec()))]),
+    };
+    let root = Path::new("project");
+    let accepted = accepted_editor_entries(root, &previous, &current, &generated);
+    assert!(matches!(accepted.get(&root.join(removed)), Some(None)));
+    assert!(
+        matches!(accepted.get(&root.join(path)), Some(Some(PublishEntryState::File { length: 9, hash, .. })) if *hash == fnv1a(b"generated"))
+    );
 }
 
 struct StagedPushRequest<'a> {
@@ -2590,12 +2699,13 @@ fn push_staged_project(
         bridge,
         guard,
         prepared_documents,
+        |changes| amend_reconciled_changes(changes, plan),
         |changes| {
-            amend_reconciled_changes(changes, plan)?;
             generated = redirect_staged_settings_writes(
                 changes,
                 &stage.project_root,
                 Path::new(&context.root),
+                expected_project,
             )?;
             Ok(())
         },
@@ -2611,6 +2721,7 @@ fn redirect_staged_settings_writes(
     changes: &mut EditorChangeSet,
     staged_root: &Path,
     project_root: &Path,
+    expected_project: Option<&ProjectSnapshot>,
 ) -> Result<ProjectSnapshot> {
     let mut generated = ProjectSnapshot::default();
     for write in &mut changes.settings_writes {
@@ -2625,13 +2736,25 @@ fn redirect_staged_settings_writes(
             })?
             .to_path_buf();
         let destination = project_root.join(&relative);
-        if settings_file_hash(&destination)? != write.expected_hash {
+        // The staged document may already contain merged Studio data or aligned IDs.
+        // Its hash guards the stage, not the original project we will publish into.
+        let expected_hash = if let Some(project) = expected_project {
+            match project.entries.get(&relative) {
+                Some(SnapshotEntry::File(bytes)) => Some(Sha256::digest(bytes).into()),
+                None => None,
+                Some(_) => bail!("Settings path {} was not a file", destination.display()),
+            }
+        } else {
+            write.expected_hash
+        };
+        if settings_file_hash(&destination)? != expected_hash {
             bail!(
                 "Settings file {} changed while its Studio update was being prepared; retry the sync",
                 destination.display()
             );
         }
         write.path = destination;
+        write.expected_hash = expected_hash;
         generated.entries.insert(
             relative,
             SnapshotEntry::File(encode_settings_bytecode(&write.document)?),
@@ -2682,6 +2805,23 @@ fn amend_reconciled_changes(
             change.deleted_attributes.dedup();
         } else {
             changes.property_changes.push(removal);
+        }
+    }
+    for change in &changes.property_changes {
+        if let Some(id) = &change.settings_id
+            && let Some(properties) = plan
+                .geometry_properties
+                .remove(&(change.service.clone(), id.clone()))
+        {
+            changes
+                .geometry_readbacks
+                .push(crate::editor::native_geometry::GeometryReadback {
+                    service: change.service.clone(),
+                    settings_id: id.clone(),
+                    path_segments: change.path_segments.clone(),
+                    path_ordinals: change.path_ordinals.clone(),
+                    properties,
+                });
         }
     }
     Ok(())
@@ -2881,6 +3021,7 @@ fn append_aligned_settings_push_plan(
     plan: &mut ReconcilePushPlan,
 ) -> Result<()> {
     let service = settings_service_name(path, desired, observed)?;
+    let database = rbx_reflection_database::get()?;
     let phase = Instant::now();
     let (desired_by_id, observed_by_id) = rayon::join(
         || {
@@ -2946,6 +3087,13 @@ fn append_aligned_settings_push_plan(
                             .filter(|name| {
                                 name.as_str() != "ScriptGuid"
                                     && !reconciliation_property_is_derived(name)
+                                    // Resets obey the same capability rules as writes.
+                                    // Engine-derived fields (for example cooked mesh
+                                    // data after switching to Box) still participate
+                                    // in the complete post-push verification.
+                                    && !crate::editor::review::is_engine_managed_editor_property(
+                                        &instance.class_name, name, database,
+                                    )
                                     && !instance.properties.contains_key(*name)
                             })
                             .cloned()
@@ -2981,6 +3129,12 @@ fn append_aligned_settings_push_plan(
             continue;
         };
         let observed_instance = &observed.instances[observed_index];
+        let geometry =
+            crate::editor::native_geometry::generated_properties(observed_instance, instance);
+        if !geometry.is_empty() {
+            plan.geometry_properties
+                .insert((service.clone(), instance.settings_id.clone()), geometry);
+        }
         if delta.requires_previous_path {
             previous_path_settings_ids.push(instance.settings_id.as_str());
         }
@@ -3660,7 +3814,7 @@ fn merge_settings_entry(
         remove_reconciliation_derived_properties(&mut base_doc);
         align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
         align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
-        align_equivalent_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc);
+        align_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc)?;
         align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         align_equivalent_values(&base_doc, &mut editor_doc);
         align_equivalent_values(&base_doc, &mut studio_doc);
@@ -3763,14 +3917,30 @@ fn merge_reconciliation_settings_documents(
     studio_source_changes: &HashSet<String>,
 ) -> (SettingsBytecode, Vec<VcMergeConflict>) {
     let prefer_studio = preference_bool(preference).map(|prefer_editor| !prefer_editor);
-    merge_settings_documents_with_policy_and_source_changes(
+    let mut interner = PathInterner::new();
+    let editor_paths = structural_path_ids(editor, &mut interner);
+    let studio_paths = structural_path_ids(studio, &mut interner);
+    let editor_by_id = editor
+        .instances
+        .iter()
+        .zip(editor_paths)
+        .map(|(instance, path)| (instance.settings_id.as_str(), path))
+        .collect::<HashMap<_, _>>();
+    let aligned_additions = studio
+        .instances
+        .iter()
+        .zip(studio_paths)
+        .filter(|(instance, path)| editor_by_id.get(instance.settings_id.as_str()) == Some(path))
+        .map(|(instance, _)| instance.settings_id.clone())
+        .collect();
+    merge_aligned_settings_documents(
         base,
         studio,
         editor,
         prefer_studio,
-        prefer_studio,
         studio_source_changes,
         editor_source_changes,
+        &aligned_additions,
     )
 }
 
@@ -3934,11 +4104,11 @@ fn align_observation_ids_to_baseline(baseline: &SettingsBytecode, observed: &mut
     align_settings_ids_to_reference(baseline, observed);
 }
 
-fn align_equivalent_new_instance_ids(
+fn align_new_instance_ids(
     baseline: &SettingsBytecode,
     editor: &SettingsBytecode,
     studio: &mut SettingsBytecode,
-) {
+) -> Result<()> {
     let baseline_ids = baseline
         .instances
         .iter()
@@ -3948,16 +4118,20 @@ fn align_equivalent_new_instance_ids(
     let editor_keys = structural_path_ids(editor, &mut interner);
     let studio_keys = structural_path_ids(studio, &mut interner);
     let editor_by_key = editor_keys
-        .into_iter()
-        .enumerate()
-        .collect::<HashMap<_, _>>();
-    let studio_ids = studio
-        .instances
         .iter()
-        .map(|instance| instance.settings_id.as_str())
-        .collect::<HashSet<_>>();
-    let remap = studio_keys
-        .into_iter()
+        .copied()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect::<HashMap<_, _>>();
+    let studio_by_key = studio_keys
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect::<HashMap<_, _>>();
+    let candidates = studio_keys
+        .iter()
+        .copied()
         .enumerate()
         .filter_map(|(studio_index, key)| {
             let editor_index = editor_by_key.get(&key).copied()?;
@@ -3965,12 +4139,66 @@ fn align_equivalent_new_instance_ids(
             let studio_id = studio.instances[studio_index].settings_id.as_str();
             (!baseline_ids.contains(editor_id)
                 && !baseline_ids.contains(studio_id)
-                && editor_id != studio_id
-                && !studio_ids.contains(editor_id)
-                && settings_instances_equal(editor, editor_index, studio, studio_index))
-            .then(|| (studio_id.to_string(), editor_id.to_string()))
+                && editor_id != studio_id)
+                .then_some((studio_index, editor_index))
+        })
+        .collect::<Vec<_>>();
+    let mut remap = candidates
+        .iter()
+        .map(|(studio_index, editor_index)| {
+            (
+                studio.instances[*studio_index].settings_id.clone(),
+                editor.instances[*editor_index].settings_id.clone(),
+            )
         })
         .collect::<HashMap<_, _>>();
+    let targets = remap.values().cloned().collect::<HashSet<_>>();
+    let mut all_ids = editor
+        .instances
+        .iter()
+        .chain(&studio.instances)
+        .map(|instance| instance.settings_id.clone())
+        .collect::<HashSet<_>>();
+    let mut seed = all_ids.len();
+    for instance in &studio.instances {
+        let id = &instance.settings_id;
+        if targets.contains(id) && !remap.contains_key(id) {
+            remap.insert(
+                id.clone(),
+                crate::bytecode::edit::next_editor_settings_id_fast(&mut all_ids, &mut seed),
+            );
+        }
+    }
+    // New identities are paired by their unique structural location, not by value.
+    // Requiring equal values turns a legitimate property difference into two instances.
+    // Duplicate-name slots still require equivalent data: their ordinal alone is not identity.
+    for (studio_index, editor_index) in candidates {
+        let key = studio_keys[studio_index];
+        let node = interner.node(key);
+        let mut second = node.part.clone();
+        second.ordinal = 2;
+        let duplicate_slot = node.part.ordinal > 1
+            || interner.find(node.parent, &second).is_some_and(|second| {
+                editor_by_key.contains_key(&second) || studio_by_key.contains_key(&second)
+            });
+        if !duplicate_slot {
+            continue;
+        }
+        let observed = &studio.instances[studio_index];
+        let desired = &editor.instances[editor_index];
+        let mut properties = observed.properties.clone();
+        let mut attributes = observed.attributes.clone();
+        remap_record_reference_ids(&mut properties, &remap);
+        remap_record_reference_ids(&mut attributes, &remap);
+        if !reconciliation_maps_equal(&desired.class_name, &desired.properties, &properties)
+            || !reconciliation_values_map_equal(&desired.attributes, &attributes)
+        {
+            bail!(
+                "Ambiguous new duplicate instances at {}; Studio was not changed",
+                render_structural_key(&interner, key)
+            );
+        }
+    }
     for instance in &mut studio.instances {
         if let Some(id) = remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);
@@ -3978,6 +4206,7 @@ fn align_equivalent_new_instance_ids(
         remap_record_reference_ids(&mut instance.properties, &remap);
         remap_record_reference_ids(&mut instance.attributes, &remap);
     }
+    Ok(())
 }
 
 fn align_first_pairing(
@@ -4358,7 +4587,8 @@ fn snapshot_path_differences(
 ) -> Result<Vec<PathBuf>> {
     let mut differences = Vec::new();
     for path in paths {
-        if !snapshot_entry_equivalent(path, left.entries.get(path), right.entries.get(path))? {
+        if !snapshot_entry_equivalent(path, left.entries.get(path), right.entries.get(path), None)?
+        {
             differences.push(path.clone());
         }
     }
@@ -4419,6 +4649,16 @@ fn settings_delta_mismatch(
     let mut before = settings_document(before)?;
     let desired = settings_document(desired)?;
     let mut observed = settings_document(observed)?;
+    if desired.instances.is_empty()
+        && !before.instances.is_empty()
+        && !observed.instances.is_empty()
+        && !align_settings_ids_to_reference(&before, &mut observed)
+    {
+        bail!(
+            "Could not align the Studio identities in {}",
+            path.display()
+        );
+    }
     if !desired.instances.is_empty() {
         if !before.instances.is_empty() && !align_settings_ids_to_reference(&desired, &mut before) {
             bail!(
@@ -4475,7 +4715,18 @@ fn settings_delta_mismatch(
             .or_else(|| before_index.map(|index| before.instances[index].name.as_str()))
             .unwrap_or(settings_id);
         match (before_index, desired_index, observed_index) {
-            (Some(_), None, Some(_)) => {
+            (Some(before_index), None, Some(observed_index)) => {
+                // A removed service store deletes its contents, not the engine's
+                // service object. Match append_aligned_settings_push_plan.
+                let previous = &before.instances[before_index];
+                let actual = &observed.instances[observed_index];
+                if previous.parent_index.is_none()
+                    && actual.parent_index.is_none()
+                    && previous.class_name == actual.class_name
+                    && previous.name == actual.name
+                {
+                    continue;
+                }
                 return Ok(Some(format!("{name} was not deleted from Studio")));
             }
             (None, Some(_), None) => {
@@ -4665,6 +4916,7 @@ fn snapshot_entry_equivalent(
     path: &Path,
     left: Option<&SnapshotEntry>,
     right: Option<&SnapshotEntry>,
+    prepared: Option<&mut Option<PreparedEditorSettingsChange>>,
 ) -> Result<bool> {
     if entries_equivalent(path, left, right) {
         return Ok(true);
@@ -4683,14 +4935,64 @@ fn snapshot_entry_equivalent(
         );
         let left = left?;
         let mut right = right?;
-        let equivalent = if settings_documents_positionally_equivalent(&left, &right) {
+        let phase = Instant::now();
+        let positional = settings_documents_positionally_equivalent(&left, &right);
+        log_global(
+            4,
+            format_args!(
+                "[renium] reconcile positional {}: {:.1}ms matched={positional}",
+                path.display(),
+                elapsed_ms(phase)
+            ),
+        );
+        let phase = Instant::now();
+        let equivalent = if positional {
             Some(true)
         } else if align_settings_ids_to_reference(&left, &mut right) {
-            Some(settings_documents_equivalent(&left, &right))
+            log_global(
+                4,
+                format_args!(
+                    "[renium] reconcile identity {}: {:.1}ms",
+                    path.display(),
+                    elapsed_ms(phase)
+                ),
+            );
+            let phase = Instant::now();
+            let matched = settings_documents_equivalent(&left, &right);
+            log_global(
+                4,
+                format_args!(
+                    "[renium] reconcile values {}: {:.1}ms matched={matched}",
+                    path.display(),
+                    elapsed_ms(phase)
+                ),
+            );
+            Some(matched)
         } else {
             None
         };
+        if equivalent == Some(false)
+            && let Some(prepared) = prepared
+        {
+            // Comparison already resolved duplicate identities. Reuse that exact
+            // mapping and the decoded documents when planning the push.
+            align_equivalent_values(&left, &mut right);
+            *prepared = Some(PreparedEditorSettingsChange {
+                previous: right,
+                current: left,
+            });
+            return Ok(false);
+        }
+        let phase = Instant::now();
         drop_settings_documents(left, right);
+        log_global(
+            4,
+            format_args!(
+                "[renium] reconcile release {}: {:.1}ms",
+                path.display(),
+                elapsed_ms(phase)
+            ),
+        );
         if let Some(equivalent) = equivalent {
             return Ok(equivalent);
         }
@@ -4854,6 +5156,14 @@ fn snapshot_differences(
     left: &ProjectSnapshot,
     right: &ProjectSnapshot,
 ) -> Result<HashSet<PathBuf>> {
+    snapshot_differences_prepared(left, right, None)
+}
+
+fn snapshot_differences_prepared(
+    left: &ProjectSnapshot,
+    right: &ProjectSnapshot,
+    mut prepared: Option<&mut HashMap<PathBuf, PreparedEditorSettingsChange>>,
+) -> Result<HashSet<PathBuf>> {
     let mut paths = left
         .entries
         .keys()
@@ -4862,18 +5172,30 @@ fn snapshot_differences(
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
-    paths
+    let prepare = prepared.is_some();
+    let compared = paths
         .into_par_iter()
         .map(|path| {
+            let mut settings = None;
             let equivalent = snapshot_entry_equivalent(
                 &path,
                 left.entries.get(&path),
                 right.entries.get(&path),
+                prepare.then_some(&mut settings),
             )?;
-            Ok((!equivalent).then_some(path))
+            Ok((!equivalent).then_some((path, settings)))
         })
-        .collect::<Result<Vec<_>>>()
-        .map(|paths| paths.into_iter().flatten().collect())
+        .collect::<Result<Vec<_>>>()?;
+    let mut differences = HashSet::new();
+    for (path, settings) in compared.into_iter().flatten() {
+        if let Some(prepared) = prepared.as_mut()
+            && let Some(settings) = settings
+        {
+            prepared.insert(path.clone(), settings);
+        }
+        differences.insert(path);
+    }
+    Ok(differences)
 }
 
 fn apply_snapshot_paths(
@@ -5043,7 +5365,171 @@ fn read_compressed<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::types::EditorSettingsWrite;
     use crate::settings::bytecode::SettingsBytecodeInstance;
+
+    #[test]
+    fn staged_settings_redirect_uses_original_project_not_merged_stage() {
+        let root = crate::tests::support::temp_dir("staged-settings-hash");
+        let stage = root.join("stage");
+        let relative = PathBuf::from("src/ServerScriptService/__roblox_sync_settings.renium");
+        let destination = root.join(&relative);
+        let staged_path = stage.join(&relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::create_dir_all(staged_path.parent().unwrap()).unwrap();
+        let document = |id: &str| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance {
+                settings_id: id.into(),
+                name: "ServerScriptService".into(),
+                class_name: "ServerScriptService".into(),
+                parent_index: None,
+                properties: Map::new(),
+                attributes: Map::new(),
+            }],
+        };
+        let original = encode_settings_bytecode(&document("editor-id")).unwrap();
+        let merged = encode_settings_bytecode(&document("aligned-id")).unwrap();
+        fs::write(&destination, &original).unwrap();
+        fs::write(&staged_path, &merged).unwrap();
+        let mut changes = EditorChangeSet {
+            settings_writes: vec![EditorSettingsWrite {
+                path: staged_path.clone(),
+                expected_hash: settings_file_hash(&staged_path).unwrap(),
+                document: document("aligned-id"),
+            }],
+            ..Default::default()
+        };
+        let project = file_snapshot(&[(relative.to_str().unwrap(), &original)]);
+        let generated =
+            redirect_staged_settings_writes(&mut changes, &stage, &root, Some(&project)).unwrap();
+        let write = &changes.settings_writes[0];
+        assert_eq!(write.path, destination);
+        assert_eq!(
+            write.expected_hash,
+            settings_file_hash(&destination).unwrap()
+        );
+        assert!(generated.entries.get(&relative) == Some(&SnapshotEntry::File(merged)));
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_settings_redirect_keeps_concurrent_write_protection() {
+        let root = crate::tests::support::temp_dir("staged-settings-concurrency");
+        let stage = root.join("stage");
+        let relative = Path::new("settings.renium");
+        let destination = root.join(relative);
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: Vec::new(),
+        };
+        let bytes = encode_settings_bytecode(&document).unwrap();
+        for existed in [false, true] {
+            for with_snapshot in [false, true] {
+                let project = if existed {
+                    file_snapshot(&[("settings.renium", &bytes)])
+                } else {
+                    ProjectSnapshot::default()
+                };
+                let expected = with_snapshot.then_some(&project);
+                for concurrent_edit in [false, true] {
+                    if existed || concurrent_edit {
+                        fs::write(
+                            &destination,
+                            if concurrent_edit {
+                                b"newer editor data".as_slice()
+                            } else {
+                                bytes.as_slice()
+                            },
+                        )
+                        .unwrap();
+                    } else if destination.exists() {
+                        fs::remove_file(&destination).unwrap();
+                    }
+                    let hash = existed.then(|| Sha256::digest(&bytes).into());
+                    let mut changes = EditorChangeSet {
+                        settings_writes: vec![EditorSettingsWrite {
+                            path: stage.join(relative),
+                            expected_hash: hash,
+                            document: document.clone(),
+                        }],
+                        ..Default::default()
+                    };
+                    let result =
+                        redirect_staged_settings_writes(&mut changes, &stage, &root, expected);
+                    if concurrent_edit {
+                        let message = result.err().unwrap().to_string();
+                        assert!(
+                            message.contains("changed while its Studio update was being prepared")
+                        );
+                        assert_eq!(fs::read(&destination).unwrap(), b"newer editor data");
+                    } else {
+                        assert!(result.is_ok());
+                        assert_eq!(changes.settings_writes[0].expected_hash, hash);
+                        assert_eq!(changes.settings_writes[0].path, destination);
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_binding_uses_saved_pairing_without_enabling_live_sync() {
+        let root = crate::tests::support::temp_dir("saved-studio-pairing");
+        let records = root.join(".renium").join(RECORD_DIR);
+        fs::create_dir_all(&records).unwrap();
+        let mut record = PairRecord {
+            version: RECORD_VERSION,
+            identity: PairIdentity {
+                experience: canonical_string(&root).unwrap(),
+                project: canonical_string(&root).unwrap(),
+                fingerprint: "prior-configuration".into(),
+                game_id: Some(10),
+                place_id: Some(20),
+                local_file: None,
+            },
+            mode: PairMode::Reconcile,
+            conflict_preference: ConflictPreference::None,
+            runtime_settings: Map::new(),
+            baseline: None,
+            head: None,
+            conflicts: Vec::new(),
+            resolution_required: false,
+            last_runtime_id: None,
+            local_file_stamp: None,
+            local_file_digest: None,
+            studio_checkpoint: None,
+        };
+        let write = |name: &str, record: &PairRecord| {
+            fs::write(records.join(name), rmp_serde::to_vec(record).unwrap()).unwrap();
+        };
+        assert_eq!(saved_studio_target_for_root(&root, &root).unwrap(), None);
+        write("first.rmp", &record);
+        write("duplicate.rmp", &record);
+        assert_eq!(
+            saved_studio_target_for_root(&root, &root).unwrap(),
+            Some(super::super::StudioReopenTarget {
+                file: None,
+                game_id: Some(10),
+                place_id: Some(20),
+            })
+        );
+        assert!(!root.join(".renium/live-watch-state.enabled").exists());
+        record.identity.project = "a different project".into();
+        write("foreign.rmp", &record);
+        assert!(
+            saved_studio_target_for_root(&root, &root)
+                .unwrap()
+                .is_some()
+        );
+        record.identity.project = canonical_string(&root).unwrap();
+        record.identity.place_id = Some(30);
+        write("different-place.rmp", &record);
+        assert_eq!(saved_studio_target_for_root(&root, &root).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn file_snapshot(entries: &[(&str, &[u8])]) -> ProjectSnapshot {
         ProjectSnapshot {
@@ -5098,6 +5584,7 @@ mod tests {
             root: String::new(),
             experience: String::new(),
             source: String::new(),
+            resource_lease: None,
             place_id: None,
             game_id: None,
             selector: String::new(),
@@ -6144,6 +6631,322 @@ mod tests {
                 "StudioIndependent",
             ]
         );
+    }
+
+    fn new_branch_fixture() -> (SettingsBytecode, SettingsBytecode, SettingsBytecode) {
+        let instance = |id: &str, name: &str, class: &str, parent| {
+            SettingsBytecodeInstance::new(
+                id.to_string(),
+                name.to_string(),
+                class.to_string(),
+                parent,
+            )
+        };
+        let base = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![instance(
+                "root",
+                "ReplicatedStorage",
+                "ReplicatedStorage",
+                None,
+            )],
+        };
+        let mut editor = base.clone();
+        editor.instances.extend([
+            instance("button", "ShiftLockButton", "TextButton", Some(0)),
+            instance("corner", "UICorner", "UICorner", Some(1)),
+            instance("ref", "Reference", "ObjectValue", Some(1)),
+        ]);
+        for name in [
+            "TopLeftRadius",
+            "TopRightRadius",
+            "BottomLeftRadius",
+            "BottomRightRadius",
+        ] {
+            editor.instances[2].properties.insert(
+                name.to_string(),
+                json!({"_type":"UDim","scale":1.0,"offset":0.0}),
+            );
+        }
+        editor.instances[3].properties.insert(
+            "Value".to_string(),
+            json!({"_type":"Ref","settingsId":"corner"}),
+        );
+        let mut studio = editor.clone();
+        // New instance IDs can collide across observations, including cycles and
+        // an unrelated addition occupying the ID wanted by a matching node.
+        studio.instances[1].settings_id = "corner".to_string();
+        studio.instances[2].settings_id = "button".to_string();
+        studio.instances[3].settings_id = "studio-ref".to_string();
+        studio.instances[3].properties.insert(
+            "Value".to_string(),
+            json!({"_type":"Ref","settingsId":"button"}),
+        );
+        studio.instances[1]
+            .properties
+            .insert("Sink".to_string(), json!({"_type":"EnumItem","name":"1"}));
+        studio
+            .instances
+            .push(instance("ref", "StudioOnly", "Folder", Some(0)));
+        (base, editor, studio)
+    }
+
+    #[test]
+    fn reconciliation_matches_new_branches_without_duplicating_property_differences() {
+        let path = Path::new("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        for iteration in 0..32 {
+            let (base, mut editor, mut studio) = new_branch_fixture();
+            // Vary traversal indices independently of structural path IDs.
+            for i in 0..iteration {
+                studio.instances.push(SettingsBytecodeInstance::new(
+                    format!("unrelated-{i}"),
+                    format!("Unrelated{i}"),
+                    "Folder".to_string(),
+                    Some(0),
+                ));
+            }
+            if iteration % 2 == 0 {
+                std::mem::swap(&mut editor, &mut studio);
+            }
+            let snapshot = |doc: &SettingsBytecode| {
+                file_snapshot(&[(
+                    path.to_str().unwrap(),
+                    &encode_settings_bytecode(doc).unwrap(),
+                )])
+            };
+            let (merged, conflicts) = merge_snapshots(
+                Some(&snapshot(&base)),
+                &snapshot(&editor),
+                &snapshot(&studio),
+                ConflictPreference::None,
+            )
+            .unwrap();
+            assert!(conflicts.is_empty(), "{conflicts:?}");
+            let merged = settings_document(merged.entries.get(path)).unwrap();
+            for name in ["ShiftLockButton", "UICorner", "Reference", "StudioOnly"] {
+                assert_eq!(
+                    merged.instances.iter().filter(|i| i.name == name).count(),
+                    1,
+                    "{name}, iteration {iteration}"
+                );
+            }
+            let corner = merged
+                .instances
+                .iter()
+                .find(|i| i.name == "UICorner")
+                .unwrap();
+            assert_eq!(
+                corner.properties,
+                new_branch_fixture().1.instances[2].properties
+            );
+            let holder = merged
+                .instances
+                .iter()
+                .find(|i| i.name == "Reference")
+                .unwrap();
+            assert_eq!(holder.properties["Value"]["settingsId"], corner.settings_id);
+            assert_eq!(
+                merged
+                    .instances
+                    .iter()
+                    .map(|i| &i.settings_id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                merged.instances.len()
+            );
+            let mut plan = ReconcilePushPlan::default();
+            append_settings_push_plan(path, &merged, &studio, &mut plan).unwrap();
+            assert!(
+                !plan.recreated_settings_ids.contains(&corner.settings_id),
+                "untouched corner scheduled for recreation"
+            );
+            assert!(
+                plan.property_removals
+                    .iter()
+                    .all(|change| change.settings_id.as_deref() != Some(&corner.settings_id)),
+                "unchanged radii scheduled for reset"
+            );
+        }
+    }
+
+    #[test]
+    fn matched_new_property_conflicts_do_not_become_copies() {
+        let (base, mut editor, mut studio) = new_branch_fixture();
+        editor.instances[1]
+            .properties
+            .insert("Text".to_string(), json!("editor"));
+        studio.instances[1]
+            .properties
+            .insert("Text".to_string(), json!("studio"));
+        align_new_instance_ids(&base, &editor, &mut studio).unwrap();
+        let (merged, conflicts) = merge_reconciliation_settings_documents(
+            &base,
+            &editor,
+            &studio,
+            ConflictPreference::None,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            merged
+                .instances
+                .iter()
+                .filter(|i| i.name == "ShiftLockButton")
+                .count(),
+            1
+        );
+        assert!(conflicts.iter().any(|c| c.detail.contains("Text")));
+    }
+
+    #[test]
+    fn new_duplicate_names_with_different_values_are_not_guessed() {
+        let (base, editor, mut studio) = new_branch_fixture();
+        let mut duplicate = studio.instances[1].clone();
+        duplicate.settings_id = "duplicate".to_string();
+        studio.instances.push(duplicate);
+        let before = encode_settings_bytecode(&studio).unwrap();
+        let error = align_new_instance_ids(&base, &editor, &mut studio).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Ambiguous new duplicate instances")
+        );
+        assert_eq!(encode_settings_bytecode(&studio).unwrap(), before);
+    }
+
+    #[test]
+    fn prepared_full_push_reuses_the_same_duplicate_and_reference_mapping() {
+        let root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        let mut first = SettingsBytecodeInstance::new(
+            "first".into(),
+            "Duplicate".into(),
+            "StringValue".into(),
+            Some(0),
+        );
+        first.properties.insert("Value".into(), json!("first"));
+        let mut second = first.clone();
+        second.settings_id = "second".into();
+        second.properties.insert("Value".into(), json!("second"));
+        let mut pointer = SettingsBytecodeInstance::new(
+            "pointer".into(),
+            "Pointer".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        pointer
+            .properties
+            .insert("Value".into(), json!({"_type":"Ref","settingsId":"first"}));
+        let mut desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, first, second, pointer],
+        };
+        let mut observed = desired.clone();
+        observed.instances.swap(1, 2);
+        observed.instances[1].settings_id = "debug:second".into();
+        observed.instances[2].settings_id = "debug:first".into();
+        observed.instances[3].properties.insert(
+            "Value".into(),
+            json!({"_type":"Ref","settingsId":"debug:first"}),
+        );
+        desired.instances[0]
+            .attributes
+            .insert("Revision".into(), json!(1));
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let snapshot = |doc: &SettingsBytecode| ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(doc).unwrap()),
+            )]),
+        };
+        let studio = snapshot(&observed);
+        let project = snapshot(&desired);
+        let mut prepared = HashMap::new();
+        let paths = snapshot_differences_prepared(&project, &studio, Some(&mut prepared)).unwrap();
+        assert_eq!(paths, snapshot_differences(&project, &studio).unwrap());
+        assert_eq!(prepared.len(), 1);
+        let change = &prepared[&path];
+        assert_eq!(change.previous.instances[1].settings_id, "second");
+        assert_eq!(change.previous.instances[2].settings_id, "first");
+        assert_eq!(
+            change.previous.instances[3].properties["Value"]["settingsId"],
+            "first"
+        );
+        let expected = reconciliation_push_plan_for_paths(&studio, &project, &paths).unwrap();
+        let actual = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &studio, &project, &paths, &prepared,
+        )
+        .unwrap();
+        assert_eq!(actual.changed_paths, expected.changed_paths);
+        assert_eq!(actual.target_settings_ids, expected.target_settings_ids);
+        assert_eq!(
+            actual.recreated_settings_ids,
+            expected.recreated_settings_ids
+        );
+        assert_eq!(
+            serde_json::to_value(&actual.instance_deletes).unwrap(),
+            serde_json::to_value(&expected.instance_deletes).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&actual.property_removals).unwrap(),
+            serde_json::to_value(&expected.property_removals).unwrap()
+        );
+    }
+
+    #[test]
+    fn removed_service_store_keeps_only_the_engine_service() {
+        let path = Path::new("src/ServerStorage/__roblox_sync_settings.renium");
+        let root = SettingsBytecodeInstance {
+            settings_id: "root".into(),
+            name: "ServerStorage".into(),
+            class_name: "ServerStorage".into(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::from_iter([("Preserved".into(), json!(true))]),
+        };
+        let child = SettingsBytecodeInstance {
+            settings_id: "child".into(),
+            name: "MovedPointer".into(),
+            class_name: "ObjectValue".into(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+        let document = |instances| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        };
+        let entry =
+            |doc: &SettingsBytecode| SnapshotEntry::File(encode_settings_bytecode(doc).unwrap());
+        let before = document(vec![root.clone(), child.clone()]);
+        let before_entry = entry(&before);
+        let empty = document(Vec::new());
+        let mut plan = ReconcilePushPlan::default();
+        append_aligned_settings_push_plan(path, &empty, &before, &mut plan).unwrap();
+        assert_eq!(plan.instance_deletes.len(), 1);
+        assert_eq!(plan.instance_deletes[0].instances.len(), 1);
+        assert!(plan.property_removals.is_empty());
+        let remaining = entry(&document(vec![root.clone()]));
+        assert_eq!(
+            settings_delta_mismatch(path, Some(&before_entry), None, Some(&remaining)).unwrap(),
+            None
+        );
+        for changed_id in [false, true] {
+            let mut retained = document(vec![root.clone(), child.clone()]);
+            if changed_id {
+                retained.instances[0].settings_id = "export-root".into();
+                retained.instances[1].settings_id = "export-child".into();
+            }
+            assert!(
+                settings_delta_mismatch(path, Some(&before_entry), None, Some(&entry(&retained)))
+                    .unwrap()
+                    .is_some_and(|message| message.contains("MovedPointer was not deleted"))
+            );
+        }
     }
 
     #[test]

@@ -17,10 +17,9 @@ use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_
 use crate::automation::op;
 use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
 use crate::cli::{
-    ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs,
-    PushEditorChangesArgs,
+    ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, EditorMutationArgs, PushEditorChangesArgs,
 };
-use crate::daemon::try_daemon_control_request;
+use crate::daemon::daemon_control_request;
 use crate::editor::diff::{
     EditorTargetChangeOptions, append_editor_instance_reconcile, append_editor_target_changes,
     editor_instance_descriptor_for_known_path,
@@ -62,7 +61,6 @@ use crate::settings::bytecode::{SettingsBytecode, is_reference_object, settings_
 use crate::settings::equivalence::drop_settings_document;
 use crate::settings::instance::remove_instances_at_indices;
 use crate::settings::tree::settings_children_by_parent;
-use crate::snapshot::export::parse_bridge_ports;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::bridge::BridgeTarget;
 use crate::studio::bridge::{
@@ -71,7 +69,7 @@ use crate::studio::bridge::{
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
 };
-use crate::studio::native::import::{build_editor_binary_import, prepare_native_editor_full_push};
+use crate::studio::native::import::build_editor_binary_import;
 use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix,
@@ -132,7 +130,7 @@ struct EditorMutationPackages {
     packages: Vec<EditorPackageTarget>,
 }
 
-fn package_root_property_is_override(class_name: &str, property_name: &str) -> bool {
+pub(crate) fn package_root_property_is_override(class_name: &str, property_name: &str) -> bool {
     if property_name == "Name" {
         return true;
     }
@@ -270,7 +268,7 @@ fn editor_mutation_package_targets(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn discover_editor_mutation_packages_with_timeout(
+pub(crate) fn discover_editor_mutation_packages_with_timeout(
     bridge: &BridgeServer,
     targets: &[Value],
     runtime_id: Option<&str>,
@@ -929,6 +927,18 @@ impl<'a> EditorTransaction<'a> {
         }
     }
 
+    fn finish<T>(transaction: Option<&mut Self>, result: Result<T>) -> Result<T> {
+        result.map_err(|error| {
+            if let Some(transaction) = transaction
+                && transaction.active
+                && let Err(rollback_error) = transaction.rollback()
+            {
+                return error.context(format!("Studio rollback also failed: {rollback_error:#}"));
+            }
+            error
+        })
+    }
+
     fn disarm(&mut self) {
         self.active = false;
         self.package_dialog.take();
@@ -1006,22 +1016,6 @@ fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorComm
     }
 }
 
-fn listen_editor_push_bridge(args: &BridgeConnectionArgs) -> Result<BridgeServer> {
-    let ports = parse_bridge_ports(&args.ports)?;
-    let (bridge, metrics) = BridgeServer::listen(&args.host, &ports, args.wait_seconds)?;
-    log_global(
-        5,
-        format_args!(
-            "[renium] editor push bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-            bridge.channel_count(),
-            bridge.expected_channel_count(),
-            metrics.bind_ms,
-            metrics.wait_for_channels_ms
-        ),
-    );
-    Ok(bridge)
-}
-
 pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
     args.changed_paths.append(&mut args.paths);
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
@@ -1048,50 +1042,13 @@ pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()>
         "destructive": !incremental,
     });
     let approved = !args.no_review && (args.yes || global_yes());
-    if let Some(result) = try_daemon_control_request(
+    let result = daemon_control_request(
         op::PUSH,
         Some(&args.project.project_root),
         parameters,
         approved,
-    )? {
-        return print_json_output(&result, global_pretty_output(false));
-    }
-    if !incremental {
-        bail!("A full push requires Renium's semantic sync daemon; Studio was not changed");
-    }
-    let started = Instant::now();
-    if native_editor_full_push_eligible(&args)? {
-        let bridge = listen_editor_push_bridge(&args.bridge)?;
-        let (changes, binary_import) = prepare_native_editor_full_push(&args, &bridge)?;
-        let summary = push_editor_changes_with_collected(
-            args,
-            &bridge,
-            changes,
-            CollectedPushOptions {
-                started,
-                projection: None,
-                prepared_binary_import: Some(binary_import),
-                guard: None,
-                validate_project: None,
-            },
-        )?;
-        return print_editor_push_summary(&summary);
-    }
-    let (changes, projection) = collect_project_editor_changes(&args)?;
-    let bridge = listen_editor_push_bridge(&args.bridge)?;
-    let summary = push_editor_changes_with_collected(
-        args,
-        &bridge,
-        changes,
-        CollectedPushOptions {
-            started,
-            projection: projection.as_ref(),
-            prepared_binary_import: None,
-            guard: None,
-            validate_project: None,
-        },
     )?;
-    print_editor_push_summary(&summary)
+    print_json_output(&result, global_pretty_output(false))
 }
 
 pub(crate) fn push_editor_changes_with_warm_bridge(
@@ -1121,21 +1078,24 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
             prepared_binary_import: None,
             guard,
             validate_project: None,
+            finalize_settings: None,
         },
     )
 }
 
-pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G>(
+pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G, H>(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
     guard: Option<&StudioChangeGuard>,
     prepared_documents: HashMap<String, SettingsBytecode>,
     amend: F,
+    mut finalize_settings: H,
     validate_project: G,
 ) -> Result<serde_json::Map<String, Value>>
 where
     F: FnOnce(&mut EditorChangeSet) -> Result<()>,
     G: Fn() -> Result<()>,
+    H: FnMut(&mut EditorChangeSet) -> Result<()>,
 {
     let started = Instant::now();
     let no_selection = args.changed_paths.is_empty()
@@ -1159,6 +1119,7 @@ where
             prepared_binary_import: None,
             guard,
             validate_project: Some(&validate_project),
+            finalize_settings: Some(&mut finalize_settings),
         },
     )
 }
@@ -2168,12 +2129,15 @@ fn prepare_protected_writes(
     })
 }
 
+type SettingsFinalizer<'a> = dyn FnMut(&mut EditorChangeSet) -> Result<()> + 'a;
+
 struct CollectedPushOptions<'a> {
     started: Instant,
     projection: Option<&'a config::ProjectionStage>,
     prepared_binary_import: Option<EditorBinaryImport>,
     guard: Option<&'a StudioChangeGuard>,
     validate_project: Option<&'a dyn Fn() -> Result<()>>,
+    finalize_settings: Option<&'a mut SettingsFinalizer<'a>>,
 }
 
 fn push_editor_changes_with_collected(
@@ -2188,6 +2152,7 @@ fn push_editor_changes_with_collected(
         prepared_binary_import,
         guard,
         validate_project,
+        finalize_settings,
     } = options;
     let phase_started = Instant::now();
     apply_files_to_studio_filters(&args, bridge, &mut changes, projection)?;
@@ -2253,18 +2218,7 @@ fn push_editor_changes_with_collected(
                 transaction_id,
             );
             log_timing("native editor change batches", phase_started);
-            match result {
-                Ok(summary) => summary,
-                Err(error) => {
-                    if let Some(transaction) = transaction.as_mut()
-                        && let Err(rollback_error) = transaction.rollback()
-                    {
-                        return Err(error
-                            .context(format!("Studio rollback also failed: {rollback_error:#}")));
-                    }
-                    return Err(error);
-                }
-            }
+            result?
         };
         if !review_skipped {
             let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
@@ -2287,6 +2241,19 @@ fn push_editor_changes_with_collected(
         let phase_started = Instant::now();
         if !review_skipped && let Some(validate_project) = validate_project {
             validate_project()?;
+        }
+        if !review_skipped {
+            super::native_geometry::capture_generated(
+                bridge,
+                &mut changes,
+                &args.project.src_root,
+                transaction
+                    .as_ref()
+                    .map(|transaction| transaction.id.as_str()),
+            )?;
+            if let Some(finalize_settings) = finalize_settings {
+                finalize_settings(&mut changes)?;
+            }
         }
         let settings_transaction = if review_skipped {
             None
@@ -2350,41 +2317,7 @@ fn push_editor_changes_with_collected(
         }
         Ok(summary)
     })();
-    match result {
-        Ok(summary) => Ok(summary),
-        Err(error) => {
-            if let Some(transaction) = transaction.as_mut()
-                && transaction.active
-                && let Err(rollback_error) = transaction.rollback()
-            {
-                return Err(
-                    error.context(format!("Studio rollback also failed: {rollback_error:#}"))
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn listen_editor_oneshot_bridge(
-    label: &str,
-    host: &str,
-    ports_raw: &str,
-    wait_seconds: f64,
-) -> Result<BridgeServer> {
-    let ports = parse_bridge_ports(ports_raw)?;
-    let (bridge, listen_metrics) = BridgeServer::listen(host, &ports, wait_seconds)?;
-    log_global(
-        5,
-        format_args!(
-            "[renium] editor {label} bridge ready: channels={}/{}, bind_ms={:.1}, handshake_ms={:.1}",
-            bridge.channel_count(),
-            bridge.expected_channel_count(),
-            listen_metrics.bind_ms,
-            listen_metrics.wait_for_channels_ms
-        ),
-    );
-    Ok(bridge)
+    EditorTransaction::finish(transaction.as_mut(), result)
 }
 
 fn apply_editor_change_with_warm_bridge(
@@ -2436,24 +2369,7 @@ fn apply_editor_change_with_warm_bridge(
         );
         Ok(summary)
     })();
-    match result {
-        Ok(summary) => Ok(summary),
-        Err(error) => {
-            if let Some(transaction) = transaction.as_mut()
-                && transaction.active
-                && let Err(rollback_error) = transaction.rollback()
-            {
-                return Err(
-                    error.context(format!("Studio rollback also failed: {rollback_error:#}"))
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn print_editor_push_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
-    print_json_output(&Value::Object(summary.clone()), global_pretty_output(false))
+    EditorTransaction::finish(transaction.as_mut(), result)
 }
 
 fn print_direct_editor_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
@@ -2499,26 +2415,17 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         .context("Failed to parse --value-json")?,
     );
     let approved = !args.no_review && (args.yes || global_yes());
-    if let Some(result) = try_daemon_control_request(
+    let result = daemon_control_request(
         op::SET_PROPERTY,
         Some(&args.target.project.project_root),
         Value::Object(parameters),
         approved,
-    )? {
-        return print_direct_editor_summary(
-            result
-                .as_object()
-                .context("The daemon returned an invalid property result")?,
-        );
-    }
-    let bridge = listen_editor_oneshot_bridge(
-        "property",
-        &args.target.bridge.host,
-        &args.target.bridge.ports,
-        args.target.bridge.wait_seconds,
     )?;
-    let summary = apply_editor_property_with_warm_bridge(args, &bridge)?;
-    print_direct_editor_summary(&summary)
+    print_direct_editor_summary(
+        result
+            .as_object()
+            .context("The daemon returned an invalid property result")?,
+    )
 }
 
 pub(crate) fn apply_editor_property_with_warm_bridge(
@@ -2545,6 +2452,7 @@ pub(crate) fn apply_editor_property_with_warm_bridge(
             prepared_binary_import: None,
             guard: None,
             validate_project: None,
+            finalize_settings: None,
         },
     )
 }
@@ -2641,26 +2549,17 @@ fn collect_direct_editor_property_change(
 pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
     let mut parameters = editor_mutation_parameters(&args.target)?;
     parameters.insert("editor".to_string(), Value::Bool(true));
-    if let Some(result) = try_daemon_control_request(
+    let result = daemon_control_request(
         op::REMOVE,
         Some(&args.target.project.project_root),
         Value::Object(parameters),
         false,
-    )? {
-        return print_direct_editor_summary(
-            result
-                .as_object()
-                .context("The daemon returned an invalid delete result")?,
-        );
-    }
-    let bridge = listen_editor_oneshot_bridge(
-        "delete",
-        &args.target.bridge.host,
-        &args.target.bridge.ports,
-        args.target.bridge.wait_seconds,
     )?;
-    let summary = apply_editor_delete_with_warm_bridge(args, &bridge)?;
-    print_direct_editor_summary(&summary)
+    print_direct_editor_summary(
+        result
+            .as_object()
+            .context("The daemon returned an invalid delete result")?,
+    )
 }
 
 fn editor_mutation_parameters(target: &EditorMutationArgs) -> Result<Map<String, Value>> {
@@ -3946,6 +3845,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
 #[cfg(test)]
 mod sync_tests {
     use super::*;
+    use crate::cli::BridgeConnectionArgs;
 
     fn model_pivot(path: &[&str]) -> EditorPropertyChange {
         EditorPropertyChange {

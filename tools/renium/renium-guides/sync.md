@@ -1,25 +1,34 @@
 # Sync
 
-`pl` is Studio → files; `ps` is files → Studio. Live Sync uses one shared connection.
+`pl`: Studio → files. `ps`: files → Studio. Live Sync handles both directions.
 
 ```powershell
 rbx pl
-rbx ps src/StarterGui/AuditClient.client.luau
+rbx ps src/ServerScriptService/Main.server.luau --verify
 rbx lon
 rbx lst
-rbx lst --wait 10
 rbx lof
 ```
 
-Use `--verify` for exact script pushes. Don't verify through `Instance.Source`; an open ScriptDocument may differ.
+Work in the place folder, or put `--place <alias|placeId>` before the command.
+Renium manages the connection; no daemon setup is needed.
 
-Run from the place folder. At a multi-place experience root, put `--place <alias|placeId>` before the command. Renium handles the daemon and runtime.
+## Live Sync
 
-For sustained edits, start Live Sync once. Saved file changes go to Studio and Studio changes go to project files; unsaved editor buffers aren't visible to Renium. Failed edits stay pending. After fixing the cause, use `rbx rp`; use `rbx dp` only to discard them.
+Start once for sustained editing. Saved files flow to Studio; Studio edits flow to files. Unsaved editor buffers do not sync. File edits during Play wait for Edit mode.
 
-On first connection, Live Sync compares Studio and the project against their last common Renium state. Independent edits are merged. Conflicting edits remain pending without changing either side. `reconcile` is the default; `verify` only reports differences. An optional Studio or editor preference resolves ordinary conflicts, but never direct PackageLink edits.
+Trust successful edits while Live Sync reports no problem. Don't poll, push, reread Studio, or launch Play after every save.
+Use `rbx lst --wait 10` only when the next operation needs completed sync, after a reported problem, or when asked.
 
-The editor asks which side to keep only when both sides changed the same content, then finishes starting Live Sync automatically. `rbx lon` reports the conflict and both commands that resolve it; no Studio inspection is needed.
+For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`.
+`rbx dp` discards pending work. Failed edits remain pending until resolved or discarded.
+`lst` also restores an enabled watcher after a daemon restart; `daemon.running: true` is not a reason to push manually.
+
+## First connection and conflicts
+
+Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side.
+
+The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands. Choose only with user direction or an existing conflict preference.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
@@ -27,12 +36,13 @@ rbx cfg set liveSync.initialSyncPriority reconcile
 rbx cfg set liveSync.initialConflictPreference none
 ```
 
-Conflict preferences are `none`, `studio`, and `editor` (project files).
+Initial modes: `reconcile` applies the comparison; `verify` only reports differences.
+Conflict preferences: `none`, `studio`, `editor` (project files). A preference resolves ordinary conflicts, never direct PackageLink edits.
 
-`rbx lst` restores an enabled watcher after a daemon restart. If `daemon.running` is true, don't repeat edits with a manual push.
+## Manual sync
 
-`rbx lst --wait 10` waits up to 10 seconds for file edits to finish syncing.
+Without Live Sync, pass the files or directories to `ps`; Renium batches them by service.
+For store edits, use returned changed paths and settings IDs to keep the push scoped.
+An unfiltered push reconciles the entire place and can remove Studio-only content.
 
-Status is compact by default. Add `--details` only when compact status reports a pending change, conflict, or failure that needs diagnosis.
-
-Without Live Sync, list files or directories after `rbx ps`. Renium expands directories and batches services. `--verify` checks selected scripts. Use an unfiltered push only to replace the full place.
+`ps --verify` checks selected script sources. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
