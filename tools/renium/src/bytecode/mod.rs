@@ -1287,23 +1287,12 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         });
     if let Some(value) = value {
         let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
-        let fallback_settings_ids;
-        let canonical_settings_ids = if let Some(settings_ids) = canonical_settings_ids.as_ref() {
-            settings_ids
-        } else {
-            fallback_settings_ids = document
-                .instances
-                .iter()
-                .map(|instance| Some(instance.settings_id.clone()))
-                .collect::<Vec<_>>();
-            &fallback_settings_ids
-        };
         let mut record = Map::from_iter([("value".to_string(), value)]);
         stabilize_reference_output(
             &document,
             &path_segments,
             &path_ordinals,
-            canonical_settings_ids,
+            canonical_settings_ids.as_deref().unwrap_or(&[]),
             &mut record,
         );
         let value = record

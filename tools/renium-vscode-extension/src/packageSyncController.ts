@@ -206,6 +206,7 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
   } | undefined;
   private linkStatusToken = 0;
   private linkPackageSourceApplyTimer: NodeJS.Timeout | undefined;
+  private linkPackageSourceFlush: Promise<void> | undefined;
   private readonly pendingLinkPackageSourcePaths = new Map<string, PendingPackageSource>();
   private linkPackageSourceWatchers: vscode.Disposable[] = [];
   private readonly activeLinkPackageSourceKeys = new Set<string>();
@@ -272,9 +273,9 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
 
   public resumePendingSources(projectRoot: string, generation: number, delayMs = 500): boolean {
     let pendingSource = false;
-    for (const pending of this.pendingLinkPackageSourcePaths.values()) {
+    for (const [filePath, pending] of this.pendingLinkPackageSourcePaths) {
       if (filesystemPathKey(pending.projectRoot) === filesystemPathKey(projectRoot)) {
-        pending.generation = generation;
+        this.pendingLinkPackageSourcePaths.set(filePath, { ...pending, generation });
         pendingSource = true;
       }
     }
@@ -1061,6 +1062,22 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
   }
 
   private async flushLinkPackageSourceChanges(projectRoot: string, generation: number): Promise<void> {
+    const previous = this.linkPackageSourceFlush;
+    const current = (async () => {
+      await previous?.catch(() => undefined);
+      await this.applyPendingLinkPackageSources(projectRoot, generation);
+    })();
+    this.linkPackageSourceFlush = current;
+    try {
+      await current;
+    } finally {
+      if (this.linkPackageSourceFlush === current) {
+        this.linkPackageSourceFlush = undefined;
+      }
+    }
+  }
+
+  private async applyPendingLinkPackageSources(projectRoot: string, generation: number): Promise<void> {
     if (generation !== this.host.experienceGeneration() || this.host.experienceChanging()) {
       return;
     }
@@ -1068,11 +1085,11 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
     if (filesystemPathKey(projectRoot) !== filesystemPathKey(cfg.projectRoot)) {
       return;
     }
-    const changedPaths = [...this.pendingLinkPackageSourcePaths]
+    const changedEntries = new Map([...this.pendingLinkPackageSourcePaths]
       .filter(([, pending]) =>
         pending.generation === generation
-        && filesystemPathKey(pending.projectRoot) === filesystemPathKey(projectRoot))
-      .map(([filePath]) => filePath);
+        && filesystemPathKey(pending.projectRoot) === filesystemPathKey(projectRoot)));
+    const changedPaths = [...changedEntries.keys()];
     if (changedPaths.length === 0) {
       return;
     }
@@ -1120,7 +1137,10 @@ export class PackageSyncController<TConfig extends PackageSyncControllerConfig> 
           });
           appliedAny = true;
         }
-        this.pendingLinkPackageSourcePaths.delete(changedPath);
+        // A new save replaces the entry while linkApply is awaiting the backend.
+        if (this.pendingLinkPackageSourcePaths.get(changedPath) === changedEntries.get(changedPath)) {
+          this.pendingLinkPackageSourcePaths.delete(changedPath);
+        }
       } catch (error) {
         failed = true;
         this.host.output.appendLine(

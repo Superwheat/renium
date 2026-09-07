@@ -1,45 +1,62 @@
-# Models, places, links, packages, and version control
+# Models, places, packages, and Git
 
-Also read `RENIUM/data.md` before editing saved instances.
+## Files
 
 ```powershell
 rbx bem Workspace -i editor:id -o model.rbxm
 rbx bim Workspace --model model.rbxm --parent-settings-id editor:parent
 rbx bep -o place.rbxl
-rbx q old-place.rbxl -n RewardHandler
-rbx q old-place.rbxl --source "reward granted"
-rbx cmp old-place.rbxl
+rbx q Place.rbxl -n RewardHandler
+rbx q Place.rbxl --source "reward granted"
+rbx cmp Place.rbxl
+rbx cmp Before.rbxl --full --all
+rbx cmp Before.rbxl --against After.rbxlx --full --all
 rbx x -d snapshots --no-run-import
 rbx si --snapshot-dir snapshots --project-root .
 rbx sm
 rbx sm --stdout
 rbx sm --cached --stdout --filter "*Tutorial*"
 rbx bpack
-rbx wally --realms shared
-rbx wally --realms shared --force
-rbx pd ReplicatedStorage.testPackage
-rbx pp ReplicatedStorage.testPackage
-rbx pu ReplicatedStorage.testPackage
+```
+
+`bem`/`bim` copy model trees; use `mv --to-service` for an existing subtree.
+`bep` builds a place without opening or publishing it.
+`q` queries an RBXL/RBXLX without Studio or a project beside it. Filter by name, class, or source.
+`cmp` is script-only by default. Add `--full --all` for all instance/property/attribute changes; `--values` includes values and source. The input is the older/before state; the project (or `--against` file) is after. `.rbxl` and `.rbxlx` work on either side without opening Studio. See [comparison scope and output](data.md#inspect-files-without-importing).
+
+`x` exports Studio snapshots; `si` imports them. Snapshot export and pull use the same bridge; don't use snapshots for a simple closed-file query.
+`sm` generates the sourcemap; `--cached` queries it. `bpack` upgrades old stores.
+
+## Roblox packages
+
+```powershell
+rbx pd ReplicatedStorage.SharedPackage
+rbx pp ReplicatedStorage.SharedPackage
+rbx pu ReplicatedStorage.SharedPackage
 rbx upl ReplicatedStorage --settings-id editor:package
 ```
 
-Wally sync needs `wally`; Aftman projects must declare it. `--force` reinstalls current packages. `--details` includes full path and ID lists.
+Files → Studio edits mark affected linked packages **Changed** before modifying descendants. The result's `autoDesyncedPackages` lists them; report those paths. Failed edits also report packages already marked Changed. Their PackageLinks stay intact.
 
-Files → Studio edits automatically mark each affected linked package Changed before modifying its descendants. The same command returns `autoDesyncedPackages`; tell the user those paths changed and ask whether to publish. Never publish automatically.
+- `pd`: mark Changed without editing contents.
+- `pp`: publish changes; requires user authorization.
+- `pu`: discard changes and fetch the latest published version.
+- `upl`: remove the PackageLink while keeping contents. This is unlinking, not desync.
 
-If the edit then fails, its error still names every package that Renium already marked Changed. The PackageLinks remain intact; review those packages before publishing.
+On Windows/macOS, `pd`/`pp`/`pu` target the package root without selection, dialogs, or focus. Their operation budget is 20 seconds, not a guarantee that Roblox publishing always succeeds.
+Use a JSON string array for names containing dots, `--ords` for duplicates, and `--pid PID` only when several processes match.
 
-On Windows and macOS, `pd` marks one linked Roblox package as Changed without altering its contents or PackageLink. `pp` publishes its changes. `pu` discards its changes and updates it to the latest published version. All three target the package root, finish within 20 seconds, and don't use selection, dialogs, or input focus. Add `--pid PID` only when several Studio processes match. Use a JSON string array for names containing dots and `--ords` for duplicate names.
+## Wally
 
-`upl` is different: it removes the PackageLink and keeps the package contents as normal editable instances.
+```powershell
+rbx wally --realms shared
+rbx wally --realms shared --force
+```
 
-`q` reads an RBXL/RBXLX directly without opening Studio or creating a project beside it. Use `-n`, `-c`, or `--source` for one existence check. `cmp` compares all scripts under the current project's services and reports source, class, missing, and extra differences; line-ending-only changes and duplicate order don't count. Use these before snapshot export/import when the input is already a place file.
+The project must provide `wally`; Aftman projects must declare it.
+`--force` reinstalls current packages; `--details` adds full paths/IDs.
 
-`bem`/`bim` copy model trees. Use `mv --to-service` to move an existing subtree across services. `x` exports Studio snapshots; `si` imports them. Both snapshot export and pull need the same bridge. `bep` builds a place. `sm` maps every instance; `--cached --stdout --filter GLOB` queries the existing map. `bpack` updates old stores only.
-
-Run `rbx vci` once to set up Git ignore, diff, and merge rules; reruns are safe. `vct` renders a store as text. Git calls `vcm` for conflicting `.renium` merges. Avoid `--untracked-files=all` on generated packages.
-
-Mirror one local source into a project target:
+## Reusable local/Git links
 
 ```powershell
 rbx lka --id logger --source-type local --source links/Logger.luau --service ReplicatedStorage --path '["ReplicatedStorage","Shared","Logger"]'
@@ -48,11 +65,13 @@ rbx lks
 rbx lkb --service ReplicatedStorage --path '["ReplicatedStorage","Shared","Logger"]' --remove
 ```
 
-`lka` adds a target, `lk` applies it, and `lks` reports status. `lkb` detaches a target; `--remove` also deletes its record. Detached targets remain editable. Local sources are project-relative. Links are read-only unless `--writable`. Live Sync sends returned paths; otherwise push only when Studio needs the update.
+`lka` adds a target, `lk` applies it, `lks` reports status, and `lkb` detaches it.
+`--remove` also deletes its record, not the editable target.
+Sources are project-relative; links are read-only unless `--writable`.
+Live Sync sends changed paths; otherwise push only when Studio needs them.
 
-For Git, use `--source-type git --source REPOSITORY --ref REF --subpath PATH`. `lk` refreshes the cached ref; `--offline` requires an existing cache.
-
-Pack an existing subtree into a reusable project package, insert it elsewhere, then remove the package while keeping both materialized trees:
+Git sources use `--source-type git --source REPOSITORY --ref REF --subpath PATH`.
+`lk` refreshes the cached ref; `--offline` requires a cache.
 
 ```powershell
 rbx lkp --link-folder packages --id shared-widget --service ReplicatedStorage --path '["ReplicatedStorage","PackageSource"]'
@@ -61,4 +80,11 @@ rbx lk --link shared-widget
 rbx lkd --id shared-widget --action unlink-uses
 ```
 
-`lkp` writes the package and registers its source subtree. Reuse its ID with `lka`. `lkd` can refuse active uses (`delete-unused`), remove them (`delete-uses`), or keep editable copies (`unlink-uses`). Each action deletes the package and link.
+`lkp` packages a subtree and registers its source; reuse its ID with `lka`.
+`lkd` deletes a package/link: `delete-unused` refuses active uses, `delete-uses` removes them, and `unlink-uses` keeps editable copies.
+
+## Version control
+
+Run `rbx vci` to install Git ignore/diff/merge rules; reruns are safe.
+`vct` renders stores as text; Git calls `vcm` for store merge conflicts.
+Avoid `--untracked-files=all` on generated packages. Git tracks files; a commit or push does not publish Roblox content.

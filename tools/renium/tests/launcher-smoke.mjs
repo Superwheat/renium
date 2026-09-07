@@ -24,15 +24,13 @@ const hasCommand = (command) => childProcess.spawnSync(
   { stdio: "ignore" },
 ).status === 0;
 
-for (const installer of ["install.ps1", "install.sh"]) {
-  const source = fs.readFileSync(path.join(repository, installer), "utf8");
-  if (!source.includes("update-manifest.json") || source.includes("SHA256SUMS.txt")) {
-    throw new Error(`${installer} does not use the published update manifest`);
-  }
-}
-
 try {
   if (process.platform === "win32") {
+    fs.writeFileSync(path.join(temporary, "fixture-asset"), "Renium installer fixture\n");
+    childProcess.execFileSync(hasCommand("pwsh.exe") ? "pwsh.exe" : "powershell.exe", [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(repository, "tools", "renium", "tests", "installer-manifest.ps1"),
+      "-Installer", path.join(repository, "install.ps1"), "-Fixture", temporary,
+    ], { stdio: "inherit" });
     const stub = path.join(temporary, "renium-stub.cmd");
     fs.writeFileSync(stub, "@echo off\r\necho %1^|%2\r\n");
     const launcher = path.join(repository, "rbx.cmd");

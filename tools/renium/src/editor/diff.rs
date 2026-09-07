@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use rbx_reflection::ReflectionDatabase;
 use serde_json::{Map, Value};
 
-use crate::bytecode::edit::instance_path_parts_key;
 use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::review::{
     is_engine_managed_editor_property, is_externally_managed_editor_property,
@@ -11,14 +10,13 @@ use crate::editor::review::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::{
-    EditorBinaryImport, EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor,
-    EditorInstancePath, EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
+    EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor, EditorInstancePath,
+    EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
 };
 use crate::rbx::encode::rbx_logical_property_name;
 use crate::roblox::schema::{MESH_SIZE_TRANSPORT_PROPERTY, PropertySchemaMap};
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
-use crate::settings::tree::editor_service_root_index;
 
 const MAX_EDITOR_MATCH_FIELDS: usize = 64;
 const MAX_EDITOR_MATCH_VALUE_BYTES: usize = 256;
@@ -690,133 +688,6 @@ pub(crate) fn append_editor_target_changes(
                 paths_by_index: &paths_by_index,
                 settings_ids_by_index: &settings_ids_by_index,
             },
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct NativeEditorPropertyRules<'a, 'db> {
-    pub property_schema_by_class: &'a PropertySchemaMap,
-    pub post_apply_properties_by_class: &'a HashMap<String, HashSet<String>>,
-    pub post_apply_properties_by_path: &'a HashMap<String, HashSet<String>>,
-    pub database: &'db ReflectionDatabase<'db>,
-}
-
-pub(crate) fn append_native_editor_full_property_changes(
-    changes: &mut EditorChangeSet,
-    document: &SettingsBytecode,
-    paths_by_index: &[Option<EditorInstancePath>],
-    service: &str,
-    binary_import: &EditorBinaryImport,
-    rules: NativeEditorPropertyRules<'_, '_>,
-) {
-    let root_index = editor_service_root_index(document, service);
-    let settings_ids_by_index = editor_settings_ids(document);
-    for (index, instance) in document.instances.iter().enumerate() {
-        if instance.class_name == "PackageLink" {
-            continue;
-        }
-        let direct_service_child = instance.parent_index == root_index;
-        if service == "Workspace"
-            && direct_service_child
-            && instance.class_name == "Camera"
-            && matches!(instance.name.as_str(), "Camera" | "CurrentCamera")
-        {
-            continue;
-        }
-        let send_all = Some(index) == root_index
-            || (direct_service_child
-                && ((service == "Workspace" && instance.class_name == "Terrain")
-                    || (service == "StarterPlayer"
-                        && matches!(
-                            instance.class_name.as_str(),
-                            "StarterPlayerScripts" | "StarterCharacterScripts"
-                        ))));
-        let class_post_apply_names = rules
-            .post_apply_properties_by_class
-            .get(&instance.class_name);
-        let has_tags = instance.properties.contains_key("Tags");
-        if !send_all
-            && !has_tags
-            && class_post_apply_names.is_none()
-            && rules.post_apply_properties_by_path.is_empty()
-        {
-            continue;
-        }
-        let Some(path_info) = paths_by_index.get(index).and_then(std::clone::Clone::clone) else {
-            continue;
-        };
-        let retained =
-            binary_import.retains_path(service, &path_info.path_segments, &path_info.path_ordinals);
-        let path_segments = path_info.path_segments.clone();
-        let path_post_apply_names = if rules.post_apply_properties_by_path.is_empty() {
-            None
-        } else {
-            rules
-                .post_apply_properties_by_path
-                .get(&instance_path_parts_key(
-                    &path_segments,
-                    &path_info.path_ordinals,
-                ))
-        };
-        let post_apply_names = if retained {
-            None
-        } else {
-            class_post_apply_names
-        };
-        if !send_all && post_apply_names.is_none() && path_post_apply_names.is_none() {
-            continue;
-        }
-
-        let mut properties = Map::new();
-        for (name, value) in &instance.properties {
-            let logical_name =
-                rbx_logical_property_name(rules.database, &instance.class_name, name)
-                    .unwrap_or(name);
-            if name.eq_ignore_ascii_case("Source")
-                || name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY)
-                || (name == "WorldPivot" && instance.properties.contains_key("PrimaryPart"))
-                || (!send_all
-                    && name != "Tags"
-                    && post_apply_names.is_none_or(|names| !names.contains(logical_name))
-                    && path_post_apply_names.is_none_or(|names| !names.contains(logical_name)))
-                || is_externally_managed_editor_property(
-                    service,
-                    &instance.class_name,
-                    &path_segments,
-                    logical_name,
-                )
-                || is_engine_managed_editor_property(
-                    &instance.class_name,
-                    logical_name,
-                    rules.database,
-                )
-            {
-                continue;
-            }
-            let schema_entry = property_schema_entry(
-                rules.property_schema_by_class,
-                &instance.class_name,
-                logical_name,
-            );
-            properties.insert(
-                logical_name.to_string(),
-                normalize_editor_bridge_value(
-                    value,
-                    schema_entry,
-                    paths_by_index,
-                    &settings_ids_by_index,
-                ),
-            );
-        }
-
-        let attributes = if send_all {
-            normalized_editor_attributes(instance, paths_by_index, &settings_ids_by_index)
-        } else {
-            Map::new()
-        };
-        append_editor_property_change(
-            changes, service, instance, path_info, properties, attributes,
         );
     }
 }

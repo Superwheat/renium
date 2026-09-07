@@ -8,7 +8,7 @@ use super::op;
 use crate::app;
 use crate::cli::BridgeConnectionArgs;
 use crate::cloud;
-use crate::daemon::{daemon_project_root, start_shared_daemon, try_daemon_control_request};
+use crate::daemon::{daemon_control_request, daemon_project_root};
 use crate::project::config;
 
 #[derive(Args)]
@@ -122,21 +122,7 @@ pub(crate) fn daemon_result(
         object.insert("bridgeWaitSeconds".to_string(), json!(bridge.wait_seconds));
         object.insert("bridgePorts".to_string(), json!(bridge.ports));
     }
-    let result = match try_daemon_control_request(operation, project, parameters.clone(), reviewed)?
-    {
-        Some(result) => result,
-        None => {
-            let (ports, wait) = bridge
-                .map(|bridge| (bridge.ports.as_str(), bridge.wait_seconds))
-                .unwrap_or(("8781,8782", 1.0));
-            if !start_shared_daemon(ports, wait) {
-                bail!("Could not start the Renium daemon");
-            }
-            try_daemon_control_request(operation, project, parameters, reviewed)?
-                .context("The Renium daemon did not accept the command")?
-        }
-    };
-    Ok(result)
+    daemon_control_request(operation, project, parameters, reviewed)
 }
 
 pub(super) fn run_daemon(

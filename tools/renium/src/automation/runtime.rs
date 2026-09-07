@@ -25,9 +25,7 @@ use crate::cli::{
 };
 use crate::daemon::transport::MAX_DAEMON_LINE_BYTES;
 #[cfg(any(windows, target_os = "macos"))]
-use crate::editor::review::{
-    local_place_path_for_bridge, local_place_path_for_pid, studio_pid_for_bridge,
-};
+use crate::editor::review::local_place_path_for_pid;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::editor::sync::resolve_editor_package_target;
 use crate::editor::sync::{
@@ -38,9 +36,9 @@ use crate::project::workflows;
 use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
-    active_studio_play_clients, click_result, compact_live_status, editor_review_decision_result,
-    execute_luau_result, get_console_output_result, goto_result, input_result, key_result,
-    press_result, record_end_result, record_start_result, shot_result, start_stop_play_result,
+    click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
+    get_console_output_result, goto_result, input_result, key_result, press_result,
+    record_end_result, record_start_result, shot_result, start_stop_play_result,
     studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
     wait_until_result,
 };
@@ -139,12 +137,14 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
             || lower.contains("plugin bridge did not connect");
         return automation::Failure::new("timeout", message, waiting_for_connection, "studios");
     }
+    if lower.contains("all compatible bridge channels are busy") {
+        return automation::Failure::new("busy", message, true, "retry");
+    }
     if lower.contains("connection reset")
         || lower.contains("connection refused")
         || lower.contains("broken pipe")
         || lower.contains("transport closed")
         || lower.contains("bridge channel closed")
-        || lower.contains("all compatible bridge channels are busy")
     {
         return automation::Failure::new("bridge_off", message, true, "studios");
     }
@@ -152,6 +152,7 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
         || lower.contains("no connected")
         || lower.contains("no plugin bridge")
         || lower.contains("pinned studio runtime disconnected")
+        || lower.starts_with("the pinned studio runtime ended:")
     {
         return automation::Failure::new("no_studio", message, false, "studios");
     }
@@ -729,6 +730,7 @@ fn prepare_studios_for_update(parameters: &Value, bridge: &BridgeServer) -> Resu
             }
             return Err(error);
         }
+        bridge.retire_runtime(&studio.runtime_id);
         if studio.target.file.is_some()
             || studio.target.game_id.is_some() && studio.target.place_id.is_some()
         {
@@ -755,9 +757,14 @@ fn close_studio(
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> Result<Value> {
+    let _selection = select_bridge_context(context, bridge);
     bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-    let file = local_place_path_for_bridge(bridge).filter(|path| path.is_file());
+    if context.runtime_id.as_deref() != Some(info.runtime_id.as_str()) {
+        bail!("Studio close target does not match the selected runtime; no Studio was closed");
+    }
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let file = local_place_path_for_pid(pid).filter(|path| path.is_file());
     let game_id = info.game_id.filter(|id| *id > 0).or(context.game_id);
     let place_id = info.place_id.filter(|id| *id > 0).or(context.place_id);
     let local_action = parameters.get("localAction").and_then(Value::as_str);
@@ -773,7 +780,6 @@ fn close_studio(
         game_id,
         place_id,
     };
-    let pid = studio_pid_for_bridge(bridge)?;
     if (target.file.is_some() || unpublished)
         && !matches!(local_action, Some("saveAndClose" | "terminate"))
     {
@@ -787,7 +793,7 @@ fn close_studio(
             Some("saveAndClose") => save_local_studio(
                 &ConnectedStudio {
                     pid,
-                    runtime_id: info.runtime_id,
+                    runtime_id: info.runtime_id.clone(),
                     local: true,
                     target: target.clone(),
                 },
@@ -800,6 +806,7 @@ fn close_studio(
     state.remember_studio_target(context, target.clone());
     state.clear_studio_launch(context);
     input_inject::terminate_studio_process(pid)?;
+    bridge.retire_runtime(&info.runtime_id);
     state.clear_context_runtime(context.id);
     Ok(json!({ "closed": true, "pid": pid, "reopenTarget": target }))
 }
@@ -909,34 +916,33 @@ fn studio_status_result(
     bridge: &BridgeServer,
 ) -> Value {
     let clients = bridge.list_bridge_clients();
-    let selector = if parameters.get("all").and_then(Value::as_bool) == Some(true) {
-        ""
+    let clients = if parameters.get("all").and_then(Value::as_bool) == Some(true) {
+        clients
     } else {
-        &context.selector
+        bound_context::context_clients(clients, context)
     };
     let mut result = json!({
-        "studios": bound_context::studio_candidates_from(&clients, selector),
-        "clients": bound_context::context_clients(clients, context),
+        "studios": bound_context::studio_candidates_from(&clients, ""),
+        "clients": clients,
         "selected": context.runtime_id,
     });
     let mut clients = result["clients"].as_array().cloned().unwrap_or_default();
     let has_edit = clients.iter().any(|client| client["role"] == "edit");
-    let active_play_clients = clients
-        .iter()
-        .find(|client| client["role"] == "edit")
-        .and_then(|client| client.get("runtimeId").and_then(Value::as_str))
-        .map(|runtime_id| active_studio_play_clients(bridge, runtime_id))
-        .unwrap_or_default();
-    let studio_state = if has_edit {
-        bridge
-            .call_for_selector_with_timeout(
-                "getStudioState",
-                json!({}),
-                BridgeTarget::Edit,
-                None,
-                Some(Duration::from_secs(2)),
-            )
-            .ok()
+    let studio_state = if let Some(runtime_id) = context.runtime_id.as_deref().filter(|_| has_edit)
+    {
+        match bridge.call_for_runtime_with_timeout(
+            "getStudioState",
+            json!({}),
+            BridgeTarget::Edit,
+            runtime_id,
+            Some(Duration::from_secs(2)),
+        ) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                result["stateError"] = json!(format!("{error:#}"));
+                None
+            }
+        }
     } else {
         None
     };
@@ -948,28 +954,12 @@ fn studio_status_result(
         .as_ref()
         .and_then(|state| state.get("playStarting"))
         .and_then(Value::as_bool);
-    let play_running = if active_play_clients.is_empty() {
-        controller_play_running
-    } else {
-        Some(true)
-    };
-    let play_starting = if active_play_clients.is_empty() {
-        controller_play_starting
-    } else {
-        Some(false)
-    };
-    if has_edit {
+    // The observation can identify a newer session than the initial inventory.
+    bridge.retain_current_clients(&mut clients);
+    if controller_play_running == Some(false) && controller_play_starting == Some(false) {
         clients.retain(|client| client["role"] == "edit");
-        for client in active_play_clients {
-            if !clients.iter().any(|existing| {
-                existing.get("runtimeId").and_then(Value::as_str)
-                    == client.get("runtimeId").and_then(Value::as_str)
-            }) {
-                clients.push(client);
-            }
-        }
-        result["clients"] = json!(clients);
     }
+    result["clients"] = json!(clients);
     let mut available = Vec::new();
     if has_edit {
         available.push("Edit");
@@ -981,17 +971,14 @@ fn studio_status_result(
         available.push("Client");
     }
     result["availableDataModels"] = json!(available);
-    result["playState"] = json!(if play_starting == Some(true) {
+    result["playState"] = json!(if controller_play_starting == Some(true) {
         "starting"
-    } else if play_running == Some(true)
-        || (play_running.is_none()
-            && clients.iter().any(|client| {
-                client["role"] == "play-server" || client["role"] == "play-client"
-            }))
-    {
+    } else if controller_play_running == Some(true) {
         "running"
-    } else {
+    } else if controller_play_running == Some(false) && controller_play_starting == Some(false) {
         "stopped"
+    } else {
+        "unknown"
     });
     if let Some(state) = studio_state {
         result["studioState"] = state;
@@ -1035,7 +1022,7 @@ fn creator_operation_result(
     }
 }
 
-fn select_bridge_context(
+pub(crate) fn select_bridge_context(
     context: &automation::BoundContext,
     bridge: &BridgeServer,
 ) -> bound_context::Selection {
@@ -1043,7 +1030,6 @@ fn select_bridge_context(
     bridge.clear_runtime_pins();
     if let Some(runtime_id) = context.runtime_id.as_deref() {
         bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
     }
     selection
 }
@@ -1058,6 +1044,11 @@ fn automation_dispatch_operation(
 ) -> Result<Value> {
     if automation_requires_runtime(operation, parameters) && context.runtime_id.is_none() {
         bail!("No Studio runtime is bound to this context");
+    }
+    // Status is deliberately unqueued. It must not overwrite the global selection
+    // used by a serialized mutation (or another simultaneous status request).
+    if operation == op::STUDIO_STATUS {
+        return Ok(studio_status_result(context, parameters, bridge));
     }
     let _selection = select_bridge_context(context, bridge);
     match operation {
@@ -1136,7 +1127,6 @@ fn automation_dispatch_operation(
         | op::PROJECT_INIT
         | op::PROJECT_VALIDATE => local::execute(operation, context, parameters),
         op::BATCH => automation_batch(context, parameters),
-        op::STUDIO_STATUS => Ok(studio_status_result(context, parameters, bridge)),
         op::LUAU => {
             let parsed = studio_args::luau(Path::new(&context.root), parameters)?;
             if parsed.player.is_none() {
@@ -1175,6 +1165,12 @@ fn automation_dispatch_operation(
         op::DEVICE => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
             studio_device_result(&studio_args::device(parameters)?, bridge)
+        }
+        op::NETWORK_SIMULATION => {
+            crate::studio::automation::network::result(parameters, bridge, bridge_wait_seconds)
+        }
+        op::PERFORMANCE_MONITOR => {
+            crate::studio::automation::monitor::result(parameters, bridge, bridge_wait_seconds)
         }
         #[cfg(any(windows, target_os = "macos"))]
         op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE => {
@@ -1264,6 +1260,30 @@ fn automation_dispatch_operation(
     }
 }
 
+fn automation_retry_is_safe(
+    operation: u16,
+    parameters: &Value,
+    failure: &automation::Failure,
+) -> bool {
+    failure.0.rt == 1
+        && (operation != op::CONSOLE
+            || parameters.get("clear").and_then(Value::as_bool) != Some(true))
+        && (matches!(
+            operation,
+            op::FIND
+                | op::TREE
+                | op::INSPECT
+                | op::GET_PROPERTY
+                | op::SCRIPT_SEARCH
+                | op::SCRIPT_READ
+                | op::SCRIPT_GREP
+                | op::STUDIO_STATUS
+                | op::CONSOLE
+                | op::UI
+                | op::JOB_STATUS
+        ) || failure.0.c == "conflict" && operation == op::PUSH)
+}
+
 fn automation_dispatch_with_retry(
     operation: u16,
     context: &automation::BoundContext,
@@ -1299,16 +1319,18 @@ fn automation_dispatch_with_retry(
     .map_err(automation_failure)
     .and_then(check_result);
     match first {
-        Err(failure) if failure.0.rt == 1 => automation_dispatch_operation(
-            operation,
-            context,
-            parameters,
-            bridge,
-            bridge_wait_seconds,
-            reviewed,
-        )
-        .map_err(automation_failure)
-        .and_then(check_result),
+        Err(failure) if automation_retry_is_safe(operation, parameters, &failure) => {
+            automation_dispatch_operation(
+                operation,
+                context,
+                parameters,
+                bridge,
+                bridge_wait_seconds,
+                reviewed,
+            )
+            .map_err(automation_failure)
+            .and_then(check_result)
+        }
         result => result,
     }
 }
@@ -1328,6 +1350,17 @@ fn automation_dispatch_managed(
     }
     if operation == op::STUDIO_OPEN {
         return open_studio(context, parameters, state, bridge).map_err(automation_failure);
+    }
+    if operation == op::PROPERTY_ACCESS {
+        let _selection = select_bridge_context(context, bridge);
+        return crate::studio::automation::property_access::result(
+            parameters,
+            context,
+            state,
+            bridge,
+            bridge_wait_seconds,
+        )
+        .map_err(automation_failure);
     }
     let writes_project = matches!(
         operation,
@@ -1705,6 +1738,7 @@ fn start_managed_live_operation(
     let mut start_parameters = parameters.clone();
     start_parameters["reset"] = json!(true);
     start_parameters["replaceServices"] = json!(true);
+    let phase = Instant::now();
     let initial_plugin = {
         let _gate = bridge.acquire_request_gate();
         automation_dispatch_with_retry(
@@ -1716,6 +1750,7 @@ fn start_managed_live_operation(
             false,
         )?
     };
+    automation::live::log_live_timing("startup Studio tracking", phase);
     let cleanup_failed_start = |mut failure: automation::Failure| {
         let cleanup = {
             let _gate = bridge.acquire_request_gate();
@@ -1749,6 +1784,7 @@ fn start_managed_live_operation(
             )
         })
         .map_err(|error| cleanup_failed_start(automation_failure(error)))?;
+    let phase = Instant::now();
     let plugin = match live_plugin_status(context, parameters, bridge, bridge_wait_seconds) {
         Ok(plugin) => plugin,
         Err(failure) => {
@@ -1756,6 +1792,7 @@ fn start_managed_live_operation(
             return Err(cleanup_failed_start(failure));
         }
     };
+    automation::live::log_live_timing("startup final Studio status", phase);
     if let Err(error) = state.live_sync().set_enabled(context, bridge, true) {
         state.live_sync().rollback_start(&started);
         return Err(cleanup_failed_start(automation_failure(error)));
@@ -2074,6 +2111,10 @@ fn restore_persisted_live_sync_for_request(
     if matches!(
         operation.id,
         op::BIND
+            | op::STUDIO_STATUS
+            | op::PROPERTY_ACCESS
+            | op::PERFORMANCE_MONITOR
+            | op::STUDIOS
             | op::UNBIND
             | op::CONTEXT
             | op::LIVE_START
@@ -2322,6 +2363,24 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let operation = request.validate()?;
+    // Unbound PID/bulk operations must not bypass workflow ownership.
+    if matches!(operation.id, op::UPDATE_STUDIOS | op::PERFORMANCE_PROFILE)
+        || matches!(
+            operation.id,
+            op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE
+        ) && request.p.get("pid").and_then(Value::as_u64).is_some()
+    {
+        let pid = request.p.get("pid").and_then(Value::as_u64);
+        for client in studio_clients(bridge) {
+            if pid.is_none() || client.get("pid").and_then(Value::as_u64) == pid {
+                crate::plugins::verify_place_lease(
+                    client.get("placeId").and_then(Value::as_i64),
+                    None,
+                )
+                .map_err(automation_failure)?;
+            }
+        }
+    }
     log_global(
         5,
         format_args!(
@@ -2612,7 +2671,7 @@ fn automation_execute_request(
 }
 
 fn automation_response(
-    request: automation::Request,
+    mut request: automation::Request,
     state: &automation::State,
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
@@ -2624,6 +2683,21 @@ fn automation_response(
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
     let result = (|| {
+        if automation::authorization::required(request.op) {
+            state
+                .authority
+                .get()
+                .context("Privileged authentication is not initialized")
+                .and_then(|authority| authority.verify(&mut request))
+                .map_err(|error| {
+                    automation::Failure::new(
+                        "unauthorized",
+                        error.to_string(),
+                        false,
+                        "use-local-cli",
+                    )
+                })?;
+        }
         restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
         let _request_guard = if queued {
             Some(match request_lease.as_deref() {
@@ -2710,6 +2784,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn busy_connections_and_ended_runtimes_have_distinct_actionable_errors() {
+        let busy = automation_failure(anyhow::anyhow!(
+            "Bridge call failed for getStudioState: all compatible bridge channels are busy"
+        ));
+        assert_eq!(busy.0.c, "busy");
+        assert_eq!(busy.0.rt, 1);
+        let ended = automation_failure(anyhow::anyhow!(
+            "The pinned Studio runtime ended: edit was retired; its outstanding response is no longer valid"
+        ));
+        assert_eq!(ended.0.c, "no_studio");
+        assert_eq!(ended.0.rt, 0);
+        for operation in [op::LUAU, op::PUSH, op::PLAY_START, op::PACKAGE_PUBLISH] {
+            assert!(!automation_retry_is_safe(operation, &json!({}), &ended));
+            assert!(!automation_retry_is_safe(operation, &json!({}), &busy));
+        }
+    }
+
+    #[test]
+    fn lost_responses_do_not_replay_mutations_with_new_request_ids() {
+        let lost = automation_failure(anyhow::anyhow!(
+            "Bridge channel closed after sending the request"
+        ));
+        for operation in [
+            op::LUAU,
+            op::CLONE,
+            op::MULTI_EDIT,
+            op::PUSH,
+            op::PACKAGE_PUBLISH,
+            op::INPUT,
+            op::PLAY_START,
+        ] {
+            assert!(!automation_retry_is_safe(operation, &json!({}), &lost));
+        }
+        assert!(automation_retry_is_safe(
+            op::STUDIO_STATUS,
+            &json!({}),
+            &lost
+        ));
+        assert!(automation_retry_is_safe(op::CONSOLE, &json!({}), &lost));
+        assert!(!automation_retry_is_safe(
+            op::CONSOLE,
+            &json!({"clear": true}),
+            &lost
+        ));
+        let rolled_back = automation_failure(anyhow::anyhow!(
+            "Studio changed ReplicatedStorage while the filesystem transaction was staged; retry the sync"
+        ));
+        assert!(automation_retry_is_safe(op::PUSH, &json!({}), &rolled_back));
+        assert!(!automation_retry_is_safe(
+            op::LUAU,
+            &json!({}),
+            &rolled_back
+        ));
+    }
+
+    #[test]
     fn studio_snapshot_invalidation_is_retryable_but_project_conflict_is_not() {
         let studio = automation_failure_ref(&anyhow::anyhow!(
             "Studio changed Workspace while native import was staged; retry the sync"
@@ -2734,6 +2864,7 @@ mod tests {
             root: "root".to_string(),
             experience: String::new(),
             source: "source".to_string(),
+            resource_lease: None,
             place_id: None,
             game_id: None,
             selector: String::new(),
@@ -2867,6 +2998,27 @@ mod tests {
                     "error": "timed out"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn successful_stop_preserves_prior_conflict_without_reporting_stop_failure() {
+        let result = compact_live_status(json!({
+            "ok": true,
+            "tracking": false,
+            "daemon": {
+                "running": false,
+                "resolutionRequired": true,
+                "pendingCount": 1,
+                "previousError": "Source changed on both sides"
+            }
+        }));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["daemon"]["pendingCount"], 1);
+        assert_eq!(result["daemon"]["resolutionRequired"], true);
+        assert_eq!(
+            result["daemon"]["previousError"],
+            "Source changed on both sides"
         );
     }
 }

@@ -7,7 +7,7 @@ import { reniumBinaryName, resolveReniumCliPath } from "./cliResolution";
 import { resolveActiveExperiencePlace } from "./experience";
 import type { VerdePropertiesData } from "./explorerProperties";
 import { spawnTrackedProcess, terminateProcess } from "./processSupervisor";
-import { canonicalExplorerServiceName, DEFAULT_SYNC_SERVICES } from "./serviceDefaults";
+import { canonicalExplorerServiceName, DEFAULT_SYNC_SERVICES, isImportStageName } from "./serviceDefaults";
 import {
   type SharedConfig,
   loadProjectSourceLocations,
@@ -476,7 +476,7 @@ export function explorerServiceForPath(config: ExplorerConfig, service: string):
 }
 
 export function canonicalExplorerServices(config: ExplorerConfig, services: readonly string[]): string[] {
-  return distinctExplorerServices(services.map((service) => explorerServiceForPath(config, String(service))));
+  return distinctExplorerServices(services.filter((service) => !isImportStageName(service)).map((service) => explorerServiceForPath(config, String(service))));
 }
 
 export function settingsFileForService(config: ExplorerConfig, service: string): string {
@@ -570,7 +570,7 @@ export function serviceFromSettingsFile(config: ExplorerConfig, filePath: string
     return undefined;
   }
   const [service] = relativePath.split(/[\\/]/);
-  return service ? explorerServiceForPath(config, service) : undefined;
+  return service && !isImportStageName(service) ? explorerServiceForPath(config, service) : undefined;
 }
 
 export function normalizeId(service: string, settingsId: string): string {

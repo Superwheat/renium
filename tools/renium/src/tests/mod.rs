@@ -85,7 +85,7 @@ use crate::snapshot::import::{
     remove_stale_import_paths, state_with_preserved_material_service_settings,
 };
 use crate::snapshot::types::{ServiceState, SnapshotInstance};
-use crate::studio::automation::validate_luau_syntax;
+use crate::studio::automation::{cooperative_luau, validate_luau_syntax};
 use crate::studio::bridge::BridgeRequestLease;
 use crate::studio::bridge::{MAX_BRIDGE_REASSEMBLY_BYTES, parse_bridge_raw_chunk};
 use crate::studio::native::editor::{
@@ -287,15 +287,14 @@ fn stale_import_paths_are_deleted() {
 #[test]
 fn studio_bridge_modules_parse_as_luau() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin_ws_bridge");
-    for name in [
-        "BridgeContent.module.lua",
-        "BridgeConnection.module.lua",
-        "BridgeEditorSync.module.lua",
-        "BridgeTransactionUpload.module.lua",
-        "BridgePluginRuntime.module.lua",
-        "BridgeStudioChanges.module.lua",
-    ] {
-        let path = root.join(name);
+    let mut paths = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "lua"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = fs::read_to_string(&path).unwrap();
         let result = thread::Builder::new()
             .name(format!("parse-{name}"))
@@ -306,6 +305,29 @@ fn studio_bridge_modules_parse_as_luau() {
             .unwrap();
         result.unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
     }
+}
+
+#[test]
+fn agent_luau_loops_receive_cooperative_checkpoints() {
+    let source = "for _, child in game:GetChildren() do while child.Parent do repeat child = child.Parent until child == game end end\nfor index = 1, 10 do print(index) end";
+    let instrumented = cooperative_luau(source).unwrap();
+    assert_eq!(instrumented.matches("__reniumCooperate();").count(), 4);
+    assert!(instrumented.contains("task.wait()"));
+    validate_luau_syntax(&instrumented).unwrap();
+}
+
+#[test]
+fn agent_luau_without_loops_is_unchanged() {
+    let source = "return game.PlaceId";
+    assert_eq!(cooperative_luau(source).unwrap(), source);
+}
+
+#[test]
+fn agent_luau_checkpoint_name_does_not_shadow_user_code() {
+    let source = "local __reniumCooperate = true; while true do break end";
+    let instrumented = cooperative_luau(source).unwrap();
+    assert!(instrumented.contains("__reniumCooperate_();"));
+    validate_luau_syntax(&instrumented).unwrap();
 }
 
 #[test]

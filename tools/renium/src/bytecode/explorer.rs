@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+#[path = "explorer_tests.rs"]
+mod workload_tests;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -37,7 +40,7 @@ use crate::settings::bytecode::{
 };
 use crate::settings::instance::{self as instance_api, InstanceQuery};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
-use crate::snapshot::import::parse_services;
+use crate::snapshot::import::{is_import_stage_name, parse_services};
 use crate::system::files::{
     absolutize_under, service_settings_path, validate_filesystem_instance_name,
 };
@@ -227,13 +230,14 @@ fn parse_batch_requested_fields(
 fn normalize_bytecode_batch_op(raw: &str) -> Result<&'static str> {
     match raw.to_ascii_lowercase().as_str() {
         "counts" | "count" | "bc" => Ok("counts"),
+        "sources" => Ok("sources"),
         "children" | "child" | "bch" => Ok("children"),
         "service" | "svc" | "bsvc" => Ok("service"),
         "search" | "query" | "bq" => Ok("search"),
         "instance" | "node" | "bi" => Ok("instance"),
         "find" | "match" | "bf" => Ok("find"),
         other => bail!(
-            "Unsupported batch op type: {other}. Use counts, children, service, search, instance, or find."
+            "Unsupported batch op type: {other}. Use counts, sources, children, service, search, instance, or find."
         ),
     }
 }
@@ -293,6 +297,8 @@ fn node_field_aliases(key: &str) -> &'static [&'static str] {
         "pathSegments" => &["path", "segments", "pathsegments"],
         "pathOrdinals" => &["ords", "ordinals", "pathordinals"],
         "sourcePath" => &["src", "source", "sourcepath"],
+        "settingsFile" => &["f", "settingsfile"],
+        "canonicalSettingsId" => &["canonical", "canonicalsettingsid"],
         "properties" => &["props", "p", "properties"],
         "attributes" => &["attrs", "a", "attributes"],
         _ => &[],
@@ -546,16 +552,90 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         )?
     };
     let children_by_parent = settings_children_by_parent(&document);
+    let needs_field = |field: &str| -> Result<bool> {
+        for op in &ops {
+            let kind = normalize_bytecode_batch_op(&op.op)?;
+            if kind == "counts" {
+                continue;
+            }
+            if kind == "sources" {
+                if field == "sourcePath" {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let mode = OutputMode::parse(
+                op.output
+                    .as_deref()
+                    .or(args.output.as_deref())
+                    .unwrap_or("compact"),
+            )?;
+            let fields = parse_batch_requested_fields(op.fields.as_ref(), args.fields.as_deref());
+            // Property/attribute reference output also needs canonical paths even
+            // when callers do not request the node's path fields explicitly.
+            let records = matches!(mode, OutputMode::Full)
+                || fields.as_ref().is_some_and(|fields| {
+                    fields.iter().any(|requested| {
+                        ![
+                            "index",
+                            "settingsId",
+                            "name",
+                            "className",
+                            "parentId",
+                            "parentIndex",
+                            "children",
+                            "childCount",
+                            "hasPackageLink",
+                            "pathSegments",
+                            "pathOrdinals",
+                            "sourcePath",
+                            "settingsFile",
+                            "canonicalSettingsId",
+                        ]
+                        .iter()
+                        .any(|key| {
+                            requested.eq_ignore_ascii_case(key)
+                                || node_field_aliases(key).contains(&requested.as_str())
+                        })
+                    })
+                });
+            if records
+                && matches!(
+                    field,
+                    "pathSegments" | "pathOrdinals" | "canonicalSettingsId"
+                )
+            {
+                return Ok(true);
+            }
+            if field == "sourcePath" && requested_property_field(fields.as_ref(), "Source") {
+                return Ok(true);
+            }
+            if (kind == "search" && matches!(field, "pathSegments" | "pathOrdinals"))
+                || should_include_node_field(mode, fields.as_ref(), field)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let (service_path_segments_by_index, service_path_ordinals_by_index) =
-        build_editor_instance_path_parts(&document, &service);
+        if needs_field("pathSegments")? || needs_field("pathOrdinals")? {
+            build_editor_instance_path_parts(&document, &service)
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let staged_settings_file = projection.as_ref().map_or_else(
         || settings_file.clone(),
         |stage| service_settings_path(&stage.root().join(&service)),
     );
-    let mut service_source_paths_by_index = staged_settings_file.parent().map_or_else(
-        || vec![None; document.instances.len()],
-        |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
-    );
+    let mut service_source_paths_by_index = if needs_field("sourcePath")? {
+        staged_settings_file.parent().map_or_else(
+            || vec![None; document.instances.len()],
+            |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
+        )
+    } else {
+        Vec::new()
+    };
     if let (Some(loaded), Some(stage)) = (loaded_project.as_ref(), projection.as_ref()) {
         for source in &mut service_source_paths_by_index {
             let Some(path) = source.as_ref() else {
@@ -570,13 +650,34 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
                 .flatten();
         }
     }
-    let mut service_settings_files_by_index =
-        vec![Some(staged_settings_file); document.instances.len()];
-    let mut service_canonical_settings_ids_by_index = document
-        .instances
-        .iter()
-        .map(|instance| Some(instance.settings_id.clone()))
-        .collect::<Vec<_>>();
+    let response_settings_file = editor_service_root_index(&document, &service)
+        .and_then(|index| {
+            projection
+                .as_ref()?
+                .canonical_identity(&document.instances[index].settings_id)
+        })
+        .map(|(path, _)| path.to_path_buf())
+        .or_else(|| {
+            let loaded = loaded_project.as_ref()?;
+            let stage = projection.as_ref()?;
+            let relative = staged_settings_file.strip_prefix(stage.root()).ok()?;
+            config::project_staged_path_to_source(loaded, relative).ok()
+        })
+        .unwrap_or_else(|| settings_file.clone());
+    let mut service_settings_files_by_index = if needs_field("settingsFile")? {
+        vec![Some(staged_settings_file); document.instances.len()]
+    } else {
+        Vec::new()
+    };
+    let mut service_canonical_settings_ids_by_index = if needs_field("canonicalSettingsId")? {
+        document
+            .instances
+            .iter()
+            .map(|instance| Some(instance.settings_id.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if let (Some(loaded), Some(stage)) = (loaded_project.as_ref(), projection.as_ref()) {
         for settings_file in &mut service_settings_files_by_index {
             let Some(path) = settings_file.as_ref() else {
@@ -592,14 +693,16 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
             if let Some((settings_file, settings_id)) =
                 stage.canonical_identity(&instance.settings_id)
             {
-                service_settings_files_by_index[index] = Some(settings_file.to_path_buf());
-                service_canonical_settings_ids_by_index[index] = Some(settings_id.to_string());
+                if let Some(target) = service_settings_files_by_index.get_mut(index) {
+                    *target = Some(settings_file.to_path_buf());
+                }
+                if let Some(target) = service_canonical_settings_ids_by_index.get_mut(index) {
+                    *target = Some(settings_id.to_string());
+                }
             }
         }
     }
-    let (global_path_segments_by_index, global_path_ordinals_by_index) =
-        build_editor_instance_path_parts(&document, &service);
-    let global_source_paths_by_index = vec![None; document.instances.len()];
+    let global_source_paths_by_index = Vec::new();
     let ctx = BytecodeExplorerBatchContext {
         document: &document,
         service: &service,
@@ -609,8 +712,8 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         service_source_paths_by_index: &service_source_paths_by_index,
         service_settings_files_by_index: &service_settings_files_by_index,
         service_canonical_settings_ids_by_index: &service_canonical_settings_ids_by_index,
-        global_path_segments_by_index: &global_path_segments_by_index,
-        global_path_ordinals_by_index: &global_path_ordinals_by_index,
+        global_path_segments_by_index: &service_path_segments_by_index,
+        global_path_ordinals_by_index: &service_path_ordinals_by_index,
         global_source_paths_by_index: &global_source_paths_by_index,
         default_output: args.output.as_deref(),
         default_fields: args.fields.as_deref(),
@@ -621,11 +724,6 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         .iter()
         .map(|op| bytecode_explorer_batch_op_json(&ctx, op))
         .collect::<Result<Vec<_>>>()?;
-    let response_settings_file = editor_service_root_index(&document, &service)
-        .and_then(|index| service_settings_files_by_index.get(index))
-        .and_then(|path| path.as_ref())
-        .unwrap_or(&settings_file);
-
     let mut response = Map::new();
     insert_top_field(
         &mut response,
@@ -662,6 +760,25 @@ fn bytecode_explorer_batch_op_json(
     }
 
     match kind {
+        "sources" => {
+            let root = bytecode_batch_instance_index(ctx.document, ctx.service, op, true)?;
+            let mut pending = root.into_iter().collect::<Vec<_>>();
+            let mut visited = HashSet::new();
+            let mut sources = BTreeSet::new();
+            while let Some(index) = pending.pop() {
+                if !visited.insert(index) {
+                    continue;
+                }
+                if let Some(Some(source)) = ctx.service_source_paths_by_index.get(index) {
+                    sources.insert(source);
+                }
+                if let Some(children) = ctx.children_by_parent.get(index) {
+                    pending.extend(children.iter().copied());
+                }
+            }
+            insert_top_field(&mut response, mode, "sourcePaths", json!(sources));
+            insert_top_field(&mut response, mode, "found", json!(root.is_some()));
+        }
         "counts" => {
             let root_index = bytecode_batch_instance_index(ctx.document, ctx.service, op, true)?;
             if root_index.is_none() {
@@ -1417,7 +1534,7 @@ impl ExplorerViewMode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ExplorerFlatRow {
     service_index: usize,
     instance_index: Option<usize>,
@@ -1541,6 +1658,9 @@ impl ExplorerDaemonState {
         };
         let mut reload_list = Vec::with_capacity(requested.len());
         for service in requested {
+            if is_import_stage_name(&service) {
+                continue;
+            }
             let canonical = self
                 .services
                 .iter()
@@ -1628,6 +1748,10 @@ impl ExplorerDaemonState {
 
     fn sort_services(&mut self) {
         self.services
+            .retain(|service| !is_import_stage_name(service));
+        self.service_states
+            .retain(|service, _| !is_import_stage_name(service));
+        self.services
             .sort_by(|a, b| explorer_compare_nodes(a, a, b, b));
         let mut seen = HashSet::new();
         self.services
@@ -1688,28 +1812,54 @@ impl ExplorerDaemonState {
     }
 
     fn expand(&mut self, node_id: &str, mode: ExplorerViewMode) {
-        match mode {
-            ExplorerViewMode::Search => {
-                self.search_collapsed.remove(node_id);
-            }
-            ExplorerViewMode::Normal => {
-                self.expanded.insert(node_id.to_string());
-            }
-        }
-        self.rebuild_rows(mode);
-        self.view_version += 1;
+        self.set_expanded(node_id, mode, true);
     }
 
     fn collapse(&mut self, node_id: &str, mode: ExplorerViewMode) {
-        match mode {
-            ExplorerViewMode::Search => {
-                self.search_collapsed.insert(node_id.to_string());
-            }
-            ExplorerViewMode::Normal => {
-                self.expanded.remove(node_id);
-            }
+        self.set_expanded(node_id, mode, false);
+    }
+
+    fn set_expanded(&mut self, node_id: &str, mode: ExplorerViewMode, expanded: bool) {
+        let changed = match (mode, expanded) {
+            (ExplorerViewMode::Search, true) => self.search_collapsed.remove(node_id),
+            (ExplorerViewMode::Search, false) => self.search_collapsed.insert(node_id.to_string()),
+            (ExplorerViewMode::Normal, true) => self.expanded.insert(node_id.to_string()),
+            (ExplorerViewMode::Normal, false) => self.expanded.remove(node_id),
+        };
+        if !changed {
+            return;
         }
-        self.rebuild_rows(mode);
+        if let Some(position) = self.row_index(mode, node_id) {
+            let row = &self.rows(mode)[position];
+            let (service_index, instance_index, depth) =
+                (row.service_index, row.instance_index, row.depth);
+            let end = self.rows(mode)[position + 1..]
+                .iter()
+                .position(|next| next.depth <= depth)
+                .map_or(self.rows(mode).len(), |offset| position + 1 + offset);
+            let mut children = Vec::new();
+            if expanded
+                && let Some(state) = self
+                    .services
+                    .get(service_index)
+                    .and_then(|service| self.service_states.get(service))
+                && let Some(parent) = instance_index.or(state.root_index)
+            {
+                self.collect_instance_rows(
+                    state,
+                    service_index,
+                    parent,
+                    depth + 1,
+                    mode,
+                    &mut children,
+                );
+            }
+            let rows = match mode {
+                ExplorerViewMode::Normal => &mut self.normal_rows,
+                ExplorerViewMode::Search => &mut self.search_rows,
+            };
+            rows.splice(position + 1..end, children);
+        }
         self.view_version += 1;
     }
 
@@ -2387,6 +2537,9 @@ fn canonical_explorer_service_name(service: &str) -> String {
 }
 
 fn push_explorer_service(services: &mut Vec<String>, service: &str) {
+    if is_import_stage_name(service) {
+        return;
+    }
     let canonical = canonical_explorer_service_name(service);
     if !services
         .iter()

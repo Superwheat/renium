@@ -116,6 +116,10 @@ macro_rules! declare_rbx_types {
                 Variant::BrickColor(value) =>
                     (*value as i32).write_outer_xml(xml_property_name, writer),
 
+                // Properties store the enum's numeric token, not its type name.
+                Variant::EnumItem(value) =>
+                    Enum::from_u32(value.value).write_outer_xml(xml_property_name, writer),
+
                 Variant::Content(value) => self::content::write_content(writer, xml_property_name, value, state),
                 Variant::Ref(value) => write_ref(writer, xml_property_name, *value, state),
                 Variant::SharedString(value) => write_shared_string(writer, xml_property_name, value, state),

@@ -1,6 +1,5 @@
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -27,36 +26,78 @@ pub(crate) fn send_request(request: &super::Request) -> Result<super::Response> 
         return Ok(response);
     }
     if request.op == op::BIND {
-        crate::daemon::start_shared_daemon("8781,8782", 1.0);
+        crate::daemon::ensure_shared_daemon("8781,8782", 1.0)?;
     }
     try_send_request(request)?.context("Renium daemon is not running")
 }
 
 pub(crate) fn try_send_request(request: &super::Request) -> Result<Option<super::Response>> {
-    let Some(stream) = daemon_control_endpoints().into_iter().find_map(|address| {
-        TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).ok()
-    }) else {
+    let Some(stream) = connect_daemon() else {
         return Ok(None);
     };
-    send_on_stream(stream, request).map(Some)
+    send_on_stream(&stream, request).map(Some)
 }
 
-fn send_on_stream(mut stream: TcpStream, request: &super::Request) -> Result<super::Response> {
-    send_on_stream_with_timeout(&mut stream, request, DAEMON_CONTROL_RESPONSE_TIMEOUT)
+fn connect_daemon() -> Option<TcpStream> {
+    daemon_control_endpoints().into_iter().find_map(|address| {
+        TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).ok()
+    })
+}
+
+fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super::Response> {
+    let timeout = match request.op {
+        op::CAP
+        | op::BIND
+        | op::STUDIOS
+        | op::STUDIO_STATUS
+        | op::PROPERTY_ACCESS
+        | op::PERFORMANCE_MONITOR => Duration::from_secs(5),
+        _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
+    };
+    send_on_stream_with_timeout(stream, request, timeout)
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon response deadline elapsed",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(bytes)
+    }
 }
 
 fn send_on_stream_with_timeout(
-    stream: &mut TcpStream,
+    mut stream: &TcpStream,
     request: &super::Request,
     timeout: Duration,
 ) -> Result<super::Response> {
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
-    writeln!(stream, "{}", serde_json::to_string(request)?)?;
+    let deadline = Instant::now() + timeout;
+    stream.set_write_timeout(Some(timeout.min(DAEMON_CONTROL_IDLE_TIMEOUT)))?;
+    writeln!(
+        stream,
+        "{}",
+        super::authorization::encode_request(request, stream.peer_addr()?.port())?
+    )?;
     stream.flush()?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(DeadlineReader { stream, deadline });
     let mut line = String::new();
-    match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)? {
+    match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES).with_context(|| {
+        format!(
+            "Waiting for daemon response to operation {} ({}s limit)",
+            request.op,
+            timeout.as_secs_f64()
+        )
+    })? {
         BoundedLineRead::Line => {}
         BoundedLineRead::Eof => bail!("Renium daemon closed the connection before responding"),
         BoundedLineRead::TooLong => bail!("Renium daemon response exceeded the protocol limit"),
@@ -87,87 +128,76 @@ pub(crate) fn daemon_endpoint_available(address: SocketAddr, timeout: Duration) 
         cx: None,
         p: json!({}),
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT)
-    else {
+    let Ok(stream) = TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT) else {
         return false;
     };
-    send_on_stream_with_timeout(&mut stream, &request, timeout)
-        .is_ok_and(|response| response.ok == 1)
+    send_on_stream_with_timeout(&stream, &request, timeout).is_ok_and(|response| response.ok == 1)
 }
 
 fn forward_proxy_request(
     request: &super::Request,
+    control: &super::stdio_proxy::RequestControl,
     bridge_ports: &str,
     bridge_wait_seconds: f64,
 ) -> super::Response {
-    match try_send_request(request) {
-        Ok(Some(response)) => response,
-        Ok(None) if crate::daemon::start_shared_daemon(bridge_ports, bridge_wait_seconds) => {
-            match try_send_request(request) {
-                Ok(Some(response)) => response,
-                Ok(None) => transport_failure(
-                    request.id,
-                    anyhow::anyhow!("Renium daemon did not become available"),
-                ),
-                Err(error) => transport_failure(request.id, error),
+    let forward = || {
+        let stream = match connect_daemon() {
+            Some(stream) => stream,
+            None => {
+                crate::daemon::ensure_shared_daemon(bridge_ports, bridge_wait_seconds)?;
+                connect_daemon().context("Renium daemon did not become available")?
             }
-        }
-        Ok(None) => transport_failure(request.id, anyhow::anyhow!("Renium daemon is not running")),
-        Err(error) => transport_failure(request.id, error),
-    }
+        };
+        let stream = crate::system::net::SharedTcpStream::from(stream);
+        control.attach(&stream)?;
+        send_on_stream(&stream, request)
+    };
+    forward().unwrap_or_else(|error| transport_failure(request.id, error))
 }
 
 pub(crate) fn run_stdio_proxy(bridge_ports: String, bridge_wait_seconds: f64) -> Result<()> {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut line = String::new();
-    let stdout_gate = Arc::new(Mutex::new(()));
-    loop {
-        match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)? {
-            BoundedLineRead::Eof => break,
-            BoundedLineRead::Line => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let request = trimmed.to_string();
-                let stdout_gate = Arc::clone(&stdout_gate);
-                let bridge_ports = bridge_ports.clone();
-                std::thread::spawn(move || {
-                    let response = match serde_json::from_str::<super::Request>(&request) {
-                        Ok(request) => {
-                            forward_proxy_request(&request, &bridge_ports, bridge_wait_seconds)
-                        }
-                        Err(error) => super::Response::failure(
-                            0,
-                            Instant::now(),
-                            super::Failure::new(
-                                "bad_req",
-                                format!("Invalid request JSON: {error}"),
-                                false,
-                                "cap",
-                            ),
-                        ),
-                    };
-                    let Ok(response) = serde_json::to_string(&response) else {
-                        return;
-                    };
-                    let _guard = stdout_gate
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    crate::app::output::write_stdout(format_args!("{response}"));
-                    let _ = io::stdout().flush();
-                });
-            }
-            BoundedLineRead::TooLong => {
-                let response = super::runtime::oversized_automation_request_response();
-                crate::app::output::write_stdout(format_args!(
-                    "{}",
-                    serde_json::to_string(&response)?
-                ));
-                io::stdout().flush()?;
-            }
-        }
+    super::stdio_proxy::run(io::stdin().lock(), io::stdout(), |request, control| {
+        forward_proxy_request(request, control, &bridge_ports, bridge_wait_seconds)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn response_deadline_is_absolute_and_reports_the_waiting_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut peer = listener.accept().unwrap().0;
+        peer.write_all(b"ab").unwrap();
+        let mut reader = DeadlineReader {
+            stream: &client,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
+        reader.deadline = Instant::now();
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let mut remaining = [0];
+        client.read_exact(&mut remaining).unwrap();
+        assert_eq!(remaining[0], b'b');
+        let error = send_on_stream_with_timeout(
+            &client,
+            &super::super::Request {
+                v: super::super::PROTOCOL_VERSION,
+                id: 1,
+                op: op::STUDIO_STATUS,
+                cx: None,
+                p: json!({}),
+            },
+            Duration::from_millis(20),
+        )
+        .err()
+        .expect("an unanswered status must time out");
+        assert!(format!("{error:#}").contains("Waiting for daemon response to operation 51"));
     }
-    Ok(())
 }

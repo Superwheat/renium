@@ -4,6 +4,11 @@ type ExplorerSortableNode = {
   className: string;
 };
 
+// Reserved service-root staging names, not a filter for Roblox descendants.
+export function isImportStageName(name: string): boolean {
+  return /^\..+\.\d+-\d+\.renium-import$/.test(name);
+}
+
 export const DEFAULT_SYNC_SERVICES = [
   "Workspace",
   "Players",

@@ -6832,16 +6832,11 @@ const CATEGORY_RANK_OVERRIDE = {
     pathfinding: 78
 };
 
-const CATEGORY_RANK_FALLBACK = {
-    avatar: 18,
-    pathfinding: 78
-};
-
 function compareCategoryNames(a, b) {
     const aKey = normalizeKey(a);
     const bKey = normalizeKey(b);
-    const aRank = CATEGORY_RANK_OVERRIDE[aKey] ?? ORDER_DATA.categoryRank[aKey] ?? CATEGORY_RANK_FALLBACK[aKey];
-    const bRank = CATEGORY_RANK_OVERRIDE[bKey] ?? ORDER_DATA.categoryRank[bKey] ?? CATEGORY_RANK_FALLBACK[bKey];
+    const aRank = CATEGORY_RANK_OVERRIDE[aKey] ?? ORDER_DATA.categoryRank[aKey];
+    const bRank = CATEGORY_RANK_OVERRIDE[bKey] ?? ORDER_DATA.categoryRank[bKey];
 
     const aHas = typeof aRank === "number";
     const bHas = typeof bRank === "number";

@@ -39,6 +39,9 @@ fs.writeFileSync(project, JSON.stringify({ schemaVersion: 1, sourceRoot: "src", 
 
 const daemonEnvironment = {
   ...process.env,
+  RENIUM_DAEMON: `127.0.0.1:${controlPort}`,
+  RENIUM_DAEMON_HOST: "127.0.0.1",
+  RENIUM_DAEMON_NAME: path.basename(root),
   RENIUM_DAEMON_CONTROL_PORT: String(controlPort),
   RENIUM_DAEMON_FILE: path.join(root, "daemon.json"),
 };
@@ -195,7 +198,11 @@ try {
     });
   });
   if (fs.existsSync(daemonEnvironment.RENIUM_DAEMON_FILE)) {
-    const stopped = childProcess.spawnSync(executable, ["dm", "stop", "default", "--force"], {
+    const owned = JSON.parse(fs.readFileSync(daemonEnvironment.RENIUM_DAEMON_FILE, "utf8"));
+    if (owned.name !== daemonEnvironment.RENIUM_DAEMON_NAME || owned.controlPort !== controlPort || owned.host !== "127.0.0.1") {
+      throw new Error("Replay cleanup refused a daemon outside its isolated test target");
+    }
+    const stopped = childProcess.spawnSync(executable, ["dm", "stop", daemonEnvironment.RENIUM_DAEMON_NAME, "--force"], {
       cwd: repository,
       env: daemonEnvironment,
       encoding: "utf8",

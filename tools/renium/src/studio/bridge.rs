@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,7 @@ use crate::daemon::transport::pid_for_local_tcp_port;
 use crate::snapshot::export::{parse_bridge_chunk, validate_bridge_chunk, validate_bridge_info};
 use crate::studio::automation::TestLaunch;
 use crate::studio::target::{place_filter, place_matches};
+use crate::system::net::SharedTcpStream;
 
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
@@ -42,6 +43,69 @@ const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
 const BRIDGE_CHANNEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BRIDGE_SLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+const BRIDGE_QUICK_SOCKET_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Manual Studio Play has no Renium launch token. Resolve its owner from the
+// process first, or from a unique published place; never guess between windows.
+fn play_owner_runtime(
+    info: &BridgeInfoPayload,
+    studio_pid: Option<u32>,
+    edits: impl Iterator<Item = BridgeSocketSnapshot>,
+) -> Option<String> {
+    if !info.launch_edit_runtime_id.is_empty() {
+        return Some(info.launch_edit_runtime_id.clone());
+    }
+    if !matches!(
+        normalize_bridge_role(&info.bridge_role),
+        BRIDGE_ROLE_PLAY_CLIENT | BRIDGE_ROLE_PLAY_SERVER
+    ) {
+        return None;
+    }
+    let mut process_owners = HashSet::new();
+    let mut place_owners = HashSet::new();
+    for edit in edits {
+        if BridgeServer::bridge_role_key_base(&edit.role_key) != BRIDGE_ROLE_EDIT
+            || edit.bridge_info.runtime_id.is_empty()
+        {
+            continue;
+        }
+        let same_place = info.place_id.is_some_and(|id| id > 0)
+            && info.place_id == edit.bridge_info.place_id
+            && info.game_id == edit.bridge_info.game_id;
+        let same_process = studio_pid.is_some() && studio_pid == edit.studio_pid;
+        if same_process && (same_place || info.place_id.is_none_or(|id| id <= 0)) {
+            process_owners.insert(edit.bridge_info.runtime_id.clone());
+        }
+        if same_place {
+            place_owners.insert(edit.bridge_info.runtime_id);
+        }
+    }
+    let owners = if process_owners.is_empty() {
+        place_owners
+    } else {
+        process_owners
+    };
+    (owners.len() == 1).then(|| owners.into_iter().next().unwrap())
+}
+
+struct HandshakePermit(Arc<AtomicUsize>);
+
+impl HandshakePermit {
+    fn acquire(pending: &Arc<AtomicUsize>) -> Option<Self> {
+        pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 8).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(pending)))
+    }
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 pub(crate) fn clamp_bridge_chunk_size(size: usize) -> usize {
     size.clamp(MIN_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_CHUNK_BYTES)
 }
@@ -63,6 +127,37 @@ impl std::fmt::Display for BridgeRequestTooLarge {
 }
 
 impl std::error::Error for BridgeRequestTooLarge {}
+
+#[derive(Debug)]
+struct BridgeResponseTimeout(String);
+
+impl std::fmt::Display for BridgeResponseTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BridgeResponseTimeout {}
+
+fn is_status_observation(method: &str, params: &Value) -> bool {
+    method == "getStudioState"
+        || method == "startStopPlay" && params.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn default_method_target(method: &str) -> BridgeTarget {
+    // Native exports describe saved Edit state, never a running simulation.
+    // Main intentionally prefers a play server for runtime commands; using it
+    // here can even replace an existing Edit pin when Play starts.
+    match method {
+        "beginEditorBinaryExport"
+        | "awaitEditorBinaryExport"
+        | "readEditorBinaryExport"
+        | "readEditorBinaryExportBatch"
+        | "getEditorBinaryOverlayChunk"
+        | "finishEditorBinaryExport" => BridgeTarget::Edit,
+        _ => BridgeTarget::Main,
+    }
+}
 
 fn bridge_response_timeout(method: &str) -> Duration {
     match method {
@@ -86,6 +181,20 @@ fn bridge_response_timeout(method: &str) -> Duration {
     }
 }
 
+fn bridge_socket_attempt_timeout(method: &str, params: &Value, remaining: Duration) -> Duration {
+    let retry_quickly = matches!(method, "getStudioState" | "startStopPlay")
+        || (method == "deviceSimulator"
+            && matches!(
+                params.get("action").and_then(Value::as_str),
+                Some("capture-status" | "status")
+            ));
+    if retry_quickly {
+        remaining.min(BRIDGE_QUICK_SOCKET_ATTEMPT_TIMEOUT)
+    } else {
+        remaining
+    }
+}
+
 fn bridge_channel_lock_timeout(method: &str) -> Duration {
     match method {
         "appendEditorBinaryImport" | "appendEditorPushReview" | "appendEditorTransactionUpload" => {
@@ -95,18 +204,295 @@ fn bridge_channel_lock_timeout(method: &str) -> Duration {
     }
 }
 
-fn bridge_method_allowed_after_cancel(method: &str) -> bool {
-    matches!(
-        method,
-        "cancelRequestLease"
-            | "getEditorTransactionState"
-            | "rollbackEditorTransaction"
-            | "cancelEditorTransactionUpload"
-            | "cancelEditorBinaryImport"
-            | "cancelEditorReconcile"
-            | "cancelEditorPushReview"
-            | "finishEditorBinaryExport"
-    )
+fn bridge_request_allowed_after_cancel(method: &str, params: &Value) -> bool {
+    (method == "startStopPlay" && params.get("start").and_then(Value::as_bool) != Some(true))
+        || matches!(
+            method,
+            "cancelRequestLease"
+                | "getEditorTransactionState"
+                | "rollbackEditorTransaction"
+                | "cancelEditorTransactionUpload"
+                | "cancelEditorBinaryImport"
+                | "cancelEditorReconcile"
+                | "cancelEditorPushReview"
+                | "finishEditorBinaryExport"
+        )
+}
+
+#[cfg(test)]
+#[path = "bridge_routing_tests.rs"]
+mod routing_tests;
+
+#[cfg(test)]
+mod request_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn manual_play_ownership_uses_process_or_unique_place_not_names() {
+        let edit = |runtime: &str, place: i64, pid: u32| BridgeSocketSnapshot {
+            port: 8781,
+            peer: String::new(),
+            studio_pid: Some(pid),
+            role_key: BRIDGE_ROLE_EDIT.into(),
+            bridge_info: BridgeInfoPayload {
+                runtime_id: runtime.into(),
+                bridge_role: BRIDGE_ROLE_EDIT.into(),
+                game_id: Some(10),
+                place_id: Some(place),
+                place_name: "Place1".into(),
+                ..BridgeInfoPayload::default()
+            },
+        };
+        let mut client = BridgeInfoPayload {
+            runtime_id: "client".into(),
+            bridge_role: BRIDGE_ROLE_PLAY_CLIENT.into(),
+            game_id: Some(10),
+            place_id: Some(20),
+            place_name: "DTE @ current test".into(),
+            player_name: "The_SirMeme".into(),
+            ..BridgeInfoPayload::default()
+        };
+        let mut edits = vec![edit("dte", 20, 100), edit("baseplate", 30, 200)];
+        // Duplicate bridge channels are one owner, not two Studio windows.
+        edits.push(edits[0].clone());
+        for role in [BRIDGE_ROLE_PLAY_CLIENT, BRIDGE_ROLE_PLAY_SERVER] {
+            client.bridge_role = role.into();
+            assert_eq!(
+                play_owner_runtime(&client, Some(100), edits.clone().into_iter()).as_deref(),
+                Some("dte")
+            );
+            assert_eq!(
+                play_owner_runtime(&client, Some(300), edits.clone().into_iter()).as_deref(),
+                Some("dte")
+            );
+        }
+        edits.push(edit("second-dte", 20, 400));
+        assert_eq!(
+            play_owner_runtime(&client, Some(100), edits.clone().into_iter()).as_deref(),
+            Some("dte")
+        );
+        assert_eq!(
+            play_owner_runtime(&client, None, edits.clone().into_iter()),
+            None
+        );
+        client.launch_edit_runtime_id = "second-dte".into();
+        assert_eq!(
+            play_owner_runtime(&client, Some(100), edits.clone().into_iter()).as_deref(),
+            Some("second-dte")
+        );
+        client.launch_edit_runtime_id.clear();
+        client.place_id = Some(0);
+        assert_eq!(
+            play_owner_runtime(&client, Some(100), edits.clone().into_iter()).as_deref(),
+            Some("dte")
+        );
+        assert_eq!(
+            play_owner_runtime(&client, None, edits.clone().into_iter()),
+            None
+        );
+        client.place_id = Some(99);
+        assert_eq!(
+            play_owner_runtime(&client, Some(100), edits.into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn stalled_handshake_does_not_block_registration_and_ack_follows_inventory() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let channel = Arc::new(BridgeChannel {
+            port: address.port(),
+            sockets: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
+        });
+        let alive = Arc::new(AtomicBool::new(true));
+        BridgeServer::spawn_accept_loop(
+            "127.0.0.1".into(),
+            address.port(),
+            listener,
+            Arc::clone(&channel),
+            BridgeAcceptState {
+                alive: Arc::clone(&alive),
+                request_session_id: "handshake-test".into(),
+                next_id: Default::default(),
+                routing: Default::default(),
+                desired_device_request: Default::default(),
+                device_reconciled_runtimes: Default::default(),
+                all_channels: Arc::new(Mutex::new(vec![Arc::clone(&channel)])),
+                expected_channels: 1,
+                reconcile_device_on_connect: false,
+                performance_manager: None,
+                #[cfg(any(windows, target_os = "macos"))]
+                update_checked_runtimes: Default::default(),
+                #[cfg(any(windows, target_os = "macos"))]
+                check_updates_on_connect: false,
+            },
+        );
+        let stalled = TcpStream::connect(address).unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut ready, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
+        let request: Value =
+            serde_json::from_str(&ready.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(request["params"]["registrationAck"], true);
+        ready.send(Message::Text(json!({
+            "id": request["id"], "ok": true, "result": {
+                "runtimeId": "handshake-test", "bridgeRole": "play-server", "registrationAck": true,
+                "protocolVersion": "compact-v5", "codecVersion": "compact-v5-schema-9",
+                "chunkFrameProtocolVersion": "rbs2", "compactValueProtocolVersion": "compact-v5-schema-4",
+            },
+        }).to_string().into())).unwrap();
+        let ack: Value = serde_json::from_str(&ready.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(ack["method"], "bridgeRegistered");
+        assert_eq!(ack["session_id"], "handshake-test");
+        assert_eq!(
+            channel.snapshots.lock().unwrap().len(),
+            1,
+            "ack must follow registration"
+        );
+        alive.store(false, Ordering::Relaxed);
+        drop(stalled);
+        drop(ready);
+
+        let pending = Arc::new(AtomicUsize::new(0));
+        let mut permits: Vec<_> = (0..8)
+            .map(|_| HandshakePermit::acquire(&pending).unwrap())
+            .collect();
+        assert!(HandshakePermit::acquire(&pending).is_none());
+        permits.pop();
+        assert!(HandshakePermit::acquire(&pending).is_some());
+    }
+
+    #[test]
+    fn slow_status_keeps_connection_and_ignores_its_late_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (resume, delayed) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut socket =
+                WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Server, None);
+            for delayed_reply in [true, false] {
+                let message = socket.read().unwrap().into_text().unwrap();
+                let request: Value = serde_json::from_str(&message).unwrap();
+                if delayed_reply {
+                    delayed.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "id": request["id"], "ok": true, "result": {"late": delayed_reply}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let socket = BridgeSocket {
+            port: address.port(),
+            peer: address.to_string(),
+            studio_pid: None,
+            role: BRIDGE_ROLE_EDIT.to_string(),
+            last_focused_at: Instant::now(),
+            bridge_info: BridgeInfoPayload {
+                runtime_id: "test-runtime".to_string(),
+                ..Default::default()
+            },
+            request_session_id: "test".to_string(),
+            pending_final_console_snapshots: Vec::new(),
+            pending_player_identity: None,
+            active_request_lease: None,
+            cancel_request_id: None,
+            socket: WebSocket::from_raw_socket(
+                client.into(),
+                tungstenite::protocol::Role::Client,
+                None,
+            ),
+        };
+        let channel = Arc::new(BridgeChannel {
+            port: address.port(),
+            sockets: Mutex::new(HashMap::from([(
+                BRIDGE_ROLE_EDIT.to_string(),
+                BridgeConnection::new(socket),
+            )])),
+            snapshots: Mutex::new(HashMap::new()),
+        });
+        let bridge = BridgeServer {
+            channels: vec![Arc::clone(&channel)],
+            alive: Arc::new(AtomicBool::new(true)),
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            preferred_index: Default::default(),
+            request_gate: Mutex::new(()),
+            active_request_leases: Mutex::new(HashMap::new()),
+            runtime_pins: Mutex::new(HashMap::new()),
+            final_console_snapshots: Mutex::new(HashMap::new()),
+            desired_device_request: Arc::new(Mutex::new(Value::Null)),
+            routing: Default::default(),
+            performance_manager: None,
+        };
+        let result = bridge.call_for_runtime_with_timeout(
+            "getStudioState",
+            json!({}),
+            BridgeTarget::Edit,
+            "test-runtime",
+            Some(Duration::from_millis(10)),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<BridgeResponseTimeout>()
+                .is_some()
+        );
+        assert_eq!(channel.sockets.lock().unwrap().len(), 1);
+        resume.send(()).unwrap();
+        let result = bridge
+            .call_for_runtime_with_timeout(
+                "getStudioState",
+                json!({}),
+                BridgeTarget::Edit,
+                "test-runtime",
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert_eq!(result, json!({"late": false}));
+        assert_eq!(channel.sockets.lock().unwrap().len(), 1);
+        worker.join().unwrap();
+        assert!(is_status_observation("startStopPlay", &json!({})));
+        assert!(!is_status_observation(
+            "startStopPlay",
+            &json!({"start": true})
+        ));
+        assert!(!is_status_observation(
+            "startStopPlay",
+            &json!({"stop": true})
+        ));
+        assert!(!is_status_observation("applyEditorChanges", &json!({})));
+    }
+
+    #[test]
+    fn play_status_and_stop_survive_bridge_reload_but_start_does_not() {
+        assert!(bridge_request_allowed_after_cancel(
+            "startStopPlay",
+            &json!({})
+        ));
+        assert!(bridge_request_allowed_after_cancel(
+            "startStopPlay",
+            &json!({ "stop": true })
+        ));
+        assert!(!bridge_request_allowed_after_cancel(
+            "startStopPlay",
+            &json!({ "start": true })
+        ));
+    }
 }
 
 fn bridge_request_lease_id<'a>(
@@ -203,6 +589,7 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) performance_mode: String,
     pub(crate) export_all_properties: bool,
     pub(crate) modified_default_bypass: bool,
+    pub(crate) registration_ack: bool,
 }
 
 #[derive(Deserialize)]
@@ -240,9 +627,54 @@ pub(crate) struct BridgeSocket {
     pub(crate) bridge_info: BridgeInfoPayload,
     pub(crate) request_session_id: String,
     pub(crate) pending_final_console_snapshots: Vec<Value>,
+    pending_player_identity: Option<(u64, Instant)>,
     active_request_lease: Option<Arc<BridgeRequestLease>>,
     cancel_request_id: Option<u64>,
-    pub(crate) socket: WebSocket<TcpStream>,
+    pub(crate) socket: WebSocket<SharedTcpStream>,
+}
+
+// Routing metadata stays available while this connection is executing a request.
+// Never hold the channel registry while waiting for this connection's I/O lock.
+#[derive(Clone)]
+pub(crate) struct BridgeConnection {
+    port: u16,
+    peer: String,
+    studio_pid: Option<u32>,
+    role: String,
+    last_focused_at: Instant,
+    bridge_info: BridgeInfoPayload,
+    io: Arc<Mutex<BridgeSocket>>,
+    shutdown: SharedTcpStream,
+}
+
+impl BridgeConnection {
+    fn new(socket: BridgeSocket) -> Self {
+        Self {
+            port: socket.port,
+            peer: socket.peer.clone(),
+            studio_pid: socket.studio_pid,
+            role: socket.role.clone(),
+            last_focused_at: socket.last_focused_at,
+            bridge_info: socket.bridge_info.clone(),
+            shutdown: socket.socket.get_ref().clone(),
+            io: Arc::new(Mutex::new(socket)),
+        }
+    }
+
+    fn close(&self) {
+        // Also interrupts an outstanding read on a replaced/retired connection.
+        let _ = self.shutdown.shutdown(Shutdown::Both);
+    }
+
+    fn is_alive(&self) -> bool {
+        match self.io.try_lock() {
+            Ok(mut socket) => BridgeServer::socket_is_alive(&mut socket),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                BridgeServer::socket_is_alive(&mut poisoned.into_inner())
+            }
+            Err(TryLockError::WouldBlock) => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -254,9 +686,50 @@ struct BridgeSocketSnapshot {
     bridge_info: BridgeInfoPayload,
 }
 
+#[derive(Default)]
+struct RuntimeRouting {
+    retired: HashSet<String>,
+    // Only the owning edit runtime establishes the launch, never a late client.
+    launches: HashMap<String, (u64, String)>,
+}
+
+impl RuntimeRouting {
+    fn allows(&self, info: &BridgeInfoPayload) -> bool {
+        self.allows_identity(
+            &info.runtime_id,
+            &info.bridge_role,
+            &info.launch_edit_runtime_id,
+            &info.launch_nonce,
+        )
+    }
+
+    fn allows_identity(&self, runtime: &str, role: &str, owner: &str, nonce: &str) -> bool {
+        if self.retired.contains(runtime) {
+            return false;
+        }
+        if nonce.is_empty() || role == BRIDGE_ROLE_EDIT {
+            return true;
+        }
+        self.launches
+            .get(owner)
+            .is_none_or(|(_, current)| current == nonce)
+    }
+
+    fn observe_launch(&mut self, edit: &str, sequence: u64, nonce: &str) {
+        if !nonce.is_empty()
+            && self
+                .launches
+                .get(edit)
+                .is_none_or(|(previous, _)| sequence > *previous)
+        {
+            self.launches.insert(edit.into(), (sequence, nonce.into()));
+        }
+    }
+}
+
 pub(crate) struct BridgeChannel {
     pub(crate) port: u16,
-    pub(crate) sockets: Mutex<HashMap<String, BridgeSocket>>,
+    pub(crate) sockets: Mutex<HashMap<String, BridgeConnection>>,
     snapshots: Mutex<HashMap<String, BridgeSocketSnapshot>>,
 }
 
@@ -265,6 +738,7 @@ struct BridgeAcceptState {
     alive: Arc<AtomicBool>,
     request_session_id: String,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    routing: Arc<Mutex<RuntimeRouting>>,
     desired_device_request: Arc<Mutex<Value>>,
     device_reconciled_runtimes: Arc<Mutex<HashSet<String>>>,
     all_channels: Arc<Mutex<Vec<Arc<BridgeChannel>>>>,
@@ -287,6 +761,7 @@ pub(crate) struct BridgeServer {
     active_request_leases: Mutex<HashMap<thread::ThreadId, Arc<BridgeRequestLease>>>,
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
+    routing: Arc<Mutex<RuntimeRouting>>,
     pub(crate) final_console_snapshots: Mutex<HashMap<String, FinalConsoleSnapshot>>,
     desired_device_request: Arc<Mutex<Value>>,
     performance_manager: Option<Arc<crate::studio::performance::Manager>>,
@@ -387,13 +862,6 @@ impl BridgeRequestLease {
         }
     }
 
-    pub(crate) fn is_finished(&self) -> bool {
-        matches!(
-            self.state.load(Ordering::Acquire),
-            REQUEST_LEASE_FINISHED | REQUEST_LEASE_CANCELLED_FINISHED
-        )
-    }
-
     pub(crate) fn ensure_active(&self) -> Result<()> {
         if self.is_cancelled() {
             bail!("Renium request was cancelled because its client disconnected");
@@ -468,6 +936,8 @@ pub(crate) struct RuntimePinKey {
 #[derive(Clone)]
 pub(crate) struct RuntimePin {
     pub(crate) runtime_id: String,
+    // An operation's explicit binding is not a role-preference cache entry.
+    exact: bool,
 }
 
 struct BridgeCallContext<'a> {
@@ -610,6 +1080,7 @@ impl BridgeServer {
             alive: Arc::clone(&alive),
             request_session_id,
             next_id: Arc::clone(&next_id),
+            routing: Arc::new(Mutex::new(RuntimeRouting::default())),
             desired_device_request: Arc::clone(&desired_device_request),
             device_reconciled_runtimes: Arc::clone(&device_reconciled_runtimes),
             all_channels: Arc::clone(&all_channels),
@@ -668,6 +1139,7 @@ impl BridgeServer {
             request_gate: Mutex::new(()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
+            routing: Arc::clone(&accept_state.routing),
             final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request,
             performance_manager,
@@ -741,145 +1213,207 @@ impl BridgeServer {
         channel: Arc<BridgeChannel>,
         state: BridgeAcceptState,
     ) {
-        let BridgeAcceptState {
-            alive,
-            request_session_id,
-            next_id,
-            desired_device_request,
-            device_reconciled_runtimes,
-            all_channels,
-            expected_channels,
-            reconcile_device_on_connect,
-            performance_manager,
-            #[cfg(any(windows, target_os = "macos"))]
-            update_checked_runtimes,
-            #[cfg(any(windows, target_os = "macos"))]
-            check_updates_on_connect,
-        } = state;
         thread::spawn(move || {
-            while alive.load(Ordering::Relaxed) {
+            let pending = Arc::new(AtomicUsize::new(0));
+            while state.alive.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, addr)) => {
+                        let Some(permit) = HandshakePermit::acquire(&pending) else {
+                            continue;
+                        };
                         let peer = addr.to_string();
-                        match Self::accept_ready_socket(
-                            &bind_host,
-                            port,
-                            stream,
-                            peer.clone(),
-                            &request_session_id,
-                        ) {
-                            Ok(socket) => {
-                                let device_runtime = (reconcile_device_on_connect
-                                    && socket.role == BRIDGE_ROLE_EDIT)
-                                    .then(|| socket.bridge_info.runtime_id.clone());
-                                let performance_peer =
-                                    (socket.role == BRIDGE_ROLE_EDIT).then(|| socket.peer.clone());
-                                #[cfg(target_os = "macos")]
-                                let auto_recovery_peer =
-                                    (socket.role == BRIDGE_ROLE_EDIT).then(|| socket.peer.clone());
+                        let state = state.clone();
+                        let bind_host = bind_host.clone();
+                        let channel = Arc::clone(&channel);
+                        thread::spawn(move || {
+                            let _permit = permit;
+                            let BridgeAcceptState {
+                                alive,
+                                request_session_id,
+                                next_id,
+                                routing,
+                                desired_device_request,
+                                device_reconciled_runtimes,
+                                all_channels,
+                                expected_channels,
+                                reconcile_device_on_connect,
+                                performance_manager,
                                 #[cfg(any(windows, target_os = "macos"))]
-                                let update_target = (check_updates_on_connect
-                                    && socket.role == BRIDGE_ROLE_EDIT)
-                                    .then(|| socket.bridge_info.runtime_id.clone());
-                                let mut guard = channel
-                                    .sockets
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner);
-                                let role = socket.role.clone();
-                                let socket_key =
-                                    Self::bridge_socket_key(&guard, &role, &socket.peer);
-                                if socket_key == role {
-                                    crate::app::output::log_global(
-                                        4,
-                                        format_args!(
-                                            "[renium] bridge channel ready on {}:{} role={} from {} build={}",
-                                            bind_host,
-                                            port,
-                                            socket.role,
-                                            socket.peer,
-                                            socket.bridge_info.bridge_build_unix
-                                        ),
-                                    );
-                                }
-                                guard.insert(socket_key, socket);
-                                Self::refresh_channel_snapshots(&channel, &guard);
-                                drop(guard);
-                                if let (Some(manager), Some(peer)) =
-                                    (&performance_manager, performance_peer)
-                                    && let Ok(pid) = Self::studio_pid_for_peer(&peer)
-                                {
-                                    let manager = Arc::clone(manager);
-                                    thread::spawn(move || {
-                                        if let Err(error) = manager.enroll(pid) {
-                                            eprintln!(
-                                                "[renium] performance profile could not enroll Studio {pid}: {error:#}"
+                                update_checked_runtimes,
+                                #[cfg(any(windows, target_os = "macos"))]
+                                check_updates_on_connect,
+                            } = state;
+                            match Self::accept_ready_socket(
+                                &bind_host,
+                                port,
+                                stream,
+                                peer.clone(),
+                                &request_session_id,
+                            ) {
+                                Ok(socket) => {
+                                    if !alive.load(Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    let device_runtime = (reconcile_device_on_connect
+                                        && socket.role == BRIDGE_ROLE_EDIT)
+                                        .then(|| socket.bridge_info.runtime_id.clone());
+                                    let performance_peer = (socket.role == BRIDGE_ROLE_EDIT)
+                                        .then(|| socket.peer.clone());
+                                    #[cfg(target_os = "macos")]
+                                    let auto_recovery_peer = (socket.role == BRIDGE_ROLE_EDIT)
+                                        .then(|| socket.peer.clone());
+                                    #[cfg(any(windows, target_os = "macos"))]
+                                    let update_target = (check_updates_on_connect
+                                        && socket.role == BRIDGE_ROLE_EDIT)
+                                        .then(|| socket.bridge_info.runtime_id.clone());
+                                    let mut guard = channel
+                                        .sockets
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    {
+                                        let mut routing =
+                                            routing.lock().unwrap_or_else(PoisonError::into_inner);
+                                        if !routing.allows(&socket.bridge_info) {
+                                            return;
+                                        }
+                                        if socket.role == BRIDGE_ROLE_EDIT {
+                                            routing.observe_launch(
+                                                &socket.bridge_info.runtime_id,
+                                                0,
+                                                &socket.bridge_info.launch_nonce,
                                             );
                                         }
+                                    }
+                                    let role = socket.role.clone();
+                                    guard.retain(|_, previous| {
+                                        let replaced = previous.bridge_info.runtime_id
+                                            == socket.bridge_info.runtime_id
+                                            && previous.role == role;
+                                        if replaced {
+                                            previous.close();
+                                        }
+                                        !replaced
                                     });
-                                }
-                                #[cfg(target_os = "macos")]
-                                if let Some(peer) = auto_recovery_peer
-                                    && let Ok(pid) = Self::studio_pid_for_peer(&peer)
-                                {
-                                    input_inject::watch_auto_recovery_dialog_for_pid(pid);
-                                }
-                                if let Some(runtime_id) = device_runtime {
-                                    let channels = all_channels
+                                    let socket_key =
+                                        Self::bridge_socket_key(&guard, &role, &socket.peer);
+                                    if socket_key == role {
+                                        crate::app::output::log_global(
+                                            4,
+                                            format_args!(
+                                                "[renium] bridge channel ready on {}:{} role={} from {} build={}",
+                                                bind_host,
+                                                port,
+                                                socket.role,
+                                                socket.peer,
+                                                socket.bridge_info.bridge_build_unix
+                                            ),
+                                        );
+                                    }
+                                    let connection = BridgeConnection::new(socket);
+                                    // Register before acknowledging, but don't send under the registry lock.
+                                    let mut socket = connection
+                                        .io
                                         .lock()
-                                        .unwrap_or_else(PoisonError::into_inner)
-                                        .clone();
-                                    let ready = channels
-                                        .iter()
-                                        .filter(|channel| {
-                                            channel
-                                                .sockets
-                                                .lock()
-                                                .unwrap_or_else(PoisonError::into_inner)
-                                                .values()
-                                                .any(|socket| {
-                                                    socket.role == BRIDGE_ROLE_EDIT
-                                                        && socket.bridge_info.runtime_id
-                                                            == runtime_id
-                                                })
-                                        })
-                                        .count();
-                                    if ready >= expected_channels
-                                        && device_reconciled_runtimes
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    guard.insert(socket_key.clone(), connection.clone());
+                                    Self::refresh_channel_snapshots(&channel, &guard);
+                                    drop(guard);
+                                    if socket.bridge_info.registration_ack {
+                                        let ack = json!({
+                                            "id": 0, "method": "bridgeRegistered", "params": {},
+                                            "session_id": request_session_id,
+                                        });
+                                        if socket
+                                            .socket
+                                            .send(Message::Text(ack.to_string().into()))
+                                            .is_err()
+                                        {
+                                            Self::remove_connection(
+                                                &channel,
+                                                &socket_key,
+                                                &connection,
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    drop(socket);
+                                    if let (Some(manager), Some(peer)) =
+                                        (&performance_manager, performance_peer)
+                                        && let Ok(pid) = Self::studio_pid_for_peer(&peer)
+                                    {
+                                        let manager = Arc::clone(manager);
+                                        thread::spawn(move || {
+                                            if let Err(error) = manager.enroll(pid) {
+                                                eprintln!(
+                                                    "[renium] performance profile could not enroll Studio {pid}: {error:#}"
+                                                );
+                                            }
+                                        });
+                                    }
+                                    #[cfg(target_os = "macos")]
+                                    if let Some(peer) = auto_recovery_peer
+                                        && let Ok(pid) = Self::studio_pid_for_peer(&peer)
+                                    {
+                                        input_inject::watch_auto_recovery_dialog_for_pid(pid);
+                                    }
+                                    if let Some(runtime_id) = device_runtime {
+                                        let channels = all_channels
                                             .lock()
                                             .unwrap_or_else(PoisonError::into_inner)
-                                            .insert(runtime_id.clone())
-                                    {
-                                        Self::apply_desired_device_state(
+                                            .clone();
+                                        let ready = channels
+                                            .iter()
+                                            .filter(|channel| {
+                                                channel
+                                                    .sockets
+                                                    .lock()
+                                                    .unwrap_or_else(PoisonError::into_inner)
+                                                    .values()
+                                                    .any(|socket| {
+                                                        socket.role == BRIDGE_ROLE_EDIT
+                                                            && socket.bridge_info.runtime_id
+                                                                == runtime_id
+                                                    })
+                                            })
+                                            .count();
+                                        if ready >= expected_channels
+                                            && device_reconciled_runtimes
+                                                .lock()
+                                                .unwrap_or_else(PoisonError::into_inner)
+                                                .insert(runtime_id.clone())
+                                        {
+                                            Self::apply_desired_device_state(
+                                                runtime_id,
+                                                Arc::clone(&channel),
+                                                Arc::clone(&next_id),
+                                                Arc::clone(&desired_device_request),
+                                                Arc::clone(&device_reconciled_runtimes),
+                                            );
+                                        }
+                                    }
+                                    #[cfg(any(windows, target_os = "macos"))]
+                                    if let Some(runtime_id) = update_target {
+                                        Self::check_for_update(
                                             runtime_id,
                                             Arc::clone(&channel),
                                             Arc::clone(&next_id),
-                                            Arc::clone(&desired_device_request),
-                                            Arc::clone(&device_reconciled_runtimes),
+                                            Arc::clone(&update_checked_runtimes),
                                         );
                                     }
                                 }
-                                #[cfg(any(windows, target_os = "macos"))]
-                                if let Some(runtime_id) = update_target {
-                                    Self::check_for_update(
-                                        runtime_id,
-                                        Arc::clone(&channel),
-                                        Arc::clone(&next_id),
-                                        Arc::clone(&update_checked_runtimes),
+                                Err(err) => {
+                                    println!(
+                                        "[renium] warning: bridge channel handshake failed on {bind_host}:{port} from {peer}: {err:#}"
                                     );
                                 }
                             }
-                            Err(err) => {
-                                println!(
-                                    "[renium] warning: bridge channel handshake failed on {bind_host}:{port} from {peer}: {err:#}"
-                                );
-                            }
-                        }
+                        });
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }
                     Err(err) => {
-                        if alive.load(Ordering::Relaxed) {
+                        if state.alive.load(Ordering::Relaxed) {
                             println!(
                                 "[renium] warning: listener accept failed on {bind_host}:{port}: {err}"
                             );
@@ -900,21 +1434,24 @@ impl BridgeServer {
     ) {
         thread::spawn(move || {
             let call_device = |request: &Value| -> Result<(Value, String)> {
-                let mut sockets = channel
+                let sockets = channel
                     .sockets
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let socket = sockets
-                    .values_mut()
+                    .values()
                     .find(|socket| {
                         socket.role == BRIDGE_ROLE_EDIT
                             && socket.bridge_info.runtime_id == runtime_id
                     })
+                    .cloned()
                     .context("Studio disconnected before device state could be restored")?;
+                drop(sockets);
+                let mut socket = socket.io.lock().unwrap_or_else(PoisonError::into_inner);
                 let peer = socket.peer.clone();
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                 let result = Self::call_on_socket_with_timeout(
-                    socket,
+                    &mut socket,
                     id,
                     "deviceSimulator",
                     request,
@@ -1066,22 +1603,28 @@ impl BridgeServer {
                     return;
                 }
             };
-            let mut sockets = channel
+            let sockets = channel
                 .sockets
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let Some(socket) = sockets.values_mut().find(|socket| {
-                socket.role == BRIDGE_ROLE_EDIT && socket.bridge_info.runtime_id == runtime_id
-            }) else {
+            let Some(socket) = sockets
+                .values()
+                .find(|socket| {
+                    socket.role == BRIDGE_ROLE_EDIT && socket.bridge_info.runtime_id == runtime_id
+                })
+                .cloned()
+            else {
                 checked_runtimes
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&runtime_id);
                 return;
             };
+            drop(sockets);
+            let mut socket = socket.io.lock().unwrap_or_else(PoisonError::into_inner);
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = Self::call_on_socket_with_timeout(
-                socket,
+                &mut socket,
                 id,
                 "setUpdateStatus",
                 &json!({ "latestVersion": version }),
@@ -1193,7 +1736,7 @@ impl BridgeServer {
             .max_message_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .accept_unmasked_frames(false);
-        let socket = accept_with_config(stream, Some(socket_config))
+        let socket = accept_with_config(SharedTcpStream::from(stream), Some(socket_config))
             .with_context(|| format!("WebSocket upgrade failed on {bind_host}:{port}"))?;
 
         let mut bridge_socket = BridgeSocket {
@@ -1205,6 +1748,7 @@ impl BridgeServer {
             bridge_info: BridgeInfoPayload::default(),
             request_session_id: request_session_id.to_string(),
             pending_final_console_snapshots: Vec::new(),
+            pending_player_identity: None,
             active_request_lease: None,
             cancel_request_id: None,
             socket,
@@ -1236,7 +1780,7 @@ impl BridgeServer {
             bridge_socket,
             id,
             "getBridgeInfo",
-            &json!({}),
+            &json!({"registrationAck": true}),
             None,
             None,
         )?;
@@ -1253,7 +1797,7 @@ impl BridgeServer {
     }
 
     pub(crate) fn bridge_socket_key(
-        sockets: &HashMap<String, BridgeSocket>,
+        sockets: &HashMap<String, BridgeConnection>,
         role: &str,
         peer: &str,
     ) -> String {
@@ -1310,23 +1854,42 @@ impl BridgeServer {
         false
     }
 
+    fn play_owner_runtime(
+        &self,
+        info: &BridgeInfoPayload,
+        studio_pid: Option<u32>,
+    ) -> Option<String> {
+        play_owner_runtime(
+            info,
+            studio_pid,
+            self.channels
+                .iter()
+                .flat_map(|channel| Self::cached_channel_snapshots(channel)),
+        )
+    }
+
     fn bridge_info_matches_selector(
+        &self,
         role_key: &str,
         info: &BridgeInfoPayload,
+        studio_pid: Option<u32>,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> bool {
-        if !Self::role_matches_target(role_key, target) {
+        if !Self::role_matches_target(role_key, target) || !self.runtime_is_routable(info) {
             return false;
         }
-        if let Some(place) = place_filter()
+        if let Some(runtime_id) = crate::app::context::automation_runtime() {
+            // Binding already resolved the place. Local test children can report
+            // "Place1" while the owning edit runtime reports its .rbxl filename.
+            // Use that exact runtime ownership, not a second mutable-name filter.
+            if info.runtime_id != runtime_id
+                && self.play_owner_runtime(info, studio_pid).as_deref() != Some(&runtime_id)
+            {
+                return false;
+            }
+        } else if let Some(place) = place_filter()
             && !place_matches(info, &place)
-        {
-            return false;
-        }
-        if let Some(runtime_id) = crate::app::context::automation_runtime()
-            && info.runtime_id != runtime_id
-            && info.launch_edit_runtime_id != runtime_id
         {
             return false;
         }
@@ -1334,22 +1897,30 @@ impl BridgeServer {
     }
 
     pub(crate) fn socket_matches_selector(
+        &self,
         role_key: &str,
-        socket: &BridgeSocket,
+        socket: &BridgeConnection,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> bool {
-        Self::bridge_info_matches_selector(role_key, &socket.bridge_info, target, player)
+        self.bridge_info_matches_selector(
+            role_key,
+            &socket.bridge_info,
+            socket.studio_pid,
+            target,
+            player,
+        )
     }
 
     pub(crate) fn distinct_places_for_selector(
-        sockets: &HashMap<String, BridgeSocket>,
+        &self,
+        sockets: &HashMap<String, BridgeConnection>,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> Vec<(Option<i64>, String)> {
         let mut places: Vec<(Option<i64>, String)> = Vec::new();
         for (role_key, socket) in sockets {
-            if !Self::socket_matches_selector(role_key.as_str(), socket, target, player) {
+            if !self.socket_matches_selector(role_key.as_str(), socket, target, player) {
                 continue;
             }
             let info = &socket.bridge_info;
@@ -1365,19 +1936,20 @@ impl BridgeServer {
     }
 
     pub(crate) fn ensure_place_unambiguous(
-        sockets: &mut HashMap<String, BridgeSocket>,
+        &self,
+        sockets: &mut HashMap<String, BridgeConnection>,
         target: BridgeTarget,
         player: Option<&str>,
     ) -> Result<()> {
         if crate::app::context::automation_runtime().is_some() {
             return Ok(());
         }
-        let mut places = Self::distinct_places_for_selector(sockets, target, player);
+        let mut places = self.distinct_places_for_selector(sockets, target, player);
         if places.len() > 1 {
             let dead_keys: Vec<String> = sockets
                 .iter_mut()
                 .filter_map(|(key, socket)| {
-                    if Self::socket_is_alive(socket) {
+                    if socket.is_alive() {
                         None
                     } else {
                         Some(key.clone())
@@ -1385,11 +1957,11 @@ impl BridgeServer {
                 })
                 .collect();
             for key in dead_keys {
-                if let Some(mut dead_socket) = sockets.remove(&key) {
-                    Self::close_socket(&mut dead_socket);
+                if let Some(dead_socket) = sockets.remove(&key) {
+                    dead_socket.close();
                 }
             }
-            places = Self::distinct_places_for_selector(sockets, target, player);
+            places = self.distinct_places_for_selector(sockets, target, player);
         }
         if places.len() > 1 {
             let listing = places
@@ -1446,6 +2018,43 @@ impl BridgeServer {
             .clear();
     }
 
+    pub(crate) fn retire_runtime(&self, runtime_id: &str) {
+        // Retire before best-effort cleanup: neither a busy channel nor an
+        // in-flight handshake may resurrect this runtime.
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retired
+            .insert(runtime_id.to_string());
+        for channel in &self.channels {
+            let mut retired = {
+                let mut sockets = match channel.sockets.try_lock() {
+                    Ok(sockets) => sockets,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => continue,
+                };
+                let keys = sockets
+                    .iter()
+                    .filter(|(_, socket)| socket.bridge_info.runtime_id == runtime_id)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                let retired = keys
+                    .into_iter()
+                    .filter_map(|key| sockets.remove(&key))
+                    .collect::<Vec<_>>();
+                Self::refresh_channel_snapshots(channel, &sockets);
+                retired
+            };
+            for socket in &mut retired {
+                socket.close();
+            }
+        }
+        self.runtime_pins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, pin| pin.runtime_id != runtime_id);
+    }
+
     pub(crate) fn pin_runtime(&self, target: BridgeTarget, runtime_id: &str) {
         self.runtime_pins
             .lock()
@@ -1454,6 +2063,7 @@ impl BridgeServer {
                 Self::runtime_pin_key(target, None),
                 RuntimePin {
                     runtime_id: runtime_id.to_string(),
+                    exact: true,
                 },
             );
     }
@@ -1478,9 +2088,9 @@ impl BridgeServer {
                         continue;
                     }
                 };
-                Self::ensure_place_unambiguous(&mut guard, target, player)?;
+                self.ensure_place_unambiguous(&mut guard, target, player)?;
                 for (role_key, socket) in guard.iter() {
-                    if !Self::socket_matches_selector(role_key, socket, target, player) {
+                    if !self.socket_matches_selector(role_key, socket, target, player) {
                         continue;
                     }
                     matching_socket_count += 1;
@@ -1511,7 +2121,10 @@ impl BridgeServer {
                     .then_with(|| left.last_focused_at.cmp(&right.last_focused_at))
             });
             if let Some((runtime_id, _)) = candidate {
-                return Ok(RuntimePin { runtime_id });
+                return Ok(RuntimePin {
+                    runtime_id,
+                    exact: false,
+                });
             }
             if !busy || Instant::now() >= lock_deadline {
                 break matching_socket_count;
@@ -1526,6 +2139,7 @@ impl BridgeServer {
         {
             return Ok(RuntimePin {
                 runtime_id: runtime_id.clone(),
+                exact: false,
             });
         }
 
@@ -1544,12 +2158,20 @@ impl BridgeServer {
     fn player_runtime_ids(&self) -> Vec<String> {
         let mut players = Vec::new();
         for channel in &self.channels {
-            for snapshot in Self::cached_channel_snapshots(channel) {
+            let snapshots = match channel.sockets.try_lock() {
+                Ok(sockets) => Self::refresh_channel_snapshots(channel, &sockets),
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    Self::refresh_channel_snapshots(channel, &poisoned.into_inner())
+                }
+                Err(TryLockError::WouldBlock) => Self::cached_channel_snapshots(channel),
+            };
+            for snapshot in snapshots {
                 let runtime_id = snapshot.bridge_info.runtime_id.trim();
                 if !runtime_id.is_empty()
-                    && Self::bridge_info_matches_selector(
+                    && self.bridge_info_matches_selector(
                         &snapshot.role_key,
                         &snapshot.bridge_info,
+                        snapshot.studio_pid,
                         BridgeTarget::Client,
                         None,
                     )
@@ -1584,7 +2206,10 @@ impl BridgeServer {
                 .get(index - 1)
                 .cloned()
                 .with_context(|| format!("No connected play client exists at index {index}"))?;
-            let pin = RuntimePin { runtime_id };
+            let pin = RuntimePin {
+                runtime_id,
+                exact: false,
+            };
             self.runtime_pins
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1598,13 +2223,17 @@ impl BridgeServer {
             .get(&key)
             .cloned();
         if let Some(pin) = existing {
+            if pin.exact {
+                return Ok(pin);
+            }
             let mut best_rank = usize::MAX;
             let mut pinned_rank = None;
             for channel in &self.channels {
                 for snapshot in Self::cached_channel_snapshots(channel) {
-                    if !Self::bridge_info_matches_selector(
+                    if !self.bridge_info_matches_selector(
                         &snapshot.role_key,
                         &snapshot.bridge_info,
+                        snapshot.studio_pid,
                         target,
                         player,
                     ) {
@@ -1634,21 +2263,23 @@ impl BridgeServer {
         Ok(pins.entry(key).or_insert(pin).clone())
     }
 
-    pub(crate) fn socket_matches_runtime_pin(socket: &BridgeSocket, pin: &RuntimePin) -> bool {
+    pub(crate) fn socket_matches_runtime_pin(socket: &BridgeConnection, pin: &RuntimePin) -> bool {
         socket.bridge_info.runtime_id == pin.runtime_id
     }
 
     pub(crate) fn select_role_for_selector_with_pin(
-        sockets: &HashMap<String, BridgeSocket>,
+        &self,
+        sockets: &HashMap<String, BridgeConnection>,
         target: BridgeTarget,
         player: Option<&str>,
         pin: &RuntimePin,
     ) -> Option<String> {
-        Self::select_role_for_selector_inner(sockets, target, player, Some(pin))
+        self.select_role_for_selector_inner(sockets, target, player, Some(pin))
     }
 
     fn select_role_for_selector_inner(
-        sockets: &HashMap<String, BridgeSocket>,
+        &self,
+        sockets: &HashMap<String, BridgeConnection>,
         target: BridgeTarget,
         player: Option<&str>,
         pin: Option<&RuntimePin>,
@@ -1662,9 +2293,19 @@ impl BridgeServer {
         } else {
             player
         };
-        let matches = |key: &str, socket: &BridgeSocket| {
-            Self::socket_matches_selector(key, socket, target, matched_player)
-                && pin.is_none_or(|pin| Self::socket_matches_runtime_pin(socket, pin))
+        let matches = |key: &str, socket: &BridgeConnection| {
+            if let Some(pin) = pin {
+                // The caller already resolved an exact runtime. In particular, a
+                // background long poll must not inherit another request's selection.
+                Self::socket_matches_runtime_pin(socket, pin)
+                    && Self::role_matches_target(key, target)
+                    && self.runtime_is_routable(&socket.bridge_info)
+                    && matched_player.is_none_or(|player| {
+                        Self::player_matches_selector(&socket.bridge_info, player)
+                    })
+            } else {
+                self.socket_matches_selector(key, socket, target, matched_player)
+            }
         };
         for role in target.preferred_roles() {
             if let Some(key) = sockets
@@ -1737,38 +2378,7 @@ impl BridgeServer {
         wait_seconds: f64,
         target: BridgeTarget,
     ) -> Result<()> {
-        let required_channels = self.expected_channel_count();
-        let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.max(1.0));
-        loop {
-            let ready_channels = self.max_runtime_channel_coverage(target, None);
-            if ready_channels >= required_channels {
-                return validate_bridge_info(&self.cached_bridge_info_for_target(target)?);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!(
-                    "Only {}/{} persistent {} plugin bridge channels are ready{}. Missing ports: {:?}",
-                    ready_channels,
-                    required_channels,
-                    Self::target_label(target),
-                    place_filter()
-                        .map(|place| format!(" for place filter '{place}'"))
-                        .unwrap_or_default(),
-                    self.missing_ports_for_target(target)
-                );
-            }
-            if self.max_cached_runtime_channel_coverage(target, None) >= required_channels {
-                let _ = self.call_for_selector_with_timeout(
-                    "cancelStudioChangeWait",
-                    json!({}),
-                    target,
-                    None,
-                    Some(remaining.min(Duration::from_millis(250))),
-                );
-            } else {
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
+        self.wait_for_target_channels(wait_seconds, target, self.expected_channel_count())
     }
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -1785,7 +2395,7 @@ impl BridgeServer {
                 Err(TryLockError::WouldBlock) => continue,
             };
             if let Some(role) =
-                Self::select_role_for_selector_with_pin(&guard, target, player, &runtime_pin)
+                self.select_role_for_selector_with_pin(&guard, target, player, &runtime_pin)
                 && let Some(socket) = guard.get(&role)
             {
                 return Ok(socket.peer.clone());
@@ -1812,7 +2422,7 @@ impl BridgeServer {
                 Err(TryLockError::WouldBlock) => continue,
             };
             if let Some(role) =
-                Self::select_role_for_selector_with_pin(&guard, target, None, &runtime_pin)
+                self.select_role_for_selector_with_pin(&guard, target, None, &runtime_pin)
                 && let Some(socket) = guard.get(&role)
             {
                 return Ok(socket.bridge_info.clone());
@@ -1841,7 +2451,7 @@ impl BridgeServer {
                 Err(TryLockError::WouldBlock) => continue,
             };
             for (role_key, socket) in guard.iter_mut() {
-                if Self::socket_matches_selector(role_key, socket, target, None)
+                if self.socket_matches_selector(role_key, socket, target, None)
                     && Self::socket_matches_runtime_pin(socket, &runtime_pin)
                 {
                     socket.bridge_info.performance_mode = performance_mode.to_string();
@@ -1865,7 +2475,10 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => return None,
                 };
-                if Self::select_role_for_selector_inner(&guard, target, None, None).is_some() {
+                if self
+                    .select_role_for_selector_inner(&guard, target, None, None)
+                    .is_some()
+                {
                     None
                 } else {
                     Some(channel.port)
@@ -1874,14 +2487,25 @@ impl BridgeServer {
             .collect()
     }
 
-    pub(crate) fn close_socket(socket: &mut BridgeSocket) {
-        let _ = socket.socket.close(None);
-        let _ = socket.socket.get_mut().shutdown(Shutdown::Both);
+    fn remove_connection(channel: &BridgeChannel, key: &str, connection: &BridgeConnection) {
+        let mut sockets = channel
+            .sockets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A late failure belongs to the old connection, never its replacement.
+        if sockets
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(&current.io, &connection.io))
+        {
+            sockets.remove(key);
+            Self::refresh_channel_snapshots(channel, &sockets);
+        }
+        connection.close();
     }
 
     fn refresh_channel_snapshots(
         channel: &BridgeChannel,
-        sockets: &HashMap<String, BridgeSocket>,
+        sockets: &HashMap<String, BridgeConnection>,
     ) -> Vec<BridgeSocketSnapshot> {
         let snapshots = sockets
             .iter()
@@ -1931,7 +2555,7 @@ impl BridgeServer {
 
     fn retire_failed_socket(
         channel: &BridgeChannel,
-        sockets: &mut HashMap<String, BridgeSocket>,
+        connection: &BridgeConnection,
         socket_role: &str,
         socket_port: u16,
         role: &str,
@@ -1944,10 +2568,7 @@ impl BridgeServer {
         if !Self::is_transport_error_text(&error_text) {
             return Err(error);
         }
-        if let Some(mut socket) = sockets.remove(socket_role) {
-            Self::close_socket(&mut socket);
-        }
-        Self::refresh_channel_snapshots(channel, sockets);
+        Self::remove_connection(channel, socket_role, connection);
         Ok(format!("port {socket_port} role {role}: {error_text}"))
     }
 
@@ -1957,20 +2578,32 @@ impl BridgeServer {
         last_error: &mut Option<String>,
         call: BridgeSocketCall<T>,
     ) -> Result<(Option<T>, bool)> {
-        if !bridge_method_allowed_after_cancel(context.method)
+        if self
+            .routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retired
+            .contains(&context.runtime_pin.runtime_id)
+        {
+            bail!(
+                "The pinned Studio runtime ended: {} was retired; its outstanding response is no longer valid",
+                context.runtime_pin.runtime_id
+            );
+        }
+        if !bridge_request_allowed_after_cancel(context.method, context.params)
             && let Some(lease) = self.active_request_lease()
         {
             lease.ensure_active()?;
         }
-        let mut attempted_socket = false;
+        let mut connected_socket = false;
         for offset in 0..self.channels.len() {
             let channel = &self.channels[(context.start + offset) % self.channels.len()];
-            let mut sockets = match channel.sockets.try_lock() {
+            let sockets = match channel.sockets.try_lock() {
                 Ok(sockets) => sockets,
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                 Err(TryLockError::WouldBlock) => continue,
             };
-            let Some(socket_role) = Self::select_role_for_selector_with_pin(
+            let Some(socket_role) = self.select_role_for_selector_with_pin(
                 &sockets,
                 context.target,
                 context.player,
@@ -1978,10 +2611,19 @@ impl BridgeServer {
             ) else {
                 continue;
             };
-            let Some(socket) = sockets.get_mut(&socket_role) else {
+            let Some(connection) = sockets.get(&socket_role).cloned() else {
                 continue;
             };
-            attempted_socket = true;
+            connected_socket = true;
+            drop(sockets);
+            let mut socket = match connection.io.try_lock() {
+                Ok(socket) => socket,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
+            if !self.runtime_is_routable(&socket.bridge_info) {
+                continue;
+            }
             let socket_port = socket.port;
             let role = socket.role.clone();
             let remaining_timeout = context
@@ -1995,23 +2637,41 @@ impl BridgeServer {
             }
             socket.active_request_lease = context.request_lease.clone();
             socket.cancel_request_id = context.cancel_request_id;
+            let attempt_timeout = remaining_timeout.map(|remaining| {
+                bridge_socket_attempt_timeout(context.method, context.params, remaining)
+            });
             let result = call(
-                socket,
+                &mut socket,
                 context.id,
                 context.method,
                 context.params,
-                remaining_timeout,
+                attempt_timeout,
                 context.lease_id,
             );
             socket.active_request_lease = None;
             socket.cancel_request_id = None;
-            self.collect_socket_final_console_snapshots(socket);
+            self.collect_socket_final_console_snapshots(&mut socket);
+            let routable = self.runtime_is_routable(&socket.bridge_info);
+            drop(socket);
+            if !routable {
+                bail!(
+                    "The pinned Studio runtime ended: {} closed before its response could be accepted",
+                    context.runtime_pin.runtime_id
+                );
+            }
             match result {
                 Ok(result) => return Ok((Some(result), true)),
                 Err(error) => {
+                    // A queued/slow observation doesn't prove that its socket is dead.
+                    // Late replies carry IDs and read_response skips them on the next call.
+                    if is_status_observation(context.method, context.params)
+                        && error.downcast_ref::<BridgeResponseTimeout>().is_some()
+                    {
+                        return Err(error);
+                    }
                     *last_error = Some(Self::retire_failed_socket(
                         channel,
-                        &mut sockets,
+                        &connection,
                         &socket_role,
                         socket_port,
                         &role,
@@ -2020,7 +2680,7 @@ impl BridgeServer {
                 }
             }
         }
-        Ok((None, attempted_socket))
+        Ok((None, connected_socket))
     }
 
     fn call_pinned_socket<T>(
@@ -2030,8 +2690,10 @@ impl BridgeServer {
         label: &str,
     ) -> Result<T> {
         let mut last_error = None;
+        let mut connected = false;
         for _ in 0..64 {
-            let (result, _) = self.try_call_pinned_socket(context, &mut last_error, call)?;
+            let (result, found) = self.try_call_pinned_socket(context, &mut last_error, call)?;
+            connected = found;
             if let Some(result) = result {
                 return Ok(result);
             }
@@ -2043,13 +2705,10 @@ impl BridgeServer {
             lock_deadline = lock_deadline.min(response_deadline);
         }
         while Instant::now() < lock_deadline {
-            let (result, attempted_socket) =
-                self.try_call_pinned_socket(context, &mut last_error, call)?;
+            let (result, found) = self.try_call_pinned_socket(context, &mut last_error, call)?;
+            connected = found;
             if let Some(result) = result {
                 return Ok(result);
-            }
-            if !attempted_socket && last_error.is_none() {
-                last_error = Some("all compatible bridge channels are busy".to_string());
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -2063,13 +2722,17 @@ impl BridgeServer {
                 .map(|selector| format!(" (player {selector})"))
                 .unwrap_or_default(),
             last_error.unwrap_or_else(|| {
-                "the pinned Studio runtime disconnected or has no available channel".to_string()
+                if connected {
+                    "all compatible bridge channels are busy".to_string()
+                } else {
+                    "the pinned Studio runtime disconnected or has no connected channel".to_string()
+                }
             })
         )
     }
 
     pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value> {
-        self.call_for_target(method, params, BridgeTarget::Main)
+        self.call_for_target(method, params, default_method_target(method))
     }
 
     pub(crate) fn cancel_request_lease(&self, lease_id: &str) -> Result<Value> {
@@ -2160,23 +2823,23 @@ impl BridgeServer {
         runtime_id: Option<&str>,
         response_timeout: Option<Duration>,
     ) -> Result<Value> {
+        let response_deadline = Some(
+            Instant::now() + response_timeout.unwrap_or_else(|| bridge_response_timeout(method)),
+        );
         let lease = self.active_request_lease();
-        if !bridge_method_allowed_after_cancel(method)
-            && let Some(lease) = &lease
-        {
+        let allowed_after_cancel = bridge_request_allowed_after_cancel(method, &params);
+        if !allowed_after_cancel && let Some(lease) = &lease {
             lease.ensure_active()?;
         }
         let runtime_pin = if let Some(runtime_id) = runtime_id {
             RuntimePin {
                 runtime_id: runtime_id.to_string(),
+                exact: true,
             }
         } else {
             self.runtime_pin_for_selector(target, player)?
         };
         let (id, start) = self.next_call()?;
-        let response_deadline = Some(
-            Instant::now() + response_timeout.unwrap_or_else(|| bridge_response_timeout(method)),
-        );
         let call_context = BridgeCallContext {
             id,
             method,
@@ -2186,22 +2849,41 @@ impl BridgeServer {
             runtime_pin: &runtime_pin,
             start,
             response_deadline,
-            lease_id: bridge_request_lease_id(method, lease.as_deref()),
-            request_lease: if bridge_method_allowed_after_cancel(method) {
+            lease_id: if method == "startStopPlay" && allowed_after_cancel {
+                None
+            } else {
+                bridge_request_lease_id(method, lease.as_deref())
+            },
+            request_lease: if allowed_after_cancel {
                 None
             } else {
                 lease.clone()
             },
-            cancel_request_id: lease
-                .as_ref()
-                .map(|_| self.next_id.fetch_add(1, Ordering::Relaxed)),
+            cancel_request_id: if allowed_after_cancel {
+                None
+            } else {
+                lease
+                    .as_ref()
+                    .map(|_| self.next_id.fetch_add(1, Ordering::Relaxed))
+            },
         };
 
-        self.call_pinned_socket(
+        let result = self.call_pinned_socket(
             &call_context,
             Self::call_on_socket_with_timeout,
             "Bridge call",
-        )
+        )?;
+        if target == BridgeTarget::Edit
+            && matches!(method, "startStopPlay" | "getStudioState" | "getBridgeInfo")
+            && result.get("ok").and_then(Value::as_bool) != Some(false)
+            && let Some(nonce) = result.get("launchNonce").and_then(Value::as_str)
+        {
+            self.routing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observe_launch(&runtime_pin.runtime_id, id, nonce);
+        }
+        Ok(result)
     }
 
     pub(crate) fn channel_count_for_target(&self, target: BridgeTarget) -> usize {
@@ -2221,42 +2903,10 @@ impl BridgeServer {
                 Err(TryLockError::WouldBlock) => continue,
             };
             for (role_key, socket) in guard.iter() {
-                if !Self::socket_matches_selector(role_key, socket, target, player) {
+                if !self.socket_matches_selector(role_key, socket, target, player) {
                     continue;
                 }
                 let runtime_id = socket.bridge_info.runtime_id.trim();
-                if !runtime_id.is_empty() {
-                    ports_by_runtime
-                        .entry(runtime_id.to_string())
-                        .or_default()
-                        .insert(channel.port);
-                }
-            }
-        }
-        ports_by_runtime
-            .values()
-            .map(HashSet::len)
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn max_cached_runtime_channel_coverage(
-        &self,
-        target: BridgeTarget,
-        player: Option<&str>,
-    ) -> usize {
-        let mut ports_by_runtime: HashMap<String, HashSet<u16>> = HashMap::new();
-        for channel in &self.channels {
-            for snapshot in Self::cached_channel_snapshots(channel) {
-                if !Self::bridge_info_matches_selector(
-                    &snapshot.role_key,
-                    &snapshot.bridge_info,
-                    target,
-                    player,
-                ) {
-                    continue;
-                }
-                let runtime_id = snapshot.bridge_info.runtime_id.trim();
                 if !runtime_id.is_empty() {
                     ports_by_runtime
                         .entry(runtime_id.to_string())
@@ -2288,7 +2938,8 @@ impl BridgeServer {
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => return false,
                 };
-                Self::select_role_for_selector_with_pin(&guard, target, player, &pin).is_some()
+                self.select_role_for_selector_with_pin(&guard, target, player, &pin)
+                    .is_some()
             })
             .count()
     }
@@ -2307,7 +2958,29 @@ impl BridgeServer {
         }
     }
 
-    pub(crate) fn capture_final_console_message(socket: &mut BridgeSocket, value: &Value) -> bool {
+    fn capture_socket_notification(socket: &mut BridgeSocket, value: &Value) -> bool {
+        if socket
+            .pending_player_identity
+            .is_some_and(|(id, _)| value["id"].as_u64() == Some(id))
+        {
+            // Only enrich this connection's player metadata. A reply must never retarget it.
+            let info = &socket.bridge_info;
+            let result = &value["result"];
+            if value["ok"] == true
+                && result["runtimeId"].as_str() == Some(info.runtime_id.as_str())
+                && result["bridgeRole"].as_str() == Some(info.bridge_role.as_str())
+                && result["launchNonce"].as_str() == Some(info.launch_nonce.as_str())
+                && result["launchEditRuntimeId"].as_str()
+                    == Some(info.launch_edit_runtime_id.as_str())
+                && let Some(name) = result["playerName"]
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty())
+            {
+                socket.bridge_info.player_name = name.to_owned();
+                socket.bridge_info.player_user_id = result["playerUserId"].as_i64();
+            }
+            return true;
+        }
         if value.get("event").and_then(Value::as_str) != Some("finalConsoleSnapshot") {
             return false;
         }
@@ -2361,11 +3034,12 @@ impl BridgeServer {
     pub(crate) fn collect_socket_final_console_snapshots(&self, socket: &mut BridgeSocket) -> bool {
         let mut closed = false;
         if socket.socket.get_mut().set_nonblocking(true).is_ok() {
-            loop {
+            // Inventory is observational: a chatty client must not monopolize it.
+            for _ in 0..128 {
                 match socket.socket.read() {
                     Ok(Message::Text(text)) => {
                         if let Ok(value) = serde_json::from_str::<Value>(text.as_str()) {
-                            Self::capture_final_console_message(socket, &value);
+                            Self::capture_socket_notification(socket, &value);
                         }
                     }
                     Ok(Message::Ping(payload)) => {
@@ -2416,15 +3090,44 @@ impl BridgeServer {
         }
         let mut probe = [0u8; 1];
         let peek = stream.peek(&mut probe);
-        let _ = stream.set_nonblocking(false);
-        match peek {
+        let alive = match peek {
             Ok(0) => false,
             Err(err) if err.kind() != io::ErrorKind::WouldBlock => false,
-            _ => {
-                socket.socket.send(Message::Ping(Vec::new().into())).is_ok()
-                    && socket.socket.flush().is_ok()
-            }
+            _ => match socket.socket.send(Message::Ping(Vec::new().into())) {
+                Ok(()) => true,
+                Err(tungstenite::Error::Io(error)) => error.kind() == io::ErrorKind::WouldBlock,
+                Err(_) => false,
+            },
+        };
+        let _ = socket.socket.get_mut().set_nonblocking(false);
+        alive
+    }
+
+    fn request_missing_player_identity(&self, socket: &mut BridgeSocket) {
+        if socket.bridge_info.bridge_role != BRIDGE_ROLE_PLAY_CLIENT
+            || !socket.bridge_info.player_name.trim().is_empty()
+            || socket
+                .pending_player_identity
+                .is_some_and(|(_, sent)| sent.elapsed() < BRIDGE_QUICK_SOCKET_ATTEMPT_TIMEOUT)
+            || socket.socket.get_mut().set_nonblocking(true).is_err()
+        {
+            return;
         }
+        let id = socket.pending_player_identity.map_or_else(
+            || self.next_id.fetch_add(1, Ordering::Relaxed),
+            |(id, _)| id,
+        );
+        socket.pending_player_identity = Some((id, Instant::now()));
+        // The existing response drain consumes this read-only reply, including while
+        // another command is running. No inventory caller waits for Studio here.
+        let _ = Self::send_request(
+            socket,
+            id,
+            "getBridgeInfo",
+            &json!({"registrationAck": true}),
+            None,
+        );
+        let _ = socket.socket.get_mut().set_nonblocking(false);
     }
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -2438,6 +3141,25 @@ impl BridgeServer {
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn cached_snapshot_is_live(_snapshot: &BridgeSocketSnapshot) -> bool {
         true
+    }
+
+    fn runtime_is_routable(&self, info: &BridgeInfoPayload) -> bool {
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allows(info)
+    }
+
+    pub(crate) fn retain_current_clients(&self, clients: &mut Vec<Value>) {
+        let routing = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
+        clients.retain(|client| {
+            routing.allows_identity(
+                client["runtimeId"].as_str().unwrap_or_default(),
+                client["role"].as_str().unwrap_or_default(),
+                client["launchEditRuntimeId"].as_str().unwrap_or_default(),
+                client["launchNonce"].as_str().unwrap_or_default(),
+            )
+        });
     }
 
     pub(crate) fn list_bridge_clients(&self) -> Vec<Value> {
@@ -2456,39 +3178,46 @@ impl BridgeServer {
         }
         let mut entries: Vec<ClientEntry> = Vec::new();
         for channel in &self.channels {
-            let snapshots = match channel.sockets.try_lock() {
-                Ok(mut guard) => {
-                    let mut dead_keys = Vec::new();
-                    for (role_key, socket) in guard.iter_mut() {
-                        if self.collect_socket_final_console_snapshots(socket)
-                            || !Self::socket_is_alive(socket)
-                        {
-                            dead_keys.push(role_key.clone());
-                            continue;
-                        }
-                        if Self::bridge_role_key_base(role_key) == BRIDGE_ROLE_PLAY_CLIENT
-                            && socket.bridge_info.player_name.trim().is_empty()
-                        {
-                            let id = self
-                                .next_id
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Ok(info) = Self::probe_bridge_info_on_socket_with_id(socket, id)
-                            {
-                                socket.role = normalize_bridge_role(&info.bridge_role).to_string();
-                                socket.bridge_info = info;
-                            }
-                        }
+            let connections = match channel.sockets.try_lock() {
+                Ok(sockets) => Some(sockets.clone()),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(connections) = connections {
+                for (key, connection) in connections {
+                    let mut socket = match connection.io.try_lock() {
+                        Ok(socket) => socket,
+                        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                        Err(TryLockError::WouldBlock) => continue,
+                    };
+                    let dead = !self.runtime_is_routable(&socket.bridge_info)
+                        || self.collect_socket_final_console_snapshots(&mut socket)
+                        || !Self::socket_is_alive(&mut socket);
+                    if dead {
+                        drop(socket);
+                        Self::remove_connection(channel, &key, &connection);
+                        continue;
                     }
-                    for key in dead_keys {
-                        if let Some(mut dead_socket) = guard.remove(&key) {
-                            Self::close_socket(&mut dead_socket);
-                        }
+                    self.request_missing_player_identity(&mut socket);
+                    let player_name = socket.bridge_info.player_name.clone();
+                    let player_user_id = socket.bridge_info.player_user_id;
+                    drop(socket);
+                    let mut sockets = channel
+                        .sockets
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if let Some(current) = sockets.get_mut(&key)
+                        && Arc::ptr_eq(&current.io, &connection.io)
+                    {
+                        current.bridge_info.player_name = player_name;
+                        current.bridge_info.player_user_id = player_user_id;
                     }
-                    Self::refresh_channel_snapshots(channel, &guard)
                 }
+            }
+            let snapshots = match channel.sockets.try_lock() {
+                Ok(sockets) => Self::refresh_channel_snapshots(channel, &sockets),
                 Err(TryLockError::Poisoned(poisoned)) => {
-                    let guard = poisoned.into_inner();
-                    Self::refresh_channel_snapshots(channel, &guard)
+                    Self::refresh_channel_snapshots(channel, &poisoned.into_inner())
                 }
                 Err(TryLockError::WouldBlock) => Self::cached_channel_snapshots(channel)
                     .into_iter()
@@ -2496,6 +3225,9 @@ impl BridgeServer {
                     .collect(),
             };
             for snapshot in snapshots {
+                if !self.runtime_is_routable(&snapshot.bridge_info) {
+                    continue;
+                }
                 let role = Self::bridge_role_key_base(&snapshot.role_key).to_string();
                 let info = &snapshot.bridge_info;
                 let existing = entries.iter_mut().find(|entry| {
@@ -2521,9 +3253,9 @@ impl BridgeServer {
                             entry.launch_nonce.clone_from(&info.launch_nonce);
                         }
                         if entry.launch_edit_runtime_id.is_empty() {
-                            entry
-                                .launch_edit_runtime_id
-                                .clone_from(&info.launch_edit_runtime_id);
+                            entry.launch_edit_runtime_id = self
+                                .play_owner_runtime(info, snapshot.studio_pid)
+                                .unwrap_or_default();
                         }
                         if entry.player_name.is_empty() {
                             entry.player_name.clone_from(&info.player_name);
@@ -2539,7 +3271,9 @@ impl BridgeServer {
                     None => entries.push(ClientEntry {
                         runtime_id: info.runtime_id.clone(),
                         launch_nonce: info.launch_nonce.clone(),
-                        launch_edit_runtime_id: info.launch_edit_runtime_id.clone(),
+                        launch_edit_runtime_id: self
+                            .play_owner_runtime(info, snapshot.studio_pid)
+                            .unwrap_or_default(),
                         role,
                         player_name: info.player_name.clone(),
                         player_user_id: info.player_user_id,
@@ -2616,7 +3350,7 @@ impl BridgeServer {
     }
 
     pub(crate) fn call_chunk(&self, method: &str, params: Value) -> Result<BridgeChunk> {
-        self.call_chunk_for_target(method, params, BridgeTarget::Main)
+        self.call_chunk_for_target(method, params, default_method_target(method))
     }
 
     pub(crate) fn call_chunk_for_target(
@@ -2626,9 +3360,8 @@ impl BridgeServer {
         target: BridgeTarget,
     ) -> Result<BridgeChunk> {
         let lease = self.active_request_lease();
-        if !bridge_method_allowed_after_cancel(method)
-            && let Some(lease) = &lease
-        {
+        let allowed_after_cancel = bridge_request_allowed_after_cancel(method, &params);
+        if !allowed_after_cancel && let Some(lease) = &lease {
             lease.ensure_active()?;
         }
         let runtime_pin = self.runtime_pin_for_selector(target, None)?;
@@ -2641,9 +3374,9 @@ impl BridgeServer {
             player: None,
             runtime_pin: &runtime_pin,
             start,
-            response_deadline: None,
+            response_deadline: Some(Instant::now() + bridge_response_timeout(method)),
             lease_id: bridge_request_lease_id(method, lease.as_deref()),
-            request_lease: if bridge_method_allowed_after_cancel(method) {
+            request_lease: if allowed_after_cancel {
                 None
             } else {
                 lease.clone()
@@ -2668,13 +3401,13 @@ impl BridgeServer {
         runtime_id: &str,
     ) -> Result<BridgeChunk> {
         let lease = self.active_request_lease();
-        if !bridge_method_allowed_after_cancel(method)
-            && let Some(lease) = &lease
-        {
+        let allowed_after_cancel = bridge_request_allowed_after_cancel(method, &params);
+        if !allowed_after_cancel && let Some(lease) = &lease {
             lease.ensure_active()?;
         }
         let runtime_pin = RuntimePin {
             runtime_id: runtime_id.to_string(),
+            exact: true,
         };
         let (id, start) = self.next_call()?;
         let call_context = BridgeCallContext {
@@ -2685,9 +3418,9 @@ impl BridgeServer {
             player: None,
             runtime_pin: &runtime_pin,
             start,
-            response_deadline: None,
+            response_deadline: Some(Instant::now() + bridge_response_timeout(method)),
             lease_id: bridge_request_lease_id(method, lease.as_deref()),
-            request_lease: if bridge_method_allowed_after_cancel(method) {
+            request_lease: if allowed_after_cancel {
                 None
             } else {
                 lease.clone()
@@ -2734,7 +3467,7 @@ impl BridgeServer {
         Self::studio_pid_for_peer(&peer)
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn studio_pid_for_runtime(
         &self,
         target: BridgeTarget,
@@ -2799,11 +3532,14 @@ impl BridgeServer {
         response_timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<Value> {
-        let response_timeout = response_timeout.unwrap_or_else(|| bridge_response_timeout(method));
-        Self::configure_request_timeout(bridge_socket, response_timeout);
-        Self::send_request(bridge_socket, id, method, params, lease_id)?;
-
-        match Self::read_response(bridge_socket, id, method, response_timeout)? {
+        match Self::request_on_socket(
+            bridge_socket,
+            id,
+            method,
+            params,
+            response_timeout,
+            lease_id,
+        )? {
             BridgeResponse::Json(result) => Ok(result),
             BridgeResponse::Chunk(_) => {
                 bail!("Bridge method {method} returned a raw chunk response unexpectedly");
@@ -2819,14 +3555,51 @@ impl BridgeServer {
         response_timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<BridgeChunk> {
-        let response_timeout = response_timeout.unwrap_or_else(|| bridge_response_timeout(method));
-        Self::configure_request_timeout(bridge_socket, response_timeout);
-        Self::send_request(bridge_socket, id, method, params, lease_id)?;
-
-        match Self::read_response(bridge_socket, id, method, response_timeout)? {
+        match Self::request_on_socket(
+            bridge_socket,
+            id,
+            method,
+            params,
+            response_timeout,
+            lease_id,
+        )? {
             BridgeResponse::Chunk(chunk) => Ok(chunk),
             BridgeResponse::Json(result) => parse_bridge_chunk(result),
         }
+    }
+
+    fn request_on_socket(
+        socket: &mut BridgeSocket,
+        id: u64,
+        method: &str,
+        params: &Value,
+        timeout: Option<Duration>,
+        lease_id: Option<&str>,
+    ) -> Result<BridgeResponse> {
+        let started = Instant::now();
+        let timeout = timeout.unwrap_or_else(|| bridge_response_timeout(method));
+        if timeout.is_zero() {
+            return Err(BridgeResponseTimeout(format!(
+                "Bridge response timed out before {method}"
+            ))
+            .into());
+        }
+        let payload = Self::encode_request(socket, id, method, params, lease_id)?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(BridgeResponseTimeout(format!(
+                "Bridge response timed out before sending {method}"
+            ))
+            .into());
+        }
+        Self::configure_request_timeout(socket, remaining);
+        Self::send_encoded_request(socket, method, payload)?;
+        Self::read_response(
+            socket,
+            id,
+            method,
+            timeout.saturating_sub(started.elapsed()),
+        )
     }
 
     pub(crate) fn configure_request_timeout(bridge_socket: &mut BridgeSocket, timeout: Duration) {
@@ -2837,7 +3610,7 @@ impl BridgeServer {
         let _ = bridge_socket
             .socket
             .get_mut()
-            .set_write_timeout(Some(Duration::from_secs(10)));
+            .set_write_timeout(Some(timeout.min(Duration::from_secs(10))));
     }
 
     pub(crate) fn send_request(
@@ -2847,6 +3620,17 @@ impl BridgeServer {
         params: &Value,
         lease_id: Option<&str>,
     ) -> Result<()> {
+        let payload = Self::encode_request(bridge_socket, id, method, params, lease_id)?;
+        Self::send_encoded_request(bridge_socket, method, payload)
+    }
+
+    fn encode_request(
+        bridge_socket: &BridgeSocket,
+        id: u64,
+        method: &str,
+        params: &Value,
+        lease_id: Option<&str>,
+    ) -> Result<String> {
         #[derive(Serialize)]
         struct BridgeRequest<'a> {
             id: u64,
@@ -2871,6 +3655,14 @@ impl BridgeServer {
             }));
         }
 
+        Ok(payload)
+    }
+
+    fn send_encoded_request(
+        bridge_socket: &mut BridgeSocket,
+        method: &str,
+        payload: String,
+    ) -> Result<()> {
         bridge_socket
             .socket
             .send(Message::Text(payload.into()))
@@ -2916,11 +3708,12 @@ impl BridgeServer {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!(
+                return Err(BridgeResponseTimeout(format!(
                     "Bridge response timed out awaiting {method} on port {} after {:.1}s",
                     bridge_socket.port,
                     timeout.as_secs_f64()
-                );
+                ))
+                .into());
             }
             let poll_timeout = if bridge_socket.active_request_lease.is_some() {
                 remaining.min(Duration::from_millis(5))
@@ -2981,7 +3774,7 @@ impl BridgeServer {
                         serde_json::from_str(text.as_str()).with_context(|| {
                             format!("Invalid bridge JSON message ({} bytes)", text.len())
                         })?;
-                    if Self::capture_final_console_message(bridge_socket, &parsed) {
+                    if Self::capture_socket_notification(bridge_socket, &parsed) {
                         continue;
                     }
                     let msg_id = parsed.get("id").and_then(Value::as_u64);
@@ -3051,8 +3844,8 @@ impl Drop for BridgeServer {
                 .sockets
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            for (_, mut socket) in guard.drain() {
-                BridgeServer::close_socket(&mut socket);
+            for (_, socket) in guard.drain() {
+                socket.close();
             }
         }
     }

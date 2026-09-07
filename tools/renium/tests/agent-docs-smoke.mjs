@@ -2,6 +2,7 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import assert from "node:assert/strict";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
 const executable = path.resolve(process.argv[2] ?? path.join(repository, "tools", "renium", "target", "debug", process.platform === "win32" ? "renium.exe" : "renium"));
@@ -19,31 +20,31 @@ if (JSON.stringify(routedGuideNames) !== JSON.stringify(guideNames)) {
 }
 
 const agents = [rootGuide, ...guideNames.map((name) => fs.readFileSync(path.join(guidesPath, name), "utf8"))].join("\n");
-for (const forbidden of ["--help", "rbx a ", "local.renium-", "extensions/local.renium", "extensions\\local.renium"]) {
+for (const forbidden of ["rbx a ", "local.renium-", "extensions/local.renium", "extensions\\local.renium"]) {
   if (agents.includes(forbidden)) {
     throw new Error(`Generated agent documentation contains forbidden text: ${forbidden}`);
   }
 }
 
-const shortCommands = new Set([
-  "ad", "ai", "as", "ba", "bb", "bcl", "bem", "bep", "bg", "bim", "bpack", "br", "bs", "bss",
-  "cfg", "clk", "cmp", "co", "cs", "dev", "dp", "f", "fmt", "gm", "go", "in", "inp", "ip", "ir", "iu", "js",
-  "ky", "l", "lc", "lk", "lka", "lkb", "lkd", "lkp", "lks", "lof", "lon", "lst", "me", "mv", "oc",
-  "pa", "pd", "pf", "pl", "play", "pn", "po", "pp", "pr", "ps", "pu", "pv", "q", "re", "ro", "rp", "rs", "sc", "sg", "si", "sm",
-  "sr", "ss", "status", "sx", "tr", "ty", "ui", "upl", "v", "vci", "vcm", "vct", "wait", "wally", "x", "xp",
-]);
-for (const line of agents.split(/\r?\n/)) {
-  const match = line.trim().match(/^rbx\s+(\S+)/);
-  if (match && !shortCommands.has(match[1])) {
-    throw new Error(`Agent documentation uses a non-short command: ${match[1]}`);
-  }
-}
+// Rust's agent_guide_examples_use_canonical_commands checks inline and fenced
+// examples against the actual CLI definitions, without executing commands.
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-agent-docs-"));
 try {
   fs.mkdirSync(path.join(root, "src"));
   fs.writeFileSync(path.join(root, "renium.project.jsonc"), JSON.stringify({ schemaVersion: 1, sourceRoot: "src", tree: {} }));
+  childProcess.execFileSync(executable, ["init"], { cwd: root, stdio: "pipe" });
   childProcess.execFileSync(executable, ["pv"], { cwd: root, stdio: "pipe" });
+  // Check the instructions agents actually receive, not only their source.
+  const generated = fs.readFileSync(path.join(root, "RENIUM.md"), "utf8");
+  assert.equal(generated.replace(/\n<!-- renium-instructions: [a-f0-9]+ -->\s*$/, "").trimEnd(), rootGuide.trimEnd());
+  for (const name of guideNames) {
+    const expected = fs.readFileSync(path.join(guidesPath, name), "utf8");
+    assert.equal(fs.readFileSync(path.join(root, "RENIUM", name), "utf8"), expected,
+      `CLI generated stale ${name}; refresh its packaged guides`);
+    assert.equal(fs.readFileSync(path.join(repository, "tools", "renium-vscode-extension", "resources", "RENIUM", name), "utf8"), expected,
+      `Extension bundled stale ${name}; run sync-assets.mjs --docs-only`);
+  }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

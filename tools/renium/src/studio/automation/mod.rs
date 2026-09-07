@@ -6,6 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use full_moon::ast;
+use full_moon::tokenizer::TokenReference;
+use full_moon::visitors::VisitorMut;
 use serde_json::{Map, Value, json};
 
 use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
@@ -28,11 +31,17 @@ use crate::studio::input as input_inject;
 
 mod console;
 mod input;
+mod microprofiler;
+pub(crate) mod monitor;
+pub(crate) mod network;
+pub(crate) mod property_access;
 mod recording;
+mod recording_review;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
 pub(crate) use input::input_result;
 pub(crate) use recording::{end as record_end_result, start as record_start_result};
+pub(crate) use recording_review::command as record_review_command;
 
 fn console_entry_level(entry: &Value) -> &str {
     entry
@@ -62,23 +71,11 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if let Some(result) = try_daemon_control_request(op::LUAU, None, parameters, false)? {
-        return print_json_output(&result, false);
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let target = BridgeTarget::main_or_client(args.client || args.player.is_some());
-    let (bridge, _listen_metrics) = BridgeServer::listen_with_initial_wait(
-        &args.bridge.host,
-        &ports,
-        args.bridge.wait_seconds,
-        false,
-    )?;
-    bridge.wait_for_target(args.bridge.wait_seconds, target)?;
-    let result = execute_luau_result(args, &bridge)?;
+    let result = daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge))?;
     print_json_output(&result, false)
 }
 
-pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
+fn parse_luau(code: &str) -> Result<ast::Ast> {
     let parsed = full_moon::parse_fallible(code, full_moon::LuaVersion::luau());
     if let Some(error) = parsed.errors().first() {
         let (start, _) = error.range();
@@ -89,7 +86,103 @@ pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
             error.error_message()
         );
     }
+    Ok(parsed.into_ast())
+}
+
+pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
+    parse_luau(code)?;
     Ok(())
+}
+
+struct LuauLoopCheckpoints {
+    checkpoint: (ast::Stmt, Option<TokenReference>),
+    inserted: usize,
+}
+
+impl LuauLoopCheckpoints {
+    fn add_to(&mut self, block: &ast::Block) -> ast::Block {
+        let mut statements = Vec::with_capacity(block.stmts().count() + 1);
+        statements.push(self.checkpoint.clone());
+        statements.extend(block.stmts_with_semicolon().cloned());
+        self.inserted += 1;
+        block.clone().with_stmts(statements)
+    }
+}
+
+impl VisitorMut for LuauLoopCheckpoints {
+    fn visit_generic_for_end(&mut self, node: ast::GenericFor) -> ast::GenericFor {
+        let block = self.add_to(node.block());
+        node.with_block(block)
+    }
+
+    fn visit_numeric_for_end(&mut self, node: ast::NumericFor) -> ast::NumericFor {
+        let block = self.add_to(node.block());
+        node.with_block(block)
+    }
+
+    fn visit_repeat_end(&mut self, node: ast::Repeat) -> ast::Repeat {
+        let block = self.add_to(node.block());
+        node.with_block(block)
+    }
+
+    fn visit_while_end(&mut self, node: ast::While) -> ast::While {
+        let block = self.add_to(node.block());
+        node.with_block(block)
+    }
+}
+
+pub(crate) fn cooperative_luau(code: &str) -> Result<String> {
+    let parsed = parse_luau(code)?;
+    let mut checkpoint_name = "__reniumCooperate".to_string();
+    while code.contains(&checkpoint_name) {
+        checkpoint_name.push('_');
+    }
+    let checkpoint_ast = full_moon::parse(&format!("{checkpoint_name}();"))
+        .expect("Renium's loop checkpoint must be valid Luau");
+    let checkpoint = checkpoint_ast
+        .nodes()
+        .stmts_with_semicolon()
+        .next()
+        .cloned()
+        .expect("Renium's loop checkpoint must contain one statement");
+    let mut checkpoints = LuauLoopCheckpoints {
+        checkpoint,
+        inserted: 0,
+    };
+    let instrumented = checkpoints.visit_ast(parsed);
+    if checkpoints.inserted == 0 {
+        return Ok(code.to_string());
+    }
+
+    let count_name = format!("{checkpoint_name}Count");
+    let started_name = format!("{checkpoint_name}Started");
+    Ok(format!(
+        "local {count_name}=64;local {started_name}=os.clock();local function {checkpoint_name}(){count_name}-=1;if {count_name}>0 then return end;{count_name}=64;local now=os.clock();if now-{started_name}>=0.004166666666666667 then task.wait();{started_name}=os.clock() end end;{instrumented}"
+    ))
+}
+
+fn call_execute_luau(
+    bridge: &BridgeServer,
+    target: BridgeTarget,
+    player: Option<&str>,
+    code: &str,
+    chunk_name: &str,
+    timeout: f64,
+    response_padding: f64,
+) -> Result<Value> {
+    let code = cooperative_luau(code)?;
+    bridge.call_for_selector_with_timeout(
+        "executeLuau",
+        json!({
+            "code": code,
+            "chunkName": chunk_name,
+            "context": if target == BridgeTarget::Client { "client" } else { "plugin" },
+            "timeoutSeconds": timeout,
+        }),
+        target,
+        player,
+        Some(Duration::from_secs_f64(timeout + response_padding)),
+    )
 }
 
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -100,24 +193,20 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
     };
-    validate_luau_syntax(&code)?;
     let client = args.client || args.player.is_some();
     let timeout = args.timeout.clamp(0.1, 120.0);
     let target = BridgeTarget::main_or_client(client);
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
-    let result = bridge.call_for_selector_with_timeout(
-        "executeLuau",
-        json!({
-            "code": code,
-            "chunkName": "Renium",
-            "context": if client { "client" } else { "plugin" },
-            "timeoutSeconds": timeout,
-        }),
+    let result = call_execute_luau(
+        bridge,
         target,
         args.player.as_deref(),
-        Some(Duration::from_secs_f64(timeout + 10.0)),
+        &code,
+        "Renium",
+        timeout,
+        10.0,
     )?;
     ensure_luau_api_ok(&result)?;
     Ok(result)
@@ -135,18 +224,7 @@ pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if let Some(result) = try_daemon_control_request(op::DEVICE, None, parameters, false)? {
-        return print_json_output(&result, false);
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, _listen_metrics) = BridgeServer::listen_with_initial_wait(
-        &args.bridge.host,
-        &ports,
-        args.bridge.wait_seconds,
-        false,
-    )?;
-    bridge.wait_for_target(args.bridge.wait_seconds, BridgeTarget::Edit)?;
-    let result = studio_device_result(&args, &bridge)?;
+    let result = daemon_result(op::DEVICE, None, parameters, false, Some(&args.bridge))?;
     print_json_output(&result, false)
 }
 
@@ -528,6 +606,7 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         "autoDesyncedPackages",
         "autoDesyncedAtPush",
         "error",
+        "previousError",
     ] {
         if let Some(value) = source.get(key) {
             result.insert(key.to_string(), value.clone());
@@ -602,13 +681,11 @@ fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
 }
 
 fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
-    if request_play_runtimes_to_stop(
+    request_play_runtimes_to_stop(
         bridge,
         &test_launch_clients(bridge, launch),
         Some(&launch.nonce),
-    ) {
-        thread::sleep(Duration::from_millis(100));
-    }
+    );
     let _ = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
         json!({
@@ -657,8 +734,7 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
         {
             ensure_plugin_api_ok(&start_result)?;
         }
-        let server_deadline = Instant::now() + Duration::from_secs(30);
-        let client_deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut last_status = start_result;
         loop {
             let clients = test_launch_clients(bridge, &launch);
@@ -680,9 +756,7 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                     "clients": clients,
                 }));
             }
-            if (!server_ready && Instant::now() >= server_deadline)
-                || Instant::now() >= client_deadline
-            {
+            if Instant::now() >= deadline {
                 bail!(
                     "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
                     serde_json::to_string(&last_status)?,
@@ -1427,7 +1501,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
          \tend",
         condition = args.condition,
     );
-    let outcome = run_luau_task(bridge, target, player, client, &code, timeout + 5.0)?;
+    let outcome = run_luau_task(bridge, target, player, &code, timeout + 5.0)?;
     if outcome.success {
         Ok(json!({
             "ok": true,
@@ -1453,23 +1527,11 @@ fn run_luau_task(
     bridge: &BridgeServer,
     target: BridgeTarget,
     player: Option<&str>,
-    client_context: bool,
     code: &str,
     timeout: f64,
 ) -> Result<LuauTaskOutcome> {
     let started = Instant::now();
-    let result = bridge.call_for_selector_with_timeout(
-        "executeLuau",
-        json!({
-            "code": code,
-            "chunkName": "ReniumTask",
-            "context": if client_context { "client" } else { "plugin" },
-            "timeoutSeconds": timeout,
-        }),
-        target,
-        player,
-        Some(Duration::from_secs_f64(timeout + 2.0)),
-    )?;
+    let result = call_execute_luau(bridge, target, player, code, "ReniumTask", timeout, 2.0)?;
     ensure_luau_api_ok(&result)?;
     let results = result
         .get("results")
@@ -1607,14 +1669,7 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
          \tif not ok then error(reached) end\n\
          \treturn reached, detail"
     );
-    let outcome = run_luau_task(
-        bridge,
-        BridgeTarget::Client,
-        player,
-        true,
-        &code,
-        timeout + 5.0,
-    )?;
+    let outcome = run_luau_task(bridge, BridgeTarget::Client, player, &code, timeout + 5.0)?;
     if outcome.success {
         let final_distance = outcome
             .detail
@@ -1959,7 +2014,7 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
 }
 
 pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
-    let result = try_daemon_control_request(
+    let mut result = try_daemon_control_request(
         op::RECORD_END,
         None,
         json!({
@@ -1968,6 +2023,9 @@ pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
         false,
     )?
     .context("No Renium recording is active")?;
+    if !args.no_review {
+        recording_review::attach_overview(&mut result);
+    }
     print_json_output(&result, false)
 }
 
@@ -2071,15 +2129,11 @@ fn studio_play_clients(bridge: &BridgeServer, edit_runtime_id: &str) -> Vec<Valu
         .collect()
 }
 
-fn play_client_is_running(bridge: &BridgeServer, client: &Value) -> bool {
-    let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
-        return false;
-    };
-    let target = match client.get("role").and_then(Value::as_str) {
-        Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
-        Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
-        _ => return false,
-    };
+fn runtime_stopped_state(
+    bridge: &BridgeServer,
+    target: BridgeTarget,
+    runtime_id: &str,
+) -> Option<bool> {
     bridge
         .call_for_runtime_with_timeout(
             "startStopPlay",
@@ -2088,7 +2142,25 @@ fn play_client_is_running(bridge: &BridgeServer, client: &Value) -> bool {
             runtime_id,
             Some(Duration::from_millis(500)),
         )
-        .is_ok_and(|status| play_status_is_running(&status))
+        .ok()
+        .map(|status| play_status_is_stopped(&status))
+}
+
+fn play_client_stopped_state(bridge: &BridgeServer, client: &Value) -> Option<bool> {
+    let runtime_id = client.get("runtimeId").and_then(Value::as_str)?;
+    let target = match client.get("role").and_then(Value::as_str) {
+        Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
+        Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
+        _ => return None,
+    };
+    runtime_stopped_state(bridge, target, runtime_id)
+}
+
+fn play_runtime_is_active(edit_stopped: Option<bool>, play_stopped: Option<bool>) -> bool {
+    match play_stopped {
+        Some(stopped) => !stopped,
+        None => edit_stopped != Some(true),
+    }
 }
 
 fn play_status_is_running(status: &Value) -> bool {
@@ -2096,21 +2168,25 @@ fn play_status_is_running(status: &Value) -> bool {
         || status.get("starting").and_then(Value::as_bool) == Some(true)
 }
 
-pub(crate) fn active_studio_play_clients(
-    bridge: &BridgeServer,
-    edit_runtime_id: &str,
-) -> Vec<Value> {
-    studio_play_clients(bridge, edit_runtime_id)
-        .into_iter()
-        .filter(|client| play_client_is_running(bridge, client))
-        .collect()
+fn play_status_is_stopped(status: &Value) -> bool {
+    !play_status_is_running(status)
+        && status.get("running").and_then(Value::as_bool) == Some(false)
+        && status.get("readyForStart").and_then(Value::as_bool) == Some(true)
+}
+
+fn retire_play_clients(bridge: &BridgeServer, clients: &[Value]) {
+    for client in clients {
+        if let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) {
+            bridge.retire_runtime(runtime_id);
+        }
+    }
 }
 
 fn request_play_runtimes_to_stop(
     bridge: &BridgeServer,
     clients: &[Value],
     launch_nonce: Option<&str>,
-) -> bool {
+) {
     let mut params = Map::new();
     params.insert("stop".to_string(), Value::Bool(true));
     params.insert("waitForStopped".to_string(), Value::Bool(false));
@@ -2120,7 +2196,6 @@ fn request_play_runtimes_to_stop(
             Value::String(launch_nonce.to_string()),
         );
     }
-    let mut requested = false;
     for client in clients {
         let target = match client.get("role").and_then(Value::as_str) {
             Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
@@ -2130,24 +2205,42 @@ fn request_play_runtimes_to_stop(
         let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
             continue;
         };
-        requested = true;
         let _ = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params.clone()),
             target,
             runtime_id,
-            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(1_100)),
         );
     }
-    requested
+}
+
+pub(crate) fn active_studio_play_clients(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+) -> Vec<Value> {
+    let clients = studio_play_clients(bridge, edit_runtime_id);
+    if clients.is_empty() {
+        return clients;
+    }
+    let edit_stopped = runtime_stopped_state(bridge, BridgeTarget::Edit, edit_runtime_id);
+    let mut active = Vec::new();
+    for client in clients {
+        if play_runtime_is_active(edit_stopped, play_client_stopped_state(bridge, &client)) {
+            active.push(client);
+        } else if let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) {
+            bridge.retire_runtime(runtime_id);
+        }
+    }
+    active
 }
 
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
     let edit_runtime_id = edit_pin.runtime_id;
     let initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
-    let initial_clients = active_studio_play_clients(bridge, &edit_runtime_id);
-    if studio_session_is_stopped(&initial, &initial_clients) {
+    let mut active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+    if play_status_is_stopped(&initial) && active_clients.is_empty() {
         bridge.clear_runtime_pins();
         return Ok(initial);
     }
@@ -2156,6 +2249,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let launch_nonce = launch_nonce.or_else(|| single_play_launch_nonce(&active_clients));
     let mut last_status = Value::Null;
     for attempt in 1..=3 {
         let mut params = Map::new();
@@ -2167,10 +2261,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             );
         }
         params.insert("waitForStopped".to_string(), Value::Bool(false));
-        let clients = active_studio_play_clients(bridge, &edit_runtime_id);
-        if request_play_runtimes_to_stop(bridge, &clients, None) {
-            thread::sleep(Duration::from_millis(100));
-        }
+        request_play_runtimes_to_stop(bridge, &active_clients, launch_nonce.as_deref());
         let stop_result = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params),
@@ -2192,9 +2283,8 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             let status_stopped = match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
                 Ok(status) => {
                     last_status = status.clone();
-                    let active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
-                    request_play_runtimes_to_stop(bridge, &active_clients, None);
-                    studio_session_is_stopped(&status, &active_clients)
+                    active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+                    play_status_is_stopped(&status) && active_clients.is_empty()
                 }
                 Err(err) => {
                     last_status = json!({ "error": format!("{:#}", err) });
@@ -2208,6 +2298,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             thread::sleep(Duration::from_millis(100));
         }
         if stopped {
+            retire_play_clients(bridge, &studio_play_clients(bridge, &edit_runtime_id));
             bridge.clear_runtime_pins();
             return Ok(json!({
                 "ok": true,
@@ -2230,7 +2321,7 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
         json!({}),
         BridgeTarget::Edit,
         runtime_id,
-        None,
+        Some(Duration::from_millis(1_100)),
     )?;
     ensure_plugin_api_ok(&status)?;
     Ok(status)
@@ -2264,41 +2355,34 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
     }
 }
 
-fn studio_status_indicates_stopped(status: &Value) -> bool {
-    if let Some(running) = status.get("running").and_then(Value::as_bool) {
-        !running
-    } else {
-        status
-            .get("studioTest")
-            .and_then(|value| value.get("editModeActive"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    }
-}
-
-fn studio_session_is_stopped(status: &Value, active_play_clients: &[Value]) -> bool {
-    studio_status_indicates_stopped(status)
-        && status.get("starting").and_then(Value::as_bool) != Some(true)
-        && active_play_clients.is_empty()
-}
-
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
 
     #[test]
-    fn running_bridge_overrides_a_stale_stopped_controller() {
-        let status = json!({ "running": false, "starting": false });
-        let clients = vec![json!({ "role": "play-server" })];
+    fn ready_controller_is_stopped() {
+        let status = json!({ "running": false, "starting": false, "readyForStart": true });
 
-        assert!(!studio_session_is_stopped(&status, &clients));
+        assert!(play_status_is_stopped(&status));
     }
 
     #[test]
-    fn stopped_controller_without_play_bridges_is_stopped() {
-        let status = json!({ "running": false, "starting": false });
+    fn transitioning_controller_is_not_stopped() {
+        let status = json!({ "running": false, "starting": false, "readyForStart": false });
 
-        assert!(studio_session_is_stopped(&status, &[]));
+        assert!(!play_status_is_stopped(&status));
+    }
+
+    #[test]
+    fn running_play_runtime_overrides_stale_stopped_editor() {
+        assert!(play_runtime_is_active(Some(true), Some(false)));
+    }
+
+    #[test]
+    fn unresponsive_play_runtime_follows_editor_state() {
+        assert!(!play_runtime_is_active(Some(true), None));
+        assert!(play_runtime_is_active(Some(false), None));
+        assert!(play_runtime_is_active(None, None));
     }
 
     #[test]

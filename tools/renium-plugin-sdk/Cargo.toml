@@ -1,0 +1,19 @@
+[package]
+name = "renium-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Small, process-based plugin API for Renium"
+license-file = "../../LICENSE"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects"] }

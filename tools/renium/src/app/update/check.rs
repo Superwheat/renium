@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread;
@@ -19,6 +19,7 @@ use crate::app::timing::current_millis;
 const CACHE_INTERVAL_MS: u128 = 5 * 60 * 1000;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+const REFRESH_RESERVATION_MS: u128 = 30_000;
 static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +46,58 @@ enum ManifestResponse {
 struct Lock {
     path: PathBuf,
     token: String,
+}
+
+// Admission happens before spawning, unlike the fetch lock in the child.
+// The short expiry also recovers a launcher killed before it starts the child.
+pub(super) fn reserve_agent_refresh() -> Result<Option<RefreshReservation>> {
+    reserve_refresh_at(
+        user_data_dir()?.join("update-refresh.pending"),
+        current_millis(),
+    )
+}
+
+pub(super) struct RefreshReservation {
+    file: fs::File,
+}
+
+impl RefreshReservation {
+    pub(super) fn cancel(self) {
+        let _ = self.file.set_len(0);
+    }
+}
+
+fn reserve_refresh_at(path: PathBuf, now: u128) -> Result<Option<RefreshReservation>> {
+    let root = path
+        .parent()
+        .context("Refresh reservation has no directory")?;
+    fs::create_dir_all(root)?;
+    let mut file = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    let mut previous = String::new();
+    Read::by_ref(&mut file)
+        .take(64)
+        .read_to_string(&mut previous)?;
+    if previous
+        .parse::<u128>()
+        .ok()
+        .is_some_and(|started| now >= started && now - started < REFRESH_RESERVATION_MS)
+    {
+        return Ok(None);
+    }
+    file.rewind()?;
+    file.set_len(0)?;
+    write!(file, "{now}")?;
+    Ok(Some(RefreshReservation { file }))
 }
 
 impl Drop for Lock {
@@ -257,4 +310,35 @@ pub(super) fn manifest(source: &str) -> Result<SignedUpdateManifest> {
         eprintln!("[renium] warning: failed to cache update check: {error:#}");
     }
     cached_manifest(cache)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    #[test]
+    fn admission_is_exclusive_recovers_and_cancels_failed_launches() {
+        let root = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-update-admission-",
+        )
+        .unwrap();
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let path = root.join("pending");
+        let first = reserve_refresh_at(path.clone(), 100).unwrap().unwrap();
+        assert!(reserve_refresh_at(path.clone(), 100).unwrap().is_none());
+        drop(first);
+        assert!(reserve_refresh_at(path.clone(), 200).unwrap().is_none());
+        reserve_refresh_at(path.clone(), REFRESH_RESERVATION_MS + 100)
+            .unwrap()
+            .unwrap()
+            .cancel();
+        assert!(
+            reserve_refresh_at(path, REFRESH_RESERVATION_MS + 101)
+                .unwrap()
+                .is_some()
+        );
+    }
 }

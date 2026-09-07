@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+mod control_reader;
 pub(crate) mod transport;
 
 use crate::app::timing::current_millis;
@@ -27,10 +28,9 @@ use crate::bytecode::explorer::watch_parent_and_exit;
 use crate::cli::args::CursorPollArgs;
 use crate::cli::{BridgeDaemonArgs, BridgeGetSourceArgs};
 use crate::daemon::transport::{
-    BoundedLineRead, DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_AGE_MS,
-    DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS, DEFAULT_DAEMON_CONTROL_PORT,
-    MAX_DAEMON_CONTROL_CONNECTIONS, MAX_DAEMON_LINE_BYTES, host_port, is_loopback_endpoint,
-    normalize_loopback_host, read_bounded_line,
+    DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_AGE_MS, DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS,
+    DEFAULT_DAEMON_CONTROL_PORT, MAX_DAEMON_CONTROL_CONNECTIONS, host_port, is_loopback_endpoint,
+    normalize_loopback_host,
 };
 use crate::snapshot::export::{fetch_text_chunks, parse_bridge_ports};
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, clamp_bridge_chunk_size};
@@ -196,6 +196,12 @@ fn spawn_daemon_control_server(
             "Failed to bind daemon control on {bind_host}:{port}; check {discoveries}, then run `rbx daemon clean` or choose another --control-port"
         )
     })?;
+    state
+        .authority
+        .set(automation::authorization::Authority::initialize(
+            listener.local_addr()?.port(),
+        )?)
+        .map_err(|_| anyhow::anyhow!("Daemon control authority was already initialized"))?;
     println!("[renium] daemon control listening on {bind_host}:{port}");
     let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
@@ -247,25 +253,22 @@ fn handle_daemon_control_connection(
 ) -> Result<()> {
     let _ = stream.set_read_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
-    let reader_stream = stream
-        .try_clone()
-        .context("Failed to clone control stream")?;
-    let mut reader = BufReader::new(reader_stream);
+    let stream = crate::system::net::SharedTcpStream::from(stream);
+    let monitor_bridge = Arc::clone(bridge);
+    let reader = control_reader::ControlReader::start(stream.clone(), move |lease| {
+        let _ = monitor_bridge.cancel_request_lease(lease.id());
+    })?;
     let mut writer = BufWriter::new(stream);
-    let mut line = String::new();
-    loop {
-        match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES)
-            .context("Failed to read daemon control request")?
-        {
-            BoundedLineRead::Eof => break,
-            BoundedLineRead::Line => {}
-            BoundedLineRead::TooLong => {
+    while let Some(request) = reader.next() {
+        let line = match request {
+            control_reader::Request::Line(line) => line,
+            control_reader::Request::TooLong => {
                 let response = oversized_automation_request_response();
                 writeln!(writer, "{}", serde_json::to_string(&response)?)?;
                 writer.flush()?;
                 continue;
             }
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -276,42 +279,9 @@ fn handle_daemon_control_connection(
             NEXT_CONTROL_LEASE_ID.fetch_add(1, Ordering::Relaxed)
         );
         let request_lease = Arc::new(BridgeRequestLease::new(lease_id));
-        let monitor_stream = writer
-            .get_ref()
-            .try_clone()
-            .context("Failed to clone control stream for cancellation")?;
-        let monitor_lease = Arc::clone(&request_lease);
-        let monitor_bridge = Arc::clone(bridge);
-        monitor_stream
-            .set_read_timeout(Some(Duration::from_millis(1)))
-            .context("Failed to configure control cancellation monitor")?;
-        let disconnect_monitor = thread::spawn(move || {
-            let mut probe = [0u8; 1];
-            while !monitor_lease.is_finished() {
-                match monitor_stream.peek(&mut probe) {
-                    Ok(0) => {
-                        if monitor_lease.cancel() {
-                            let _ = monitor_bridge.cancel_request_lease(monitor_lease.id());
-                        }
-                        break;
-                    }
-                    Ok(_) => thread::sleep(Duration::from_millis(2)),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock
-                                | io::ErrorKind::TimedOut
-                                | io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => {
-                        if monitor_lease.cancel() {
-                            let _ = monitor_bridge.cancel_request_lease(monitor_lease.id());
-                        }
-                        break;
-                    }
-                }
-            }
-        });
+        if !reader.activate(Arc::clone(&request_lease)) {
+            break;
+        }
         let response = automation_parse_response_with_lease(
             trimmed,
             state,
@@ -324,11 +294,7 @@ fn handle_daemon_control_connection(
             writeln!(writer, "{response}")?;
             writer.flush()
         })();
-        request_lease.finish();
-        let _ = disconnect_monitor.join();
-        let _ = writer
-            .get_ref()
-            .set_read_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT));
+        reader.finish();
         write_result?;
     }
     Ok(())
@@ -613,6 +579,7 @@ fn push_daemon_endpoint(
 }
 
 fn try_bind_daemon_context(project_root: Option<&Path>) -> Result<Option<Value>> {
+    let resource_lease = crate::plugins::environment_claim()?;
     let root = project_root
         .map_or_else(
             || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -625,7 +592,7 @@ fn try_bind_daemon_context(project_root: Option<&Path>) -> Result<Option<Value>>
         id: current_millis().min(u128::from(u64::MAX)) as u64,
         op: automation::op::BIND,
         cx: None,
-        p: json!({ "root": root, "place": place_filter() }),
+        p: json!({ "root": root, "place": place_filter(), "resourceLease": resource_lease }),
     })?
     else {
         return Ok(None);
@@ -634,9 +601,9 @@ fn try_bind_daemon_context(project_root: Option<&Path>) -> Result<Option<Value>>
         let error = bind.e.context("Daemon bind failed without an error")?;
         bail!("{}", error.m);
     }
-    bind.r
-        .context("Daemon bind response omitted its context")
-        .map(Some)
+    let response = bind.r.context("Daemon bind response omitted its context")?;
+    crate::plugins::verify_lease_ack(resource_lease.is_some(), &response)?;
+    Ok(Some(response))
 }
 
 pub(crate) fn daemon_project_root(project: Option<&Path>) -> Option<&Path> {
@@ -680,6 +647,7 @@ fn spawn_shared_daemon(
         .arg(wait_seconds.to_string())
         .arg("--control-port")
         .arg(control_port.to_string())
+        .env_remove("RENIUM_RESOURCE_LEASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -697,6 +665,13 @@ fn spawn_shared_daemon(
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+    // The shared daemon must outlive the job containing a plugin command.
+    let detach_flags = if std::env::var_os("RENIUM_PLUGIN_CHILD").is_some_and(|value| value == "1")
+    {
+        0x01000000
+    } else {
+        0
+    };
     let status = Command::new("powershell.exe")
         .args([
             "-NoLogo",
@@ -711,10 +686,11 @@ fn spawn_shared_daemon(
         .env("RENIUM_DAEMON_PORTS", ports)
         .env("RENIUM_DAEMON_WAIT", wait_seconds.to_string())
         .env("RENIUM_DAEMON_CONTROL_PORT", control_port.to_string())
+        .env_remove("RENIUM_RESOURCE_LEASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW | detach_flags)
         .status()?;
     if status.success() {
         Ok(())
@@ -723,28 +699,35 @@ fn spawn_shared_daemon(
     }
 }
 
-pub(crate) fn start_shared_daemon(ports: &str, wait_seconds: f64) -> bool {
+pub(crate) fn ensure_shared_daemon(ports: &str, wait_seconds: f64) -> Result<()> {
     let control_port = std::env::var("RENIUM_DAEMON_CONTROL_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port != 0)
         .unwrap_or(DEFAULT_DAEMON_CONTROL_PORT);
-    start_shared_daemon_on(ports, wait_seconds, control_port)
+    ensure_shared_daemon_on(ports, wait_seconds, control_port)
 }
 
 fn start_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) -> bool {
-    let Ok(executable) = std::env::current_exe() else {
-        return false;
-    };
-    let _ = spawn_shared_daemon(&executable, ports, wait_seconds, control_port);
+    ensure_shared_daemon_on(ports, wait_seconds, control_port).is_ok()
+}
+
+fn ensure_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) -> Result<()> {
+    let executable = std::env::current_exe().context("Cannot locate the Renium executable")?;
+    spawn_shared_daemon(&executable, ports, wait_seconds, control_port)
+        .context("Could not start the Renium daemon")?;
     let deadline = Instant::now() + SHARED_DAEMON_START_TIMEOUT;
     while Instant::now() < deadline {
         if shared_daemon_available() {
-            return true;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    shared_daemon_available()
+    if shared_daemon_available() {
+        Ok(())
+    } else {
+        bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+    }
 }
 
 pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<PathBuf>> {
@@ -762,8 +745,28 @@ pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<Path
 pub(super) fn try_daemon_control_request(
     operation: u16,
     project_root: Option<&Path>,
+    parameters: Value,
+    approved: bool,
+) -> Result<Option<Value>> {
+    daemon_control_request_inner(operation, project_root, parameters, approved, false)
+}
+
+pub(crate) fn daemon_control_request(
+    operation: u16,
+    project_root: Option<&Path>,
+    parameters: Value,
+    approved: bool,
+) -> Result<Value> {
+    daemon_control_request_inner(operation, project_root, parameters, approved, true)?
+        .context("Renium daemon did not accept the command")
+}
+
+fn daemon_control_request_inner(
+    operation: u16,
+    project_root: Option<&Path>,
     mut parameters: Value,
     approved: bool,
+    required: bool,
 ) -> Result<Option<Value>> {
     let opcode = automation::opcode_by_id(operation)?;
     let bridge_wait_seconds = parameters
@@ -791,17 +794,22 @@ pub(super) fn try_daemon_control_request(
     ) && object.get("pid").and_then(Value::as_u64).is_some();
     if matches!(
         operation,
-        automation::op::STUDIOS | automation::op::PERFORMANCE_PROFILE
+        automation::op::CAP | automation::op::STUDIOS | automation::op::PERFORMANCE_PROFILE
     ) || direct_package
     {
-        let Some(response) = try_send_request(&automation::Request {
+        let request = automation::Request {
             v: automation::PROTOCOL_VERSION,
             id: current_millis().min(u128::from(u64::MAX)) as u64,
             op: operation,
             cx: None,
             p: std::mem::take(&mut parameters),
-        })?
-        else {
+        };
+        let mut response = try_send_request(&request)?;
+        if response.is_none() && required {
+            ensure_shared_daemon(&bridge_ports, bridge_wait_seconds)?;
+            response = try_send_request(&request)?;
+        }
+        let Some(response) = response else {
             return Ok(None);
         };
         if response.ok == 0 {
@@ -824,9 +832,11 @@ pub(super) fn try_daemon_control_request(
             !needs_runtime || context.get("runtimeId").and_then(Value::as_str).is_some()
         })
     };
-    let daemon_started = needs_runtime
-        && context.is_none()
-        && start_shared_daemon(&bridge_ports, bridge_wait_seconds);
+    let daemon_started = context.is_none() && (required || needs_runtime);
+    if daemon_started {
+        ensure_shared_daemon(&bridge_ports, bridge_wait_seconds)?;
+        context = try_bind_daemon_context(project_root)?;
+    }
     if needs_runtime && !ready(&context) && shared_daemon_available() {
         let reconnect_grace = if daemon_started {
             Duration::from_secs(2)

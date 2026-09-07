@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "name": "sandbox",
+  "version": "0.1.0",
+  "description": "Reserve a disposable published Studio place for one task",
+  "executable": {
+    "windows": ["target/release/renium-sandbox.exe"],
+    "macos": ["target/release/renium-sandbox"]
+  },
+  "permissions": ["renium", "filesystem", "network", "studio"],
+  "guide": "AGENTS.md",
+  "commands": {
+    "acquire": {
+      "description": "Reserve a configured slot and begin preparing an isolated project",
+      "arguments": [
+        {"name": "slot", "type": "string", "description": "Optional configured slot name"}
+      ]
+    },
+    "prepare": {
+      "description": "Continue preparation; return when ready or when another bounded step is needed",
+      "arguments": [
+        {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
+      ]
+    },
+    "refresh": {
+      "description": "Load the worktree's current projection into the owned stopped sandbox",
+      "arguments": [
+        {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
+      ]
+    },
+    "run": {
+      "description": "Run a targeted Renium test/capture command in the owned sandbox",
+      "arguments": [
+        {"name": "slot", "type": "string", "description": "Owned slot", "required": true},
+        {"name": "args", "type": "string", "description": "JSON argument array, e.g. [\"status\"]", "required": true},
+        {"name": "reason", "type": "string", "description": "Specific runtime question; required when starting Play"}
+      ]
+    },
+    "release": {
+      "description": "Close the owned Studio, erase test data and reset the slot; resumable on interruption",
+      "arguments": [
+        {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
+      ]
+    },
+    "status": {"description": "Read local slot ownership and progress without opening Studio"}
+  }
+}

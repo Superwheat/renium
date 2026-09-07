@@ -251,7 +251,7 @@ fn write_sample(
 }
 
 fn record_file(
-    window: &input_inject::StudioWindow,
+    mut capture: impl FnMut() -> Result<(u32, u32, Vec<u8>)>,
     first: (u32, u32, Vec<u8>),
     options: &RecordingOptions,
     stop: &AtomicBool,
@@ -330,7 +330,7 @@ fn record_file(
         if stop.load(Ordering::Relaxed) || started.elapsed() >= limit {
             break;
         }
-        let (frame_width, frame_height, pixels) = input_inject::capture_window_rgba(window)?;
+        let (frame_width, frame_height, pixels) = capture()?;
         if (frame_width, frame_height) != (source_width, source_height) {
             bail!(
                 "The recorded window changed from {source_width}x{source_height} to {frame_width}x{frame_height}"
@@ -381,7 +381,14 @@ fn record(
 ) -> Result<FinishedRecording> {
     cleanup_stale_sibling_temps(&options.output);
     let temp_path = sibling_temp_path(&options.output);
-    let result = record_file(&window, first, &options, &stop, ready, &temp_path);
+    let result = record_file(
+        || input_inject::capture_window_rgba(&window),
+        first,
+        &options,
+        &stop,
+        ready,
+        &temp_path,
+    );
     if result.is_err() {
         let _ = fs::remove_file(temp_path);
     }
@@ -546,4 +553,78 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         "mimeType": "video/mp4",
         "audio": false,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_end_saves_video_reviews_and_preserves_it_when_review_fails() {
+        let root = std::env::temp_dir().join(automation_token("recording-end"));
+        fs::create_dir_all(&root).unwrap();
+        for (name, review, block_review) in [
+            ("normal", true, false),
+            ("video-only", false, false),
+            ("blocked", true, true),
+        ] {
+            let output = root.join(format!("{name}.mp4"));
+            if block_review {
+                fs::write(root.join(format!("{name}.mp4.review")), b"not a directory").unwrap();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let options = RecordingOptions {
+                output: output.clone(),
+                fps: 30.0,
+                max_seconds: 5.0,
+                quality: 80.0,
+            };
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let mut frames = 0;
+                let mut frame = || {
+                    frames += 1;
+                    if frames == 3 {
+                        thread_stop.store(true, Ordering::Relaxed);
+                    }
+                    Ok((65, 33, [20, 80, 200, 255].repeat(65 * 33)))
+                };
+                let first = frame()?;
+                let temp = sibling_temp_path(&options.output);
+                let result = record_file(frame, first, &options, &thread_stop, ready_tx, &temp);
+                let _ = done_tx.send(());
+                result
+            });
+            ready_rx.recv().unwrap().unwrap();
+            *ACTIVE.lock().unwrap() = Some(ActiveRecording {
+                id: name.into(),
+                output: output.clone(),
+                target: "test",
+                window: "synthetic capture".into(),
+                stop,
+                worker,
+            });
+            assert!(end(&json!({"recordingId":"wrong"})).is_err());
+            done_rx.recv().unwrap();
+            let mut result = end(&json!({"recordingId":name})).unwrap();
+            if review {
+                super::super::recording_review::attach_overview(&mut result);
+            }
+            assert_eq!(result["width"], 64);
+            assert_eq!(result["height"], 32);
+            assert!(output.is_file());
+            if review && !block_review {
+                assert_eq!(result["review"]["totalFrames"], result["frames"]);
+                assert!(Path::new(result["review"]["path"].as_str().unwrap()).is_file());
+            } else if block_review {
+                assert!(result["reviewError"].is_string());
+            } else {
+                assert!(result.get("review").is_none());
+            }
+            assert!(end(&json!({})).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

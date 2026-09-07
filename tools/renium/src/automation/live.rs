@@ -47,7 +47,7 @@ struct EnabledMarker {
     target: String,
 }
 
-fn log_live_timing(label: &str, started: Instant) {
+pub(super) fn log_live_timing(label: &str, started: Instant) {
     log_global(
         4,
         format_args!("[renium] live {label}: {:.1}ms", elapsed_ms(started)),
@@ -81,9 +81,47 @@ struct Status {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginLiveStatus {
+    running: bool,
+    paused: bool,
+    read_only: bool,
+    resolution_required: bool,
+    error: Option<String>,
+}
+
+impl Control {
+    fn plugin_live_status(&self) -> PluginLiveStatus {
+        let status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        PluginLiveStatus {
+            running: status.running,
+            paused: status.paused,
+            read_only: status.mode == "verify",
+            resolution_required: status.resolution_required,
+            error: status.error.clone(),
+        }
+    }
+}
+
+fn report_plugin_live_status(bridge: &BridgeServer, runtime_id: &str, status: &PluginLiveStatus) {
+    if let Err(error) = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "compact": true, "liveSyncStatus": status }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(1)),
+    ) {
+        log_global(
+            5,
+            format_args!("[renium] live status display update failed: {error:#}"),
+        );
+    }
+}
+
 #[derive(Default)]
 struct LivePushResult {
-    generated_paths: Vec<PathBuf>,
+    accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
     auto_desynced_packages: Vec<String>,
 }
 
@@ -627,6 +665,25 @@ impl Control {
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
+
+    fn stop_and_wait(&self, bridge: &BridgeServer, runtime_id: Option<&str>) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(runtime_id) = runtime_id
+            && let Err(error) = bridge.call_for_runtime_with_timeout(
+                "cancelStudioChangeWait",
+                json!({}),
+                BridgeTarget::Edit,
+                runtime_id,
+                Some(Duration::from_secs(1)),
+            )
+        {
+            log_global(
+                5,
+                format_args!("[renium] cancel live change wait: {error:#}"),
+            );
+        }
+        self.wait_finished();
+    }
 }
 
 struct SyncActivity<'a> {
@@ -743,6 +800,7 @@ impl Manager {
     }
 
     pub(crate) fn attach(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
+        crate::plugins::verify_place_lease(context.place_id, context.resource_lease.as_ref())?;
         let key = self.coordinator.pair_key(context, bridge)?;
         let alias = self
             .sessions
@@ -783,7 +841,9 @@ impl Manager {
         reset_files_paused: bool,
         configuration: PairConfiguration,
     ) -> Result<StartResult> {
+        let phase = Instant::now();
         let setup = self.coordinator.prepare(&context, &bridge, configuration)?;
+        log_live_timing("startup pair preparation", phase);
         let pair_key = setup.key.clone();
         let mut release_owner = OnDrop::new(|| self.coordinator.release_target(&pair_key));
         let result = self.start_prepared(
@@ -865,9 +925,8 @@ impl Manager {
                     created: None,
                 });
             }
-            control.stop.store(true, Ordering::Release);
             drop(sessions);
-            control.wait_finished();
+            control.stop_and_wait(&bridge, runtime_id.as_deref());
             sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions.get(&setup.key).is_some_and(|current| {
                 current.id == session_id && Arc::ptr_eq(&current.control, &control)
@@ -918,6 +977,8 @@ impl Manager {
         let coordinator = Arc::clone(&self.coordinator);
         let owner_coordinator = Arc::clone(&coordinator);
         let owner_key = pair_key.clone();
+        let report_bridge = Arc::clone(&session_bridge);
+        let report_runtime = runtime_id.clone();
         let (start_sender, start_receiver) = mpsc::sync_channel(0);
         thread::Builder::new()
             .name(format!("renium-live-{context_id}"))
@@ -952,6 +1013,18 @@ impl Manager {
                             .unwrap_or_else(|| "unknown panic".to_string());
                         worker_control.fail(format!("Live sync watcher panicked: {message}"));
                     }
+                }
+                worker_control
+                    .status
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .running = false;
+                if let Some(runtime_id) = report_runtime.as_deref() {
+                    report_plugin_live_status(
+                        &report_bridge,
+                        runtime_id,
+                        &worker_control.plugin_live_status(),
+                    );
                 }
                 owner_coordinator.release_target(&owner_key);
                 worker_control.finish();
@@ -1342,17 +1415,7 @@ impl Manager {
                 })
         };
         if let Some((control, bridge, runtime_id)) = session {
-            control.stop.store(true, Ordering::Release);
-            if let Some(runtime_id) = runtime_id {
-                let _ = bridge.call_for_runtime_with_timeout(
-                    "cancelStudioChangeWait",
-                    json!({}),
-                    BridgeTarget::Edit,
-                    &runtime_id,
-                    Some(Duration::from_secs(1)),
-                );
-            }
-            control.wait_finished();
+            control.stop_and_wait(&bridge, runtime_id.as_deref());
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions.get(&alias.key).is_some_and(|current| {
                 current.id == alias.session_id && Arc::ptr_eq(&current.control, &control)
@@ -1364,7 +1427,13 @@ impl Manager {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .retain(|_, current| current != alias);
-            control.snapshot()
+            let mut stopped = control.snapshot();
+            if let Some(object) = stopped.as_object_mut()
+                && let Some(error) = object.remove("error")
+            {
+                object.insert("previousError".to_string(), error);
+            }
+            stopped
         } else {
             self.aliases
                 .lock()
@@ -1721,7 +1790,7 @@ fn push_full(
         bail!("Studio changes are waiting for review");
     }
     Ok(LivePushResult {
-        generated_paths: Vec::new(),
+        accepted: BTreeMap::new(),
         auto_desynced_packages: auto_desynced_packages(&summary),
     })
 }
@@ -1736,6 +1805,7 @@ struct PulledStudioChanges {
 fn pull_studio_changes(
     context: &BoundContext,
     bridge: &BridgeServer,
+    control: &Control,
     pending_state: Option<Value>,
 ) -> Result<Option<PulledStudioChanges>> {
     let runtime_id = context
@@ -1748,6 +1818,10 @@ fn pull_studio_changes(
         read_live_studio_change_state(bridge, runtime_id)?
     };
     let state = settle_studio_change_state(bridge, runtime_id, state)?;
+    // Reconciliation may already have acknowledged this queued notification.
+    // Publish the fresh empty state too, or --wait retains the old dirty cache
+    // until the next long-poll response despite all data already being synced.
+    control.set_plugin_state(state.clone());
     if state["twoWaySyncEnabled"].as_bool() == Some(false) {
         return Ok(None);
     }
@@ -1777,7 +1851,7 @@ fn pull_studio_changes(
     bridge.clear_runtime_pins();
     bridge.pin_runtime(BridgeTarget::Main, runtime_id);
     bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let published = export_snapshots_with_warm_bridge(
         automation_pull_args(context, &parameters, true)?,
         bridge,
@@ -2027,6 +2101,43 @@ fn file_stamp_label(state: Option<&FileStamp>) -> String {
     }
 }
 
+fn record_accepted_stamp(
+    root: &Path,
+    path: &Path,
+    expected: Option<&PublishEntryState>,
+    current: Option<&FileStamp>,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+) {
+    let matches = published_state_matches(root, path, expected, current);
+    // Advance to the bytes actually accepted, even if the editor has since
+    // changed back to the old baseline. A later event must not cancel that edit.
+    let accepted = match expected {
+        Some(PublishEntryState::Directory) => Some(FileStamp {
+            directory: true,
+            length: 0,
+            hash: 0,
+        }),
+        Some(PublishEntryState::File { length, hash, .. }) => Some(FileStamp {
+            directory: false,
+            length: *length,
+            hash: *hash,
+        }),
+        Some(PublishEntryState::Symlink(_)) if matches => current.copied(),
+        _ => None,
+    };
+    if let Some(accepted) = accepted {
+        baseline.insert(path.to_path_buf(), accepted);
+    } else {
+        baseline.remove(path);
+    }
+    if matches {
+        pending.remove(path);
+    } else {
+        pending.insert(path.to_path_buf());
+    }
+}
+
 fn reconcile_published_changes(
     project: &WatchProject,
     baseline: &mut BTreeMap<PathBuf, FileStamp>,
@@ -2038,23 +2149,24 @@ fn reconcile_published_changes(
         .keys()
         .chain(current.keys())
         .cloned()
+        .chain(
+            published
+                .expected
+                .keys()
+                .map(|path| project.root.join(path)),
+        )
         .collect::<BTreeSet<_>>();
     for path in candidates {
         let relative = path.strip_prefix(&project.root).unwrap_or(&path);
-        if let Some(expected) = published.expected.get(relative)
-            && published_state_matches(
+        if let Some(expected) = published.expected.get(relative) {
+            record_accepted_stamp(
                 &project.root,
-                relative,
+                &path,
                 expected.as_ref(),
                 current.get(&path),
-            )
-        {
-            if let Some(stamp) = current.get(&path) {
-                baseline.insert(path.clone(), *stamp);
-            } else {
-                baseline.remove(&path);
-            }
-            pending.remove(&path);
+                baseline,
+                pending,
+            );
         } else if baseline.get(&path) != current.get(&path) {
             log_global(
                 5,
@@ -2678,11 +2790,8 @@ impl LiveLoop {
                         Some(&push.guard),
                     )
                     .map(
-                        |AppliedEditorChanges {
-                             generated_paths,
-                             summary,
-                         }| LivePushResult {
-                            generated_paths,
+                        |AppliedEditorChanges { accepted, summary }| LivePushResult {
+                            accepted,
                             auto_desynced_packages: auto_desynced_packages(&summary),
                         },
                     )
@@ -2752,8 +2861,15 @@ impl LiveLoop {
         Ok(true)
     }
 
-    fn record_incremental_push(&mut self, push: &PreparedPush, generated_paths: Vec<PathBuf>) {
+    fn record_incremental_push(
+        &mut self,
+        push: &PreparedPush,
+        accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
+    ) {
         for (path, captured_stamp) in &push.captured {
+            if accepted.contains_key(path) {
+                continue;
+            }
             match stamp(path) {
                 Ok(current) if *captured_stamp == current => {
                     record_stamp(
@@ -2776,15 +2892,21 @@ impl LiveLoop {
                 }
             }
         }
-        for path in generated_paths {
-            if let Err(error) = record_current_stamp(
+        for (path, expected) in accepted {
+            let current = stamp(&path);
+            record_accepted_stamp(
+                &self.project.root,
                 &path,
+                expected.as_ref(),
+                current.as_ref().ok().and_then(|value| value.as_ref()),
                 &mut self.baseline,
                 &mut self.pending,
-                &mut self.blocked,
-            ) {
+            );
+            self.blocked.remove(&path);
+            if let Err(error) = current {
+                self.pending.insert(path);
                 self.control.fail(format!(
-                    "Live sync could not record a generated file: {error:#}"
+                    "Live sync could not verify an accepted file: {error:#}"
                 ));
                 self.rescan_pending = true;
             }
@@ -2793,7 +2915,7 @@ impl LiveLoop {
 
     fn record_push_success(&mut self, push: &PreparedPush, result: LivePushResult) -> Result<bool> {
         let LivePushResult {
-            generated_paths,
+            accepted,
             auto_desynced_packages,
         } = result;
         if push.refresh_project {
@@ -2801,7 +2923,7 @@ impl LiveLoop {
                 return Ok(true);
             }
         } else {
-            self.record_incremental_push(push, generated_paths);
+            self.record_incremental_push(push, accepted);
         }
         let mut status = self
             .control
@@ -2886,10 +3008,10 @@ impl LiveLoop {
 
     fn pull_studio(&mut self) -> Result<Option<PulledStudioChanges>> {
         let payload = self.studio.pending_payload.take();
-        match pull_studio_changes(&self.context, &self.bridge, payload) {
+        match pull_studio_changes(&self.context, &self.bridge, &self.control, payload) {
             Err(error) if automation_failure_ref(&error).0.rt == 1 => {
                 thread::sleep(Duration::from_millis(100));
-                pull_studio_changes(&self.context, &self.bridge, None)
+                pull_studio_changes(&self.context, &self.bridge, &self.control, None)
             }
             result => result,
         }
@@ -3044,7 +3166,21 @@ impl LiveLoop {
     }
 
     fn run(mut self) -> Result<()> {
+        let mut reported_status = None;
         while self.running() {
+            if self.push_ready || self.studio.pull_ready {
+                crate::plugins::verify_place_lease(
+                    self.context.place_id,
+                    self.context.resource_lease.as_ref(),
+                )?;
+            }
+            let status = self.control.plugin_live_status();
+            if reported_status.as_ref() != Some(&status) {
+                if let Some(runtime_id) = self.context.runtime_id.as_deref() {
+                    report_plugin_live_status(&self.bridge, runtime_id, &status);
+                }
+                reported_status = Some(status);
+            }
             if self.process_events()? {
                 thread::sleep(RESCAN_RETRY);
                 continue;
@@ -3074,6 +3210,23 @@ mod tests {
             PairMode::Reconcile,
             false,
         ))
+    }
+
+    #[test]
+    fn plugin_status_reports_failure_recovery_and_stop_without_per_edit_updates() {
+        let control = test_control();
+        let healthy = control.plugin_live_status();
+        control.status.lock().unwrap().pulls += 1;
+        assert_eq!(control.plugin_live_status(), healthy);
+        control.fail("Export failed".to_string());
+        assert_eq!(
+            control.plugin_live_status().error.as_deref(),
+            Some("Export failed")
+        );
+        control.clear_error();
+        assert_eq!(control.plugin_live_status(), healthy);
+        control.finish();
+        assert!(!control.plugin_live_status().running);
     }
 
     #[test]
@@ -3161,6 +3314,62 @@ mod tests {
             value["autoDesyncedPackages"],
             json!(["ReplicatedStorage.Package"])
         );
+    }
+
+    #[test]
+    fn acknowledged_intermediate_state_does_not_erase_a_later_revert() {
+        let root = PathBuf::from("test-project");
+        let path = root.join("src/changed.luau");
+        let old = FileStamp {
+            directory: false,
+            length: 8,
+            hash: fnv1a(b"return 1"),
+        };
+        let sent = FileStamp {
+            directory: false,
+            length: 8,
+            hash: fnv1a(b"return 2"),
+        };
+        for (before, accepted) in [
+            (Some(old), Some(sent)),
+            (None, Some(sent)),
+            (Some(old), None),
+        ] {
+            let mut baseline = before
+                .map(|value| (path.clone(), value))
+                .into_iter()
+                .collect();
+            let current = before
+                .map(|value| (path.clone(), value))
+                .into_iter()
+                .collect();
+            let mut pending = BTreeSet::from([path.clone()]);
+            let expected = accepted.map(|value| PublishEntryState::File {
+                sha256: String::new(),
+                length: value.length,
+                hash: value.hash,
+            });
+            record_accepted_stamp(
+                &root,
+                &path,
+                expected.as_ref(),
+                before.as_ref(),
+                &mut baseline,
+                &mut pending,
+            );
+            assert!(baseline.get(&path).copied() == accepted);
+            queue_scan_changes(&baseline, &current, &mut pending, &mut BTreeMap::new());
+            assert_eq!(pending, BTreeSet::from([path.clone()]));
+            record_accepted_stamp(
+                &root,
+                &path,
+                expected.as_ref(),
+                accepted.as_ref(),
+                &mut baseline,
+                &mut pending,
+            );
+            assert!(pending.is_empty());
+        }
     }
 
     #[test]

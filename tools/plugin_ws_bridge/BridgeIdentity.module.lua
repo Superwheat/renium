@@ -102,10 +102,25 @@ function BridgeIdentity.getDebugId(instance)
 	return if type(debugId) == "string" and #debugId > 0 then debugId else nil
 end
 
-local function siblingOrdinal(instance)
+local function siblingOrdinal(instance, ordinalsByParent)
 	local parent = instance.Parent
 	if parent == nil or parent == game then
 		return 1
+	end
+	if ordinalsByParent ~= nil then
+		local ordinals = ordinalsByParent[parent]
+		if ordinals == nil then
+			ordinals = {}
+			local counts = {}
+			for _, sibling in parent:GetChildren() do
+				local name = sibling.Name
+				local ordinal = (counts[name] or 0) + 1
+				counts[name] = ordinal
+				ordinals[sibling] = ordinal
+			end
+			ordinalsByParent[parent] = ordinals
+		end
+		return ordinals[instance] or 1
 	end
 	local ordinal = 0
 	for _, sibling in ipairs(parent:GetChildren()) do
@@ -119,7 +134,15 @@ local function siblingOrdinal(instance)
 	return 1
 end
 
-function BridgeIdentity.getRefPathParts(instance)
+-- Scope to one hierarchy snapshot; discard before changing names or parents.
+function BridgeIdentity.newPathSnapshot()
+	return { pathSegmentsByInstance = {}, pathOrdinalsByInstance = {}, siblingOrdinalsByParent = {} }
+end
+
+function BridgeIdentity.getRefPathParts(instance, snapshot)
+	if snapshot ~= nil then
+		return BridgeIdentity.getCachedRefPathParts(snapshot, instance)
+	end
 	if instance == game then
 		return {}, {}
 	end
@@ -170,7 +193,7 @@ function BridgeIdentity.getCachedRefPathParts(state, instance)
 		end
 	end
 	segments[#segments + 1] = instance.Name
-	ordinals[#ordinals + 1] = siblingOrdinal(instance)
+	ordinals[#ordinals + 1] = siblingOrdinal(instance, state.siblingOrdinalsByParent)
 	state.pathSegmentsByInstance[instance] = segments
 	state.pathOrdinalsByInstance[instance] = ordinals
 	return segments, ordinals

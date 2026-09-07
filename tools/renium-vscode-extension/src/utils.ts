@@ -210,32 +210,8 @@ export function normalizeServices(requested: readonly string[], fallback: readon
   return [...services];
 }
 
-export function normalizeReportedServices(
-  reported: readonly string[],
-  allowedServices: readonly string[],
-): string[] {
-  const allowed = new Set(allowedServices.map((service) => service.trim()).filter(Boolean));
-  return [...new Set(reported.map((service) => String(service).trim()).filter((service) => allowed.has(service)))];
-}
-
 export function samePathSegments(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((segment, index) => segment === right[index]);
-}
-
-export function writeUtf8FileIfChanged(filePath: string, content: string): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const next = Buffer.from(content, "utf8");
-  try {
-    const current = fs.readFileSync(filePath);
-    if (current.equals(next)) {
-      return;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-  fs.writeFileSync(filePath, next);
 }
 
 export function tabInputUris(input: unknown, scheme?: string): vscode.Uri[] {

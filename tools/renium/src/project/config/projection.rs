@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use globset::escape as escape_glob;
@@ -195,8 +195,8 @@ pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
             root: loaded.root.join(&loaded.project.source_root),
             temporary: false,
             cleanup: false,
-            transforms: Vec::new(),
-            identities: HashMap::new(),
+            transforms: Arc::default(),
+            identities: Arc::default(),
         });
     }
 
@@ -245,9 +245,19 @@ pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
         root,
         temporary: true,
         cleanup: true,
-        transforms,
-        identities,
+        transforms: Arc::new(transforms),
+        identities: Arc::new(identities),
     })
+}
+
+fn projection_cache_entry(key: &Path) -> super::ProjectionCacheEntry {
+    let cache = PROJECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 pub fn stage_project_cached(
@@ -256,15 +266,15 @@ pub fn stage_project_cached(
 ) -> Result<ProjectionStage> {
     let project_hash = sha256_hex(&serde_json::to_vec(&loaded.project)?);
     let key = fs::canonicalize(&loaded.path).unwrap_or_else(|_| absolute_path(&loaded.path));
-    let cache = PROJECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
+    let entry_lock = projection_cache_entry(&key);
+    let mut cache = entry_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let reusable = cache
-        .get(&key)
+        .as_ref()
         .is_some_and(|entry| entry.project_hash == project_hash && entry.root.is_dir());
     let source_shape_changed = reusable
-        && cache.get(&key).is_some_and(|entry| {
+        && cache.as_ref().is_some_and(|entry| {
             changed_sources.iter().any(|source| {
                 entry
                     .source_shape
@@ -279,7 +289,7 @@ pub fn stage_project_cached(
     let created = if reusable {
         false
     } else {
-        if let Some(previous) = cache.remove(&key) {
+        if let Some(previous) = cache.take() {
             remove_cached_script_naming(&previous.root);
             let _ = fs::remove_dir_all(previous.root);
         }
@@ -287,11 +297,11 @@ pub fn stage_project_cached(
             drop(cache);
             return stage_project(loaded);
         };
-        cache.insert(key.clone(), entry);
+        *cache = Some(entry);
         true
     };
     let entry = cache
-        .get_mut(&key)
+        .as_mut()
         .context("Projection cache entry disappeared")?;
     if created {
         return Ok(ProjectionStage {
@@ -330,19 +340,17 @@ pub fn stage_project_cached(
         }
     }
     if rebuild_all {
-        let previous = cache
-            .remove(&key)
-            .context("Projection cache entry disappeared")?;
+        let previous = cache.take().context("Projection cache entry disappeared")?;
         remove_cached_script_naming(&previous.root);
         let _ = fs::remove_dir_all(previous.root);
         let Some(entry) = create_cached_projection(loaded, &key, project_hash)? else {
             drop(cache);
             return stage_project(loaded);
         };
-        cache.insert(key.clone(), entry);
+        *cache = Some(entry);
     }
     let entry = cache
-        .get_mut(&key)
+        .as_mut()
         .context("Projection cache entry disappeared")?;
     if !changed_sources.is_empty()
         && patch_cached_projection_scripts(loaded, &entry.root, changed_sources)?
@@ -367,15 +375,15 @@ pub fn stage_project_cached(
             &entry.identities,
         ) {
             Ok((transforms, identities)) => {
-                entry.transforms = transforms;
-                entry.identities = identities;
+                entry.transforms = Arc::new(transforms);
+                entry.identities = Arc::new(identities);
                 if source_shape_changed {
                     entry.source_shape = projection_source_shape(loaded)?;
                 }
             }
             Err(error) => {
                 let root = entry.root.clone();
-                cache.remove(&key);
+                cache.take();
                 remove_cached_script_naming(&root);
                 let _ = fs::remove_dir_all(root);
                 return Err(error);
@@ -2946,4 +2954,23 @@ fn copy_file_to_target(loaded: &LoadedProject, source: &Path, target: &Path) -> 
     }
     fs::copy(source, destination)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_project_does_not_lock_an_unrelated_project() {
+        let root = create_unique_directory(&env::temp_dir(), "renium-cache-lock-").unwrap();
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let a = projection_cache_entry(&root.join("a"));
+        let b = projection_cache_entry(&root.join("b"));
+        let _busy = a.lock().unwrap();
+        assert!(b.try_lock().is_ok());
+        assert!(Arc::ptr_eq(&a, &projection_cache_entry(&root.join("a"))));
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
 }

@@ -74,6 +74,7 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   private mutationAdmissionOpen = true;
   private referenceRevealHandler: ((nodeId: string) => Promise<void> | void) | undefined;
   private projectGeneration = 0;
+  private selectionRevision = 0;
 
   public constructor(
     private readonly model: FileExplorerModel,
@@ -146,9 +147,11 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
 
   public async show(node: FileExplorerNode): Promise<void> {
     const generation = this.projectGeneration;
+    const selection = ++this.selectionRevision;
+    this.currentNode = undefined;
     this.currentPackageMessage = undefined;
     const loaded = await this.model.loadDetails(node);
-    if (generation !== this.projectGeneration) {
+    if (generation !== this.projectGeneration || selection !== this.selectionRevision) {
       return;
     }
     this.currentNode = loaded;
@@ -159,6 +162,7 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
     if (!payload) {
       return;
     }
+    this.selectionRevision += 1;
     const packageName = cleanPropertyText(payload.packageName) || cleanPropertyText(payload.packageId) || "Package";
     const rawNode = payload.node;
     const nodeName = cleanPropertyText(rawNode?.name) || cleanPropertyText(payload.rootName) || packageName;
@@ -216,6 +220,7 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
   }
 
   public showReadonlyInstance(info: ReadonlyInstanceInfo): void {
+    this.selectionRevision += 1;
     const nodeName = cleanPropertyText(info.name) || "Instance";
     const className = cleanPropertyText(info.className) || "Instance";
     const pathSegments = sanitizePathSegments(info.pathSegments);
@@ -279,12 +284,13 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const generation = this.projectGeneration;
+    const selection = ++this.selectionRevision;
     const updated = (this.currentNode.settingsId
       ? this.model.getNode(normalizeId(this.currentNode.service, this.currentNode.settingsId))
       : this.model.getNode(serviceTreeId(this.currentNode.service))) ?? this.currentNode;
     updated.detailsLoaded = false;
     const loaded = await this.model.loadDetails(updated);
-    if (generation !== this.projectGeneration) {
+    if (generation !== this.projectGeneration || selection !== this.selectionRevision) {
       return;
     }
     this.currentNode = loaded;
@@ -882,12 +888,13 @@ export class FilePropertiesViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const generation = this.projectGeneration;
+    const selection = ++this.selectionRevision;
     const updated = this.currentNode.settingsId
       ? this.model.getNode(normalizeId(this.currentNode.service, this.currentNode.settingsId))
       : this.model.getNode(serviceTreeId(this.currentNode.service));
     if (updated) {
       const loaded = await this.model.loadDetails(updated);
-      if (generation !== this.projectGeneration) {
+      if (generation !== this.projectGeneration || selection !== this.selectionRevision) {
         return;
       }
       this.currentNode = loaded;

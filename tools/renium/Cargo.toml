@@ -1,6 +1,6 @@
 [package]
 name = "renium"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.89"
 license-file = "../../LICENSE"
@@ -12,8 +12,10 @@ anyhow = "1.0.100"
 ahash = "0.8"
 mimalloc = "0.1"
 memchr = "2.7"
-clap = { version = "4.5.53", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive", "string"] }
+renium-plugin-sdk = { path = "../renium-plugin-sdk" }
 full_moon = { version = "2.2.0", features = ["luau"] }
+mlua = { version = "0.11.6", features = ["luau", "vendored", "serialize", "error-send"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 ureq = { version = "=2.10.1", features = ["json", "proxy-from-env"] }
@@ -24,10 +26,12 @@ png = "0.17"
 mp4 = "0.14"
 openh264 = "0.9.7"
 walkdir = "2.5.0"
+same-file = "1.0.6"
 zstd = "0.13.2"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 base64 = "0.13.1"
 ed25519-dalek = "2.2.0"
+getrandom = "0.3"
 globset = "0.4.16"
 rmp-serde = "1.3.0"
 semver = "1.0"
@@ -46,8 +50,9 @@ rbx_reflection_database = { path = "../vendor/rbx-dom/rbx_reflection_database" }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 windows = { version = "0.61.3", features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility"] }
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 cc = "1.2"
@@ -56,4 +61,4 @@ sha2 = "0.10.9"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 16

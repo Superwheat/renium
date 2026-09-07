@@ -1,4 +1,24 @@
 pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
+    (
+        "access",
+        "Examples:\n  rbx access mode\n  rbx access mode ask\n  rbx access mode read-only\n  rbx access mode read-write --accept-risk",
+    ),
+    (
+        "perf",
+        "Examples:\n  rbx perf snapshot --player 1\n  rbx perf start --player 1 --seconds 10\n  rbx perf stop --player 1 --capture ID\n  rbx perf export --player 1 --capture ID --out trace.json",
+    ),
+    (
+        "net",
+        "Examples:\n  rbx net presets\n  rbx net set --player 1 --preset mid\n  rbx net set --player 1 --in-delay 50 --out-jitter 10\n  rbx net show --player 2\n  rbx net restore --player 1",
+    ),
+    (
+        "plugin",
+        "Examples:\n  rbx plugin new my-workflow\n  rbx plugin install ./my-workflow\n  rbx plugin list\n  rbx my-workflow hello --name World",
+    ),
+    (
+        "ck",
+        "Examples:\n  rbx ck src/ServerScriptService/Main.server.luau src/ReplicatedStorage/Config.luau\n  Get-Content -Raw script.luau | rbx ck -",
+    ),
     ("fmt", "Examples:\n  rbx fmt ."),
     ("pv", "Examples:\n  rbx pv"),
     ("xp", "Examples:\n  rbx xp src/Workspace/Door"),
@@ -14,7 +34,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "q",
         "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"",
     ),
-    ("cmp", "Examples:\n  rbx cmp Place.rbxl"),
+    (
+        "cmp",
+        "Examples:\n  rbx cmp Place.rbxl\n  rbx cmp Before.rbxl --full --all\n  rbx cmp Before.rbxl --against After.rbxlx --full --all",
+    ),
     ("dr", "Examples:\n  rbx dr"),
     ("docs", "Examples:\n  rbx docs sync"),
     ("dm", "Examples:\n  rbx dm list"),
@@ -123,6 +146,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("rs", "Examples:\n  rbx rs -o playtest.mp4"),
     ("re", "Examples:\n  rbx re"),
+    (
+        "rf",
+        "Examples:\n  rbx rf clip.mp4\n  rbx rf clip.mp4 --page 2\n  rbx rf clip.mp4 --frame 15",
+    ),
     ("setup", "Examples:\n  rbx setup"),
     ("st", "Examples:\n  rbx st --event-wait-seconds 1"),
     (
@@ -233,3 +260,67 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("pn", "Examples:\n  rbx pn 123456 main"),
     ("po", "Examples:\n  rbx po 123456 789012"),
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_guide_examples_use_canonical_commands() {
+        use pulldown_cmark::{Event, Parser};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = vec![root.join("renium-agents.md")];
+        paths.extend(
+            std::fs::read_dir(root.join("renium-guides"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "md")),
+        );
+        let command = super::super::command();
+        let mut examples = 0;
+        for path in paths {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for event in Parser::new(&text) {
+                let (Event::Code(code) | Event::Text(code)) = event else {
+                    continue;
+                };
+                for line in code.lines() {
+                    let Some(example) = line.trim().strip_prefix("rbx ") else {
+                        continue;
+                    };
+                    let mut tokens = example.split_whitespace();
+                    while let Some(token) = tokens.next() {
+                        if token == "<PLUGIN>" {
+                            // Dynamic namespaces are discovered from installed manifests.
+                            examples += 1;
+                            break;
+                        }
+                        if let Some(option) = token.strip_prefix("--") {
+                            let (name, inline_value) = option
+                                .split_once('=')
+                                .map_or((option, false), |(name, _)| (name, true));
+                            let argument = command
+                                .get_arguments()
+                                .find(|arg| arg.get_long() == Some(name))
+                                .unwrap_or_else(|| {
+                                    panic!("{}: unknown global option {token}", path.display())
+                                });
+                            if argument.get_action().takes_values() && !inline_value {
+                                tokens.next();
+                            }
+                            continue;
+                        }
+                        assert!(
+                            command
+                                .get_subcommands()
+                                .any(|subcommand| subcommand.get_name() == token),
+                            "{}: use a canonical short command, not {token}",
+                            path.display()
+                        );
+                        examples += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(examples > 0, "no command examples were checked");
+    }
+}

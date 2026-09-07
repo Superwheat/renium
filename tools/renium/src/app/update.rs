@@ -810,6 +810,9 @@ fn spawn_agent_update_check() {
     let Ok(executable) = resolved_current_executable() else {
         return;
     };
+    let Ok(Some(reservation)) = check::reserve_agent_refresh() else {
+        return;
+    };
     let mut command = Command::new(executable);
     command
         .args(["upd", "check"])
@@ -821,7 +824,9 @@ fn spawn_agent_update_check() {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let _ = command.spawn();
+    if command.spawn().is_err() {
+        reservation.cancel();
+    }
 }
 
 pub(crate) fn report_update_notice(version: &str) {
@@ -2508,10 +2513,11 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
         error: (!errors.is_empty()).then(|| errors.join("; ")),
         helper,
     };
-    let result_written = match write_deferred_update_result(&args.result, &record) {
+    let primary_written = match write_deferred_update_result(&args.result, &record) {
         Ok(()) => true,
         Err(error) => match write_deferred_update_result(&args.fallback_result, &record) {
-            Ok(()) => true,
+            // Keep the reservation as the exact address of the fallback result.
+            Ok(()) => false,
             Err(fallback_error) => {
                 eprintln!(
                     "[renium] warning: update completed but neither result file could be written: {error:#}; fallback: {fallback_error:#}"
@@ -2520,7 +2526,7 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
             }
         },
     };
-    if result_written && let Err(error) = clear_update_helper_reservation(&plan.transaction_id) {
+    if primary_written && let Err(error) = clear_update_helper_reservation(&plan.transaction_id) {
         eprintln!(
             "[renium] warning: failed to clear the completed update helper reservation: {error:#}"
         );
@@ -2799,11 +2805,84 @@ pub(crate) fn report_pending_update_result() {
     let Ok(current) = resolved_current_executable() else {
         return;
     };
-    let mut candidates = vec![(primary, false)];
-    let mut fallbacks = fs::read_dir(env::temp_dir())
-        .ok()
-        .into_iter()
-        .flatten()
+    let reservation = read_update_helper_reservation().ok().flatten();
+    let temp = env::temp_dir();
+    let Some((path, result)) =
+        pending_update_result(&primary, &current, &temp, reservation.as_ref())
+    else {
+        return;
+    };
+    let _ = fs::remove_file(&path);
+    if let Some(reservation) =
+        reservation.filter(|reservation| paths_equal(&reservation.helper, &result.helper))
+    {
+        let _ = clear_update_helper_reservation(&reservation.transaction_id);
+    }
+    if owned_update_helper(&result.helper, &temp)
+        && let Err(error) = fs::remove_file(&result.helper)
+    {
+        eprintln!(
+            "[renium] warning: failed to remove update helper {}: {error}",
+            result.helper.display()
+        );
+    }
+    if result.ok {
+        eprintln!(
+            "[renium] Renium {} finished updating {}",
+            result.version,
+            result.target.display()
+        );
+    } else {
+        eprintln!(
+            "[renium] Renium {} update failed for {}: {}",
+            result.version,
+            result.target.display(),
+            result.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+}
+
+fn owned_update_helper(helper: &Path, temp: &Path) -> bool {
+    helper
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with("renium-update-helper-") && name.ends_with(".exe"))
+        && fs::canonicalize(helper)
+            .ok()
+            .zip(fs::canonicalize(temp).ok())
+            .is_some_and(|(helper, temp)| {
+                helper
+                    .parent()
+                    .is_some_and(|parent| paths_equal(parent, &temp))
+            })
+}
+
+fn pending_update_result(
+    primary: &Path,
+    current: &Path,
+    temp: &Path,
+    reservation: Option<&UpdateHelperReservation>,
+) -> Option<(PathBuf, DeferredUpdateResult)> {
+    let current = fs::canonicalize(current).ok()?;
+    let read = |path: &Path| {
+        let result: DeferredUpdateResult = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        paths_equal(&fs::canonicalize(&result.target).ok()?, &current)
+            .then(|| (path.to_path_buf(), result))
+    };
+    if let Some(result) = read(primary) {
+        return Some(result);
+    }
+    if let Some(reservation) = reservation {
+        return read(&reservation.helper.with_extension("result.json"));
+    }
+    // Older helpers removed their reservation even when only the temp result was
+    // written. Recover those once, never enumerate user TEMP on each CLI command.
+    let migrated = primary.with_file_name("legacy-update-results-indexed");
+    if migrated.is_file() {
+        return None;
+    }
+    let mut fallbacks = fs::read_dir(temp)
+        .ok()?
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -2821,70 +2900,21 @@ pub(crate) fn report_pending_update_result() {
                 .ok(),
         )
     });
-    candidates.extend(fallbacks.into_iter().map(|path| (path, true)));
-    let mut selected = None;
-    for (path, fallback) in candidates {
-        if !path.is_file() {
-            continue;
+    for path in fallbacks {
+        if let Some(result) = read(&path) {
+            return Some(result);
         }
-        let result = fs::read(&path)
-            .context("Failed to read deferred update result")
-            .and_then(|bytes| {
-                serde_json::from_slice::<DeferredUpdateResult>(&bytes)
-                    .context("Invalid deferred update result")
-            });
-        if result.as_ref().is_ok_and(|result| {
-            fs::canonicalize(&result.target)
-                .ok()
-                .zip(fs::canonicalize(&current).ok())
-                .is_some_and(|(target, current)| paths_equal(&target, &current))
-        }) {
-            selected = Some((path, result));
-            break;
-        }
-        if fallback
-            && fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > Duration::from_secs(7 * 24 * 60 * 60))
+        if fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(7 * 24 * 60 * 60))
         {
             let _ = fs::remove_file(path);
         }
     }
-    let Some((path, result)) = selected else {
-        return;
-    };
-    let _ = fs::remove_file(&path);
-    match result {
-        Ok(result) => {
-            if result.helper.is_file()
-                && let Err(error) = fs::remove_file(&result.helper)
-            {
-                eprintln!(
-                    "[renium] warning: failed to remove update helper {}: {error}",
-                    result.helper.display()
-                );
-            }
-            if result.ok {
-                eprintln!(
-                    "[renium] Renium {} finished updating {}",
-                    result.version,
-                    result.target.display()
-                );
-            } else {
-                eprintln!(
-                    "[renium] Renium {} update failed for {}: {}",
-                    result.version,
-                    result.target.display(),
-                    result.error.as_deref().unwrap_or("unknown error")
-                );
-            }
-        }
-        Err(error) => {
-            eprintln!("[renium] warning: {error:#}");
-        }
-    }
+    let _ = fs::write(migrated, b"");
+    None
 }
 
 fn editor_kind_from_extension_root(root: &Path) -> Option<&'static str> {
@@ -3095,4 +3125,76 @@ fn group_editor_installs_by_platform(
         groups.entry(platform).or_default().push(editor.clone());
     }
     Ok(groups)
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    #[test]
+    fn update_results_use_exact_paths_and_recover_legacy_helpers_once() {
+        let root = crate::tests::support::temp_dir("update-results");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let state = root.join("state");
+        let temp = root.join("temp");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&temp).unwrap();
+        let current = root.join("rbx.exe");
+        fs::write(&current, b"test").unwrap();
+        let primary = state.join("update-result.json");
+        let record = DeferredUpdateResult {
+            ok: true,
+            version: "test".into(),
+            target: current.clone(),
+            error: None,
+            helper: temp.join("renium-update-helper-1-2.exe"),
+        };
+        fs::write(&record.helper, b"helper").unwrap();
+        assert!(owned_update_helper(&record.helper, &temp));
+        assert!(!owned_update_helper(&current, &temp));
+        let outside = root.join("renium-update-helper-outside.exe");
+        fs::write(&outside, b"keep").unwrap();
+        assert!(!owned_update_helper(&outside, &temp));
+        write_deferred_update_result(&primary, &record).unwrap();
+        assert_eq!(
+            pending_update_result(&primary, &current, &root.join("unreadable-temp"), None)
+                .unwrap()
+                .0,
+            primary
+        );
+        fs::remove_file(&primary).unwrap();
+        let fallback = record.helper.with_extension("result.json");
+        write_deferred_update_result(&fallback, &record).unwrap();
+        assert_eq!(
+            pending_update_result(&primary, &current, &temp, None)
+                .unwrap()
+                .0,
+            fallback
+        );
+        fs::remove_file(&fallback).unwrap();
+        assert!(pending_update_result(&primary, &current, &temp, None).is_none());
+        assert!(state.join("legacy-update-results-indexed").is_file());
+        write_deferred_update_result(&fallback, &record).unwrap();
+        assert!(pending_update_result(&primary, &current, &temp, None).is_none());
+        let reservation = UpdateHelperReservation {
+            transaction_id: "test".into(),
+            helper: record.helper.clone(),
+            parent_pid: 1,
+            parent_start_identity: "test".into(),
+            helper_pid: None,
+            helper_start_identity: None,
+            phase: "claimed".into(),
+        };
+        assert_eq!(
+            pending_update_result(&primary, &current, &temp, Some(&reservation))
+                .unwrap()
+                .0,
+            fallback
+        );
+        let foreign = root.join("foreign.exe");
+        fs::write(&foreign, b"other").unwrap();
+        assert!(pending_update_result(&primary, &foreign, &temp, Some(&reservation)).is_none());
+    }
 }

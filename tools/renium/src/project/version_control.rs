@@ -493,8 +493,14 @@ pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
     let document = match extension.as_deref() {
         Some("renium") => SettingsBytecode::read_file(&args.file)?,
         Some("rbxm" | "rbxmx") => read_settings_model_document(&args.file)?,
+        Some("rbxl" | "rbxlx") => super::place_diff::document(
+            &super::place_file::place_dom(&args.file)?,
+            "place",
+            None,
+            false,
+        )?,
         _ => bail!(
-            "Unsupported file type for {}; expected .renium, .rbxm, or .rbxmx",
+            "Unsupported file type for {}; expected .renium, .rbxm, .rbxmx, .rbxl, or .rbxlx",
             args.file.display()
         ),
     };
@@ -671,6 +677,7 @@ fn prepare_settings_merge(
     base: &SettingsBytecode,
     ours: &SettingsBytecode,
     theirs: &SettingsBytecode,
+    aligned_additions: &HashSet<String>,
 ) -> PreparedSettingsMerge {
     let mut base = base.clone();
     let mut ours = ours.clone();
@@ -704,6 +711,7 @@ fn prepare_settings_merge(
     for (theirs_index, instance) in theirs.instances.iter().enumerate() {
         let id = &instance.settings_id;
         if let Some(ours_index) = ours_ids.get(id).copied()
+            && !aligned_additions.contains(id)
             && !base_ids.contains_key(id)
             && !vc_instance_equal(&ours, ours_index, &theirs, theirs_index)
         {
@@ -937,12 +945,48 @@ pub(crate) fn merge_settings_documents_with_policy_and_source_changes(
     ours_source_changes: &HashSet<String>,
     theirs_source_changes: &HashSet<String>,
 ) -> (SettingsBytecode, Vec<VcMergeConflict>) {
+    merge_prepared_settings_documents(
+        prepare_settings_merge(base, ours, theirs, &HashSet::new()),
+        value_prefer,
+        structural_prefer,
+        ours_source_changes,
+        theirs_source_changes,
+    )
+}
+
+// Reconciliation has already matched live/file identities. Unlike independently
+// created Git IDs, different values on a matched addition must not create a copy.
+pub(crate) fn merge_aligned_settings_documents(
+    base: &SettingsBytecode,
+    ours: &SettingsBytecode,
+    theirs: &SettingsBytecode,
+    prefer: Option<bool>,
+    ours_source_changes: &HashSet<String>,
+    theirs_source_changes: &HashSet<String>,
+    aligned_additions: &HashSet<String>,
+) -> (SettingsBytecode, Vec<VcMergeConflict>) {
+    merge_prepared_settings_documents(
+        prepare_settings_merge(base, ours, theirs, aligned_additions),
+        prefer,
+        prefer,
+        ours_source_changes,
+        theirs_source_changes,
+    )
+}
+
+fn merge_prepared_settings_documents(
+    prepared: PreparedSettingsMerge,
+    value_prefer: Option<bool>,
+    structural_prefer: Option<bool>,
+    ours_source_changes: &HashSet<String>,
+    theirs_source_changes: &HashSet<String>,
+) -> (SettingsBytecode, Vec<VcMergeConflict>) {
     let PreparedSettingsMerge {
         base,
         ours,
         theirs,
         theirs_id_remap,
-    } = prepare_settings_merge(base, ours, theirs);
+    } = prepared;
     let version = ours.version.max(theirs.version);
     let base = &base;
     let ours = &ours;
@@ -954,15 +998,20 @@ pub(crate) fn merge_settings_documents_with_policy_and_source_changes(
 
     let mut merged: Vec<VcMergedInstance> = Vec::new();
     let mut merged_ids: HashSet<String> = HashSet::new();
+    let empty_properties = Map::new();
 
     for (ours_index, instance) in ours.instances.iter().enumerate() {
         let id = &instance.settings_id;
         if merged_ids.contains(id) {
             continue;
         }
-        match (base_ids.get(id).copied(), theirs_ids.get(id).copied()) {
-            (Some(base_index), Some(theirs_index)) => {
-                let base_inst = &base.instances[base_index];
+        let theirs_index = theirs_ids
+            .get(id)
+            .copied()
+            .filter(|_| !theirs_id_remap.contains_key(id));
+        match (base_ids.get(id).copied(), theirs_index) {
+            (base_index, Some(theirs_index)) => {
+                let base_inst = base_index.map(|index| &base.instances[index]);
                 let theirs_inst = &theirs.instances[theirs_index];
                 let mut merge_context = VcMergeContext {
                     value_prefer,
@@ -972,13 +1021,13 @@ pub(crate) fn merge_settings_documents_with_policy_and_source_changes(
                     conflicts: &mut conflicts,
                 };
                 let name = merge_context.merge_scalar(
-                    Some(&base_inst.name),
+                    base_inst.map(|instance| &instance.name),
                     &instance.name,
                     &theirs_inst.name,
                     || format!("Name: ours={} theirs={}", instance.name, theirs_inst.name),
                 );
                 let class_name = merge_context.merge_scalar(
-                    Some(&base_inst.class_name),
+                    base_inst.map(|instance| &instance.class_name),
                     &instance.class_name,
                     &theirs_inst.class_name,
                     || {
@@ -989,22 +1038,22 @@ pub(crate) fn merge_settings_documents_with_policy_and_source_changes(
                     },
                 );
                 let ours_parent = settings_parent_id(ours, ours_index);
-                let base_parent = settings_parent_id(base, base_index);
+                let base_parent = base_index.map(|index| settings_parent_id(base, index));
                 let theirs_parent = settings_parent_id(theirs, theirs_index);
                 let parent_id = merge_context.merge_scalar(
-                    Some(&base_parent),
+                    base_parent.as_ref(),
                     &ours_parent,
                     &theirs_parent,
                     || "Parent: moved to different parents on both sides".to_string(),
                 );
                 let properties = merge_context.merge_maps(
-                    &base_inst.properties,
+                    base_inst.map_or(&empty_properties, |instance| &instance.properties),
                     &instance.properties,
                     &theirs_inst.properties,
                     "property",
                 );
                 let attributes = merge_context.merge_maps(
-                    &base_inst.attributes,
+                    base_inst.map_or(&empty_properties, |instance| &instance.attributes),
                     &instance.attributes,
                     &theirs_inst.attributes,
                     "attribute",

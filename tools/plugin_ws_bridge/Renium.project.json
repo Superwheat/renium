@@ -70,6 +70,15 @@
       "BridgeRuntimeApi": {
         "$path": "BridgeRuntimeApi.module.lua"
       },
+      "BridgePerformance": {
+        "$path": "BridgePerformance.module.lua"
+      },
+      "BridgeMicroProfiler": {
+        "$path": "BridgeMicroProfiler.module.lua"
+      },
+      "BridgeNetworkSimulation": {
+        "$path": "BridgeNetworkSimulation.module.lua"
+      },
       "BridgeCreatorApi": {
         "$path": "BridgeCreatorApi.module.lua"
       },

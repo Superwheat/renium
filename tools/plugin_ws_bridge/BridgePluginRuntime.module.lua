@@ -26,7 +26,7 @@ type ServiceState = {
 	nativeLuaSourceIndices: { number }?,
 	nativeNonArchivableIndices: { number }?,
 	nativeStructureGeneration: number?,
-	studioChangeGeneration: number?,
+	nativeContentGeneration: number?,
 	nativePreparationProfile: { [string]: number }?,
 	matchedSettingsIds: { { index: number, id: string } }?,
 	matchedSettingsIdVersion: number?,
@@ -55,6 +55,16 @@ type ServiceState = {
 }
 
 local BridgePluginRuntime = {}
+
+function BridgePluginRuntime.withSuppression(studioChanges, callback, params, scopeChanges)
+	studioChanges.beginSuppress(nil, scopeChanges)
+	local ok, result = pcall(callback, params)
+	task.defer(studioChanges.endSuppress)
+	if not ok then
+		error(result, 0)
+	end
+	return result
+end
 
 function BridgePluginRuntime.start(context)
 	local plugin = context.plugin
@@ -172,9 +182,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.4"
+	local BRIDGE_VERSION = "0.3.5"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1788436894
+	local BRIDGE_BUILD_UNIX = 1788765703
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -411,6 +421,26 @@ function BridgePluginRuntime.start(context)
 			editorSync.assertCurrentRequestLeaseActive()
 		end,
 	})
+	local networkSimulation = requireChildModule("BridgeNetworkSimulation").create(function()
+		return settings():GetService("NetworkSettings")
+	end)
+	-- Roblox's version() global is available in Studio but absent from Selene's stdlib.
+	-- selene: allow(undefined_variable)
+	local studioVersion = version()
+	local performance = requireChildModule("BridgePerformance").create({
+		stats = game:GetService("Stats"), runService = RunService,
+		studioVersion = studioVersion, bridgeVersion = BRIDGE_VERSION,
+		timestamp = function() return DateTime.now():ToIsoDate() end,
+		memoryTags = Enum.DeveloperMemoryTag:GetEnumItems(),
+		microProfiler = function() return game:GetService("MicroProfilerService") end,
+		encodeBuffer = function(data) return buffer.tostring(EncodingService:Base64Encode(data)) end,
+		runtimeId = Config.bridgeRuntimeId, client = Config.bridgeRole == "play-client",
+		newId = function() return HttpService:GenerateGUID(false) end,
+		delay = task.delay, cancel = task.cancel,
+	})
+	local microProfiler = requireChildModule("BridgeMicroProfiler").create(function()
+		return game:GetService("MicroProfilerService")
+	end)
 	function Config.applyBridgeRuntimeSettings(runtimeSettings: { [string]: any })
 		Config.studioChanges.setOptions({
 			syncbackProperties = runtimeSettings.syncbackProperties,
@@ -707,17 +737,38 @@ function BridgePluginRuntime.start(context)
 	end
 	Config.includeExportInstance = includeExportInstance
 	local nativeStructureGenerationByService: { [string]: number } = {}
+	local nativeContentGenerationByService: { [string]: number } = {}
+	local nativeServiceNames: { [Instance]: string } = {}
 	for serviceName in pairs(ALLOWED_SERVICES) do
 		nativeStructureGenerationByService[serviceName] = 0
+		nativeContentGenerationByService[serviceName] = 0
 		local service = game:GetService(serviceName)
+		nativeServiceNames[service] = serviceName
 		local function markStructureChanged(instance: Instance)
 			if includeExportInstance(serviceName, instance) then
 				nativeStructureGenerationByService[serviceName] += 1
+				nativeContentGenerationByService[serviceName] += 1
 			end
 		end
 		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantAdded:Connect(markStructureChanged)
 		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantRemoving:Connect(markStructureChanged)
 	end
+	-- Export includes camera objects even though Live Sync deliberately ignores
+	-- their edits. Its bytes therefore need a separate invalidation generation.
+	lifetimeConnections[#lifetimeConnections + 1] = (game :: any).ItemChanged:Connect(function(instance, propertyName)
+		-- Archivable is restored from the overlay; serialization temporarily sets it.
+		if typeof(instance) ~= "Instance" or string.lower(tostring(propertyName)) == "archivable" then
+			return
+		end
+		local root = instance
+		while root.Parent ~= nil and root.Parent ~= game do
+			root = root.Parent
+		end
+		local serviceName = nativeServiceNames[root]
+		if serviceName ~= nil and includeExportInstance(serviceName, instance) then
+			nativeContentGenerationByService[serviceName] += 1
+		end
+	end)
 
 	function Config.updateStatusText()
 		local statusState = {
@@ -746,6 +797,11 @@ function BridgePluginRuntime.start(context)
 
 	local refreshMatchedSettingsIds
 	local matchedSettingsIdsForRange
+	local function nativeExportGeneration(serviceName: string): number
+		-- ItemChanged covers ignored camera edits, but does not cover every
+		-- attribute event. The tracker covers those without another listener set.
+		return nativeContentGenerationByService[serviceName] + Config.studioChanges.serviceGeneration(serviceName)
+	end
 	editorSync = EditorSyncModule.create({
 		stats = editorSyncStats,
 		runtimeId = Config.bridgeRuntimeId,
@@ -761,12 +817,10 @@ function BridgePluginRuntime.start(context)
 		end,
 		prepareNativeState = function(serviceName: string, scriptSourcesByInstance)
 			local structureGeneration = nativeStructureGenerationByService[serviceName] or 0
-			local studioChangeGeneration = if Config.studioChanges.isTracking(serviceName)
-				then Config.studioChanges.serviceGeneration(serviceName)
-				else nil
+			local contentGeneration = nativeExportGeneration(serviceName)
 			local cached = nativeStateByService[serviceName]
 			if cached ~= nil and cached.nativeStructureGeneration == structureGeneration then
-				if studioChangeGeneration == nil or cached.studioChangeGeneration ~= studioChangeGeneration then
+				if not Config.studioChanges.isTracking(serviceName) or cached.nativeContentGeneration ~= contentGeneration then
 					table.clear(cached.batchCacheByKey)
 					table.clear(cached.batchCacheKeys)
 				end
@@ -803,17 +857,18 @@ function BridgePluginRuntime.start(context)
 					table.clear(cached.batchCacheByKey)
 					table.clear(cached.batchCacheKeys)
 				end
-				cached.studioChangeGeneration = studioChangeGeneration
+				cached.nativeContentGeneration = contentGeneration
 				return cached
 			end
 			local trackedInstances = Config.studioChanges.exportInstances(serviceName)
 			local _, state = prepareService(serviceName, true, nil, scriptSourcesByInstance, trackedInstances)
 			state.nativeStructureGeneration = structureGeneration
-			state.studioChangeGeneration = studioChangeGeneration
+			state.nativeContentGeneration = contentGeneration
 			nativeStateByService[serviceName] = state
 			return state
 		end,
 		includeExportInstance = includeExportInstance,
+		nativeExportGeneration = nativeExportGeneration,
 		getPropertySchema = function(className: string)
 			return getClassPropertySchema(className) or {}
 		end,
@@ -4955,47 +5010,23 @@ function BridgePluginRuntime.start(context)
 		return result
 	end
 	Config.bridgeMethodHandlers.commitEditorTransaction = function(p)
-		local transactionId = tostring(p.transactionId or "")
-		local transactionScoped = transactionExpectations[transactionId] ~= nil
-		if not transactionScoped then
-			Config.studioChanges.beginSuppress(nil)
+		if transactionExpectations[tostring(p.transactionId or "")] ~= nil then
+			return editorSync.commitTransaction(p)
 		end
-		local ok, result = pcall(editorSync.commitTransaction, p)
-		if not transactionScoped then
-			task.defer(Config.studioChanges.endSuppress)
-		end
-		if not ok then
-			error(result, 0)
-		end
-		return result
+		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.commitTransaction, p)
 	end
 	Config.bridgeMethodHandlers.rollbackEditorTransaction = function(p)
-		local transactionId = tostring(p.transactionId or "")
-		local transactionScoped = transactionExpectations[transactionId] ~= nil
-		if not transactionScoped then
-			Config.studioChanges.beginSuppress(nil)
+		if transactionExpectations[tostring(p.transactionId or "")] ~= nil then
+			return editorSync.rollbackTransaction(p)
 		end
-		local ok, result = pcall(editorSync.rollbackTransaction, p)
-		if not transactionScoped then
-			task.defer(Config.studioChanges.endSuppress)
-		end
-		if not ok then
-			error(result, 0)
-		end
-		return result
+		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.rollbackTransaction, p)
 	end
 	Config.bridgeMethodHandlers.getEditorTransactionState = function(p)
 		return editorSync.getTransactionState(p)
 	end
 
 	Config.bridgeMethodHandlers.finishEditorBinaryImport = function(p)
-		Config.studioChanges.beginSuppress(nil)
-		local ok, result = pcall(editorSync.finishBinaryImport, p)
-		task.defer(Config.studioChanges.endSuppress)
-		if not ok then
-			error(result, 0)
-		end
-		return result
+		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.finishBinaryImport, p)
 	end
 
 	Config.bridgeMethodHandlers.applyEditorChanges = function(p)
@@ -5003,16 +5034,14 @@ function BridgePluginRuntime.start(context)
 		if transactionScoped then
 			return editorSync.applyChanges(p)
 		end
-		Config.studioChanges.beginSuppress(nil, p)
-		local ok, result = pcall(editorSync.applyChanges, p)
-		task.defer(Config.studioChanges.endSuppress)
-		if not ok then
-			error(result, 0)
-		end
-		return result
+		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.applyChanges, p, p)
 	end
 
 	Config.bridgeMethodHandlers.getStudioChangeState = function(p)
+		if type(p.liveSyncStatus) == "table" then
+			editorSyncStats.liveSync = p.liveSyncStatus
+			Config.updateStatusText()
+		end
 		local runtimeSettings = Config.getBridgeSettings()
 		if tostring(p.runtimeId or "") == Config.bridgeRuntimeId then
 			Config.ackPendingBridgeSettingChanges(p.ackRuntimeSettingsSeq)
@@ -5088,6 +5117,30 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.getMouseLocation = RuntimeApi.getMouseLocation
 	Config.bridgeMethodHandlers.sendVirtualInput = RuntimeApi.sendVirtualInput
 	Config.bridgeMethodHandlers.deviceSimulator = RuntimeApi.deviceSimulator
+	Config.bridgeMethodHandlers.networkSimulation = function(p)
+		local isClient = Config.bridgeRole == "play-client"
+		assert((p.client == true) == isClient, "Network target changed; select the current client")
+		if isClient then
+			assert(not RunService:IsEdit() and game:GetService("Players").LocalPlayer ~= nil, "The selected play client has stopped")
+		elseif p.action ~= "show" then
+			assert(RunService:IsEdit(), "Use --player to change networking during Play")
+		end
+		local result = networkSimulation.handle(p)
+		result.runtimeId = Config.bridgeRuntimeId
+		result.scope = if isClient then "client-process" else "studio-settings"
+		return result
+	end
+	Config.bridgeMethodHandlers.performance = function(p)
+		assert(p.runtimeId == Config.bridgeRuntimeId, "Performance target changed; select the current runtime")
+		if p.action == "micro-start" then
+			microProfiler.start(p.frames or 256)
+			return { ok = true, runtimeId = Config.bridgeRuntimeId, state = "collecting", frameLimit = p.frames or 256, scope = "studio-process" }
+		elseif p.action == "micro-stop" then
+			return microProfiler.stop(performance.micro)
+		end
+		assert(p.action == "snapshot" or p.action == "start" or p.action == "stop" or p.action == "read" or p.action == "micro", "Unknown performance action")
+		return performance[p.action](p)
+	end
 	Config.bridgeMethodHandlers.captureViewportProbe = RuntimeApi.captureViewportProbe
 	Config.bridgeMethodHandlers.executeLuau = RuntimeApi.executeLuau
 	Config.bridgeMethodHandlers.cancelLuauExecution = function(p, sessionGeneration)
@@ -5287,6 +5340,8 @@ function BridgePluginRuntime.start(context)
 		finishEditorBinaryExport = true,
 		setConflictResolution = true,
 		deviceSimulator = true,
+		networkSimulation = true,
+		performance = true,
 		captureViewportProbe = true,
 		sendVirtualInput = true,
 		executeLuau = true,
@@ -5345,6 +5400,8 @@ function BridgePluginRuntime.start(context)
 		getMouseLocation = true,
 		sendVirtualInput = true,
 		deviceSimulator = true,
+		networkSimulation = true,
+		performance = true,
 		captureViewportProbe = true,
 		executeLuau = true,
 		startStopPlay = true,
@@ -5383,8 +5440,9 @@ function BridgePluginRuntime.start(context)
 		maxRequestBytes = 16 * 1024 * 1024,
 		maxQueuedExclusiveRequests = 16,
 		allowedMethods = Config.bridgeMethodHandlers,
-		isExclusiveMethod = function(method)
+		isExclusiveMethod = function(method, params)
 			return not not Config.bridgeExclusiveMethods[method]
+				and not (method == "startStopPlay" and next(params) == nil)
 		end,
 		isSessionOwnedMethod = function(method)
 			return not not Config.bridgeSessionOwnedMethods[method]
@@ -5445,6 +5503,11 @@ function BridgePluginRuntime.start(context)
 				table.clear(transactionExpectations)
 				RuntimeApi.cleanup(runtimeCleanupGeneration)
 				Config.creatorApi.cleanup()
+				performance.cleanup()
+				if unloading then
+					networkSimulation.restore()
+				end
+				microProfiler.cleanup()
 			end
 		end,
 	})

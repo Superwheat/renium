@@ -500,6 +500,68 @@ struct IdentityScore {
     has_reference_evidence: bool,
     reference_evidence: usize,
     content_matches: bool,
+    subtree_matches: bool,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct IdentitySubtreeKey<'a> {
+    name: &'a str,
+    class_name: &'a str,
+    properties: Vec<(&'a str, &'a Value)>,
+    attributes: Vec<(&'a str, &'a Value)>,
+    children: Vec<usize>,
+}
+
+// Intern exact content, not hashes used as identity. Children are an unordered multiset;
+// references remain separate, stronger evidence in identity_score. A non-match here
+// never excludes a candidate (float rounding or an actual edit may change its key).
+fn identity_subtree_keys<'a>(
+    document: &'a SettingsBytecode,
+    keys: &mut AHashMap<IdentitySubtreeKey<'a>, usize>,
+) -> Vec<usize> {
+    let mut remaining = vec![0; document.instances.len()];
+    for instance in &document.instances {
+        if let Some(parent) = instance.parent_index {
+            remaining[parent] += 1;
+        }
+    }
+    let mut ready = remaining
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut children = vec![Vec::new(); document.instances.len()];
+    let mut result = vec![0; document.instances.len()];
+    while let Some(index) = ready.pop() {
+        let instance = &document.instances[index];
+        let mut child_keys = std::mem::take(&mut children[index]);
+        child_keys.sort_unstable();
+        let stable = |values: &'a Map<String, Value>, properties| {
+            values
+                .iter()
+                .filter(|(name, value)| identity_value_is_stable(name, value, properties))
+                .map(|(name, value)| (name.as_str(), value))
+                .collect()
+        };
+        let key = IdentitySubtreeKey {
+            name: &instance.name,
+            class_name: &instance.class_name,
+            properties: stable(&instance.properties, true),
+            attributes: stable(&instance.attributes, false),
+            children: child_keys,
+        };
+        let next = keys.len() + 1;
+        let id = *keys.entry(key).or_insert(next);
+        result[index] = id;
+        if let Some(parent) = instance.parent_index {
+            children[parent].push(id);
+            remaining[parent] -= 1;
+            if remaining[parent] == 0 {
+                ready.push(parent);
+            }
+        }
+    }
+    result
 }
 
 struct IdentityScoreContext<'a> {
@@ -509,6 +571,7 @@ struct IdentityScoreContext<'a> {
     observed_graph: &'a ReferenceGraph,
     assigned_reference: &'a [Option<usize>],
     assigned_observed: &'a [Option<usize>],
+    subtree_keys: Option<&'a (Vec<usize>, Vec<usize>)>,
 }
 
 fn identity_score(
@@ -542,6 +605,10 @@ fn identity_score(
         has_reference_evidence: reference_evidence != 0,
         reference_evidence,
         content_matches,
+        subtree_matches: context.subtree_keys.is_some_and(|(reference, observed)| {
+            reference[reference_index] != 0
+                && reference[reference_index] == observed[observed_index]
+        }),
     })
 }
 
@@ -652,6 +719,7 @@ struct ScoredIdentityPass<'a> {
     reference_groups: &'a HashMap<(Option<usize>, &'a str, &'a str), Vec<usize>>,
     reference_graph: &'a ReferenceGraph,
     observed_graph: &'a ReferenceGraph,
+    subtree_keys: Option<&'a (Vec<usize>, Vec<usize>)>,
     old_ids: &'a [String],
     reserved_reference_ids: &'a HashSet<String>,
     blocked_ids: &'a mut HashSet<String>,
@@ -662,6 +730,138 @@ struct ScoredIdentityPass<'a> {
     used_ids: &'a mut HashSet<String>,
     generated: &'a mut usize,
     remaining: &'a mut usize,
+}
+
+struct IdentityNumberField {
+    attribute: bool,
+    property: String,
+    pointer: String,
+}
+
+impl IdentityNumberField {
+    fn read(&self, instance: &SettingsBytecodeInstance) -> Option<f64> {
+        let values = if self.attribute {
+            &instance.attributes
+        } else {
+            &instance.properties
+        };
+        let value = values.get(&self.property)?;
+        // Enum equality can use either name or number, so its number is not a safe filter.
+        if contains_identity_enum(value) {
+            return None;
+        }
+        value
+            .pointer(&self.pointer)?
+            .as_f64()
+            .filter(|value| value.is_finite())
+    }
+}
+
+fn contains_identity_enum(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => {
+            values.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                || values.values().any(contains_identity_enum)
+        }
+        Value::Array(values) => values.iter().any(contains_identity_enum),
+        _ => false,
+    }
+}
+
+fn identity_number_pointers(value: &Value, pointer: &mut String, output: &mut Vec<String>) {
+    match value {
+        Value::Number(_) => output.push(pointer.clone()),
+        Value::Object(values) => {
+            for (name, value) in values {
+                let length = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
+                identity_number_pointers(value, pointer, output);
+                pointer.truncate(length);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let length = pointer.len();
+                write!(pointer, "/{index}").expect("writing to a String cannot fail");
+                identity_number_pointers(value, pointer, output);
+                pointer.truncate(length);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct IdentityCandidateIndex {
+    field: IdentityNumberField,
+    values: Vec<(f64, usize)>,
+}
+
+impl IdentityCandidateIndex {
+    fn build(document: &SettingsBytecode, candidates: &[usize]) -> Option<Self> {
+        if candidates.len() < 32 {
+            return None;
+        }
+        let first = &document.instances[candidates[0]];
+        let mut best = None;
+        let mut best_distinct = 1;
+        for (attribute, properties) in [(false, &first.properties), (true, &first.attributes)] {
+            for (property, value) in properties {
+                if !identity_value_is_stable(property, value, !attribute)
+                    || contains_identity_enum(value)
+                {
+                    continue;
+                }
+                let mut pointers = Vec::new();
+                identity_number_pointers(value, &mut String::new(), &mut pointers);
+                for pointer in pointers {
+                    let field = IdentityNumberField {
+                        attribute,
+                        property: property.clone(),
+                        pointer,
+                    };
+                    let values = candidates
+                        .iter()
+                        .filter_map(|index| {
+                            field
+                                .read(&document.instances[*index])
+                                .map(|value| (value, *index))
+                        })
+                        .collect::<Vec<_>>();
+                    let distinct = values
+                        .iter()
+                        .map(|(value, _)| value.to_bits())
+                        .collect::<AHashSet<_>>()
+                        .len();
+                    if distinct > best_distinct {
+                        best_distinct = distinct;
+                        best = Some(Self { field, values });
+                    }
+                }
+            }
+        }
+        if let Some(index) = best.as_mut() {
+            index
+                .values
+                .sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        }
+        best
+    }
+
+    fn matching(&self, instance: &SettingsBytecodeInstance) -> Option<&[(f64, usize)]> {
+        let value = self.field.read(instance)?;
+        // A conservative superset of the existing f32 comparison, including its relative
+        // tolerance and rounding at either boundary. identity_score remains authoritative.
+        let epsilon = 4.0 * f64::from(f32::EPSILON);
+        let radius = (epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0);
+        let start = self
+            .values
+            .partition_point(|(candidate, _)| *candidate < value - radius);
+        let end = self
+            .values
+            .partition_point(|(candidate, _)| *candidate <= value + radius);
+        Some(&self.values[start..end])
+    }
 }
 
 impl ScoredIdentityPass<'_> {
@@ -732,32 +932,79 @@ impl ScoredIdentityPass<'_> {
                 observed_graph: self.observed_graph,
                 assigned_reference: self.assigned_reference,
                 assigned_observed: self.assigned_observed,
+                subtree_keys: self.subtree_keys,
             };
             let mut proposals = Vec::with_capacity(observed_group.len());
             let mut proposal_counts = HashMap::<usize, usize>::new();
+            // Identical unreferenced candidates all receive the same score. Preserve the
+            // existing tie/fallback decision without evaluating every identical pair.
+            let representative = &self.reference.instances[candidates[0]];
+            let uniform = candidates.iter().all(|candidate| {
+                self.reference_graph.outgoing[*candidate].is_empty()
+                    && self.reference_graph.incoming[*candidate].is_empty()
+                    && self.reference.instances[*candidate].properties == representative.properties
+                    && self.reference.instances[*candidate].attributes == representative.attributes
+            });
+            let mut uniform_subtrees = AHashMap::<usize, Vec<usize>>::new();
+            if uniform && let Some((reference, _)) = self.subtree_keys {
+                for candidate in &candidates {
+                    uniform_subtrees
+                        .entry(reference[*candidate])
+                        .or_default()
+                        .push(*candidate);
+                }
+            }
+            let content_index = if !uniform
+                && observed_group.iter().any(|index| {
+                    self.observed_graph.outgoing[*index].is_empty()
+                        && self.observed_graph.incoming[*index].is_empty()
+                }) {
+                IdentityCandidateIndex::build(self.reference, &candidates)
+            } else {
+                None
+            };
             for index in observed_group {
+                let candidates = self
+                    .subtree_keys
+                    .and_then(|(_, observed)| uniform_subtrees.get(&observed[index]))
+                    .map_or(candidates.as_slice(), Vec::as_slice);
                 let mut best = None;
                 let mut best_candidate = None;
                 let mut tied = false;
-                for candidate in &candidates {
-                    let Some(score) = identity_score(&score_context, *candidate, index) else {
+                let narrowed = content_index
+                    .as_ref()
+                    .filter(|_| {
+                        self.observed_graph.outgoing[index].is_empty()
+                            && self.observed_graph.incoming[index].is_empty()
+                    })
+                    .and_then(|lookup| lookup.matching(&self.observed.instances[index]));
+                let count = if uniform {
+                    1
+                } else {
+                    narrowed.map_or(candidates.len(), <[_]>::len)
+                };
+                for offset in 0..count {
+                    let candidate =
+                        narrowed.map_or_else(|| candidates[offset], |values| values[offset].1);
+                    let Some(score) = identity_score(&score_context, candidate, index) else {
                         continue;
                     };
                     match best {
                         None => {
                             best = Some(score);
-                            best_candidate = Some(*candidate);
+                            best_candidate = Some(candidate);
                             tied = false;
                         }
                         Some(current) if score > current => {
                             best = Some(score);
-                            best_candidate = Some(*candidate);
+                            best_candidate = Some(candidate);
                             tied = false;
                         }
                         Some(current) if score == current => tied = true,
                         _ => {}
                     }
                 }
+                tied |= uniform && candidates.len() > 1;
                 if !tied && let Some(candidate) = best_candidate {
                     proposals.push((index, candidate));
                     *proposal_counts.entry(candidate).or_default() += 1;
@@ -859,19 +1106,7 @@ fn align_settings_ids_to_reference_impl(
     observed: &mut SettingsBytecode,
 ) -> bool {
     let positional_topology_matches = settings_topology_matches(reference, observed);
-    let positional_identity_is_unambiguous = positional_topology_matches && {
-        let mut seen = HashSet::with_capacity(reference.instances.len());
-        reference.instances.iter().all(|instance| {
-            seen.insert((
-                instance.parent_index,
-                instance.name.as_str(),
-                instance.class_name.as_str(),
-            ))
-        })
-    };
-    if positional_identity_is_unambiguous
-        || positional_topology_matches && positional_documents_equivalent(reference, observed)
-    {
+    if positional_topology_matches && positional_identity_preserved(reference, observed) {
         remap_positional_ids(reference, observed);
         return true;
     }
@@ -918,6 +1153,21 @@ fn align_settings_ids_to_reference_impl(
 
     let reference_graph = build_reference_graph(reference);
     let observed_graph = build_reference_graph(observed);
+    let parents = reference
+        .instances
+        .iter()
+        .filter_map(|instance| instance.parent_index)
+        .collect::<AHashSet<_>>();
+    let subtree_keys = reference_groups
+        .values()
+        .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index)))
+        .then(|| {
+            let mut keys = AHashMap::new();
+            (
+                identity_subtree_keys(reference, &mut keys),
+                identity_subtree_keys(observed, &mut keys),
+            )
+        });
     let mut remaining = assigned_ids.len();
     while remaining > 0 {
         let mut progressed = ExactIdentityPass {
@@ -939,6 +1189,7 @@ fn align_settings_ids_to_reference_impl(
             reference_groups: &reference_groups,
             reference_graph: &reference_graph,
             observed_graph: &observed_graph,
+            subtree_keys: subtree_keys.as_ref(),
             old_ids: &old_ids,
             reserved_reference_ids: &reserved_reference_ids,
             blocked_ids: &mut blocked_ids,
@@ -1028,6 +1279,48 @@ fn positional_documents_equivalent(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
+    positional_values_equivalent(reference, observed, None)
+}
+
+fn positional_identity_preserved(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> bool {
+    let mut first_by_key = AHashMap::with_capacity(reference.instances.len());
+    let mut ambiguous = vec![false; reference.instances.len()];
+    for (index, instance) in reference.instances.iter().enumerate() {
+        let key = (
+            instance.parent_index,
+            instance.name.as_str(),
+            instance.class_name.as_str(),
+        );
+        if let Some(first) = first_by_key.insert(key, index) {
+            ambiguous[first] = true;
+            ambiguous[index] = true;
+        }
+    }
+    if !ambiguous.iter().any(|value| *value) {
+        return true;
+    }
+    // Unchanged duplicate subtrees may retain their positional identities even
+    // when an unrelated unique instance changed. Reference-bearing instances
+    // outside those subtrees must still agree, including incoming references.
+    for (index, instance) in reference.instances.iter().enumerate() {
+        if let Some(parent) = instance.parent_index {
+            if parent >= index {
+                return false;
+            }
+            ambiguous[index] |= ambiguous[parent];
+        }
+    }
+    positional_values_equivalent(reference, observed, Some(&ambiguous))
+}
+
+fn positional_values_equivalent(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    identity_checks: Option<&[bool]>,
+) -> bool {
     let ids_started = Instant::now();
     let reference_ids = reference
         .instances
@@ -1046,6 +1339,17 @@ fn positional_documents_equivalent(
         usize,
         (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
     )| {
+        if identity_checks.is_some_and(|checks| !checks[index])
+            && !reference_instance
+                .properties
+                .values()
+                .chain(reference_instance.attributes.values())
+                .chain(observed_instance.properties.values())
+                .chain(observed_instance.attributes.values())
+                .any(reconciliation_value_contains_reference)
+        {
+            return true;
+        }
         reference_instance.class_name == "PackageLink"
             || is_reconciliation_protected_workspace_camera(reference, index)
             || reconciliation_maps_equal_with_ids(
@@ -1381,12 +1685,28 @@ fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str>
 
 pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsBytecode) -> Result<()> {
     let database = rbx_reflection_database::get()?;
+    let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
     for instance in &mut document.instances {
+        let names = names_by_class.entry(&instance.class_name).or_default();
+        let mut renamed_property = |name: &str| {
+            if let Some(renamed) = names.get(name) {
+                return *renamed;
+            }
+            let renamed = rbx_logical_property_name(database, &instance.class_name, name)
+                .filter(|canonical| *canonical != name);
+            names.insert(name.to_string(), renamed);
+            renamed
+        };
+        if !instance
+            .properties
+            .keys()
+            .any(|name| renamed_property(name).is_some())
+        {
+            continue;
+        }
         let mut canonical = Map::new();
         for (name, value) in std::mem::take(&mut instance.properties) {
-            let name = rbx_logical_property_name(database, &instance.class_name, &name)
-                .unwrap_or(&name)
-                .to_string();
+            let name = renamed_property(&name).map_or(name, str::to_string);
             if let Some(existing) = canonical.get(&name)
                 && !reconciliation_values_equal(existing, &value, false)
             {
@@ -1527,7 +1847,7 @@ fn reconciliation_maps_equal_with_ids(
                 if reconciliation_values_equal_with_ids(
                     value,
                     other,
-                    reconciliation_property_uses_f32(class_name, name),
+                    reconciliation_property_uses_f32(class_name, name, value, other),
                     Some(left_ids),
                     Some(right_ids),
                 ) => {}
@@ -1575,11 +1895,7 @@ fn reconciliation_identity_maps_equal(
     ignore_transient_properties: bool,
 ) -> bool {
     let stable = |name: &str, value: &Value| {
-        (!ignore_transient_properties
-            || name != "ScriptGuid"
-                && !reconciliation_property_is_derived(name)
-                && !reconciliation_property_is_metadata(name, value))
-            && !reconciliation_value_contains_reference(value)
+        identity_value_is_stable(name, value, ignore_transient_properties)
     };
     left.iter()
         .filter(|(name, value)| stable(name, value))
@@ -1596,6 +1912,14 @@ fn reconciliation_identity_maps_equal(
                     .get(name)
                     .is_some_and(|other| reconciliation_values_equal(value, other, false))
             })
+}
+
+fn identity_value_is_stable(name: &str, value: &Value, ignore_transient_properties: bool) -> bool {
+    (!ignore_transient_properties
+        || name != "ScriptGuid"
+            && !reconciliation_property_is_derived(name)
+            && !reconciliation_property_is_metadata(name, value))
+        && !reconciliation_value_contains_reference(value)
 }
 
 fn reconciliation_value_contains_reference(value: &Value) -> bool {
@@ -1800,20 +2124,30 @@ fn reconciliation_property_value_is_default(class_name: &str, name: &str, value:
     reconciliation_values_equal(
         value,
         &default,
-        reconciliation_property_uses_f32(class_name, name),
+        reconciliation_property_uses_f32(class_name, name, value, &default),
     )
 }
 
-fn reconciliation_property_uses_f32(class_name: &str, name: &str) -> bool {
-    rbx_reflection_database::get()
-        .ok()
-        .and_then(|database| rbx_model_property_descriptor(database, class_name, name))
-        .is_some_and(|descriptor| {
-            matches!(
-                descriptor.data_type,
-                RbxDataType::Value(RbxVariantType::Float32)
-            )
-        })
+fn reconciliation_property_uses_f32(
+    class_name: &str,
+    name: &str,
+    left: &Value,
+    right: &Value,
+) -> bool {
+    // Structured values carry their own numeric type. Only unequal scalar numbers
+    // need reflection to distinguish Float32 rounding from exact Float64 values.
+    left.is_number()
+        && right.is_number()
+        && left != right
+        && rbx_reflection_database::get()
+            .ok()
+            .and_then(|database| rbx_model_property_descriptor(database, class_name, name))
+            .is_some_and(|descriptor| {
+                matches!(
+                    descriptor.data_type,
+                    RbxDataType::Value(RbxVariantType::Float32)
+                )
+            })
 }
 
 pub(crate) fn reconciliation_property_values_equal(
@@ -1828,7 +2162,7 @@ pub(crate) fn reconciliation_property_values_equal(
         (Some(left), Some(right)) => reconciliation_values_equal(
             left,
             right,
-            reconciliation_property_uses_f32(class_name, name),
+            reconciliation_property_uses_f32(class_name, name, left, right),
         ),
         (Some(value), None) | (None, Some(value)) => {
             reconciliation_property_value_is_default(class_name, name, value)
@@ -1916,6 +2250,194 @@ mod tests {
 
     use super::*;
 
+    fn duplicate_geometry(count: usize) -> SettingsBytecode {
+        let mut instances = vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        for index in 0..count {
+            let mut instance = SettingsBytecodeInstance::new(
+                format!("editor:{index}"),
+                "Wedge".into(),
+                "WedgePart".into(),
+                Some(0),
+            );
+            instance.properties.insert(
+                "Position".into(),
+                json!({
+                    "_type": "Vector3", "x": index as f64, "y": 0, "z": 0,
+                }),
+            );
+            instances.push(instance);
+        }
+        SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    }
+
+    #[test]
+    fn duplicate_geometry_index_preserves_reordered_ids_and_edits() {
+        let reference = duplicate_geometry(6_178);
+        let mut observed = reference.clone();
+        observed.instances[1..].reverse();
+        for (index, instance) in observed.instances.iter_mut().enumerate() {
+            instance.settings_id = format!("debug:fresh:{index}");
+        }
+        observed.instances[0]
+            .attributes
+            .insert("Edited".into(), json!(true));
+        let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
+        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        for instance in &observed.instances[1..] {
+            assert_eq!(index.matching(instance).unwrap().len(), 1);
+        }
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        for instance in &observed.instances[1..] {
+            let position = instance.properties["Position"]["x"].as_f64().unwrap() as usize;
+            assert_eq!(instance.settings_id, format!("editor:{position}"));
+        }
+        assert_eq!(observed.instances[0].attributes["Edited"], true);
+    }
+
+    #[test]
+    fn positional_identity_checks_duplicate_subtrees_and_incoming_references() {
+        let mut reference = duplicate_geometry(2);
+        for parent in [1, 2] {
+            let mut child = SettingsBytecodeInstance::new(
+                format!("child:{parent}"),
+                "Leaf".into(),
+                "StringValue".into(),
+                Some(parent),
+            );
+            child.properties.insert("Value".into(), json!(parent));
+            reference.instances.push(child);
+        }
+        let mut pointer = SettingsBytecodeInstance::new(
+            "pointer".into(),
+            "Pointer".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        pointer.properties.insert(
+            "Value".into(),
+            json!({"_type":"Ref", "settingsId":"editor:1"}),
+        );
+        reference.instances.push(pointer);
+        let mut observed = reference.clone();
+        observed.instances[0]
+            .attributes
+            .insert("Edited".into(), json!(true));
+        assert!(positional_identity_preserved(&reference, &observed));
+        assert!(!settings_documents_positionally_equivalent(
+            &reference, &observed
+        ));
+        observed.instances[1]
+            .attributes
+            .insert("Edited".into(), json!(true));
+        assert!(!positional_identity_preserved(&reference, &observed));
+        observed.instances[1].attributes.clear();
+        observed.instances[3]
+            .properties
+            .insert("Value".into(), json!(2));
+        observed.instances[4]
+            .properties
+            .insert("Value".into(), json!(1));
+        assert!(!positional_identity_preserved(&reference, &observed));
+        observed = reference.clone();
+        observed.instances[5].properties["Value"]["settingsId"] = json!("editor:2");
+        assert!(!positional_identity_preserved(&reference, &observed));
+    }
+
+    #[test]
+    fn numeric_candidate_filter_is_a_superset_of_float_equality() {
+        let mut reference = duplicate_geometry(80);
+        for (index, instance) in reference.instances[1..].iter_mut().enumerate() {
+            let value = if index % 2 == 0 { -1.0 } else { 1.0 } * 10.0_f64.powi(index as i32 - 40);
+            instance.properties["Position"]["x"] = json!(value);
+        }
+        let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
+        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        for candidate in &candidates {
+            let original = &reference.instances[*candidate];
+            let value = original.properties["Position"]["x"].as_f64().unwrap();
+            for fraction in [-1.000001, -1.0, -0.999999, 0.0, 0.999999, 1.0, 1.000001] {
+                let mut observed = original.clone();
+                observed.properties["Position"]["x"] =
+                    json!(value + fraction * 4.0 * f64::from(f32::EPSILON) * value.abs().max(1.0));
+                if reconciliation_identity_maps_equal(
+                    &original.properties,
+                    &observed.properties,
+                    true,
+                ) {
+                    assert!(
+                        index
+                            .matching(&observed)
+                            .unwrap()
+                            .iter()
+                            .any(|(_, actual)| actual == candidate)
+                    );
+                }
+            }
+        }
+        let mut enum_observed = reference.instances[1].clone();
+        enum_observed.properties["Position"]["_type"] = json!("EnumItem");
+        assert!(index.matching(&enum_observed).is_none());
+        enum_observed.properties.clear();
+        assert!(index.matching(&enum_observed).is_none());
+    }
+
+    #[test]
+    fn uniform_duplicate_geometry_keeps_deterministic_ties() {
+        let mut reference = duplicate_geometry(6_178);
+        for instance in &mut reference.instances[1..] {
+            instance.properties.clear();
+        }
+        let mut observed = reference.clone();
+        for (index, instance) in observed.instances.iter_mut().enumerate() {
+            instance.settings_id = format!("debug:{index}");
+        }
+        observed.instances[0]
+            .attributes
+            .insert("Edited".into(), json!(true));
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        for (expected, actual) in reference.instances.iter().zip(&observed.instances) {
+            assert_eq!(expected.settings_id, actual.settings_id);
+        }
+        assert_eq!(observed.instances[0].attributes["Edited"], true);
+    }
+
+    #[test]
+    fn indexed_duplicates_still_prioritize_reference_evidence_over_content() {
+        let mut reference = duplicate_geometry(40);
+        let mut holder = SettingsBytecodeInstance::new(
+            "holder".into(),
+            "Holder".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        holder.properties.insert(
+            "Value".into(),
+            json!({"_type": "Ref", "settingsId": "editor:0"}),
+        );
+        reference.instances.push(holder);
+        let mut observed = reference.clone();
+        for (index, instance) in observed.instances[1..41].iter_mut().enumerate() {
+            instance.settings_id = format!("debug:{index}");
+        }
+        observed.instances[1].properties["Position"]["x"] = json!(999.0);
+        observed.instances[41].properties["Value"]["settingsId"] = json!("debug:0");
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        assert_eq!(observed.instances[1].settings_id, "editor:0");
+        assert_eq!(observed.instances[1].properties["Position"]["x"], 999.0);
+        assert_eq!(
+            observed.instances[41].properties["Value"]["settingsId"],
+            "editor:0"
+        );
+    }
+
     fn string_value_with_properties(properties: Map<String, Value>) -> SettingsBytecode {
         SettingsBytecode {
             version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
@@ -1959,6 +2481,48 @@ mod tests {
                 .to_string()
                 .contains("conflicting values for property Archivable")
         );
+    }
+
+    #[test]
+    fn canonical_properties_keep_their_storage_and_alias_cache_is_class_scoped() {
+        let mut document = string_value_with_properties(Map::from_iter([
+            ("Archivable".to_string(), json!(false)),
+            ("Value".to_string(), json!("saved")),
+            ("FutureProperty".to_string(), json!({"future": true})),
+        ]));
+        let key = document.instances[0]
+            .properties
+            .keys()
+            .next()
+            .unwrap()
+            .as_ptr();
+        let mut alias = document.instances[0].clone();
+        alias.properties.insert("archivable".into(), json!(false));
+        document.instances.push(alias);
+        let mut unknown_class = document.instances[0].clone();
+        unknown_class.class_name = "FutureClass".into();
+        unknown_class
+            .properties
+            .insert("archivable".into(), json!(true));
+        document.instances.push(unknown_class);
+
+        canonicalize_settings_property_names(&mut document).unwrap();
+
+        assert_eq!(
+            document.instances[0]
+                .properties
+                .keys()
+                .next()
+                .unwrap()
+                .as_ptr(),
+            key
+        );
+        assert_eq!(
+            document.instances[0].properties,
+            document.instances[1].properties
+        );
+        assert_eq!(document.instances[2].properties["archivable"], true);
+        assert_eq!(document.instances[2].properties["Archivable"], false);
     }
 
     #[test]
@@ -2636,6 +3200,45 @@ mod tests {
             .unwrap(),
             SettingsAlignment::Equivalent
         ));
+    }
+
+    #[test]
+    fn duplicate_containers_align_by_distinct_descendant_content() {
+        for count in [2, 2_000] {
+            let mut reference = duplicate_geometry(count);
+            for instance in &mut reference.instances[1..] {
+                instance.name = "Wood Crate".into();
+                instance.class_name = "Folder".into();
+                instance.properties.clear();
+            }
+            for index in 1..=count {
+                let mut child = SettingsBytecodeInstance::new(
+                    format!("editor:child-{index}"),
+                    "Part".into(),
+                    "Part".into(),
+                    Some(index),
+                );
+                child.properties.insert(
+                    "Position".into(),
+                    json!({"_type":"Vector3", "x":index, "y":0, "z":0}),
+                );
+                reference.instances.push(child);
+            }
+            let mut observed = reference.clone();
+            observed.instances[1..=count].reverse();
+            for index in 1..=count {
+                observed.instances[count + index].parent_index = Some(count + 1 - index);
+            }
+            for (index, instance) in observed.instances.iter_mut().enumerate() {
+                instance.settings_id = format!("debug:{index}");
+            }
+            assert!(align_settings_ids_to_reference(&reference, &mut observed));
+            assert_eq!(
+                observed.instances[1].settings_id,
+                reference.instances[count].settings_id
+            );
+            assert!(settings_documents_equivalent(&reference, &observed));
+        }
     }
 
     #[test]

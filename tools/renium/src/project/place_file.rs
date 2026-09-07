@@ -42,7 +42,7 @@ impl Iterator for Descendants<'_> {
     }
 }
 
-fn place_dom(path: &Path) -> Result<RbxWeakDom> {
+pub(super) fn place_dom(path: &Path) -> Result<RbxWeakDom> {
     if !path.is_file() {
         bail!("Place file does not exist: {}", path.display());
     }
@@ -232,12 +232,46 @@ fn difference_value(
 }
 
 pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> Result<()> {
-    let loaded = config::load_project(project, None)?;
-    let projection = config::stage_project(&loaded)?;
-    let services = projected_services(projection.root())?;
-    let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
-    let project_dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
     let place_dom = place_dom(&args.input)?;
+    let (mut project_dom, project_path, service_set) = if let Some(against) = &args.against {
+        let target = self::place_dom(against)?;
+        let services = [&place_dom, &target]
+            .into_iter()
+            .flat_map(|dom| {
+                dom.root()
+                    .children()
+                    .iter()
+                    .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        (target, against.clone(), services)
+    } else {
+        let loaded = config::load_project(project, None)?;
+        let projection = config::stage_project(&loaded)?;
+        let services = projected_services(projection.root())?;
+        let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
+        let dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
+        (dom, loaded.path, service_set)
+    };
+    if args.full {
+        let not_serialized = if args.against.is_none() {
+            super::place_diff::omit_unsaved_project_properties(&mut project_dom)?
+        } else {
+            BTreeMap::new()
+        };
+        let mut result = super::place_diff::compare(&place_dom, &project_dom, &service_set, &args)?;
+        if !not_serialized.is_empty() {
+            result["notSerializedProjectProperties"] = json!(not_serialized);
+        }
+        result["input"] = json!(args.input);
+        result["target"] = json!(project_path);
+        result["targetKind"] = json!(if args.against.is_some() {
+            "place"
+        } else {
+            "project"
+        });
+        return print_json_output(&result, args.pretty);
+    }
     let project_scripts = script_groups(&project_dom, &service_set);
     let place_scripts = script_groups(&place_dom, &service_set);
     let project_count = project_scripts.values().map(Vec::len).sum::<usize>();
@@ -322,7 +356,9 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
             "ok": true,
             "matches": difference_count == 0,
             "input": args.input,
-            "project": loaded.path,
+            "project": project_path,
+            "scope": "scripts",
+            "targetKind": if args.against.is_some() { "place" } else { "project" },
             "services": service_set,
             "projectScripts": project_count,
             "placeScripts": place_count,

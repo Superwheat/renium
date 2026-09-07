@@ -19,12 +19,30 @@ pub(crate) fn place_matches(info: &BridgeInfoPayload, selector: &str) -> bool {
     {
         return info.game_id == Some(game_id) && info.place_id == Some(place_id);
     }
-    if let Ok(id) = trimmed.parse::<i64>()
-        && info.place_id == Some(id)
-    {
-        return true;
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return info.place_id == Some(id);
     }
     let name = info.place_name.to_ascii_lowercase();
     let wanted = trimmed.to_ascii_lowercase();
     !name.is_empty() && (name == wanted || name.contains(&wanted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_place_selectors_never_fall_back_to_display_names() {
+        let info = BridgeInfoPayload {
+            place_id: Some(20),
+            game_id: Some(10),
+            place_name: "Unrelated 30".into(),
+            ..Default::default()
+        };
+        assert!(place_matches(&info, "20"));
+        assert!(place_matches(&info, "10:20"));
+        assert!(!place_matches(&info, "30"));
+        assert!(!place_matches(&info, "11:20"));
+        assert!(place_matches(&info, "Unrelated"));
+    }
 }

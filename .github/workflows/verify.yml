@@ -48,7 +48,9 @@ jobs:
       - name: Run CLI tests
         run: |
           cargo test --locked --manifest-path tools/renium/Cargo.toml
+          cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
           node tools/renium/tests/launcher-smoke.mjs
+          node tools/renium/tests/package-subobject.mjs
 
   rust-msrv:
     name: Rust 1.89 compatibility

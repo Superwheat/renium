@@ -177,15 +177,11 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> (), us
 
 	function api.isLockInstance(instance: Instance): boolean
 		local value = instance
-		while value ~= ServerStorage do
+		while value ~= nil and value ~= ServerStorage do
 			if isSessionLock(value) then
 				return true
 			end
-			local parent = value.Parent
-			if parent == nil then
-				return false
-			end
-			value = parent
+			value = value:FindFirstAncestor(LOCK_NAME)
 		end
 		return false
 	end

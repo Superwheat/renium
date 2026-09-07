@@ -9,7 +9,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use memchr::{memchr_iter, memmem};
+use memchr::memmem;
+#[path = "windows_properties.rs"]
+mod properties;
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod tests;
+pub(crate) use properties::prepare_property;
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -65,6 +71,7 @@ struct CachedLayout {
     modified: Option<SystemTime>,
     data: PeSection,
     trace: SerializerTrace,
+    image_stamp: [u32; 3],
 }
 struct CachedPackageLayout {
     len: u64,
@@ -91,7 +98,9 @@ struct SerializerTrace {
 #[derive(Clone)]
 struct PackageLayout {
     data: PeSection,
+    text: PeSection,
     submit_task: usize,
+    image_stamp: [u32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -314,12 +323,14 @@ struct PeSection {
     virtual_address: usize,
     raw_size: usize,
     raw_offset: usize,
+    characteristics: u32,
 }
 
 struct PeImage<'a> {
     bytes: &'a [u8],
     image_base: usize,
     sections: Vec<PeSection>,
+    image_stamp: [u32; 3],
 }
 
 impl<'a> PeImage<'a> {
@@ -334,11 +345,21 @@ impl<'a> PeImage<'a> {
         let section_count = read_u16(bytes, pe_offset + 6)? as usize;
         let optional_size = read_u16(bytes, pe_offset + 20)? as usize;
         let optional_offset = pe_offset + 24;
+        if optional_size < 68 {
+            bail!("Studio executable optional header is truncated");
+        }
         if read_u16(bytes, optional_offset)? != 0x20b {
             bail!("Studio executable is not PE32+");
         }
         let image_base = read_u64(bytes, optional_offset + 24)? as usize;
         let section_offset = optional_offset + optional_size;
+        slice(
+            bytes,
+            section_offset,
+            section_count
+                .checked_mul(40)
+                .context("Studio section table overflowed")?,
+        )?;
         let mut sections = Vec::with_capacity(section_count);
         for index in 0..section_count {
             let offset = section_offset + index * 40;
@@ -350,12 +371,21 @@ impl<'a> PeImage<'a> {
                 virtual_address: read_u32(bytes, offset + 12)? as usize,
                 raw_size: read_u32(bytes, offset + 16)? as usize,
                 raw_offset: read_u32(bytes, offset + 20)? as usize,
+                characteristics: read_u32(bytes, offset + 36)?,
             });
+        }
+        for section in &sections {
+            slice(bytes, section.raw_offset, section.raw_size)?;
         }
         Ok(Self {
             bytes,
             image_base,
             sections,
+            image_stamp: [
+                read_u32(bytes, pe_offset + 8)?,
+                read_u32(bytes, optional_offset + 56)?,
+                read_u32(bytes, optional_offset + 64)?,
+            ],
         })
     }
 
@@ -390,9 +420,7 @@ impl<'a> PeImage<'a> {
 
     fn rva_to_offset(&self, rva: usize) -> Result<usize> {
         for section in &self.sections {
-            if rva >= section.virtual_address
-                && rva < section.virtual_address + section.virtual_size.max(section.raw_size)
-            {
+            if rva >= section.virtual_address && rva < section.virtual_address + section.raw_size {
                 return Ok(section.raw_offset + rva - section.virtual_address);
             }
         }
@@ -416,7 +444,41 @@ impl<'a> PeImage<'a> {
         let target = source
             .checked_add(displacement)
             .context("Studio call target overflowed")?;
-        usize::try_from(target).context("Studio call target was negative")
+        let target = usize::try_from(target).context("Studio call target was negative")?;
+        self.require_executable_rva(target)?;
+        Ok(target)
+    }
+
+    fn require_executable_rva(&self, rva: usize) -> Result<()> {
+        if !self.sections.iter().any(|section| {
+            section.characteristics & 0x2000_0000 != 0
+                && rva
+                    .checked_sub(section.virtual_address)
+                    .is_some_and(|offset| offset < section.raw_size)
+        }) {
+            bail!("Studio function target 0x{rva:X} is outside executable code");
+        }
+        Ok(())
+    }
+
+    fn function_end(&self, offset: usize) -> Result<usize> {
+        let target = self.offset_to_rva(offset)?;
+        let table = self.section(b".pdata")?;
+        let (mut low, mut high) = (0, table.raw_size / 12);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = table.raw_offset + middle * 12;
+            let begin = read_u32(self.bytes, entry)? as usize;
+            let end = read_u32(self.bytes, entry + 4)? as usize;
+            if target < begin {
+                high = middle;
+            } else if target >= end {
+                low = middle + 1;
+            } else {
+                return Ok(self.rva_to_offset(end - 1)? + 1);
+            }
+        }
+        bail!("Studio call site has no x64 unwind function boundary")
     }
 
     fn rip_target(&self, offset: usize, instruction_size: usize) -> Result<usize> {
@@ -460,13 +522,22 @@ fn pattern_matches<'a>(
     let range = if pattern.is_empty() || end < start || end - start < pattern.len() {
         &bytes[0..0]
     } else {
-        &bytes[start..end]
+        bytes.get(start..end).unwrap_or(&[])
     };
-    memmem::find_iter(range, pattern).map(move |offset| start + offset)
+    let finder = memmem::Finder::new(pattern);
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        if pattern.is_empty() {
+            return None;
+        }
+        let offset = cursor + finder.find(range.get(cursor..)?)?;
+        cursor = offset + 1;
+        Some(start + offset)
+    })
 }
 
 fn unique_match(matches: impl Iterator<Item = usize>) -> (Option<usize>, usize) {
-    matches.fold((None, 0), |(first, count), offset| {
+    matches.take(2).fold((None, 0), |(first, count), offset| {
         (first.or(Some(offset)), count + 1)
     })
 }
@@ -490,24 +561,20 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     let text = image.section(b".text")?;
     let start = text.raw_offset;
     let end = start + text.raw_size;
-    let anchor = hex("4C897DA8498B16488D4D88")?;
-    let continuation = hex(
-        "E800000000488BD3488D8DD0000000E800000000904C897C24384C897C2430488D4588488944242844897C24204C8D8DD00000004D8B06488D55E0488D8D30010000E8",
+    // Match the calling convention, not the compiler's register allocation or
+    // stack locations. Relationships between operands are checked below.
+    let signature = masked(
+        "4C 89 ?? ?? 49 8B ?? 48 8D 4D ?? E8 ?? ?? ?? ?? 48 8B D3 48 8D 8D ?? ?? ?? ?? E8 ?? ?? ?? ?? 90 \
+         4C 89 ?? 24 38 4C 89 ?? 24 30 48 8D 45 ?? 48 89 44 24 28 44 89 ?? 24 20 \
+         4C 8D 8D ?? ?? ?? ?? 4D 8B ?? 48 8D 55 ?? 48 8D 8D ?? ?? ?? ?? E8 ?? ?? ?? ??",
     )?;
-    let (sequence, sequence_count) =
-        unique_match(
-            pattern_matches(bytes, &anchor, start, end).filter(|sequence| {
-                let offset = sequence + anchor.len();
-                let Ok(candidate) = slice(bytes, offset, continuation.len()) else {
-                    return false;
-                };
-                candidate.iter().zip(&continuation).enumerate().all(
-                    |(index, (actual, expected))| {
-                        matches!(index, 1..=4 | 16..=19) || actual == expected
-                    },
-                )
-            }),
-        );
+    let (sequence, sequence_count) = unique_match(
+        find_masked_where(bytes, &signature, start, end, |sequence| {
+            let b = &bytes[*sequence..*sequence + signature.len()];
+            serializer_operands_consistent(b)
+        })
+        .into_iter(),
+    );
     if sequence_count != 1 {
         bail!(
             "Studio serializer signature matched {} locations",
@@ -518,12 +585,21 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     let root_collector = image.call_target(sequence + 11)?;
     let context_builder = image.call_target(sequence + 26)?;
     let wrapper = image.call_target(sequence + 77)?;
-    let destroy_pattern = hex("C6853801000000488D8DD0000000E8")?;
+    let context_offset = read_i32(bytes, sequence + 22)?;
+    let result_offset = read_i32(bytes, sequence + 73)?;
+    let mut destroy_pattern = hex("C6850000000000488D8D00000000E8")?;
+    destroy_pattern[2..6].copy_from_slice(
+        &result_offset
+            .checked_add(8)
+            .context("Studio result offset overflowed")?
+            .to_le_bytes(),
+    );
+    destroy_pattern[10..14].copy_from_slice(&context_offset.to_le_bytes());
     let (destroy_match, destroy_count) = unique_match(pattern_matches(
         bytes,
         &destroy_pattern,
         sequence,
-        (sequence + 0x500).min(bytes.len()),
+        image.function_end(sequence)?,
     ));
     if destroy_count != 1 {
         bail!(
@@ -533,7 +609,8 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     }
     let destroy_match = destroy_match.expect("cleanup signature count was validated");
     let context_destroy = image.call_target(destroy_match + 14)?;
-    let deallocator_suffix = hex("0F57C0F30F7F4588")?;
+    let mut deallocator_suffix = hex("0F57C0F30F7F4588")?;
+    deallocator_suffix[7] = bytes[sequence + 10];
     let (deallocator_call, deallocator_count) = unique_match(
         (destroy_match + destroy_pattern.len()
             ..(destroy_match + destroy_pattern.len() + 0x100).min(bytes.len()))
@@ -596,7 +673,21 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     Ok(trace)
 }
 
-fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
+fn serializer_operands_consistent(b: &[u8]) -> bool {
+    let zero_register = (b[2] >> 3) & 7;
+    b[2] & 0xc7 == 0x45
+        && [b[34], b[39], b[53]]
+            .iter()
+            .all(|operand| *operand == (0x44 | (zero_register << 3)))
+        && b[6] & 0xf8 == 0x10
+        && b[65] == (b[6] & 7)
+        && b[3] == b[10].wrapping_add(32)
+        && b[45] == b[10]
+        && b[22..26] == b[59..63]
+        && read_i32(b, 73).ok() == read_i32(b, 22).ok().and_then(|value| value.checked_add(96))
+}
+
+fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace, [u32; 3])> {
     let metadata =
         fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
     let modified = metadata.modified().ok();
@@ -606,7 +697,7 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
-        .map(|cached| (cached.data, cached.trace));
+        .map(|cached| (cached.data, cached.trace, cached.image_stamp));
     if let Some(layout) = cached {
         return Ok(layout);
     }
@@ -625,9 +716,10 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace)> {
                 modified,
                 data,
                 trace,
+                image_stamp: image.image_stamp,
             },
         );
-    Ok((data, trace))
+    Ok((data, trace, image.image_stamp))
 }
 
 fn hex(value: &str) -> Result<Vec<u8>> {
@@ -658,19 +750,40 @@ fn masked(value: &str) -> Result<Vec<Option<u8>>> {
 }
 
 fn find_all_masked(bytes: &[u8], pattern: &[Option<u8>], start: usize, end: usize) -> Vec<usize> {
-    if pattern.is_empty() || end < start || end - start < pattern.len() {
+    find_masked_where(bytes, pattern, start, end, |_| true)
+}
+
+fn find_masked_where(
+    bytes: &[u8],
+    pattern: &[Option<u8>],
+    start: usize,
+    end: usize,
+    accept: impl FnMut(&usize) -> bool,
+) -> Vec<usize> {
+    if pattern.is_empty() || end < start || end > bytes.len() || end - start < pattern.len() {
         return Vec::new();
     }
-    let Some((anchor_index, anchor)) = pattern
+    // A long literal run is much more selective than the common first opcode.
+    let (mut anchor_index, mut anchor_len, mut run_start) = (0, 0, 0);
+    for (index, byte) in pattern.iter().enumerate() {
+        if byte.is_none() {
+            run_start = index + 1;
+        } else if index + 1 - run_start > anchor_len {
+            anchor_index = run_start;
+            anchor_len = index + 1 - run_start;
+        }
+    }
+    if anchor_len == 0 {
+        return Vec::new();
+    }
+    let anchor = pattern[anchor_index..anchor_index + anchor_len]
         .iter()
-        .enumerate()
-        .find_map(|(index, value)| value.map(|value| (index, value)))
-    else {
-        return (start..=end - pattern.len()).collect();
-    };
-    memchr_iter(anchor, &bytes[start + anchor_index..end])
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    pattern_matches(bytes, &anchor, start + anchor_index, end)
         .filter_map(|matched| {
-            (start + anchor_index + matched)
+            matched
                 .checked_sub(anchor_index)
                 .filter(|offset| *offset + pattern.len() <= end)
         })
@@ -679,6 +792,8 @@ fn find_all_masked(bytes: &[u8], pattern: &[Option<u8>], start: usize, end: usiz
                 expected.is_none_or(|expected| bytes[offset + index] == expected)
             })
         })
+        .filter(accept)
+        .take(2) // Two candidates are already an unsupported, ambiguous layout.
         .collect()
 }
 
@@ -721,7 +836,9 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
     let image = PeImage::parse(&bytes)?;
     let layout = PackageLayout {
         data: image.section(b".data")?,
+        text: image.section(b".text")?,
         submit_task: renderer_submit_task_rva(&bytes, &image)?,
+        image_stamp: image.image_stamp,
     };
     cache
         .lock()
@@ -767,6 +884,32 @@ fn modules(pid: u32) -> Result<Vec<ModuleEntry>> {
         bail!("Studio process {pid} has no readable modules");
     }
     Ok(result)
+}
+
+fn verify_loaded_image(
+    memory: &ProcessMemory,
+    module: &ModuleEntry,
+    expected: [u32; 3],
+) -> Result<()> {
+    let pe_offset = memory.read_u32(module.base + 0x3c)? as usize;
+    if pe_offset
+        .checked_add(92)
+        .is_none_or(|end| end > module.size)
+    {
+        bail!("Loaded Studio executable has an invalid PE header");
+    }
+    let header = memory.read_vec(module.base + pe_offset, 92)?;
+    let actual = [
+        read_u32(&header, 8)?,
+        read_u32(&header, 80)?,
+        read_u32(&header, 88)?,
+    ];
+    if read_u32(&header, 0)? != 0x4550 || actual != expected {
+        bail!(
+            "Running Studio does not match its traced executable; restart Studio before using native operations"
+        );
+    }
+    Ok(())
 }
 
 fn wide_array(value: &[u16]) -> String {
@@ -1291,6 +1434,15 @@ fn ensure_helper_loaded(
     memory: &ProcessMemory,
     current_modules: &[ModuleEntry],
 ) -> Result<usize> {
+    ensure_helper_loaded_with_timeout(pid, memory, current_modules, REMOTE_TIMEOUT)
+}
+
+fn ensure_helper_loaded_with_timeout(
+    pid: u32,
+    memory: &ProcessMemory,
+    current_modules: &[ModuleEntry],
+    timeout: u32,
+) -> Result<usize> {
     let path = helper_path()?;
     if let Some(module) = current_modules
         .iter()
@@ -1328,7 +1480,7 @@ fn ensure_helper_loaded(
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
     memory.write(remote_path.address, &bytes)?;
-    remote_path.run(load_library, REMOTE_TIMEOUT)?;
+    remote_path.run(load_library, timeout)?;
     let loaded = modules(pid)?
         .into_iter()
         .find(|module| module_path_matches(module, &path))
@@ -1402,26 +1554,12 @@ fn find_class_member_descriptor(
     member_name: &str,
 ) -> Result<usize> {
     let class_descriptor = memory.read_u64(instance + layout.class_descriptor)? as usize;
+    let class_bytes = memory.read_vec(class_descriptor, 0x218)?;
     let mut matches = HashSet::new();
     for offset in (0..=0x200usize).step_by(8) {
-        let Ok(entries) = memory
-            .read_u64(class_descriptor + offset)
-            .map(|value| value as usize)
-        else {
-            continue;
-        };
-        let Ok(count) = memory
-            .read_u64(class_descriptor + offset + 8)
-            .map(|value| value as usize)
-        else {
-            continue;
-        };
-        let Ok(capacity) = memory
-            .read_u64(class_descriptor + offset + 16)
-            .map(|value| value as usize)
-        else {
-            continue;
-        };
+        let entries = read_u64(&class_bytes, offset)? as usize;
+        let count = read_u64(&class_bytes, offset + 8)? as usize;
+        let capacity = read_u64(&class_bytes, offset + 16)? as usize;
         if count == 0
             || count > 512
             || capacity < count
@@ -1430,13 +1568,11 @@ fn find_class_member_descriptor(
         {
             continue;
         }
+        let Ok(members) = memory.read_vec(entries, count * 16) else {
+            continue;
+        };
         for index in 0..count {
-            let Ok(member) = memory
-                .read_u64(entries + index * 16)
-                .map(|value| value as usize)
-            else {
-                continue;
-            };
+            let member = read_u64(&members, index * 16)? as usize;
             if !likely_pointer(member) {
                 continue;
             }
@@ -1836,6 +1972,7 @@ pub(super) fn platform_package_action(
         .context("Roblox Studio module was not found")?;
     let layout = package_layout(&studio.path)?;
     let memory = ProcessMemory::open(pid)?;
+    verify_loaded_image(&memory, studio, layout.image_stamp)?;
     let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)?;
     let package = resolve_package_target(&memory, &data_model, target)?;
     let status_layout = package_status_layout(&memory, package.link.instance, data_model.layout)?;
@@ -2105,9 +2242,10 @@ fn write_live_snapshot(
         .first()
         .context("Studio process has no main module")?;
     let trace_started = Instant::now();
-    let (data, trace) = studio_layout(&studio.path)?;
+    let (data, trace, image_stamp) = studio_layout(&studio.path)?;
     let trace_ms = trace_started.elapsed().as_secs_f64() * 1000.0;
     let memory = ProcessMemory::open(pid)?;
+    verify_loaded_image(&memory, studio, image_stamp)?;
     let discover_started = Instant::now();
     let mut data_model = active_data_model(pid, &memory, studio, data, studio_title)?;
     if let Some(service) = service {

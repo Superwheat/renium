@@ -10,13 +10,10 @@ use serde_json::{Map, Value, json};
 
 use crate::app::timing::{log_timing, verbose_timing_logs};
 use crate::bytecode::edit::instance_path_parts_key;
-use crate::bytecode::explorer::explorer_daemon_services;
 use crate::cli::PushEditorChangesArgs;
-use crate::editor::diff::{NativeEditorPropertyRules, append_native_editor_full_property_changes};
 use crate::editor::types::{
     EditorBinaryExport, EditorBinaryImport, EditorBinaryImportGroup, EditorBinaryPackageRoot,
-    EditorBinaryRetainedRoot, EditorBinaryRootPath, EditorChangeSet, EditorInstanceChange,
-    EditorInstancePath, EditorSettingsWrite,
+    EditorBinaryRetainedRoot, EditorBinaryRootPath, EditorChangeSet,
 };
 use crate::rbx::decode::{
     NativeOverlayRequest, NativePropertyFilter, RbxSettingsConversionOptions,
@@ -28,7 +25,7 @@ use crate::rbx::model::{
     BytecodeModelImportRefs, build_rbx_place, rbx_dom_instance_by_path_unique,
     rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
 };
-use crate::roblox::schema::{PropertySchemaMap, load_rbx_dom_property_schema};
+use crate::roblox::schema::PropertySchemaMap;
 use crate::roblox::services::explorer_service_order;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
@@ -42,9 +39,7 @@ use crate::studio::native::editor::{
     EditorBinaryExportFinishGuard, begin_editor_binary_export, rbx_variant_referent,
     receive_editor_binary_export_bytes,
 };
-use crate::system::files::{
-    absolutize_under, resolve_project_root_if_present, service_settings_path,
-};
+use crate::system::files::{absolutize_under, resolve_project_root_if_present};
 
 struct PendingEditorBinaryGroup {
     service: String,
@@ -1913,13 +1908,6 @@ fn plan_editor_package_root_retention(
     Ok(plans)
 }
 
-struct PreparedEditorBinaryImport {
-    binary_import: EditorBinaryImport,
-    documents_by_service: HashMap<String, SettingsBytecode>,
-    paths_by_service: HashMap<String, Vec<Option<EditorInstancePath>>>,
-    settings_writes: Vec<EditorSettingsWrite>,
-}
-
 pub(crate) fn build_editor_binary_import(
     args: &PushEditorChangesArgs,
     changes: &EditorChangeSet,
@@ -1956,14 +1944,7 @@ pub(crate) fn build_editor_binary_import(
             Some((service, &write.document))
         })
         .collect::<HashMap<_, _>>();
-    Ok(build_editor_binary_import_for_services(
-        args,
-        services,
-        Some(&document_overrides),
-        bridge,
-        false,
-    )?
-    .map(|prepared| prepared.binary_import))
+    build_editor_binary_import_for_services(args, services, Some(&document_overrides), bridge)
 }
 
 fn build_editor_binary_import_for_services(
@@ -1971,8 +1952,7 @@ fn build_editor_binary_import_for_services(
     services: HashSet<String>,
     document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
     bridge: &BridgeServer,
-    merge_source_files: bool,
-) -> Result<Option<PreparedEditorBinaryImport>> {
+) -> Result<Option<EditorBinaryImport>> {
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_count = services.len();
@@ -1993,7 +1973,7 @@ fn build_editor_binary_import_for_services(
                 document_overrides,
                 true,
                 true,
-                merge_source_files,
+                false,
             );
             log_timing("native editor import place build", started);
             result.and_then(|build| {
@@ -2270,100 +2250,12 @@ fn build_editor_binary_import_for_services(
     rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)
         .context("Failed to encode native Studio import")?;
     log_timing("native editor import binary encode", phase_started);
-    Ok(Some(PreparedEditorBinaryImport {
-        documents_by_service: build.documents_by_service,
-        paths_by_service: build.paths_by_service,
-        settings_writes: build.settings_writes,
-        binary_import: EditorBinaryImport {
-            bytes,
-            groups,
-            instance_count,
-            post_apply_properties_by_class: build.omitted_properties_by_class,
-            post_apply_properties_by_path,
-            external_references_post_applied: true,
-        },
+    Ok(Some(EditorBinaryImport {
+        bytes,
+        groups,
+        instance_count,
+        post_apply_properties_by_class: build.omitted_properties_by_class,
+        post_apply_properties_by_path,
+        external_references_post_applied: true,
     }))
-}
-
-pub(crate) fn prepare_native_editor_full_push(
-    args: &PushEditorChangesArgs,
-    bridge: &BridgeServer,
-) -> Result<(EditorChangeSet, EditorBinaryImport)> {
-    let started = Instant::now();
-    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
-    let services = native_editor_full_push_services(args)?;
-    let PreparedEditorBinaryImport {
-        binary_import,
-        documents_by_service,
-        paths_by_service,
-        settings_writes,
-    } = build_editor_binary_import_for_services(args, services, None, bridge, true)?
-        .context("The project could not be represented as a native full sync")?;
-
-    let property_schema_by_class = load_rbx_dom_property_schema(&project_root)?.unwrap_or_default();
-    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let mut changes = EditorChangeSet {
-        settings_writes,
-        ..EditorChangeSet::default()
-    };
-    let mut ordered_services = documents_by_service.keys().cloned().collect::<Vec<_>>();
-    ordered_services.sort_by(|a, b| {
-        explorer_service_order(a)
-            .unwrap_or(usize::MAX)
-            .cmp(&explorer_service_order(b).unwrap_or(usize::MAX))
-            .then_with(|| a.cmp(b))
-    });
-    let phase_started = Instant::now();
-    for service in ordered_services {
-        changes.instance_changes.push(EditorInstanceChange {
-            mode: "reconcileService".to_string(),
-            service: service.clone(),
-            allow_deletes: true,
-            instances: Vec::new(),
-            preserve_instances: Vec::new(),
-        });
-        append_native_editor_full_property_changes(
-            &mut changes,
-            &documents_by_service[&service],
-            &paths_by_service[&service],
-            &service,
-            &binary_import,
-            NativeEditorPropertyRules {
-                property_schema_by_class: &property_schema_by_class,
-                post_apply_properties_by_class: &binary_import.post_apply_properties_by_class,
-                post_apply_properties_by_path: &binary_import.post_apply_properties_by_path,
-                database,
-            },
-        );
-    }
-    log_timing("native editor post-apply preparation", phase_started);
-    if verbose_timing_logs() {
-        let property_count = changes
-            .property_changes
-            .iter()
-            .map(|change| change.properties.len())
-            .sum::<usize>();
-        eprintln!(
-            "[renium] native editor post-apply: instances={}, properties={}, external_refs={}",
-            changes.property_changes.len(),
-            property_count,
-            binary_import.post_apply_properties_by_path.len()
-        );
-    }
-    log_timing("native editor full push preparation", started);
-    Ok((changes, binary_import))
-}
-
-pub(crate) fn native_editor_full_push_services(
-    args: &PushEditorChangesArgs,
-) -> Result<HashSet<String>> {
-    let project_root = resolve_project_root_if_present(&args.project.project_root)?;
-    let src_root = absolutize_under(&project_root, &args.project.src_root);
-    Ok(explorer_daemon_services(&src_root, "")?
-        .into_iter()
-        .filter(|service| {
-            let service_dir = src_root.join(service);
-            service_dir.is_dir() || service_settings_path(&service_dir).is_file()
-        })
-        .collect())
 }

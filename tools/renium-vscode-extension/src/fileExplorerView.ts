@@ -12,6 +12,7 @@ import {
   type ExplorerViewMode,
 } from "./explorerBackendClient";
 import { fileExplorerWebviewHtml } from "./fileExplorerWebview";
+import { parseExplorerMessage } from "./explorerMessages";
 import { emptyGitViewState, type GitViewActions, type GitViewState } from "./gitView";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
 import {
@@ -33,7 +34,6 @@ import {
   type ExplorerHistoryTarget,
   type FileExplorerNode,
   type FileExplorerNodeKind,
-  type ReadonlyInstanceInfo,
   type ViewVisibilityHandler,
   canonicalExplorerServices,
   editorHistoryRoot,
@@ -66,6 +66,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "renium.fileExplorer";
   private webviewView: vscode.WebviewView | undefined;
   private selectedId: string | undefined;
+  private selectionSerial = 0;
   private webviewReady = false;
   private lastErrorMessage: string | undefined;
   private readonly backend = new ExplorerBackendClient(getExplorerConfig, (response) => this.onBackendEvent(response));
@@ -352,6 +353,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public clearSelection(): void {
+    this.selectionSerial += 1;
     if (!this.selectedId && !this.referencePreviewId) {
       return;
     }
@@ -991,40 +993,13 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async onMessage(message: {
-    type?: string;
-    nodeId?: string;
-    revealId?: string;
-    targetId?: string;
-    linkId?: string;
-    className?: string;
-    name?: string;
-    newName?: string;
-    query?: string;
-    start?: number;
-    count?: number;
-    mode?: ExplorerViewMode;
-    revision?: number;
-    delta?: number;
-    expanded?: boolean;
-    command?: string;
-    historyId?: string;
-    historyIds?: string[];
-    historyGroupId?: string;
-    modelPaths?: string[];
-    fetch?: boolean;
-    action?: string;
-    path?: string;
-    projectRoot?: string;
-    generation?: number;
-    message?: string;
-    base64?: string;
-    node?: ReadonlyInstanceInfo;
-  }): Promise<void> {
+  private async onMessage(input: unknown): Promise<void> {
+    const message = parseExplorerMessage(input);
+    if (!message) { return; }
     if (!this.mutationAdmissionOpen && message.type && MUTATION_MESSAGE_TYPES.has(message.type)) {
       return;
     }
-    const node = message.nodeId ? this.model.getNode(message.nodeId) : undefined;
+    const node = "nodeId" in message && message.nodeId ? this.model.getNode(message.nodeId) : undefined;
     switch (message.type) {
       case "storeDecode":
         await this.handleSettingsStoreDecode(message.name, message.base64);
@@ -1185,33 +1160,7 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       case "selectNode":
         if (message.nodeId) {
-          this.referencePreviewId = undefined;
-          const previousSelectedId = this.selectedId;
-          const service = this.serviceFromNodeId(message.nodeId);
-          try {
-            let loadedNode: FileExplorerNode;
-            if (service && this.propertyOnlyStaleServices.has(service)) {
-              await this.backend.reloadServices([service]);
-              const details = await this.backend.selectDetails(message.nodeId);
-              loadedNode = this.model.rememberNode(
-                this.nodeFromBackend(details.details ?? { id: message.nodeId }),
-                true,
-              );
-              this.propertyOnlyStaleServices.delete(service);
-            } else {
-              const details = await this.backend.selectDetails(message.nodeId);
-              loadedNode = this.model.rememberNode(
-                this.nodeFromBackend(details.details ?? { id: message.nodeId }),
-                true,
-              );
-            }
-            this.selectedId = message.nodeId;
-            await this.propertiesProvider.show(loadedNode);
-            this.actions.onSelectNode?.();
-          } catch (error) {
-            this.selectedId = previousSelectedId;
-            throw error;
-          }
+          await this.selectNode(message.nodeId);
         }
         return;
       case "openScript":
@@ -1322,6 +1271,33 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       default:
         return;
+    }
+  }
+
+  private async selectNode(nodeId: string): Promise<void> {
+    const serial = ++this.selectionSerial;
+    const generation = this.projectGeneration;
+    const current = () => serial === this.selectionSerial && generation === this.projectGeneration;
+    const previousSelectedId = this.selectedId;
+    this.referencePreviewId = undefined;
+    const service = this.serviceFromNodeId(nodeId);
+    try {
+      if (service && this.propertyOnlyStaleServices.has(service)) {
+        await this.backend.reloadServices([service]);
+        if (!current()) { return; }
+      }
+      const details = await this.backend.selectDetails(nodeId);
+      if (!current()) { return; }
+      const loadedNode = this.model.rememberNode(this.nodeFromBackend(details.details ?? { id: nodeId }), true);
+      if (service) { this.propertyOnlyStaleServices.delete(service); }
+      this.selectedId = nodeId;
+      await this.propertiesProvider.show(loadedNode);
+      if (current()) { this.actions.onSelectNode?.(); }
+    } catch (error) {
+      if (current()) {
+        this.selectedId = previousSelectedId;
+        throw error;
+      }
     }
   }
 

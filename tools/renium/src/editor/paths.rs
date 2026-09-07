@@ -27,6 +27,9 @@ pub(crate) fn project_script_file_names(
     class_name: &str,
     properties: &Map<String, Value>,
 ) -> Option<(String, String)> {
+    if !is_lua_source_class(class_name) {
+        return None;
+    }
     let run_context = properties.get("RunContext").and_then(run_context_name);
     let naming = config::cached_script_naming(parent_dir);
     let suffix = if class_name == "Script"

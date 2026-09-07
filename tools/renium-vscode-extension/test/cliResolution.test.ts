@@ -8,7 +8,27 @@ import {
   bundledReniumCliPath,
   findExecutableOnPath,
   reniumCliCandidates,
+  resolveReniumCliPath,
 } from "../src/cliResolution";
+
+test("CLI resolution does not inspect PATH when the configured or bundled binary exists", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-local-resolution-"));
+  const bundled = bundledReniumCliPath(root);
+  fs.mkdirSync(path.dirname(bundled), { recursive: true });
+  fs.writeFileSync(bundled, "binary");
+  try {
+    for (const configuredPath of [undefined, bundled]) {
+      const options = {
+        configuredPath,
+        extensionRoot: root,
+        get pathValue(): string { throw new Error("PATH must not be inspected"); },
+      };
+      assert.equal(resolveReniumCliPath(options), bundled);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("findExecutableOnPath finds Renium in PATH", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-path-"));

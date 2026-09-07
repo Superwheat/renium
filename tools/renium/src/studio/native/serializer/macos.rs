@@ -17,6 +17,10 @@ use crate::studio::native::snapshot::{
 };
 use crate::system::files::{atomic_write_file, sha256_hex};
 
+#[path = "macos_properties.rs"]
+mod properties;
+pub(crate) use properties::prepare_property;
+
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
@@ -51,6 +55,8 @@ struct CachedTrace {
 struct PackageActionTrace {
     submit_rva: u64,
     image_uuid: [u8; 16],
+    image_base: u64,
+    text: MachSection,
 }
 
 struct CachedPackageActionTrace {
@@ -643,6 +649,8 @@ fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
     let mut trace = PackageActionTrace {
         submit_rva: 0,
         image_uuid: image.image_uuid,
+        image_base: image.image_base,
+        text: image.text,
     };
     trace.submit_rva = match image.cpu {
         CPU_TYPE_ARM64 => trace_arm64_task_submitter(&image)?,
@@ -1077,6 +1085,8 @@ struct StudioPatchState {
     original_sha256: String,
     #[serde(default)]
     patched_launcher_sha256: String,
+    #[serde(default)]
+    patched_engine_sha256: String,
 }
 
 fn studio_patch_root() -> Result<PathBuf> {
@@ -1311,12 +1321,9 @@ fn patch_is_current(studio: &Path, state: &StudioPatchState) -> bool {
         && !state.patched_launcher_sha256.is_empty()
         && sha256_file(&studio_launcher(studio)).ok().as_deref()
             == Some(state.patched_launcher_sha256.as_str())
-        && studio_patched_engine(studio).is_file()
-        && studio_original_backup()
-            .ok()
-            .and_then(|path| sha256_file(&path).ok())
-            .as_deref()
-            == Some(state.original_sha256.as_str())
+        && !state.patched_engine_sha256.is_empty()
+        && sha256_file(&studio_patched_engine(studio)).ok().as_deref()
+            == Some(state.patched_engine_sha256.as_str())
 }
 
 fn ensure_studio_closed(studio: &Path) -> Result<()> {
@@ -1368,6 +1375,7 @@ fn capture_studio_baseline(studio: &Path) -> Result<StudioPatchState> {
         bundle_version: studio_bundle_version(studio)?,
         original_sha256: sha256_file(&studio_launcher(studio))?,
         patched_launcher_sha256: String::new(),
+        patched_engine_sha256: String::new(),
     };
     let result = (|| -> Result<()> {
         fs::copy(studio_launcher(studio), next.join("RobloxStudio"))
@@ -1591,6 +1599,7 @@ fn install_studio_patch(studio: &Path, state: &StudioPatchState) -> Result<()> {
         )?;
         let mut installed_state = state.clone();
         installed_state.patched_launcher_sha256 = sha256_file(&studio_launcher(studio))?;
+        installed_state.patched_engine_sha256 = sha256_file(&studio_patched_engine(studio))?;
         write_patch_state(&studio_patch_state_path()?, &installed_state)?;
         Ok(())
     })();

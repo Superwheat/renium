@@ -1,38 +1,32 @@
-# Renium (VS Code/Cursor)
+# Renium for VS Code and Cursor
 
-This extension controls Renium from VS Code and Cursor through the native CLI.
+Edit scripts and instances in your editor while Studio and project files stay in sync.
+[Installation and CLI guide](../renium/README.md).
 
-Renium checks signed updates when the editor opens. **Install Update** installs
-matching extension and plugin versions. Reload the editor and restart Studio.
-Disable checks with `renium.automaticUpdateChecks`.
+## Start
 
-## What it does
+1. Open the intended place in Studio and a dedicated project folder in your editor.
+2. For a new project, run **Renium: Pull Studio to Files**.
+3. Enable **Renium: Start Live Sync**. For an existing project, start Live Sync
+   without first pulling over your files.
 
-- Pull, Push, snapshots, and two-way Live Sync
-- Git status, pull, commit, and push
-- Pull from Studio, commit, and push in one flow
-- Wally and reusable link packages
-- Optional sync on save
-- Status bar menu and output panel
+Saves flow to Studio; Studio edits flow to files. File edits during Play wait
+for Edit mode. Healthy Live Sync needs no push or playtest after each save.
+Conflicts ask which version to keep.
 
-## Commands
+Use **Renium: Open Menu** for sync, places, packages, Git, settings, and diagnostics.
+The Output panel reports errors and pending work.
 
-- `Renium: Open Menu`
-- `Renium: Install Studio Plugin`
-- `Renium: Manage Places`
-- `Renium: Pull Studio to Files`
-- `Renium: Push Files to Studio`
-- `Renium: Export Snapshots Only`
-- `Renium: Sync Wally Packages`
-- `Renium: Start Live Sync`
-- `Renium: Stop Live Sync`
-- `Renium: Git`
+## Explorer and Inspector
 
-## Multi-place experiences
+Browse the project hierarchy, search instances, and edit properties/attributes
+without opening Studio. Drag a `.renium` store onto **Inspector**, or double-click
+it, to inspect instances, source, references, and IDs.
+
+## Multiple places
 
 Use **Manage Places → Add Current Studio Place** for each published place.
-Renium checks the `GameId` before writing. Each place has its own project root;
-`sourceRoot` changes the default `src` folder:
+Renium checks the GameId and creates separate project folders:
 
 ```text
 renium.experience.json
@@ -47,152 +41,77 @@ places/
     sourcemap.json
 ```
 
-Place files default to `{ "schemaVersion": 1 }`; add only non-default options.
+**Switch Active Place** chooses the sync target. **Rename Active Place** moves
+its folder, not its Roblox name. **Reorder Places** changes display order.
 
-Aliases come from published names: lowercase, spaces to underscores, ASCII
-letters and numbers only. **Rename Active Place** moves the folder without
-renaming the Roblox place.
+Aliases derive from published names. Place configs default to
+`{ "schemaVersion": 1 }`; `sourceRoot` overrides `src`.
+The workspace remembers the active place; the experience file stores order.
+Without an experience file, the project stays single-place.
 
-**Switch Active Place** selects the target for sync and project commands.
-**Reorder Places** changes display order. The workspace stores the active place;
-`renium.experience.json` stores order. Without it, the project stays single-place.
+## Packages and Git
 
-## .renium viewer
+**Sync Wally Packages** installs/imports dependencies from `wally.toml`.
+Renium can create a missing manifest. Shared packages default to
+`<sourceRoot>/ReplicatedStorage/Packages`; server/dev targets are configurable.
+Applying packages to Studio is a separate choice.
 
-Drag a `.renium` file onto **Inspector**, or double-click it, to view instances,
-properties, attributes, source, and IDs. The CLI uses the same decoder as sync.
+The **Git** tab shows branch, remote, ahead/behind, and project changes.
+It uses fast-forward-only pull, pauses mirroring during pull/checkout, rejects
+unexpected staged files, and excludes untracked files by default. Credentials
+are redacted from remote URLs. Applying pulled files to Studio is optional.
+Git push does not publish a Roblox place or package.
 
-## Requirements
+## Requirements and settings
 
-- Renium Studio plugin running in Studio
-- Renium CLI bundled with the extension, installed on `PATH`, or selected with `renium.cliPath`
-- For Wally package sync: `wally` on PATH, or configure `renium.wallySync.wallyPath`
-- `git` available on PATH, or configure `renium.gitSync.gitPath`
+The extension bundles the matching CLI and exposes `rbx`/`renium` in new terminals.
+No executable copies belong in projects. Studio operations need the Renium plugin;
+Git and Wally workflows need their project-configured tools.
 
-Releases include the matching CLI and expose `renium` and `rbx` to new terminals.
-Projects need no executable copies.
+Search **Renium** in editor Settings for descriptions, defaults, and allowed values.
+Common groups:
 
-On macOS, installation creates `~/Applications/Renium Studio.app` for
-protected-property sync. The original Studio app is unchanged.
+| Setting | Purpose |
+|---|---|
+| `renium.cliPath` | Optional CLI override; blank uses the bundle |
+| `renium.projectRoot` | Project folder; defaults to the workspace |
+| `renium.autoSyncOnSave` / `autoSyncDebounceMs` | Manual-sync save behavior |
+| `renium.editorLiveSyncEnabled` / `studioLiveSyncEnabled` | Sync directions |
+| `renium.studioLiveSyncPollMs` | Studio polling interval |
+| `renium.gitSync.*` | Git tool, scope, staging, confirmations, and Studio application |
+| `renium.wallySync.*` | Wally tool, package folders, realm targets, and install behavior |
 
-## Wally package sync
+On macOS, use installed `~/Applications/Renium Studio.app` for protected-property
+sync; the original Studio app stays unchanged.
 
-Use Wally normally from the project root:
-
-```toml
-[package]
-name = "local/my-game"
-version = "0.1.0"
-registry = "https://github.com/UpliftGames/wally-index"
-realm = "shared"
-
-[dependencies]
-```
-
-Run **Sync Wally Packages** to install, import, and optionally apply packages to
-Studio. The default target is `<sourceRoot>/ReplicatedStorage/Packages`.
-
-If `wally.toml` is missing, Renium can create it. Set
-`renium.wallySync.wallyPath` for custom locations.
-
-## Git tab behavior
-
-The **Git** tab is beside Explorer and History.
-
-- Shows branch, remote, ahead/behind, and changed project files
-- Redacts credentials from remote URLs
-- Scopes Git operations to the configured source folder
-- Can require a clean worktree before pull
-- Pauses mirroring during pull and checkout
-- Uses fast-forward-only pull
-- Rejects unexpected pre-staged files
-- Excludes untracked files by default
-- Can apply pulled changes to Studio
+Signed update checks run when the editor opens. **Install Update** installs
+matching components; reload the editor and restart Studio afterward.
+`renium.automaticUpdateChecks` controls these checks.
 
 ## Development
 
+From this extension folder:
+
 ```powershell
-cd tools/renium-vscode-extension
 npm.cmd ci
 npm.cmd run verify
-```
-
-Normal builds use checked-in API metadata and icons without starting Studio.
-Refresh assets explicitly:
-
-```powershell
-npm.cmd run sync-assets             # local metadata/icons; no Studio process
-npm.cmd run refresh-studio-assets   # also runs Studio's headless -API export
-```
-
-Review generated diffs. Release builds don't depend on the installed Studio.
-
-Build the Rust backend:
-
-```powershell
-$env:PATH = "$env:USERPROFILE\\.cargo\\bin;$env:PATH"
-cd tools/renium
-cargo build --locked --release
-```
-
-Press `F5` here to run an Extension Development Host.
-
-## Packaging and release builds
-
-Build the VSIX:
-
-```powershell
-cd tools/renium-vscode-extension
-npm.cmd ci
 npm.cmd run package
 ```
 
-Build all release artifacts from the repository root:
+Use `npm` on macOS/Linux. Press F5 in VS Code for an Extension Development Host.
+Edit `src/`, not generated `out/`.
+
+Build the backend from the repository root:
 
 ```powershell
-.\tools\build-release.ps1 -LocalBuild
+cargo build --locked --release --manifest-path tools/renium/Cargo.toml
+./tools/build-release.ps1 -LocalBuild
 ```
 
-This writes versioned artifacts, hashes, and a manifest under `dist/`.
-`recompile.bat` is the shortcut.
+The bundle goes under `dist/`; `recompile.bat` is a shortcut.
+Public releases omit `-LocalBuild` and require a clean checkout, license,
+and registered publisher; publisher `local` is for private VSIX installs.
 
-For a public release, omit `-LocalBuild`. It requires a clean checkout, license,
-and registered VS Code publisher. `publisher: "local"` supports only private
-VSIX installation.
-
-## Key settings
-
-- `renium.cliPath` (optional CLI override; blank uses the bundled CLI)
-- `renium.projectRoot` (default: `${workspaceFolder}`)
-- `renium.autoSyncOnSave` (default: `false`)
-- `renium.autoSyncDebounceMs` (default: `800`)
-- `renium.editorLiveSyncEnabled` (default: `false`)
-- `renium.studioLiveSyncEnabled` (default: `true`)
-- `renium.studioLiveSyncPollMs` (default: `250`, minimum: `10`; backs off while idle or after errors)
-- `renium.progressHeartbeatSeconds` (default: `2`)
-- `renium.gitSync.gitPath` (default: `git`)
-- `renium.gitSync.remote` (default: `origin`)
-- `renium.gitSync.branch` (blank = current branch)
-- `renium.gitSync.autoFetch` (default: `true`)
-- `renium.gitSync.pullFromStudioBeforePush` (`ask`, `always`, `never`)
-- `renium.gitSync.stageMode` (`tracked` or `configuredPaths`)
-- `renium.gitSync.stagePaths` (defaults to `sourceRoot`; path list used with `configuredPaths`)
-- `renium.gitSync.includeUntracked` (default: `false`)
-- `renium.gitSync.commitMessageTemplate` (supports `${date}`, `${datetime}`, `${branch}`)
-- `renium.gitSync.confirmBeforePush` (default: `true`)
-- `renium.gitSync.requireCleanWorktreeBeforePull` (default: `true`)
-- `renium.gitSync.applyPulledChangesToStudio` (`ask`, `always`, `never`)
-- `renium.gitSync.timeoutSeconds` (default: `120`)
-- `renium.gitSync.outputBehavior` (`onStart`, `onError`, `silent`)
-- `renium.wallySync.wallyPath` (default: `wally`)
-- `renium.wallySync.packagesDir` (default: `Packages`)
-- `renium.wallySync.targetService` (default: `ReplicatedStorage`)
-- `renium.wallySync.targetName` (default: `Packages`)
-- `renium.wallySync.serverPackagesDir` (default: `ServerPackages`)
-- `renium.wallySync.serverTargetService` (default: `ServerStorage`)
-- `renium.wallySync.serverTargetName` (default: `ServerPackages`)
-- `renium.wallySync.devPackagesDir` (default: `DevPackages`)
-- `renium.wallySync.devTargetService` (default: `ReplicatedStorage`)
-- `renium.wallySync.devTargetName` (default: `DevPackages`)
-- `renium.wallySync.runInstall` (default: `true`)
-- `renium.wallySync.applyToStudio` (`ask`, `always`, `never`)
+Builds use checked-in metadata/icons, not a running Studio.
+`npm run sync-assets` syncs local assets; `npm run refresh-studio-assets`
+also invokes Studio's headless API export. Review generated diffs.

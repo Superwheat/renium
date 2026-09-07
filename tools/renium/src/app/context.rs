@@ -1,11 +1,20 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 static CLI_PROJECT: OnceLock<Option<PathBuf>> = OnceLock::new();
-static AUTOMATION_PROJECT: Mutex<Option<PathBuf>> = Mutex::new(None);
-static AUTOMATION_RUNTIME: Mutex<Option<String>> = Mutex::new(None);
-static PLACE_SELECTOR: Mutex<Option<String>> = Mutex::new(None);
+#[derive(Default)]
+struct SelectedContext {
+    project: Option<PathBuf>,
+    runtime: Option<String>,
+    place: Option<String>,
+}
+
+static SELECTED: Mutex<SelectedContext> = Mutex::new(SelectedContext {
+    project: None,
+    runtime: None,
+    place: None,
+});
 static AUTOMATION_STDIO: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_cli_project(project: Option<PathBuf>) {
@@ -13,49 +22,60 @@ pub(crate) fn set_cli_project(project: Option<PathBuf>) {
 }
 
 pub(crate) fn project_override() -> Option<PathBuf> {
-    AUTOMATION_PROJECT
+    SELECTED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
+        .project
         .clone()
         .or_else(|| CLI_PROJECT.get().cloned().flatten())
 }
 
-pub(crate) fn select_automation(runtime: Option<String>, project: PathBuf) {
-    *AUTOMATION_RUNTIME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime;
-    *AUTOMATION_PROJECT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(project);
+#[must_use]
+pub(crate) struct Selection(SelectedContext);
+
+impl Drop for Selection {
+    fn drop(&mut self) {
+        *SELECTED.lock().unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut self.0);
+    }
 }
 
-pub(crate) fn clear_automation() {
-    *AUTOMATION_RUNTIME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *AUTOMATION_PROJECT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+// Callers hold the bridge request gate. Staging can nest a different project
+// inside the same operation; leaving it must restore the caller, not clear it.
+pub(crate) fn select_automation(
+    runtime: Option<String>,
+    project: PathBuf,
+    place: Option<String>,
+) -> Selection {
+    Selection(std::mem::replace(
+        &mut *SELECTED.lock().unwrap_or_else(PoisonError::into_inner),
+        SelectedContext {
+            runtime,
+            project: Some(project),
+            place,
+        },
+    ))
 }
 
 pub(crate) fn automation_runtime() -> Option<String> {
-    AUTOMATION_RUNTIME
+    SELECTED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
+        .runtime
         .clone()
 }
 
 pub(crate) fn set_place_selector(value: Option<String>) {
-    *PLACE_SELECTOR
+    SELECTED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        value.filter(|text| !text.trim().is_empty());
+        .unwrap_or_else(PoisonError::into_inner)
+        .place = value.filter(|text| !text.trim().is_empty());
 }
 
 pub(crate) fn place_selector() -> Option<String> {
-    PLACE_SELECTOR
+    SELECTED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
+        .place
         .clone()
 }
 
