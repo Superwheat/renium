@@ -2691,19 +2691,22 @@ impl BridgeServer {
     ) -> Result<T> {
         let mut last_error = None;
         let mut connected = false;
+        let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(context.method);
+        if let Some(response_deadline) = context.response_deadline {
+            lock_deadline = lock_deadline.min(response_deadline);
+        }
         for _ in 0..64 {
             let (result, found) = self.try_call_pinned_socket(context, &mut last_error, call)?;
             connected = found;
             if let Some(result) = result {
                 return Ok(result);
             }
+            if Instant::now() >= lock_deadline {
+                break;
+            }
             thread::yield_now();
         }
 
-        let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(context.method);
-        if let Some(response_deadline) = context.response_deadline {
-            lock_deadline = lock_deadline.min(response_deadline);
-        }
         while Instant::now() < lock_deadline {
             let (result, found) = self.try_call_pinned_socket(context, &mut last_error, call)?;
             connected = found;

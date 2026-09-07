@@ -753,7 +753,6 @@ fn busy_runtime_keeps_its_connected_channel_count() {
         handshake(&bridge, 1, &edit_info("same", 1)).unwrap(),
         "same",
     );
-    let started = Instant::now();
     assert_eq!(
         bridge.max_runtime_channel_coverage(BridgeTarget::Edit, None),
         2
@@ -765,6 +764,10 @@ fn busy_runtime_keeps_its_connected_channel_count() {
             .is_empty()
     );
     bridge.wait_for_all_target(1.0, BridgeTarget::Edit).unwrap();
+    assert_eq!(
+        bridge.wait_for_ready_channels_for_target(2, Duration::ZERO, BridgeTarget::Edit),
+        2
+    );
     let error = bridge
         .call_for_runtime_with_timeout(
             "getStudioState",
@@ -783,16 +786,15 @@ fn busy_runtime_keeps_its_connected_channel_count() {
             .len(),
         2
     );
-    let elapsed = started.elapsed();
     for (release, caller, responder) in [a, b] {
+        // Prove readiness and inventory did not wait for the requests to finish.
+        // A wall-clock threshold also measures unrelated CI scheduler delays.
+        assert!(!caller.is_finished());
+        assert!(!responder.is_finished());
         release.send(()).unwrap();
         caller.join().unwrap().unwrap();
         responder.join().unwrap();
     }
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "busy is connected, not missing: {elapsed:?}"
-    );
 }
 
 #[test]
