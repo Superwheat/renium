@@ -17,6 +17,7 @@
 - Closing and immediately reopening a local place no longer targets its retired Studio connection.
 - Place-name targeting uses the Studio window name instead of the unreliable DataModel name. Commands stay attached to the selected place and reject ambiguous targets.
 - Busy connections remain distinguishable from disconnected ones; one slow place no longer holds up unrelated places.
+- Commands apply one timeout budget while waiting for busy Studio connections, including their initial retries.
 - Play clients and servers follow the correct session through starts, stops, reconnects, and delayed replies.
 - macOS automatically ignores Auto-Recovery prompts while preserving recovery files, and explains missing Accessibility permission instead of silently failing.
 
