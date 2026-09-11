@@ -112,6 +112,7 @@ jobs:
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           node tools/renium/tests/automation-replay.mjs tools/renium/target/release/renium.exe
+          node tools/renium-vscode-extension/scripts/sync-assets.mjs --docs-only
           node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/release/renium.exe
           node tools/renium/tests/launcher-smoke.mjs
 
